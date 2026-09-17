@@ -713,6 +713,47 @@ if ! python3 scripts/check_ambiguous_ran_false.py --strict \
 fi
 say "ambiguous-ran-false phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_ranfalse.log"))"
 
+# ── NATIVE-ASAN-LEG SKIP PHASE (#3682) ────────────────────────────────────
+# The per-test ASan leg funnels through sanitizerRuntimeMaster() (via
+# asanRuntimeObject() or buildRuntimeSanitizerObject()), and every
+# caller follows the same shape: bind the result, then `if (rc < 0)
+# return;` (or `== -1`) — a guard that swallows the empty result as a
+# silent SKIP. ~49 sites banked across 14 files at #3682 (the rest of
+# the >150 the spec's line-based grep counted were unbound variables,
+# not real swallows). The conflating_helpers count is post-#3676
+# (commit 1 of this ratchet) AND post-#3682-fix-forward (cycle-9 round-2:
+# the brace-matching bug fix uncovered 72 additional real conflations
+# in 71 files, rebanked from 0 → 73 in scripts/native_asan_leg_skips.baseline).
+#
+# Two banked per-file counts, exact-not-ceiling baseline + a per-file
+# grandfather ceiling. Marker protocol: `// ASAN-LEG-ONLY: <reason>`
+# exempts the next swallow, `// ASAN-LEG-DEBT: #NNNN <reason>`
+# justifies a rise above the grandfathered ceiling (same shape as
+# LOCALDECL-ONLY / LOCALDECL-DEBT, check_localdecl_only_walkers.py).
+say "native-asan-leg phase: detector self-test + skip-swallow ratchet (#3682)"
+if ! python3 scripts/check_native_asan_leg_skips.py --self-test \
+      > "$LOGDIR/${TAG}_asanleg.log" 2>&1; then
+  say "CYCLE FAILURE: check_native_asan_leg_skips SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_asanleg.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_asanleg.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_native_asan_leg_skips.py --strict \
+      >> "$LOGDIR/${TAG}_asanleg.log" 2>&1; then
+  say "CYCLE FAILURE: the native ASan-leg skip surface ROSE (#3682) — a"
+  say "  new \`if (<asan-var> == -1|<0) return;\` site, a new"
+  say "  \`-fsanitize=address\` helper with a post-link \`return -1;\`, or"
+  say "  a marked-rather-than-fixed swallowing guard. Each row reports a"
+  say "  clean PASS while the ASan leg is unavailable — the failure mode"
+  say "  #3653's \`detect_leaks\` regression reached the gate unseen for."
+  say "  See $LOGDIR/${TAG}_asanleg.log"
+  sed -n '/NATIVE ASAN LEG SKIPS:/,$p' "$LOGDIR/${TAG}_asanleg.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "native-asan-leg phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_asanleg.log"))"
+
 # ── UNINSTRUMENTED-EMIT PHASE (#3917) ──────────────────────────────────────
 # Hand-rolled `codegen::emitObjectFile` runners that bypass
 # `bezel::test::forceSanitizeAddress()` (the predicate `--full` flows
