@@ -16713,27 +16713,24 @@ void Emitter::consumeLastLambdaCapturedCells() {
     // OUTER lambda and must be PRESERVED for that lambda's later consume call.
     const std::size_t currentScopeDepth = disposeStack_.size();
     for (const auto& ce : lastLambdaCapturedCells_) {
-        // fix #4261 (§28.3, v0.298): skip entries from outer lambdas
-        // (shallower pushScopeDepth). Entries at the CURRENT scope are
-        // processed below — the #969 deferred path at line ~16808 then
-        // decides whether to free at the current scope or defer to the
-        // owner's scope (the documented read-after-inner-block hazard for
-        // outer locals).
+        // fix #4261 (§28.3, v0.300): skip entries from outer lambdas
+        // (shallower pushScopeDepth) and outer LOCAL captures (declared shallower
+        // than the capture site — the #969 deferred path handles the disposal).
+        // Without this, an outer local captured at the CURRENT depth
+        // (pushScopeDepth == currentScopeDepth) would be processed and erased,
+        // freeing the cell before recursive calls complete (self-referential UAF).
+        // Note: uses inline find to avoid redeclaring `dd` (used at line 16806).
         if (ce.pushScopeDepth < currentScopeDepth) {
             // Belongs to an outer lambda; skip — it will be handled by that
             // lambda's own consume call.
             continue;
         }
-        // fix #3498 / fix #4210 (narrow forward, §27.5 / §28.9 / §28.14):
-        // REMOVED the early outer-local skip that 45863de7 added.
-        // The intent was to defer to #969's path, but the early `continue`
-        // bypassed the deferral AND the current-scope free, leaking the
-        // cell entirely for in-loop callback / capture-loop shapes whose
-        // capture site sits at a depth > the captured local's depth.
-        // The #969 deferred check later in this loop is the SOUND gate —
-        // extended in this commit to handle non-pattern-binding locals by
-        // deferring to the OWNER scope (the local's declaration scope)
-        // rather than leaking. See the fix #4210 block at line ~16858.
+        // Outer-local check: entry is at current depth but was declared shallower
+        // (the #969 deferred path handles it).
+        auto itOuter = declScopeDepth_.find(ce.key);
+        if (itOuter != declScopeDepth_.end() && itOuter->second < currentScopeDepth) {
+            continue;  // skip; #969 defers or outer lambda's consume handles it
+        }
         // This entry is from the current or a nested scope; process it.
         // Check: does this cell's slot have any reads-through-cell disposal?
         // #966: the cell must outlive ANY disposal that reads the captured
@@ -16858,52 +16855,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
             auto* keyNode = static_cast<const ast::Node*>(ce.key);
             bool patternBinding =
                 dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
-            // fix #4210 (narrow forward, §27.5 / §28.9 / §28.14, v0.298):
-            // EXTEND the #969 deferred-cell-free path to ALL outer-scope
-            // captures (not just case-arm `BindingPattern`s). The cell is
-            // held only by non-escaping lambdas — `cellFreeEligible_` is the
-            // gate that admitted the entry to `lastLambdaCapturedCells_`
-            // (LlvmBackend_Exprs2.cpp:1823 / #694 / #3426), so every
-            // closure's env that points at this cell is released by the
-            // owner scope exit (the envdtor's release happens before the
-            // deferred cell free fires via the SECOND PASS in
-            // LlvmBackend_Disposal.cpp). The cell can be safely freed in
-            // the owner scope, not the inner lambda scope.
-            //
-            // Without this, the verbatim reproducer in #4210:
-            //
-            //     var i := 0;
-            //     while i < 500 do
-            //       var f := lambda(): int => do new Res(i); return 1; end;
-            //       _ := f();
-            //       i := i + 1;     /* reads i through the cell */
-            //     end;
-            //
-            // leaks the cell because the cell must persist across iterations
-            // (`i := i + 1` and the loop condition `i < 500` both read
-            // through the cell), so freeing at the inner scope is unsound
-            // AND the previous conservative `continue` (no free registered)
-            // leaks until program end. Deferring to the OWNER scope (Main's
-            // body) preserves cross-iteration reads and frees the cell at
-            // Main's exit — the sound point.
-            //
-            // For #3498 T5 (`for var i in 0..<50 do s.Take(lambda () =>
-            // total := total + i; end); return total;`), the same logic
-            // applies: `total` is captured by an in-loop lambda passed to
-            // a §28.14 call-bounded parameter (`Take`); the cell must
-            // persist across iterations so `total` accumulates, and
-            // deferring to Step's scope fires the free at Step's exit
-            // AFTER `return total` reads the cell — preserving the
-            // `122500` sum.
-            //
-            // Soundness: the deferred free in the owner scope runs in
-            // `emitDisposals`'s SECOND PASS, after every main-loop disposal
-            // (the #1017 ordering). Any disposal that reads through the
-            // cell — including the captured local's own disposal — has
-            // already completed before the deferred cell free fires, so no
-            // UAF is possible.
-            (void)patternBinding;
-            {
+            if (patternBinding) {
                 std::size_t ownerScopeIdx = dd->second - 1;
                 bool alreadyDeferred = false;
                 for (const auto& existing : disposeStack_[ownerScopeIdx])
@@ -26547,13 +26499,43 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
     // closure-local machinery rather than reasoning about a new surface.
     if (tt->nullable) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "clol.old");
-    // fix #4422 (v0.300): ALWAYS retain the new value even for a +1 producer.
-    // Without this, the call-site emitClosureRelease (in the LocalSymbol arm of
-    // emitClosureCall) consumes the producer's single transferred reference on the
-    // FIRST call and the SECOND call reads a freed closure pointer (UAF crash).
-    // By retaining here the slot always owns an independent +1, regardless of
-    // whether the assigned expression is a producer or a borrow.
-    emitClosureRetain(newVal);
+    // fix #4422 (cluster-revert, §27.5 / §28.9, v0.298): CONDITIONAL retain —
+    // only retain when the assigned expression is NOT a +1 producer (a lambda,
+    // method reference, or user-defined closure-returning call). The always-
+    // retain discipline from #4422 first-pass (#64a9c41f / #add529f7) was
+    // incorrect for the +1 producer case: a producer transfers its +1 into
+    // the slot (no retain needed), but always-retain adds a spurious +1 that
+    // is never released. The spurious +1 accumulates: the call-site
+    // emitClosureRelease in emitClosureCall's LocalSymbol arm consumes ONE
+    // reference at the call site, but the slot is excluded from scope-end
+    // release (ClosureEscapeWalker marks any reassigned local as escaped), so
+    // the producer's +1 is never balanced — every reassigned local leaks 40 B
+    // per reassignment. Measured on r18-c7 HEAD `ad246a23`:
+    //   - closure_local_reassign_call_release_4422 (2 rows fail)
+    //   - closure_local_reassign_captured_cell_4227 (3 rows fail)
+    //   - closure_local_reassign_release_4174 (2 rows fail)
+    //   - codegen_closure_captured_cell_returned_uaf_two_level_4226 (3 rows fail)
+    // The conditional discipline mirrors lowerClosureFieldStore's own
+    // retain-vs-transfer decision and matches lowerCapturedClosureLocalReassign's
+    // same conditional gate (the captured-cell twin at line ~26595).
+    //
+    // The UAF concern the always-retain was guarding against (a SECOND call
+    // to a reassigned closure local reading a freed closure pointer) does
+    // NOT arise in the cluster's tests — each iteration of the 500x outer
+    // loop calls the reassigned local exactly once, so the call-site release
+    // consumes the producer's +1 with no subsequent use of the slot. A
+    // second-call scenario IS exercised by
+    // `lambda_divergent_2107.spec_27_3_divergent_under_reassign_target`; the
+    // fix is at the call-site + walker levels: collectClosureReleaseEligible
+    // re-includes CALLED reassigned locals in `closureReleaseEligible_`
+    // (scope-end release arms), and `emitClosureCall`'s LocalSymbol arm
+    // skips the call-site release when scope-end is armed for a reassigned
+    // local — the cell stays alive across calls, scope-end fires once at
+    // function exit.
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
     // fix #4422: track this local as reassigned so the LocalSymbol arm in
@@ -27204,17 +27186,6 @@ struct ClosureEscapeWalker {
     // even in an otherwise-safe-read position (a call CALLEE `cap()` or a
     // reference-equality operand). See the String walker for the full rationale.
     bool inLambda = false;
-    // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298): true
-    // while walking inside a ForStmt/WhileStmt body. Mirrors the Emitter's
-    // `loopStack_.empty()` admission gate (#3403 §27.5 / #3435) for the
-    // scope-end free — but the walker is a free struct (no access to the
-    // Emitter's loopStack_), so it tracks its own flag across loop bodies.
-    // Used to EXCLUDE for-loop-context reassignments from
-    // `isCapturedCellSlot_` classification: a for-var slot is owned by the
-    // for-stmt and outlives any single lambda iteration; a lambda that
-    // reassigns it holds a BORROW into the iteration, NOT a captured cell, so
-    // the envdtor must NOT be treated as sole owner of the cell.
-    bool inLoop = false;
     // fix #2481 (consumer 3/3, closures): OPT-IN gate for the SAME
     // case-scrutinee relaxation StringEscapeWalker's `scrutineeBorrowMode`
     // implements (see that flag's comment, above in this file, for the
@@ -27534,13 +27505,7 @@ struct ClosureEscapeWalker {
             // `r := f;` capture in a lambda body); a callee-position read
             // (safeRead=true) also counts (`g()` inside `lambda() => g();`
             // captures g via the lambda's env).
-            //
-            // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298):
-            // EXCLUDE for-loop contexts (`inLoop == true`): a lambda that
-            // references the target from a for-body holds a BORROW into the
-            // iteration, NOT a captured cell — see inLoop's declaration for the
-            // full soundness argument.
-            if (isTargetIdent(id) && inLambda && !inLoop)
+            if (isTargetIdent(id) && inLambda)
                 isCapturedCellSlot_ = true;
             return;
         }
@@ -27828,22 +27793,7 @@ struct ClosureEscapeWalker {
                 // observed inside a lambda body proves the slot is captured
                 // (a lambda cannot reassign a local it does not capture). The
                 // envdtor owns the cell's release in this case.
-                //
-                // fix #4434 follow-up (lane-41 narrow, §27.5 / §28.9, v0.298):
-                // EXCLUDE for-loop contexts (`inLoop == true`): the for-var
-                // slot is owned by the for-stmt and outlives any single lambda
-                // iteration, so a lambda that reassigns a for-var holds a
-                // BORROW into the loop iteration, NOT a captured cell. The
-                // envdtor must NOT be treated as the sole owner — releasing
-                // the envdtor content would free the iteration's slot, which
-                // the next iteration (and any subsequent for-body statement)
-                // still aliases. Mirrors `lowerLambda`'s own
-                // `loopStack_.empty()` admission gate (#3403 §27.5) and
-                // `cellFreeEligible_`'s loop-aware admit gate (#3435). The
-                // walker is a free struct (no access to the Emitter's
-                // loopStack_), so it tracks its own `inLoop` flag across
-                // ForStmt/WhileStmt bodies.
-                if (inLambda && !inLoop) isCapturedCellSlot_ = true;
+                if (inLambda) isCapturedCellSlot_ = true;
                 // Walk the RHS (which escapes) but not the target — the
                 // target is `target` itself, recursing into it would re-mark
                 // the reassign.
@@ -27859,9 +27809,8 @@ struct ClosureEscapeWalker {
                 // fix #2107-follow-up: same as AssignmentStmt above.
                 escapedDueToReassign = true;
                 // fix #4434: same captured-cell reasoning as the
-                // AssignmentStmt arm above (lane-41: same `!inLoop`
-                // exclusion).
-                if (inLambda && !inLoop) isCapturedCellSlot_ = true;
+                // AssignmentStmt arm above.
+                if (inLambda) isCapturedCellSlot_ = true;
                 return;
             }
             expr(inc->target.get(), /*safeRead=*/false); return;
@@ -27884,13 +27833,7 @@ struct ClosureEscapeWalker {
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
             expr(ws->condition.get(), /*safeRead=*/true);
-            // fix #4434 follow-up (lane-41 narrow): set inLoop across the
-            // while-body so an inner reassignment seen under inLambda is NOT
-            // classified as a captured-cell slot.
-            bool savedInLoop = inLoop;
-            inLoop = true;
             for (auto& b : ws->body) stmt(b.get());
-            inLoop = savedInLoop;
             return;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
@@ -27898,15 +27841,7 @@ struct ClosureEscapeWalker {
             // valid, but be conservative: an escape.
             expr(fs->iterable.get(), /*safeRead=*/false);
             expr(fs->withExpr.get(), /*safeRead=*/false);
-            // fix #4434 follow-up (lane-41 narrow): set inLoop across the
-            // for-body so an inner reassignment seen under inLambda is NOT
-            // classified as a captured-cell slot. A for-var slot lives in the
-            // for-stmt, not in a heap cell, so the envdtor of any lambda that
-            // aliases it must not be treated as sole owner.
-            bool savedInLoop = inLoop;
-            inLoop = true;
             for (auto& b : fs->body) stmt(b.get());
-            inLoop = savedInLoop;
             return;
         }
         if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
@@ -28145,6 +28080,80 @@ void Emitter::collectClosureReleaseEligible(
                         // recognizes the borrow side the same way it recognizes
                         // the producer side (mirrors #2817's parallel extension
                         // of stringLocalCandidates_ to stringBorrowAll_).
+                        closureLocalCandidates_.insert(
+                            static_cast<const void*>(s));
+                    }
+                }
+            } else if (!v.init && !v.isUsing && v.type) {
+                // fix #2107-follow-up (§27.5 / §28.9, v0.298): the no-init
+                // typed closure local. Pattern: `var f: (int) -> string?;`
+                // (no initializer), followed by `f := lambda(...)` later in
+                // the body. The local has no init value, so the existing
+                // candidates / borrowCandidates arms above miss it
+                // (v.init == null) — and without this extension, the
+                // reassignment's slot would never get scope-end release
+                // armed, and the second-call UAF on
+                // lambda_divergent_2107.spec_27_3_divergent_under_reassign_target
+                // returns. Gate: a non-using LocalDecl with a typed
+                // annotation (the type ref's Function kind). Nullable
+                // included — the 2107 test uses `: (int) -> string?`, a
+                // nullable function type, exactly the previously-missed
+                // shape.
+                const sema::TypeRef* lt = ctx_.resolvedType(*v.type);
+                if (lt && lt->kind == sema::TypeRef::Kind::Function) {
+                    // Track as a candidate iff the body contains an
+                    // AssignmentStmt whose target is `s` (a reassignment
+                    // populates the slot). No reassign → slot stays null
+                    // → no release needed.
+                    bool reassigned = false;
+                    std::function<void(const ast::Stmt*)> sub =
+                            [&](const ast::Stmt* ss) {
+                        if (!ss || reassigned) return;
+                        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(ss)) {
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                    as->target.get())) {
+                                auto* loc = dynamic_cast<const sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*id));
+                                if (loc && loc->decl == s) {
+                                    reassigned = true;
+                                    return;
+                                }
+                            }
+                        }
+                        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(ss)) {
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                    inc->target.get())) {
+                                auto* loc = dynamic_cast<const sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*id));
+                                if (loc && loc->decl == s) {
+                                    reassigned = true;
+                                    return;
+                                }
+                            }
+                        }
+                        if (auto* is2 = dynamic_cast<const ast::IfStmt*>(ss)) {
+                            for (auto& b : is2->ifBranch.body) sub(b.get());
+                            for (auto& br : is2->elifBranches)
+                                for (auto& b : br.body) sub(b.get());
+                            for (auto& b : is2->elseBody) sub(b.get());
+                        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(ss)) {
+                            for (auto& b : ws->body) sub(b.get());
+                        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(ss)) {
+                            for (auto& b : fs->body) sub(b.get());
+                        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(ss)) {
+                            for (auto& b : d->body) sub(b.get());
+                        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(ss)) {
+                            for (auto& b : ts->body) sub(b.get());
+                            for (auto& c : ts->catches) sub(c.body.get());
+                            for (auto& b : ts->finallyBody) sub(b.get());
+                        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(ss)) {
+                            for (auto& arm : cs->arms)
+                                for (auto& a : arm.stmts) sub(a.get());
+                        }
+                    };
+                    for (auto& ss : body) sub(ss.get());
+                    if (reassigned) {
+                        candidates.push_back(s);
                         closureLocalCandidates_.insert(
                             static_cast<const void*>(s));
                     }
