@@ -72,6 +72,14 @@ using bezel::test::runAot;
 
 namespace {
 
+// Forward-declare `linkRunAsan3181` so that `runUnderASan3181` below can call
+// it before its definition appears further down in this anonymous namespace.
+// The body itself (defined alongside `runUnderASan3181` for proximity) has been
+// stable since #3676; a forward declaration (rather than moving the definition
+// above) is the smallest-diff fix for the undeclared-identifier build break.
+inline int linkRunAsan3181(const std::string& rtObj, const std::string& objPath,
+                           const std::string& exe);
+
 // Per-process unique working dir under the shared scratch base (DISK-backed
 // per CLAUDE.md; /tmp tmpfs races across shards).
 static const fs::path& wtDir3181() {
