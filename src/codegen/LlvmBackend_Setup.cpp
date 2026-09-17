@@ -16981,8 +16981,28 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // `returnedCaptureVars_` (populated by collectBoxCaptureLocals at
         // function entry — the same walker that flags `capturedLocalReturnedByName`
         // for the envdtor's release-path selection).
+        //
+        // fix #4261-FORWARD (§28.3 / §27.5 / §28.9, v0.300): the envdtor fires
+        // a CELL-FREE for `key` only on TWO paths — the sole-escaping-holder
+        // arm of #694 (line ~2333 in lowerLambda, gated on `singleCaptureLocals_
+        // .count(key) && definitelyEscapingLambdas_` of the sole capturer), and
+        // the shared-cell arm of #3426 (line ~2388 in lowerLambda, gated on
+        // `isSharedCellEnvdtorFreeOwner(key, &lam)`). EITHER gate arm being
+        // satisfied is sufficient: it is the O(1) ORACLE for "this entry's
+        // envdtor will free the cell". For the SPECIFIC case the original SKIP
+        // was meant to guard (escaping-holder envdtor owns the cell) BOTH arms
+        // are populated; for our new shape (multiple NON-escaping co-capturers,
+        // `f := lambda() => 42;` inside a non-escaping nested lambda — see
+        // `lambda_nested_local_decl_capture_cell_leak_4261_test.cpp` rows A and
+        // B) NEITHER arm is populated: no envdtor fires the cell-free, so
+        // `boxedCellFree` is the cell's ONLY reclaim path and the pre-fix SKIP
+        // leaked the cell past the captured local's scope end. The narrowly-
+        // widened gate below admits only the original-shape SKIP and falls
+        // through to register `boxedCellFree` for ours.
         if (ce.key && closureLocalCapturedCellReassigned_.count(ce.key) &&
-            !returnedCaptureVars_.count(ce.key)) {
+            !returnedCaptureVars_.count(ce.key) &&
+            (singleCaptureLocals_.count(ce.key) ||
+             sharedCellEnvdtorFreeOwner_.count(ce.key))) {
             continue;
         }
         Disposal dc{ce.newSlot, nullptr};

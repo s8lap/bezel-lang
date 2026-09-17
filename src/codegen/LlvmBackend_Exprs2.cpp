@@ -2250,10 +2250,32 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //      capture-time cell allocation, one release at the owner's
         //      scope end — never both).
         if ((contentIsString || contentIsClosure) &&
-            (declaredShallower || inArgumentLambda_) &&
             !alreadyBoxed && !isForVar && declScopeDepth > 0 &&
             currentFn_ == cellFreeEligibleFn_ &&
-            cellFreeEligible_.count(static_cast<const void*>(decl))) {
+            cellFreeEligible_.count(static_cast<const void*>(decl)) &&
+            ((declaredShallower || inArgumentLambda_) ||
+             // fix #4261-FORWARD (§28.3 / §27.5 / §28.9, v0.300):
+             // a captured-cell + reassigned local whose envdtor's content
+             // release is SUPPRESSED (mutatedSharedCaptureCell suppresses
+             // for the multi-env-shares-one-cell + body-writes combination)
+             // would otherwise leak its cell content forever: every prior
+             // reassign's old-value release balances the previous new value
+             // via `lowerCapturedClosureLocalReassign`, but the FINAL
+             // reassign's closure value remains held by the cell with no
+             // envdtor decrementing it. The `declaredShallower` /
+             // `inArgumentLambda_` shape fires #3752/#3778 for lifetime
+             // reasons (the envdtor would run too early on the deeper-scope
+             // capture); the SUPPRESSED envdtor case here fires for an
+             // accounting reason (the envs share the cell — every envdtor
+             // release would over-release the single +1). In both cases
+             // exactly ONE release at the owner's scope (this block's
+             // `disposeStack_[ownerScopeIdx]` push) is needed; the cell
+             // holder's lifetime (the local at depth `declScopeDepth`)
+             // ends before its `+1` content would otherwise die.
+             (assignedCaptureVars_.count(static_cast<const void*>(decl)) &&
+              mutatedSharedCaptureCell(static_cast<const void*>(decl),
+                                       ce.semaTy,
+                                       /*freshCellPerIteration=*/false)))) {
             std::size_t ownerScopeIdx = declScopeDepth - 1;
             if (ownerScopeIdx < disposeStack_.size()) {
                 ce.suppressContentRcInEnvdtor = true;
