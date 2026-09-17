@@ -91,7 +91,7 @@ Confirmed by direct inspection:
   bezelc IR generation. RSS stays linear; the cost is LLVM's lowering on
   bezelc's linear-size IR. **SPLIT.**
 
-Split issue filed at: https://github.com/s8lap/bezel-lang/issues/4473
+Split issue filed at: https://github.com/s8lap/bezel-lang/issues/4458
 "Family J — record-chain trio (#4255 / #4242 / #4436) is a separate family:
 classification memoization does not reach these code paths".
 
