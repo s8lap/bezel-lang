@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "native_test_harness.hpp"
+#include "support/aot_support.hpp"
 #include "support/force_sanitize.hpp"
 #include "support/scratch_dir.hpp"
 #include "test_harness.hpp"
@@ -318,6 +319,26 @@ int main(int argc, char** argv) {
               << " check(s) skipped (ASan/TSan runtime unavailable — see"
                  " tests/native_test_harness.hpp sanitizerRuntimeMaster())\n";
 
+    // fix #3733: loud, not silent. runAotChecked's toolchain probe at
+    // tests/support/aot_support.hpp takes a single early-return when
+    // `clang --version` fails (or BEZEL_AOT_FORCE_NO_TOOLCHAIN=1 forces it).
+    // That branch was previously the #3633 silent-skip class: a box without
+    // clang reported clean PASS having run no sanitizer at all. The counter
+    // `checkedToolchainSkips()` is incremented at that ONE chokepoint
+    // (modelled on nativeSanitizerUnavailableSkips above), and is printed
+    // here UNCONDITIONALLY — "0" is then a positive confirmation the
+    // ASan/LSan tier was actually armed in this process, not the absence of
+    // a signal. A separate line (not embedded in the "N passed, M failed …
+    // T total" summary above) so the LOAD-BEARING legacy-line regex
+    // (scripts/gate/summary.py's _LEGACY_HEAD_RE/_LEGACY_TOTAL_RE, which
+    // tests/run_parallel.sh's dual-read agreement check depends on) is
+    // untouched.
+    const std::size_t checkedToolchainSkips =
+        ::bezel::test::checkedToolchainSkips().load(std::memory_order_relaxed);
+    std::cout << "CHECKED TOOLCHAIN: " << checkedToolchainSkips
+              << " skip(s) (clang unavailable for the ASan link — see"
+                 " tests/support/aot_support.hpp runAotCheckedImpl)\n";
+
     // per #3012 Phase 2a: ALSO emit a structured JSON shard summary to the path
     // named by BEZEL_SHARD_SUMMARY (off unless set). The legacy summary line
     // above is UNCHANGED and remains the gate's authoritative source; this JSON
@@ -367,6 +388,15 @@ int main(int argc, char** argv) {
         // is nonzero.
         json += ",\"native_sanitizer_unavailable_skips\":";
         json += std::to_string(nativeSanitizerSkips);
+        // fix #3733: additive field — same rationale as #3626 above; an older
+        // reader that does not know this key ignores it (summary.py's
+        // check_agreement only compares passed/failed/total/selected/schema),
+        // so no schema-version bump is needed. tests/run_parallel.sh sums it
+        // across every shard's JSON directly and fails the sharded run when
+        // the total is nonzero (GATE FAILURE banner — the loud half of the
+        // #3733 toolchain-SKIP ratchet).
+        json += ",\"checked_toolchain_skips\":";
+        json += std::to_string(checkedToolchainSkips);
         json += "}\n";
         atomicWriteShardSummary(std::string(sumEnv), json);
     }

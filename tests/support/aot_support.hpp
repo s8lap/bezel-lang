@@ -153,6 +153,49 @@
 
 namespace bezel::test {
 
+// ── checkedToolchainSkips + forceToolchainMissing (fix #3733) ─────────────
+//
+// WHY THIS PAIR EXISTS. `runAotCheckedImpl` probes `clang --version` once per
+// process and, on failure, returns `ran=false` with a single
+// `Severity::Error` carrying the literal message "<name>: SKIP — C toolchain
+// (clang) unavailable for the ASan link" (the in-source comment at the
+// chokepoint names this). 2,046 call sites in 634 files reach that branch
+// (measured 2026-09-17 at b57a712e) and the absorption surface is the ~1,518
+// `wasSkipped`/`SKIP (not a failure)` lines — #3733 is the whole program of
+// ratcheting + burn-down for this silent-skip class.
+//
+// THE LOUD HALF (this pair + the per-process line in test_main.cpp + the shard
+// JSON field + the run_parallel.sh floor) is the harness side: a box without
+// clang fails the run loudly instead of silently reporting clean PASS having
+// run no sanitizer at all. The source half (`scripts/check_toolchain_skip_surface.py`)
+// freezes the 2,046-call-site surface so it cannot grow while the burn-down
+// runs. Both halves are wired into the same gate cycle (spec §1 / issue #3733).
+//
+// `forceToolchainMissing()` is the test-only knob that forces the SKIP path
+// unconditionally regardless of whether the box has clang — mirrors the
+// `forceSanitizeAddress()` shape (`tests/support/force_sanitize.hpp`). It is
+// NOT memoized because the regression test sets it at runtime via setenv(),
+// so it must be re-read on every call (cheap, one getenv). Production paths
+// never set it, so the cost is irrelevant.
+inline bool forceToolchainMissing() {
+    const char* e = std::getenv("BEZEL_AOT_FORCE_NO_TOOLCHAIN");
+    if (!e || *e == '\0') return false;
+    return *e != '0';
+}
+
+// Process-wide counter for every `runAotChecked` row that hit the toolchain
+// SKIP branch. Modelled on `nativeSanitizerUnavailableSkips()`
+// (tests/native_test_harness.hpp:65–68). Atomic, memoised; incremented at the
+// ONE chokepoint inside runAotCheckedImpl (the early-return at the probe).
+// tests/test_main.cpp reads this once per process and prints it
+// UNCONDITIONALLY (so "0" is a positive confirmation the oracle ran), and
+// the additive `checked_toolchain_skips` field in the shard JSON carries it
+// to tests/run_parallel.sh's sum + floor.
+inline std::atomic<std::size_t>& checkedToolchainSkips() {
+    static std::atomic<std::size_t> n{0};
+    return n;
+}
+
 namespace aot_detail {
 
 namespace fs = std::filesystem;
@@ -2630,6 +2673,18 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     // is absent — preserves the pre-existing "environment can't run this"
     // contract. Memoized: probed once per process.
     //
+    // fix #3733: this branch is now LOUD, not silent. The counter at the
+    // chokepoint (`checkedToolchainSkips()` above) is incremented on every
+    // early return here, and tests/test_main.cpp prints it unconditionally
+    // + appends it to the shard JSON, so a box without clang fails the
+    // sharded run via tests/run_parallel.sh's floor (the same shape as the
+    // #3626 native-sanitizer floor) instead of silently reporting clean
+    // PASS having run no sanitizer at all. `forceToolchainMissing()` is the
+    // test-only knob (env var BEZEL_AOT_FORCE_NO_TOOLCHAIN=1) that forces
+    // this branch on any box, so the regression test
+    // tests/support/native_toolchain_unavailable_loud_test.cpp can prove
+    // the chokepoint counts on a box that does have clang.
+    //
     // #3007 scope note: this SKIP is itself a member of the #3633 silent-skip
     // class — a box without clang runs the whole ASan tier vacuously — but it
     // is DELIBERATELY left as-is here. It is already textually distinguishable
@@ -2642,10 +2697,20 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     // policy change about which environments may run the suite, not a
     // harness-honesty fix. Filed separately; this lane changes only the paths
     // that were INdistinguishable.
-    static const bool toolchainOk = [] {
+    static const bool toolchainProbeOk = [] {
         return std::system("clang --version > /dev/null 2>&1") == 0;
     }();
-    if (!toolchainOk) {
+    // `forceToolchainMissing()` is intentionally NOT memoized here: the
+    // regression test (`tests/support/native_toolchain_unavailable_loud_test.cpp`)
+    // sets/un-sets BEZEL_AOT_FORCE_NO_TOOLCHAIN at runtime via setenv(), and
+    // memoising it at first call would lock in whatever the env looked like
+    // then, not what it looks like NOW. The probe is memoised because
+    // `system("clang --version …")` is expensive; the env-var read is one
+    // getenv, irrelevant next to that. Production paths never set the knob,
+    // so the per-call check costs nothing measurable.
+    if (::bezel::test::forceToolchainMissing() || !toolchainProbeOk) {
+        ::bezel::test::checkedToolchainSkips().fetch_add(
+            1, std::memory_order_relaxed);
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::string(name) + ": SKIP — C toolchain (clang) "
                              "unavailable for the ASan link");

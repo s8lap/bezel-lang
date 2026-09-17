@@ -493,7 +493,37 @@ if [[ "$sanitizer_unavailable_total" -gt 0 ]]; then
     echo "############################################################"
 fi
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 || "$sanitizer_unavailable_total" -gt 0 ]]; then
+# ── checked-toolchain oracle floor (#3733) ─────────────────────────────────
+# Every shard's structured JSON summary also carries `checked_toolchain_skips`
+# (test_main.cpp, sourced from the ONE harness chokepoint:
+# tests/support/aot_support.hpp's runAotCheckedImpl — the `toolchainOk` probe
+# at the early-return when `clang --version` fails or
+# `BEZEL_AOT_FORCE_NO_TOOLCHAIN=1` forces it). 2,046 runAotChecked( call
+# sites in 634 files reach that branch (#3733, measured 2026-09-17); on a
+# box without clang the whole ASan/LSan tier reports clean PASS having run
+# no sanitizer at all unless this floor fails the run. Same shape as the
+# #3626 floor above: sum the additive key across every shard's JSON directly
+# via grep/awk (NOT summary.py — narrow, no schema change), print
+# unconditionally ("0" is positive confirmation), fail the sharded run when
+# the total is nonzero. A missing field on an older/foreign JSON degrades to
+# 0, never a parse error.
+checked_toolchain_total=$(grep -aho '"checked_toolchain_skips":[0-9]*' \
+    "$logdir"/summary.*.json 2>/dev/null \
+    | grep -oE '[0-9]+$' | awk '{t+=$1} END{print t+0}')
+checked_toolchain_total="${checked_toolchain_total:-0}"
+echo "CHECKED TOOLCHAIN (all shards): $checked_toolchain_total skip(s) (clang unavailable for the ASan link)"
+if [[ "$checked_toolchain_total" -gt 0 ]]; then
+    echo "############################################################"
+    echo "## GATE FAILURE: checked-toolchain oracle UNAVAILABLE for $checked_toolchain_total check(s)"
+    echo "##   runAotChecked's `clang --version` probe failed for this many rows,"
+    echo "##   so those checks silently could not run the ASan/LSan tier (#3733)"
+    echo "##   — an acceptance run must not pass with this verification leg"
+    echo "##   switched off. See tests/support/aot_support.hpp"
+    echo "##   runAotCheckedImpl and the per-shard logs in $logdir."
+    echo "############################################################"
+fi
+
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 || "$sanitizer_unavailable_total" -gt 0 || "$checked_toolchain_total" -gt 0 ]]; then
     exit 1
 fi
 exit 0
