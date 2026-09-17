@@ -713,6 +713,46 @@ if ! python3 scripts/check_ambiguous_ran_false.py --strict \
 fi
 say "ambiguous-ran-false phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_ranfalse.log"))"
 
+# ── UNINSTRUMENTED-EMIT PHASE (#3917) ──────────────────────────────────────
+# Hand-rolled `codegen::emitObjectFile` runners that bypass
+# `bezel::test::forceSanitizeAddress()` (the predicate `--full` flows
+# through) leave gate.sh --full blind to generated-code ASan on those
+# programs. The capability gap is real: a 3-arg call defaults
+# `sanitizeAddress` to false at src/codegen/LlvmBackend.hpp:102, LSan
+# still catches a leak, but a use-after-free read performed by
+# generated code is invisible - no shadow-memory check is emitted on
+# the program's own loads/stores.
+#
+# Spec §5 ("Ratchet first, fix second" per #4452): there is no runtime
+# half available for this hole, and that is worth stating rather than
+# leaving implicit. The source shape is the only observable, so this
+# ratchet freezes the bypassing_call and overpromising_row surfaces
+# while the burn-down (wrapper + 87-file repoint + 42-row name audit)
+# runs separately. See scripts/check_uninstrumented_emit_runners.py
+# docstring for the full counting criteria.
+say "uninstrumented-emit phase: detector self-test + source ratchet (#3917)"
+if ! python3 scripts/check_uninstrumented_emit_runners.py --self-test \
+      > "$LOGDIR/${TAG}_emitasan.log" 2>&1; then
+  say "CYCLE FAILURE: check_uninstrumented_emit_runners SELF-TEST failed —"
+  say "  the detector is broken, so its verdict on the tree means nothing."
+  say "  See $LOGDIR/${TAG}_emitasan.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_emitasan.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_uninstrumented_emit_runners.py --strict \
+      >> "$LOGDIR/${TAG}_emitasan.log" 2>&1; then
+  say "CYCLE FAILURE: a test lowers a program with emitObjectFile() without"
+  say "  threading forceSanitizeAddress(), so --full does not instrument"
+  say "  that program's generated code — a \"no UAF\" row there can only"
+  say "  observe a signal death (#3917). See $LOGDIR/${TAG}_emitasan.log"
+  sed -n '/UNINSTRUMENTED-EMIT RUNNERS:/,/See issue #3917/p' \
+    "$LOGDIR/${TAG}_emitasan.log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "uninstrumented-emit phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_emitasan.log"))"
+
 # ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
 # A pointer-typed local bound from a lookup/finder call and then guarded with
 # a bare truthy `if (ptr) { ...EXPECT... }` (braced or brace-less) before any

@@ -439,9 +439,48 @@ def tighten_ceiling(existing, cur):
     return out
 
 
-def write_grandfather(existing, cur):
+def write_grandfather(existing, cur, seeding=False):
     """Persist the tightened ceiling (mirrors check_localdecl_only_walkers.
-    py:488-516)."""
+    py:488-516).
+
+    seeding=True: first-ever --update where no grandfather file exists.
+    Seed the ceiling to match `cur` directly (without the min() that would
+    otherwise collapse every entry to 0). After this seed, every subsequent
+    --update tightens the ceiling monotonically downward via tighten_ceiling().
+    """
+    if seeding:
+        # First-ever seed: copy current counts verbatim. From here on, the
+        # ceiling only falls.
+        new = {p: n for p, n in cur.items() if n > 0}
+        lines = [
+            '# uninstrumented_emit_runners.grandfather - the ceiling for #3917.',
+            '#',
+            '# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling',
+            '# (to min(existing, measured) - a drain becomes the new ceiling on the',
+            '# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a',
+            '# deliberate, reviewed hand-edit to this file. A path whose tightened',
+            '# ceiling reaches 0 is dropped entirely. See tighten_ceiling() in',
+            '# check_uninstrumented_emit_runners.py (same rationale/mechanism as',
+            '# scripts/localdecl_only_walkers.grandfather / scripts/enumerable_grid_',
+            '# spellings.grandfather / scripts/imported_symbol_reads.grandfather,',
+            '# #3590).',
+            '#',
+            '# Seeded on first --update from the measured count (the family',
+            '# already had 99 bypassing call(s) in 87 file(s) at the moment this',
+            '# ratchet shipped). All future --update calls tighten the ceiling to',
+            '# min(existing, measured), never raise it.',
+            '#',
+            '# One row per file: the number of codegen::emitObjectFile( calls with',
+            '# FEWER THAN FOUR arguments (so sanitizeAddress defaults to false at',
+            '# src/codegen/LlvmBackend.hpp:102) in a file that nowhere reads the',
+            '# bezel::test::forceSanitizeAddress() predicate and is not a',
+            '# tests/support/ wrapper that consults it.',
+            '',
+        ]
+        lines += ['%-4d %s' % (n, p) for p, n in sorted(new.items())]
+        GRANDFATHER.write_text('\n'.join(lines) + '\n')
+        return new, [(p, 0, n) for p, n in sorted(new.items())]
+
     new = tighten_ceiling(existing, cur)
     lines = [
         '# uninstrumented_emit_runners.grandfather - the ceiling for #3917.',
@@ -821,19 +860,28 @@ def main():
                  sum(cur_o.values()), len(cur_o)))
         return 0
 
-    # read_baseline() exits 2 when missing - the GATE never wants to run
-    # without a banked baseline. --list and --self-test run before this
-    # line so they don't need a baseline.
-    base_b = read_baseline()
-    base_o = read_overpromising()
-    floor = read_grandfather()
-
-    debt_bad = check_debt_floor(cur_b, floor, debt_by_file)
-    debt_bad += malformed_debt_report([(p, ln)
-                                       for p, (_, mal) in debt_by_file.items()
-                                       for ln in mal])
-
+    # --update creates the baseline if missing (mirrors
+    # check_ambiguous_ran_false.py:1041-1046), then refuses any rise
+    # above the existing baseline. --strict requires a banked baseline
+    # and exits 2 if missing (gate phase expectation).
     if a.update:
+        if not BASELINE.exists():
+            write_baseline(cur_b, cur_o)
+            # Seed grandfather so future --update can tighten it. First
+            # --update on a fresh tree: copy current bypassing counts into
+            # the ceiling verbatim (the family already had these call sites
+            # before this ratchet landed, so the ceiling equals the count).
+            _new, ceiling_seeded = write_grandfather({}, cur_b, seeding=True)
+            print('created baseline: %d bypassing call(s) in %d file(s), '
+                  '%d overpromising row(s) in %d file(s); grandfather '
+                  'seeded in %d file(s)'
+                  % (sum(cur_b.values()), len(cur_b),
+                     sum(cur_o.values()), len(cur_o),
+                     len(ceiling_seeded)))
+            return 0
+        base_b = read_baseline()
+        base_o = read_overpromising()
+        floor = read_grandfather()
         rises_b = [v for v in compare(cur_b, base_b, stale=False) if base_b]
         rises_o = [v for v in compare_overpromising(cur_o, base_o, stale=False)
                    if base_o]
@@ -843,6 +891,10 @@ def main():
                 print('  ' + v)
             print('Use --force if the rise is deliberate, and say why in the commit.')
             return 1
+        debt_bad = check_debt_floor(cur_b, floor, debt_by_file)
+        debt_bad += malformed_debt_report([(p, ln)
+                                           for p, (_, mal) in debt_by_file.items()
+                                           for ln in mal])
         if debt_bad:
             print('REFUSING to update: new bypassing call(s) above the '
                   'grandfathered ceiling need a per-site marker - --force '
@@ -866,6 +918,16 @@ def main():
             for path, old_v, new_v in ceiling_changed:
                 print('  %s: %d -> %d' % (path, old_v, new_v))
         return 0
+
+    # --strict (the gate phase). Baseline MUST exist - fail closed.
+    base_b = read_baseline()
+    base_o = read_overpromising()
+    floor = read_grandfather()
+
+    debt_bad = check_debt_floor(cur_b, floor, debt_by_file)
+    debt_bad += malformed_debt_report([(p, ln)
+                                       for p, (_, mal) in debt_by_file.items()
+                                       for ln in mal])
 
     bad = (compare(cur_b, base_b) + compare_overpromising(cur_o, base_o)
            + debt_bad)
