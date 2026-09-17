@@ -4,9 +4,9 @@
 |---|---|
 | **Status** | under-review — draft |
 | **Tracking issue** | [#1457](https://github.com/s8lap/bezel-lang/issues/1457) |
-| **Target module** | `System.Collections.Linq` (§5; requires `import System.Collections.Linq` — not auto-imported, spec §2.3 auto-imports only System / System.Text, and the spec's own LINQ examples write the import) |
+| **Target module** | `System.Collections.Linq` (§5; **auto-imported since v0.278** — spec §2.3 carries the module row under the invariant *where the stdlib declares an extension over an always-available type, its module is auto-imported*, so no `import System.Collections.Linq` line is needed and the spec's own LINQ examples carry none) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-09-17 to v0.306: the Target-module row's "requires `import System.Collections.Linq` — not auto-imported" claim corrected — §5 has been **auto-imported since v0.278** and the spec now carries zero `import System.Collections.Linq` lines. The addendum's `Take`/`Skip` clamping citations, the §29.11 `ToArray()` re-enumeration remedy, and `TakeLast`/`SkipLast(count: int)`'s parameter name (matching live `Take`/`Skip`) re-verified. No tier-2 flags. Written-against pin unchanged. |
 | **Gap-review item** | #18 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](stdlib-gap-design-plan-2026-07.md) |
 

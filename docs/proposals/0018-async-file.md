@@ -5,6 +5,7 @@
 | **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.IO` (extends stdlib §7.3 `File`) |
 | **Written against** | spec/stdlib **v0.177** |
+| **Currency note** | Re-verified clean at v0.306 (2026-09-17 sweep): §1's transcribed §7.3 `File` surface still matches the landed text member-for-member (including the `:=`-defaulted `token` parameters, so the v0.290 overload-pair rule takes no edit here); `ReadOnlySpan<byte>` is a live type and the #1438 exclusion stands. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
 | **Tracking issue** | [#1447](https://github.com/s8lap/bezel-lang/issues/1447) |
 | **Gap-review item** | #22 (2026-07 ranking, wave D2) |
 | **Design character** | Mechanical — the value of this proposal is **exactness**, not creativity |

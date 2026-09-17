@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1458](https://github.com/s8lap/bezel-lang/issues/1458) |
 | **Target modules** | `System.Text` (§3, auto-imported): new `StringSplitCursor` class; `string` (§9.6): three new `SplitSpans` overloads |
 | **Written against** | spec v0.177 / stdlib v0.165 |
+| **Currency note** | Re-verified clean at v0.306 (2026-09-17 sweep): zero scan hits across all 28 retired-form patterns; `string.AsSpan(r: Range<int>)`, `Range<int>.IsEmpty` (now `pure`, v0.263 — a marker addition, no respell), §29.2's span-enumerator bar and the free §3.5 slot all still hold. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
 | **Gap-review item** | #20 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](stdlib-gap-design-plan-2026-07.md) |
 
