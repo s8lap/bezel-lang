@@ -2,10 +2,10 @@
 //   (BEZEL_TEST event_direct_bogus_1639, subscribe_from_outside_still_accepted).
 //
 // ---------------------------------------------------------------------------
-// (4) §24.3 / #1639: `Subscribe` on a direct event access from OUTSIDE the
+// (4) §24 / #1639: `Subscribe` on a direct event access from OUTSIDE the
 // declaring class remains accepted (the subscribe-only `IEvent<T>` face
 // is in scope everywhere) — the new bogus-member check must not
-// interfere with the pre-existing §24.3 visibility posture.
+// interfere with the pre-existing §24 visibility posture.
 // ---------------------------------------------------------------------------
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.

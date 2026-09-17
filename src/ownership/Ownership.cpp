@@ -3093,7 +3093,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                            dynamic_cast<const ast::CallExpr*>(lc->value.get());
                        sce &&
                        common::isEventSubscribeCall(*sce, ctx_)) {
-                // fix #3694 (§21.1 v0.286 / stdlib §2.11 / §6.5): the §24.1 /
+                // fix #3694 (§21.1 v0.286 / stdlib §2.11 / §6.5): the §24 /
                 // §6.5 `.Subscribe(...)` member on an event face
                 // (`IEvent<T>` / `IAsyncEvent<T>` / `ISharedEvent<T>`), on a
                 // producer-side sealed source (`EventSource<T>` /

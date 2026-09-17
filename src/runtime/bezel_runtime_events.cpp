@@ -37,7 +37,7 @@ extern "C" void* bz_event_source_new(void) {
     return s;
 }
 
-// §24.1 / §22.13 (#477 B6): a STATIC event's backing EventSource is a static
+// §24 / §22.13 (#477 B6): a STATIC event's backing EventSource is a static
 // owned field with PROGRAM-EXIT disposal. Track the static sources in a global
 // list and free them (handlers + struct) via an atexit handler installed once,
 // so the program-exit-disposal obligation is met across every exit path
@@ -135,7 +135,7 @@ extern "C" void* bz_event_handler_at(void* srcp, int64_t idx) {
 // Distinct kinds are never equal (§27.7.1 fourth bullet: "a lambda never
 // equals a method reference"). The identical-wrapper fast path (a == b) serves
 // the store-once pattern for ALL kinds (a stored value compared/removed via the
-// same binding) — load-bearing for §24.4 `-=` matching of a stored lambda or a
+// same binding) — load-bearing for §24 `-=` matching of a stored lambda or a
 // record-receiver named method (which, lacking identity, can only match itself).
 //
 // Layout per bz_closure_release: fn at off 0, env at off 8. The env for a
@@ -179,9 +179,9 @@ extern "C" int32_t bz_closure_value_equals(void* a, void* b) {
 extern "C" void bz_event_remove_closure(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return;
-    // §24.4: -= removes the FIRST matching handler. A handler matches by the
+    // §24: -= removes the FIRST matching handler. A handler matches by the
     // closure wrapper's { fn, env } VALUE, not by wrapper-pointer identity, so
-    // a method-group `-=` removes the corresponding `+=`. // per §24.4 (#1170)
+    // a method-group `-=` removes the corresponding `+=`. // per §24 (#1170)
     for (int64_t i = 0; i < s->count; ++i) {
         if (s->handlers[i].active &&
             bz_closure_same(s->handlers[i].closure, closure)) {
@@ -327,7 +327,7 @@ extern "C" void bz_shared_event_source_free(void* srcp) {
     bz_event_source_free(srcp);
 }
 
-// per §24.5 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
+// per §24 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
 //
 // Problem with the prior implementation (bz_task_await_sync loop inside the
 // raiser's continuation): bz_task_await_sync blocks the OS thread, which is
@@ -344,7 +344,7 @@ extern "C" void bz_shared_event_source_free(void* srcp) {
 //      - already-done  → step is enqueued to the domain (no blocking).
 //      - pending       → step fires when the handler's timer/await completes.
 //   4. bz_raise_chain_step:
-//      - if faulted → fault the outer task (first-error-wins §24.5); done.
+//      - if faulted → fault the outer task (first-error-wins §24); done.
 //      - else       → free completed task, invoke handler[i+1]; repeat.
 //      - if all done → complete the outer task.
 //
@@ -355,7 +355,7 @@ extern "C" void bz_shared_event_source_free(void* srcp) {
 // alloca into a heap buffer (ctx->payload_buf) so subsequent chain steps can
 // read the payload after the originating continuation has returned.
 //
-// §24.6: the subscriber list is unsynchronized — single-domain run-to-
+// §24: the subscriber list is unsynchronized — single-domain run-to-
 // completion serializes all continuation steps within a domain.  count is
 // snapshotted at raise time; bz_event_handler_at is re-read live at each step
 // so handlers deactivated mid-raise are skipped (matching sync Raise, #908).
@@ -392,7 +392,7 @@ static void bz_raise_invoke_next(BzRaiseChainCtx* ctx) {
 static void bz_raise_chain_step(void* completed_task, void* state) {
     auto* ctx = (BzRaiseChainCtx*)state;
     if (bz_task_is_error(completed_task)) {
-        // §24.5 first-error-wins: fault outer, skip remaining handlers.
+        // §24 first-error-wins: fault outer, skip remaining handlers.
         void* errObj = bz_task_error_obj(completed_task);
         bz_task_free(completed_task);
         bz_task_complete_error_obj(ctx->outer, errObj);
@@ -404,7 +404,7 @@ static void bz_raise_chain_step(void* completed_task, void* state) {
     bz_raise_invoke_next(ctx);
 }
 
-// per §24.5 / §30.13 / #1377: non-blocking RaiseAsync entry point.
+// per §24 / §30.13 / #1377: non-blocking RaiseAsync entry point.
 // srcp         — bz_event_source_t* (the AsyncEventSource backing field).
 // payload_buf  — pointer to caller's stack buffer holding a copy of the payload;
 //                null when payload_size == 0 (unit / no-payload event).

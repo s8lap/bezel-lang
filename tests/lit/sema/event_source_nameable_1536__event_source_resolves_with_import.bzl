@@ -5,7 +5,7 @@
 // (1) §2.3 / §6.5 / #1536: `EventSource<T>` names cleanly as a parameter type
 // after `import System.Threading;` — the issue's own repro shape (a
 // helper method on the declaring class taking the in-class producer-side
-// face as a parameter, §24.3).
+// face as a parameter, §24).
 // ---------------------------------------------------------------------------
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.

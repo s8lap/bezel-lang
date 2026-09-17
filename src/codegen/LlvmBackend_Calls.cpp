@@ -231,7 +231,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // bitcast'd `lowerStringLiteral` whose value is a static-rc global,
     // exactly the same shape the nullable-value branch above uses for
     // its `"null"` literal at line 360 (phied into a `ptrTy()` slot
-    // before `emitConsoleWrite`). The §2875 "+1 discharge" rule
+    // before `emitConsoleWrite`). The #2875 "+1 discharge" rule
     // explicitly exempts borrowed statics, so no `releaseRender` flag.
     if (call.args[0].value) {
         const sema::TypeRef* preTy = ctx_.exprType(*call.args[0].value);
@@ -546,7 +546,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             //       `emitRecordToString` / `emitChoiceToString` arms, so the
             //       inline `recordIsAutoBearing` / `isAutoEqualityBearingChoice`
             //       arms become redundant — one renderer, one discharge flag,
-            //       and the inline §3118 block above this `else if` is now
+            //       and the inline #3118 block above this `else if` is now
             //       dead (the rest of the function does not reach it).
             //
             // WHY `emitValueToString` AND NOT A HAND-ROLLED WALK. §8.5's
@@ -5841,12 +5841,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // fix #1881 / §28.3 Unbound owned temporaries / §28.11 "Storing a
             // borrow": a BORROWING collection's Add/Push/Enqueue takes a
             // BORROW — its element parameter carries no `owned` marker — so
-            // the call transfers no ownership. Per §2771's own citation,
+            // the call transfers no ownership. Per #2771's own citation,
             // "Add, Insert, and the indexer-set on a borrowing collection
             // remain governed by §28.3's unbound-temporary admission and
             // §28.11's residual-trust store rule" — this call is admitted
             // (only the COLLECTION-LITERAL form is rejected at the literal
-            // site, §2771), and §28.3 enumerates "a non-owned argument" as
+            // site, #2771), and §28.3 enumerates "a non-owned argument" as
             // one of the borrowing uses an unbound owned temporary may serve
             // before being "disposed at the end of the full expression".
             // Before this fix nothing disposed such an argument here: a
@@ -5863,7 +5863,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // not a fresh producer and stays undisposed here — no UAF of a
             // value some other holder still owns. Disposing the fresh
             // producer here creates exactly the "borrow-lifetime hazard that
-            // checked disposal mode backstops" the spec names at §2771: the
+            // checked disposal mode backstops" the spec names at #2771: the
             // copy just stored in `recv` dangles from this point on,
             // backstopped by DisposedAccessException in checked-disposal
             // mode (undefined behavior, by design, unchecked) — the same

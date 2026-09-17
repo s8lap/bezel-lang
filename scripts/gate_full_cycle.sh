@@ -836,6 +836,80 @@ if [ "$_gs_skipped" -gt "$_gs_skip_cap" ]; then
 fi
 say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
 
+# src/ citation phase (#4455). Build-free: it cross-references the §-citations
+# in src/ against the section headings every document defines, so it sits here
+# beside the gate self-tests rather than in the compile path.
+#
+# A citation is how a reader finds the authority for what the code does
+# (CLAUDE.md, "Comments"). One that resolves nowhere is worse than none: it
+# claims an authority and spends the reader's time disproving it. The first run
+# found 298 sites — 165 citing subsections of a RETIRED §24, 113 issue numbers
+# wearing a section sigil, 20 naming sections no document has.
+#
+# Self-test first, as every other ratchet here does: the checker reads ALL the
+# documents' headings, and a checker that read only the spec's would call every
+# rationale citation dangling — which is exactly what the first measurement did.
+say "src-citation phase: scripts/check_src_citations.py"
+_sc_log="$LOGDIR/${TAG}_src_citations.log"
+if ! python3 scripts/check_src_citations.py --self-test > "$_sc_log" 2>&1; then
+  say "CYCLE FAILURE: check_src_citations SELF-TEST failed — the checker cannot"
+  say "  be trusted to report on the tree. See $_sc_log"
+  tail -20 "$_sc_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_src_citations.py >> "$_sc_log" 2>&1; then
+  say "CYCLE FAILURE: src/ carries §-citations that resolve to no document —"
+  say "  a citation is how a reader finds the authority for the code (#4455)."
+  say "  See $_sc_log"
+  tail -40 "$_sc_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "src-citation phase: GREEN (every §-citation in src/ resolves)"
+
+# Rule-corpus harness phase (tests/conformance/rules). Build-free and fast, so
+# it sits beside the gate self-tests rather than in the conformance phase, which
+# needs a bezelc. Three checks, all fail-closed:
+#   1. the harness's own unit tests — the baseline ratchet decides whether a
+#      corpus run is a pass, so a broken ratchet makes the verdict meaningless,
+#      exactly as #3415 argued for the gate's own tests;
+#   2. `corpus.py check` — manifest.tsv is GENERATED from the case headers, and
+#      a stale one means the runner is running a different corpus than the tree
+#      holds;
+#   3. `corpus.py lint` — the manifest/cases bijection and the case-header
+#      contract.
+# The corpus itself is not run here: it needs a bezelc and a classified
+# baseline (tests/conformance/rules/README.md, "Gate wiring").
+say "rule-corpus phase: tests/conformance/rules harness"
+_rc_log="$LOGDIR/${TAG}_rule_corpus.log"
+# Exact-not-a-ceiling, as the deprecated-JIT-oracle baseline is: the floor is
+# the harness's current test count, so headroom cannot accumulate unbanked. It
+# only ever moves up — a lane that deletes a test lowers it deliberately.
+_rc_floor=150
+if ! python3 -m unittest discover -s tests/conformance/rules -v \
+      > "$_rc_log" 2>&1; then
+  say "CYCLE FAILURE: the rule-corpus harness self-tests failed — the ratchet"
+  say "  that decides whether a corpus run passed is itself broken."
+  say "  See $_rc_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_rc_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_rc_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_rc_log" | tail -1)"
+if [ -z "$_rc_ran" ] || [ "$_rc_ran" -lt "$_rc_floor" ]; then
+  say "CYCLE FAILURE: the rule-corpus self-tests reported OK but ran only"
+  say "  ${_rc_ran:-0} tests (floor $_rc_floor) — discovery collected almost"
+  say "  nothing, so the OK certifies nothing. See $_rc_log"
+  exit 1
+fi
+if ! python3 tests/conformance/rules/corpus.py check >> "$_rc_log" 2>&1; then
+  say "CYCLE FAILURE: tests/conformance/rules/manifest.tsv is stale or the"
+  say "  corpus does not lint — run 'python3 tests/conformance/rules/corpus.py"
+  say "  build'. See $_rc_log"
+  tail -20 "$_rc_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "rule-corpus phase: GREEN ($_rc_ran harness tests, manifest current)"
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded

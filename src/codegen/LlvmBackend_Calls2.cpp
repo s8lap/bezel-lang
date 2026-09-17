@@ -1637,7 +1637,7 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         // only dispatching the destructor (which leaks the block). The slot itself
         // is the pre-declared local's — already created by its LocalDecl; we only
         // record ownership here.
-        // §1466 fix: since v0.160 (§A.4) the parser never re-emits the literal
+        // #1466 fix: since v0.160 (§A.4) the parser never re-emits the literal
         // "out owned" modifier for a call-site argument — bare `out owned x` was
         // replaced by the inline `out owned var x` form — so the literal-string
         // arm alone is unreachable for a pre-declared recipient. The form that
@@ -3590,7 +3590,7 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // codebase already uses to gate a NEW diagnostic away from that dead
         // pass — the closest sibling precedent is a few thousand lines above
         // in this same file (the `ToString`/`Equals`/`GetHashCode`-on-
-        // unconstrained-`T` §8.1/§2465 gate, "FALSE-REJECT ANALYSIS", which
+        // unconstrained-`T` §8.1/#2465 gate, "FALSE-REJECT ANALYSIS", which
         // excludes the identical dead-template corpus hit by the same
         // mechanism) and #2477 (`new T()` in the dead abstract body). In the
         // dead template pass this decline still bare-returns null exactly as
@@ -3706,19 +3706,19 @@ const sema::EventSymbol* Emitter::eventSymbolOf(const ast::Expr& e) {
     return dynamic_cast<const sema::EventSymbol*>(ctx_.exprSymbol(e));
 }
 
-// per §24.1: load the backing EventSource<T> pointer for an event access.
+// per §24: load the backing EventSource<T> pointer for an event access.
 llvm::Value* Emitter::eventSourcePtr(const ast::Expr& e) {
     const sema::EventSymbol* es = eventSymbolOf(e);
     if (!es || !es->parent) return nullptr;
 
-    // §24.1 / §22.13 (#477 B6): a STATIC event has no per-instance slot — its
+    // §24 / §22.13 (#477 B6): a STATIC event has no per-instance slot — its
     // backing EventSource<T> is a program-wide global, allocated in Main's
     // prologue. Load it directly (no receiver).
     if (auto sit = staticEventGlobals_.find(es);
         sit != staticEventGlobals_.end())
         return builder_.CreateLoad(ptrTy(), sit->second, "static.event.src");
 
-    // §24.3 / §24.7 (#477 B7): the event was resolved on an INTERFACE that
+    // §24 (#477 B7): the event was resolved on an INTERFACE that
     // declares it (`i.Ready` where `i: ISource`). The interface has no backing
     // field — the EventSource<T> lives in the implementing OBJECT's struct, at
     // a class-specific offset unknown statically through the interface. Dispatch
@@ -3771,7 +3771,7 @@ llvm::Value* Emitter::eventSourcePtr(const ast::Expr& e) {
     return builder_.CreateLoad(ptrTy(), slot, "event.src");
 }
 
-// per §24.1 / §24.3: the resolved payload type of an event member (the `: T`
+// per §24: the resolved payload type of an event member (the `: T`
 // annotation), or null when the event has no payload (unit `()` form).
 const sema::TypeRef* Emitter::eventPayloadType(const sema::EventSymbol* es) {
     if (!es) return nullptr;
@@ -3794,13 +3794,13 @@ const sema::TypeRef* Emitter::eventPayloadType(const sema::EventSymbol* es) {
     return rt;
 }
 
-// per §24.5: invoke every active handler closure with `payloadLL` (the lowered
+// per §24: invoke every active handler closure with `payloadLL` (the lowered
 // payload value, or null for the no-payload unit form). Each handler is a
 // Bezel closure { fn_ptr, env_ptr }; the call convention is
 // (env_ptr, payload?) -> void. Handlers run in subscription order; with zero
-// subscribers this is a no-op (no null check at the call site, per §24.5).
+// subscribers this is a no-op (no null check at the call site, per §24).
 //
-// §24.5 (#747 R42): "if a handler throws, subsequent handlers are not invoked
+// §24 (#747 R42): "if a handler throws, subsequent handlers are not invoked
 // and the exception propagates." Bezel propagates exceptions through the global
 // exception slot (emitExcSlot), not LLVM unwind edges, so a plain closure call
 // does not stop the loop on its own — the slot must be tested after each
@@ -3840,7 +3840,7 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* iv = builder_.CreateLoad(i64(), iSlot);
     llvm::Value* closure = builder_.CreateCall(atFn, {srcPtr, iv}, "event.h");
-    // §24.5 (#908): a handler deactivated MID-RAISE — e.g. another handler in this
+    // §24 (#908): a handler deactivated MID-RAISE — e.g. another handler in this
     // same Raise disposed this subscription — leaves a null slot;
     // bz_event_handler_at returns null for it. Loading the function pointer from
     // null would SIGSEGV, so skip a null handler and continue the iteration.
@@ -3857,7 +3857,7 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     callArgs.push_back(envPtr);
     if (payloadLL) callArgs.push_back(payloadLL);
     builder_.CreateCall(handlerFnTy, fnPtr, callArgs);
-    // §24.5: stop on a throwing handler — break the loop if the handler set the
+    // §24: stop on a throwing handler — break the loop if the handler set the
     // global exception slot; the exception stays pending and propagates.
     llvm::Value* pend =
         builder_.CreateLoad(ptrTy(), emitExcSlot(), "raise.exc");
@@ -3872,7 +3872,7 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     builder_.SetInsertPoint(endBB);
 }
 
-// per §24.5 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
+// per §24 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
 //
 // Prior approach (blocked domain thread via bz_task_await_sync): if any handler
 // genuinely suspends (e.g. awaits Task.Delay), the domain drain thread parks in
@@ -3882,7 +3882,7 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
 // New approach: delegate the entire chain to bz_event_raise_async_chain (runtime
 // helper, bezel_runtime.cpp).  The helper invokes handler[0] non-blockingly,
 // registers bz_raise_chain_step via bz_task_then, and returns the outer Task
-// immediately.  Each step: check fault (first-error-wins §24.5), free completed
+// immediately.  Each step: check fault (first-error-wins §24), free completed
 // task, invoke next handler, repeat.  No domain thread is ever blocked.
 //
 // Payload ABI: the payload type is arbitrary (ptr for class/string, struct for
@@ -3970,7 +3970,7 @@ llvm::Value* Emitter::emitAsyncEventRaise(llvm::Value* srcPtr,
 
     // 3. Call the runtime chain helper.
     //    bz_event_raise_async_chain(src, payload_buf, payload_size, shim) → Task*
-    //    per §24.5 / §30.13 / #1377 (bezel_runtime.cpp).
+    //    per §24 / §30.13 / #1377 (bezel_runtime.cpp).
     auto* chainFn = declareC("bz_event_raise_async_chain",
                               ptrTy(),
                               {ptrTy(), ptrTy(), i64(), ptrTy()});
@@ -3989,7 +3989,7 @@ bool Emitter::isIEventTypeName(const sema::TypeRef* rt) {
     return n == "IEvent" || n == "IAsyncEvent";
 }
 
-// §6.5 / §24.3 (#1610): the producer-side event-source classes. Like
+// §6.5 / §24 (#1610): the producer-side event-source classes. Like
 // isIEventTypeName, a NULL-declaration Named TypeRef whose astNode first name
 // part is "EventSource" / "AsyncEventSource". A value of this static type held
 // in a local/parameter/field is the same bz_event_source_t* a direct event
@@ -4043,7 +4043,7 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
         p.type = const_cast<sema::TypeRef*>(payload);
         handlerTy.funcParams.push_back(p);
     }
-    // §24.3: a handler returns unit. Set funcReturn so lowerLambda resolves a
+    // §24: a handler returns unit. Set funcReturn so lowerLambda resolves a
     // block-bodied handler's return type to void — without this it defaulted to
     // i32, defining the handler as i32(...) while the Raise loop calls it through
     // a void(...) function pointer (an indirect-call type mismatch).
@@ -4058,7 +4058,7 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
 
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    // fix #3225 (§24.3 / §24.5 / §2.5, v0.254): the §24 raise-syntax BARE-CALL
+    // fix #3225 (§24 / §2.5, v0.254): the §24 raise-syntax BARE-CALL
     // form `Ev(payload)` — the shorthand for `this.Ev.Raise(payload)` inside
     // the declaring class — parses as a CallExpr whose callee is a bare
     // IdentifierExpr pointing to the EventSymbol, with no MemberAccessExpr
@@ -4066,12 +4066,12 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     // `.Subscribe`/`.Raise`/etc. member-access callee shape; the bare form
     // fell through to ordinary dispatch, where the EventSymbol callee had no
     // matching arm and the whole Raise was silently dropped (subscribed
-    // handler never fired). Per §24.3, the bare-call form is shorthand for
+    // handler never fired). Per §24, the bare-call form is shorthand for
     // `this.Ev.Raise(payload)` — ALWAYS Raise (or RaiseAsync for an `async
     // event`), with the implicit `this` as the receiver. eventSourcePtr's
     // IdentifierExpr arm already loads the receiver as `currentThis_`, so
     // reusing it gets the correct backing EventSource<T> pointer for the
-    // direct class event (the §24.1 backing-field load on the implicit-this
+    // direct class event (the §24 backing-field load on the implicit-this
     // receiver). Only the DIRECT local-event form needs this interception;
     // an imported event goes through the MemberAccessExpr path (the
     // ModuleLoader-reconstructed EventSymbol has no ast::EventDecl and is
@@ -4084,7 +4084,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
                 if (dynamic_cast<const ast::EventDecl*>(bareEs->decl)) {
                     llvm::Value* src = eventSourcePtr(*idCallee);
                     if (!src) return std::nullopt;
-                    // §24.5: gate payload lowering on the event's payload TYPE,
+                    // §24: gate payload lowering on the event's payload TYPE,
                     // not on the call args being non-empty (mirrors the
                     // isRaise/isRaiseAsync block in dispatchEventMethods above —
                     // `Raise()` and `Raise(())` are equivalent and must dispatch
@@ -4103,7 +4103,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
                     if (auto* ed = dynamic_cast<const ast::EventDecl*>(
                             bareEs->decl)) {
                         if (ed->isAsync) {
-                            // §24.5 / §30: RaiseAsync returns a Task* (awaited
+                            // §24 / §30: RaiseAsync returns a Task* (awaited
                             // by the caller). emitAsyncEventRaise calls each
                             // handler, awaits each synchronously, and returns
                             // an already-done Task carrying either success or
@@ -4122,7 +4122,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     }
     if (!ma->target) return std::nullopt;
 
-    // §24.3 / §24.5: dispatch a recognized event method (Subscribe/Add/Remove/
+    // §24: dispatch a recognized event method (Subscribe/Add/Remove/
     // Raise/RaiseAsync) against a bz_event_source_t* (`src`) whose payload type
     // is `payload`. Shared by the direct-event-access path (src from
     // eventSourcePtr, payload from eventPayloadType) and the
@@ -4143,7 +4143,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         if (!isSubscribe && !isAdd && !isRemove && !isRaise && !isRaiseAsync)
             return std::nullopt;  // not an event method — ordinary dispatch
         if (isSubscribe || isAdd || isRemove) {
-            // per §24.3 / stdlib §6.5: the handler argument is a function value
+            // per §24 / stdlib §6.5: the handler argument is a function value
             // (lambda or method reference) lowered to a closure { fn, env } with
             // the synthesized `(payload) -> ()` expected type (shared helper).
             llvm::Value* closure =
@@ -4184,7 +4184,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             return std::optional<llvm::Value*>(nullptr);  // Remove returns unit
         }
 
-        // isRaise / isRaiseAsync — per §24.5: invoke each subscribed handler
+        // isRaise / isRaiseAsync — per §24: invoke each subscribed handler
         // with the payload.
         // #737: gate payload lowering on the event's payload TYPE, not on the
         // call args being non-empty. For a no-payload event the explicit
@@ -4192,7 +4192,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         // but lowerExpr has no case for a UnitExpr and returns null, so the old
         // `!call.args.empty` check then bailed BEFORE emitEventRaise and
         // silently dropped the entire dispatch (the Subscribe side already
-        // builds a `void(env)` handler for unit events). §24.5: `Raise()` and
+        // builds a `void(env)` handler for unit events). §24: `Raise()` and
         // `Raise(())` are equivalent and must dispatch identically.
         const bool hasPayload =
             payload && payload->kind != sema::TypeRef::Kind::Unit;
@@ -4204,7 +4204,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             payloadTy = payloadLL->getType();
         }
         if (isRaiseAsync) {
-            // §24.5 / §30: RaiseAsync returns a Task* (awaited by the caller).
+            // §24 / §30: RaiseAsync returns a Task* (awaited by the caller).
             // emitAsyncEventRaise calls each handler (which returns Task*),
             // awaits each synchronously via bz_task_await_sync in order, and
             // returns an already-done Task carrying either success or the first
@@ -4242,12 +4242,12 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     // es == null: the target is not a direct event access. Its static type
     // determines the dispatch.
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
-    // §24.3 (#747): `.Subscribe` on a STORED IEvent<T>/IAsyncEvent<T> value
+    // §24 (#747): `.Subscribe` on a STORED IEvent<T>/IAsyncEvent<T> value
     // (`var ev := s.Happened; ev.Subscribe(h)`). IEvent<T> has no itable, but
     // its runtime value IS the bz_event_source_t* (via the event-as-value
     // read), so dispatch directly to bz_event_subscribe. The payload is the
     // receiver type's genericArgs[0] (the upcast type, variance-safe per §12.9).
-    // Add/Remove/Raise are NOT on the IEvent<T> interface (§24.3) and stay
+    // Add/Remove/Raise are NOT on the IEvent<T> interface (§24) and stay
     // rejected (no IEvent member-dispatch block admits them).
     if (ma->member == "Subscribe" && call.args.size() == 1 &&
         call.args[0].value && isIEventTypeName(recvTy)) {
@@ -4279,7 +4279,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         return std::optional<llvm::Value*>(
             builder_.CreateCall(subFn, {src, closure}, "subscription"));
     }
-    // §6.5 / §24.3 (#1610): a value held in a local/param/field of static type
+    // §6.5 / §24 (#1610): a value held in a local/param/field of static type
     // EventSource<T>/AsyncEventSource<T>. Its runtime value is the same
     // bz_event_source_t* a direct event access yields (via the event-as-value
     // read), so Raise/Add/Remove/Subscribe/RaiseAsync dispatch identically.
@@ -4296,7 +4296,7 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
 }
 
 
-// per §2.11 / §24.4: the built-in `Subscription` resolves (TypeResolution_Names)
+// per §2.11 / §24: the built-in `Subscription` resolves (TypeResolution_Names)
 // to a Named TypeRef with a null user declaration whose first name part is
 // "Subscription". Same shape as the collection/StringBuilder built-in checks.
 bool Emitter::isSubscriptionType(const sema::TypeRef* rt) {
@@ -5395,7 +5395,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // "nothing lowered this" from a nullptr that also means "lowered, unit".
     // See that site for what it is spent on.
     const IrFootprint dispatchEntry = irFootprint();
-    // per §24.3/§24.5: event method calls — `<event>.Subscribe(h)` (returns an
+    // per §24: event method calls — `<event>.Subscribe(h)` (returns an
     // owned Subscription), `.Add`/`.Remove` (the += / -= desugaring targets),
     // and `.Raise(payload)` / `.Raise()`. Checked first so the event member
     // access does not fall through to ordinary (no-such-method) dispatch.
@@ -9500,7 +9500,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
-                // per §2.11 / §24.4: disposing a Subscription removes the
+                // per §2.11 / §24: disposing a Subscription removes the
                 // handler from its event source. A Subscription is the value
                 // produced by `<event>.Subscribe(...)`; a local bound to such a
                 // call (`var sub := …Subscribe(…)`) carries no resolved type,
@@ -10460,7 +10460,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // receiver is a value type (record/enum/primitive), box it into a heap
         // Object reference (the standard §8.6 boxing path) so the extension's
         // `this: Object` argument matches the callee's `ptr` `this` parameter
-        // and the §484 non-pointer guard does not silently drop the call.
+        // and the #484 non-pointer guard does not silently drop the call.
         if (isExtensionMethod(ms)) {
             bool byPtr = false;
             llvm::Type* thisTy = extensionThisType(ms, &byPtr);
@@ -10472,7 +10472,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // Object is a Primitive TypeRef rather than a Named Class decl). The
             // existing if-block below only fires for byPointer=true (Class/Record
             // targets); Object/Interface-Primitive targets would otherwise pass a
-            // raw struct where ptrTy() is expected — the §484 guard then returns
+            // raw struct where ptrTy() is expected — the #484 guard then returns
             // nullptr and the call silently becomes `ret i32 0`.
             bool targetIsObject = extTgt &&
                 extTgt->kind == sema::TypeRef::Kind::Primitive &&
@@ -10559,7 +10559,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // (`Result.IsOk`) receives `this` as a pointer to a spilled copy — the
         // same convention as a record (its body's `case this of …` loads the
         // struct through that pointer). Spill a value-form choice receiver the
-        // identical way, so `emitMethodCall`'s §484 non-pointer-`this` guard does
+        // identical way, so `emitMethodCall`'s #484 non-pointer-`this` guard does
         // not silently drop the call (which returned 0 before this fix).
         if (ms->parent &&
             (ms->parent->kind == ast::TypeDeclKind::Record ||
@@ -12325,7 +12325,7 @@ bool Emitter::computeAncestorGenericSubst(
         // cannot pin it without an active substitution). Without this
         // guard the relaxed seed would install `T → bare T ref`, then
         // `lowerTypeRef` would happily produce the i32 ERASED PLACEHOLDER
-        // and we would silently regress the §2759-style "template
+        // and we would silently regress the #2759-style "template
         // substituted with placeholder" bug. Concreteness means: not a
         // bare generic-parameter reference (Named with no declaration +
         // single-part name / importedName).
@@ -13893,7 +13893,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncChainedReturn_ = false;
     asyncBorrowedReturn_ = false;
     // fix #4173 (§28.3 / §30.1, v0.298): pendingOwnedParams_ / pendingArgsDisposal_
-    // are the same §2731-item-3 ROOT-SCOPE REGISTRATION channels NestedBodyScope
+    // are the same #2731-item-3 ROOT-SCOPE REGISTRATION channels NestedBodyScope
     // already saves/clears/restores by name for the OTHER nested-emission venues
     // (property/choice-method getter/setter bodies — see that ctor/dtor pair,
     // LlvmBackend_Assign.cpp ~5140/~5158/~5200, and its own comment's "REACHED by
@@ -14523,7 +14523,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
     // fix #628 (phase a) / §9.5 / §14.2: for EXPRESSION-body generic record
-    // instance methods (`this with … end`), lowerWith's §575 reverse-lookup
+    // instance methods (`this with … end`), lowerWith's #575 reverse-lookup
     // uses `currentFn_` to find the parent record TypeSymbol.  But
     // emitInlineGenericMethod does NOT change currentFn_ (the inlining happens
     // inside the CALLER's function), so the lookup finds the caller's function
@@ -14824,7 +14824,7 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             // `emitVtablelessBuiltinRelease` actually knows a release (a
             // BOUNDED LEAK for the ~29-name "classified but unknown" gap
             // documented at `vtablelessBuiltinReleaseIsKnown`'s declaration,
-            // §2874/§2823's leak-over-wild-jump trade) rather than falling
+            // #2874/#2823's leak-over-wild-jump trade) rather than falling
             // through to the same wild-jump general path #4209's
             // success-gate did for that population — closing that gap too.
             // Guaranteed non-null here (inside `doBB`), so

@@ -311,7 +311,7 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             // internally synchronized (compiler-known set: Mutex, Atomic<T>,
             // AtomicInteger<T>, Semaphore — per spec §28.13 sendability rule).
             // Shared<string>/Shared<UserClass>/etc. remain domain-local.
-            // Prerequisite: the control block counts are now atomic (§689 stage 1).
+            // Prerequisite: the control block counts are now atomic (#689 stage 1).
             if (bname == "Shared") {
                 if (rt->genericArgs.empty() || !rt->genericArgs[0])
                     return false;

@@ -416,7 +416,7 @@ std::size_t positionalCtorArityOfBuiltinRecord(std::string_view n);
 bool isVtableLessBuiltinClassName(std::string_view n);
 
 // fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): is `n` one of the reserved
-// built-in INTERFACE heads? Exposed as its own predicate so the §2969 fix
+// built-in INTERFACE heads? Exposed as its own predicate so the #2969 fix
 // (codegen-side routing of an interface-head-typed interpolation hole through
 // the vtable-less built-in renderer when the AST source statically determines
 // the value is a built-in collection) does not have to re-list the

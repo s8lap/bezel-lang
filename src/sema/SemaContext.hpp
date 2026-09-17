@@ -1269,7 +1269,7 @@ inline ParameterSymbol* buildBuiltinInterfaceParamSymbol(
     // builtin interfaces' parameters carry no spec-side modifier, so the
     // value is empty; the assignment closes the seam gap.
     ps->modifier = param.modifier;
-    // per §22.4/§1585 (v0.268, #3313) — populate the `when true`/`when
+    // per §22.4/#1585 (v0.268, #3313) — populate the `when true`/`when
     // false` out-nullability postcondition from the synthesized
     // ast::Param so the caller-side narrowing (narrowFromOutPostcond)
     // sees the same postcondition path #1 (~line 1216) writes. Today
@@ -1305,7 +1305,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             const char* pname;
             const char* type;
             const char* mod;
-            // §22.4/§1585 (stdlib §1): a shape-(a) Try out-parameter's
+            // §22.4/#1585 (stdlib §1): a shape-(a) Try out-parameter's
             // `when true` nullability postcondition, or None when absent.
             ast::OutNullWhen postcond = ast::OutNullWhen::None;
         };
@@ -1432,7 +1432,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                     ast::Param p;
                     p.name = sp.pname;
                     p.modifier = sp.mod;
-                    p.outNullPostcond = sp.postcond;  // §22.4/§1585
+                    p.outNullPostcond = sp.postcond;  // §22.4/#1585
                     p.type = makeTypeNode(sp.type);
                     preResolve(p.type.get());
                     rm.paramTypes.push_back(p.type.get());
@@ -1475,7 +1475,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                 auto* ps = makeSymbol<ParameterSymbol>();
                 ps->name = sm.params[p].pname;
                 ps->modifier = sm.params[p].mod;
-                // §22.4/§1585 (stdlib §1): carry the out-nullability
+                // §22.4/#1585 (stdlib §1): carry the out-nullability
                 // postcondition onto the symbol the caller-side narrowing
                 // (narrowFromOutPostcond) reads for the `T.TryParse` bridge.
                 ps->outNullPostcond = sm.params[p].postcond;

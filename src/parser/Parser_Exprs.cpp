@@ -1512,7 +1512,7 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
     // operand. §19.3 (v0.167, #1371): the operand parses at the Shift level or
     // tighter (parseBinaryExpression(12)) — below `|` — so a trailing `|` is the
     // alternative separator, not bitwise-or absorbed into the operand. A
-    // bitwise operand must be parenthesized (§17.1.1).
+    // bitwise operand must be parenthesized (§17.2).
     if (isPunctuator("<") || isPunctuator(">") ||
         isPunctuator("<=") || isPunctuator(">=")) {
         auto rop = std::make_unique<ast::RelOpPattern>();
@@ -1603,7 +1603,7 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
     // its Shift-level bounds/value (12+) are tighter than `|` (bitwise-or, 8),
     // so a `|` at pattern level is left for the alternative separator, never
     // absorbed as bitwise-or. A bitwise-or *value* pattern must be
-    // parenthesized (`(A | B)`), per the §17.1.1 mandatory-parenthesization
+    // parenthesized (`(A | B)`), per the §17.2 mandatory-parenthesization
     // discipline. A RangeExpr at the root is a RangePattern (slice 52);
     // otherwise the expression is a single ConstantPattern member (the
     // parsePattern wrapper collects any `|`-joined alternatives).

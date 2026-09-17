@@ -4,7 +4,7 @@
 //   (BEZEL_TEST static_event_capture_free_1542, add_capturing_local_rejected_22_12_5).
 //
 // §22.12 rule 5: `<StaticEvent>.Add(handler)` (inside the declaring class,
-// where Add is on the EventSource<T> face, §24.3) with a capturing handler
+// where Add is on the EventSource<T> face, §24) with a capturing handler
 // → rejected the same way as Subscribe.
 
 module M; record Ev(N: int); class Bus public static event Ticked: Ev; public static method Hook(offset: int) Ticked.Add(lambda(e) => do offset := offset + e.N; end); end Hook; end Bus;

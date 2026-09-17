@@ -1712,7 +1712,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): CompareTo(other,
     // ignoreCase: bool): int — ordinal comparison, optionally ASCII
     // case-folded. `other` is non-nullable (checkBuiltinStringCallArgs'
-    // §2315 gate covers this position for both CompareTo arities, so a
+    // #2315 gate covers this position for both CompareTo arities, so a
     // well-typed call's `other` is guaranteed non-null here — the same
     // premise the 1-arg arm above rests on for emitStringOrdCmp). Routed
     // through the runtime helper `bz_string_compare` — the same one the
@@ -2858,7 +2858,7 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 // source `src` narrows the runtime value to a vtable-less built-in class.
 //
 // WHY THIS EXISTS (and is not just a call into emitVtablelessBuiltinToString).
-// §2923's fix gates on the STATIC type being a vtable-less built-in CLASS —
+// #2923's fix gates on the STATIC type being a vtable-less built-in CLASS —
 // it deliberately excluded interface heads from the discriminator, because an
 // interface slot may LEGITIMATELY hold a user class declaring that interface
 // (`class MyE: IEnumerable<int>`, `var e: IEnumerable<int> := new MyE();
@@ -2866,13 +2866,13 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 // through `emitVtablelessBuiltinToString` statically would (a) render
 // "IEnumerable" instead of "MyE" for a user class — wrong per §8.5 — and (b)
 // stop disposing user-class instances through vtable[kDisposeSlot], which
-// §2975 has only just made safe.
+// #2975 has only just made safe.
 //
 // But for the COMMON shaping of an interface-head-typed local — the
 // initializer is a known constructor of a built-in collection, e.g.
 // `var e: IList<int> := new Array<int>(2);` (a direct NewExpr) or
 // `var e: IList<int> := a;` where `a: Array<int>` (an IdentifierExpr whose
-// sema type is the built-in class) — the §2923 premise DOES hold on the
+// sema type is the built-in class) — the #2923 premise DOES hold on the
 // runtime value. The renderer just needs the runtime TYPE, which the
 // initializer's static type already names.
 //
@@ -2886,7 +2886,7 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 //     `IList<int>`.
 //   * A NON-`IdentifierExpr` shape (a member access on an object, a method
 //     call returning the interface head, a generic instantiation through a
-//     type parameter) returns nullptr — the §2923 dynamic path remains in
+//     type parameter) returns nullptr — the #2923 dynamic path remains in
 //     force, which is correct for the user-class arm and DEFERS the
 //     unanalysed built-in case to a future design decision per #2969.
 //
@@ -2894,8 +2894,8 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 // the user-class arm keeps its correct vtable dispatch. It does not change
 // `bz_obj_is_string`, so the interface-head -> vtable path remains available.
 // The receiver retains NOTHING — the returned string is a `lowerStringLiteral`
-// constant with a SENTINEL rc, the same discharge shape §2923 already relies
-// on. And the §2975 disposal fix (interface slot holding a raw user-class
+// constant with a SENTINEL rc, the same discharge shape #2923 already relies
+// on. And the #2975 disposal fix (interface slot holding a raw user-class
 // instance routes to the class disposal) is untouched — its predicate is
 // `iterFormatWrappedDecls_`, never reaches the BuiltinInterfaceHead path here.
 //
@@ -2955,7 +2955,7 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
         frt->kind == sema::TypeRef::Kind::Primitive &&
         frt->primitive == sema::PrimitiveType::Object;
     if (!isObjectSlot) {
-        // §2923 deliberately excluded interface heads from the vtable-less
+        // #2923 deliberately excluded interface heads from the vtable-less
         // discriminator; the interface slot may hold a user class. We are the
         // OTHER arm of the exclusion — we only fire when the AST source
         // statically narrows the runtime value to a built-in class.
@@ -2965,7 +2965,7 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
         if (bn.empty() || !common::isBuiltinInterfaceHead(bn)) return nullptr;
     }
     if (!src) return nullptr;
-    // §2923's `common::isVtableLessBuiltinClassName` test asks whether the
+    // #2923's `common::isVtableLessBuiltinClassName` test asks whether the
     // RUNTIME TYPE carries no Bezel vtable at word 0 — i.e. is one of the
     // built-in classes whose runtime value is a plain C struct
     // (`bz_array_t*`, `bz_dict_t*`, `bz_mutex_t*`, …). Same predicate, same
@@ -2976,8 +2976,8 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
         if (n.empty()) return false;
         return common::isVtableLessBuiltinClassName(n);
     };
-    // Only the IdentifierExpr shape is admitted here — the §2975 prior art
-    // shows the precise AST-and-sema walk this fix mirrors (the §2975
+    // Only the IdentifierExpr shape is admitted here — the #2975 prior art
+    // shows the precise AST-and-sema walk this fix mirrors (the #2975
     // `rawUserClassInBuiltinInterfaceSlot` reads the same `ld->initializer`
     // source type for the disposal-side decision). A method-call or
     // member-access source would need a wider analysis and is left for a
@@ -3002,7 +3002,7 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
     // fix #3127 (§8.6 / §8.5): `Range<T>` IS in `kNonHeapReservedBuiltins`
     // (so `isVtableLessBuiltinClassName` answers true), but #3127 gave it a
     // real Bezel vtable (Range is now boxable per §8.6, dispatch through
-    // vtable[kToStringSlot]). The §2968 #2923 helper bypasses the dispatch —
+    // vtable[kToStringSlot]). The #2968 #2923 helper bypasses the dispatch —
     // it would return the literal type name "Range" — exactly the wrong
     // rendering #3127 exists to fix. Decline the helper for any Range
     // initializer so the interp falls through to lowerObjectToString →

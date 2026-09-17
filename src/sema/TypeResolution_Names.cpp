@@ -238,13 +238,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "ISharedEvent" || n == "SharedEventSource" ||
         // stdlib §6.5 / spec §2.3 (fix #1536): EventSource<T> / AsyncEventSource<T>
         // — the producer-side (in-declaring-class) face of an event member
-        // (§24.3). Per §2.3, `IEvent<T>`/`IAsyncEvent<T>` are auto-imported (they
+        // (§24). Per §2.3, `IEvent<T>`/`IAsyncEvent<T>` are auto-imported (they
         // are the public type of every event member) but `EventSource<T>` /
         // `AsyncEventSource<T>` require `import System.Threading`, like
         // `CancellationTokenSource` / `Mutex` and the rest of that module.
         // Before this fix neither name was registered at all, so a helper
         // method whose parameter type names the in-class face (spec-legal per
-        // §24.3) could not be written. Same import-gating stance as
+        // §24) could not be written. Same import-gating stance as
         // CancellationTokenSource/TaskScope above: not yet enforced. Arity 1
         // (single payload-type parameter); declaration stays null (no user
         // TypeDecl) — same representation as Channel<T> below.
@@ -1725,7 +1725,7 @@ void Resolver::checkOutNullPostcond(const std::vector<ast::Param>& params,
     }
 }
 
-// fix #3619 (§17.14 / §3619, v0.286): the ONE Resolver-side identifier
+// fix #3619 (§17.14 / #3619, v0.286): the ONE Resolver-side identifier
 // resolver for a compile-time integer constant — see the declaration in
 // TypeResolution_impl.hpp. A bare name is a `const` whose initializer is
 // itself an int-const expression. Member consts live on the enclosing type
@@ -2384,7 +2384,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (!hashRole.empty() && !ref.genericArgs.empty())
                     hashContainerSites_.push_back(
                         {first, hashRole, ref.genericArgs[0], &t,
-                         currentOuterType_});  // §1384: for per-instantiation check
+                         currentOuterType_});  // #1384: for per-instantiation check
                 // §28.11 / §15.3 (#3775): record every element-category slot
                 // the move-only row covers so checkElementCategoryInstantiations
                 // can reject it — after all member types are resolved, exactly

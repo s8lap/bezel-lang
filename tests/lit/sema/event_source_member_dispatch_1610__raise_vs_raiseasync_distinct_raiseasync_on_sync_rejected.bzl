@@ -13,4 +13,4 @@
 
 module Probe; import System.Threading; class Ev public N: int := 0; public constructor(n: int) N := n; end constructor; end Ev; public class Counter public event Ticked: Ev; public method Fire(es: EventSource<Ev>) es.RaiseAsync(new Ev(1)); end Fire; end Counter;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `RaiseAsync` on `EventSource<T>`; documented surface: Subscribe(handler), Raise(payload), Add(handler), Remove(handler) (stdlib §6.5 / §24.3)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `RaiseAsync` on `EventSource<T>`; documented surface: Subscribe(handler), Raise(payload), Add(handler), Remove(handler) (stdlib §6.5 / §24)

@@ -1,7 +1,7 @@
 // Ported from tests/sema/event_visibility_test.cpp
 //   (BEZEL_TEST sema_event_vis_24_3, subscribe_inside_declaring_class_ok).
 //
-// §24.4: Subscribe from inside the declaring class is also fine.
+// §24: Subscribe from inside the declaring class is also fine.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //

@@ -7,7 +7,7 @@
 //   - stdlib §5 ("GroupBy"): `GroupBy<TKey>(key: (T) -> TKey): IEnumerable<
 //     IGrouping<TKey, T>>` and `public interface IGrouping<TKey, T>:
 //     IEnumerable<T>` — a helper method that takes or returns an IGrouping
-//     is spec-legal (and is exactly the §24.3 sibling of fix #1536 for
+//     is spec-legal (and is exactly the §24 sibling of fix #1536 for
 //     EventSource<T>).
 //
 // RUN: %bezelc -c -o %t.o %s

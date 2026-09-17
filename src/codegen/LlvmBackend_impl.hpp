@@ -1301,7 +1301,7 @@ private:
     // iterates in INSERTION ORDER (the order in which the per-method fn was
     // registered), which is AST-walk order and therefore reproducible.
     llvm::MapVector<sema::MethodSymbol*, llvm::Function*> methodFns_;
-    // #1170 / §24.4: cached method-reference thunk per method symbol. A named
+    // #1170 / §24: cached method-reference thunk per method symbol. A named
     // method reference (`event += OnTick`) must resolve to a STABLE function
     // pointer so `event -= OnTick` removes the subscribed handler by value
     // (fn + receiver) — see bz_event_remove_closure. Without caching, each
@@ -1911,7 +1911,7 @@ private:
         //   4. bz_tcs_free(tcs) — frees the TCS struct itself.
         // No user TypeSymbol; recognised by the builtin type name.
         bool tcs = false;
-        // §6.5 / §24.3 (#2026): a `using var` bound to an EventSource<T> /
+        // §6.5 / §24 (#2026): a `using var` bound to an EventSource<T> /
         // AsyncEventSource<T> (constructed via `new EventSource<T>()` / a factory
         // returning the source). The runtime value is a bz_event_source_t* with
         // no user TypeSymbol and no vtable, so classOfLocal returns null and
@@ -2250,7 +2250,7 @@ private:
         bool dictEntryForReleaseInFlightKey = false;
         // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
         // (a sum whose classification is Owning, e.g. one with an `owned`
-        // payload slot per §35.4.1). At scope end the active case's owned
+        // payload slot per §35.4). At scope end the active case's owned
         // payloads are disposed in payload declaration order (§35.4 "Disposal
         // is defined by the active case"). `slot` holds the choice struct
         // value (the `tag` lives at field 0; payload slot i is field 1+i).
@@ -2727,7 +2727,7 @@ private:
     const sema::TypeSymbol* currentChoiceMethod_ = nullptr;
     // fix #628 / §9.5 / §14.2: when emitting a SPECIALIZED method body via
     // buildSpecializedMethodFn, currentFn_ is set to the freshly-created specFn
-    // which is NOT registered in methodFns_.  lowerWith's §575 reverse-lookup
+    // which is NOT registered in methodFns_.  lowerWith's #575 reverse-lookup
     // (fn == currentFn_ in methodFns_) therefore fails — t stays null and
     // `this with … end` returns the raw `this` pointer instead of a struct copy
     // → ret-type mismatch (IR verification failure).  currentSpecMethodSymbol_
@@ -3060,7 +3060,7 @@ private:
              llvm::GlobalVariable*>
         genericInstStaticGlobals_;
 
-    // §24.1 (#477 B6): each STATIC event's compiler-generated backing
+    // §24 (#477 B6): each STATIC event's compiler-generated backing
     // EventSource<T> field — a static owned field, modeled as a `ptr` global
     // initialized to null at module load and allocated (bz_event_source_new)
     // at program start, alongside the static constructors run in Main's
@@ -3307,7 +3307,7 @@ private:
     // runtime helper bz_itable_lookup(itmap, td$I) → itab$C$I, then GEPs
     // to position k within the itable to find the function pointer.
     std::unordered_map<const sema::MethodSymbol*, unsigned> ifaceMethodIndex_;
-    // §24.7 (#477 B7): an interface EVENT also occupies an itab slot — its
+    // §24 (#477 B7): an interface EVENT also occupies an itab slot — its
     // position is APPENDED after the interface's non-static methods (so method
     // indices are unchanged). The slot holds a per-class accessor `ptr(this)`
     // returning the implementing object's backing EventSource<T>; interface-
@@ -3348,7 +3348,7 @@ private:
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
              llvm::GlobalVariable*>
         itables_;
-    // §24.7 (#477 B7): per-class event-accessor functions (emit-once cache),
+    // §24 (#477 B7): per-class event-accessor functions (emit-once cache),
     // keyed by the class's own instance EventSymbol.
     std::unordered_map<const sema::EventSymbol*, llvm::Function*>
         eventAccessorFns_;
@@ -5037,7 +5037,7 @@ private:
     // class/interface references → opaque pointer (heap reference).
     // Other kinds fall back to i32 (refined as more types are lowered).
     // CG-nullable: helpers for nullable primitive value types (int?, bool?, etc.)
-    // Represented as a packed struct {i1 hasValue; primType value} per §18.9.
+    // Represented as a packed struct {i1 hasValue; primType value}.
     // Is rt a nullable VALUE primitive (int?, bool?, double?, etc.)?
     // Excludes reference-like primitives (String, Char, Object) and None.
     // These are the types represented as tagged {i8, primTy} structs.
@@ -6273,7 +6273,7 @@ private:
             // occupies its correct storage slot — see that helper's comment
             // for the confirmed memory-safety hazard this closes.
             if (sema::isAutoPropertyStorageSymbol(m, ctx_)) out.push_back(m);
-            // per §24.1 / §24.5 (#1176): each INSTANCE event declaration (sync
+            // per §24 (#1176): each INSTANCE event declaration (sync
             // or async) gets a compiler-generated owned backing field of type
             // EventSource<T> / AsyncEventSource<T>, laid out as a plain `ptr`
             // slot. Static events (static-init backed) are handled separately in
@@ -7795,7 +7795,7 @@ private:
         return nullptr;
     }
 
-    // §24.7 (#477 B7): the instance EventSymbol named `name` declared on `cls`
+    // §24 (#477 B7): the instance EventSymbol named `name` declared on `cls`
     // (or an inherited base class) — the concrete backing-field owner an
     // interface event resolves to on the implementing class. Sync events only.
     const sema::EventSymbol* classEventByName(const sema::TypeSymbol* cls,
@@ -7818,7 +7818,7 @@ private:
         return nullptr;
     }
 
-    // §24.7 (#477 B7): emit (once, cached) a per-class accessor function
+    // §24 (#477 B7): emit (once, cached) a per-class accessor function
     // `ptr bz$<Class>$<Event>$get(ptr this)` that returns the object's backing
     // EventSource<T>. Placed in the class's itab so interface-typed event
     // access reaches the real source. `es` is the class's own instance event.
@@ -8515,7 +8515,7 @@ private:
 
     // fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): for an interpolation
     // hole whose STATIC type `frt` is a built-in INTERFACE HEAD
-    // (common::isBuiltinInterfaceHead), the §2923 fix DELIBERATELY left the
+    // (common::isBuiltinInterfaceHead), the #2923 fix DELIBERATELY left the
     // receiver on `lowerObjectToString`'s dynamic path (an interface slot may
     // hold a user class declaring the interface — those MUST keep dispatching
     // through vtable[kToStringSlot]). When the AST source of `frt` statically
@@ -8523,7 +8523,7 @@ private:
     // (e.g. `var e: IList<int> := new Array<int>(2);` — the local's initializer
     // is `new Array<int>(2)`, whose type is the built-in class `Array<int>`),
     // we route the value through `emitVtablelessBuiltinToString` with that
-    // concrete class type, which is the §2923 renderer the runtime value's
+    // concrete class type, which is the #2923 renderer the runtime value's
     // shape already satisfies. Returns nullptr when the static type is not a
     // built-in interface head OR the AST source does not statically determine
     // the runtime type as a vtable-less built-in class — in either case the
@@ -10946,7 +10946,7 @@ private:
         return false;
     }
 
-    // §28.5/§24.4 (#879): true when `fs` is an `owned` field of type
+    // §28.5/§24 (#879): true when `fs` is an `owned` field of type
     // Subscription (or Subscription?).  Subscription is a compiler-known opaque
     // handle with no user TypeDecl / no vtable; it is disposed via
     // bz_subscription_dispose (which is null-safe: `if (!subp) return;`), not
@@ -10968,7 +10968,7 @@ private:
         return isSubscriptionType(rt);
     }
 
-    // §6.5 / §24.3 (#1646): true when `fs` is an `owned` field of type
+    // §6.5 / §24 (#1646): true when `fs` is an `owned` field of type
     // EventSource<T> or AsyncEventSource<T> — the producer-side event sources a
     // user may now construct directly (`new EventSource<T>()`; the pattern's
     // `private owned readonly _e: EventSource<T> := new();`). These are
@@ -13610,7 +13610,7 @@ private:
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
 
-    // §22.7 / §22.13 / §24.1 (#1502): the entry-point (Main) static-init
+    // §22.7 / §22.13 / §24 (#1502): the entry-point (Main) static-init
     // prologue — SerializationException vtable, non-lazy static ctors, and
     // static-event backing-source allocation. Shared by the synchronous-Main
     // body path (emitFunctionBody) and the async-Main entry (emitAsyncMethod).
@@ -14605,7 +14605,7 @@ private:
     // #2142 / §28.9 / §28.11: the Set<T> analog of borrowingArrayFreeEligible_ —
     // plain `var s: Set<T> := [ ... ]` collection-literal locals (dict-backed,
     // bz_dict_t*) that the type-agnostic escape walk proves never escape. Set<T>
-    // is a borrowing-family collection (spec table, §28.9/§7052) exactly like
+    // is a borrowing-family collection (spec table, §28.9/#7052) exactly like
     // Array<T>: trivial-dispose, backing "reclaimed with the instance". Populated
     // alongside borrowingArrayFreeEligible_ (same escape walk, separate set
     // because a Set frees via bz_dict_free, not bz_array_free).
@@ -18840,7 +18840,7 @@ private:
     llvm::Value* eventSourcePtr(const ast::Expr& e);
     const sema::TypeRef* eventPayloadType(const sema::EventSymbol* es);
 
-    // per §24.3 / §24.5: recognize and lower an event method call —
+    // per §24: recognize and lower an event method call —
     // `<event>.Subscribe(h)` (returns owned Subscription), `<event>.Add(h)`,
     // `<event>.Remove(h)`, `<event>.Raise(payload)` / `<event>.Raise()`.
     // Returns the produced value (Subscription ptr for Subscribe; null/unit for
@@ -18848,7 +18848,7 @@ private:
     // the caller continues normal dispatch.
     std::optional<llvm::Value*> tryLowerEventCall(const ast::CallExpr& call);
 
-    // §24.3 (#747): lower an event handler argument (a lambda / method ref) to a
+    // §24 (#747): lower an event handler argument (a lambda / method ref) to a
     // closure {fn, env}, informing lowerLambda of the expected `(payload) -> ()`
     // type so an untyped `(e) => …` param resolves the payload and a block-bodied
     // handler resolves its return to void (not the i32 default). Shared by the
@@ -18856,11 +18856,11 @@ private:
     // `.Subscribe` path. Returns null on failure.
     llvm::Value* lowerEventHandlerClosure(const ast::Expr* handlerExpr,
                                           const sema::TypeRef* payload);
-    // §24.3 (#747): is `rt` the builtin IEvent<T> / IAsyncEvent<T> interface
+    // §24 (#747): is `rt` the builtin IEvent<T> / IAsyncEvent<T> interface
     // (a Named TypeRef with a null user declaration whose first name part is
     // "IEvent"/"IAsyncEvent")? Mirrors isSubscriptionType.
     static bool isIEventTypeName(const sema::TypeRef* rt);
-    // §6.5 / §24.3 (#1610): producer-side "EventSource"/"AsyncEventSource".
+    // §6.5 / §24 (#1610): producer-side "EventSource"/"AsyncEventSource".
     static bool isEventSourceTypeName(const sema::TypeRef* rt);
     // fix #1832 / stdlib §6.5 (v0.187): cross-domain publication-point pair.
     // ISharedEvent<T> is the public subscribe-only face; SharedEventSource<T>
@@ -18871,7 +18871,7 @@ private:
     static bool isISharedEventTypeName(const sema::TypeRef* rt);
     static bool isSharedEventSourceTypeName(const sema::TypeRef* rt);
 
-    // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
+    // per §24: `<event> += h` / `<event> -= h` inside the declaring class —
     // a fixed desugaring to Add/Remove. Returns true when handled.
     bool tryLowerEventCompound(const ast::AssignmentStmt& as);
     // §6.4 / #647: `atom.Value := v` — seq-cst store into an Atomic<T> or
@@ -18882,7 +18882,7 @@ private:
     // has no user PropertyDecl, so without this the write is silently dropped.
     bool tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as);
 
-    // per §2.11 / §24.4: true when `e`'s static type is the built-in
+    // per §2.11 / §24: true when `e`'s static type is the built-in
     // `Subscription` (stdlib §2.11), or — for an inferred local bound to a
     // literal `.Subscribe(...)` whose result sema does not yet type — when it is
     // structurally that call. Routes `sub.Dispose()` to bz_subscription_dispose
@@ -18891,7 +18891,7 @@ private:
 
     // per §2.11: true when the resolved type `rt` is the built-in
     // `Subscription` — a Named TypeRef with no user declaration whose name is
-    // "Subscription" (resolved per TypeResolution_Names §24.4 / stdlib §2.11).
+    // "Subscription" (resolved per TypeResolution_Names §24 / stdlib §2.11).
     static bool isSubscriptionType(const sema::TypeRef* rt);
 
     // fix #3685 / §6.6 / §30.11 (v0.287): true when `rt` is one of the
@@ -18906,16 +18906,16 @@ private:
     // per §30.11 / §28.3, v0.287
     static bool isTaskCompletionSourceType(const sema::TypeRef* rt);
 
-    // per §24.5: emit the handler-invocation loop for `Raise(payload)` — call
+    // per §24: emit the handler-invocation loop for `Raise(payload)` — call
     // every active handler closure with `payload` (already lowered, or null for
     // the no-payload unit form). `payloadLL`/`payloadTy` describe the argument.
     void emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
                         llvm::Type* payloadTy);
 
-    // per §24.5 / §30: emit the async-event raise sequence for `RaiseAsync` —
+    // per §24 / §30: emit the async-event raise sequence for `RaiseAsync` —
     // invoke each subscribed handler closure (which returns a Task*) in
     // subscription order, awaiting each handler's task synchronously before
-    // invoking the next (per §24.5: "each handler's task is awaited before the
+    // invoking the next (per §24: "each handler's task is awaited before the
     // next is invoked"). If any handler's task faults, subsequent handlers are
     // not invoked and the fault is carried in the returned Task. Returns a
     // Task* that is always already-done on return (enabling the caller's

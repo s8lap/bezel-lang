@@ -280,7 +280,7 @@ constexpr std::array<std::string_view, 73> kHeapPointerReferenceBuiltins = {
     "ICollection", "IList", "IOwningCollection", "IOwningList",
     // §30 tasks
     "Task", "OwningTask",
-    // §2.11 / §24.4 subscription; §6.1/§30.8 cancellation; §6.10 nursery
+    // §2.11 / §24 subscription; §6.1/§30.8 cancellation; §6.10 nursery
     "Subscription", "CancellationToken", "CancellationTokenSource", "TaskScope",
     // §28.13 / §2.16 Shared/Weak; §30.14/§30.15 channels; §5 groupings
     "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
@@ -295,12 +295,12 @@ constexpr std::array<std::string_view, 73> kHeapPointerReferenceBuiltins = {
     // and imported-name-path checks to the i32 default, mismatching the
     // ptr the LINQ runtime actually produces.
     "IOrderedEnumerable",
-    // §24.3 event sources; §6.5 / fix #1536: EventSource<T>/AsyncEventSource<T>
-    // (the producer-side face, §24.3) are heap-allocated like the IEvent<T>/
+    // §24 event sources; §6.5 / fix #1536: EventSource<T>/AsyncEventSource<T>
+    // (the producer-side face, §24) are heap-allocated like the IEvent<T>/
     // IAsyncEvent<T> interfaces above — same ptr rep, no user TypeDecl.
     //
     // fix #1832 / §6.5 (v0.187): the cross-domain publication-point pair
-    // ISharedEvent<T> / SharedEventSource<T> share the §24.3 same ptr rep (a
+    // ISharedEvent<T> / SharedEventSource<T> share the §24 same ptr rep (a
     // bz_event_source_t*; a real synchronization discipline around the
     // subscriber list is recorded for a later slice and is the runtime-side
     // contract — the type-name registration here just admits them). Both names
@@ -447,7 +447,7 @@ constexpr std::array<std::string_view, 25> kBuiltinInterfaceHeads = {
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
     "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
     "ICollection", "IList", "IOwningCollection", "IOwningList",
-    // §24.3 / §6.5 event faces; §5 groupings
+    // §24 / §6.5 event faces; §5 groupings
     "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
     // §2.14–§2.15 serialization vocabulary
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
@@ -473,7 +473,7 @@ constexpr std::array<std::string_view, 25> kBuiltinInterfaceHeads = {
     // instead of the real dynamic-dispatch slot), and `$"{f:X}"` on an
     // `IFormattable`-typed receiver printed the literal text "IFormattable"
     // instead of dispatching to the real `ToString(format)` override
-    // (`LlvmBackend_String.cpp`'s §2969 routing falls back to the vtable-
+    // (`LlvmBackend_String.cpp`'s #2969 routing falls back to the vtable-
     // less-builtin renderer). Both are FIXED by this addition (see the
     // regression tests in
     // idisposable_iasyncdisposable_iformattable_heap_ptr_4326_test.cpp).
@@ -985,12 +985,12 @@ bool isVtableLessBuiltinClassName(std::string_view n) {
 }
 
 // fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): the reserved built-in
-// INTERFACE heads — exposed as its own predicate so the §2969 codegen routing
+// INTERFACE heads — exposed as its own predicate so the #2969 codegen routing
 // does not have to re-list the `kBuiltinInterfaceHeads` names. See the header
 // for the contract — split off from `isVtableLessBuiltinClassName` because a
 // user class may legitimately declare `class MyE: IEnumerable<int>`, so the
 // dynamic dispatch on these names must remain reachable even though they are
-// the one reserved-name population that §2923's fix declined to route away
+// the one reserved-name population that #2923's fix declined to route away
 // from it.
 bool isBuiltinInterfaceHead(std::string_view n) {
     return contains(kBuiltinInterfaceHeads, n);
@@ -1045,7 +1045,7 @@ constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
     "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator",
     "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
-    // §30.15 channels; §24.3 events; §2.11 subscription.
+    // §30.15 channels; §24 events; §2.11 subscription.
     "Channel", "ChannelSender",
     "EventSource", "AsyncEventSource",
     // fix #1832 / §6.5 (v0.187): SharedEventSource<T> — same §28.9
@@ -1310,7 +1310,7 @@ constexpr std::array<BuiltinClassModulePath, 82> kBuiltinClassModulePaths = {{
     {"BinaryDeserializer", "System"},
     {"JsonSerializer", "System"},
     {"JsonDeserializer", "System"},
-    // §24.3 (#1536): EventSource / AsyncEventSource / IEvent / IAsyncEvent —
+    // §24 (#1536): EventSource / AsyncEventSource / IEvent / IAsyncEvent —
     // the class heads go under `System`, the interface heads are out.
     {"EventSource", "System"},
     {"AsyncEventSource", "System"},

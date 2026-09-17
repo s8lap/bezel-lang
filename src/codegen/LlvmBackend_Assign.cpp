@@ -5827,7 +5827,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // guard, so the same shape on the EXPRESSION-GETTER face
                 // was a hard abort.
                 //
-                // NARROW PREDICATE — !cls->genericParams.empty(). §2759's
+                // NARROW PREDICATE — !cls->genericParams.empty(). #2759's
                 // residual (`public virtual property O: Object => 0;` on a
                 // non-generic `Base`) is the EXACT same mismatch on a
                 // non-generic class: body returns i32, function returns
@@ -5835,7 +5835,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // coercion for every tag-0 emission, which made #2759's
                 // pinned-as-broken test build successfully and was reverted
                 // (commit 671726f). Restricting the coercion to GENERIC
-                // classes leaves the §2759 path untouched (its build failure
+                // classes leaves the #2759 path untouched (its build failure
                 // is the deliberate safe direction, per the test's own
                 // comment) and only arms the substitution-erased-template
                 // case where the body references a generic-base field with
@@ -5876,12 +5876,12 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             // never via `emitFunctionBody`.
             //
             // NARROW PREDICATE — !cls->genericParams.empty(). Same shape
-            // as the expression-getter arm above: §2759's
+            // as the expression-getter arm above: #2759's
             // `public virtual property O: Object get => do return _n;
             // end;` (block form) on a non-generic `Holder` would also
             // mismatch (body i32, function ptr) and was deliberately
             // pinned as a build failure. Restricting the arm to GENERIC
-            // classes preserves the §2759 residual — and since the §2759
+            // classes preserves the #2759 residual — and since the #2759
             // test is only the expression-bodied variant, the block-form
             // arm here is the more conservative choice: it never fires
             // for non-generic classes regardless of body shape.
@@ -6789,7 +6789,7 @@ bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) 
     // indexer-setter codegen had no case for a CollectionLiteralExpr RHS —
     // `lowerExpr` returns null for one (§15.4), the assignment silently
     // degraded via the pre-existing #4045 backstop, and the write never
-    // happened. The sema side (§4316's gate that admits the conforming
+    // happened. The sema side (#4316's gate that admits the conforming
     // program and rejects the non-conforming twin) applies here too.
     // Mirror the indexer-setter / local-decl / return-stmt / field-init
     // pattern exactly: a literal RHS targeting an INLINE-array property
@@ -7999,7 +7999,7 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
 }
 
 
-// per §24.3 / §24.4: inside the declaring class, `event += handler` and
+// per §24: inside the declaring class, `event += handler` and
 // `event -= handler` are a fixed, language-defined desugaring to
 // `event.Add(handler)` and `event.Remove(handler)`. They are NOT the
 // compound-assignment statements of §17 (they neither read nor assign the
@@ -8297,7 +8297,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     }
     // fix #1069 / stdlib §4.10 / §5: DICT-backed `Set<T>` — snapshot its element
     // keys into a fresh array and hand out an OWNING enumerator over the
-    // snapshot. Reuses the tested §389 Set lazy source (bz_lazy_from_set, which
+    // snapshot. Reuses the tested #389 Set lazy source (bz_lazy_from_set, which
     // snapshots the key table) and the #1916 drain (bz_lazy_to_array, which
     // materialises the array AND disposes the lazy source), so the only new
     // object is the snapshot the returned enumerator owns. fix #2299 / §28.9:
@@ -13591,7 +13591,7 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // byte `lowerParamType` substitutes for `void`). The IR verifier
         // rejects the misaligned call with "Call parameter type does not
         // match function signature" — MEASURED on 50eb493 with the issue's
-        // `TakeUnit(ReturnsUnit())` repro. The §3079 Console-only guard
+        // `TakeUnit(ReturnsUnit())` repro. The #3079 Console-only guard
         // caught the same shape for `Console.WriteLine(<unit>)`; the
         // broader call family did not.
         //

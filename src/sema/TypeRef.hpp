@@ -59,7 +59,7 @@ struct TypeRef {
     // name information there).
     std::string_view importedName;
 
-    // #1462 / §27.8 / §578: a type alias (`type OA := OwningArray<R>`) resolves
+    // #1462 / §27.8 / #578: a type alias (`type OA := OwningArray<R>`) resolves
     // transparently by copying the underlying TypeRef into this one, then
     // RESTORING astNode to the use-site node (the alias name `OA`) so
     // diagnostics point to the use site. That restore hides the underlying

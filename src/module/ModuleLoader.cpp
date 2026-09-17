@@ -2183,7 +2183,7 @@ static bool parseAndAttachCtorBody(
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
             // fix #2839: a LAMBDA parameter is declared inside the body and has
-            // no importer-side counterpart (like a body-local, §2290 bug 1
+            // no importer-side counterpart (like a body-local, #2290 bug 1
             // below) — carry it over verbatim rather than running the
             // positional ctor-param search that can never match it.
             if (freshLambdaParamSyms.count(freshSym)) {
@@ -2206,7 +2206,7 @@ static bool parseAndAttachCtorBody(
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
-            // §2290 bug 1: a LOCAL variable declared inside the ctor body
+            // #2290 bug 1: a LOCAL variable declared inside the ctor body
             // (`var x := …;` / `using var x := …;`) has no counterpart in
             // importedType's members — it is private to this body. Register the
             // fresh LocalSymbol itself under mainCtx (kept alive below), so
@@ -2220,7 +2220,7 @@ static bool parseAndAttachCtorBody(
         // they are not needed by inlineCtorBody / implicitFieldAddr.
     }
 
-    // §2290 bug 1 / #783 precedent: copy the body's resolved-type and
+    // #2290 bug 1 / #783 precedent: copy the body's resolved-type and
     // expr-type entries from the fresh context into mainCtx so codegen's
     // per-instantiation monomorphization finds a type for LOCAL declarations
     // and expressions the field/param/method remaps above don't cover (e.g. a

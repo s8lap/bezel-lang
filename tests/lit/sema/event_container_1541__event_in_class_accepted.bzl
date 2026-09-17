@@ -1,7 +1,7 @@
 // Ported from tests/sema/event_container_1541_test.cpp
 //   (BEZEL_TEST event_container_1541, event_in_class_accepted).
 //
-// §24.1: a `class` may declare an event (the control case — no error).
+// §24: a `class` may declare an event (the control case — no error).
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //

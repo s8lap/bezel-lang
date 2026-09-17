@@ -1,7 +1,7 @@
 // Ported from tests/sema/event_visibility_test.cpp
 //   (BEZEL_TEST sema_event_vis_24_3, derived_raise_protected_base_event_ok).
 //
-// §24.5: "Derived classes may raise `protected` events declared on their base
+// §24: "Derived classes may raise `protected` events declared on their base
 // class because the protected access exposes the EventSource form." A subclass
 // raising a base-class `protected` event is allowed.
 //

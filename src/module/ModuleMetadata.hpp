@@ -824,7 +824,7 @@ struct MetaMember {
     //   - the ifaceEventIndex_ index/mirror AND the itab$C$I BUILD loops
     //     (LlvmBackend_Setup.cpp declareVtables / Pass D / record-box itable)
     //     need `!isAsync` to reserve a per-class EventSource-accessor itable
-    //     slot for an IMPORTED interface's sync event (§24.7: only a sync event
+    //     slot for an IMPORTED interface's sync event (§24: only a sync event
     //     is an itable member; an async event is not). Both the INDEX lookup
     //     (eventSourcePtr) and the itable ARRAY build must classify identically
     //     or the importer reserves a slot the exporter's real itable layout

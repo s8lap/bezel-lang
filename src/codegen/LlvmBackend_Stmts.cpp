@@ -327,7 +327,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->target && as->value) {
-            // per §24.4: `event += handler` / `event -= handler` (inside the
+            // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound
             // assignment. Checked first so the event target is not treated as
             // an lvalue.
@@ -2026,7 +2026,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // therefore unreachable from any program that passes sema — retired here
     // per #4109. For built-in numeric operands keep the x := x ± 1 path.
     //
-    // fix #587 / §20.5: `++`/`--` on a computed property or user-defined indexer
+    // fix #587 / §17.6: `++`/`--` on a computed property or user-defined indexer
     // slot must call the setter to write the incremented value back.
     // The lvalueAddr fallback returns null for these targets (no backing alloca),
     // so the store was silently dropped. After a null from lvalueAddr two additional
@@ -2097,7 +2097,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
             } else {
-                // fix #587 / §20.5: lvalueAddr returned null — the target is either
+                // fix #587 / §17.6: lvalueAddr returned null — the target is either
                 // a built-in heap-collection indexer, a computed property with a
                 // block setter, or a user-defined indexer.  All require a getter
                 // read + arithmetic + setter write-back.
@@ -2942,7 +2942,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // SECOND +1 on a reference `outer`'s own body already
             // transferred, so the returned closure's refcount never reaches
             // zero and its envdtor (and therefore every capture cell it is
-            // the designated §3426 owner of) never runs — a permanent leak
+            // the designated #3426 owner of) never runs — a permanent leak
             // of the closure header, its env, and its captures, not merely
             // the 26000 B / 1500-allocation figure LSan reports at 500
             // iterations of issue #3804's own probes.
@@ -3132,7 +3132,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         }
         // No enclosing finally: dispose all live scopes, then ret.
         emitAllDisposals();
-        // fix #1607 / §28.3/§28.4 (§3459: `return;` exits a destructor early):
+        // fix #1607 / §28.3/§28.4 (#3459: `return;` exits a destructor early):
         // an early `return;` inside a user destructor body is a second
         // reachable exit from emitDisposerCore's bz_exc park (see
         // LlvmBackend_Disposal.cpp). Without restoring here, the still
@@ -3376,7 +3376,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     //
                     // The named-binding `discardOutOwnedVar` flag is set by the
                     // ownership pass only when the binding's state is Owned and
-                    // not a `using var` borrow-pin alias (§3253) — so this
+                    // not a `using var` borrow-pin alias (#3253) — so this
                     // emission runs only for the Genuine-Owner shape and cannot
                     // double-dispose a borrow-pin (whose real owner keeps the
                     // obligation). A borrow-state operand is also already

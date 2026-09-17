@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.298 — September 2026**
+**Companion to the Bezel Language Specification, v0.306 — September 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -232,9 +232,9 @@ Bezel's ownership model is the part most likely to surprise readers. The high-le
 
 - Class instances are heap-allocated and must be disposed exactly once.
 - Records, enums, and primitives need no disposal.
-- A small set of types — `string`, boxed value types, function values — are **runtime-managed** and exempt from manual disposal.
+- A small set of types — `string`, `Type`, boxed value types, function values — are **runtime-managed** and exempt from manual disposal.
 
-For the runtime-managed trio — `string`, boxed values, function values, and only them — the reclamation mechanism is not specified: reference counting works, region allocation works, a small collector over the trio works; implementations choose. Every class instance, trivial-dispose included, is instead freed by compiler-inserted code at its statically-known owner's release point — no runtime lifetime mechanism exists for user-defined classes at all ([§5.9](#sec-trivial-dispose-classes), [§5.28](#sec-silent-tracking); spec §28).
+For the runtime-managed set — `string`, boxed values, function values, and `Type`, and only them — reclamation is the runtime's business rather than the program's. For the first three the mechanism is not specified: reference counting works, region allocation works, a small collector over them works; implementations choose. `Type` is the fixed-mechanism member: the runtime interns one instance per type, holds it for the life of the process, and reclaims none (spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)). Every class instance, trivial-dispose included, is instead freed by compiler-inserted code at its statically-known owner's release point — no runtime lifetime mechanism exists for user-defined classes at all ([§5.9](#sec-trivial-dispose-classes), [§5.28](#sec-silent-tracking); spec §28).
 
 <a id="sec-why-strings-are-runtime-managed"></a>
 ### 4.1 Why strings are runtime-managed
@@ -243,7 +243,7 @@ Marking `string` as owned would mean `using var` on the result of `int.ToString(
 
 The alternative — value-type strings with copy-on-write — silently allocates on every concatenation and complicates interop with languages where `string` is a reference type.
 
-The chosen path is to put `string` (and a small set of other deeply-pervasive types: boxed values, function values) in a runtime-managed region and leave manual ownership clean for the 95% of types where it actually matters. Manual ownership would be unworkable for strings; runtime management is unworkable for resources. Each gets the right tool.
+The chosen path is to put `string` (and a small set of other deeply-pervasive types: boxed values, function values, and the interned `Type` tokens) in a runtime-managed region and leave manual ownership clean for the 95% of types where it actually matters. Manual ownership would be unworkable for strings; runtime management is unworkable for resources. Each gets the right tool.
 
 <a id="sec-why-function-typed-values-are-runtime-managed"></a>
 ### 4.2 Why function-typed values are runtime-managed
@@ -370,7 +370,7 @@ v0.60 adds collection literals to the producers table as owned values when targe
 
 Not every class holds resources. `Random` holds only an internal seed. `StringBuilder` holds a buffer that is plain memory. The `Encoding` singletons hold nothing at all. Under v0.60's strict rules, `new Random()` required `using var` or triggered a warning — adding ceremony for a no-op dispose.
 
-The runtime-managed exemption ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types) of the spec) covers `string`, boxed values, and function types — types the language itself creates implicitly and pervasively — but it is a fixed list, and joining it permanently is the wrong model for user classes: what a resource-free class needs is an exemption that is *computed from its declaration* and tracks the class as it changes.
+The runtime-managed exemption ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types) of the spec) covers `string`, `Type`, boxed values, and function types — types the language itself creates implicitly and pervasively — but it is a fixed list, and joining it permanently is the wrong model for user classes: what a resource-free class needs is an exemption that is *computed from its declaration* and tracks the class as it changes.
 
 That is the resolution: **trivial-dispose** is a derived type property (spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties), [§28.9](Bezel_Language_Spec.md#sec-trivial-dispose-classes)). A class with no destructor, no `owned` fields of non-trivial-dispose type, no owning-inline-array fields, and a trivial-dispose base has a disposal that provably runs no user code and releases only memory, and the compiler drops the **ceremony** — never the tracking: a bare `var r := new Random()` compiles clean and the discard `_ := new StringBuilder();` is legal and purely cosmetic, while the instance keeps its statically-known owner and is freed by compiler-inserted code at that owner's release point (spec §28.9; no runtime lifetime mechanism is involved — [§5.28](#sec-silent-tracking) is the decision record). The two recorded steps that reached this endpoint were commitments about ceremony: v0.61 first softened the discharge diagnostic to a reduced-severity informational warning; v0.66 dropped even that — nothing is demanded *of the program*, so there is nothing to warn about. (v0.66 also specified an implementation-defined runtime reclaim mechanism for trivial instances; that half was retracted at v0.238 — the ceremony half is what survives, and [§5.28](#sec-silent-tracking) records why the mechanism went.)
 
@@ -2074,6 +2074,12 @@ PEP 393 hides the choice in the runtime. The user model is "string is a sequence
 Two regularizations ride the same principle from the other side. *Overload pairs for an optional trailing argument* were a second idiom for a shape the document already spelled with §22.5 defaults (`Increment(key, delta := 1)`, `token: CancellationToken := CancellationToken.None` at seventeen sites); nine such pairs — thirteen rows — are one defaulted signature each, and stdlib §1 states the rule so it does not regrow. The shapes that keep a pair are an interface-required member beside its widened twin (`CompareTo`/`Equals` with `ignoreCase`), because §11.2's exact-match conformance fixes the shorter signature, and an omitted argument with no nameable default — the to-the-end window forms, and the JSON facade's `JsonOptions`. *`Counter<K>` spelled key membership `ContainsKey` alone* — a name minted at v0.215 with no .NET antecedent, on the one map-like type on which `key in tally` therefore did not compile; it is `Contains(key)`, and stdlib §1 records that `ContainsKey` is the dictionaries' inherited alias and is not minted on new types.
 
 *`Math.Sign` is one generic.* `Sign<T>(x: T): int where T: INumber<T>` replaces four per-type overloads by the principle that retired `Sum`'s (stdlib §5): the per-type forms predated §2.19's abstraction, and `Sign(decimal)` was added at v0.228 as a symmetry completion fifty-two revisions after `INumber<T>` shipped. The return type is `int` at every substitution, so no call changes meaning and `DECLINED.md`'s result-type block on `Average` does not reach it; the two costs are stated — `pure` is lost until `INumber<T>`'s members are `pure`-declared (recorded as the follow-on, beside `Min`/`Max`/`Clamp`), and a `char` argument, admitted today by §5.1's `char → int` widening, is rejected (0 sites). **`Abs` stays generic-free** for the reason the same trace exposes: `Abs<T>` returns `T`, so `Math.Abs(shortVal)` — today `int` by widening — would infer `T = short` and change its result type at every `var` and every checked follow-on; that is the very mapping the `Average` row records as blocked, and a per-width return-type change with the `pure` loss is not what this evidence earns.
+
+### 15.z `OwningSet<T>` pops rather than takes: an instance member shadows a same-named extension
+
+`OwningSet<T>`'s transfer members are `Pop`/`TryPop`, not `Take`/`TryTake`, and the ground is measured shadowing rather than taste. Under language spec §26.5 rule 1 an instance member blocks a same-named extension **by name**, so an instance `Take(query: T)` on the set made LINQ's `Take(count: int)` unreachable on an `OwningSet<T>` receiver — permanently, for every caller. `Pop`/`TryPop` un-shadow it (`set.Take(2)` resolves to the lazy operator) and put the member in the transfer family the documents already teach: `Get`/`Peek` borrow, `Pop`/`Drain` transfer, which `OwningStack<T>` and `OwningQueue<T>` already spell.
+
+`OwningDictionary<K, V>` keeps `PopValue`/`TryPopValue` with its own reason recorded at stdlib §4.9. `OwningSet<T>` has no such ambiguity — its element and its query are the same type and the same thing — which is why its member can lose the qualifier.
 
 <a id="sec-ffi"></a>
 ## 16. FFI

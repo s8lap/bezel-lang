@@ -3,7 +3,7 @@
 // Ported from tests/sema/static_event_capture_free_1542_test.cpp
 //   (BEZEL_TEST static_event_capture_free_1542, plus_equals_capturing_parameter_rejected_22_12_5).
 //
-// §22.12 rule 5 / §24.4: `staticEvent += handler` desugars to Add — a
+// §22.12 rule 5 / §24: `staticEvent += handler` desugars to Add — a
 // capturing handler (captures the enclosing static method's parameter
 // `offset`) is rejected exactly as the explicit `.Add(...)` form is.
 

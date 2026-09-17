@@ -585,7 +585,12 @@ def caged_run(cmd, cwd=None):
     stderr into stdout. Returns (rc, combined_text). timeout's exit is 124.
     This is the ONLY non-pure seam in a case run; run_case accepts it via the
     `run` parameter so tests inject a fake and never touch bezelc/systemd."""
+    # stdin is /dev/null, not inherited: a case program that reads console
+    # input must see end-of-input, or its verdict becomes a property of the
+    # machine the gate runs on (a TTY blocks to the shard ceiling; a pipe
+    # feeds it data the case never asked for).
     proc = subprocess.run(_CAGE_ARGV + list(cmd), cwd=cwd,
+                          stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     text = proc.stdout.decode("utf-8", errors="replace")
     return proc.returncode, text

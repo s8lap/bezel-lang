@@ -613,7 +613,7 @@ bool PureBodyWalker::inOperatorCalleeIsPure(const ast::BinaryExpr& be) const {
     // pure-Contains types whose purity is a documentation fact, not a
     // symbol-table lookup (the members may not exist as MemberSymbols on
     // the builtin TypeSymbol after ModuleLoader's import-side filtering
-    // — see the §3152 umbrella, family F11/F13).
+    // — see the #3152 umbrella, family F11/F13).
     //
     // Only types whose Contains is `public pure method Contains(...)`
     // in stdlib belong in this list. As of v0.277 the set is exactly
@@ -831,7 +831,7 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
         // type, §25.2) and publish it via `setStmtOperatorSymbol` — read here
         // rather than re-resolved, so this is not a sixth predicate. Null for
         // every compound form that resolves no user overload: `:=`, `??=`,
-        // a primitive/primitive pair, and an event `+=`/`-=` (§24.4 — not a
+        // a primitive/primitive pair, and an event `+=`/`-=` (§24 — not a
         // real compound assignment, resolves no 2-param `operator`).
         if (Symbol* opSym = ctx_.stmtOperatorSymbol(*as)) {
             std::string_view underlying = as->op;

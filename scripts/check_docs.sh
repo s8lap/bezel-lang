@@ -144,6 +144,54 @@ else:
             pin_fail.append(f"  {os.path.basename(path)} is {stale} revisions stale "
                             f"(v0.{minor} vs v0.{cur}); max {CODEGEN_MAX_STALE} -- "
                             f"re-validate it and move its pin, or the code it teaches is wrong")
+    # CODEGEN carries a SECOND pin assertion -- the revision its CITATIONS are
+    # numbered against -- and until v0.301 nothing checked it, because the loop
+    # above reads only the first 6 lines and that line sits below them. The
+    # document therefore sat at "Validated against v0.300" (line 3) while telling
+    # readers its section numbers were v0.268's (line 13), 32 revisions apart.
+    # Found by a conformance-authoring lane chasing a citation, not by either gate.
+    # A pin is an assertion that someone re-traced the document; this file's whole
+    # reason for existing is that an unchecked assertion is how that goes stale.
+    CITE_RE = re.compile(r'are to spec v(\d+)\.(\d+)')
+    cm = CITE_RE.search(text['codegen']) if 'codegen' in text else None
+    if cm is None:
+        for key, path in DOCS.items():
+            if path == CODEGEN:
+                cm = CITE_RE.search(text[key]); break
+    if cm is None:
+        pin_fail.append(f"  {os.path.basename(CODEGEN)} states no citation basis "
+                        f"(\"... are to spec vX.Y ...\") -- it must say which revision its "
+                        f"section numbers are against, or a reader cannot re-check a citation")
+    elif int(cm.group(2)) != cur:
+        pin_fail.append(f"  {os.path.basename(CODEGEN)} pins its CITATIONS to "
+                        f"v0.{cm.group(2)} but the spec is v0.{cur} -- re-check its section "
+                        f"numbers and move the citation-basis line, or every \u00a7 it cites "
+                        f"points at stale numbering")
+
+    # ...and a THIRD, found the same way (#4415, closed at v0.302): section 5's
+    # stdlib name index states the revision it was transcribed from, and that
+    # line sat at v0.282 while the document's other two pins read v0.301 -- 19
+    # revisions, over the one part of the file whose whole job is exact
+    # signatures. Gating the document pin and the citation basis while leaving
+    # this one loose is the same defect the comment above describes, one line
+    # further down. All three now move together or the gate fails.
+    TRANS_RE = re.compile(r'transcribed from `Bezel_Standard_Library\.md` v(\d+)\.(\d+)')
+    tm = TRANS_RE.search(text['codegen']) if 'codegen' in text else None
+    if tm is None:
+        for key, path in DOCS.items():
+            if path == CODEGEN:
+                tm = TRANS_RE.search(text[key]); break
+    if tm is None:
+        pin_fail.append(f"  {os.path.basename(CODEGEN)} states no transcription basis for its "
+                        f"stdlib name index (\"transcribed from `Bezel_Standard_Library.md` vX.Y\") "
+                        f"-- section 5 is copied signatures; without it a reader cannot tell "
+                        f"which stdlib revision they match")
+    elif int(tm.group(2)) != cur:
+        pin_fail.append(f"  {os.path.basename(CODEGEN)} pins its stdlib name index to "
+                        f"v0.{tm.group(2)} but the stdlib is v0.{cur} -- re-check section 5's "
+                        f"signatures against the stdlib and move the transcription line, or the "
+                        f"index a model copies from is stale")
+
     if pin_fail:
         fail = 1
         print(f"PIN: {len(pin_fail)} violation(s):"); print("\n".join(pin_fail))

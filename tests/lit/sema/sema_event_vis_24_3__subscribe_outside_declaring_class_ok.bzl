@@ -1,7 +1,7 @@
 // Ported from tests/sema/event_visibility_test.cpp
 //   (BEZEL_TEST sema_event_vis_24_3, subscribe_outside_declaring_class_ok).
 //
-// §24.4 / §24.3: "Subscribe is available everywhere — inside or outside the
+// §24: "Subscribe is available everywhere — inside or outside the
 // declaring class — because it is on the public interface." So a `Subscribe`
 // call from outside is NOT flagged by the visibility fence.
 //
