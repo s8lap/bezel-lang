@@ -8,6 +8,7 @@
 | **Written against** | spec v0.177, stdlib v0.177 |
 | **Wave** | D1 (gap-review items #4 and #17) |
 | **Depends on** | Proposal 0009 (Base64 + hex encodings — prerequisite for `WriteBytes` text-wire encoding) |
+| **Currency note** | Re-verified clean at v0.306 (2026-09-17 sweep): no tier-1 respell. §2.14's thirteen write and fifteen read tokens are unchanged, so the §"Existing … token vocabulary" enumeration still matches the landed text; §9.8's admissible-serialized-component list still excludes all five value builtins, so the Problem statement stands (the list has since grown — synthesized classes, `Shared<T>`/`Weak<T>`, sequence collections, dictionaries, `T?` — which the quotation's ellipsis covers), and v0.299's ruling that a nested record component must declare the conformance itself reinforces Option A. One tier-2 flag recorded in `proposals-currency-2026-09-17.md` §3 (the `when true` out-postcondition on `TryReadBytes`). Written-against pin unchanged. |
 
 ## Problem
 

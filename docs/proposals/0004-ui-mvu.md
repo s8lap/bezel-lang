@@ -7,7 +7,7 @@
 | **Written against** | spec v0.216 (owner-directed currency refresh 2026-07-22 — the draft predated `choice` and the v0.208 expression forms; §3's "honest sum-type gap" is now closed by the language and the examples use current syntax. Architecture unchanged.) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |
 | **The one-line pitch** | The Elm runtime's defining constraint — updates are strictly serial — *is* Bezel's domain model; every piece of MVU maps to an existing language feature, and messages-as-data is exactly what sendability wants |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-08-11 to v0.246: `closed` replaces `sealed abstract` (v0.242), `case move msg of` transfer-marker respell (v0.246). Written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-08-11 to v0.246: `closed` replaces `sealed abstract` (v0.242), `case move msg of` transfer-marker respell (v0.246); re-verified clean at v0.306 (2026-09-17 sweep) — no retired spelling and no dangling citation: §11.7's `closed`, §19.6, §22.15, §35.4/§35.5/§35.12 and A.6's `CaseStmt` all still resolve, and §35.12's owning-choice admission reads as cited (now keyed on §35.4's *holds-borrows* property, renamed from *borrow-carrying census* at v0.257 — a phrase this draft never uses). Written-against pin unchanged. |
 
 ## 1. The four pieces, in Bezel terms
 
