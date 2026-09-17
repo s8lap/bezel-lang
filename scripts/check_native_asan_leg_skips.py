@@ -248,14 +248,55 @@ def build_function_index(text):
 def scan_conflating_helpers(text, path):
     """Return a list of (line, function_name) for each function body that
     contains BOTH a `-fsanitize=address` link command AND a post-link
-    `return -1;`."""
+    `return -1;`.
+
+    PRE-LINK CHECK (Bug 2 fix, ratchet-3682 detector): the body must also
+    contain a `return -1;` BEFORE the link command. Every canonical
+    ASan-leg helper (`runUnderAsan`, `runUnderAsanValue`,
+    `runUnderAsanExitCode`, the per-file copies like `runUnderLeakSanitizer`
+    that the #3676 fix has not yet migrated, and the named helpers
+    `asanRuntimeObject` / `buildRuntimeSanitizerObject` /
+    `sanitizerRuntimeMaster`) opens with the toolchain-unavailable check
+    `if (rtObj.empty()) return -1;` (per `tests/support/run_under_asan.hpp`
+    and its per-file copies). The `return -1;` after that check is
+    canonical and semantically correct (it is the `-1` code that the
+    downstream `if (... == -1) return;` swallowing guard reads as
+    "toolchain unavailable"). The `return -1;` AFTER the link command
+    is the #3676 bug — link failure should be `-3`, not `-1`.
+
+    Requiring BOTH a pre-link and a post-link `return -1;` filters out a
+    hypothetical false-positive class: a function that happens to
+    compose a `linkCmd = "clang++ -fsanitize=address -g ..."` string for
+    an unrelated purpose (a doc helper, a build-Doc script, an unrelated
+    early-exit) and has an unrelated post-link `return -1;` — but is NOT
+    an ASan-leg helper, so it has no canonical pre-link toolchain check.
+    The rebanked baseline (73 sites across 71 files) was measured against
+    functions that all have the canonical structure, so the pre-link
+    check keeps the count at 73 while excluding the hypothetical class.
+
+    The pre-link check matches `return -1;` anywhere before the link
+    command's text position, not just as the first statement: a few
+    helpers bind `rtObj` first then check empty (the canonical shape),
+    and one (tests/codegen/async_lambda_488_test.cpp) uses a
+    clang-availability check followed by a `buildRuntimeSanitizerObject`
+    failure check rather than `rtObj.empty()` — both forms have a
+    pre-link `return -1;` and all three match the filter. Anything that
+    lacks a pre-link `return -1;` is, by construction, not one of those
+    helpers and not a conflation.
+    """
     stripped = strip_strings_and_comments(text)
     blocks = build_function_index(stripped)
     out = []
+    PRE_LINK_RE = re.compile(r'\breturn\s+-1\s*;')
     for open_pos, close_pos in blocks:
         body = stripped[open_pos:close_pos + 1]
         fsan_pos = body.find('-fsanitize=address')
         if fsan_pos < 0:
+            continue
+        # Require a pre-link `return -1;` (the canonical toolchain-unavailable
+        # check). Without it, this is not one of the ASan-leg helpers and
+        # any post-link `return -1;` is unrelated.
+        if not PRE_LINK_RE.search(body, 0, fsan_pos):
             continue
         # Look for a `return -1;` AFTER the link command.
         post = body.find('return -1', fsan_pos)
@@ -851,6 +892,33 @@ FIXTURES_CONFLATE = [
      '    if (std::system(linkCmd.c_str()) != 0) { return -3; }\n'  # post-fix
      '    return 0;\n'
      '}\n', 0),
+    # Bug 2 (ratchet-3682 detector, post-link return -1 pre-link check):
+    # a helper that composes a `linkCmd = "clang++ -fsanitize=address -g ..."`
+    # string AND has a `return -1;` AFTER the link command but is NOT an
+    # ASan-leg helper — no pre-link toolchain-unavailable check, so the
+    # post-link `return -1;` is for an unrelated purpose. The pre-fix
+    # detector matched it (false positive). The Bug 2 fix requires a
+    # pre-link `return -1;` (the canonical toolchain-unavailable check),
+    # so this is excluded.
+    ('not_conflate_post_link_only_unrelated_4150',
+     'int buildLinkDoc(const std::string& objPath) {\n'
+     '    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath;\n'
+     '    // No pre-link toolchain check — this is a doc helper.\n'
+     '    if (some_unrelated_check_failed) return -1;\n'  # post-link, unrelated
+     '    return 0;\n'
+     '}\n', 0),
+    # Bug 2: the canonical runUnderAsan helper. The function is an ASan-leg
+    # helper (canonical `if (rtObj.empty()) return -1;` pre-link check, then
+    # a `-fsanitize=address` link command, then a post-link `return -1;`).
+    # Still counts (1) after the Bug 2 fix — the pre-link check is present.
+    ('conflate_canonical_runUnderAsan_4151',
+     'int runUnderAsan(const std::string& source, const char* tag) {\n'
+     '    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();\n'
+     '    if (rtObj.empty()) return -1;\n'  # pre-link toolchain check
+     '    std::string linkCmd = "clang++ -fsanitize=address -g ";\n'
+     '    if (std::system(linkCmd.c_str()) != 0) { return -1; }\n'  # post-link bug
+     '    return 0;\n'
+     '}\n', 1),
 ]
 
 
