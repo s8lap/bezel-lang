@@ -793,6 +793,46 @@ if ! python3 scripts/check_uninstrumented_emit_runners.py --strict \
   exit 1
 fi
 say "uninstrumented-emit phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_emitasan.log"))"
+# ── TOOLCHAIN-SKIP PHASE (#3733) ────────────────────────────────────────────
+# `runAotCheckedImpl`'s `clang --version` probe at tests/support/aot_support.hpp
+# returns the SKIP branch on failure, and the literal diagnostic it emits
+# ("<name>: SKIP — C toolchain (clang) unavailable for the ASan link") is
+# read by 1,518 `wasSkipped` / `SKIP (not a failure)` guards across 270
+# files (#3733, measured 2026-09-17 at b57a712e). On a box without clang
+# the whole ASan/LSan tier silently reports clean PASS having run no
+# sanitizer at all — the #3633 silent-skip class, counted nowhere. The
+# runtime half of #3733 makes the absence LOUD (counter + print + shard
+# JSON field + run_parallel.sh floor); this phase freezes the
+# 2,305-call-site surface so it cannot grow while the burn-down runs.
+#
+# Both halves are wired into the same gate cycle: a rise in the script's
+# source-side count without a contemporaneous drop in absorbing_sites
+# fails here, and a nonzero `checked_toolchain_skips` total at the
+# shard level fails inside tests/run_parallel.sh (which gate.sh already
+# consumes). The script's --self-test plants six fixtures in
+# TemporaryDirectory() and asserts the detector's own behaviour; this
+# phase runs --self-test FIRST for the same reason every sibling phase
+# does — a green from a matcher that matched nothing is worth nothing.
+say "toolchain-skip phase: detector self-test + surface ratchet (#3733)"
+if ! python3 scripts/check_toolchain_skip_surface.py --self-test \
+      > "$LOGDIR/${TAG}_toolchainskip.log" 2>&1; then
+  say "CYCLE FAILURE: check_toolchain_skip_surface SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_toolchainskip.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_toolchainskip.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_toolchain_skip_surface.py --strict \
+      >> "$LOGDIR/${TAG}_toolchainskip.log" 2>&1; then
+  say "CYCLE FAILURE: the runAotChecked toolchain-SKIP surface GREW — a new"
+  say "  call site absorbs \"SKIP — C toolchain (clang) unavailable\" without"
+  say "  asserting, so a box without clang runs that row's ASan tier vacuously"
+  say "  (#3733). See $LOGDIR/${TAG}_toolchainskip.log"
+  sed -n '/check_toolchain_skip_surface:/,$p' "$LOGDIR/${TAG}_toolchainskip.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "toolchain-skip phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_toolchainskip.log"))"
 
 # ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
 # A pointer-typed local bound from a lookup/finder call and then guarded with
