@@ -496,7 +496,7 @@ BEZEL_TEST(fixture_suite, location_plus_text_check) {
         # (they are protected); the bare unprotected row (file D) IS in
         # car's count. The shared-helper row (file C) and the location-
         # plus-text-check row (file G) are not in car's count either.
-        car_total, car_per_file = car.measure(root)
+        car_total, car_per_file, _car_debt = car.measure(root)
         chk('check_ambiguous_ran_false counts only the bare unprotected '
             'row (file D) — the partition holds: this ratchet and the '
             'sibling do not double-count any row in the fixture tree',
