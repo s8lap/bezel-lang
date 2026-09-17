@@ -10227,7 +10227,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 std::string(isAsyncES
                                     ? ", RaiseAsync(payload), Add(handler), Remove(handler)"
                                     : ", Raise(payload), Add(handler), Remove(handler)") +
-                                " (stdlib \xC2\xA7""6.5 / \xC2\xA7""24.3)");
+                                " (stdlib \xC2\xA7""6.5 / \xC2\xA7""24)");
                         }
                     }
                     // §6.2 / issue #647: Mutex instance methods.
@@ -16199,7 +16199,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     "` on event `" + std::string(es->name) +
                     "`; documented surface: Subscribe(handler), "
                     "Raise(payload)/RaiseAsync(payload), Add(handler), "
-                    "Remove(handler) (stdlib \xC2\xA7""6.5 / \xC2\xA7""24.3)");
+                    "Remove(handler) (stdlib \xC2\xA7""6.5 / \xC2\xA7""24)");
             }
         }
     }
