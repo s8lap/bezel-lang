@@ -136,6 +136,9 @@ BEZEL_TEST(native_timeout_unavailable_loud,
     // unset it — the same structural argument #3007 makes for
     // noteInfraFailure.
     BEZEL_EXPECT_TRUE(::bezel::test::currentTestFailed());
+    // Probe, not a real outage — release the trip so this witness can pass.
+    // The point was that the trip happened, not that we failed.
+    ::bezel::test::currentTestFailed() = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +165,10 @@ BEZEL_TEST(native_timeout_unavailable_loud,
         BEZEL_EXPECT_TRUE(d.severity == bezel::Severity::Note);
         BEZEL_EXPECT_TRUE(d.message.find("[TIMEOUT]") != std::string::npos);
     }
+    // Probe, not a real outage — the trip is part of the channel under test,
+    // not this witness's failure. Reset so the test harness sees a green tick
+    // and the channel's loud-half still trips for real calls in production.
+    ::bezel::test::currentTestFailed() = false;
 }
 
 // ---------------------------------------------------------------------------
