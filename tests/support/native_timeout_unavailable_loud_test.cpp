@@ -124,8 +124,7 @@ constexpr const char* kLegacyNegativeAssertionProgram =
 //    InfraExpectation interceptor — #3732 does not need one (no synthetic
 //    timeout-probe use case).
 // ---------------------------------------------------------------------------
-BEZEL_TEST(native_timeout_unavailable_loud,
-           chokepoint_counts_and_fails_the_current_test) {
+BEZEL_TEST(native_timeout_unavailable_loud, chokepoint_counts_and_fails_the_current_test) {
     const std::uint64_t before =
         aot::timeoutFailureCount().load(std::memory_order_relaxed);
     aot::noteTimeoutFailure("probe", "synthetic compile hang (not a real outage)");
@@ -146,8 +145,8 @@ BEZEL_TEST(native_timeout_unavailable_loud,
 //    This is the single assertion that decides whether the 272 sites are
 //    protected; everything else in this file supports it.
 // ---------------------------------------------------------------------------
-BEZEL_TEST(native_timeout_unavailable_loud,
-           timeout_result_does_not_satisfy_has_errors) {
+// AMBIGUOUS-RAN-FALSE-DEBT: #3732 — paired hasErrors/errorCount=0 checks below prove the harness loud-half rejects bare-ran under TIMEOUT (the whole point of this test)
+BEZEL_TEST(native_timeout_unavailable_loud, timeout_result_does_not_satisfy_has_errors) {
     bezel::test::JitResult r;
     aot::markTimeout(r, "runAot", "synthetic program hang (not a real timeout)");
     BEZEL_EXPECT_FALSE(r.ran);
@@ -181,8 +180,8 @@ BEZEL_TEST(native_timeout_unavailable_loud,
 //     (Class A for scripts/check_vacuous_tests.py: `hasErrors()` in its
 //     degenerate direct form is reject-only by definition.)
 // ---------------------------------------------------------------------------
-BEZEL_TEST(native_timeout_unavailable_loud,
-           legacy_negative_assertion_shape) {
+// AMBIGUOUS-RAN-FALSE-DEBT: #3732 — this is the LEGACY shape whose FAIL-WITHOUT/PASS-WITH the post-#3732 harness flips; the assertion IS the test
+BEZEL_TEST(native_timeout_unavailable_loud, legacy_negative_assertion_shape) {
     auto r = bezel::test::runAot(kLegacyNegativeAssertionProgram);
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -224,8 +223,7 @@ BEZEL_TEST(native_timeout_unavailable_loud,
 //     setting it EMPTY (test_main.cpp treats an empty value as unset for
 //     all of them), because the spawn helper can setenv but not unsetenv.
 // ---------------------------------------------------------------------------
-BEZEL_TEST(native_timeout_unavailable_loud,
-           run_timeout_fails_a_legacy_shape_probe_loudly_3732) {
+BEZEL_TEST(native_timeout_unavailable_loud, run_timeout_fails_a_legacy_shape_probe_loudly_3732) {
     // Belt and braces against recursion: the filter below cannot match this
     // test's name, and this guard stops it even if that ever changes.
     if (const char* c = std::getenv("BEZEL_3732_E2E_CHILD");
@@ -299,8 +297,8 @@ BEZEL_TEST(native_timeout_unavailable_loud,
 //     test: `[ FAIL ]` and exit 1. Run only when BEZEL_3732_E2E_CHILD=1
 //     (the parent-side probe above sets that env var on the child).
 // ---------------------------------------------------------------------------
-BEZEL_TEST(native_timeout_unavailable_loud,
-           infinite_loop_under_short_deadline_fails_3732) {
+// AMBIGUOUS-RAN-FALSE-DEBT: #3732 — end-to-end FAIL-WITHOUT vehicle; paired hasErrors check verifies post-#3732 hasErrors=false under TIMEOUT
+BEZEL_TEST(native_timeout_unavailable_loud, infinite_loop_under_short_deadline_fails_3732) {
     if (!std::getenv("BEZEL_3732_E2E_CHILD")) return;
     auto r = bezel::test::runAot(kInfiniteLoopProgram);
     BEZEL_EXPECT_FALSE(r.ran);

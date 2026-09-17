@@ -1,18 +1,17 @@
 # ambiguous_ran_false.grandfather - per-file ceiling for #3892/#3895.
 #
-# Each row is one file's maximum number of bare-!ran/hasErrors() rows
-# allowed without per-site `// AMBIGUOUS-RAN-FALSE-DEBT: #NNNN <reason>`
-# markers. The ceiling only ever falls - every successful `--update`
-# tightens each file to min(existing, measured), so a drain becomes the
-# new ceiling on the very next --update. A file whose tightened
-# ceiling reaches 0 is dropped entirely. Raising a ceiling stays a
-# deliberate, reviewed hand-edit to this file.
+# Each row is one file maximum number of bare-!ran/hasErrors()
+# rows allowed without per-site `// AMBIGUOUS-RAN-FALSE-DEBT:
+# #NNNN <reason>` markers. The ceiling only ever falls - every
+# successful `--update` tightens each file to min(existing,
+# measured), so a drain becomes the new ceiling on the very
+# next --update. A file whose tightened ceiling reaches 0 is
+# dropped entirely. Raising a ceiling stays a deliberate,
+# reviewed hand-edit to this file.
 #
 # See check_debt_floor() in scripts/check_ambiguous_ran_false.py
-# (mirrors scripts/localdecl_only_walkers.grandfather, ported from
-# #3590 as the family-wide mechanism).
-#
-# Initial values seeded at C2 landing time (count = 29 across 24 files).
+# (mirrors scripts/localdecl_only_walkers.grandfather, ported
+# from #3590 as the family-wide mechanism).
 
 1    tests/codegen/async_auto_drop_sync_dispose_1663_test.cpp
 1    tests/codegen/async_iter_early_abandonment_dispose_1525_test.cpp
