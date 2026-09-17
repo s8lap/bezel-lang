@@ -20,9 +20,11 @@
 
 #include "support/aot_support.hpp"         // runAot
 #include "support/codegen_support.hpp"
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 // ---------------------------------------------------------------------------
 // §14.1 — Named with genericArgs: a buried parameter inside a concrete
@@ -261,5 +263,10 @@ BEZEL_TEST(substitute_generic_args_unified_walker_4212,
     // The pre-fix `substituteAliasGenericArgs` reported this from the
     // alias reference site; the unified walker must do the same. A
     // clean ACCEPT here would mean the alias-specific arm was lost.
+    // Per #3892 burn-down: a bare `!r.ran` cannot distinguish a genuine
+    // compile-time rejection from a runtime crash/signal/timeout/ASan
+    // report, so also pin a real source location in the diagnostic
+    // (see tests/support/aot_result_asserts.hpp).
     BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
