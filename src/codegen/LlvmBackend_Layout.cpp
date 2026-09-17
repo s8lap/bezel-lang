@@ -1551,9 +1551,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
 
 
 llvm::Type* Emitter::storageType(const sema::Symbol* m) {
-    // fix #2533 (§24.1/§22.8/§2.8.2 clause 1, v0.236): an event's backing
+    // fix #2533 (§24/§22.8/§2.8.2 clause 1, v0.236): an event's backing
     // storage is a runtime `EventSource<T>` (`AsyncEventSource<T>` for async)
-    // referenced by an OPAQUE POINTER (§24.1), NOT the event's payload type.
+    // referenced by an OPAQUE POINTER (§24), NOT the event's payload type.
     // The wire-carried MetaMember::type for an IMPORTED event is its `: T`
     // PAYLOAD type (e.g. `EvB2421` in the issue's repro), not the EventSource
     // storage type — so the imported-member-type fallback below would happily
@@ -4564,7 +4564,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // paths so the kind tag is consistent across every reference to this method.
     FnValKind kind = closureKindForMethod(ms, extRef);
 
-    // #1170 / §24.4: reuse a cached thunk for this method so a named method
+    // #1170 / §24: reuse a cached thunk for this method so a named method
     // reference resolves to a STABLE fn pointer (the cell's fn at offset 0).
     // This lets `event -= OnTick` match the `event += OnTick` handler by value
     // (fn + receiver) — see bz_event_remove_closure. The thunk body is
@@ -4961,7 +4961,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // #1170 / §24.4: cache the thunk so subsequent references to this method
+    // #1170 / §24: cache the thunk so subsequent references to this method
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
     methodThunks_[{ms, extRef, methTy}] = thunk;
 

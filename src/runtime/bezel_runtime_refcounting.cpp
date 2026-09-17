@@ -210,7 +210,7 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 // (the startup/shutdown thread's own sequence, §30.13) when g_current_domain
 // is null. fetch_add under the side-table lock makes assignment atomic and
 // preserves the first-request order even under concurrent hashing within a
-// domain (domain run-to-completion serializes continuations anyway, §24.6).
+// domain (domain run-to-completion serializes continuations anyway, §24).
 // ---------------------------------------------------------------------------
 static std::unordered_map<void*, int32_t> g_identity_hashes;
 static std::mutex                         g_identity_hashes_mtx;

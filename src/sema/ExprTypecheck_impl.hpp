@@ -552,7 +552,7 @@ private:
     enum class ContractClauseKind { None, Requires, Ensures };
     ContractClauseKind currentClauseKind_ = ContractClauseKind::None;
 
-    // per §24.3: when about to visit an event-handler lambda argument
+    // per §24: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
     // holds the event's payload type so the lambda's untyped parameter is
     // given the handler's parameter type `T` — letting the body resolve
@@ -752,7 +752,7 @@ private:
     void collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
                                          std::vector<TypeRef*>& out);
 
-    // per §24.3: the payload type of an event-handler call's callee, or null
+    // per §24: the payload type of an event-handler call's callee, or null
     // when `callee` is not `<event>.Subscribe/.Add/.Remove`. Used to set
     // pendingLambdaParamType_ before visiting the handler argument.
     TypeRef* eventHandlerPayloadType(const ast::Expr* callee);
@@ -3101,7 +3101,7 @@ private:
     // (a bare expression/discard statement, or a `var` without annotation).
     void reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce);
 
-    // §24.3: the event visibility fence. Outside the declaring class, an
+    // §24: the event visibility fence. Outside the declaring class, an
     // event member's static type is `IEvent<T>` / `IAsyncEvent<T>`, which
     // exposes only `Subscribe`. The producer-side operations `Raise` /
     // `RaiseAsync` / `Add` / `Remove` (and the `+=` / `-=` desugaring) live
@@ -3110,7 +3110,7 @@ private:
     // names, or `+=` / `-=`), and the access location, this emits a
     // diagnostic when the access is from outside the declaring class. A
     // derived class may use the producer-side face only for a `protected`
-    // event declared on a base class (§24.5). `Subscribe` is never flagged.
+    // event declared on a base class (§24). `Subscribe` is never flagged.
     void checkEventVisibilityFence(EventSymbol* es, std::string_view op,
                                    SourceLocation loc);
 

@@ -1324,7 +1324,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
 
-        // §22.7 / §22.13 / §24.1 (#1502): run the entry-point static-init
+        // §22.7 / §22.13 / §24 (#1502): run the entry-point static-init
         // prologue BEFORE driving the state machine. emitFunctionBody's async
         // routing returns before its own inline prologue site, so without this
         // an async Main never allocated the static event sources (nor ran the

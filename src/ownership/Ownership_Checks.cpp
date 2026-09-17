@@ -5509,7 +5509,7 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
                    dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         if (dynamic_cast<sema::FieldSymbol*>(sym)) {
-            // Bare unqualified field name (implicit `this._field` form, §1082).
+            // Bare unqualified field name (implicit `this._field` form, #1082).
             dest = Dest::Field;
             destName = id->name;
         } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
@@ -6019,7 +6019,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         // §28.3 "captures an owned local whose source is disposed at scope
         // end" rule below (the `st.state == Owned` arm in
         // checkClosureEscapesOnReturn), not a new severity decision on the
-        // separately-open §3975/§3979/§4023 question (which is about
+        // separately-open #3975/#3979/#4023 question (which is about
         // `checkRead`'s OWN warning-vs-error split across read positions in
         // a single function, a different code path).
         const sema::TypeRef* holderTy = ctx_.exprType(e);
@@ -15413,7 +15413,7 @@ std::string_view builtinTypeRefNameHead(const sema::TypeRef* rt) {
 }  // namespace
 
 bool MethodOwnership::typeRefIsEventSourceLike(const sema::TypeRef* rt) const {
-    // §24.3 / stdlib §6.5: the four faces of an event member (or a value of
+    // §24 / stdlib §6.5: the four faces of an event member (or a value of
     // one of those types). All carry the v0.175 `Subscribe(scoped handler)`
     // signature.
     const std::string_view n = builtinTypeRefNameHead(rt);
@@ -15469,7 +15469,7 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
     return isBorrowBearingRecord(rt);
 }
 
-// §35.4 / §9.7 (v0.220, #2180): a BORROW-BEARING choice — §35.4.2 classification.
+// §35.4 / §9.7 (v0.220, #2180): a BORROW-BEARING choice — §35.4 classification.
 // The single §35.4 authority is common::classifyChoiceType (shared with the
 // sendability / disposal-codegen / lint paths); a null type, a non-choice type,
 // or a value-like / owning choice is correctly NOT flagged. // per §35.4, §9.7
@@ -16777,7 +16777,7 @@ bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
                                                   std::size_t argPos) {
     // #1420 / #1541: builtin subscribe-and-store callees whose handler formal
     // the stdlib declares `scoped` (stdlib §6.5 Subscribe/Add, §6.1 Register;
-    // spec §24.3, v0.175/v0.180). Enforcing here applies the §28.14 admission
+    // spec §24, v0.175/v0.180). Enforcing here applies the §28.14 admission
     // to their capture-bearing handler arguments. `EventSource<T>.Add` /
     // `AsyncEventSource<T>.Add` became `scoped` (storing) in v0.180 (#1541 — the
     // `event += handler` desugaring stores the handler in the subscriber list),
@@ -16938,7 +16938,7 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
             exprIsReceiverOwnedFieldBorrow(*as->target))
             scopedInitOfOwnedFieldOfThis_.insert(as->value.get());
         // §28.14 form 4 (v0.180, #1541): `event += handler` desugars to the
-        // `scoped` `Add` (§24.3). It is an AssignmentStmt (not a call), so
+        // `scoped` `Add` (§24). It is an AssignmentStmt (not a call), so
         // queue the handler's admission explicitly, bounded by the event's
         // containing instance (the chain head of the event target). `-=` is
         // `Remove` (call-bounded) and is not admitted.
@@ -17497,7 +17497,7 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
             ownedReturn = true;
     // Form 2 — owned-return call initializing a using/await-using local: the
     // returned object bounds the callback (its disposal severs the
-    // registration — quiescence by removal, §28.14 / §24.6).
+    // registration — quiescence by removal, §28.14 / §24).
     if (ownedReturn) {
         auto it = scopedInitOfUsingLocal_.find(&callNode);
         if (it != scopedInitOfUsingLocal_.end())
@@ -18888,7 +18888,7 @@ void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
             (as->op == ":=" && as->value) ? callBoundedSourceOf(*as->value)
                                           : nullptr;
         // (`+=`/`-=` never move a function value into storage; the event
-        // `+=` form is the stdlib-certified Add path — §24.3, v0.177.)
+        // `+=` form is the stdlib-certified Add path — §24, v0.177.)
         if (src && as->target) {
             // Sink: store into a FIELD of any object (qualified, bare, or
             // another object's). A `scoped`-field target is reported by the

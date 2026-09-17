@@ -3,11 +3,11 @@
 // Ported from tests/sema/event_visibility_test.cpp
 //   (BEZEL_TEST sema_event_vis_24_3, raise_outside_declaring_class_diagnosed).
 //
-// §24.5: "Calling Raise ... outside the declaring class is a compile error:
+// §24: "Calling Raise ... outside the declaring class is a compile error:
 // the static type of the event member outside the declaring class is the
 // interface, which has no Raise method."
 
 module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() _ := this; end Inside; end Button; class Other public method Outside(b: Button) b.Clicked.Raise(new Ev(1)); end Outside; end Other;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: event `Clicked` is accessed from outside its declaring class `Button`, where its static type is the subscribe-only interface `IEvent<T>` — `.Raise` is not available; only `.Subscribe` may be used here
-// CHECK-SAME: (§24.3)
+// CHECK-SAME: (§24)

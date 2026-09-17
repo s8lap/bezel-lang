@@ -645,7 +645,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // retained as a string and released by the consumer: the
                     // measured double free. Ask FIRST whether the AST source
                     // statically narrows the slot to a vtable-less built-in
-                    // class; if so render via the §2923 helper. If not, fall
+                    // class; if so render via the #2923 helper. If not, fall
                     // through unchanged — correct for a genuine string, for a
                     // user class, and for a box.
                     if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
@@ -803,13 +803,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // besides the type-parameter one, and it may also be
                             // a vtable-less built-in class at runtime
                             // (`var e: IList<int> := new Array<int>(2);`).
-                            // §2923 deliberately declined to handle it because
+                            // #2923 deliberately declined to handle it because
                             // the interface slot may also hold a USER class
                             // declaring the interface; that arm is correct for
                             // the user class, broken for the built-in collection.
                             // Ask first whether the AST source statically
                             // narrows the runtime value to a vtable-less built-in
-                            // class — if yes, render via the §2923 helper and
+                            // class — if yes, render via the #2923 helper and
                             // skip the broken `emitValueToString` call; if no,
                             // fall through (correct for user class; deferral per
                             // #2969 for the unanalysed built-in case).
@@ -818,7 +818,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // the other opaque slot that reaches here, and it
                             // fails the same way — the helper now gates on it
                             // too, so `var o: Object := mx; $"{o}"` renders
-                            // via the §2923 helper instead of double-freeing
+                            // via the #2923 helper instead of double-freeing
                             // `mx` through `lowerObjectToString`.
                             if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
                                     ev, rt, part.expr.get())) {
@@ -6240,7 +6240,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     }
     // CG8: field read `obj.f`.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        // §24.3 (#747): an event read in VALUE position (`var ev := b.Clicked;`,
+        // §24 (#747): an event read in VALUE position (`var ev := b.Clicked;`,
         // `return Clicked;` — not immediately `.Subscribe`'d) yields the bare
         // bz_event_source_t* (a BORROW of the declaring instance's backing
         // source — the same pointer the direct `.Subscribe` path uses). Without
@@ -6503,7 +6503,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         }
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-        // §24.3 (#747): a BARE event identifier read in VALUE position (e.g.
+        // §24 (#747): a BARE event identifier read in VALUE position (e.g.
         // `return Clicked;` returning the event as an IEvent<T>) yields the
         // bz_event_source_t* — the same borrow the `b.Clicked` member-access form
         // produces. Without this, a bare event in a value position lowered as a
@@ -6704,7 +6704,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // CG60: a bare identifier resolving to a static method —
         // produce a closure struct { thunk_ptr, null_env } so it can
         // be passed as a function-typed value (§A.7 / §17.14).
-        // §27.6/§24.4, #880 #881: a bare identifier resolving to an INSTANCE
+        // §27.6/§24, #880 #881: a bare identifier resolving to an INSTANCE
         // method used in value position binds the implicit `this` receiver,
         // exactly as `this.MethodName` does in the qualified MemberAccessExpr
         // path below. Without this, the env block held a null/garbage receiver

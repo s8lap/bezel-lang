@@ -2,7 +2,7 @@
 //   (BEZEL_TEST event_direct_bogus_1639, real_members_accepted_direct_access).
 //
 // ---------------------------------------------------------------------------
-// (3) §6.5 / §24.3 / #1639: the documented producer-side surface — Raise,
+// (3) §6.5 / §24 / #1639: the documented producer-side surface — Raise,
 // Add, Remove, Subscribe, and the compiler-generated Dispose — still
 // compiles clean on a direct access from inside the declaring class.
 // (Control: the fix must not over-reject real members.)

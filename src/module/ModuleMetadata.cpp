@@ -153,7 +153,7 @@ enum RecordCode : unsigned {
     // fields are independent of `dtorBodyText` (none of them share its
     // positional slot in the type block) and may be absent or present in
     // arbitrary combinations. Absent (an OLD artifact) reads as "" — the
-    // pre-fix behaviour, which is the §3911 silent-wrong-value defect the
+    // pre-fix behaviour, which is the #3911 silent-wrong-value defect the
     // importer-side `parseAndAttachBaseCtorArgs` closes. See
     // MetaTypeDecl::baseCtorArgsText for the byte-identical-serialization
     // rationale and the dependency-direction staleness contract.
@@ -906,7 +906,7 @@ void emitPolyCase(llvm::BitstreamWriter& w,
 
 void emitParam(llvm::BitstreamWriter& w, const MetaParam& p) {
     w.EnterSubblock(PARAM_BLOCK, 4);
-    // §2392: outNullWhen is a 2nd, additive trailing scalar (see the
+    // #2392: outNullWhen is a 2nd, additive trailing scalar (see the
     // kSchemaVersion comment in ModuleMetadata.hpp) — old readers only
     // consult sc[0] and ignore the rest.
     llvm::SmallVector<std::uint64_t, 2> sc{
@@ -1753,7 +1753,7 @@ bool readParamBody(Reader& r, MetaParam& p) {
     llvm::SmallVector<std::uint64_t, 2> sc;
     if (!expectScalars(r, sc) || sc.empty()) return false;
     p.hasDefault = sc[0] != 0;
-    // §2392: outNullWhen is a 2nd, additive trailing scalar — absent (a
+    // #2392: outNullWhen is a 2nd, additive trailing scalar — absent (a
     // pre-#2392 blob) reads as 0/None, matching every such blob's implicit
     // value before this field existed.
     p.outNullWhen = sc.size() >= 2 ? static_cast<std::uint8_t>(sc[1]) : 0;
@@ -2170,7 +2170,7 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // inheritance-clause argument list source text, through the new
     // `thirdCodedCapture` slot. Same independent, self-describing record-code
     // shape — absent leaves the field empty, the pre-fix reading, which is
-    // exactly the §3911 silent-wrong-value defect the importer-side
+    // exactly the #3911 silent-wrong-value defect the importer-side
     // `parseAndAttachBaseCtorArgs` closes.
     return finishBlockImpl(
         r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,

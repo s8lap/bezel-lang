@@ -3958,7 +3958,7 @@ void ExprTC::checkAssignable(
     // narrowed (non-null) pointer assigns directly to a non-nullable reference
     // slot. (For a class reference the assignment still needs `move` — that
     // ownership rule is orthogonal and enforced separately.)
-    // §11.8/§22.4/§1585 (fixes #1597 regression): a null-declaration Named
+    // §11.8/§22.4/#1585 (fixes #1597 regression): a null-declaration Named
     // `from` — a generic type parameter (`T?`, declaration == nullptr) — is
     // also unwrapped when narrowed. The `if T.TryParse(s, out var v) then
     // return v; end` bridge narrows `v: T?` non-null via the `when true`
@@ -8549,7 +8549,7 @@ Symbol* ExprTC::lookupExtensionMember(
         // argument into an IR-verifier crash — `checkArgsAgainstParams` below
         // now substitutes the binding into parameter types for BOTH target
         // kinds, closing that gap generically). `targetIsBuiltin` is kept only
-        // to scope the one deferral that remains genuine (§3672's own-generic-
+        // to scope the one deferral that remains genuine (#3672's own-generic-
         // constraint case), matching that fix's original, unwidened scope.
         bool targetIsBuiltin =
             target && target->kind == TypeRef::Kind::Named && !target->declaration;
@@ -8847,7 +8847,7 @@ Symbol* ExprTC::lookupExtensionMember(
 std::string ExprTC::extensionNameBlockedNote(const TypeRef* receiver,
                                              std::string_view name) {
     if (!receiver) return std::string();
-    // §1307: this is a pure existence PROBE ("does any extension match this
+    // #1307: this is a pure existence PROBE ("does any extension match this
     // receiver/name at all") for the note text below — it must not itself
     // trigger the §26.5 rule 4 ambiguity diagnostic (the instance-member call
     // it annotates already failed for its own, unrelated reason; a second,
@@ -12874,7 +12874,7 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
 //
 // Scope: an inline array (`[N]T`) checks each element against `arrayElement`,
 // recursing when an element is itself a nested literal (`[1]Array<IHolder>`,
-// §4310's nested case) — the recursive call re-derives the SAME judgment one
+// #4310's nested case) — the recursive call re-derives the SAME judgment one
 // level down rather than assuming the outer check covers it. A §15.4
 // builtin-collection head (`Array<T>`, `OwningArray<T>`, `Set<T>`, …,
 // `Dictionary<K, V>`, `OwningDictionary<K, V>`) checks each element/key
@@ -15609,7 +15609,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
-        // per §24.4: `event += handler` / `event -= handler` — type the
+        // per §24: `event += handler` / `event -= handler` — type the
         // handler lambda's param as the event payload `T` (these forms desugar
         // to Add/Remove; they are not real compound assignments).
         TypeRef* eventPayload = nullptr;
@@ -15622,7 +15622,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if ((as->op == "+=" || as->op == "-=") && as->target) {
             if (auto* es = dynamic_cast<EventSymbol*>(
                     ctx_.exprSymbol(*as->target))) {
-                // per §24.3: the `+=` / `-=` forms desugar to Add / Remove,
+                // per §24: the `+=` / `-=` forms desugar to Add / Remove,
                 // which live on the EventSource<T> face — available only
                 // inside the declaring class (and inside a derived class for a
                 // `protected` event). Outside, the event is IEvent<T>, which
@@ -16387,7 +16387,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
-        // per §24.4: an event += / -= is not a real compound assignment, so
+        // per §24: an event += / -= is not a real compound assignment, so
         // the readonly / assignability checks below do not apply to it.
         if (!eventPayload) {
             // §4.15 (#549) / §4.14 (#779): ReadOnlyArraySpan<T>[i] := v and

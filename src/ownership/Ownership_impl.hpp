@@ -2792,7 +2792,7 @@ private:
     // this state-free pre-pass cannot evaluate those live-states_ gates to
     // know whether a given instance actually does, so it must not guess).
     // Called only at depth 0 (an unconditional rebind), matching
-    // recollectRecordBorrowSourceOnReassign's own §1741 depth-0 restriction:
+    // recollectRecordBorrowSourceOnReassign's own #1741 depth-0 restriction:
     // a conditional rebind might not execute, so the old window must stay
     // open on the not-taken path (sound over-rejection). // per §28.3,
     // #4225, #4250
@@ -3386,7 +3386,7 @@ private:
     bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const;
 
     // §35.4 / §9.7 (v0.220, #2180): true when `rt` is a BORROW-BEARING choice
-    // (its §35.4.2 classification — any case has a plain borrow-carrying payload
+    // (its §35.4 classification — any case has a plain borrow-carrying payload
     // field). §9.7 (v0.220): "Borrow-bearing choices are subject to every rule
     // of this section, with 'record' read as 'record or choice' throughout" —
     // including the closure-capture escape bullet. isBorrowBearingRecordOrSpan
@@ -4835,7 +4835,7 @@ private:
                         const std::vector<ast::CallArgument>* args,
                         std::size_t argPos);
 
-    // §24.3 / stdlib §6.5, §6.1 (v0.175 signatures; enforced per #1420): true
+    // §24 / stdlib §6.5, §6.1 (v0.175 signatures; enforced per #1420): true
     // when `callee` is a builtin subscribe-and-store call whose handler formal
     // at `argPos` is `scoped` — `<event>.Subscribe(handler)` (the target
     // resolves to an EventSymbol, or the receiver's static type is
@@ -4844,7 +4844,7 @@ private:
     // return `owned Subscription` (stdlib §2.11), so the §28.14 bounding
     // object resolves per form 2 (owned return initializing a `using var`) —
     // see scopedBoundingLocal. As of v0.180 (#1541) `EventSource<T>.Add` /
-    // `AsyncEventSource<T>.Add` are `scoped` too (§24.3): a bare/qualified
+    // `AsyncEventSource<T>.Add` are `scoped` too (§24): a bare/qualified
     // `<event>.Add(handler)` (and the `+=` desugaring) admits per §28.14
     // bounding form 4 (the event's containing instance). `Remove` stays
     // call-bounded.

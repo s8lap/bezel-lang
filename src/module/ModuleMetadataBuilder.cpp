@@ -888,7 +888,7 @@ MetaParam convertParam(const sema::ParameterSymbol& p, sema::SemaContext& ctx) {
     MetaParam mp;
     mp.name = std::string(p.name);
     mp.modifier = std::string(p.modifier);  // "", "ref", "out", "owned", ...
-    // Prefer a context-supplied resolved type (§24.3 event-handler params),
+    // Prefer a context-supplied resolved type (§24 event-handler params),
     // else the resolved type of the syntactic annotation.
     if (p.resolvedDeclType != nullptr)
         mp.type = convertType(p.resolvedDeclType);

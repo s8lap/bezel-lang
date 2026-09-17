@@ -1310,7 +1310,7 @@ void* bz_task_when_all(void* task_arr) {
 // Variant of bz_task_when_all that collects each input task's result (elem_size
 // bytes) into a new bz_array_t and completes the aggregate with a ptr-sized
 // result (the Array<T> pointer). Fault propagation matches bz_task_when_all
-// (§1529): the terminal continuation scans the ORIGINAL input array in INPUT
+// (#1529): the terminal continuation scans the ORIGINAL input array in INPUT
 // ORDER for the first non-successful task, rather than racing on completion
 // order; `fault_borrowed` marks the aggregate so codegen never double-frees
 // the fault object the winning input task still owns.

@@ -955,7 +955,7 @@ void Resolver::checkEnumRestrictions() {
                 }
                 continue;
             }
-            // per §24.1 (v0.180): an event's compiler-generated `owned
+            // per §24 (v0.180): an event's compiler-generated `owned
             // EventSource` backing field requires an owning, disposable
             // container, which an enum is not (§9.7, Appendix C.3).
             if (dynamic_cast<EventSymbol*>(m)) {
@@ -965,7 +965,7 @@ void Resolver::checkEnumRestrictions() {
                     "` may not declare an `event` member — an event's "
                     "compiler-generated `owned EventSource` backing field "
                     "requires an owning, disposable container, which an enum "
-                    "is not (§24.1, §9.7)");
+                    "is not (§24, §9.7)");
                 continue;
             }
             if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
@@ -1163,7 +1163,7 @@ void Resolver::checkChoiceDispatchModifiers() {
 //     separate, pre-existing enum-side gap this fix does not touch —
 //     filed alongside #3840's other enum/choice over-admission catalog).
 //   - the `event` rejection is worded from §35.2's admitted-list boundary
-//     ("not part of" the list), not enum's/record's §24.1/§9.7 "not an
+//     ("not part of" the list), not enum's/record's §24/§9.7 "not an
 //     owning disposable container" reasoning — an OWNING choice IS a real
 //     disposal-obligated container (§35.4 rule 1), so that container-based
 //     claim would be FALSE for it; the admitted-list boundary holds
@@ -1822,7 +1822,7 @@ void Resolver::checkRecordRestrictions() {
                     "` may not declare a destructor (§9.7)");
                 continue;
             }
-            // per §24.1 (v0.180): an event's compiler-generated `owned
+            // per §24 (v0.180): an event's compiler-generated `owned
             // EventSource` backing field requires an owning, disposable
             // container, which a record is not (§9.7, Appendix C.3).
             if (dynamic_cast<EventSymbol*>(m)) {
@@ -1832,7 +1832,7 @@ void Resolver::checkRecordRestrictions() {
                     "` may not declare an `event` member — an event's "
                     "compiler-generated `owned EventSource` backing field "
                     "requires an owning, disposable container, which a record "
-                    "is not (§24.1, §9.7)");
+                    "is not (§24, §9.7)");
                 continue;
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
@@ -1870,7 +1870,7 @@ void Resolver::checkRecordRestrictions() {
                 // `IDisposable`), and §35.4 makes owning choices move-only
                 // value types whose active case carries `owned` payloads
                 // (§28.3); the buried owner would never be discharged. The
-                // §35.4 classification is structural (§35.4.1) — a generic
+                // §35.4 classification is structural (§35.4) — a generic
                 // `Opt<T>` field whose `T` is an owning class instantiates to
                 // an owning choice and is rejected at the instantiation site.
                 // Borrow-bearing and value-like choices are unaffected; the
@@ -5841,7 +5841,7 @@ void Resolver::checkAbstractImplementations() {
         // classPositionalFieldProperty / the box-vtable Pass C fallback both
         // key off). concreteProps above is typed to PropertySymbol* and
         // cannot hold it, so it is tracked separately here — the accessor-set
-        // (#2413) and type-match (§2380) checks below both consult this map
+        // (#2413) and type-match (#2380) checks below both consult this map
         // when concreteProps has no entry, so a positional-field satisfaction
         // is checked exactly like a declared property one (always getter-
         // only, since §9.1's generated property never has a setter).
@@ -11847,7 +11847,7 @@ static bool isChoiceTypeRef(const TypeRef* rt) {
 // classification under §35.4). The owning-classified-choice branch above
 // already short-circuits before this one, so a borrow-bearing OWNING
 // choice never reaches this predicate; what reaches here is a
-// `BorrowBearing`-classified choice (§35.4.2).
+// `BorrowBearing`-classified choice (§35.4).
 static bool isHoldsBorrowsChoice(const TypeRef* rt,
                                  const sema::SemaContext& ctx) {
     if (!isChoiceTypeRef(rt)) return false;
@@ -13085,7 +13085,7 @@ bool checkStaticReadonlyRecordInit(
 // it has to iterate every declared case and guess by matching arity. That
 // guess is unsound in general (two cases of the same arity are
 // indistinguishable to it) and, per the spec's own field-initializer
-// admission list (§5130-area prose: "it is not a `new` expression … a
+// admission list (#5130-area prose: "it is not a `new` expression … a
 // choice's construction *is* case selection", §35.1), a `new`-expression
 // is not how a choice value is ever legitimately constructed in the first
 // place — the real spelling is a qualified case CALL, `Type.Case(args)`,

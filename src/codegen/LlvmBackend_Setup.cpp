@@ -884,7 +884,7 @@ void Emitter::declareStatics() {
         staticGlobals_[ps] = gv;
     }
 
-    // §24.1 (#477 B6): a STATIC event's backing EventSource<T> is a static
+    // §24 (#477 B6): a STATIC event's backing EventSource<T> is a static
     // owned field — give it a `ptr` global, null until program start. It is
     // allocated (bz_event_source_new) in Main's prologue alongside the static
     // constructors (§22.7) and read by eventSourcePtr. Synchronous events only
@@ -1426,7 +1426,7 @@ llvm::GlobalVariable* Emitter::getOrCreateGenericInstStaticGlobal(
     // ... exactly one runtime identity ... regardless of how many compilations
     // emitted code for the type." Before this fix each importing module's
     // independent compilation created its OWN InternalLinkage `bz$Reg$int$Hits`
-    // — two private, never-synchronized copies (§1513's "0/0, not even 1/1"
+    // — two private, never-synchronized copies (#1513's "0/0, not even 1/1"
     // repro: neither copy is ever the ONE process-wide instance the runtime
     // initializer described below actually populates). ODR-safety: `instInit`
     // is deterministic from (fs, the concrete substitution) alone — every
@@ -2723,7 +2723,7 @@ void Emitter::emitExportedPropertyGetters() {
 // `r.Name := 55; return r.x + r.Name;` against an imported record with a
 // public settable computed property returned 9 (the untouched original,
 // i.e. `_n` still 1) instead of 64 — the write silently dropped, exactly
-// the #2400 "DIRECT shape" symptom §2400's own header documents, not a link
+// the #2400 "DIRECT shape" symptom #2400's own header documents, not a link
 // error (lowerImportedPropertySetValue's pre-#2489 `isPointerTy()` guard,
 // see LlvmBackend_Assign.cpp, rejects the by-value record receiver before
 // ever emitting the call, so the undefined symbol this gate leaves dangling
@@ -4147,7 +4147,7 @@ llvm::Function* Emitter::ensureVtableWideningThunk(
 }
 
 
-// §24.7 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
+// §24 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
 // returns the object's backing EventSource<T> (the event's instance field).
 // Cached per EventSymbol. Self-contained: saves/restores the builder so it may
 // run during declareVtables (before method bodies are emitted).
@@ -4201,7 +4201,7 @@ void Emitter::declareVtables() {
             if (ms && !isStaticMethod(ms))
                 ifaceMethodIndex_[ms] = idx++;
         }
-        // §24.7 (#477 B7): interface events follow the methods in the itab,
+        // §24 (#477 B7): interface events follow the methods in the itab,
         // each holding a per-class EventSource accessor. Indices continue from
         // the method count so method positions are unchanged. Sync events only.
         for (sema::Symbol* m : ts->members) {
@@ -4283,7 +4283,7 @@ void Emitter::declareVtables() {
                     ifaceMethodIndex_[ms] = idx++;
             }
             // fix #2401: mirror ifaceEventIndex_ for imported interfaces, exactly
-            // as Pass 0 does for local ones above (§24.7 / #477 B7).
+            // as Pass 0 does for local ones above (§24 / #477 B7).
             // fix #2421 (§24/§2.8.2): eventIsAsync, not the bare decl-
             // dependent `ed->isAsync` — an IMPORTED interface's event (decl-
             // null) was silently given NO itable index here, so eventSourcePtr's
@@ -4832,7 +4832,7 @@ void Emitter::declareVtables() {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
             }
-            // §24.7 (#477 B7): collect iface's sync events in declaration order
+            // §24 (#477 B7): collect iface's sync events in declaration order
             // (after the methods, matching ifaceEventIndex_'s numbering).
             // fix #2421 (§24/§2.8.2): eventIsAsync, not the bare decl-
             // dependent `ed->isAsync` — when `iface` is an IMPORTED interface
@@ -4881,7 +4881,7 @@ void Emitter::declareVtables() {
                 }
                 itabElems.push_back(fp);
             }
-            // §24.7 (#477 B7): append a per-class accessor for each interface
+            // §24 (#477 B7): append a per-class accessor for each interface
             // event. The accessor returns the implementing object's backing
             // EventSource<T> (the class's own event field). Interface-typed
             // event access dispatches here to reach the real source.
@@ -9038,7 +9038,7 @@ bool Emitter::isFreshOwnedClassProducer(const ast::Expr* e) const {
 }
 
 
-// §22.7 / §22.13 / §24.1: the entry-point (Main) static-init prologue. Runs
+// §22.7 / §22.13 / §24: the entry-point (Main) static-init prologue. Runs
 // the program-wide static initialization that must complete before any user
 // code: the SerializationException runtime vtable, every non-lazy static
 // constructor, and the allocation of each static event's backing EventSource<T>
@@ -9099,7 +9099,7 @@ void Emitter::emitMainStaticInitPrologue() {
         builder_.CreateCall(e.fn, {});
         emitPendingCheck();
     }
-    // §24.1 / §22.13 (#477 B6): allocate each static event's backing
+    // §24 / §22.13 (#477 B6): allocate each static event's backing
     // EventSource<T> at program start (the single static root), so a
     // subscribe/raise on a static event reaches a real shared source. Mirrors
     // the per-instance allocation done during construction (emitInstanceInit),
@@ -9656,7 +9656,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // enclosing try/catch (e.g. in a test), the TypeInitializationException
     // reaches the catch arm; otherwise it propagates to Main's propagateBB
     // (bz_unhandled_exception).
-    // §22.7 / §22.13 / §24.1: the entry-point (Main) static-init prologue —
+    // §22.7 / §22.13 / §24: the entry-point (Main) static-init prologue —
     // SerializationException vtable, static ctors, and static-event backing
     // sources. Factored into emitMainStaticInitPrologue so the async-Main entry
     // (emitAsyncMethod, which returns from emitFunctionBody before this point)
@@ -11138,21 +11138,21 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                    // §28.13 (#620): owned Shared<T>/Weak<T> field also needs
                    // cleanup if the constructor body throws.
                    isOwnedSharedWeakField(fs) ||
-                   // §28.5/§24.4 (#879): owned Subscription field also needs
+                   // §28.5/§24 (#879): owned Subscription field also needs
                    // cleanup if the constructor body throws.
                    isOwnedSubscriptionField(fs) ||
                    // #1643 / §29.7: owned IEnumerable<T>/IOwningEnumerable<T>
                    // field's iterator frame needs cleanup (slot-1 dispose) if
                    // the constructor body throws after it was assigned.
                    isOwnedIteratorInterfaceField(fs) ||
-                   // §6.5 / §24.3 (#1646): owned EventSource<T>/AsyncEventSource<T>
+                   // §6.5 / §24 (#1646): owned EventSource<T>/AsyncEventSource<T>
                    // field (user-constructed) also needs freeing if the ctor body
                    // throws after it was assigned.
                    isOwnedEventSourceField(fs))) {
             hasOwnedToClean = true;
             break;
         }
-        // #480 / §24.1 / §28: EventSymbol backing fields are also owned — each
+        // #480 / §24 / §28: EventSymbol backing fields are also owned — each
         // instance event's EventSource is allocated by emitInstanceInit BEFORE the
         // ctor body runs.  If the ctor body throws the source must be freed by the
         // cleanup block.  Including EventSymbol here ensures the cleanup block is
@@ -11308,7 +11308,7 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                                llvm::StructType* st) {
     // Own (non-inherited) instance storage only: `t`'s own non-static fields,
     // auto-properties, and instance event backing fields (sync + async per
-    // §24.5 / #1176) — in declaration order (the same per-member shape
+    // §24 / #1176) — in declaration order (the same per-member shape
     // collectInstanceStorage records, minus the base-first recursion).
     std::vector<const sema::Symbol*> storage;
     for (const sema::Symbol* m : t->members) {
@@ -11881,7 +11881,7 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
 
-    // per §24.1: initialize each instance event's backing EventSource<T> slot
+    // per §24: initialize each instance event's backing EventSource<T> slot
     // to a fresh, empty source during construction.
     for (const sema::Symbol* m : storage) {
         if (!dynamic_cast<const sema::EventSymbol*>(m)) continue;
@@ -14466,7 +14466,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // Array branch above — sharing its `d.collection = true` path
                     // would call the wrong runtime free and leak the dict struct +
                     // entries). Set<T> is a borrowing-family collection exactly
-                    // like Array<T> (§28.9/§7052's table: trivial-dispose Dispose,
+                    // like Array<T> (§28.9/#7052's table: trivial-dispose Dispose,
                     // backing "reclaimed with the instance"), so the same implicit-
                     // reclaim obligation applies; #2142 found it was in NEITHER
                     // eligibility set. buildCollectionTempDisposal derives the
@@ -14527,7 +14527,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // derives the correct per-value disposer — null for a plain
                     // int/value V, the box-free thunk for a record V, the string-
                     // release thunk for a string V). `Dictionary<K,V>` is trivial-
-                    // dispose (§28.9/§7052): its backing is "reclaimed with the
+                    // dispose (§28.9/#7052): its backing is "reclaimed with the
                     // instance", but this literal path early-returns, bypassing
                     // the shared #1028 reclaim block at the end of lowerLocalDecl
                     // (that block only matches a ToDictionary()-CALL initializer,
@@ -14994,7 +14994,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 //
                 // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the snapshot is
                 // INDEPENDENT of the source set (it owns its own key table — the
-                // §389 `bz_lazy_from_set` API materialises a fresh key snapshot,
+                // #389 `bz_lazy_from_set` API materialises a fresh key snapshot,
                 // distinct from the live source), so it is sound to free the
                 // source right here at the local-decl site for the same
                 // "unbound `new` ⇒ sole owner" shape the RETURN coercion's
@@ -18591,7 +18591,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
-    // §6.5 / §24.3 (#2026): a `using var` bound to an EventSource<T> /
+    // §6.5 / §24 (#2026): a `using var` bound to an EventSource<T> /
     // AsyncEventSource<T>. These are bz_event_source_t* objects with no user
     // TypeSymbol and no vtable (the same runtime object emitInstanceInit mints
     // for a keyword-form event and that Subscribe/Add/Remove/Raise/RaiseAsync
@@ -19152,7 +19152,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     //
     // Why a NEW arm rather than widening `usingVarOwnsClassObjectDynamically`:
     // that predicate's `isClassOrInterfaceRef` (line 33388) explicitly
-    // requires `rt->declaration`, and the §2921/#4326 vtable-classification
+    // requires `rt->declaration`, and the #2921/#4326 vtable-classification
     // derivation forces the subtraction in the OTHER direction — adding
     // these names to a "class-like" check would also widen the explicit-
     // Dispose classification and risk silently treating them as vtable-
@@ -23372,7 +23372,7 @@ struct StringEscapeWalker {
     // The separate ClosureEscapeWalker consumer (#2481's third) is NOT
     // covered by this flag (a different struct entirely) and keeps the
     // pre-existing unconditional scrutinee-escape rule — needs its own,
-    // separately-argued soundness case (§2481 tracking issue).
+    // separately-argued soundness case (#2481 tracking issue).
     bool scrutineeBorrowMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
     // that were independently proven never to escape. A binding of the target into
@@ -23923,7 +23923,7 @@ struct StringEscapeWalker {
         // args[0].value)` at each arm) — Add/TryAdd's VALUE-position second
         // argument (index 1) and GetOrAdd's factory-closure second argument
         // are NOT widened by this change (index != 0 never matches below);
-        // their co-owned-+1/retain story is different (§3703's VALUE-side
+        // their co-owned-+1/retain story is different (#3703's VALUE-side
         // handling) and stays out of scope here, exactly as issue #3886
         // scoped it.
         //
@@ -24381,7 +24381,7 @@ struct StringEscapeWalker {
         // Gated on borrowingArrayMode so the shared string/dict/grouping
         // walks keep their conservative escape — their callee-side discipline
         // has no matching counterpart retain, and a release on a string local
-        // that's been moved into a record field via the §4254 raw-store path
+        // that's been moved into a record field via the #4254 raw-store path
         // leaks (#4254 documents exactly this case).
         //
         // NARROW: requires `isTargetIdent` (a non-target argument cannot be
@@ -26513,7 +26513,7 @@ bool Emitter::isOwnedCollectionFieldLvalue(const ast::Expr& target) {
 // bz_array_free / bz_llist_free are null-safe (no-op on null), so the first
 // assignment in a constructor (where the slot holds an uninitialized null
 // pointer) is correctly handled without an explicit null-guard — matching the
-// emitOwnedFieldDisposals comment at §2184.
+// emitOwnedFieldDisposals comment at #2184.
 // Store-new BEFORE dispose-old (like lowerStringFieldStore retain-before-
 // release): the field points to the new value from the moment of the store, so
 // even if the disposal path is re-entrant (unlikely for collections, but
@@ -26563,7 +26563,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     }
 
     // Identify the collection element type and whether this is an owning family.
-    // Reuse the same logic as emitOwnedFieldDisposals (§2185-§2218).
+    // Reuse the same logic as emitOwnedFieldDisposals (#2185-#2218).
     sema::Symbol* sym = ctx_.exprSymbol(target);
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
     const sema::TypeRef* collTy = fs ? ownedCollectionFieldType(fs) : nullptr;
@@ -26592,7 +26592,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
     llvm::Function* elemDisp = pol.disposerThunk;
     // §28.11: borrowing Array/Stack/Queue<string> co-owns a +1 per element
-    // (retainRelease path); use the string-release thunk. Mirrors §2200-§2208.
+    // (retainRelease path); use the string-release thunk. Mirrors #2200-#2208.
     // #2603 / issue #401: IList<T>/IReadOnlyList<T> are array-backed + borrowing
     // (same bz_array_t* + per-element string +1 as Array<T>), so a string-element
     // field of those interface types releases its elements through the SAME thunk.
@@ -30213,7 +30213,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     }
     // #2142 / §28.9 / §28.11: same conservative escape walk as the Array-literal
     // pass above (borrowingArrayMode, safeViewAliases) — Set<T> is a borrowing-
-    // family collection exactly like Array<T> (spec table, §7052/§28.9): a
+    // family collection exactly like Array<T> (spec table, #7052/§28.9): a
     // `for var x in s` clones a per-loop enumerator that borrows the dict table
     // and whose Dispose frees only its own struct, never the backing, so
     // iterating the set is a borrow-read, not an escape (same reasoning as
@@ -31711,7 +31711,7 @@ void Emitter::collectBoxReleaseEligible(
                 candidates.push_back(s);
         }
         // fix #2968 (§8.1 / §8.5 / §18.5 / §28.9, v0.240): record any local
-        // REASSIGNED at statement level, so the §2968 `Object`-slot narrowing
+        // REASSIGNED at statement level, so the #2968 `Object`-slot narrowing
         // (which reads the local's INITIALIZER type) declines on it. Compound
         // assignment counts too — `AssignmentStmt` covers every `op`. See
         // `reassignedOpaqueLocals_` for the two expression-position mutation
@@ -34815,7 +34815,7 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     //     slot. The element disposer must call bz_box_release per element at
     //     array-dispose time, mirroring stringElementReleaseThunk. Today's
     //     ClassBorrow policy stamps a NULL disposer for an interface-typed
-    //     element, so the box leaks — the §2791 defect.
+    //     element, so the box leaks — the #2791 defect.
     //
     // Both cases use the same box-release thunk (`boxElementDisposerThunk`):
     // it calls bz_box_release (the runtime refcount path), which is null-safe
@@ -36672,7 +36672,7 @@ void Emitter::setupBoxDescriptors() {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
             }
-            // §24.7 (#477 B7): collect iface's sync events in declaration order
+            // §24 (#477 B7): collect iface's sync events in declaration order
             // (after the methods, matching ifaceEventIndex_'s numbering). Even
             // though records cannot declare events themselves, an interface that
             // a record implements may declare events; their slots must be
@@ -36823,7 +36823,7 @@ void Emitter::setupBoxDescriptors() {
                 }
                 itabElems.push_back(fp);
             }
-            // §24.7 (#477 B7): append null slots for interface events. Records
+            // §24 (#477 B7): append null slots for interface events. Records
             // cannot declare or back interface events; the slots must be present
             // so property GEP offsets (ifacePropertyGetIndex_) stay correct.
             for (sema::EventSymbol* ie : ifaceEvents) {
@@ -39632,7 +39632,7 @@ llvm::Value* Emitter::emitIsBoxedUnit(llvm::Value* other) {
 }
 
 
-// fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): the §2793 discipline for
+// fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): the #2793 discipline for
 // this new boxable kind. The single function the three boxes (the vtable, the
 // descriptor, the predicate) all consult, so they cannot drift — the same
 // shape #2804 used for inline arrays and #2915 used for the unit type. The

@@ -911,7 +911,7 @@ bool isEventSubscribeCall(const ast::CallExpr& call,
     // signature) — so the single `Subscribe` name covers both.
     if (call.args.size() != 1) return false;
     // The direct-event path: `evt.Subscribe(handler)` / `this.Clicked.Subscribe(...)`
-    // — the EventSymbol-bearing shape (§24.1, the §17.2 desugaring of the
+    // — the EventSymbol-bearing shape (§24, the §17.2 desugaring of the
     // `+=` operator stays in `Emitter::isSubscriptionExpr`'s recognition,
     // which we mirror here for the §21.1 half). An event-member access on its
     // own is a `MemberAccessExpr` / `IdentifierExpr` carrying an `EventSymbol`
@@ -1471,7 +1471,7 @@ bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
 // cycles.
 namespace {
 
-// §35.4.1 / §15.3: a payload field's resolved type is a MOVE-ONLY VALUE TYPE
+// §35.4 / §15.3: a payload field's resolved type is a MOVE-ONLY VALUE TYPE
 // — an owning inline array (`[N owned]T`) or another owning choice (reached
 // transitively). Owns cases is what makes a choice owning; value types that
 // are NOT move-only (records, value-like choices, enums, primitives) do not.
@@ -1520,9 +1520,9 @@ bool payloadFieldTypeIsMoveOnly(
     return false;
 }
 
-// §35.4.2 / §9.7: a payload field's resolved type is BORROW-CARRYING under
+// §35.4 / §9.7: a payload field's resolved type is BORROW-CARRYING under
 // §9.7's definition (verbatim with "record" read as "record or choice" per
-// §35.4.2): a plain (unmarked) class/interface reference field (nullable
+// §35.4): a plain (unmarked) class/interface reference field (nullable
 // or not); an inline array of reference-typed elements; a borrow-bearing
 // record; or transitively a borrow-bearing choice. The caller has already
 // checked the field is NOT `owned`-marked (owning is decided first).
@@ -1567,7 +1567,7 @@ bool payloadFieldTypeIsBorrowCarrying(
                                                    &choiceSeen);
             }
             if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
-                // §35.4.2 transitivity: a payload that is itself a borrow-
+                // §35.4 transitivity: a payload that is itself a borrow-
                 // bearing choice. Classify at THIS instantiation (env-threaded,
                 // #2183) via the shared core, which continues the `choiceSeen`
                 // path guard.
@@ -1662,7 +1662,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     const RecordSubstEnv* fieldEnv = myEnv.map.empty() ? nullptr : &myEnv;
 
     const ChoiceClassification verdict = [&]() -> ChoiceClassification {
-        // §35.4.1: OWNING — any case has an ACTIVE `owned` marker (per the
+        // §35.4: OWNING — any case has an ACTIVE `owned` marker (per the
         // §28.1 per-instantiation erasure oracle) or a move-only value-typed
         // payload. The `owned`-marker leg threads the in-flight `choiceSeen`
         // path guard through the file-local oracle impl so the choice↔choice
@@ -1690,7 +1690,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                     return ChoiceClassification::Owning;
             }
         }
-        // §35.4.2: BORROW-BEARING — any case has a plain (unmarked) borrow-
+        // §35.4: BORROW-BEARING — any case has a plain (unmarked) borrow-
         // carrying payload field under §9.7's definition, classified AT THIS
         // instantiation via `fieldEnv` (#2183).
         for (const sema::ChoiceCaseSymbol* ccs : cases) {
@@ -1703,7 +1703,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                     return ChoiceClassification::BorrowBearing;
             }
         }
-        // §35.4.3: VALUE-LIKE.
+        // §35.4: VALUE-LIKE.
         return ChoiceClassification::ValueLike;
     }();
     choiceSeen.erase(rt);

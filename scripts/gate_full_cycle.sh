@@ -836,6 +836,36 @@ if [ "$_gs_skipped" -gt "$_gs_skip_cap" ]; then
 fi
 say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
 
+# src/ citation phase (#4455). Build-free: it cross-references the §-citations
+# in src/ against the section headings every document defines, so it sits here
+# beside the gate self-tests rather than in the compile path.
+#
+# A citation is how a reader finds the authority for what the code does
+# (CLAUDE.md, "Comments"). One that resolves nowhere is worse than none: it
+# claims an authority and spends the reader's time disproving it. The first run
+# found 298 sites — 165 citing subsections of a RETIRED §24, 113 issue numbers
+# wearing a section sigil, 20 naming sections no document has.
+#
+# Self-test first, as every other ratchet here does: the checker reads ALL the
+# documents' headings, and a checker that read only the spec's would call every
+# rationale citation dangling — which is exactly what the first measurement did.
+say "src-citation phase: scripts/check_src_citations.py"
+_sc_log="$LOGDIR/${TAG}_src_citations.log"
+if ! python3 scripts/check_src_citations.py --self-test > "$_sc_log" 2>&1; then
+  say "CYCLE FAILURE: check_src_citations SELF-TEST failed — the checker cannot"
+  say "  be trusted to report on the tree. See $_sc_log"
+  tail -20 "$_sc_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_src_citations.py >> "$_sc_log" 2>&1; then
+  say "CYCLE FAILURE: src/ carries §-citations that resolve to no document —"
+  say "  a citation is how a reader finds the authority for the code (#4455)."
+  say "  See $_sc_log"
+  tail -40 "$_sc_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "src-citation phase: GREEN (every §-citation in src/ resolves)"
+
 # Rule-corpus harness phase (tests/conformance/rules). Build-free and fast, so
 # it sits beside the gate self-tests rather than in the conformance phase, which
 # needs a bezelc. Three checks, all fail-closed:

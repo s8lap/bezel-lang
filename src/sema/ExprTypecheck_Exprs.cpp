@@ -1218,7 +1218,7 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         //
         // The diagnostic keeps the parameterless wording VERBATIM (the "exactly
         // as for an identically-shaped user record" rule #2994 introduced —
-        // the §2935 lesson: a diagnostic that only says "no constructor" leaves
+        // the #2935 lesson: a diagnostic that only says "no constructor" leaves
         // the reader to find the spelling that does exist) so the
         // tests/lit/builtin_closed_ctor_surface_reject_2994.bzl CHECK-DAG
         // pins keep matching, and adds an arity-equal sentence for the
@@ -1656,7 +1656,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         ctx_.setExprType(&e, rt);
                     }
                 } else if (par->resolvedDeclType) {
-                    // per §24.3: a context-typed lambda param (event handler).
+                    // per §24: a context-typed lambda param (event handler).
                     ctx_.setExprType(&e, par->resolvedDeclType);
                 }
             } else if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
@@ -2357,7 +2357,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         typeUnary(*ue);
     }
-    // §17.12 / §2553: the postfix `!` (null-forgiving) operator yields
+    // §17.12 / #2553: the postfix `!` (null-forgiving) operator yields
     // the non-nullable form of its operand's type. Recording it lets
     // member access through `x!` (and any other consumer) resolve —
     // without it, `x!.member` reads/writes silently fail (#206).
@@ -4579,7 +4579,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // any arg check for a body-only record (positional-field
                             // count is zero), where §9.1 has nothing to validate
                             // and §9.2 declares no implicit default ctor — until
-                            // §4059 fix's `ctors.empty()` arm rejects the silent
+                            // #4059 fix's `ctors.empty()` arm rejects the silent
                             // zero-fill (`new Foo()` type-checked clean and minted
                             // a 0-valued record; `return f.Bar;` returned 0). The
                             // fix opens this gate so every record — positional,
@@ -7299,7 +7299,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         pendingLambdaParamTypes_ = savedIifeParams;
         currentCallArity_ = savedArity;
         calleeOfCallCtx_ = savedCallee;
-        // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
+        // per §24: an event-handler argument (`<event>.Subscribe(h)` / .Add /
         // .Remove) — push the event payload type so an untyped handler lambda's
         // parameter is typed as `T`, letting its body resolve `e.Field`.
         TypeRef* eventPayload = ce->callee
@@ -7850,7 +7850,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
             }
             if (a.value) {
-                // per §24.3 / stdlib §5 (D7): type the (single) untyped lambda
+                // per §24 / stdlib §5 (D7): type the (single) untyped lambda
                 // param as the event payload T (handler) or the LINQ source
                 // element T, so its body resolves member access on the param.
                 TypeRef* savedPending = pendingLambdaParamType_;
@@ -8931,7 +8931,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // symbols. Each parameter becomes a ParameterSymbol whose
         // declType is inferred from the explicit type annotation (untyped
         // lambda params remain null — callers must supply context).
-        // per §24.3: an event-handler lambda — give its single untyped param
+        // per §24: an event-handler lambda — give its single untyped param
         // the event payload type T. Consumed once (cleared) so nested lambdas
         // don't inherit it.
         TypeRef* eventParamType = pendingLambdaParamType_;
@@ -9009,7 +9009,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // type is unchanged by the spelling").
                 TypeRef* target = pi < inferredParamTypes.size()
                     ? inferredParamTypes[pi] : nullptr;
-                // §24.3 / stdlib §5 (D7): the spec's own §27.4 headline example
+                // §24 / stdlib §5 (D7): the spec's own §27.4 headline example
                 // — `entries.Select((Entry(k, v)) => ...)` — is a single-param
                 // LINQ/event-handler lambda, whose target type flows through
                 // the SINGULAR eventParamType (set from linqLambdaElementType /
@@ -9057,7 +9057,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
             if (p.type) ps->declType = p.type.get();
             else if (eventParamType && lam->params.size() == 1)
-                ps->resolvedDeclType = eventParamType;  // §24.3 handler param
+                ps->resolvedDeclType = eventParamType;  // §24 handler param
             // fix #829: an untyped param takes its inferred type from the
             // lambda's expected function type, positionally.
             else if (pi < inferredParamTypes.size() && inferredParamTypes[pi])

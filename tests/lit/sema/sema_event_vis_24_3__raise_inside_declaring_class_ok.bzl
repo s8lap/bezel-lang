@@ -1,7 +1,7 @@
 // Ported from tests/sema/event_visibility_test.cpp
 //   (BEZEL_TEST sema_event_vis_24_3, raise_inside_declaring_class_ok).
 //
-// §24.5: `Clicked.Raise(...)` inside the declaring class is allowed.
+// §24: `Clicked.Raise(...)` inside the declaring class is allowed.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //

@@ -1050,7 +1050,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             //      left at i32 fallback".  These cases are NOT void; leave retTy.
             //
             // User-defined void methods (md->returnType==null) get a Kind::Unit
-            // exprType from sema (ExprTypecheck_Calls.cpp §549-553); lowerTypeRef
+            // exprType from sema (ExprTypecheck_Calls.cpp #549-553); lowerTypeRef
             // maps Unit→voidTy and the branch above (ctx_.exprType != null) fires
             // for them — they are already handled without reaching this else.
             //
@@ -2961,7 +2961,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // ancestor scope (e.g. `outer`'s own captured `x`, boxed only to pass
     // down to a nested `inner`) is never itself a LocalDecl of THIS body,
     // so collectCellFreeEligible's fresh walk over `lam.stmts` structurally
-    // cannot rediscover the non-escaping co-capture (§3426 condition (c))
+    // cannot rediscover the non-escaping co-capture (#3426 condition (c))
     // that made the ancestor's answer valid — `outer` does not capture
     // itself. The ancestor's whole-function-body walk (collectCellFreeEligible's
     // #1135 widening, run once for the OUTERMOST body that actually
@@ -4862,7 +4862,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // value the constructor wrote (the call-site analogue of ensureOutVarSlots).
     ensureCtorOutVarSlots(ne, rt);
     if (!rt->declaration) {
-        // §6.5 / §24.3 (#1646): user construction of a producer-side event source
+        // §6.5 / §24 (#1646): user construction of a producer-side event source
         // — `new EventSource<T>()` / `new AsyncEventSource<T>()` (the constructors
         // are public as of stdlib §6.5, v0.187). These have no user TypeSymbol
         // (rt->declaration == null); their runtime value is a plain
@@ -12313,7 +12313,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             return builder_.CreateAnd(geL, leH);
         }
     }
-    // §19: BindingPattern `var x` or `var x: T` (§3016).
+    // §19: BindingPattern `var x` or `var x: T` (#3016).
     // Unconstrained `var x` always matches and binds the scrutinee's value
     // to `x` within the arm body. The binding is a borrow (non-destructive).
     // `var x: T` with a type annotation is a type-test + binding.

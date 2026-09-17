@@ -2340,7 +2340,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // ever reaches this point with `mm == "Compare"` any more. The
             // replacement instance member `CompareTo(other: string[, bool])`
             // is a PRIMITIVE-STRING-VALUE receiver call, which
-            // checkBuiltinStringCallArgs (§2315) already gates for its
+            // checkBuiltinStringCallArgs (#2315) already gates for its
             // non-nullable `other` parameter at position 0 (it has done so
             // since CompareTo's single-arg form was added, fix #586) — so the
             // #2581 hole this block patched does not reopen for the new 2-arg
@@ -2876,7 +2876,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 else if (auto* cncm =
                              dynamic_cast<const ast::NullCondMemberExpr*>(
                                  ce.callee.get()))
-                    // per §7.5/§1278: `recv?.Method<T>(...)` carries its
+                    // per §7.5/#1278: `recv?.Method<T>(...)` carries its
                     // explicit type args the same way `recv.Method<T>(...)` does.
                     callTypeArgs = &cncm->typeArgs;
                 else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
@@ -3496,7 +3496,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // check) below — see the header comment on
                 // `checkArgsAgainstParams` for the gap it closes.
                 if (!md->genericParams.empty()) {
-                    // per §14.1 (issue #509/#561) + §7.5/§1278: explicit type
+                    // per §14.1 (issue #509/#561) + §7.5/#1278: explicit type
                     // args may appear on a MemberAccessExpr callee
                     // (`obj.Method<T>(...)`), a NullCondMemberExpr callee
                     // (`obj?.Method<T>(...)` — the null-conditional form is
@@ -7593,7 +7593,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // First/Last value properties (T? — nullable element)
                         // are property accesses, not call expressions — typed in
                         // the member-access typechecker (ExprTypecheck_Calls.cpp
-                        // §2194 property section and LlvmBackend_Exprs.cpp).
+                        // #2194 property section and LlvmBackend_Exprs.cpp).
                     }
                     // per §4.6: LinkedListNode<T> accessor methods / properties.
                     if (colName == "LinkedListNode" &&
@@ -9045,7 +9045,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // ExprTypecheck_Exprs.cpp:1088). So 'Task.TotallyBogusMember
                 // (1, 2)' on a class with no instance path went through
                 // the static-call dispatch, never triggered the gate,
-                // and degraded to zero with only the §2434 internal
+                // and degraded to zero with only the #2434 internal
                 // warning. Mirror the per-instance-type closed-surface
                 // arms further below (lines 6914-7775, the "no member `M`
                 // on `R`; documented surface: ..." diagnostic family)
@@ -10173,7 +10173,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
-                    // §6.5 / §24.3 (#1610): EventSource<T> / AsyncEventSource<T>
+                    // §6.5 / §24 (#1610): EventSource<T> / AsyncEventSource<T>
                     // instance methods on a value held in a local, parameter, or
                     // field — i.e. NOT a direct `<event>.Method()` access (whose
                     // receiver carries no exprType and is handled by the
@@ -10183,7 +10183,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // methods; without this block any call — valid or bogus —
                     // silently compiles and no-ops at runtime (#1610). Mirror the
                     // Channel<T> pattern: type each known method (stdlib §6.5)
-                    // and reject any unrecognized name. The §24.3 visibility
+                    // and reject any unrecognized name. The §24 visibility
                     // fence is NOT re-applied here: once a value is typed
                     // EventSource<T>, all producer methods are available per the
                     // type-fence design (stdlib §6.5 — the reference is
@@ -14453,7 +14453,7 @@ TypeSymbol* ExprTC::memberTargetType(const ast::Expr* target) {
                     }
                 } else if (par->resolvedDeclType &&
                            par->resolvedDeclType->kind == TypeRef::Kind::Named) {
-                    // per §24.3: a context-typed lambda param (event handler).
+                    // per §24: a context-typed lambda param (event handler).
                     targetType = par->resolvedDeclType->declaration;
                 }
             } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
@@ -14466,7 +14466,7 @@ TypeSymbol* ExprTC::memberTargetType(const ast::Expr* target) {
     return targetType;
 }
 
-// per §24.3: if `callee` is `<event>.Subscribe` / `.Add` / `.Remove`, return
+// per §24: if `callee` is `<event>.Subscribe` / `.Add` / `.Remove`, return
 // the event's payload type (the `: T` annotation, or unit when omitted). The
 // callee's MemberAccess target carries the EventSymbol (set when the target was
 // visited). Null otherwise.
@@ -14482,7 +14482,7 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
             if (!ed->type) return nullptr;  // no-payload → unit (no param)
             return ctx_.resolvedType(*ed->type);
         }
-        // fix #3211 (§24.3/§2.5, v0.254): imported event — `decl` is null
+        // fix #3211 (§24/§2.5, v0.254): imported event — `decl` is null
         // because ModuleLoader never reconstructs an ast::EventDecl for an
         // imported member (mirrors the #503/#2414 Property/Indexer
         // limitation; the wire side carries the type in MetaMember::type →
@@ -14496,7 +14496,7 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
         if (!rt || rt->kind == TypeRef::Kind::Unit) return nullptr;
         return rt;
     }
-    // §6.5 / §24.3 (#1610): a Subscribe/Add/Remove on a value held in a local,
+    // §6.5 / §24 (#1610): a Subscribe/Add/Remove on a value held in a local,
     // parameter, or field of static type EventSource<T>/AsyncEventSource<T>
     // (the target is not an EventSymbol). The payload type is the receiver's
     // genericArgs[0], so an untyped handler lambda's `(e)` param is typed as T
@@ -14521,7 +14521,7 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
 // a `.Subscribe` member call whose target resolves to an event member — so the
 // hard error fires. (A Subscription obtained via other APIs — CancellationToken
 // .Register, a stored IEvent value, a method returning `owned Subscription` —
-// is a narrower follow-up; this targets the §24.3 direct-event case of #949.)
+// is a narrower follow-up; this targets the §24 direct-event case of #949.)
 bool ExprTC::isEventSubscribeDrop(const ast::Expr* e) {
     auto* ce = dynamic_cast<const ast::CallExpr*>(e);
     if (!ce || !ce->callee) return false;
@@ -14535,7 +14535,7 @@ bool ExprTC::isEventSubscribeDrop(const ast::Expr* e) {
 // source element type T, return T (the receiver's first generic arg). This lets
 // an untyped LINQ lambda parameter (`(p) => p.x = 5`) be typed as the element
 // type so its body resolves member access (`p.x`) — exactly as the
-// event-handler payload mechanism (§24.3) types `(e) => …` handler params.
+// event-handler payload mechanism (§24) types `(e) => …` handler params.
 // Null when the call is not such a LINQ operator (no seeding applied).
 TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
@@ -14671,11 +14671,11 @@ std::vector<TypeRef*> ExprTC::zipCombineLambdaParamTypes(const ast::CallExpr& ce
     return { elemT, elemU };                              // {T, U}
 }
 
-// per §24.3: enforce the event visibility fence. `op` is the producer-side
+// per §24: enforce the event visibility fence. `op` is the producer-side
 // operation being attempted on the event (`Raise`, `RaiseAsync`, `Add`,
 // `Remove`, or `+=` / `-=`). These are in scope only when the event's static
 // type is `EventSource<T>` / `AsyncEventSource<T>` — i.e. inside the declaring
-// class, or inside a derived class for a `protected` event (§24.5). Outside,
+// class, or inside a derived class for a `protected` event (§24). Outside,
 // the member's type is `IEvent<T>` / `IAsyncEvent<T>`, which has no such
 // member, so the access is a compile error.
 void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
@@ -14685,7 +14685,7 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
     if (!declaring) return;  // defensive: an event always has a parent type
     // Inside the declaring class: the EventSource<T> face is in scope.
     if (currentType_ == declaring) return;
-    // §24.5: a derived class may use the producer-side face for a `protected`
+    // §24: a derived class may use the producer-side face for a `protected`
     // event declared on a base class. Any other event accessed from a subclass
     // (or from anywhere else) is, outside its declaring class, only IEvent<T>.
     if (es->visibility == ast::Visibility::Protected && currentType_ &&
@@ -14704,7 +14704,7 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
         "` is accessed from outside its declaring class `" +
         std::string(declaring->name) + "`, where its static type is the "
         "subscribe-only interface `IEvent<T>` — " + detail +
-        " is not available; only `.Subscribe` may be used here (§24.3)");
+        " is not available; only `.Subscribe` may be used here (§24)");
 }
 
 // §13.1 member-visibility enforcement (issue #432).
@@ -15327,7 +15327,7 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
         callTypeArgs = &callMa->typeArgs;
     else if (auto* callNcm =
                  dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()))
-        // §7.5/§1278: `recv?.Method<T>(...)` — same short-circuit as `.`.
+        // §7.5/#1278: `recv?.Method<T>(...)` — same short-circuit as `.`.
         callTypeArgs = &callNcm->typeArgs;
     else if (auto* callId =
                  dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
@@ -16168,7 +16168,7 @@ bool selfCallSiblingWhereSatisfiedByCaller(
 }  // namespace
 
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
-    // per §24.3: the event visibility fence. When the access target resolves
+    // per §24: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
     // `Add`, `Remove`) are only in scope inside the declaring class (and inside
     // a derived class for a `protected` event); from outside, the event's
@@ -16181,7 +16181,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (ma.member == "Raise" || ma.member == "RaiseAsync" ||
                 ma.member == "Add" || ma.member == "Remove")
                 checkEventVisibilityFence(es, ma.member, ma.span.begin);
-            // per stdlib §6.5 / §24.3 (#1639): a DIRECT `<event>.Method()`
+            // per stdlib §6.5 / §24 (#1639): a DIRECT `<event>.Method()`
             // access whose member name is not on the event's documented
             // surface previously fell straight through to the ordinary
             // member-lookup path below, which never resolves an event name
@@ -17397,7 +17397,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                 } else if (par->resolvedDeclType &&
                            par->resolvedDeclType->kind == TypeRef::Kind::Named) {
-                    // per §24.3: a context-typed lambda param (event handler).
+                    // per §24: a context-typed lambda param (event handler).
                     targetType = par->resolvedDeclType->declaration;
                 }
             } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {

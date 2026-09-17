@@ -636,7 +636,7 @@ bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
 // member call on an `IEvent<T>` / `IAsyncEvent<T>` / `ISharedEvent<T>` face, on
 // the producer-side `EventSource<T>` / `AsyncEventSource<T>` /
 // `SharedEventSource<T>` sealed classes, or on a direct event member access
-// (carrying an `EventSymbol`, §24.1). Every one of those returns
+// (carrying an `EventSymbol`, §24). Every one of those returns
 // `owned Subscription` (stdlib §2.11), so by §21.1's text it MUST be rejected
 // as a `const` initializer — but the call is to a COMPILER-KNOWN MEMBER with
 // no user `MethodDecl`, so `producerState`'s `md->returnOwned` arm (the only
@@ -845,9 +845,9 @@ RecordSubstEnv::Entry resolveRecordFieldSubst(const sema::TypeRef* ft,
 // containment rule; the guard mirrors isBorrowBearingRecordOrSpan's #1611
 // discipline.
 enum class ChoiceClassification {
-    ValueLike,      // §35.4.3
-    BorrowBearing,  // §35.4.2
-    Owning,         // §35.4.1
+    ValueLike,      // §35.4
+    BorrowBearing,  // §35.4
+    Owning,         // §35.4
 };
 
 std::optional<ChoiceClassification> classifyChoiceType(

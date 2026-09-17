@@ -2,7 +2,7 @@
 //   (BEZEL_TEST event_source_member_dispatch_1610, real_members_accepted).
 //
 // ---------------------------------------------------------------------------
-// (2) §6.5 / §24.3 / #1610: a REAL member call on an `EventSource<T>`
+// (2) §6.5 / §24 / #1610: a REAL member call on an `EventSource<T>`
 // parameter compiles cleanly — Raise / Subscribe / Add / Remove are all on
 // the producer surface (stdlib §6.5). (Before the fix these compiled too,
 // but only because EVERYTHING compiled; this guards against an over-broad
