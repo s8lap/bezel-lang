@@ -105,6 +105,7 @@ static const char* kDisposerBodyMidEmission =
     "  private owned _o: Owner; "
     "  public constructor() _o := new Owner(); end constructor; "
     "  destructor "
+    "    Sink.Seen := _o.P; "
     "  end destructor; "
     "end Holder; "
     "class Sink "
