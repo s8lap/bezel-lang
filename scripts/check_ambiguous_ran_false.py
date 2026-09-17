@@ -206,10 +206,67 @@ BEZEL_TEST_LINE = re.compile(r'BEZEL_TEST\s*\(\s*\w+\s*,\s*(\w+)\s*\)')
 _WORDCHAR = re.compile(r'[0-9A-Za-z_]')
 
 
+# Partial numeric-literal grammar for the C3 completion item. The
+# pp-number grammar (C++14+) allows `9x` as a valid pp-number (digit,
+# then identifier-nondigit), so a strict pp-number check would NOT
+# reject the malformed `9x` prefix. The detector instead validates
+# against a partial NUMERIC-LITERAL grammar: a token that begins with
+# a digit (or `0x`/`0X` for hex, `0b`/`0B` for binary, `0o`/`0O` for
+# octal) and contains only digits and a small set of exponent/sign
+# markers. This rejects `9x` (the `x` is not a valid digit or exponent
+# letter) without rejecting `0xFF` (`FF` are valid hex digits) or
+# `1e+10` (the `e+` exponent is valid). See issue #3935 (2026-09-06).
+_HEX_DIGITS = set('0123456789abcdefABCDEF')
+_BIN_DIGITS = set('01')
+_OCT_DIGITS = set('01234567')
+_DEC_EXTRAS = set('eEpP+-')
+
+
+def _is_numeric_literal_run(run):
+    """True if `run` (the contiguous word-char run immediately before a
+    `'` candidate) is a syntactically coherent numeric-literal prefix.
+
+    Accepts:
+    - decimal: ``1``, ``123``, ``1e+10``, ``1.5``
+    - hex:     ``0xFF``, ``0XFF'FF`` (note `'` is not in the run; the
+      run is the chars BEFORE `'` only)
+    - binary:  ``0b1010``, ``0B1010``
+    - octal:   ``0o755``, ``0O755``
+
+    Rejects anything with a non-numeric, non-exponent character anywhere
+    in the run, e.g. `9x`, `1a`, `2ppx` (the `x` in `9x'y'` is the C3
+    bug: a numeric-literal can NEVER have an identifier-nondigit like
+    `x` immediately after a decimal digit). Partial implementation:
+    no enforcement of `e`/`E`/`p`/`P` requiring a following sign, no
+    enforcement of `.` position rules - the goal is "reject malformed
+    prefixes that happen to start with a digit", not "parse every
+    numeric literal in the C++ standard".
+    """
+    if not run:
+        return False
+    # Hex / binary / octal: 0{xXbBoO} prefix
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'xX':
+        return all(c in _HEX_DIGITS for c in run[2:])
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'bB':
+        return all(c in _BIN_DIGITS for c in run[2:])
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'oO':
+        return all(c in _OCT_DIGITS for c in run[2:])
+    # Decimal: digits, e/E (exponent), p/P (hex exponent), +/- (sign)
+    for c in run:
+        if c.isdigit():
+            continue
+        if c in _DEC_EXTRAS:
+            continue
+        return False
+    return True
+
+
 def _is_digit_separator(text, i):
     """True if the `'` at `text[i]` is a C++14 digit separator (`1'000`,
     `0xFF'FF`) rather than the start of a char literal that merely abuts an
-    identifier character on both sides (`return'a'`, `x'y'`) - fix #3920.
+    identifier character on both sides (`return'a'`, `x'y'`) - fix #3920,
+    tightened by fix-C3 (issue #3935) to also reject malformed digit-
+    leading runs like `9x'y'`.
 
     Fix #3915 round 2 flagged a `'` as a separator whenever BOTH neighbours
     were word characters. That is necessary but not sufficient: an
@@ -225,6 +282,17 @@ def _is_digit_separator(text, i):
     "0xFF" starts with '0') apart from an identifier abutting a char
     literal (`return'a'` -> run "return" starts with 'r'; `x'y'` -> run
     "x" starts with 'x') without needing a full numeric-literal grammar.
+
+    fix-C3 (issue #3935) tightens this further: the FIRST-char-is-digit
+    check is necessary but not sufficient - a malformed word-char run
+    that happens to START with a digit (e.g. `9x` in `9x'y'`) but is not
+    actually a numeric-literal prefix (the `x` cannot appear in any
+    numeric literal) was still misclassified, with the subsequent `'`
+    then desyncing quote parity and hiding any trailing `//` comment.
+    The C3 check additionally validates the run against a partial
+    numeric-literal grammar - issue #3935 calls this "low priority" and
+    "unreachable in compiling C++", but the gap matters inside dead/
+    disabled text (the #if-0/-false block discussed by C4).
     """
     n = len(text)
     if not (i > 0 and i + 1 < n and _WORDCHAR.match(text[i - 1]) and
@@ -233,7 +301,11 @@ def _is_digit_separator(text, i):
     j = i - 1
     while j > 0 and _WORDCHAR.match(text[j - 1]):
         j -= 1
-    return text[j].isdigit()
+    if not text[j].isdigit():
+        return False
+    # C3: validate the run against the partial numeric-literal grammar.
+    # Reject malformed digit-leading runs like `9x` in `9x'y'`.
+    return _is_numeric_literal_run(text[j:i])
 
 
 def _strip_comments(text):
@@ -1337,6 +1409,51 @@ BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
             'separator',
             'tests/codegen/char_literal_abuts_short_identifier_test.cpp'
             not in per_file)
+        # C3 fixture (issue #3935): a malformed digit-leading run
+        # `9x'y'` followed by a trailing `// ... BEZEL_EXPECT_FALSE(r.ran)`
+        # comment. Pre-C3, the FIRST `'` was misclassified as a digit
+        # separator (run "9x" starts with `9`, passes the #3920 check),
+        # then the SECOND `'` opened char-literal mode (its right
+        # neighbour is `;`, fails the flanking check), unterminated
+        # across the line, and the trailing `//` comment was HIDDEN
+        # (left unstripped) inside the unterminated char literal. The
+        # test then saw the comment text as a live assertion. Post-C3,
+        # the partial numeric-literal grammar rejects `9x` (the `x` is
+        # not a valid numeric-literal character), so the FIRST `'`
+        # correctly enters char-literal mode, the SECOND `'` closes it
+        # (char literal is `'y'`), and the trailing `//` comment IS
+        # stripped. The fixture is the literal `int z = 9x'y';` line
+        # from #3935 verbatim.
+        _mk(root, 'tests/codegen/malformed_digit_run_test.cpp', """
+// issue #3935 - the literal `int z = 9x'y';` line from the issue, with
+// a trailing `// ... BEZEL_EXPECT_FALSE(r.ran)` comment that MUST stay
+// stripped (the comment text leaks through as a live row if the
+// detector's quote parity desyncs - the exact bug C3 fixes).
+int z = 9x'y';  // quoting BEZEL_EXPECT_FALSE(r.ran) trailing comment must be stripped
+""")
+        chk('C3: a malformed digit-leading run `9x\'y\'` followed by a '
+            'trailing comment - the partial numeric-literal grammar '
+            'rejects `9x` so the first `\'` enters char-literal mode, the '
+            'second `\'` closes it, and the trailing `//` comment IS '
+            'stripped (no live row from the comment text)',
+            'tests/codegen/malformed_digit_run_test.cpp' not in per_file)
+        # C3 control: a VALID numeric-literal prefix with digit
+        # separator still works after the C3 tightening - `0xFF'FF` is
+        # a real C++14 hex literal, the `'` between `FF` and `FF` is a
+        # separator, not a char literal opener. The detector must keep
+        # accepting this shape (otherwise C3 over-corrects into denying
+        # every legitimate separator).
+        _mk(root, 'tests/codegen/valid_digit_separator_test.cpp', """
+// Real C++14 hex literal with a digit separator - same-shape as the
+// malformed fixture above but the run is `0xFF` (a valid hex prefix
+// followed by valid hex digits). The `'` is a real separator, the
+// trailing `// BEZEL_EXPECT_FALSE(r.ran)` is a real comment.
+int z = 0xFF'FF;  // quoting BEZEL_EXPECT_FALSE(r.ran) trailing comment must be stripped
+""")
+        chk('C3: a valid numeric-literal prefix with digit separator '
+            '(0xFF\'FF) still works after C3 tightening - the comment is '
+            'stripped, no live row from the comment text',
+            'tests/codegen/valid_digit_separator_test.cpp' not in per_file)
         # C1 fixtures: the suppression marker mechanism.
         chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
             'BEZEL_TEST body suppresses that row from the count (the '
