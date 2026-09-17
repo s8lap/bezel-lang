@@ -890,19 +890,28 @@ def self_test():
     ok = self_test_tighten() and ok
     ok = self_test_drain_protection() and ok
     ok = self_test_grandfather_missing_fails_closed() and ok
-    # A detector that cannot see the real tree is also broken.
+    # A detector that cannot see the real tree is also broken — but a
+    # legitimately DRAINED tree (all LazyBodyEmitter sites already wired
+    # to NestedBodyScope) is a valid terminal state, not a false green.
+    # The detector's correctness is independently proven by the fixtures
+    # above (which match positive inputs and yield non-zero counts); what
+    # the live-tree scan needs to verify is consistency with the baseline,
+    # not bare presence of violations.
     uncovered, incomplete, _mal = scan(ROOT)
     u_total = len(uncovered)
     i_total = len(incomplete)
-    if not uncovered and not incomplete:
+    base = read_baseline()
+    base_total = sum(u for (u, _i) in base.values()) + \
+                 sum(i for (_u, i) in base.values())
+    if not uncovered and not incomplete and base_total > 0:
         ok = False
-        print('  [FAIL] whole-tree scan found 0 uncovered / 0 incomplete - '
-              'a matcher that matched nothing is what a false green looks '
-              'like')
+        print('  [FAIL] whole-tree scan found 0 uncovered / 0 incomplete '
+              'but baseline has %d total entries — the matcher is broken '
+              'OR someone forgot to --update after a drain' % base_total)
     else:
         print('  [ok  ] whole-tree scan found %d uncovered emitter(s), '
-              '%d incomplete_field_saves site(s) in the live tree'
-              % (u_total, i_total))
+              '%d incomplete_field_saves site(s) in the live tree '
+              '(baseline total %d)' % (u_total, i_total, base_total))
     print('check_nested_body_scope_coverage --self-test: '
           + ('PASS' if ok else 'FAIL'))
     return 0 if ok else 1
