@@ -447,9 +447,26 @@ def _is_exempt(path):
 def scan(root):
     """Return (swallow_sites, conflate_sites, malformed_debt) for every
     .cpp/.hpp file under `root/tests/`, excluding the shared
-    implementation in `tests/support/` for swallowing_guards."""
+    implementation in `tests/support/` for swallowing_guards.
+
+    SCOPE (per spec §2 "What the ratchet asserts"): only `tests/` is in
+    scope. A whole-tree `root.rglob('*')` walk would scan `src/codegen/`,
+    `src/driver/`, and other non-test TUs that contain `-fsanitize=address`
+    for unrelated reasons (e.g., a doc string describing the flag), and
+    on a worktree that has nested worktrees under `.claude/worktrees/`,
+    those nested worktrees' OWN `tests/` trees get scanned as if they
+    were the current tree's tests — which made the detector report 516
+    conflations in r18-c7-coord when the rebanked baseline (manual,
+    for the current tree) was 73. The `SCAN_DIR` constant at line 438
+    names the right scope; this function uses it directly.
+    """
     swallow, conflate, malformed = [], [], []
-    for p in sorted(root.rglob('*')):
+    scan_dir = root / 'tests'
+    if not scan_dir.is_dir():
+        # No tests/ — nothing in scope. (A worktree without a tests/ tree
+        # is a config error elsewhere; here we just return empty.)
+        return swallow, conflate, malformed
+    for p in sorted(scan_dir.rglob('*')):
         if not p.is_file() or p.suffix not in SUFFIXES:
             continue
         rel = str(p.relative_to(root))
@@ -931,6 +948,81 @@ def self_test():
         chk('scan of empty tree returns 0 swallow sites', len(swallow) == 0)
         chk('scan of empty tree returns 0 conflate sites', len(conflate) == 0)
 
+    # --- scope (Bug 1 fix, ratchet-3682 detector): stray src/ + scripts/
+    # files outside tests/ MUST NOT be counted, even when they contain
+    # `-fsanitize=address` + post-link `return -1;`. Pre-fix the detector
+    # did `root.rglob('*')` and walked into src/, docs/, scripts/,
+    # build/, AND into any nested worktree under .claude/worktrees/ —
+    # the latter alone inflated 73 -> 516 on r18-c7-coord (#3682
+    # over-count follow-up). The post-fix `scan()` walks only `tests/`.
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        (root / 'tests').mkdir()
+        (root / 'src').mkdir()
+        (root / 'scripts').mkdir()
+        # Stray src/ file with the bug pattern — MUST NOT count.
+        (root / 'src' / 'stray_src.cpp').write_text(
+            'int runUnderAsanXXX() {\n'
+            '    std::string linkCmd = "clang++ -fsanitize=address -g /tmp/x.o";\n'
+            '    if (std::system(linkCmd.c_str()) != 0) { return -1; }\n'
+            '    return 0;\n'
+            '}\n')
+        # Stray scripts/ file with the bug pattern — MUST NOT count.
+        (root / 'scripts' / 'stray_script.cpp').write_text(
+            'int helper() {\n'
+            '    std::string cmd = "clang++ -fsanitize=address -g";\n'
+            '    if (some_check) return -1;\n'
+            '    return 0;\n'
+            '}\n')
+        # Real conflation in tests/ — MUST count.
+        (root / 'tests' / 'real.cpp').write_text(
+            'int runUnderLeakSanitizer(const std::string& source) {\n'
+            '    const std::string& rtObj = '
+            '::bezel::native_test::asanRuntimeObject();\n'
+            '    if (rtObj.empty()) return -1;\n'
+            '    std::string linkCmd = "clang++ -fsanitize=address -g /tmp/x.o";\n'
+            '    if (std::system(linkCmd.c_str()) != 0) { return -1; }\n'
+            '    return 0;\n'
+            '}\n')
+        swallow, conflate, _ = scan(root)
+        chk('scope: stray src/ helper NOT counted (got=%d want=0)'
+            % len([s for s in conflate if 'src/' in s[0]]),
+            len([s for s in conflate if 'src/' in s[0]]) == 0)
+        chk('scope: stray scripts/ helper NOT counted (got=%d want=0)'
+            % len([s for s in conflate if 'scripts/' in s[0]]),
+            len([s for s in conflate if 'scripts/' in s[0]]) == 0)
+        chk('scope: real tests/ helper IS counted (got=%d want=1)'
+            % len([s for s in conflate if 'tests/' in s[0]]),
+            len([s for s in conflate if 'tests/' in s[0]]) == 1)
+
+    # --- scope: a nested-worktree `.claude/worktrees/<x>/tests/...` tree
+    # is NOT scanned (it belongs to a different worktree, not the current
+    # tree's `tests/`). Pre-fix `root.rglob('*')` walked into it; that's
+    # how the detector reported 516 on r18-c7-coord (where 5 sibling
+    # worktrees each carry their own copy of the test files).
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        (root / 'tests').mkdir()
+        (root / '.claude' / 'worktrees' / 'nested').mkdir(parents=True)
+        (root / '.claude' / 'worktrees' / 'nested' / 'tests').mkdir(parents=True)
+        # Empty tests/ in current tree — would report 0.
+        (root / 'tests' / 'empty.cpp').write_text('// nothing here\n')
+        # A conflation in the nested worktree's tests/ — MUST NOT count.
+        (root / '.claude' / 'worktrees' / 'nested' / 'tests' / 'nested.cpp'
+         ).write_text(
+            'int runUnderLeakSanitizer(const std::string& source) {\n'
+            '    const std::string& rtObj = '
+            '::bezel::native_test::asanRuntimeObject();\n'
+            '    if (rtObj.empty()) return -1;\n'
+            '    std::string linkCmd = "clang++ -fsanitize=address -g /tmp/x.o";\n'
+            '    if (std::system(linkCmd.c_str()) != 0) { return -1; }\n'
+            '    return 0;\n'
+            '}\n')
+        swallow, conflate, _ = scan(root)
+        nested_count = len([s for s in conflate if '.claude/' in s[0]])
+        chk('scope: nested-worktree tests/ NOT scanned (got=%d want=0)'
+            % nested_count, nested_count == 0)
+
     # --- whole-tree sanity: the real tree MUST show non-zero counts for
     # the families we expect — a matcher that matched nothing is what a
     # false green looks like (#3460 family). 49 swallowing-guard sites is
@@ -980,21 +1072,24 @@ def main():
     swallow_sites, conflate_sites, malformed = scan(ROOT)
 
     # Per-file marker data — built once, used twice (swallow filter,
-    # debt-marker per-site attachment).
+    # debt-marker per-site attachment). SCOPE mirrors `scan()` above:
+    # only `tests/` is in scope. The pre-fix walk was whole-tree.
     file_exempt_lines = {}     # file -> set of lines covered by ASAN-LEG-ONLY
     debt_triples = []          # [(file, line, issue)]
     all_malformed = list(malformed)
-    for p in ROOT.rglob('*'):
-        if not p.is_file() or p.suffix not in SUFFIXES:
-            continue
-        rel = str(p.relative_to(ROOT))
-        raw = p.read_text()
-        if not _is_exempt(rel):
-            file_exempt_lines[rel] = exempt_lines_for_only(raw)
-        well, mal = debt_lines(rel, raw)
-        debt_triples.extend(well)
-        for ln in mal:
-            all_malformed.append((rel, ln))
+    marker_scan_dir = ROOT / 'tests'
+    if marker_scan_dir.is_dir():
+        for p in marker_scan_dir.rglob('*'):
+            if not p.is_file() or p.suffix not in SUFFIXES:
+                continue
+            rel = str(p.relative_to(ROOT))
+            raw = p.read_text()
+            if not _is_exempt(rel):
+                file_exempt_lines[rel] = exempt_lines_for_only(raw)
+            well, mal = debt_lines(rel, raw)
+            debt_triples.extend(well)
+            for ln in mal:
+                all_malformed.append((rel, ln))
 
     # Apply ASAN-LEG-ONLY markers to swallow sites — drop exempted lines.
     swallow_filtered = []
