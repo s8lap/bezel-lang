@@ -1321,6 +1321,41 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         llvm::Value* otField =
             builder_.CreateStructGEP(stateStructTy, st, OUTER_TASK_FIELD);
         builder_.CreateStore(outerTask, otField);
+        // fix #3460 (§28.3 / §30.1): the heap frame holds a strong reference to
+        // its own outerTask for the frame's lifetime. The retain runs BEFORE
+        // the synchronous drive (which may immediately call emitAsyncComplete
+        // and free the frame on a body with no awaits) and BEFORE the entry
+        // returns outerTask to the caller (whose bz_task_free from `using var`
+        // scope-end can otherwise race the worker's resume continuation). The
+        // matching release is in emitAsyncComplete and the fault-boundary
+        // block (just before `free(self)`). Without this retain the worker's
+        // `mov OUTER_TASK_FIELD, %rdi` would be a use-after-free when the
+        // caller's release wins the race against the resume — the
+        // `heap-use-after-free in bz$async$M.C$Fill$Resume` of #3460.
+        auto* retainFn = declareC("bz_task_retain",
+                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(retainFn, {outerTask});
+        // fix #3460 (§28.3 / §30.1): for an INSTANCE method, the heap frame
+        // also holds a *borrow* on `this` for the frame's lifetime. Classes
+        // in Bezel are single-owner (no per-class refcount), so a borrowed
+        // `this = c` cannot keep c alive through refcounting alone. The
+        // borrow tracker (runtime side table) lets the OWNER's dispose site
+        // (`using var c := new C()` scope-end) block until the frame's
+        // emitAsyncComplete has run and released the borrow — closing the
+        // race where main's `free(c)` wins against the worker's resume read
+        // of `this._h` (the 24-byte-block UAF of #3460). The borrow is
+        // unconditional for instance methods; a method whose body never
+        // suspends registers + immediately releases inside emitAsyncComplete,
+        // leaving the OWNER's wait a no-op.
+        if (isInstance) {
+            llvm::Value* thisVal = currentThis_
+                                       ? currentThis_
+                                       : &*currentFn_->arg_begin();
+            auto* registerBorrowFn =
+                declareC("bz_register_borrow",
+                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(registerBorrowFn, {thisVal});
+        }
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
 
@@ -1742,6 +1777,23 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // §30.13 (#439-followup): free the cross-suspend spill area first (if
             // any) — it is a side allocation pointed to from the frame.
             emitFreeSpillArea(self);
+            // fix #3460 (§28.3 / §30.1): release the frame's strong reference
+            // to outerTask (retained in emitAsyncMethod immediately after the
+            // outerTask field was stored). Mirror of the success edge in
+            // emitAsyncComplete; both terminal paths must release so the
+            // refcount tracks the frame's lifetime.
+            auto* releaseFn = declareC("bz_task_release",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(releaseFn, {outerTask});
+            // fix #3460: release the borrow on `this` (instance methods).
+            // Mirrors emitAsyncComplete; both terminal paths must release so
+            // the OWNER's `bz_wait_for_borrows(this)` unblocks.
+            if (currentThis_) {
+                auto* releaseBorrowFn =
+                    declareC("bz_release_borrow",
+                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(releaseBorrowFn, {currentThis_});
+            }
             auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeFn2, {self});
             builder_.CreateRetVoid();
@@ -2105,6 +2157,29 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         builder_.CreateStore(
             outerTask,
             builder_.CreateStructGEP(stateStructTy, st, OUTER_TASK_FIELD));
+        // fix #3460 (§28.3 / §30.1): the heap frame holds a strong reference
+        // to its own outerTask for the frame's lifetime. Mirrors the named
+        // async-method path above (emitAsyncMethod): the matching release
+        // runs in emitAsyncComplete (called from emitResumeDispatch's done
+        // block and from the asynclam.fault boundary) just before free(self).
+        auto* retainFn = declareC("bz_task_retain",
+                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(retainFn, {outerTask});
+        // fix #3460 (§28.3 / §30.1): for an async LAMBDA that captured
+        // `this` (instance method or another closure's `this`), the heap
+        // frame holds a *borrow* on `this` for the frame's lifetime. Classes
+        // are single-owner, so the borrow tracker is what keeps the OWNER's
+        // dispose site (in the enclosing method) from racing the worker's
+        // resume read of `this.<field>`. The register mirrors the named
+        // async-method path above; the matching release runs in
+        // emitAsyncComplete (done block) and asynclam.fault, where
+        // currentThis_ has been rebound by emitFrameCaptureRestores.
+        if (currentThis_) {
+            auto* registerBorrowFn =
+                declareC("bz_register_borrow",
+                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(registerBorrowFn, {currentThis_});
+        }
         // captures (lambda params + cell pointers + this), spilled from the
         // values captured above (in entry context, before any state mutation).
         for (unsigned i = 0; i < caps.size(); ++i) {
@@ -2428,6 +2503,21 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                                  emitExcSlot());
             emitFreeSpillArea(self);
+            // fix #3460 (§28.3 / §30.1): release the frame's strong reference
+            // to outerTask (retained in emitAsyncLambda immediately after the
+            // outerTask field was stored). Mirror of the success edge in
+            // emitAsyncComplete and of the named-method fault path above.
+            auto* releaseFn = declareC("bz_task_release",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(releaseFn, {outerTask});
+            // fix #3460: release the borrow on `this` (async lambdas that
+            // captured `this`). Mirrors the success edge in emitAsyncComplete.
+            if (currentThis_) {
+                auto* releaseBorrowFn =
+                    declareC("bz_release_borrow",
+                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(releaseBorrowFn, {currentThis_});
+            }
             auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy()});
             builder_.CreateCall(freeFn2, {self});
@@ -5510,6 +5600,31 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
     // field; the field is null when the body had no cross-suspend temporary, and
     // free(null) is a no-op, so this is unconditional and safe in every shape.
     emitFreeSpillArea(self);
+    // fix #3460 (§28.3 / §30.1): release the strong reference the frame's
+    // outerTask field held (taken in emitAsyncMethod / emitAsyncLambda right
+    // after the field was stored). MUST run BEFORE free(self) — the field is
+    // the source of this call's pointer. The release may run the destroy body
+    // (if the caller's bz_task_free has already run) or just decrement the
+    // atomic counter (if it hasn't); either way the worker resume's read of
+    // frame[OUTER_TASK_FIELD] is no longer racing the caller's release.
+    auto* releaseFn = declareC("bz_task_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(releaseFn, {outerTask});
+    // fix #3460 (§28.3 / §30.1): release the borrow on `this` (instance
+    // methods / async lambdas that captured `this`) registered in
+    // emitAsyncMethod / emitAsyncLambda immediately after the outerTask
+    // field was stored. The OWNER's dispose site is currently blocked on
+    // `bz_wait_for_borrows(this)` from `using var c` scope-end; this
+    // release unblocks it. MUST run BEFORE free(self). currentThis_ was
+    // rebound by emitFrameCaptureRestores at the top of the resume fn (the
+    // same activation that calls emitAsyncComplete), so it holds the loaded
+    // `this` pointer — exactly the object the OWNER is waiting on.
+    if (currentThis_) {
+        auto* releaseBorrowFn =
+            declareC("bz_release_borrow",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(releaseBorrowFn, {currentThis_});
+    }
     builder_.CreateCall(freeFn2, {self});
 }
 

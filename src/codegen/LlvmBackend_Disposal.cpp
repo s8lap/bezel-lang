@@ -2642,8 +2642,25 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // branch, matching checked disposal's own deliberate-leak posture for
     // everything else the block owns — only the block header itself is kept
     // readable for the disposed-flag guard.)
-    if (!checkedDisposal_)
+    if (!checkedDisposal_) {
+        // fix #3460 (§28.3 / §30.1): before freeing the heap block, wait for
+        // any cross-task BORROWS on this object to be released. A borrow is
+        // registered by an async frame whose `this = c` capture points at c
+        // (the heap-use-after-free of #3460 was main's `using var c` exit
+        // firing `free(c)` while the worker's resume continuation still read
+        // `this._h`). The wait blocks until the worker's emitAsyncComplete
+        // has run and released its borrow — closing the race. Null-safe and
+        // cheap for objects nobody borrowed (the runtime side-table find is a
+        // mutex lock + failed lookup, no syscall). Runs BEFORE the free,
+        // AFTER the CauseChain reclaim — the CauseChain read races only with
+        // a still-borrowed object, but the borrow's release synchronizes
+        // with the wait's acquire-load so the reclaim is safe.
+        builder_.CreateCall(
+            declareC("bz_wait_for_borrows",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+            {obj});
         builder_.CreateCall(freeFn(), {obj});
+    }
 }
 
 

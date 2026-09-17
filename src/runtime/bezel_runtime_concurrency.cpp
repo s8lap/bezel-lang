@@ -1070,7 +1070,34 @@ void bz_task_then(void* tp, void (*cont)(void* task, void* state), void* state) 
 }
 
 void bz_task_free(void* tp) {
+    // fix #3460 (§28.3 / §30.1): bz_task_free is now a thin wrapper around
+    // bz_task_release. The producer's original reference (created with count
+    // == 1 by bz_task_alloc) is balanced by either of these. Callers that hold
+    // a second reference (the frame's strong reference to outerTask, retained
+    // after the outerTask field is stored in the heap frame) release it via
+    // bz_task_release when the frame is freed.
+    bz_task_release(tp);
+}
+
+// fix #3460 (§28.3 / §30.1): increment the task's reference count. Pairs with
+// bz_task_release. The producer's original reference (the one balanced by
+// bz_task_free) starts at 1; bz_task_retain is the way the heap frame picks
+// up a strong reference to its own outerTask so the worker resume continuation
+// can safely read frame[OUTER_TASK_FIELD] even after the caller's `bz_task_free`
+// has already run from `using var` scope-end disposal. Null-safe (no-op on
+// null); safe on a task that has already completed (the refcount outlives
+// task completion — only the LAST release runs the destroy body).
+void bz_task_retain(void* tp) {
+    if (!tp) return;
     auto* task = (bz_task_t*)tp;
+    task->refcount.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// fix #3460 (§28.3 / §30.1): decrement the task's reference count; when it
+// reaches zero, run the destroy body (the former bz_task_free dispose chain).
+// The destroy body is split into a static helper so it can be invoked exactly
+// once, by the call whose decrement drops the count to zero.
+static void bz_task_destroy(bz_task_t* task) {
     // §30.5 / #1503: dispose an UNCONSUMED owned class-typed result before
     // reclaiming the result buffer. Guards mirror bz_task_dispose_owned_result:
     //   • result_disposer == null → no ownership obligation on the result
@@ -1172,7 +1199,25 @@ void bz_task_free(void* tp) {
     delete task;
     if (dom) domain_release(dom);  // per fix #632: release task's domain ref
     if (recvChannel) channel_core_release((bz_channel_t*)recvChannel);
-    if (chainedSrc) bz_task_free(chainedSrc);
+    // fix #3460 (§28.3 / §30.1): the chained Pattern A source task is held
+    // through its own refcount (the chained_source link is a strong reference
+    // established when codegen ran bz_task_set_chained). Use the refcounted
+    // release so the chained source's own refcount — possibly inflated by a
+    // codegen-side retain we have not yet introduced for chained sources —
+    // remains consistent with every other release path.
+    if (chainedSrc) bz_task_release(chainedSrc);
+}
+
+void bz_task_release(void* tp) {
+    if (!tp) return;
+    auto* task = (bz_task_t*)tp;
+    // acq_rel pairs with bz_task_retain's acq_rel add: a release-decrement must
+    // not be reordered before any later reader of the released state on a
+    // thread that observed a prior retain. The acquire-load of the post-
+    // decrement value (==0 here) ensures the destroy body sees every store
+    // that any preceding retain-er made before its release.
+    int32_t prev = task->refcount.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) bz_task_destroy(task);
 }
 
 // stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a fresh task and
