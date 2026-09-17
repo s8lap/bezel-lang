@@ -12987,7 +12987,33 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 // `disposeStack_.back().push_back(dc)` at line 16379
                 // writes to THIS scope (now at index 0), not to a
                 // stale empty stack.
+                //
+                // fix #4077 (depth half, §28.3, v0.295, the chain-call
+                // empty-stack arm): the entries in lastLambdaCapturedCells_
+                // for the chain-call's lambda were PUSHED when the
+                // args were lowered — when disposeStack_.size() was
+                // still 0 — so their LastCellEntry::pushScopeDepth is 0.
+                // consumeLastLambdaCapturedCells' #4261 skip-block
+                // (`if (ce.pushScopeDepth < currentScopeDepth) continue;`)
+                // rejects those entries (0 < 1 → skip), so the captured
+                // cell leaks per-call. Rebase the chain-call's lambda's
+                // entries to the post-transient-push depth so the helper
+                // processes them; entries from a NESTED lambda lowered
+                // inside the chain-call's lambda's body share the same
+                // pre-push depth (the inner lowering happens in the same
+                // outer scope frame), so they are rebased too. Compare
+                // against the pre-push depth, NOT 0: a future call site
+                // that pushes its own scope first (and so lowers the
+                // lambda at depth N, then pushes the transient to N+1)
+                // would otherwise rebase the wrong entries — here we only
+                // own the `disposeStack_.size()`'s-old-depth ones.
+                const std::size_t preTransientDepth = disposeStack_.size();
                 disposeStack_.emplace_back();
+                const std::size_t transientDepth = disposeStack_.size();
+                for (auto& ce : lastLambdaCapturedCells_) {
+                    if (ce.pushScopeDepth == preTransientDepth)
+                        ce.pushScopeDepth = transientDepth;
+                }
                 consumeLastLambdaCapturedCells();
                 emitDisposals(disposeStack_.back(), /*isUnwind=*/false);
                 disposeStack_.pop_back();
