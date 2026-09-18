@@ -534,7 +534,6 @@ extern "C" void bz_wait_for_borrows(void* obj) {
         return e->borrow_count.load(std::memory_order_acquire) == 0;
     });
 }
-
 // fix #3460 follow-up: process-exit drain for the borrow-tracker side table.
 //
 // The entry-retain-not-erase design (above) keeps BzBorrowEntry instances alive
