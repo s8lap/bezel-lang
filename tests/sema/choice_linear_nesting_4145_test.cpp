@@ -121,7 +121,20 @@ BEZEL_TEST(choice_linear_nesting_4145,
     // wall-clock ceiling is.
     constexpr int kDepth = 50;
     constexpr auto kWallClockCeiling = std::chrono::seconds(30);
-    auto r = resolveAll(depthNSrc(kDepth));
+    // fix #4459 (cycle-9 cycle-7 COVERAGE SHORT verdict flake): the AST
+    // borrows string_views into the source buffer for every name part
+    // (TypeDecl::name, ChoiceCase::name, every Param::name, etc.), and
+    // `depthNSuf` returns a temporary that the AST would outlive if not
+    // captured here. Held locally so the borrowed string_views stay live
+    // for every classify call that follows (the classifier consults
+    // headName() during the §35.4 substitution on the bare `T` payload
+    // of `D<T>.Some`, #4140+#4112 — a use-after-free there reads garbage
+    // and the conservative bare-parameter arm of `ownedMarkerActiveOn…
+    // TypeImpl` returns `true`, flipping D<int> to Owning and the whole
+    // chain to Owning). Capturing the source costs ~50 KB and is
+    // negligible vs the wall-clock budget. Per §9.7 / §35.4 / §28.1.
+    std::string src = depthNSrc(kDepth);
+    auto r = resolveAll(src);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto tStart = std::chrono::steady_clock::now();
     auto c = classify(r, "C1");
