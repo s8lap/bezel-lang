@@ -364,6 +364,10 @@ class SelfTestSuiteIsolationTest(_MarkerAssertions):
         # function bodies against a stub gate.sh in a temp dir (#3666).
         # Never the real gate_and_push.sh.
         "test_gate_full_cycle_pins.py": "source-only",
+        # Reads gate_and_push.sh TEXT and sources the EXTRACTED smart-push
+        # block against a stub git remote in a temp dir (smart-push design,
+        # user directive 2026-09-18). Never the real gate_and_push.sh.
+        "test_gate_and_push_smart_push.py": "source-only",
         # This file.
         "test_gate_markers.py": "isolated",
     }
