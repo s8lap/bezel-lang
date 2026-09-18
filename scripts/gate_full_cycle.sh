@@ -1049,6 +1049,63 @@ if [ "$_gs_skipped" -gt "$_gs_skip_cap" ]; then
 fi
 say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
 
+# ── GATE-SMART-PUSH-SELFTEST PHASE (smart-push, user directive 2026-09-18) ──
+# The smart-push block at scripts/gate_and_push.sh's push boundary sits on the
+# critical path: every gate run that is about to push goes through it. The four
+# cases (no-op / remote-advanced / normal / diverged) are pinned by source AND
+# by functional tests in scripts/gate/tests/test_gate_and_push_smart_push.py,
+# and those tests are also picked up by the existing gate-selftest phase
+# (discover scans scripts/gate/tests/). This phase re-runs JUST them so a
+# failure surfaces as its own line in the cycle log — the gate_selftest floor
+# of 560 + skip cap of 4 lets a regression slip silently if the smart-push
+# tests stop running for any reason; this phase pins that they ran AND that
+# they ran in non-trivial number.
+#
+# Smart-push tests are fast (~0.2s, all git/text work in temp dirs), so the
+# re-run cost is negligible. Build-free, fail-closed, with the same floor/cap
+# ratchet pattern the sibling phases use.
+say "gate-smart-push-selftest phase: test_gate_and_push_smart_push (smart-push, 2026-09-18)"
+_sps_log="$LOGDIR/${TAG}_smart_push_selftest.log"
+_sps_floor=10
+_sps_skip_cap=0
+# Same isolation pattern as gate-selftest: redirect the gate's terminal
+# markers away from the live gate's paths. The smart-push tests do not
+# actually invoke scripts/gate_and_push.sh (they extract the block and
+# source it in a subprocess), but the markers redirect is cheap defence
+# in depth — a future test in this file might.
+_sps_markers="$LOGDIR/${TAG}_smart_push_selftest_markers"
+mkdir -p "$_sps_markers" 2>/dev/null || true
+if ! BEZEL_GATE_PIDFILE="$_sps_markers/gate.pid" \
+     BEZEL_GATE_DONEFILE="$_sps_markers/gate.done" \
+     python3 -m unittest scripts.gate.tests.test_gate_and_push_smart_push -v \
+      > "$_sps_log" 2>&1; then
+  say "CYCLE FAILURE: the smart-push self-tests failed — the push-boundary"
+  say "  race detector (no-op / remote-advanced / normal / diverged) is broken"
+  say "  or out of date, so a green gate followed by 'PUSH FAILED' on a remote"
+  say "  advance could reappear (smart-push, user directive 2026-09-18). See $_sps_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_sps_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_sps_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_sps_log" | tail -1)"
+_sps_skipped="$(sed -n 's/^OK (.*skipped=\([0-9]*\).*/\1/p' "$_sps_log" | tail -1)"
+[ -n "$_sps_skipped" ] || _sps_skipped=0
+if [ -z "$_sps_ran" ] || [ "$_sps_ran" -lt "$_sps_floor" ]; then
+  say "CYCLE FAILURE: the smart-push self-tests reported OK but ran only"
+  say "  ${_sps_ran:-0} tests (floor $_sps_floor) — discovery collected almost"
+  say "  nothing, so the OK certifies nothing. See $_sps_log"
+  exit 1
+fi
+if [ "$_sps_skipped" -gt "$_sps_skip_cap" ]; then
+  say "CYCLE FAILURE: the smart-push self-tests skipped $_sps_skipped tests (cap"
+  say "  $_sps_skip_cap) — an unenforced guard with a green tick is worse than"
+  say "  an honest gap. See $_sps_log"
+  sed -n '/skipped/p' "$_sps_log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "gate-smart-push-selftest phase: GREEN ($_sps_ran tests, $_sps_skipped skipped)"
+
 # src/ citation phase (#4455). Build-free: it cross-references the §-citations
 # in src/ against the section headings every document defines, so it sits here
 # beside the gate self-tests rather than in the compile path.
