@@ -606,6 +606,20 @@ public:
     void applyLambdaBodyDiscardStmtFlags(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void applyLambdaBodyDiscardStmtFlagsBody(const ast::LambdaExpr& lam);
+
+    // prep #4146 Stage 2-A (§28.3, v0.298): run the ownership CFG dataflow
+    // over one lambda body, seeded with the outer-scope captured states. Mirrors
+    // MethodOwnership::run but skips the method-body-only checks that have no
+    // lambda-body analogue: checkAsyncSignatureBorrowBearing,
+    // checkBorrowBearingLocalsAcrossSuspension, and the IOwningEnumerable check.
+    // Expression-bodied lambdas are handled by building a single-block CFG that
+    // records the exprBody; block-bodied lambdas use the same Builder path as
+    // buildCFG. The capturedStates parameter is the outer scope's BlockState at
+    // the point the lambda is defined — it seeds the dataflow entry state for
+    // any captured locals.
+    void runLambdaBody(
+        const ast::LambdaExpr* lam,
+        const BlockState& capturedStates);
     void applyLambdaBodyDiscardStmtFlagsStmt(const ast::Stmt& s);
 
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
@@ -754,6 +768,10 @@ private:
     // parameter-sourced borrow returns. Defaults true (a no-op) so a non-bare-T
     // method is never affected. // per §28.3 v0.194
     bool bareReturnSourceSetEmpty_ = true;
+    // prep #4146 Stage 2-A (§28.3, v0.298): CFG build options for lambda body
+    // CFGs constructed by runLambdaBody. Initialised to the default (full CFG
+    // with exception edges, same as buildCFG's default for method bodies).
+    flow::CFGBuildOptions buildOpts_;
     // §28.3 v0.194 *Bare-type-parameter returns* Callee side, per-instantiation-
     // category admission (#2064): true when the returned parameter is constrained
     // `where T: class` at its own level, so every substitution is class/interface
