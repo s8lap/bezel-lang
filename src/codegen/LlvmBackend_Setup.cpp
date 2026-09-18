@@ -17022,6 +17022,24 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // is handled separately in the envdtor body via freeCellInEnvdtor.
         if (ce.dictEntryKeyReleaseDeferred)
             dc.dictEntryKeyReleaseDeferred = true;
+        // fix #2718 cycle-10 (Family A follow-up): propagate
+        // semaTy / releaseBox / suppressContent from the LastCellEntry
+        // (populated at the lowerLambda registration site — see
+        // LlvmBackend_Exprs2.cpp ~1426 / ~1980) onto the boxedCellFree
+        // Disposal, so the frame scope-end's emitCellRefcountedFree call
+        // (LlvmBackend_Disposal.cpp:~6745) can release the contained
+        // string/closure/Box/DictEntry-K/DrainedEntry-K+V inside the
+        // rc==0 free branch and obey the suppressContent gate. Without
+        // this, frame scope-end passed `semaTy=null` to the helper and
+        // silently dropped all value-refcounted releases on
+        // non-escaping captures — leaking 32+16 B / string, 24+value B
+        // / Box, etc. per capture (the FINDING A/B problem on the
+        // FRAME side; the ENVDTOR side is fixed by the corresponding
+        // args to emitCellRefcountedFree at LlvmBackend_Exprs2.cpp
+        // ~3681).
+        dc.capturedSemaTy = ce.semaTy;
+        dc.releaseBoxInDisposal = ce.releaseBox;
+        dc.suppressContentInDisposal = ce.suppressContent;
         disposeStack_.back().push_back(dc);
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null

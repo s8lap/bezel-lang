@@ -6730,7 +6730,46 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // the cell itself wasn't freed (rc went 2->1). Then frame dec
             // 1->0, free. Pass nullptr to emitCellRefcountedFree so it does
             // NOT also release the value (that would be a double-release).
-            emitCellRefcountedFree(cell, /*semaTy=*/nullptr);
+            // fix #2718 cycle-10 (Family A follow-up): pass the cell's valTy (looked up
+            // in cellVars_, set by boxLocalSlot on both boxing paths) so the
+            // helper computes the layout-correct rc offset (rc sits AFTER the
+            // value, not at a fixed offset 8 — important for value-typed cells
+            // like DictionaryEntry / DrainedEntry where V would collide with a
+            // fixed-offset rc). nullptr semaTy → frame is not a producer of the
+            // value, only of the cell.
+            llvm::Type* cellValTy = nullptr;
+            if (auto cvIt = cellVars_.find(it->slot);
+                cvIt != cellVars_.end()) {
+                cellValTy = cvIt->second;
+            }
+            // fix #2718 cycle-10 (Family A follow-up): the frame's
+            // scope-end --rc is the LAST rc-- for non-escaping captures
+            // — pre-#2718 each env had its own cell + its own string
+            // retain, so each envdtor released its own share of the
+            // string; the cell-rc hoist collapsed that to ONE shared
+            // cell per captured local with cell-rc counting envs, which
+            // means the string-release now happens AT THE CELL'S DEATH
+            // (rc reaches 0 once across env dtors + frame — and the
+            // FRAME's --rc is what brings it to 0 for non-escaping
+            // captures because boxedCellFree is registered BEFORE the
+            // env dtors run and each env dtor brings rc 1 short of 0).
+            // pass the cell's captured type so the helper can release
+            // the contained string/closure/Box inside the rc==0 free
+            // branch. `it->capturedSemaTy` is populated by
+            // consumeLastLambdaCapturedCells when the boxedCellFree
+            // Disposal is registered (next to `boxedCellFree = true`).
+            // Failing to pass semaTy here left value-refcounted
+            // releases silently dropped on the floor in pre-cycle-10
+            // attempts — the helper's `if (semaTy)` block skipped,
+            // and the cell freed without releasing its held string,
+            // leaking 32+16 B/string per non-escaping capture.
+            const sema::TypeRef* capturedSemaTy = it->capturedSemaTy;
+            bool releaseBoxCd = it->releaseBoxInDisposal;
+            bool suppressContentCd = it->suppressContentInDisposal;
+            emitCellRefcountedFree(cell, capturedSemaTy, cellValTy,
+                                    /*forceFree=*/false,
+                                    /*releaseBox=*/releaseBoxCd,
+                                    /*suppressContent=*/suppressContentCd);
             // A guarded capture may be re-entered (for example, a case arm in
             // a loop). Null the holder after reclaim so the next entry allocates
             // a fresh cell instead of reusing freed storage.

@@ -1423,6 +1423,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // a nulled holder: a SIGSEGV, measured on the pre-fix compiler.
             lce.isParam = true;
             lce.pushScopeDepth = disposeStack_.size();  // fix #4261 §28.3
+            // fix #2718 cycle-10 (Family A follow-up): propagate
+            // semaTy / releaseBoxInEnvdtor / suppressContentRcInEnvdtor
+            // from the per-capture CaptureEntry onto the LastCellEntry so
+            // the boxedCellFree Disposal registration in
+            // consumeLastLambdaCapturedCells can route them onto the
+            // Disposal (LlvmBackend_Disposal.cpp:~6745 then reads them
+            // to populate the frame scope-end's emitCellRefcountedFree
+            // call). For PARAMS these reflect the FIRST capture site's
+            // CaptureEntry (`ce`); a subsequent capture of the same
+            // parameter in the same lambda block is treated as the same
+            // shape — semaTy is invariant for a parameter symbol, and
+            // releaseBoxInEnvdtor / suppressContentRcInEnvdtor are
+            // capture-shape attributes the walker resolved at first
+            // capture. (Subsequent captures' flags are OR-equivalent
+            // for the boxedCellFree frame-side accounting.)
+            lce.semaTy = ce.semaTy;
+            lce.releaseBox = ce.releaseBoxInEnvdtor;
+            lce.suppressContent = ce.suppressContentRcInEnvdtor;
             lastLambdaCapturedCells_.push_back(lce);
         }
         // #429/#672: resolve sema type for retain/release classification.
@@ -1491,8 +1509,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (!ce.suppressContentRcInEnvdtor) {
             // fix #2718: parameter-side additional-capture retain is on the
             // CELL (rc++) rather than on the value. The cell owns the value
-            // for its lifetime; balancing +1s belong to the cell.
-            emitCellRetain(ce.envValue);
+            // for its lifetime; balancing +1s belong to the cell. fix #2718
+            // cycle-10: pass valTy so the rc offset is layout-correct (rc
+            // sits AFTER the value, not at a fixed offset 8 — important for
+            // value-typed cells where V lives at offset 8).
+            emitCellRetain(ce.envValue, ce.valTy);
         }
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
@@ -1962,6 +1983,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     if (rt && isDictEntryStringKeyTypeRef(rt))
                         lce.dictEntryKeyReleaseDeferred = true;
                 }
+                // fix #2718 cycle-10 (Family A follow-up): see the
+                // params registration site (line 1426 above). Mirror the
+                // same semaTy / releaseBox / suppressContent propagation
+                // from the LOCAL's CaptureEntry onto the LastCellEntry so
+                // consumeLastLambdaCapturedCells can forward them onto
+                // the boxedCellFree Disposal — the frame's scope-end
+                // emitCellRefcountedFree call then sees the captured
+                // type and the content-release suppressions when its
+                // --rc hits zero.
+                lce.semaTy = ce.semaTy;
+                lce.releaseBox = ce.releaseBoxInEnvdtor;
+                lce.suppressContent = ce.suppressContentRcInEnvdtor;
                 lastLambdaCapturedCells_.push_back(lce);
             }
             // fix #3508 (§27.5 / §28.9, v0.286): the #969/#3403 depth guard
@@ -2325,8 +2358,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // the cell-rc semantics do not have those hazards (the cell is
         // per-allocation, not per-value, and the rc-counts-envs + frame-
         // scope-end --rc pattern already accounts for shared and mutated
-        // cells correctly).
-        emitCellRetain(ce.envValue);
+        // cells correctly). fix #2718 cycle-10: pass valTy so the rc
+        // offset is layout-correct (see cellRcOffsetFor).
+        emitCellRetain(ce.envValue, ce.valTy);
         // #694: free the 8-byte capture cell in the envdtor when this local is
         // captured by exactly ONE env (singleCaptureLocals_) and THIS lambda
         // DEFINITELY escapes (definitelyEscapingLambdas_ — directly returned). The
@@ -3641,33 +3675,41 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // `suppressContentRcInEnvdtor`, `releaseBoxInEnvdtor`) is also
                 // gone — the refcount makes the decision mechanical.
                 //
-                // #4127 / #4135's dictEntry / drainedEntry captures are now
-                // handled here: the cell holds the {K, V} or {K, V*} struct
-                // BY VALUE, and the value release branch above uses the
-                // declared element types. emitCellRefcountedFree consults the
-                // sema type and falls through the string/closure arms
-                // (dictEntry's Key, drainedEntry's Key) accordingly; for a
-                // DrainedEntry V that is a class, we additionally dispose it.
-                if (isDrainedEntryTypeRef(ce.semaTy) && ce.semaTy) {
-                    const sema::TypeRef* entryTy = ce.semaTy;
-                    const sema::TypeRef* vTy = entryTy->genericArgs[1];
-                    llvm::Type* vLlvm = lowerTypeRef(vTy);
-                    if (vLlvm && vLlvm->isPointerTy()) {
-                        // Dispose the owned V class BEFORE the cell is freed.
-                        // We do this here (not in emitCellRefcountedFree)
-                        // because the V field is an offset within the cell,
-                        // not a pointer at offset 0. After dispose, the cell
-                        // rc is decremented normally; if it reaches zero the
-                        // cell free releases the K (handled by the string arm).
-                        llvm::Value* vFldPtr =
-                            builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)},
-                                               "dde.vfield");
-                        llvm::Value* vPtr =
-                            builder_.CreateLoad(ptrTy(), vFldPtr, "dde.v");
-                        emitDisposeAndReclaim(vPtr);
-                    }
-                }
-                emitCellRefcountedFree(cell, ce.semaTy);
+                // fix #2718 cycle-10 (Family A follow-up): the cell layout
+                // depends on the captured value's LLVM type. A ptr-typed
+                // cell is 16 bytes `{value (off 0), rc (off 8)}`; a 16-byte
+                // value-typed cell (DictionaryEntry<string,V>, DrainedEntry)
+                // is `{value (off 0..15), rc (off 16)}` = 24 bytes — the rc
+                // sits AFTER the value so the value's V field at offset 8
+                // is NOT clobbered by the rc-- store. Pass `valTy` so the
+                // helper computes the correct rc offset.
+                //
+                // fix #2718 cycle-10 follow-up (Family A follow-up, FINDING A/B):
+                // `ce.freeCellInEnvdtor` is the SOLE-escaping-capture proof
+                // (#694 + #3426 — singleCaptureLocals_ ∧ definitelyEscapingLambdas_,
+                // shared-cell owner). For this shape, `boxedCellFree` (the
+                // frame-scope-end `--rc`) is SUPPRESSED by #4210's
+                // `!definitelyEscapingLambdas_` guard in
+                // consumeLastLambdaCapturedCells (Setup.cpp:~1820), so the
+                // rc never reaches 0 through decrement alone — the
+                // envdtor's --rc would leave the cell at rc=1 forever
+                // (leaking 24 B cell + 32 B K + 2 B payload per call,
+                // measured on the 4127 repro). Pass `forceFree=true` so
+                // the helper unconditionally frees. Pre-#2718 the envdtor
+                // WAS the sole reclaim site for this shape (unconditional
+                // `free(cell)` — git show e8a921fd:
+                // LlvmBackend_Exprs2.cpp:~3796); the cell-rc hoist removed
+                // that branch without preserving its semantics. The K-release /
+                // Box-release / DrainedEntry-release arms above supply the
+                // value-decrement side; this flag is the cell-free side.
+                // SOUNDNESS: singleCaptureLocals_ guarantees no other env
+                // shares the cell (no other --rc competes with this one),
+                // and definitelyEscapingLambdas_ guarantees this envdtor
+                // runs AFTER the frame (no later read through the cell).
+                emitCellRefcountedFree(cell, ce.semaTy, ce.valTy,
+                                        /*forceFree=*/ce.freeCellInEnvdtor,
+                                        /*releaseBox=*/ce.releaseBoxInEnvdtor,
+                                        /*suppressContent=*/ce.suppressContentRcInEnvdtor);
                 // fix #4210: the freed-cell pointer is still needed by
                 // boxLocalSlot's stale-cell detection on the next loop pass —
                 // emitCellRefcountedFree decrements the rc and conditionally

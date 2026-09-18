@@ -3943,21 +3943,18 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
 
         // Allocation branch: first pass (or previous alloc was skipped).
         builder_.SetInsertPoint(allocBB);
-        // fix #2718: pointer-typed cells are now `{value (off 0), rc (off 8)}`,
-        // 16 bytes total. Non-pointer values (int, struct) keep the existing
-        // valTy-sized allocation — those are value-typed, never refcounted, so
-        // the existing scope-end free path is correct without an rc.
-        const bool cellIsPtr = valTy->isPointerTy();
-        llvm::Value* cellSize;
-        if (cellIsPtr) {
-            cellSize = builder_.getInt64(16);
-        } else {
-            cellSize = builder_.CreatePtrToInt(
-                builder_.CreateGEP(valTy,
-                                   llvm::ConstantPointerNull::get(ptrTy()),
-                                   {builder_.getInt32(1)}),
-                i64());
-        }
+        // fix #2718: pointer-typed cells are `{value (off 0), rc (off 8)}`,
+        // 16 bytes total.
+        // fix #2718 cycle-10 (Family A follow-up): value-typed cells are
+        // `{value (off 0..valSz-1), rc (off align_up(valSz, 8))}`. The rc
+        // sits AFTER the value so the V field at offset 8 of a 16-byte
+        // DictionaryEntry / DrainedEntry value is NOT clobbered by the
+        // rc-- store. For 8-byte ptr values the layout is unchanged.
+        uint64_t rcOff =
+            Emitter::cellRcOffsetFor(valTy, *module_);
+        uint64_t cellSz =
+            Emitter::cellAllocSizeFor(valTy, *module_);
+        llvm::Value* cellSize = builder_.getInt64(cellSz);
         llvm::Value* cell = builder_.CreateCall(
             callocFn(), {builder_.getInt64(1), cellSize});
         // Read the original slot's value (tracked in cellVarSyncSlot_) to
@@ -3975,10 +3972,9 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         // fix #2718: initialise the cell's refcount to 1 (the producer's +1).
         // Each additional capture does rc++, each envdtor does --rc and
         // releases+free on rc==0.
-        if (cellIsPtr) {
-            builder_.CreateStore(builder_.getInt64(1),
-                                 builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
-        }
+        builder_.CreateStore(builder_.getInt64(1),
+                             builder_.CreateGEP(i8(), cell,
+                                                {builder_.getInt64(rcOff)}));
         builder_.CreateStore(cell, newSlot);
         builder_.CreateBr(doneBB);
 
@@ -4029,26 +4025,23 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         if (wasGuardedBoxing) *wasGuardedBoxing = false;
         // fix #2718: ptr-typed cells are 16 bytes `{value, rc}`; non-ptr
         // values keep valTy-sized allocation.
-        const bool cellIsPtrF = valTy->isPointerTy();
-        llvm::Value* cellSizeF;
-        if (cellIsPtrF) {
-            cellSizeF = builder_.getInt64(16);
-        } else {
-            cellSizeF = builder_.CreatePtrToInt(
-                builder_.CreateGEP(valTy,
-                                   llvm::ConstantPointerNull::get(ptrTy()),
-                                   {builder_.getInt32(1)}),
-                i64());
-        }
+        // fix #2718 cycle-10 (Family A follow-up): value-typed cells get
+        // `{value (off 0..valSz-1), rc (off align_up(valSz, 8))}` — rc sits
+        // AFTER the value so the V field of a 16-byte DictionaryEntry /
+        // DrainedEntry at offset 8 is NOT clobbered by the rc-- store.
+        uint64_t rcOffF =
+            Emitter::cellRcOffsetFor(valTy, *module_);
+        uint64_t cellSzF =
+            Emitter::cellAllocSizeFor(valTy, *module_);
+        llvm::Value* cellSizeF = builder_.getInt64(cellSzF);
         llvm::Value* cell = builder_.CreateCall(callocFn(),
                                                 {builder_.getInt64(1), cellSizeF});
         llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
         builder_.CreateStore(cur2, cell);
-        // fix #2718: init rc=1 for ptr cells (each fresh cell has its own +1).
-        if (cellIsPtrF) {
-            builder_.CreateStore(builder_.getInt64(1),
-                                 builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
-        }
+        // fix #2718: init rc=1 (producer's +1).
+        builder_.CreateStore(builder_.getInt64(1),
+                             builder_.CreateGEP(i8(), cell,
+                                                {builder_.getInt64(rcOffF)}));
         newSlot = entryAlloca(ptrTy());
         builder_.CreateStore(cell, newSlot);
         cellVars_[newSlot] = valTy;
@@ -4093,25 +4086,24 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     builder_.SetInsertPoint(allocBB);
     // fix #2718: ptr cells are 16 bytes `{value, rc}`; non-ptr cells keep
     // valTy-sized allocation.
-    const bool cellIsPtrG = valTy->isPointerTy();
-    llvm::Value* cellSizeG;
-    if (cellIsPtrG) {
-        cellSizeG = builder_.getInt64(16);
-    } else {
-        cellSizeG = builder_.CreatePtrToInt(
-            builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
-                               {builder_.getInt32(1)}),
-            i64());
-    }
+    // fix #2718 cycle-10 (Family A follow-up): value-typed cells get
+    // `{value (off 0..valSz-1), rc (off align_up(valSz, 8))}` — rc sits
+    // AFTER the value so the V field of a 16-byte DictionaryEntry /
+    // DrainedEntry at offset 8 is NOT clobbered by the rc-- store. For 8-byte
+    // ptr values the layout is unchanged.
+    uint64_t rcOffG =
+        Emitter::cellRcOffsetFor(valTy, *module_);
+    uint64_t cellSzG =
+        Emitter::cellAllocSizeFor(valTy, *module_);
+    llvm::Value* cellSizeG = builder_.getInt64(cellSzG);
     llvm::Value* cell = builder_.CreateCall(callocFn(),
                                             {builder_.getInt64(1), cellSizeG});
     llvm::Value* cur = builder_.CreateLoad(valTy, slot, "preboxed");
     builder_.CreateStore(cur, cell);
-    // fix #2718: init rc=1 for ptr cells (producer's +1).
-    if (cellIsPtrG) {
-        builder_.CreateStore(builder_.getInt64(1),
-                             builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
-    }
+    // fix #2718: init rc=1 (the producer's +1).
+    builder_.CreateStore(builder_.getInt64(1),
+                         builder_.CreateGEP(i8(), cell,
+                                            {builder_.getInt64(rcOffG)}));
     builder_.CreateStore(cell, newSlot);
     builder_.CreateBr(doneBB);
 
