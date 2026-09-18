@@ -543,6 +543,103 @@ if "${GATE_CMD[@]}"; then
     exit 1
   fi
   echo "== gate_and_push: destination $_push_remote $_push_ref (upstream of '$_cur_branch'), commit $(git rev-parse --short "$_head") =="
+
+  # ── SMART-PUSH (#smart-push, user directive 2026-09-18) ─────────────────
+  #
+  # Before this block, a fast-forward push that lost its race to a remote
+  # advance (origin/main advanced WHILE the gate ran) reached the bare
+  # `git push` below and exited 3 — "PUSH FAILED", with no diagnostics
+  # distinguishing that from a network failure or a permission denial. The
+  # whole gate was already green and a commit was already consumed; only
+  # the push step reacted, so failing the run as a whole was overreach.
+  #
+  # The gate runs to verdict regardless of remote state; only the push
+  # step should react. Fetch the ref we are about to push to, compare
+  # heads via `git merge-base --is-ancestor`, and resolve to one of four
+  # shapes:
+  #
+  #   local == remote                  -> NO-OP, exit 0 (we are current)
+  #   local is ancestor of remote      -> SKIPPED (remote advanced), exit 0
+  #   remote is ancestor of local      -> fall through to the existing push
+  #   diverged                       -> SKIPPED (refuse force-push), exit 4
+  #
+  # The `GATE PASSED -> NO-OP/SKIPPED PUSH` markers all contain
+  # `GATE PASSED`, which gate_wait.sh's TERMINAL_RE matches as an accept
+  # marker (`GATE PASSED|GATE FAILED .*->|PUSHED origin/main now`). A
+  # normal push still ends with the byte-identical `PUSHED origin/main
+  # now` line that gate_wait.sh has always accepted on — nothing in this
+  # block rewrites that path.
+  #
+  # `git fetch` is best-effort: a fetch failure (no network, missing
+  # remote, rate limit) leaves `_remote_head` empty and the block falls
+  # through to the existing push, which surfaces the failure with its
+  # own diagnostics. NO case here can mask a real failure as success.
+  git fetch "$_push_remote" "$_push_ref" 2>/dev/null || true
+  # Resolve the remote-tracking branch. `$_push_ref` is the FULL ref
+  # (`refs/heads/main`); the tracking branch is `origin/main` =
+  # `refs/remotes/origin/main`, NOT `origin/refs/heads/main` (which
+  # would resolve to a non-existent `refs/remotes/origin/refs/heads/
+  # main`). The basename of the pushed ref is what the remote-tracking
+  # branch's short name uses, so "${_push_ref##*/}" extracts it. Falls
+  # back to the full ref (works for non-branch refs like tags) if the
+  # basename lookup misses.
+  _remote_head="$(git rev-parse "${_push_remote}/${_push_ref##*/}" 2>/dev/null \
+                  || git rev-parse "${_push_remote}/${_push_ref}" 2>/dev/null \
+                  || echo '')"
+  if [ -z "$_remote_head" ]; then
+    # Couldn't fetch — fall through to the existing push; it will fail
+    # clearly with its own diagnostics (network / non-fast-forward /
+    # permission denied all surface there). Smart-push is a race detector,
+    # not a network requirement.
+    :
+  elif [ "$_remote_head" = "$_head" ]; then
+    # NO-OP. We are already current on the destination. Auto-GC: this
+    # gate passed cleanly and landed worktrees whose commits are now in
+    # $_push_remote/$_push_ref can be reaped — best-effort, same as the
+    # post-push GC below. The marker names the destination + the gated
+    # commit so a log reader sees what "already current" means.
+    echo "== gate_and_push: GATE PASSED -> NO-OP (already current on $_push_remote/${_push_ref##refs/heads/} $(git rev-parse --short "$_remote_head")) =="
+    if [ "${BEZEL_NO_GC:-0}" != 1 ] && [ -x scripts/gc_scratch.sh ]; then
+      echo "== gate_and_push: auto-GC (landed worktrees + stale builds + root) =="
+      scripts/gc_scratch.sh --landed-only --builds --root --apply || \
+        echo "== gate_and_push: GC reported an issue (ignored; already current) =="
+    fi
+    exit 0
+  elif git merge-base --is-ancestor "$_head" "$_remote_head"; then
+    # REMOTE ADVANCED. Local is a fast-forward ancestor of remote — i.e.
+    # somebody else pushed commits between the gate's verdict and the
+    # push step. The gated commit is already superseded by remote; a
+    # `git push` here would non-fast-forward fail (exit 3). Skip cleanly
+    # and tell the coordinator to fetch + rebase before the next gate.
+    # Exit 0: the gate passed; this is the documented recovery path.
+    echo "== gate_and_push: GATE PASSED -> SKIPPED PUSH (remote advanced: $_push_remote/${_push_ref##refs/heads/}=$(git rev-parse --short "$_remote_head"), local HEAD=$(git rev-parse --short "$_head")) =="
+    echo "==   Local is fast-forward ancestor of remote. Coordinator: fetch origin + rebase or merge before next gate. =="
+    # Auto-GC best-effort: local is clean of any orphan worktrees we may
+    # have produced (we did not push), and the gated batch is still in
+    # the tree. Reap stale build/root scratch the same way the post-push
+    # path does.
+    if [ "${BEZEL_NO_GC:-0}" != 1 ] && [ -x scripts/gc_scratch.sh ]; then
+      echo "== gate_and_push: auto-GC (stale builds + root) =="
+      scripts/gc_scratch.sh --builds --root --apply || \
+        echo "== gate_and_push: GC reported an issue (ignored; remote advanced) =="
+    fi
+    exit 0
+  elif ! git merge-base --is-ancestor "$_remote_head" "$_head"; then
+    # DIVERGED. Neither is an ancestor of the other — local has commits
+    # the remote does not, and vice versa. The fast-forward path cannot
+    # complete this push without force-pushing (which we never do
+    # implicitly); exit 4 so the coordinator knows to fetch + rebase (or
+    # merge) before retrying. NO auto-GC here: the local tree is in a
+    # mid-divergence state we do not want to reap from.
+    echo "== gate_and_push: GATE PASSED -> SKIPPED PUSH (DIVERGED: $_push_remote/${_push_ref##refs/heads/}=$(git rev-parse --short "$_remote_head"), local HEAD=$(git rev-parse --short "$_head")) =="
+    echo "==   Neither is ancestor of the other. Refusing force-push. Coordinator: fetch + rebase (or merge) before next gate. =="
+    exit 4
+  fi
+  # ELSE: $_remote_head is a fast-forward ancestor of $_head (= local
+  # ahead of remote) — the normal-push case. Fall through to the bare
+  # `git push` below; it produces the `PUSHED origin/main now` accept
+  # marker gate_wait.sh has always matched.
+
   if git push "$_push_remote" "$_head:$_push_ref"; then
     # ⚠ KEEP THIS LINE BYTE-IDENTICAL. scripts/gate_wait.sh matches
     # 'PUSHED origin/main now' as a TERMINAL marker and as its only accept
