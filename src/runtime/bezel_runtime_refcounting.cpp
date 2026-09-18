@@ -210,7 +210,7 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 // (the startup/shutdown thread's own sequence, §30.13) when g_current_domain
 // is null. fetch_add under the side-table lock makes assignment atomic and
 // preserves the first-request order even under concurrent hashing within a
-// domain (domain run-to-completion serializes continuations anyway, §24.6).
+// domain (domain run-to-completion serializes continuations anyway, §24).
 // ---------------------------------------------------------------------------
 static std::unordered_map<void*, int32_t> g_identity_hashes;
 static std::mutex                         g_identity_hashes_mtx;
@@ -432,4 +432,86 @@ extern "C" void bz_box_release(void* b) {
     // never-hashed box is a cheap mutex lock + failed find.
     bz_obj_identity_hash_forget(b);
     free(b);
+}
+
+// ---------------------------------------------------------------------------
+// fix #3460 (§28.3 / §30.1): cross-task borrow tracker.
+//
+// Classes in Bezel are single-owner (no GC, no per-class refcount), so a
+// borrowed reference to a class instance cannot extend its lifetime through
+// refcounting alone. When an async method captures `this = c` into its heap
+// frame, the frame must hold a *borrow* on c that outlives every pending
+// resumption — the §28.3 claim that "the borrow of the captured state must
+// outlive any pending resumption". The borrow tracker is a process-global
+// side table indexed by the borrowed object's pointer. Each entry holds an
+// atomic borrow count and a condition variable for waiters. Codegen emits
+// bz_register_borrow / bz_release_borrow at the frame's lifetime boundary,
+// and emits bz_wait_for_borrows at the OWNER's dispose site (e.g. `using var
+// c := new C()` scope-end) BEFORE the actual `free(c)`. With both halves in
+// place, the race of #3460 closes: the owner's dispose site blocks until the
+// worker's resume continuation has run emitAsyncComplete and released its
+// borrow.
+//
+// Side table is a single global unordered_map guarded by g_borrow_mu. The
+// entry is RETAINED when the count returns to zero (a future register on
+// the same pointer must find it, and the BzBorrowEntry's cv must remain
+// valid across the wait/notify pair). The condition variable is per-entry
+// (no false wakes across objects). All three entry points are null-safe.
+//
+// Ordering: the register/release pair is acq_rel so a release that drops
+// the count to zero synchronizes-with the wait_for_borrows' acquire-load of
+// the same zero — the waiter observes every store that any preceding
+// retain-er (a frame's register) made before its release.
+// ---------------------------------------------------------------------------
+
+struct BzBorrowEntry {
+    std::atomic<int> borrow_count{0};
+    std::condition_variable cv;
+};
+
+namespace {
+std::mutex g_borrow_mu;
+std::unordered_map<void*, std::unique_ptr<BzBorrowEntry>> g_borrow_table;
+}  // namespace
+
+extern "C" void bz_register_borrow(void* obj) {
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_borrow_mu);
+    auto& slot = g_borrow_table[obj];
+    if (!slot) slot.reset(new BzBorrowEntry());
+    slot->borrow_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" void bz_release_borrow(void* obj) {
+    if (!obj) return;
+    std::unique_lock<std::mutex> lk(g_borrow_mu);
+    auto it = g_borrow_table.find(obj);
+    if (it == g_borrow_table.end()) return;
+    BzBorrowEntry* e = it->second.get();
+    int prev = e->borrow_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) {
+        // Last borrower gone. Notify any waiters BEFORE the lock is released
+        // (so the waiter can re-acquire the mutex in cv.wait's atomic
+        // release/wait — releasing the lock before notify_all allows a
+        // second waiter to acquire it and miss the wakeup). The entry stays
+        // in the table; future register/release find it and increment again.
+        // The unique_ptr keeps the entry alive across the cv.notify_all,
+        // which would otherwise UAF if we erased the entry first.
+        e->cv.notify_all();
+    }
+}
+
+extern "C" void bz_wait_for_borrows(void* obj) {
+    if (!obj) return;
+    std::unique_lock<std::mutex> lk(g_borrow_mu);
+    auto it = g_borrow_table.find(obj);
+    if (it == g_borrow_table.end()) return;
+    BzBorrowEntry* e = it->second.get();
+    e->cv.wait(lk, [&] {
+        // Re-check under the lock: a register/release may have raced with us
+        // between the find and the wait. The predicate reads the atomic with
+        // acquire so it synchronizes-with the release that drove the count
+        // to zero.
+        return e->borrow_count.load(std::memory_order_acquire) == 0;
+    });
 }

@@ -90,6 +90,34 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
 
 
 void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
+    // fix #3936 / #2702 item 2 (§28.3 / §28.4 / §28.9, v0.290+): the
+    // per-body emitter fields a NESTED body emission must not INHERIT —
+    // the destructor-body pair (emittingDisposerBody_ / disposerEntryExc_),
+    // the catch-arm pair, the accessor-representation pair
+    // (accessorReturnTypeNode_ / accessorReturnTypeFn_), the choice
+    // receiver-identity recovery field, the suspend/resume frame, the
+    // narrow per-call channels, and the root-scope registration channels
+    // (see NestedBodyScope's definition in LlvmBackend_Assign.cpp ~5114
+    // for the full list and the members deliberately inherited) — are
+    // saved, neutralised and restored by ONE guard. This is the same
+    // #2702 shape the other six lazy emitters already adopt
+    // (ensurePropertyBlockGetter / ensureIndexerGetterFn /
+    // ensureIndexerSetterFn / ensurePropertyAccessorFn /
+    // emitIteratorMethod / emitAsyncMethod). Without it, the two
+    // mid-emission call paths this function is reached from
+    // (`emitSpecializedDisposer` from `specializedVtableFor` ->
+    // `emitInstanceInit` for a generic instantiation with an `owned T`
+    // field, #816 / §28.5; and `specializedDisposerCoreFor` from
+    // `emitBaseDisposeChain`) leave the disposer body of a TYPED-`Owner`
+    // reached MID-emission of a HOLDER destructor carrying the HOLDER's
+    // `emittingDisposerBody_ = true` — and on the way out, the cached
+    // `Owner.dispose` IR is frozen module-wide by `disposerCoreFns_[ts]`
+    // with that flag's *wrong* value. The disposer's own `Sink.Seen := _n`
+    // (a block-body property getter lowered from this disposer body)
+    // therefore reads the HOLDER caller's stored `Sink.Seen` instead of
+    // the property's own `_n` (#3936's measured divergence, two callers
+    // in two orders). The RAII guard's dtor restores everything on exit.
+    NestedBodyScope nestedScope(*this);
     // fix #3921 (§27.5 / §28.4 / §28.9, v0.294): the SAVE/RESTORE half of the
     // capture-cell clear+re-pin block ~150 lines below (fix #2887's). A
     // `clear()` on per-lowering emitter state and a save/restore around nested
@@ -117,7 +145,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
     // reason, but neither ever grew a save for the capture-cell family. So a
     // single `new Box<Res>(…)` anywhere in a method body silently wiped that
     // body's own §27.5 capture-cell eligibility (and its `sharedCellEnvdtor
-    // FreeOwner_` §3426 decisions) for every lambda lowered AFTER it, with no
+    // FreeOwner_` #3426 decisions) for every lambda lowered AFTER it, with no
     // diagnostic and no crash: a leak, never a double-free.
     //
     // MEASURED (issue 3921, at 500 iterations under ASan/LSan): fix #3804's
@@ -312,7 +340,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // clean exception context, and restore it — combined via select with
         // any genuinely NEW exception the body raised — at every reachable
         // exit from the body (the normal fallthrough below, and an early
-        // `return;` inside the body, per §3459: LlvmBackend_Stmts.cpp's plain
+        // `return;` inside the body, per #3459: LlvmBackend_Stmts.cpp's plain
         // ReturnStmt path). On the normal, non-unwind disposal path this
         // value is null at runtime, so clear/restore is a no-op there.
         parkedDtorExc = disposerEntryExc_;
@@ -961,7 +989,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // bz_array_free, cascading into class elements for an owning collection),
     // or — §28.13 / stdlib §2.16 (#620) — a Shared<T>/Weak<T> handle (released
     // via bz_shared_release / bz_weak_release),
-    // or — §28.5/§24.4 (#879) — a Subscription handle (unsubscribed via
+    // or — §28.5/§24 (#879) — a Subscription handle (unsubscribed via
     // bz_subscription_dispose, which is null-safe).
     struct OwnedField {
         // fix #2778 / §29.7 (v0.NNN): auto-property storage is a MemberSymbol,
@@ -979,7 +1007,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         bool sharedField = false;
         // §28.13 (#620): true for Weak<T> owned field (bz_weak_release).
         bool weakField = false;
-        // §28.5/§24.4 (#879): true for Subscription (or Subscription?) owned
+        // §28.5/§24 (#879): true for Subscription (or Subscription?) owned
         // field (bz_subscription_dispose — null-safe, so no guard needed).
         bool subscriptionField = false;
         // #1643 / §29.7: true for an owned IEnumerable<T>/IOwningEnumerable<T>
@@ -987,7 +1015,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // frees the frame itself), dispatched below via the iterEnumDispose
         // path, NOT the class-vtable slot-2 dynamicDispose.
         bool iterField = false;
-        // §6.5 / §24.3 (#1646): true for an owned EventSource<T>/AsyncEventSource<T>
+        // §6.5 / §24 (#1646): true for an owned EventSource<T>/AsyncEventSource<T>
         // field — a bz_event_source_t* freed via bz_event_source_free (null-safe),
         // which reclaims the subscriber list and the struct. No vtable.
         bool eventSourceField = false;
@@ -1093,7 +1121,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
             owned.push_back({fs, ct});
         } else if (isOwnedSubscriptionField(fs)) {
-            // §28.5/§24.4 (#879): an `owned` field of Subscription (or
+            // §28.5/§24 (#879): an `owned` field of Subscription (or
             // Subscription?) type.  Subscription is a compiler-known opaque
             // handle with no vtable; unsubscribe via bz_subscription_dispose
             // (null-safe: `if (!subp) return;` — so Subscription? is safe too).
@@ -1109,7 +1137,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             of.iterField = true;
             owned.push_back(of);
         } else if (isOwnedEventSourceField(fs)) {
-            // §6.5 / §24.3 (#1646): an `owned` EventSource<T>/AsyncEventSource<T>
+            // §6.5 / §24 (#1646): an `owned` EventSource<T>/AsyncEventSource<T>
             // field (the event pattern's source, now user-constructible). A
             // bz_event_source_t* with no vtable; freed via bz_event_source_free
             // (null-safe), which reclaims the subscriber list + struct.
@@ -1331,7 +1359,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateCall(fn, {val, disp});
             continue;
         }
-        // §28.5/§24.4 (#879): owned Subscription (or Subscription?) field —
+        // §28.5/§24 (#879): owned Subscription (or Subscription?) field —
         // unsubscribe via bz_subscription_dispose (null-safe: first thing it
         // does is `if (!subp) return;`, so Subscription? left null is safe).
         // Null the field after so a re-entrant dispose is a no-op.
@@ -1342,7 +1370,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             continue;
         }
-        // §6.5 / §24.3 (#1646): owned EventSource<T>/AsyncEventSource<T> field —
+        // §6.5 / §24 (#1646): owned EventSource<T>/AsyncEventSource<T> field —
         // free the subscriber list + struct via bz_event_source_free (null-safe:
         // `if (!s) return;`, so a ctor that threw before the field was assigned is
         // safe). This is the same runtime free the keyword-form EventSymbol
@@ -1839,7 +1867,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
-    // #480 / §24.1 / §24.5 / §28 (#1176): free each instance event's backing
+    // #480 / §24 / §28 (#1176): free each instance event's backing
     // EventSource. emitInstanceInit allocated one bz_event_source_new per
     // instance EventSymbol (sync and async); those allocations are NOT visited
     // by the FieldSymbol loop above because EventSymbol does not inherit from
@@ -2614,8 +2642,25 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // branch, matching checked disposal's own deliberate-leak posture for
     // everything else the block owns — only the block header itself is kept
     // readable for the disposed-flag guard.)
-    if (!checkedDisposal_)
+    if (!checkedDisposal_) {
+        // fix #3460 (§28.3 / §30.1): before freeing the heap block, wait for
+        // any cross-task BORROWS on this object to be released. A borrow is
+        // registered by an async frame whose `this = c` capture points at c
+        // (the heap-use-after-free of #3460 was main's `using var c` exit
+        // firing `free(c)` while the worker's resume continuation still read
+        // `this._h`). The wait blocks until the worker's emitAsyncComplete
+        // has run and released its borrow — closing the race. Null-safe and
+        // cheap for objects nobody borrowed (the runtime side-table find is a
+        // mutex lock + failed lookup, no syscall). Runs BEFORE the free,
+        // AFTER the CauseChain reclaim — the CauseChain read races only with
+        // a still-borrowed object, but the borrow's release synchronizes
+        // with the wait's acquire-load so the reclaim is safe.
+        builder_.CreateCall(
+            declareC("bz_wait_for_borrows",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+            {obj});
         builder_.CreateCall(freeFn(), {obj});
+    }
 }
 
 
@@ -2949,7 +2994,7 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     case VtablelessBuiltinReleaseArm::AtomicFamily:
         callVoid("bz_atomic_dispose", {recv});
         return true;
-    // §24.3 / §6.5 / #2026: sync and async sources share one runtime
+    // §24 / §6.5 / #2026: sync and async sources share one runtime
     // representation, so both free identically (null-safe).
     case VtablelessBuiltinReleaseArm::EventSourceFamily:
         callVoid("bz_event_source_free", {recv});
@@ -3017,7 +3062,7 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     case VtablelessBuiltinReleaseArm::FileStream:
         callVoid("bz_filestream_dispose", {recv});
         return true;
-    // §2.11 / §24.4: disposing a Subscription removes the handler from its
+    // §2.11 / §24: disposing a Subscription removes the handler from its
     // event source. The explicit-Dispose chain reaches this only when
     // `isSubscriptionExpr`'s STRUCTURAL detection (the local's initializer is an
     // event `Subscribe(...)` call) did not fire — a Subscription-typed
@@ -7499,7 +7544,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
-        // §6.5 / §24.3 (#2026): a `using var` EventSource<T>/AsyncEventSource<T>
+        // §6.5 / §24 (#2026): a `using var` EventSource<T>/AsyncEventSource<T>
         // — a bz_event_source_t* with no vtable. Free the subscriber list + struct
         // via bz_event_source_free (null-safe: `if (!s) return;`, so a ctor that
         // threw before the local was assigned, or a moved-out slot, is safe). The
