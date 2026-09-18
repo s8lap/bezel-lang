@@ -6713,7 +6713,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             }
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
-            builder_.CreateCall(freeFn(), {cell});
+            // fix #2718 (§27.5 / §28.9, v0.298): the frame's scope-end release
+            // is the producer's --rc. Each env also does --rc in its envdtor;
+            // whichever fires LAST (deepest rc) sees rc==0 and frees the cell
+            // plus its contained value. Pass nullptr for `semaTy` because the
+            // envdtor for every env that captured this local has already
+            // (or will, in LIFO order) released the contents — and the frame
+            // here is NOT a producer of the cell's value, only of the cell
+            // itself. The cell's value-refcounted-release lives entirely on
+            // the env/closure path; the frame-side is plain --rc/free.
+            //
+            // Hmm — but if the envdtor has already fired (LIFO: envdtor first,
+            // frame scope end second), rc will already be <N. The frame's --rc
+            // needs to find rc==0 (if only this local captured the cell) to
+            // free the cell. The envdtor will have released the value, but
+            // the cell itself wasn't freed (rc went 2->1). Then frame dec
+            // 1->0, free. Pass nullptr to emitCellRefcountedFree so it does
+            // NOT also release the value (that would be a double-release).
+            emitCellRefcountedFree(cell, /*semaTy=*/nullptr);
             // A guarded capture may be re-entered (for example, a case arm in
             // a loop). Null the holder after reclaim so the next entry allocates
             // a fresh cell instead of reusing freed storage.

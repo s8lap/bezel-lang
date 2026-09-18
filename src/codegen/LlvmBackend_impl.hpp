@@ -4273,6 +4273,67 @@ private:
         builder_.CreateCall(fn, {b});
     }
 
+    // fix #2718 (§27.5 / §28.9, v0.298): the capture cell is `{value, rc}` with
+    // the value at offset 0 (preserving the existing boxedStorage load/store
+    // path) and a 64-bit refcount at offset 8. Capture increments rc; the
+    // envdtor and the frame's scope end both decrement and free on zero. These
+    // helpers encapsulate that accounting so the envdtor / boxedCellFree /
+    // capture-retain sites only have to name the cell pointer and the value's
+    // static type.
+
+    // GEP to the cell's rc field (offset 8, regardless of value type — the
+    // cell layout reserves 8 bytes for the value and 8 for the rc).
+    llvm::Value* cellRcAddr(llvm::Value* cell) {
+        return builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)});
+    }
+
+    // Increment the cell's refcount (a new env now owns a +1).
+    void emitCellRetain(llvm::Value* cell) {
+        if (!cell) return;
+        llvm::Value* rc = builder_.CreateLoad(i64(), cellRcAddr(cell), "cell.rc");
+        llvm::Value* inc = builder_.CreateAdd(rc, builder_.getInt64(1));
+        builder_.CreateStore(inc, cellRcAddr(cell));
+    }
+
+    // Decrement the cell's refcount. At zero: release the value (when the
+    // static type is one of the refcounted kinds), then free the cell.
+    // `semaTy` is the captured local's resolved sema type (null for value
+    // types — int / bool / struct — which carry no release obligation).
+    void emitCellRefcountedFree(llvm::Value* cell, const sema::TypeRef* semaTy) {
+        if (!cell) return;
+        llvm::Value* rcAddr = cellRcAddr(cell);
+        llvm::Value* rc = builder_.CreateLoad(i64(), rcAddr, "cell.rc");
+        llvm::Value* dec = builder_.CreateSub(rc, builder_.getInt64(1));
+        builder_.CreateStore(dec, rcAddr);
+        llvm::Value* isZero = builder_.CreateICmpEQ(
+            dec, builder_.getInt64(0), "cell.rc.zero");
+        llvm::Function* parentFn = builder_.GetInsertBlock()->getParent();
+        auto* freeBB = llvm::BasicBlock::Create(llvm_, "cell.rc.free", parentFn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "cell.rc.cont", parentFn);
+        builder_.CreateCondBr(isZero, freeBB, contBB);
+
+        builder_.SetInsertPoint(freeBB);
+        // fix #2718: when the cell dies, it owns exactly one value — the
+        // contents at offset 0. Release it according to its static type, then
+        // free the cell. Class borrows are NOT released (they are borrows per
+        // §28.9 / §28.3; the closure does not own them).
+        if (semaTy) {
+            if (isStringTypeRefNonNull(semaTy)) {
+                llvm::Value* str = builder_.CreateLoad(ptrTy(), cell, "cell.str");
+                emitStringRelease(str);
+            } else if (semaTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* cl = builder_.CreateLoad(ptrTy(), cell, "cell.cl");
+                emitClosureRelease(cl);
+            }
+            // Value-typed captures (int, bool, struct): nothing to release.
+            // Class borrows (§28.9 / §28.3): no release.
+        }
+        builder_.CreateCall(freeFn(), {cell});
+        builder_.CreateBr(contBB);
+
+        builder_.SetInsertPoint(contBB);
+    }
+
     // fix #1747 / §28.9 / §9.7 / §28.3: GEP every string storage member of
     // record `ts` at struct ADDRESS `recAddr` (the slot in a plain-`var`
     // local), load the field's current string pointer, bz_string_release

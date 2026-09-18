@@ -3859,6 +3859,17 @@ void Emitter::fixupCapturedCellHolderReads() {
 }
 
 
+// fix #2718 (§27.5 / §28.9, v0.298): the cell layout is `{value, rc}` where
+// `value` lives at offset 0 (so existing load/store through `boxedStorage`
+// is unchanged) and `rc` is the cell's refcount at offset sizeof(value).
+// Capture does rc++, envdtor does `if (--rc == 0) release(value); free(cell)`,
+// and the frame's scope end does the same. The decision machinery that exists
+// ONLY to choose who frees the cell (`cellFreeEligible_`, `singleCaptureLocals_`,
+// `definitelyEscapingLambdas_`, `freeCellInEnvdtor`) is deleted; the refcount
+// replaces the decision. This helper allocates the 16-byte cell for ptr-typed
+// values (the common case — string/closure/box captures); non-ptr captures
+// keep the existing valTy-sized allocation.
+
 // §27.5: promote a local/param slot to a shared heap cell so that the
 // enclosing function and any capturing closure access the same storage.
 // Idempotent: a slot already boxed is reused (multiple lambdas capturing the
@@ -3932,11 +3943,21 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
 
         // Allocation branch: first pass (or previous alloc was skipped).
         builder_.SetInsertPoint(allocBB);
-        llvm::Value* cellSize = builder_.CreatePtrToInt(
-            builder_.CreateGEP(valTy,
-                               llvm::ConstantPointerNull::get(ptrTy()),
-                               {builder_.getInt32(1)}),
-            i64());
+        // fix #2718: pointer-typed cells are now `{value (off 0), rc (off 8)}`,
+        // 16 bytes total. Non-pointer values (int, struct) keep the existing
+        // valTy-sized allocation — those are value-typed, never refcounted, so
+        // the existing scope-end free path is correct without an rc.
+        const bool cellIsPtr = valTy->isPointerTy();
+        llvm::Value* cellSize;
+        if (cellIsPtr) {
+            cellSize = builder_.getInt64(16);
+        } else {
+            cellSize = builder_.CreatePtrToInt(
+                builder_.CreateGEP(valTy,
+                                   llvm::ConstantPointerNull::get(ptrTy()),
+                                   {builder_.getInt32(1)}),
+                i64());
+        }
         llvm::Value* cell = builder_.CreateCall(
             callocFn(), {builder_.getInt64(1), cellSize});
         // Read the original slot's value (tracked in cellVarSyncSlot_) to
@@ -3950,6 +3971,13 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
             llvm::Value* cur = builder_.CreateLoad(
                 valTy, syncIt->second, "preboxed");
             builder_.CreateStore(cur, cell);
+        }
+        // fix #2718: initialise the cell's refcount to 1 (the producer's +1).
+        // Each additional capture does rc++, each envdtor does --rc and
+        // releases+free on rc==0.
+        if (cellIsPtr) {
+            builder_.CreateStore(builder_.getInt64(1),
+                                 builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
         }
         builder_.CreateStore(cell, newSlot);
         builder_.CreateBr(doneBB);
@@ -3999,14 +4027,28 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         // pass (for-var loop variable fresh binding, or per-iteration re-init).
         // NOT guarded: a fresh cell is created every time this code runs.
         if (wasGuardedBoxing) *wasGuardedBoxing = false;
-        llvm::Value* cellSize = builder_.CreatePtrToInt(
-            builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
-                               {builder_.getInt32(1)}),
-            i64());
+        // fix #2718: ptr-typed cells are 16 bytes `{value, rc}`; non-ptr
+        // values keep valTy-sized allocation.
+        const bool cellIsPtrF = valTy->isPointerTy();
+        llvm::Value* cellSizeF;
+        if (cellIsPtrF) {
+            cellSizeF = builder_.getInt64(16);
+        } else {
+            cellSizeF = builder_.CreatePtrToInt(
+                builder_.CreateGEP(valTy,
+                                   llvm::ConstantPointerNull::get(ptrTy()),
+                                   {builder_.getInt32(1)}),
+                i64());
+        }
         llvm::Value* cell = builder_.CreateCall(callocFn(),
-                                                {builder_.getInt64(1), cellSize});
+                                                {builder_.getInt64(1), cellSizeF});
         llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
         builder_.CreateStore(cur2, cell);
+        // fix #2718: init rc=1 for ptr cells (each fresh cell has its own +1).
+        if (cellIsPtrF) {
+            builder_.CreateStore(builder_.getInt64(1),
+                                 builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
+        }
         newSlot = entryAlloca(ptrTy());
         builder_.CreateStore(cell, newSlot);
         cellVars_[newSlot] = valTy;
@@ -4049,14 +4091,27 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
 
     // Allocation branch: first pass only.
     builder_.SetInsertPoint(allocBB);
-    llvm::Value* cellSize = builder_.CreatePtrToInt(
-        builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
-                           {builder_.getInt32(1)}),
-        i64());
+    // fix #2718: ptr cells are 16 bytes `{value, rc}`; non-ptr cells keep
+    // valTy-sized allocation.
+    const bool cellIsPtrG = valTy->isPointerTy();
+    llvm::Value* cellSizeG;
+    if (cellIsPtrG) {
+        cellSizeG = builder_.getInt64(16);
+    } else {
+        cellSizeG = builder_.CreatePtrToInt(
+            builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
+                               {builder_.getInt32(1)}),
+            i64());
+    }
     llvm::Value* cell = builder_.CreateCall(callocFn(),
-                                            {builder_.getInt64(1), cellSize});
+                                            {builder_.getInt64(1), cellSizeG});
     llvm::Value* cur = builder_.CreateLoad(valTy, slot, "preboxed");
     builder_.CreateStore(cur, cell);
+    // fix #2718: init rc=1 for ptr cells (producer's +1).
+    if (cellIsPtrG) {
+        builder_.CreateStore(builder_.getInt64(1),
+                             builder_.CreateGEP(i8(), cell, {builder_.getInt64(8)}));
+    }
     builder_.CreateStore(cell, newSlot);
     builder_.CreateBr(doneBB);
 
