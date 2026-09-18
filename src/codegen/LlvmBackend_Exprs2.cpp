@@ -1438,7 +1438,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // capture-shape attributes the walker resolved at first
             // capture. (Subsequent captures' flags are OR-equivalent
             // for the boxedCellFree frame-side accounting.)
-            lce.semaTy = ce.semaTy;
+            //
+            // fix #4261 Row C (cycle-11, §27.5 / §28.3 / §28.9): keep
+            // `lce.semaTy = nullptr` for captured PARAMETERS. A parameter
+            // is a borrow (§28.9: caller owns the reference and releases it
+            // at the caller's scope end) — the cell's frame-side
+            // --rc at scope end must NOT release the value, else the
+            // caller-side release becomes a double-release on a borrowed
+            // string (the regression V1's WIP fix introduced on Row 1 of
+            // lambda_capture_cell_refcount_2718). The local-capture site
+            // below DOES resolve `lce.semaTy` inline (cell claims the
+            // local's suppressed scope-end release; the cell's --rc==0
+            // branch must discharge it). For parameter captures, the
+            // caller still owns the +1 and will release at its own scope
+            // end — the cell frees WITHOUT releasing.
+            lce.semaTy = nullptr;
             lce.releaseBox = ce.releaseBoxInEnvdtor;
             lce.suppressContent = ce.suppressContentRcInEnvdtor;
             lastLambdaCapturedCells_.push_back(lce);
@@ -1992,7 +2006,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // emitCellRefcountedFree call then sees the captured
                 // type and the content-release suppressions when its
                 // --rc hits zero.
-                lce.semaTy = ce.semaTy;
+                // V2-narrow (fix-forward of V1 WIP, #4261 Row C / §28.3):
+                // resolve lce.semaTy INLINE so the frame's boxedCellFree
+                // emitCellRefcountedFree call sees the captured type and
+                // emits the value-release arm at rc==0. (ce.semaTy is
+                // still null at this point — the per-symbol assignment
+                // sits below at line 2131.)
+                lce.semaTy = nullptr;
+                for (const sema::Symbol* s : capturedSyms) {
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                        if (loc->decl == decl) {
+                            lce.semaTy = loc->declType;
+                            break;
+                        }
+                    }
+                }
                 lce.releaseBox = ce.releaseBoxInEnvdtor;
                 lce.suppressContent = ce.suppressContentRcInEnvdtor;
                 lastLambdaCapturedCells_.push_back(lce);
