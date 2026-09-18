@@ -254,6 +254,24 @@ struct bz_domain_t {
 struct bz_task_t {
     std::mutex mtx;
     std::condition_variable cv;
+    // fix #3460 (§28.3 / §30.1): reference count for the TASK OBJECT ITSELF,
+    // separate from the existing per-`result` ownership (which `result_disposer`
+    // / `chained_source` track). A task object is created with refcount == 1
+    // (the producer / caller's reference, the one they balance with
+    // `bz_task_free`). Codegen's async-method entry additionally calls
+    // `bz_task_retain` on `outerTask` immediately after storing it into the
+    // heap frame's outerTask field; `emitAsyncComplete` (and the fault-boundary
+    // path) calls `bz_task_release` immediately before `free(self)`. That makes
+    // the FRAME hold a strong reference to `outerTask` for its entire lifetime,
+    // so the worker's resume continuation can read `frame[OUTER_TASK_FIELD]`
+    // safely even when the caller's `bz_task_free(outerTask)` from `using var t`
+    // scope-end disposal has already run. Pre-#3460 this read was a UAF when
+    // the caller's scope end won the race against the worker's resume — the
+    // `heap-use-after-free in bz$async$M.C$Fill$Resume` of #3460. The retain
+    // is unconditional for every async method (named or lambda), so a task that
+    // never suspends (synchronous body) simply retains + immediately releases
+    // inside `emitAsyncComplete`, leaving the caller's count undisturbed.
+    std::atomic<int32_t> refcount{1};
     bool done = false;
     bool is_error = false;
     // §30.5 (v0.162 / #1352): OwningTask single-consumer affine tracking. Set to

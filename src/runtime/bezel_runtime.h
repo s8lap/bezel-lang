@@ -932,8 +932,51 @@ int8_t bz_task_fault_borrowed(void* task);
 // Register a continuation to run when the task completes (on the thread pool).
 void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* state);
 
+// fix #3460 (§28.3 / §30.1): increment the task's reference count. Pairs with
+// `bz_task_release`; the producer's original reference (the one they balance
+// with `bz_task_free`) starts at 1. Used by codegen to make the heap frame
+// hold a strong reference to its own `outerTask` for the frame's lifetime, so
+// the worker resume continuation can safely read `frame[OUTER_TASK_FIELD]`
+// even when the caller's `bz_task_free(outerTask)` from `using var` scope-end
+// has already run. Null-safe (a no-op for `task == null`); safe to call on a
+// task that has already completed (the refcount outlives task completion).
+void  bz_task_retain(void* task);
+
+// fix #3460 (§28.3 / §30.1): decrement the task's reference count; when the
+// count reaches zero, dispose the result / error / chained source and free
+// the task object exactly as `bz_task_free` did before #3460. `bz_task_free`
+// itself is now a thin wrapper around this; both behave identically. Null-
+// safe. The final release (the one whose decrement reaches zero) frees the
+// struct after the existing `bz_task_free` body runs; intermediate releases
+// only touch the atomic counter.
+void  bz_task_release(void* task);
+
 // Free the task object. Must be called after the result has been consumed.
+// Since #3460 this is a thin wrapper around `bz_task_release`; both balance
+// the producer's original reference (counted at `bz_task_alloc`).
 void  bz_task_free(void* task);
+
+// fix #3460 (§28.3 / §30.1): cross-task borrow tracking on heap objects.
+// Classes in Bezel are single-owner (no GC, no per-class refcount), so a
+// borrowed reference to a class instance cannot extend its lifetime through
+// refcounting alone. When an async method captures `this = c` into its heap
+// frame, the frame must hold a *borrow* on c that outlives every pending
+// resumption (the spec §28.3 claim that "the borrow of the captured state
+// must outlive any pending resumption"). The borrow registry is a
+// process-global side table: bz_register_borrow(c) increments the borrow
+// count for c; bz_release_borrow(c) decrements; bz_wait_for_borrows(c)
+// blocks until the borrow count for c reaches zero. Codegen emits
+// register/release at the frame's lifetime boundary, and emits
+// wait_for_borrows at the OWNER's dispose site (e.g. `using var c := new C()`
+// scope-end) BEFORE the actual `free(c)`. With both halves in place, the
+// race of #3460 — main's `using var c` exit firing `free(c)` while the
+// worker's resume continuation still reads `this._h` — closes: the dispose
+// site blocks until the worker has run emitAsyncComplete and released its
+// borrow. Null-safe; the entry is removed when the count returns to zero
+// so the side table does not grow unbounded for long-running services.
+void  bz_register_borrow(void* obj);
+void  bz_release_borrow(void* obj);
+void  bz_wait_for_borrows(void* obj);
 
 // stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a task and
 // immediately complete it with the `result_size` bytes at `result`. The
