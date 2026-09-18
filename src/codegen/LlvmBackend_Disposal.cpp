@@ -90,6 +90,34 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
 
 
 void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
+    // fix #3936 / #2702 item 2 (§28.3 / §28.4 / §28.9, v0.290+): the
+    // per-body emitter fields a NESTED body emission must not INHERIT —
+    // the destructor-body pair (emittingDisposerBody_ / disposerEntryExc_),
+    // the catch-arm pair, the accessor-representation pair
+    // (accessorReturnTypeNode_ / accessorReturnTypeFn_), the choice
+    // receiver-identity recovery field, the suspend/resume frame, the
+    // narrow per-call channels, and the root-scope registration channels
+    // (see NestedBodyScope's definition in LlvmBackend_Assign.cpp ~5114
+    // for the full list and the members deliberately inherited) — are
+    // saved, neutralised and restored by ONE guard. This is the same
+    // #2702 shape the other six lazy emitters already adopt
+    // (ensurePropertyBlockGetter / ensureIndexerGetterFn /
+    // ensureIndexerSetterFn / ensurePropertyAccessorFn /
+    // emitIteratorMethod / emitAsyncMethod). Without it, the two
+    // mid-emission call paths this function is reached from
+    // (`emitSpecializedDisposer` from `specializedVtableFor` ->
+    // `emitInstanceInit` for a generic instantiation with an `owned T`
+    // field, #816 / §28.5; and `specializedDisposerCoreFor` from
+    // `emitBaseDisposeChain`) leave the disposer body of a TYPED-`Owner`
+    // reached MID-emission of a HOLDER destructor carrying the HOLDER's
+    // `emittingDisposerBody_ = true` — and on the way out, the cached
+    // `Owner.dispose` IR is frozen module-wide by `disposerCoreFns_[ts]`
+    // with that flag's *wrong* value. The disposer's own `Sink.Seen := _n`
+    // (a block-body property getter lowered from this disposer body)
+    // therefore reads the HOLDER caller's stored `Sink.Seen` instead of
+    // the property's own `_n` (#3936's measured divergence, two callers
+    // in two orders). The RAII guard's dtor restores everything on exit.
+    NestedBodyScope nestedScope(*this);
     // fix #3921 (§27.5 / §28.4 / §28.9, v0.294): the SAVE/RESTORE half of the
     // capture-cell clear+re-pin block ~150 lines below (fix #2887's). A
     // `clear()` on per-lowering emitter state and a save/restore around nested
@@ -2614,8 +2642,25 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // branch, matching checked disposal's own deliberate-leak posture for
     // everything else the block owns — only the block header itself is kept
     // readable for the disposed-flag guard.)
-    if (!checkedDisposal_)
+    if (!checkedDisposal_) {
+        // fix #3460 (§28.3 / §30.1): before freeing the heap block, wait for
+        // any cross-task BORROWS on this object to be released. A borrow is
+        // registered by an async frame whose `this = c` capture points at c
+        // (the heap-use-after-free of #3460 was main's `using var c` exit
+        // firing `free(c)` while the worker's resume continuation still read
+        // `this._h`). The wait blocks until the worker's emitAsyncComplete
+        // has run and released its borrow — closing the race. Null-safe and
+        // cheap for objects nobody borrowed (the runtime side-table find is a
+        // mutex lock + failed lookup, no syscall). Runs BEFORE the free,
+        // AFTER the CauseChain reclaim — the CauseChain read races only with
+        // a still-borrowed object, but the borrow's release synchronizes
+        // with the wait's acquire-load so the reclaim is safe.
+        builder_.CreateCall(
+            declareC("bz_wait_for_borrows",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+            {obj});
         builder_.CreateCall(freeFn(), {obj});
+    }
 }
 
 
