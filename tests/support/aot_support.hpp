@@ -417,10 +417,40 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
         if (execPipe[0] >= 0) ::close(execPipe[0]);   // child holds only the write end
-        ::execv(cargv[0], cargv.data());
+        // Fix narrow #3007 retry: ETXTBSY (errno 26, "Text file busy") is a
+        // TRANSIENT FS-level race, not a real exec failure. It fires when
+        // another process / thread holds the executable open for writing —
+        // the async_frame_teardown_no_uaf_3460 reproducer measures ~1-3 %
+        // pre-fix failure on this exact symptom: it forks 8 threads × K=32
+        // attempts each, all hammering the SAME cached executable inode
+        // (one fs::create_hard_link per attempt), and a concurrent sibling
+        // shard's clang link (forkedLink's child) or storeToCache rename
+        // can leave a brief window where the kernel refuses the exec.
+        //
+        // Bounded retry (≤ kMaxExecRetries attempts with kExecRetrySleepMs
+        // between) closes the window. ONLY ETXTBSY is retried — EACCES,
+        // ENOENT, ENOMEM, and every other errno are real failures and pass
+        // through immediately, so the harness's "[ INFRA ]" channel still
+        // surfaces genuine compile/link or harness errors at the same
+        // fidelity. The total retry budget is ≤ 25 ms (5 attempts × 5 ms),
+        // negligible against aotTimeoutSec (30 s). The execPipe[1] write end
+        // stays open across retries (it's O_CLOEXEC — a successful exec
+        // would still close it automatically); we only WRITE the final errno
+        // after the retry budget is exhausted, so the parent receives the
+        // REAL outcome, not the first transient one.
+        int execRetryErrno = 0;
+        constexpr int kMaxExecRetries = 5;
+        constexpr int kExecRetrySleepMs = 5;
+        for (int attempt = 0;; ++attempt) {
+            ::execv(cargv[0], cargv.data());
+            execRetryErrno = errno;
+            if (execRetryErrno != ETXTBSY || attempt >= kMaxExecRetries) break;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kExecRetrySleepMs));
+        }
+        const int e = execRetryErrno;
         // exec failed — report errno through the CLOEXEC pipe (#3007) so the
         // parent can tell this apart from a program that returned 127 itself.
-        const int e = errno;
         if (execPipe[1] >= 0) {
             ssize_t ignored = ::write(execPipe[1], &e, sizeof(e));
             (void)ignored;
