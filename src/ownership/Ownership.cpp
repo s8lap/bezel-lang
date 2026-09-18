@@ -10962,42 +10962,59 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // dataflow), and widening it to one is out of this fix's scope.
         // // per §28.3 K1.3, §28.8.1, v0.295, #3951, #4117
         //
-        // #4138 (declined here — see issue #4142): the try-body's normal-
-        // completion path has the identical false-reject shape as the
-        // Case/If joins above when it ends in `return`/`throw` (measured:
-        // `try t := t + Take(move x); return t; catch E => t := 0; end; t
-        // := t + Take(move x);` compiles clean on origin/main, falsely
-        // rejected on this batch's base) — but excluding it here the same
-        // way is UNSOUND, not merely incomplete, because of `finally`.
-        // `finally` ALWAYS runs, on every path including one that is about
-        // to return/throw, so the state fed into `finally`'s own walk below
-        // must be the union of EVERY path, terminated or not — dropping a
-        // terminated operand here is invisible when there is no `finally`,
-        // but reopens a real double-move once one is added: measured, `try
-        // t := t + Take(move x); return t; finally t := t + Take(move x);
-        // end;` (no catch arm at all) correctly rejects "already moved out"
-        // at `102d29f`/`3bdae03` alike (a single-operand join, the body's
-        // own MovedFrom state, feeds `finally` directly) but silently
-        // ACCEPTED once this arm was excluded from `tryEnds` the same way
-        // the Case/If arms are — `finally` was walked from the wrong
-        // (too-optimistic) state. `finally`'s state and "state that
-        // survives past the whole `try`" are the SAME variable in this
-        // walker (`states_`, mutated in place) precisely because `finally`
-        // is walked exactly once, not once per tryEnds operand — so there
-        // is no way to filter one consumer without also filtering the
-        // other with the tools this walker has. A correct fix needs the two
-        // uses separated (an unfiltered union for `finally`'s own walk, and
-        // a further reachability re-filter of ITS OWN result afterward for
-        // what continues past the whole `try`) — a larger, more careful
-        // change than this narrow batch fix-forward should make under time
-        // pressure. Left EXACTLY as #4117 landed it (unconditional), so the
-        // known-safe `finally` behavior is preserved and #4138's Try
-        // sub-case remains a declared, open false-reject (issue #4142).
+        // fix #4142 (§21.7 / §28.3 / §28.8.1, v0.298): the try-body's normal-
+        // completion path that ends in `return`/`throw` (per
+        // `armNeverFallsThrough`, the same predicate the Case/If #4138 arms
+        // already use — see this file's header for the why-break/continue-are-
+        // excluded asymmetry) leaves the enclosing callable outright, so it
+        // NEVER reaches the point directly after the `try`. The pre-#4142
+        // walker joined every body operand into `tryEnds` regardless, which
+        // gave code-after-the-try a spurious "already moved" / "maybe-
+        // consumed" diagnostic that the real per-method TryStmt join has
+        // never produced.
+        //
+        // The fix splits the operands into TWO views:
+        //   - `tryEndsForFinally` — the FULL union (body + every catch arm).
+        //     Used to seed the `finally` walk, because `finally` ALWAYS runs,
+        //     on every path including one that just returned/threw — dropping
+        //     a terminated operand here is unsafe (the previously-measured
+        //     `try t := t + Take(move x); return t; finally t := t + Take(
+        //     move x); end;` shape would silently re-accept the double-move).
+        //   - `tryEndsForJoin` — body and catch arms EXCLUDED when their last
+        //     reachable stmt is `return`/`throw`. Used for the post-try state
+        //     (what code AFTER the whole try sees).
+        //
+        // `applyUsingVarBorrowPinInLambdaStmt`'s `states_` is mutated in place
+        // by the finally walk (one-pass, no fixpoint), so the two views cannot
+        // share the variable: finally walks from `tryEndsForFinally`'s join
+        // FIRST, then `states_` is REASSIGNED to `tryEndsForJoin`'s join for
+        // what survives past the whole try. Same shape as CaseStmt/IfStmt
+        // #4138 (this file's If/Case arms ~lines 10660-10784 / 11021-11112),
+        // generalized to the {body-normal-completion} ∪ {catch arms} ∪
+        // {finally-always-runs} control shape. // per §21.7, §28.3 K1.4,
+        // §28.8.1, v0.298, #4142, #4138
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        std::vector<BlockState> tryEnds;
-        tryEnds.push_back(states_);  // normal completion, no throw
+        // fix #4142: track whether the body's normal-completion path is
+        // reachable to the post-try code. `armNeverFallsThrough` returns true
+        // when the body's last reachable stmt is `return`/`throw` — that path
+        // leaves the callable, so its state must be excluded from the post-try
+        // join (mirrors If/Case #4138). The same-state-for-finally variable
+        // below retains it for the finally walk.
+        const bool bodyNeverFallsThrough = armNeverFallsThrough(trys->body);
+        // Build both views IN PARALLEL as we walk each catch arm. Each
+        // operand (body + each catch arm) is pushed to the view it belongs
+        // to based on whether its last reachable stmt is a terminator.
+        // Both views get COPIES (not moves) of the post-walk `states_` — a
+        // `std::move` would invalidate the source for the OTHER view, since
+        // the finally walk later mutates `states_` in place from
+        // `tryEndsForFinally`'s join.
+        std::vector<BlockState> tryEndsForFinally;
+        std::vector<BlockState> tryEndsForJoin;
+        tryEndsForFinally.push_back(states_);
+        if (!bodyNeverFallsThrough)
+            tryEndsForJoin.push_back(states_);
         for (const auto& arm : trys->catches) {
             states_ = savedTryStates;
             if (arm.guard) {
@@ -11007,15 +11024,53 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     applyUsingVarBorrowPinInLambdaBody(*nested);
             }
             if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
-            tryEnds.push_back(states_);
+            // fix #4142: a catch arm whose body ends in `return`/`throw`
+            // ALSO never reaches the post-try code — the throw that brought
+            // control here is "consumed" by the catch arm, but the arm itself
+            // then exits the callable, leaving the post-try code unreachable.
+            // (`stmtNeverFallsThrough` handles the ExpressionStmt/DoEndBlock/
+            // if-with-no-else nested shapes the same way `armNeverFallsThrough`
+            // does for vector bodies.) Catch arms always run BEFORE `finally`,
+            // so their terminated operands STAY in `tryEndsForFinally` — the
+            // exclusion only applies to `tryEndsForJoin`.
+            const bool armTerminates = arm.body &&
+                stmtNeverFallsThrough(*arm.body);
+            tryEndsForFinally.push_back(states_);
+            if (!armTerminates)
+                tryEndsForJoin.push_back(states_);
         }
-        auto tryJoined = std::move(tryEnds.front());
-        for (std::size_t i = 1; i < tryEnds.size(); ++i)
-            joinInto(tryJoined, tryEnds[i], trys->span.begin,
-                     /*emitClash=*/false, /*unionKeys=*/false);
-        states_ = std::move(tryJoined);
+        // #4142: feed `finally` the FULL union (the body's own state plus
+        // every catch arm's own state) — this is `tryEndsForFinally`. Walk
+        // finally from `states_` set to this union's join; the
+        // post-try state is then OVERWRITTEN with the FILTERED join below.
+        if (tryEndsForFinally.empty()) {
+            // Empty body + no catch arms: the `try` is a no-op, walk finally
+            // (if any) from the pre-try snapshot.
+            states_ = savedTryStates;
+        } else {
+            auto tryJoinedForFinally = std::move(tryEndsForFinally.front());
+            for (std::size_t i = 1; i < tryEndsForFinally.size(); ++i)
+                joinInto(tryJoinedForFinally, tryEndsForFinally[i],
+                         trys->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(tryJoinedForFinally);
+        }
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        // #4142: the post-try state. When the entire operand set is
+        // excluded (every body + every catch arm ends in `return`/`throw`),
+        // the post-try code is unreachable via any live path — fall back to
+        // the pre-try snapshot, mirroring CaseStmt's identical fallback at
+        // ~line 11104.
+        if (tryEndsForJoin.empty()) {
+            states_ = savedTryStates;
+        } else {
+            auto tryJoined = std::move(tryEndsForJoin.front());
+            for (std::size_t i = 1; i < tryEndsForJoin.size(); ++i)
+                joinInto(tryJoined, tryEndsForJoin[i], trys->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(tryJoined);
+        }
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
