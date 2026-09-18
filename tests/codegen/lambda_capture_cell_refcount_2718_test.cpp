@@ -80,32 +80,27 @@
 // (FINDINGS A & B). Verified PASS-WITH on this commit.
 //
 // ORACLE. `runAotChecked` (ASan+LSan) for leak-checking rows; plain `runAot`
-// for the function-typed sibling (Row 2). A `runAotChecked` run that is
-// SKIPPED (no ASan toolchain) returns ran=false with "SKIP" in diagnostics;
-// those are SKIPPED, not failed, per the test's wasSkipped() guard below.
-// Reference values are the program outputs, not the leak byte counts — those
-// are checked against LSan (no `leaksAtLeast` weakening).
+// for the function-typed sibling (Row 2). Each checked row asserts
+// `BEZEL_EXPECT_FALSE(failedAtCompileTimeWithRealLocation(r))` so a SKIP
+// (no ASan toolchain → ran=false with "SKIP" in diagnostics, where
+// failedAtCompileTimeWithRealLocation returns false) falls through to
+// `BEZEL_EXPECT_TRUE(r.ran)` and fails LOUDLY — the #3733 fail-closed
+// pattern. Reference values are the program outputs, not the leak byte
+// counts — those are checked against LSan (no `leaksAtLeast` weakening).
 
 #include <string>
 #include <string_view>
 
+#include "support/aot_result_asserts.hpp"   // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -146,7 +141,7 @@ const char* kCapturedStringSharedByTwo =
 BEZEL_TEST(codegen_lambda_capture_cell_refcount_2718,
            captured_string_shared_by_two_envs_no_leak_spec_27_5) {
     JitResult r = runAotChecked(kCapturedStringSharedByTwo);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(r.ran);          // FAILS-WITHOUT: ASan/LSan leak
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=4784"));  // sum 2*len($"v-{i+1}") over i=0..499
 }
@@ -230,7 +225,7 @@ const char* kBoxCaptureLeakFree =
 BEZEL_TEST(codegen_lambda_capture_cell_refcount_2718,
            box_sole_escaping_capture_no_wrapper_leak_spec_28_9_box_release) {
     JitResult r = runAotChecked(kBoxCaptureLeakFree);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(failedAtCompileTimeWithRealLocation(r));
     if (!r.ran) {
         for (const auto& d : r.diagnostics.diagnostics())
             std::fprintf(stderr, "    DIAG: %s\n", d.message.c_str());
@@ -277,7 +272,7 @@ const char* kDictEntryStringKeyCapture =
 BEZEL_TEST(codegen_lambda_capture_cell_refcount_2718,
            dict_entry_string_key_capture_no_k_release_leak_spec_27_5_dict_entry) {
     JitResult r = runAotChecked(kDictEntryStringKeyCapture);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(r.ran);          // FAILS-WITHOUT: ~17500 B / 1000 LSan leak
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=5500"));
 }
