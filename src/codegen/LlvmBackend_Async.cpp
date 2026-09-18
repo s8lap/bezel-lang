@@ -1348,13 +1348,26 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // suspends registers + immediately releases inside emitAsyncComplete,
         // leaving the OWNER's wait a no-op.
         if (isInstance) {
-            llvm::Value* thisVal = currentThis_
-                                       ? currentThis_
-                                       : &*currentFn_->arg_begin();
-            auto* registerBorrowFn =
-                declareC("bz_register_borrow",
-                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(registerBorrowFn, {thisVal});
+            // fix #3460 (§28.3 / §30.1): register the borrow ONLY when
+            // currentThis_ is set — this matches the three release sites
+            // (emitAsyncComplete, named-method fault, lambda fault) all of
+            // which gate on `if (currentThis_)`. The earlier
+            // `arg_begin()`-fallback form was asymmetric: it would register
+            // against the wrong pointer for an `isInstance` method that
+            // reached this site without currentThis_ bound (e.g. an extension
+            // method lowered as an instance shape, or a builder that
+            // populated the frame before bind-this ran) and the OWNER's
+            // `bz_wait_for_borrows(this)` would then block on the wrong
+            // address forever. With this gate the register/release pair is
+            // symmetric: any frame that registers a borrow releases the
+            // borrow, the OWNER's wait unblocks, and a frame whose body has
+            // no `this` simply does not touch the side table at all.
+            if (currentThis_) {
+                auto* registerBorrowFn =
+                    declareC("bz_register_borrow",
+                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(registerBorrowFn, {currentThis_});
+            }
         }
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
