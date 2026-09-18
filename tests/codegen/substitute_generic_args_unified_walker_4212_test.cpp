@@ -270,3 +270,152 @@ BEZEL_TEST(substitute_generic_args_unified_walker_4212,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
+
+// ---------------------------------------------------------------------------
+// §14.1 / §27.8 — CONSISTENCY ACROSS CALLERS: a single program that
+// exercises all three eager walkers (`Resolver::applyGenericSubst` on the
+// override return, `Resolver::substituteAliasGenericArgs` on the alias
+// reference, `ExprTC::substituteGenericFieldType` on the generic field)
+// against the SAME concrete instantiation `<int>` and proves the three
+// substitutions produce the SAME observable value. The unification the
+// hoist is supposed to guarantee — if any caller path drifts from the
+// others, this row fails to compile or returns 0 instead of 21.
+//
+// This is the structural analogue of the §3434 precedent: that hoist
+// consolidated two callers of "does this TypeRef produce a value?" into
+// `sema::ascribedReturnTypeProducesValue`; this row verifies three
+// callers of "what does this TypeRef substitute to?" all hit the same
+// `sema::substituteGenericArgs`.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(substitute_generic_args_unified_walker_4212,
+           three_callers_substitute_identically_spec_14_1_27_8) {
+    auto r = runAot(
+        "module M; "
+        "class Base3Callers4212<T> "
+        "  public method GetT(): T? "
+        "    return null; "
+        "  end GetT; "
+        "end Base3Callers4212; "
+        "class Derived3Callers4212: Base3Callers4212<int> "
+        "end Derived3Callers4212; "
+        "type IdP3Callers4212<T> := T; "
+        "class Box3Callers4212<T> "
+        "  public V: T; "
+        "end Box3Callers4212; "
+        "public static class C "
+        "  public static method Main(): int "
+        // applyGenericSubst path: override resolution returns T, T → int
+        "    var d := new Derived3Callers4212(); "
+        "    var a: int? := d.GetT(); "
+        // substituteGenericFieldType path: Box<int>.V is int
+        "    var b := new Box3Callers4212<int>(); "
+        "    var bb: int := b.V; "
+        // substituteAliasGenericArgs path: IdP3Callers<int> is interchangeable with int
+        "    var c: IdP3Callers4212<int> := 21; "
+        "    var cc: int := c; "
+        "    if a = null and bb = 0 and cc = 21 then return 21; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 21);
+}
+
+// ---------------------------------------------------------------------------
+// §14.1 — MULTI-PARAMETER GENERIC: a record with TWO type parameters
+// (`MPair<A, B>`) must substitute at EVERY position independently — A→int
+// on `First`, B→string on `Second`. A walker that substituted only the
+// FIRST parameter, or only the bare-name leaf, would fail to compile this
+// row.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(substitute_generic_args_unified_walker_4212,
+           multi_parameter_generic_substitutes_at_every_position_spec_14_1) {
+    auto r = runAot(
+        "module M; "
+        "record MPair4212<A, B>(First: A, Second: B); "
+        "public static class C "
+        "  public static method Main(): int "
+        "    var p := new MPair4212<int, string>(3, \"xy\"); "
+        // substituteGenericFieldType: First: A → int, Second: B → string
+        "    if p.First = 3 and p.Second.Length = 2 then "
+        "      return 23; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 23);
+}
+
+// ---------------------------------------------------------------------------
+// §14.1 — DEEPLY NESTED GENERIC (depth-3 recursion): `Outer<T>` holds
+// `Middle<T>` holds `Inner<T>` holds `V: T`. After `Outer<int>` the
+// walker must recurse THREE levels so `o.Middle.Inner.V` reads at `int`,
+// not at bare-T's "no members". A walker that did only one level of
+// recursion would leave `Middle.Inner` typed `Middle<T>` (with T still
+// unbound) and the inner-field access would fail type resolution.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(substitute_generic_args_unified_walker_4212,
+           deeply_nested_generic_substitutes_three_levels_spec_14_1) {
+    auto r = runAot(
+        "module M; "
+        "class NestInner4212<T> "
+        "  public V: T; "
+        "end NestInner4212; "
+        "class NestMiddle4212<T> "
+        "  public owned Inner: NestInner4212<T> := new NestInner4212<T>(); "
+        "end NestMiddle4212; "
+        "class NestOuter4212<T> "
+        "  public owned Middle: NestMiddle4212<T> := new NestMiddle4212<T>(); "
+        "end NestOuter4212; "
+        "public static class C "
+        "  public static method Main(): int "
+        "    var o := new NestOuter4212<int>(); "
+        // After 3 levels of substitution, o.Middle.Inner.V is int (default 0)
+        "    if o.Middle.Inner.V = 0 then return 27; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 27);
+}
+
+// ---------------------------------------------------------------------------
+// §14.1 — REPEATED INSTANTIATION (cache miss / generic-spec cache):
+// a single program that instantiates the SAME generic `<int>` SIX times
+// at distinct call sites — every call must produce the same substituted
+// type. If the unified walker caches by structural shape rather than by
+// instantiation identity, every one of these reads as int. If a future
+// refactor accidentally keyed the cache by pointer (so each access
+// re-walked the substitution) the values still match — but the test
+// pins the CONSISTENCY that is the load-bearing guarantee of "one
+// authority, three callers".
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(substitute_generic_args_unified_walker_4212,
+           repeated_instantiation_produces_consistent_substitution_spec_14_1) {
+    auto r = runAot(
+        "module M; "
+        "class RepBox4212<T> "
+        "  public V: T; "
+        "end RepBox4212; "
+        "public static class C "
+        "  public static method Main(): int "
+        "    var b1 := new RepBox4212<int>(); "
+        "    var b2 := new RepBox4212<int>(); "
+        "    var b3 := new RepBox4212<int>(); "
+        "    var b4 := new RepBox4212<int>(); "
+        "    var b5 := new RepBox4212<int>(); "
+        "    var b6 := new RepBox4212<int>(); "
+        // All six V fields substituted to int — sum 0 (defaults).
+        "    var sum := b1.V + b2.V + b3.V + b4.V + b5.V + b6.V; "
+        "    if sum = 0 then return 31; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 31);
+}
