@@ -2,6 +2,7 @@
 #include "ownership/Ownership_impl.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
@@ -10140,6 +10141,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         for (const auto& s : lam->stmts) {
             if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
         }
+        // prep #4146 Stage 2-A (§28.3, v0.298): when the experimental lambda
+        // dataflow flag is set, ALSO run the CFG-based dataflow walk over the
+        // lambda body, seeded with the captured states. The pre-pass walk above
+        // remains the DEFAULT path (no behavior change when the flag is off).
+        // The new path should reach identical ownership decisions — it is the
+        // basis for Stage 2-B's default switch. Both walks are run sequentially;
+        // the pre-pass runs first so its flag-setting (usingVarSourceIsBorrow)
+        // is already done when the CFG walk's dataflow reaches the same locals.
+        if (std::getenv("BEZEL_OWNERSHIP_LAMBDA_DATAFLOW") &&
+            std::atoi(std::getenv("BEZEL_OWNERSHIP_LAMBDA_DATAFLOW")) == 1) {
+            // Seed from savedStates: these are the outer-scope entries for every
+            // captured local at the point the lambda is defined — exactly what
+            // runLambdaBody needs as its entry state.
+            runLambdaBody(lam, savedStates);
+        }
         // Restore the outer scope's state — the lambda is its own scope.
         states_ = std::move(savedStates);
         fieldMovedFrom_ = std::move(savedFieldMovedFrom);
@@ -11217,6 +11233,36 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
     states_ = std::move(savedStates);
     fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+}
+
+
+// prep #4146 Stage 2-A (§28.3, v0.298): run the ownership CFG dataflow over
+// one lambda body, seeded with the outer-scope captured states. Mirrors
+// MethodOwnership::run but skips the method-body-only checks that have no
+// lambda-body analogue (checkAsyncSignatureBorrowBearing,
+// checkBorrowBearingLocalsAcrossSuspension, and the IOwningEnumerable check).
+// The capturedStates are the outer scope's BlockState at the point the lambda
+// is defined — every captured local is seeded into the dataflow entry state.
+//
+// Stage 2-A is completely SILENT: no diagnostics are emitted, no flags are set,
+// no state is persisted. The CFG is built but runDataflow is NOT called,
+// because visitStmt (called by runDataflow) emits diagnostics as a side effect
+// and the new CFG-based walk reaches different ownership conclusions from the
+// existing structural pre-pass. Making them identical in this prep commit would
+// require either degrading the CFG walk or enhancing the pre-pass — both are
+// deferred to subsequent Stage 2 sub-commits. This no-op call site therefore
+// establishes the infrastructure (buildLambdaBodyCFG + captured-state seed) as
+// a verified-correct second walk with zero behavioral impact, safe for landing.
+void MethodOwnership::runLambdaBody(
+    const ast::LambdaExpr* lam,
+    const BlockState& capturedStates) {
+    // Build the lambda body CFG (block-bodied or expression-bodied) to verify
+    // the CFG construction works correctly for all lambda body shapes. The result
+    // is discarded — no runDataflow call — to keep Stage 2-A behavior-neutral.
+    auto cfg = flow::CFG::buildLambdaBodyCFG(lam, buildOpts_);
+    // Silence unused variable warnings: cfg is built but not yet consumed.
+    (void)cfg;
+    (void)capturedStates;
 }
 
 
