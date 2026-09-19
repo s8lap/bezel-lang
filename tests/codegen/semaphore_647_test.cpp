@@ -276,6 +276,81 @@ BEZEL_TEST(codegen_semaphore_6_3, two_arg_constructor_works) {
 }
 
 // ---------------------------------------------------------------------------
+// fix #4445 / stdlib §6.3 v0.302: the two-arg constructor must raise
+// `ArgumentException` when `max < 1` or `initial > max`. The one-arg form
+// has no ceiling and is unaffected.
+//
+// The codegen emits the ArgumentException guard (max < 1 OR initial > max)
+// BEFORE calling bz_semaphore_new, so the constructor's runtime path never
+// sees a value that would have tripped the guard — only the throw, never a
+// silent coercion. The runtime clamps in bz_semaphore_new stay as defensive
+// defaults for any direct FFI / misuse path.
+//
+// Regression tests:
+//   * Row (1) initial > max  → ArgumentException
+//   * Row (2) max < 1        → ArgumentException
+//   * Row (3) initial ≤ max AND max ≥ 1 → no exception (control)
+//   * Row (4) one-arg form   → no exception (control: ceiling inert, max=INT_MAX)
+// ---------------------------------------------------------------------------
+
+// fix #4445 / stdlib §6.3 v0.302: `new Semaphore(5, 3)` (initial > max) raises
+// a catchable ArgumentException. Without the guard, the runtime silently clamps
+// max up to 5 and returns a working N=5 semaphore — exactly the v0.302 defect.
+BEZEL_TEST(codegen_semaphore_6_3_4445, initial_gt_max_raises_argument_exception_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var caught := 0; "
+        "try "
+        "  var sem := new Semaphore(5, 3); "
+        "  sem.Dispose(); "
+        "catch ArgumentException => do caught := 1; end "
+        "end; "
+        "return caught; "                 // 1
+    )), 1);
+}
+
+// fix #4445 / stdlib §6.3 v0.302: `new Semaphore(0, 0)` (max < 1) raises a
+// catchable ArgumentException. Without the guard, max gets clamped up to
+// initial=0 — a silent zero-permit semaphore that no acquire can ever fulfil.
+BEZEL_TEST(codegen_semaphore_6_3_4445, max_lt_one_raises_argument_exception_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var caught := 0; "
+        "try "
+        "  var sem := new Semaphore(0, 0); "
+        "  sem.Dispose(); "
+        "catch ArgumentException => do caught := 1; end "
+        "end; "
+        "return caught; "                 // 1
+    )), 1);
+}
+
+// fix #4445 / stdlib §6.3 v0.302 CONTROL: `new Semaphore(3, 5)` (initial ≤ max,
+// max ≥ 1) constructs successfully and the semaphore works.
+BEZEL_TEST(codegen_semaphore_6_3_4445, valid_two_arg_succeeds_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var sem := new Semaphore(3, 5); "
+        "using var t1 := sem.Acquire(); "
+        "using var t2 := sem.Acquire(); "
+        "using var t3 := sem.Acquire(); "
+        "return 33; "
+    )), 33);
+}
+
+// fix #4445 / stdlib §6.3 v0.302 CONTROL: `new Semaphore(5)` (one-arg form)
+// constructs successfully. The one-arg form has no ceiling; the codegen passes
+// max=INT_MAX, so both guard conditions (max < 1, initial > max) are inert.
+BEZEL_TEST(codegen_semaphore_6_3_4445, one_arg_form_unaffected_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var sem := new Semaphore(5); "
+        "using var t1 := sem.Acquire(); "
+        "using var t2 := sem.Acquire(); "
+        "using var t3 := sem.Acquire(); "
+        "using var t4 := sem.Acquire(); "
+        "using var t5 := sem.Acquire(); "
+        "return 44; "
+    )), 44);
+}
+
+// ---------------------------------------------------------------------------
 // §6.3 / §28.2: Double-dispose idempotency.
 // Calling Dispose() on a SemaphoreToken twice must not crash or double-release.
 // A subsequent Acquire must still succeed (the permit was released exactly once).

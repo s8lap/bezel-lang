@@ -441,13 +441,16 @@ struct bz_semaphore_t {
     // fix #706: atomic so concurrent Dispose from two domains cannot both
     // reach semaphore_core_release (exchange(true) ensures exactly one caller).
     std::atomic<bool>   disposed{false};
-    // maxCount cap: stored but enforced only at release time via a mutex+cond
-    // in the full implementation.  For the current runtime (no hard maxCount
-    // enforcement beyond not exceeding POSIX sem count), maxCount is advisory.
-    // Note: POSIX sem_post does not enforce an upper bound — §6.3 two-arg ctor
-    // documents maxCount as a cap; we store it but only enforce "initial count"
-    // behaviour here.  Full enforcement is a follow-up.  Recorded per §4.
-    // (Stored as int, not enforced in this slice — see comment above.)
+    // fix #4445 (stdlib §6.3, v0.302): maxCount is the permit ceiling
+    // documented at construction. It is recorded for diagnostics and is NOT
+    // enforced at release time, because no release path can exceed it: a
+    // permit is returned ONLY by disposing a SemaphoreToken, and a token
+    // exists only because an acquisition consumed a permit, so the count
+    // can never rise above where it started. POSIX sem_post has no upper
+    // bound of its own, but the ceiling is structurally unreachable. The
+    // construction-time ArgumentException guard (codegen LlvmBackend_Exprs2.cpp
+    // — max < 1 or initial > max) is the whole reachable effect of
+    // maxCount. (Stored as int for diagnostics.)
     int                 maxCount;
 };
 
@@ -500,8 +503,16 @@ extern "C" {
 
 // §6.3: Semaphore — allocate a new counting semaphore.  core_refs = 1.
 // initialCount: the initial permit count (must be >= 0).
-// maxCount: advisory upper bound (stored; not enforced in this slice — see
-// comment on bz_semaphore_t.maxCount above).
+// maxCount: the permit ceiling (diagnostics-only here; see bz_semaphore_t
+// comment for why no release-time check is needed).
+//
+// fix #4445 (stdlib §6.3, v0.302): the ArgumentException contract on the
+// two-arg form (`max < 1` or `initial > max`) is enforced at the codegen
+// guard in LlvmBackend_Exprs2.cpp — bz_semaphore_new is only called with
+// already-validated args. The clamps below are a defensive default for any
+// direct FFI / misuse path; a value reaching here that would have tripped
+// the codegen guard means the guard was bypassed (e.g. a future caller or
+// a hand-written FFI binding).
 void* bz_semaphore_new(int initial_count, int max_count) {
     if (initial_count < 0) initial_count = 0;
     if (max_count < initial_count) max_count = initial_count;
