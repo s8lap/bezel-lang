@@ -162,6 +162,30 @@ std::string wrap(const std::string& body) {
            "end C;";
 }
 
+// Post-ruling wording (#4450, v0.303): every #3989 / #3990 NEGATIVE row was
+// originally pinned to the pre-ruling §28.3 ERROR text "cannot move from
+// disposed local `x`" via the `hasErrorMessage` helper; v0.303 retires the
+// ERROR — a `move x` after `x.Dispose()` now draws §28.2's consume-side
+// WARNING instead, so the rows' `hasErrors() == true` /
+// `hasErrorMessage(...)` assertions flip to `hasErrors() == false` and
+// `hasMoveAfterDisposeWarning(...)` (defined below), the new consume-side
+// wording.
+constexpr char kMoveAfterDisposeWarn[] =
+    "move from a local `x` already disposed at this point (§28.2)";
+
+// The post-ruling consistency predicate every #3989 / #3990 NEGATIVE row
+// pins: a `move x` whose source `x` has been explicitly disposed on every
+// path reaching the consume (the "dominating kill" of §28.2, v0.303) emits
+// a single §28.2 WARNING — the consume-side wording above — and nothing
+// else.
+inline bool hasMoveAfterDisposeWarning(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find(kMoveAfterDisposeWarn) != std::string::npos)
+            return true;
+    return false;
+}
+
 // `runAot` with generated-code ASan forced on for THIS row only, regardless
 // of the suite-wide `BEZEL_AOT_FORCE_SANITIZE` env var: #3989's pre-fix
 // symptom is a plain heap-use-after-free, which a non-ASan build can survive
@@ -183,15 +207,15 @@ JitResult runAotAsan(const std::string& source) {
 
 // The direct, non-nested spelling: #3990's issue text's own contrast. Must
 // stay rejected regardless of this fix.
+// Post-ruling (#4450, v0.303): the verdict is the §28.2 consume-side
+// WARNING, NOT the pre-ruling §28.3 ERROR the row originally pinned.
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           control_direct_move_of_disposed_local_rejected_28_3) {
+           control_direct_move_of_disposed_local_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); "
         "using var h := new Holder(move x); return h.v;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (\xc2\xa7"
-                            "28.3)"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // The bare-STATEMENT throw was always correctly discharged — #3989's issue
@@ -215,57 +239,43 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
 
 // ============================================================================
 // NEGATIVE (#3990) — a `move` nested inside a marker-free if/case arm, of a
-// DISPOSED local. FAIL-WITHOUT: rc=0, silent, SEGV. PASS-WITH: the precise
-// §28.3 error, at a real location, and no program is ever produced.
+// DISPOSED local. FAIL-WITHOUT (#3989/#3990 — the new arm): rc=0, silent,
+// SEGV. PASS-WITH: a §28.3 error pre-ruling, a §28.2 WARNING post-ruling.
+// The static-analysis verdict is what #4450 rules on; the runtime checked-
+// disposal backstop is exercised exhaustively in
+// `move_after_dominating_dispose_warns_4450_test.cpp` for every consume
+// position (rows 1–6 of the issue table). The Holder-wrapper shape these
+// rows use is structurally incapable of tripping the runtime backstop (the
+// ctor immediately disposes `r`), and the `OwningArray<Res>` shape required
+// to retain the disposed `x` trips #2434 ("internal: lowerLocalDecl's
+// initializer expression failed to lower") at the if/case-arm level, so an
+// AOT oracle's half here would test nothing real. The parse-only twins
+// below are the static-analysis oracle.
 // ============================================================================
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           if_expr_move_of_disposed_local_rejected_28_3) {
+           if_expr_move_of_disposed_local_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var flag := true; "
         "using var h := (if flag then new Holder(move x) "
         "                        else new Holder(new Res(0))); "
         "return h.v;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (\xc2\xa7"
-                            "28.3)"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           aot_if_expr_move_of_disposed_local_rejected_no_program_28_3) {
-    JitResult r = runAot(wrap(
-        "var x := new Res(1); x.Dispose(); var flag := true; "
-        "using var h := (if flag then new Holder(move x) "
-        "                        else new Holder(new Res(0))); "
-        "return h.v;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-}
-
-BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           case_expr_move_of_disposed_local_rejected_28_3) {
+           case_expr_move_of_disposed_local_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var n := 1; "
         "using var h := (case n of "
         "  1 => new Holder(move x), "
         "  _ => new Holder(new Res(0))); "
         "return h.v;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (\xc2\xa7"
-                            "28.3)"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
-BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           aot_case_expr_move_of_disposed_local_rejected_no_program_28_3) {
-    JitResult r = runAot(wrap(
-        "var x := new Res(1); x.Dispose(); var n := 1; "
-        "using var h := (case n of "
-        "  1 => new Holder(move x), "
-        "  _ => new Holder(new Res(0))); "
-        "return h.v;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-}
 
 // A guard clause can carry the same nested move; the join logic must reach
 // it too (§19.2's arm walk visits guard THEN body from the same isolated
@@ -277,17 +287,15 @@ BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
 // otherwise make this row accidentally exercise a DIFFERENT unfixed defect
 // instead of the guard-walk this fix actually adds.
 BEZEL_TEST(record_moves_arm_and_throw_3989_3990,
-           case_expr_guard_move_of_disposed_local_rejected_28_3) {
+           case_expr_guard_move_of_disposed_local_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         "var x := new Res(1); x.Dispose(); var n := 1; "
         "var y := (case n of "
         "  var m when new Holder(move x) <> null => m, "
         "  _ => 0); "
         "return y;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (\xc2\xa7"
-                            "28.3)"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // ============================================================================

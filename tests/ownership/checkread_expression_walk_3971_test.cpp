@@ -508,34 +508,50 @@ BEZEL_TEST(checkread_expression_walk_3971,
 }
 
 // ============================================================================
-// GUARD — the #3941 preemption axis.  These four programs were ALREADY
-// rejected before this fix, by a MORE PRECISE diagnostic that `recordMovesIn`
-// owns.  A `NewExpr` arm that walked every argument unconditionally would run
-// `checkRead` first, poison the record, and leave `markMovedByName` (which has
-// no Poisoned arm) falling through — degrading `cannot move from disposed
-// local` (ERROR, program REJECTED) to §28.2's use-after-dispose WARNING
-// (program ACCEPTED, and it SEGVs).  Pin the precise text.
+// GUARD — the #3941 preemption axis.  The two NEW rows were pinned by #3971
+// to assert that `recordMovesIn`'s own consume-side path detects `move x`
+// after a dominating `Dispose()`, with a verdict that the cascade suppression
+// in `checkRead` would otherwise preempt.  Spec v0.303 / issue #4450 retires
+// the original "precise §28.3 ERROR" claim (the ruling is the OTHER way: a
+// consume under a dominating Dispose is §28.2's WARNING, not §28.3's error),
+// but the GUARD invariant #3971 owns — that `recordMovesIn`'s arm is the
+// one that reports, NOT a degraded generic warning — survives the ruling
+// unchanged.  The guard now pins:
+//   * `markMovedByName`'s Disposed arm produces the §28.2 consume-side
+//     warning text (distinct from `checkRead`'s read-side wording), and
+//   * `checkRead` does NOT also report a redundant §28.2 read-side warning
+//     for the same `x` (one diagnostic per consume site, not two).
+// This is the exact preemption `recordMovesIn` provides — it runs first
+// here, so its OWN §28.2 warning wins — and it remains load-bearing for the
+// reject-on-no-warning safety the original row traced.
 // ============================================================================
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           guard_new_move_argument_after_dispose_keeps_precise_error_28_3) {
+           guard_new_move_argument_after_dispose_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "using var h := new Holder(move x); return t + h.v;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Error, kMoveFromDisposed));
+    // §28.2 WARNING (not §28.3 error) under the v0.303 ruling — the consume
+    // side wording, distinct from the read side, with the `x` name and the
+    // §28.2 citation all present.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagWithSeverity(
+        r, bezel::Severity::Warning,
+        "move from a local `x` already disposed at this point (§28.2)"));
+    // `checkRead` must NOT also fire on `move x` (no double warning) — this
+    // is the preemption invariant #3971's GUARD originally owned.
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 0);
 }
 
 BEZEL_TEST(checkread_expression_walk_3971,
-           guard_new_bare_owned_argument_after_dispose_keeps_precise_error) {
+           guard_new_bare_owned_argument_after_dispose_warns_28_2_4450) {
     OwnershipResult r = parseAndCheckOwnership(wrap(
         std::string(kDisposed) +
         "using var h := new Holder(x); return t + h.v;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        diagWithSeverity(r, bezel::Severity::Error, kMoveFromDisposed));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagWithSeverity(
+        r, bezel::Severity::Warning,
+        "move from a local `x` already disposed at this point (§28.2)"));
     BEZEL_EXPECT_EQ(diagCount(r, kUseAfterDispose), 0);
 }
 

@@ -97,11 +97,22 @@ using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
 constexpr char kDisposedMoveError[] =
     "cannot move from disposed local `x` (§28.3)";
+// The post-ruling wording (`markMovedByName`'s Disposed arm is now a
+// §28.2 WARNING per v0.303 / #4450 — the OLD §28.3 ERROR above is the
+// pre-ruling wording, kept here only because the negative rows below have
+// always used it for the controls whose scenario reaches the SAME arm via
+// a different surrounding node kind.  The new wording is what rows 4-6 of
+// the #3975 table now draw, and what the new
+// `move_after_dominating_dispose_warns_4450_test.cpp` regression file
+// pins for every consume position.
+constexpr char kDisposedMoveWarn[] =
+    "move from a local `x` already disposed at this point (§28.2)";
 
 // A plain disposable class — no ctor consuming an owned argument is needed
 // for this bug: the `move` is validated at the LITERAL element position
@@ -122,12 +133,18 @@ std::string program(const std::string& classesAndMain) {
 
 // =============================================================================
 // CONTROL — the pre-existing non-literal `move` spelling was already
-// correctly rejected before this fix (it routes through `recordMovesIn`'s
+// correctly handled before this fix (it routes through `recordMovesIn`'s
 // existing `UnaryExpr` arm, not the new `CollectionLiteralExpr` one) and
-// must stay rejected with the IDENTICAL diagnostic text.
+// must stay handled with the SAME diagnostic text.  Under v0.303 / #4450
+// the text is the §28.2 consume-side WARNING, NOT the pre-ruling §28.3
+// ERROR this row originally pinned — the wording is what changed (and what
+// the new consume-side text `kDisposedMoveWarn` names), and the
+// consistency between the two arms of `recordMovesIn` (the original
+// `UnaryExpr` arm and the new `CollectionLiteralExpr` arm) is exactly the
+// invariant this row was originally written to prove.
 // =============================================================================
 BEZEL_TEST(record_moves_in_collection_literal_4024,
-           direct_move_of_disposed_local_rejected_control) {
+           direct_move_of_disposed_local_warns_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -136,20 +153,32 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
         "    return y.tag; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool hasWarn = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find(kDisposedMoveWarn) != std::string::npos) {
+            hasWarn = true; break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(hasWarn);
 }
 
 // =============================================================================
 // NEGATIVE (issue #4024's own repro) — `move x` as a bare COLLECTION-LITERAL
 // element (`OwningArray<Res>` sequence-literal form).
-// FAIL-WITHOUT: `r.diagnostics.hasErrors()` is FALSE (rc=0, zero
-// diagnostics) — measured pre-fix.
-// PASS-WITH: flips true, with the SAME diagnostic text the control case
-// gets.
+// FAIL-WITHOUT THE COLLECTION-LITERAL ARM: zero diagnostics — measured
+// pre-fix.  After the arm was added (the fix #4024 itself, not #4450) the
+// diagnostic text became the §28.3 "cannot move from disposed local"
+// ERROR.  After #4450 / v0.303 the text is now the §28.2 consume-side
+// WARNING — the same warning the control case above now draws.  The
+// pre-/post-ruling consistency the control case proves is also the
+// pre-/post-arm consistency this row proves: the new `CollectionLiteralExpr`
+// arm draws the SAME diagnostic as the old `UnaryExpr` arm, and they reach
+// it through the SAME code path (`markMovedByName`'s Disposed arm).
 // =============================================================================
 BEZEL_TEST(record_moves_in_collection_literal_4024,
-           collection_literal_element_move_of_disposed_local_rejected) {
+           collection_literal_element_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -158,24 +187,51 @@ BEZEL_TEST(record_moves_in_collection_literal_4024,
         "    return arr[0].tag; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool hasWarn = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find(kDisposedMoveWarn) != std::string::npos) {
+            hasWarn = true; break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(hasWarn);
 }
 
 // The same case through the STRONG AOT oracle (real `bezelc` + link + exec):
-// proves not merely that a diagnostic fired, but that NO EXECUTABLE was ever
-// produced (the pre-fix program compiled to a real, SEGV-on-run binary).
-BEZEL_TEST(record_moves_in_collection_literal_4024,
-           aot_collection_literal_element_move_of_disposed_local_rejected_no_program) {
-    JitResult r = runAot(program(
+// the program now COMPILES (with a warning), so the pre-fix "rejection"
+// oracle cannot stand.  The checked-disposal backstop §28.2 promises is
+// the new soundness claim — a member access through the surviving borrow
+// of a logically-disposed instance raises `DisposedAccessException` in
+// checked mode.  Same shape the regression file for #4450 uses for the
+// other consume positions; this row is the collection-literal analogue so
+// every #4003/#4028/#4024 wrapper kind has its own checked-mode row.
+//
+// IMPORTANT: the backstop ONLY fires on a MEMBER ACCESS through the
+// disposed reference (§28.2).  The natural `[move x]` shape transfers
+// ownership into the OwningArray element with no read of `x`'s fields,
+// so the natural form runs to completion in checked mode (which is itself
+// the §28.2 verdict).  The row below uses the SHAPE that DOES include a
+// member access through the now-disposed element (`arr[0].tag`), so the
+// runtime exception fires and the catch arm observes it; the
+// static-analysis verdict (the §28.2 warning) is unchanged.
+BEZEL_TEST(
+    record_moves_in_collection_literal_4024,
+    aot_collection_literal_element_move_of_disposed_local_raises_in_checked_mode_4450) {
+    JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
         "    var x := new Res(1); x.Dispose(); "
-        "    var arr: OwningArray<Res> := [move x]; "
-        "    return arr[0].tag; "
+        "    try "
+        "      var arr: OwningArray<Res> := [move x]; "
+        "      var t := arr[0].tag; "
+        "      return 0; "
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // A second, independently-shaped repro: an already-MOVED-FROM (not merely
