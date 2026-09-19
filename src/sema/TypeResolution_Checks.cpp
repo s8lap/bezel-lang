@@ -2073,17 +2073,26 @@ void Resolver::checkChoiceSelfContainment() {
 }
 
 void Resolver::checkUserDeclaredDispose() {
-    // #594 (§28.2): "User code does not implement Dispose() directly.  The
-    // customization points are: a destructor for cleanup logic; owned fields
-    // for fields that should be disposed with the containing object."
+    // #594 + #4421 (§28.2, stdlib §2.10, v0.300): "User code does not implement
+    // `Dispose()` directly. ... Declaring a member named `Dispose` on a class
+    // or a record is a compile error at that declaration, whatever its
+    // parameter list; the diagnostic names the two customization points above
+    // — the §9.3 posture for a body member colliding with a compiler-generated
+    // one, keyed on the name as §12.2 is."
     //
-    // A user-declared `Dispose()` on a class or record is never invoked by
-    // the compiler's ownership machinery (using var / owned field teardown /
+    // A user-declared `Dispose` on a class or record is never invoked by the
+    // compiler's ownership machinery (using var / owned field teardown /
     // explicit Dispose call all go through the compiler-generated Dispose) so
     // the user body silently never runs — a silent trap.  Reject it here.
     //
+    // The v0.300 widening to "whatever its parameter list" matters at
+    // optional-parameter declarations specifically (`Dispose(mode: int := 0)`,
+    // §22.5): the zero-argument call `x.Dispose()` is then ambiguous against
+    // the generated member, so the body silently never runs even though the
+    // call looks right.
+    //
     // Applies to both Class and Record even though records cannot normally
-    // carry a destructor (§9.7): a user who accidentally writes a Dispose()
+    // carry a destructor (§9.7): a user who accidentally writes a Dispose
     // method on a record also gets a clear diagnostic rather than a silent
     // no-op (the destructor restriction is a separate, earlier check).
     if (!ctx_.module()) return;
@@ -2096,18 +2105,13 @@ void Resolver::checkUserDeclaredDispose() {
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || ms->name != "Dispose") continue;
-            // Only reject a zero-parameter Dispose(): that's the exact
-            // signature the compiler generates per §28.2.  A user method named
-            // Dispose with parameters is unusual but technically unambiguous
-            // and not what §28.2 restricts.
-            if (!ms->params.empty()) continue;
             ctx_.diagnostics().report(
                 Severity::Error, ms->declLoc,
                 std::string(t->kind == ast::TypeDeclKind::Record ? "record" : "class") +
                 " `" + std::string(t->name) +
-                "` may not declare a `Dispose()` method directly (§28.2): "
+                "` may not declare a `Dispose` method directly (§28.2): "
                 "the compiler synthesises `Dispose()` from the `destructor`; "
-                "user-declared `Dispose()` bodies are never called by the "
+                "user-declared `Dispose` bodies are never called by the "
                 "ownership machinery.  Use a `destructor` for cleanup logic "
                 "and `owned` fields for resource fields instead.");
         }
