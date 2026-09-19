@@ -15931,7 +15931,31 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // currentFn_ matching the analyzed function (a lambda/thunk body lowered
     // mid-function is not analyzed → its closure locals just leak, never
     // double-freed).
-    if (v && currentFn_ == closureReleaseEligibleFn_ &&
+    //
+    // fix #4425 (§27.5 / §28.9, v0.301): the prior `v &&` guard REQUIRED a
+    // non-null init — `var f: () -> int;` (no init, just a typed annotation)
+    // also enters `closureReleaseEligible_` via the no-init typed local path
+    // (the candidates walker at line 28303+ runs it through the escape walk
+    // and, after the override extension this commit installs, arms release for
+    // reassigned + never-called + not-returned + non-captured-cell locals),
+    // but lowerLocalDecl's `v &&` guard rejected it because `v` was nullptr
+    // at this site (no initializer value to store). The cell is allocated
+    // LATER — at the `f := lambda(...)` AssignmentStmt lowering — but
+    // disposeStack_ entries registered here run at SCOPE END, after every
+    // assignment has executed. bz_closure_release is null-safe (verified
+    // against the runtime header at src/runtime/bezel_runtime_refcounting.cpp
+    // line 331), so an armed disposal on a still-null slot is a no-op, and
+    // a non-null slot at scope end releases the cell exactly once — matching
+    // the `var f := lambda()` shape the existing `v &&` guard already
+    // accepted. The "no captured cell" guard inside this if-body stays sound:
+    // a captured-cell slot would be in cellVars_ and the envdtor would own
+    // the cell's release; the closureRelease disposal would double-free.
+    // closureReleaseEligible_ is gated to non-captured-cell locals (via the
+    // override's `!w.isCapturedCellSlot_` check at line 28478), so the new
+    // `v`-relaxed condition is exactly the same set of locals the existing
+    // `v &&` guard accepted, plus the no-init typed case the prior guard
+    // excluded.
+    if (currentFn_ == closureReleaseEligibleFn_ &&
         closureReleaseEligible_.count(static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
         // #429 / §27.5: register boxedCellFree BEFORE closureRelease so that
@@ -27453,6 +27477,41 @@ struct ClosureEscapeWalker {
     // IdentifierExpr callee, AssignmentStmt target, IncrementStmt target,
     // etc.) is observed while `inLambda` is true.
     bool isCapturedCellSlot_ = false;
+    // fix #4425 (§27.5 / §28.9, v0.301): true when target is RETURNED via a
+    // ReturnStmt's value expression (e.g. `return lambdaRef`). A returned local
+    // transfers its +1 out of the slot at the function exit; an additional
+    // scope-end `bz_closure_release` would UAF (or double-free, depending on
+    // caller's release site). Mirrors the existing isCapturedCellSlot_ gate:
+    // both answer "is the slot's +1 already claimed by another release site?".
+    // Set when the ReturnStmt stmt() arm visits a value that IS the target
+    // ident.
+    bool isReturned_ = false;
+    // fix #4473 (§27.5 / §28.9, v0.301): true when target is the RHS of an
+    // AssignmentStmt whose LHS is a same-scope closure-typed local/parameter
+    // (a `lambdaRef := y` shape where `y` is the walked target and
+    // `lambdaRef` is a closure-typed local/parameter slot in this scope).
+    // `lowerClosureLocalReassign` retains the RHS (rc++) and stores it into
+    // the LHS slot, leaving the RHS slot still holding its +1 reference;
+    // without this flag, the post-walk override sees only `escaped=true` from
+    // the RHS-read (`isTargetIdent` matching the RHS IdentifierExpr with
+    // safeRead=false) and refuses to admit target into `closureReleaseEligible_`
+    // — the RHS's scope-end release never arms, so the cell is left at rc=1
+    // when the LHS's scope-end release fires (the LHS drops to rc=0; the RHS
+    // +1 stays stranded — a 40-byte closure cell leak). Setting this flag
+    // lets the post-walk override clear `escaped`, admitting the RHS into
+    // `closureReleaseEligible_` so its scope-end release balances the +1
+    // (the LHS release still fires, both decrements, the cell is freed once
+    // — `bz_closure_release` is rc-based and safe to fire on multiple slots
+    // pointing at the same cell, verified against
+    // src/runtime/bezel_runtime_refcounting.cpp line 336). Distinct from
+    // `escapedDueToReassign`: that flag fires when target IS the LHS of an
+    // AssignmentStmt (a `y := ...` reassign, fix #4425 / lane-35 / #2107-
+    // follow-up). #4473 fires when target IS the RHS of an AssignmentStmt
+    // whose LHS is itself a closure-typed local/parameter slot — the
+    // read-into-same-function-closure path. Set by the AssignmentStmt arm
+    // below (line ~28060); read by the post-walk override in
+    // collectClosureReleaseEligible.
+    bool escapedDueToAssignIntoClosureLocal_ = false;
 
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -27460,6 +27519,49 @@ struct ClosureEscapeWalker {
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
+    }
+
+    // fix #4473 (§27.5 / §28.9, v0.301): true when `target_expr` is the LHS
+    // of an AssignmentStmt and is a same-scope closure-typed local or
+    // parameter slot — the `lambdaRef := y` shape where `lambdaRef` is a
+    // closure-typed local/parameter in this function and `y` is the walked
+    // target. Mirrors `lowerClosureLocalReassign`'s own localSlot/exprType
+    // gates (lines 26681–26690): bare-identifier LHS only (the same shape
+    // `lowerClosureLocalReassign` admits — a member access, array index,
+    // parameter slot, etc. takes a different path through the emit
+    // pipeline and is not the leak shape this fix targets), resolved
+    // symbol is a `LocalSymbol` or `ParameterSymbol` (not a type name,
+    // method reference, etc.), type is non-nullable `Kind::Function`
+    // (nullable closure-typed slots are left as plain stores by
+    // `lowerClosureLocalReassign` itself, so they cannot arm the retain-
+    // and-store pattern that produces the read-into leak). The check
+    // does NOT verify the LHS is in the current function's `locals_` /
+    // `paramSlots_` — the walker has no direct access to those, but
+    // sema's resolution of `LambdaRef` (a same-scope local) to a
+    // `LocalSymbol` whose `decl` is the declaring `LocalDecl` of THIS
+    // function's body is the load-bearing fact for the read-into leak
+    // path: an outer-scope closure-typed local would resolve to a CAPTURED
+    // CELL slot, not a plain local, and the captured-cell twin
+    // (`lowerCapturedClosureLocalReassign`) has its own retained
+    // refcount handling that does not leak. A non-LocalSymbol /
+    // non-ParameterSymbol target (a static field, auto-property, type
+    // name) is excluded — those go through `lowerClosureFieldStore` /
+    // `closureFieldStoreRetain` / etc., whose retain discipline is
+    // independent of this walker's classification. Conservative: when
+    // in doubt, return false and the post-walk override declines (the
+    // safe direction).
+    bool isClosureTypedLocalAssign(const ast::Expr& target_expr) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target_expr);
+        if (!id) return false;
+        sema::Symbol* sym = ctx.exprSymbol(*id);
+        if (!sym) return false;
+        bool isLocalOrParam = (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr) ||
+                              (dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr);
+        if (!isLocalOrParam) return false;
+        const sema::TypeRef* tt = ctx.exprType(target_expr);
+        if (!tt || tt->kind != sema::TypeRef::Kind::Function) return false;
+        if (tt->nullable) return false;
+        return true;
     }
 
     // fix #3805 follow-up #2 (review NEEDS-FIX, delta re-review): does
@@ -27952,6 +28054,23 @@ struct ClosureEscapeWalker {
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            // fix #4425 (§27.5 / §28.9, v0.301): mark target RETURNED when the
+            // ReturnStmt's value expression IS a bare identifier naming the
+            // target. The walker's existing expr() call (with safeRead=false)
+            // already sets `escaped = true` via the FINDING [1] read arm, but
+            // the post-walk override needs to know whether the escape was
+            // ALSO a return transfer (which transfers the +1 out of the slot,
+            // blocking a scope-end release) vs. some other escape source that
+            // the override does not consider. Without this, the override
+            // would arm scope-end release for a reassigned-and-returned local
+            // and double-free alongside the caller's release at function exit.
+            // A `return` of a NON-bare expression containing target (e.g.
+            // `return lambdaRef()` — the call result, not the local itself) is
+            // NOT a return transfer of target: the cell's lifetime is the
+            // call return, and the existing call-site release handles it. So
+            // only the bare-ident case marks isReturned_.
+            if (r->value && isTargetIdent(r->value.get()))
+                isReturned_ = true;
             expr(r->value.get(), /*safeRead=*/false); return;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
@@ -27989,6 +28108,74 @@ struct ClosureEscapeWalker {
                 // the reassign.
                 expr(as->value.get(), /*safeRead=*/false);
                 return;
+            }
+            // fix #4473 (§27.5 / §28.9, v0.301): the read-into path — when
+            // target appears as the RHS of an AssignmentStmt whose LHS is
+            // a same-scope closure-typed local or parameter slot, the
+            // `lowerClosureLocalReassign` emit path (lines 26674 ff.)
+            // retains the newVal and stores it into the LHS slot, but the
+            // RHS slot (target's slot) is left pointing at the cell — the
+            // +1 it still holds must be balanced by the RHS's scope-end
+            // release, which only fires if the walker admits target into
+            // `closureReleaseEligible_`. Without this branch the walker
+            // would observe the read via the existing safeRead arm
+            // (`escaped = true`) and never reach the override (the
+            // override currently only considers `escapedDueToReassign`,
+            // not the read-into shape). This arm fires BEFORE recursing
+            // into `as->value` so the override can read the flag.
+            //
+            // Detection shape: `isClosureTypedLocalAssign(*as->target)`
+            // requires (a) LHS is an IdentifierExpr (a member access,
+            // array index, parameter slot via indexer, etc. takes a
+            // different emit path with its own retain discipline), (b)
+            // resolved symbol is a `LocalSymbol` or `ParameterSymbol`
+            // (not a static field / type name / auto-property — those
+            // take `lowerClosureFieldStore` and friends, which are
+            // independent of this walker's classification), (c) type is
+            // non-nullable `Kind::Function` (nullable closure-typed
+            // slots are left as plain stores, no retain-and-store
+            // pattern, so the leak shape does not apply). The RHS
+            // recursion below will mark `escaped = true` via the read
+            // arm in `expr()`.
+            //
+            // The flag is independent of `escapedDueToReassign` (set
+            // above in the LHS-IS-target arm) — they describe
+            // orthogonal dispositions of the AssignmentStmt and can
+            // both fire on a chain like `lambdaRef := y := z` only if
+            // the LHS-IS-target arm fires on a DIFFERENT target, which
+            // is structurally impossible per walker (each walker pass
+            // targets exactly one local). The two paths target
+            // DIFFERENT leaks (fix #4425 vs. fix #4473) and the post-
+            // walk override's disjunction (`(... escapedDueToReassign
+            // ... ) || escapedDueToAssignIntoClosureLocal_`) keeps
+            // them composable — see override block at line ~28573.
+            //
+            // DISTINCT FROM #4425's mechanism: #4425 fixes the LHS-IS-
+            // target arm by extending the call-count disjunction to
+            // admit `calleeCallCount == 0` reassigned-and-never-called
+            // locals; this fix does NOT touch that arm and does NOT
+            // touch the call-count predicate — it adds a NEW override
+            // disjunction that does not depend on call count (a
+            // non-reassigned read-into local has its +1 retained by
+            // `lowerClosureLocalReassign` even when calleeCallCount is
+            // 0, see `LlvmBackend_Calls2.cpp` line 6585 — the call-site
+            // release arm only fires for reassigned locals).
+            //
+            // Requires BOTH conditions: LHS is a closure-typed local/
+            // parameter slot (`isClosureTypedLocalAssign`) AND the
+            // RHS contains `target` as a read (`containsTargetAnywhere`).
+            // The first alone fires for any assignment to a closure-
+            // typed local regardless of whether target participates
+            // (e.g. `lambdaRef := otherLambda`); the second alone fires
+            // for an arbitrary RHS expression containing target that is
+            // being assigned to a non-closure-typed slot. Only the
+            // conjunction is the leak shape `lowerClosureLocalReassign`
+            // produces — the retain-and-store pair is only emitted for
+            // closure-typed LHS, and a non-target RHS would not strand
+            // target's +1.
+            if (isClosureTypedLocalAssign(*as->target) &&
+                containsTargetAnywhere(as->value.get())) {
+                escapedDueToAssignIntoClosureLocal_ = true;
             }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
@@ -28432,8 +28619,60 @@ void Emitter::collectClosureReleaseEligible(
         // fires; `escaped` keeps its original value. The pre-existing
         // escape-walk verdict — non-escaping → scope-end arms normally,
         // escaping → no scope-end arm — is preserved untouched.
-        if (w.escaped && w.escapedDueToReassign && !w.isCapturedCellSlot_ &&
-            (w.calleeCallCount > 1 || w.uncountableCalleeSeen)) {
+        //
+        // fix #4425 (§27.5 / §28.9, v0.301): extend the override to ALSO fire
+        // when `calleeCallCount == 0` — the local is reassigned but never
+        // called. Pre-#4425 the override required `calleeCallCount > 1 ||
+        // uncountableCalleeSeen`, so a reassigned + never-called local stayed
+        // `escaped = true` and never entered `closureReleaseEligible_` — the
+        // cell +1 it holds at scope end leaks (a 40 B × N allocations leak
+        // per execution, measured on the cycle-8 #4261 refutation/fix
+        // investigation that surfaced it). The fix is sound: with zero call
+        // sites, no call-site release exists to balance a scope-end release
+        // (the single-call counter-shape is exactly what the existing override
+        // declines), so adding `calleeCallCount == 0` to the disjunction
+        // completes the coverage without disturbing the single-call
+        // discipline. The `!isReturned_` guard is the SAME distinction as
+        // `!isCapturedCellSlot_`: both reject "the slot's +1 is already
+        // claimed by a different release site" — a `return lambdaRef` transfers
+        // the +1 to the caller, so a scope-end release would double-free.
+        //
+        // fix #4473 (§27.5 / §28.9, v0.301): extend the override's
+        // disjunction with `escapedDueToAssignIntoClosureLocal_` — the
+        // `lambdaRef := y` shape where the walked target `y` is the RHS
+        // of an AssignmentStmt whose LHS is a same-scope closure-typed
+        // local/parameter. `lowerClosureLocalReassign`'s retain-store-
+        // release-old leaves the RHS slot still pointing at the cell —
+        // without admitting the RHS into `closureReleaseEligible_`, the
+        // RHS's +1 strands when the LHS's scope-end release fires (a
+        // 40-byte closure cell leak, per issue #4473's repro). The
+        // override clears `escaped` so the RHS joins
+        // `closureReleaseEligible_`; the RHS's scope-end release then
+        // drops the cell's rc by 1 (the LHS's scope-end release drops
+        // the second +1 — `bz_closure_release` is rc-based and safe to
+        // fire on multiple slots pointing at the same cell, verified
+        // against src/runtime/bezel_runtime_refcounting.cpp line 336).
+        // DISTINCT FROM #4425: #4425 fixes the
+        // `escapedDueToReassign` arm (target IS the AssignmentStmt LHS,
+        // a reassign) by extending the call-count disjunction to
+        // include `calleeCallCount == 0`; #4473 fixes the
+        // `escapedDueToAssignIntoClosureLocal_` arm (target IS the
+        // AssignmentStmt RHS, the read-into path) by adding a NEW
+        // disjunction that does not depend on the call count (a call
+        // does NOT consume a +1 for non-reassigned locals — the
+        // LocalSymbol arm of `emitClosureCall` only emits a call-site
+        // release for reassigned locals, see
+        // src/codegen/LlvmBackend_Calls2.cpp line 6585 — so any
+        // `lambdaRef := y` retains a +1 that ONLY the RHS's scope-end
+        // release can balance). The `!w.isCapturedCellSlot_` guard
+        // parallels the existing reassign arm: a captured-cell RHS
+        // would be released by the envdtor of the lambda that captured
+        // it, and arming scope-end release here would double-free.
+        if (w.escaped && !w.isCapturedCellSlot_ &&
+            ((w.escapedDueToReassign && !w.isReturned_ &&
+              (w.calleeCallCount > 1 || w.calleeCallCount == 0 ||
+               w.uncountableCalleeSeen)) ||
+             w.escapedDueToAssignIntoClosureLocal_)) {
             w.escaped = false;
         }
         if (!w.escaped)
