@@ -203,22 +203,29 @@ BEZEL_TEST(assignment_stmt_collection_literal_element_interface_conformance_4316
 // A false reject here would be worse than the bug this fix closes.
 // ============================================================
 
+// NOTE: switched to `[1 owned]` / `[2 owned]` (the spec-conformant form per
+// §15.1.1 / #4336 / `569a680`): the non-owning `[N]IHolder` is a BORROW
+// slot per §15.1 and the `new Widget3Ok(s)` initializer is now rejected by
+// #4351's sema fix. The owning form takes ownership of the fresh widget on
+// construction and exercises the SAME AssignmentStmt collection-literal
+// element conformance path this test pins.
 BEZEL_TEST(assignment_stmt_collection_literal_element_interface_conformance_4316,
            conforming_single_element_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder; "
+        "var outer: [1 owned]IHolder; "
         "outer := [new Widget3Ok(s)]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(assignment_stmt_collection_literal_element_interface_conformance_4316,
            two_different_conforming_implementors_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [2]IHolder; "
+        "var outer: [2 owned]IHolder; "
         "outer := [new Widget3Ok(s), new Widget4Ok(\"world\")]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
