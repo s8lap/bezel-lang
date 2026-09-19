@@ -105,25 +105,31 @@ JitResult run(const std::string& mainBody,
 // ============================================================
 
 // Site 1: `outer[i] := new RecHolder(...)` — single-element index-assignment
-// into a pre-existing `[N]IHolder`.
+// into a pre-existing `[N owned]IHolder`.
+// NOTE: switched to `[1 owned]` (the spec-conformant form per §15.1.1 /
+// #4336 / `569a680`): the non-owning `[1]IHolder` is a BORROW slot per §15.1
+// and the `new Widget("init")` initializer is now rejected by #4351's sema
+// fix. The owning form takes ownership of the fresh widget on construction
+// and exercises the SAME index-assign boxing path this test pins.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            index_assign_record_element_boxed_spec_15_1_8_6) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder := [new Widget(\"init\")]; "
+        "var outer: [1 owned]IHolder := [new Widget(\"init\")]; "
         "outer[0] := new RecHolder(s); "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
-// Same site, a SECOND slot of a `[2]IHolder` — proves the fix is not
+// Same site, a SECOND slot of a `[2 owned]IHolder` — proves the fix is not
 // slot-0-specific.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            index_assign_record_element_second_slot_boxed_spec_15_1_8_6) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [2]IHolder := "
+        "var outer: [2 owned]IHolder := "
         "  [new Widget(\"init0\"), new Widget(\"init1\")]; "
         "outer[1] := new RecHolder(s); "
         "return outer[1].GetV().Length;");
@@ -133,11 +139,12 @@ BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
 
 // Site 2: `outer := [new RecHolder(...), ...]` — whole-array collection-
 // literal REASSIGNMENT (a plain `AssignmentStmt`, not a declaration).
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            assignment_stmt_whole_literal_record_element_boxed_spec_15_1_8_6) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder := [new Widget(\"init\")]; "
+        "var outer: [1 owned]IHolder := [new Widget(\"init\")]; "
         "outer := [new RecHolder(s)]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -147,13 +154,14 @@ BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
 // Same site, TWO record elements plus a mix with a class element in one
 // literal — proves the per-element loop boxes every record slot
 // independently rather than only the first.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(
     inline_array_interface_record_element_store_boxing_4317,
     assignment_stmt_whole_literal_mixed_class_and_record_boxed_spec_15_1_8_6) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [2]IHolder := [new Widget(\"init0\"), "
-        "                          new Widget(\"init1\")]; "
+        "var outer: [2 owned]IHolder := [new Widget(\"init0\"), "
+        "                              new Widget(\"init1\")]; "
         "outer := [new Widget(\"cls\"), new RecHolder(s)]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -161,16 +169,17 @@ BEZEL_TEST(
 }
 
 // Site 3: `return [new RecHolder(...)];` from a method declared to return
-// `[1]IHolder` — the ReturnStmt collection-literal arm.
+// `[1 owned]IHolder` — the ReturnStmt collection-literal arm.
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            return_stmt_inline_array_literal_record_element_boxed_spec_15_1_8_6) {
     auto r = runAot(
         kPrelude +
-        "class Helper public static method Wrap(s: string): [1]IHolder "
+        "class Helper public static method Wrap(s: string): [1 owned]IHolder "
         "  return [new RecHolder(s)]; end Wrap; end Helper; "
         "class C public static method Main(): int "
         "  var s := \"he\" + \"llo\"; "
-        "  var outer: [1]IHolder := Helper.Wrap(s); "
+        "  var outer: [1 owned]IHolder := Helper.Wrap(s); "
         "  return outer[0].GetV().Length; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -183,37 +192,40 @@ BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
 // A false change here would mean the fix's no-op guard is wrong.
 // ============================================================
 
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            index_assign_class_element_unaffected_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder := [new Widget(\"init\")]; "
+        "var outer: [1 owned]IHolder := [new Widget(\"init\")]; "
         "outer[0] := new Widget(s); "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            assignment_stmt_whole_literal_class_element_unaffected_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder := [new Widget(\"init\")]; "
+        "var outer: [1 owned]IHolder := [new Widget(\"init\")]; "
         "outer := [new Widget(s)]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_element_store_boxing_4317,
            return_stmt_class_element_unaffected_control) {
     auto r = runAot(
         kPrelude +
-        "class Helper public static method Wrap(s: string): [1]IHolder "
+        "class Helper public static method Wrap(s: string): [1 owned]IHolder "
         "  return [new Widget(s)]; end Wrap; end Helper; "
         "class C public static method Main(): int "
         "  var s := \"he\" + \"llo\"; "
-        "  var outer: [1]IHolder := Helper.Wrap(s); "
+        "  var outer: [1 owned]IHolder := Helper.Wrap(s); "
         "  return outer[0].GetV().Length; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
