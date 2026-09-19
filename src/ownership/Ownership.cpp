@@ -13092,6 +13092,80 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
     if (!isAsync_ || !returnType_) return;
     if (!isAsyncPatternAClassResultType(ctx_.resolvedType(*returnType_), ctx_))
         return;
+
+    // fix #4463 (§30.5 Pattern A kind 1, §28.3 Producers, v0.306):
+    // `checkAsyncPatternABorrowedIdentifierReturn` only inspected a bare
+    // IdentifierExpr at the top level.  Wrapper AST shapes that can only
+    // unwrap to a borrowed source were invisible to the check.
+    //
+    // Recursive helper: walks through wrapper shapes to the underlying
+    // borrowed source.  The walk is intentionally CONSERVATIVE — it rejects
+    // only when the underlying source is demonstrably a borrow (plain
+    // parameter, tracked Borrowed local, implicit-this field).  It does NOT
+    // classify CallExpr/NullCondCallExpr results beyond checking the callee;
+    // a method call whose result is borrowed through its receiver's borrow
+    // is caught via the MemberAccessExpr base-check.  The 6 defect probes
+    // (L4 report, probes 3/4/5/7/9/10) are all caught by this walk.
+    // Codegen's `detectAsyncPatternAKind` remains as the fast first-pass
+    // for the unambiguous MemberAccessExpr / NullCondMemberExpr / IndexExpr
+    // top-level shapes. // per §30.5, §28.3
+    std::function<bool(const ast::Expr&)> isBorrowed =
+        [&](const ast::Expr& expr) -> bool {
+        // PostfixBangExpr: the `!` postfix asserts non-null but does not
+        // change ownership classification (§7.5 / §28.3) — unwrap and recurse.
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(&expr))
+            return isBorrowed(*p->operand);
+        // TypeTestExpr (op="as"): borrows from its operand.
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(&expr))
+            return t->op == "as" && isBorrowed(*t->operand);
+        // ConditionalExpr: the meet of the arms' ownership states; if
+        // either arm is borrowed the whole expression is (§28.3).
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&expr))
+            return isBorrowed(*c->thenValue) || isBorrowed(*c->elseValue);
+        // BinaryExpr (op="??"): identically to ConditionalExpr (§28.3).
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&expr))
+            return b->op == "??" &&
+                   (isBorrowed(*b->left) || isBorrowed(*b->right));
+        // CallExpr / NullCondCallExpr: the result is borrowed if the callee
+        // is borrowed (§28.3 row 4).
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&expr))
+            return isBorrowed(*call->callee);
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&expr))
+            return isBorrowed(*nc->callee);
+        // MemberAccessExpr: if the base is borrowed, the access is borrowed.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&expr))
+            return isBorrowed(*ma->target);
+        // NullCondMemberExpr: `h?.Peek` — same borrow semantics as MemberAccessExpr
+        // per §28.3; the `?.` does not transfer ownership.
+        if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(&expr))
+            return isBorrowed(*ncm->target);
+        // IdentifierExpr: consult per-local flow state, then parameter
+        // symbol, then implicit-this field — the same 3-arm logic this
+        // function uses for a bare IdentifierExpr.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&expr)) {
+            if (auto* st = lookupState(id->name))
+                return st->state == OwnershipState::Borrowed;
+            if (auto* sym = ctx_.exprSymbol(*id))
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
+                    return ps->modifier.empty();
+            if (auto* sym = ctx_.exprSymbol(*id))
+                if (dynamic_cast<sema::FieldSymbol*>(sym))
+                    return true;
+            return false;  // owned local or untracked — admitted
+        }
+        return false;  // everything else: owned or not this check's business
+    };
+
+    // fix #4463: for non-IdentifierExpr shapes (wrapper expressions),
+    // use the recursive walk to detect borrowed sources.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (isBorrowed(e)) {
+            reportAsyncPatternABorrowedIdentifierReturn(e);
+            return;
+        }
+        // Not borrowed: fall through to handle bare IdentifierExpr via
+        // the existing top-level check below.
+    }
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
     if (!id) return;
     if (auto* st = lookupState(id->name)) {
