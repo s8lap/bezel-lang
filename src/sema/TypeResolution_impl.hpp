@@ -710,6 +710,16 @@ private:
 
     void checkTypeDuplicates(TypeSymbol* t);
 
+    // fix #4444 (§35.1, v0.302): walk a Choice's cases and reject any case
+    // whose name is `Equals`/`GetHashCode`/`ToString`. The reservation holds
+    // on every classification, independent of whether a member of that name
+    // is declared (the §35.7 remedy is to *declare* the member — only choices
+    // that need it can land on the name; keying on synthesis would reintroduce
+    // the defect). The duplicate-walk above already covers DECLARED-vs-CASE
+    // collisions (§11.3 / choice-cases-count-as-members); this reservation is
+    // its §35.1 sibling.
+    void checkChoiceCaseReservedNames(const TypeSymbol* t);
+
     // Slice S12: DFS over baseTypes; if we revisit a node already in
     // the current path, report a cycle anchored at the offending
     // TypeSymbol. Each cycle is reported once (at its smallest entry).
