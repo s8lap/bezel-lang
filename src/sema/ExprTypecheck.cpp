@@ -12956,6 +12956,58 @@ void ExprTC::checkCollectionLiteralElementAssignability(
     };
     if (target->kind == TypeRef::Kind::InlineArray) {
         if (!target->arrayElement) return;
+        // fix #4351 (spec §15.1, v0.307): a NON-OWNING inline array of a
+        // class-typed element stores BORROWS, not owned values; the spec
+        // requires "the initializer expressions must be borrows of class
+        // instances already owned elsewhere". A `new T(...)` element is a
+        // fresh producer with no outer owner — at end-of-statement the
+        // temporary would be disposed and the array's slot would hold a
+        // dangling borrow from birth (the leak #4336 measured on its
+        // owning twin `569a680`, and the long-standing codegen-deferred
+        // ruling that becomes a sema rejection here). The owning form
+        // `[N owned]C` (per §15.1.1, already wired by #4336 / `569a680`)
+        // is exempt — its slot takes ownership, so a `new T(...)` element
+        // IS a valid fresh producer.
+        //
+        // Scope: rejects `new T(...)` ONLY (a `someOwnedVar` identifier is
+        // a borrow — fine). Class-typed element means the element type's
+        // declaration has kind Class or Interface; primitives, records,
+        // enums, choices, runtime-managed types (string, function types),
+        // and uninstantiated generic parameters are NOT in scope (per
+        // §15.1's "class-typed elements" wording, which the owning form
+        // §15.1.1 also keys on). The check is local-decl / field-init /
+        // property-init / return-stmt / default-param / call-arg uniform
+        // — every `CollectionLiteralExpr` against a non-owning inline-array
+        // target reaches this arm regardless of which position seeded it.
+        // Fires BEFORE the per-element `checkAssignable` below so the
+        // borrow-only-contract diagnostic is the one the reader sees on a
+        // `new SomeClass()` against `[N]IHolder`; a non-conforming class
+        // at the same slot additionally gets the §5.1/§11.2 message from
+        // `checkAssignable`.
+        if (!target->arrayOwned) {
+            const TypeRef* et = target->arrayElement;
+            const bool classTyped =
+                et && et->kind == TypeRef::Kind::Named && et->declaration &&
+                (et->declaration->kind == ast::TypeDeclKind::Class ||
+                 et->declaration->kind == ast::TypeDeclKind::Interface);
+            if (classTyped) {
+                for (const auto& el : cl.elements) {
+                    if (!el) continue;
+                    if (dynamic_cast<const ast::NewExpr*>(el.get())) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, el->span.begin,
+                            "collection-literal element is a fresh producer "
+                            "(`new ...`) of a class-typed element in a "
+                            "non-owning inline array — §15.1 requires the "
+                            "initializer to be a borrow of a class instance "
+                            "already owned elsewhere; add `owned` to the "
+                            "array type (`[N owned]C`) to take ownership, or "
+                            "bind the value to a local first (`using var x "
+                            ":= new T(...);` then `[x]`) (§15.1)");
+                    }
+                }
+            }
+        }
         for (const auto& el : cl.elements)
             checkOne(el.get(), target->arrayElement, "element");
         return;

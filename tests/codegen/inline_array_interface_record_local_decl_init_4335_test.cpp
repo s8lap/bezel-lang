@@ -103,24 +103,30 @@ JitResult run(const std::string& mainBody,
 
 // The issue's OWN literal repro — local-decl init of an inline-array-of-
 // interface literal whose element is a genuinely conforming record.
+// NOTE: switched to `[1 owned]` (the spec-conformant form per §15.1.1 /
+// #4336 / `569a680`): the non-owning `[1]IHolder` is a BORROW slot per §15.1
+// and the `new RecHolder(...)` initializer is now rejected by #4351's sema
+// fix. The owning form takes ownership of the fresh record on construction
+// and exercises the SAME local-decl-init boxing path this test pins.
 BEZEL_TEST(inline_array_interface_record_local_decl_init_4335,
            local_decl_init_record_element_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [1]IHolder := [new RecHolder(\"he\" + \"llo\")]; "
+        "var outer: [1 owned]IHolder := [new RecHolder(\"he\" + \"llo\")]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
-// Same shape, a SECOND slot of a `[2]IHolder` — proves the fix is not
+// Same shape, a SECOND slot of a `[2 owned]IHolder` — proves the fix is not
 // slot-0-specific. Both elements are records of different payloads so a
 // "first element only" defect would still slip a length from the second
 // into the first.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(
     inline_array_interface_record_local_decl_init_4335,
     local_decl_init_record_element_second_slot_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [2]IHolder := "
+        "var outer: [2 owned]IHolder := "
         "  [new RecHolder(\"he\" + \"llo\"), new RecHolder(\"world\")]; "
         "return outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -129,11 +135,12 @@ BEZEL_TEST(
 
 // A class element + a record element in the SAME local-decl-init literal —
 // the class slot must no-op `boxForTarget` and the record slot must box.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(
     inline_array_interface_record_local_decl_init_4335,
     local_decl_init_mixed_class_and_record_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [2]IHolder := "
+        "var outer: [2 owned]IHolder := "
         "  [new Widget(\"cls\"), new RecHolder(\"he\" + \"llo\")]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -144,11 +151,12 @@ BEZEL_TEST(
 // Exercises the per-element loop hitting the new `boxForTarget` call on
 // every iteration (not just the first) — proving the fix lives in the
 // loop body, not at literal-construction time.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(
     inline_array_interface_record_local_decl_init_4335,
     local_decl_init_two_record_elements_both_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [2]IHolder := "
+        "var outer: [2 owned]IHolder := "
         "  [new RecHolder(\"he\" + \"llo\"), new RecHolder(\"world\")]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -192,10 +200,11 @@ BEZEL_TEST(inline_array_interface_record_local_decl_init_4335,
 // A genuinely conforming class as a single inline-array element at the
 // local-decl init — this was already correct pre-fix and must stay
 // correct.
+// See note above: switched to `[1 owned]` for #4351.
 BEZEL_TEST(inline_array_interface_record_local_decl_init_4335,
            local_decl_init_class_element_unaffected_control) {
     auto r = run(
-        "var outer: [1]IHolder := [new Widget(\"he\" + \"llo\")]; "
+        "var outer: [1 owned]IHolder := [new Widget(\"he\" + \"llo\")]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);

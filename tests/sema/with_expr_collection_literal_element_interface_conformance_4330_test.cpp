@@ -170,9 +170,11 @@ BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
            positional_field_conforming_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var items1: [1]IHolder := [new Widget3Ok(s)]; "
+        "using var w1 := new Widget3Ok(s); "
+        "using var w2 := new Widget3Ok(s); "
+        "var items1: [1]IHolder := [w1]; "
         "var b1 := new Box(items1); "
-        "var b2 := b1 with(Items := [new Widget3Ok(s)]); "
+        "var b2 := b1 with(Items := [w2]); "
         "return b2.Items[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
@@ -182,9 +184,11 @@ BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
            body_record_explicit_field_conforming_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var items1: [1]IHolder := [new Widget3Ok(s)]; "
+        "using var w1 := new Widget3Ok(s); "
+        "using var w2 := new Widget3Ok(s); "
+        "var items1: [1]IHolder := [w1]; "
         "var b1 := new BodyBox(items1, \"orig\"); "
-        "var b2 := b1 with(Items := [new Widget3Ok(s)]); "
+        "var b2 := b1 with(Items := [w2]); "
         "return b2.Items[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
@@ -205,10 +209,10 @@ BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
         "  public constructor(v: string) V := v; end constructor; "
         "  public method GetV(): string return V; end GetV; "
         "end Widget4Ok; "
-        "record Box2(Items: [2]IHolder); "
+        "record Box2(Items: [2 owned]IHolder); "
         "class C public static method Main(): int "
         "  var s := \"he\" + \"llo\"; "
-        "  var items1: [2]IHolder := [new Widget3Ok(s), new Widget4Ok(s)]; "
+        "  var items1: [2 owned]IHolder := [new Widget3Ok(s), new Widget4Ok(s)]; "
         "  var b1 := new Box2(items1); "
         "  var b2 := b1 with(Items := [new Widget3Ok(s), new Widget4Ok(\"world\")]); "
         "  return b2.Items[0].GetV().Length + b2.Items[1].GetV().Length; "
