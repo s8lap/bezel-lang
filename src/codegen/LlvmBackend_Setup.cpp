@@ -14816,6 +14816,68 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         dynamic_cast<const ast::CallExpr*>(init)) {
         recordCallResultInitOutermostClassWithRecordField_ = true;
     }
+    // fix #4462 (§30.5 Pattern A, §30.6, v0.306): for a `using var x := await t;`
+    // LocalDecl where `t` is a BOUND plain `Task<T:class>`, the consuming binding
+    // (the using-var) takes ownership of T at scope end via cascade-dispose. If
+    // the task's own result slot remains populated, the kind-1 disposer attached
+    // by the producer's `emitAsyncPatternAResultDecision` (fired when the
+    // producer's body is `return await Task.FromOwnedResult(new X)`, the §30.5
+    // kind-2 chained path with `bz_task_needs_caller_disposal` returning 1)
+    // runs at the TASK's scope end on the same freed T — a heap-use-after-free
+    // invisible on plain builds (#2633 oracle) and deterministic under ASan.
+    // Arm `awaitConsumesPlainTaskResult_` for the duration of `lowerExpr(*init)`
+    // so `lowerAwait`'s extended `takeResultAfter` decision fires for plain
+    // `Task<T:class>` (the OwningTask half already fires unconditionally), and
+    // `emitAwaitSuspend`'s existing `bz_task_take_result(awaitedTask, ...)` call
+    // clears `t->result` so the disposer check skips at destroy time. The flag
+    // is read once inside `lowerAwait` (no nested emit of the same expression,
+    // and the save/restore below guarantees correctness on any nested
+    // LocalDecl init the future might add). Gated to (a) `using var` modifier
+    // (not `var x := await t;` borrow — that path MUST leave the slot populated
+    // for the disposer to fire at t's scope end), (b) plain Task (not
+    // OwningTask, which has its own takeResultAfter path), (c) class-typed T
+    // (Pattern A — elementPolicyFor's ClassOwned category). The chained kind-3
+    // case is unaffected because `chainedReturnBorrowedTaskSource` reads from a
+    // different emitter state and produces no result_disposer in the first place.
+    // // per §30.5 Pattern A, §30.6, v0.306
+    // LOCALDECL-DEBT: #4462 — the consume flag arms ONLY for a `using var
+    // x := await t;` binding (`ld->isUsing` gate below), and `using var`
+    // is admitted only on `LocalDecl`, never on `const` locals (the
+    // const-binding form doesn't exist for the owned/using family). A
+    // const-local `await` is a borrow and is correctly handled by the
+    // existing `var x := await t;` shape (no `awaitConsumesPlainTaskResult_`
+    // arm) — no §21.1 `const` local can reach this site.
+    const bool savedAwaitConsumesPlainTaskResult =
+        awaitConsumesPlainTaskResult_;
+    if (init) {
+        // LOCALDECL-DEBT: #4462 — `using var` only admits LocalDecl.
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode)) {
+            if (ld->isUsing) {
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(init)) {
+                    if (un->op == "await" && un->operand) {
+                        const sema::TypeRef* taskTy = ctx_.exprType(*un->operand);
+                        // Detect `Task<T:class>` specifically — not
+                        // OwningTask<T>, which has its OWN `takeResultAfter`
+                        // path fired unconditionally by `lowerAwait`. Use the
+                        // shared `isTaskTypeName` predicate (handles both the
+                        // astNode-name and the builtinClassSym shapes Task
+                        // takes), then `headName() == "Task"` to exclude the
+                        // OwningTask twin.
+                        bool isPlainClassTask =
+                            taskTy && isTaskTypeName(taskTy) &&
+                            taskTy->headName() == "Task" &&
+                            !taskTy->genericArgs.empty() &&
+                            taskTy->genericArgs[0] &&
+                            elementPolicyFor(taskTy->genericArgs[0],
+                                             /*owningFamily=*/true).cat ==
+                                ElementPolicy::Category::ClassOwned;
+                        if (isPlainClassTask)
+                            awaitConsumesPlainTaskResult_ = true;
+                    }
+                }
+            }
+        }
+    }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
@@ -14827,6 +14889,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     recordCallResultInitOutermost_ = savedRecordCallResultInitOutermost;
     recordCallResultInitOutermostClassWithRecordField_ =
         savedRecordCallResultInitOutermostClassWithRecordField;
+    // fix #4462: restore the consume flag (mirrored with the arm above).
+    awaitConsumesPlainTaskResult_ = savedAwaitConsumesPlainTaskResult;
     // §9 / §9.1 (#1759): `var q := this` in a record method copies the record
     // value. `this` lowered to the receiver POINTER (CG29 / §9.2); load the
     // struct so the local holds a value-semantics copy, not the pointer bits — a

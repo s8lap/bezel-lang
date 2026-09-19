@@ -21,7 +21,7 @@
 1    src/codegen/LlvmBackend_Exprs.cpp
 5    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Iterators.cpp
-1    src/codegen/LlvmBackend_Setup.cpp
+2    src/codegen/LlvmBackend_Setup.cpp
 1    src/codegen/LlvmBackend_Stmts.cpp
 1    src/codegen/LlvmBackend_String.cpp
 1    src/driver/ScopedAwaitBind.cpp
