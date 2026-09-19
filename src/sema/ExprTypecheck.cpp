@@ -3087,9 +3087,29 @@ bool ExprTC::returnsValue(const ast::Type* rt) {
 // issue #777 / §30.6: a Named `Task<…>` / `OwningTask<…>` shape — the async task
 // wrapper. An async lambda/method body must produce the unwrapped element T, not
 // a Task value; a Task-shaped body where T is NOT itself Task-shaped is a
-// forgotten `await`.
+// forgotten `await`. STRICT form (non-nullable): use this where the rule is
+// about the DECLARED wrapper (§30.1 / §30.6 async-context mapping, the
+// declared-return-type check) — a `Task?` ascription/return is a different
+// question the relevant site decides on its own.
 bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
-    return t && t->kind == TypeRef::Kind::Named && !t->nullable &&
+    return isTaskFamilyRef(t) && !t->nullable;
+}
+
+// fix #4443 (v0.302, §17.13 / §28.3 Keying rule): the task-family predicate
+// with nullability STRIPPED. The §17.13 discard-and-anonymous-binding rule
+// keys on "is this a Task-family value", and a non-null `Task?` IS a Task-
+// family value (the rule exists to prevent abandonment of a running operation,
+// and a nullable static type changes what may be absent, not what is abandoned
+// when it is present) — exactly as the §28.3 announcement table's Keying rule
+// for its own rows ("read from the signature *before* generic substitution,
+// with nullability stripped: `Task?` … qualify"). The §28.3 mint-announcing
+// rule's calls-mint set therefore also admits `Task?`/`Task<T>?`/`OwningTask<T>?`,
+// and the §17.13 discard rule rejects their discards. The two sites that
+// strip are §17.13's discard + anonymous binding halves; the §30.1 / §30.6
+// async-context rules DO NOT strip — the declared wrapper is `Task`/`Task<T>`/
+// `OwningTask<T>`, not their nullable spellings.
+bool ExprTC::isTaskFamilyRef(const TypeRef* t) const {
+    return t && t->kind == TypeRef::Kind::Named &&
            t->astNode && t->astNode->name &&
            t->astNode->name->parts.size() == 1 &&
            (t->headName() == "Task" ||
@@ -3130,7 +3150,11 @@ bool ExprTC::isConcreteSlotReturnType(const TypeRef* t) const {
         t->primitive == PrimitiveType::Object) return true;
     if (t->kind != TypeRef::Kind::Named) return false;
     // Task-family: the v0.190 rule claims these (calls mint).
-    if (isTaskShapedRef(t)) return false;
+    // fix #4443 (v0.302, §28.3 Keying rule): the §28.3 announcement table's
+    // mint-announcing Keying strips nullability (`Task?` qualifies), so a
+    // nullable `Task?` slot is also claimed by calls-mint — not a concrete
+    // borrowed-slot. Use the stripped `isTaskFamilyRef`.
+    if (isTaskFamilyRef(t)) return false;
     // The eight iterator/enumerator interface heads (§29.3/§30.7) are
     // #1787's seam, deliberately unclassified by #1820.
     if (!t->nullable && t->astNode && t->astNode->name &&
@@ -14189,8 +14213,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
+                    // fix #4443 (v0.302, §28.3 Keying rule): a function-slot
+                    // declared as `(…) -> Task?` / `(…) -> Task<T>?` / `(…) ->
+                    // OwningTask<T>?` is a mint-announcing slot — the §28.3
+                    // announcement table's Keying rule strips nullability
+                    // ("`Task?` … qualify"), so the lambda body must be checked
+                    // under the §30.1 peeled-element-context as for the
+                    // non-nullable spelling. Use the stripped `isTaskFamilyRef`.
                     if (dt->kind == TypeRef::Kind::Function && dt->funcReturn &&
-                        isTaskShapedRef(dt->funcReturn) &&
+                        isTaskFamilyRef(dt->funcReturn) &&
                         !dt->funcReturn->genericArgs.empty())
                         pendingLambdaReturnType_ =
                             dt->funcReturn->genericArgs.front();
@@ -14257,16 +14288,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // a generic parameter IS recorded as `TypeRef::Kind::Named` with a
         // null declaration (TypeResolution_Names.cpp, "Generic parameter —
         // record as a Named with no declaration"), so it passes that check.
-        // The exclusion comes from `isTaskShapedRef`'s `headName()` test --
+        // The exclusion comes from `isTaskFamilyRef`'s `headName()` test --
         // the parameter's own name (`T`) is neither "Task" nor "OwningTask"
         // (K2.4 keying, matching the discard-statement check below). Only the ANONYMOUS spelling
         // (`ld->name == "_"`, set only by the parser's `using var _`/
         // `await using var _` production, Parser_Stmts.cpp) is rejected;
         // a NAMED `using var t := expr;` remains the unsupervised idiom
         // (§30.10) and is untouched by this check.
+        // fix #4443 (v0.302, §17.13 Keying rule): §17.13 covers the discard
+        // statement AND the anonymous owning binding in the same bullet, so the
+        // keying-strips-nullability ruling from the discard half applies here
+        // too — use the stripped form `isTaskFamilyRef`.
         if (ld->isUsing && ld->name == "_" && ld->initializer) {
             if (const TypeRef* it = ctx_.exprType(*ld->initializer)) {
-                if (isTaskShapedRef(it)) {
+                if (isTaskFamilyRef(it)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ld->initializer->span.begin,
                         "cannot bind a `Task` to the anonymous `using var _` — "
@@ -14961,6 +14996,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the 8-byte task pointer into the element-sized result slot → memory
         // corruption / SIGSEGV. Reject it with a clear diagnostic, unless the
         // element T is itself Task-shaped (a legitimate `Task<Task<U>>` result).
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable).
+        // currentReturnType_ is the peeled element T threaded from the declared
+        // `Task<T>` / `OwningTask<T>` return (§30.1, non-nullable), and the
+        // body-return check is about the declared-wrapper mapping (§30.6) — a
+        // `Task?` body return is a different question; this rule's
+        // forgetfulness diagnosis does not extend to nullable spellings.
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
             inAsyncContext_ && currentReturnType_ &&
             !isTaskShapedRef(currentReturnType_) &&
@@ -15440,6 +15481,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `Task.FireAndForget` lead, since discarding/disposing a task
         // abandons a running operation — `using var` is the fallback, not the
         // first-offered fix, unlike the class arm above.
+        // fix #4443 (v0.302, §17.13 Keying rule): the parallel to the §17.13
+        // discard site — a `Task?` bare expression-statement (e.g. a `()`
+        // returning `Task?`) is the same abandonment, and the v0.302
+        // "keying strips nullability" ruling applies here too. Use the
+        // stripped `isTaskFamilyRef`.
         if (es->expr) {
             const TypeRef* taskStmtTy = ctx_.exprType(*es->expr);
             // A `move <task>;` statement is an explicit ownership transfer that
@@ -15451,7 +15497,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // acknowledging the transfer, so it is excluded here.
             auto* moveExpr = dynamic_cast<const ast::UnaryExpr*>(es->expr.get());
             bool isMove = moveExpr && moveExpr->op == "move";
-            if (isTaskShapedRef(taskStmtTy) && !isMove) {
+            if (isTaskFamilyRef(taskStmtTy) && !isMove) {
                 ctx_.diagnostics().report(
                     Severity::Error, es->expr->span.begin,
                     "this expression statement discards a `Task` result — an "
@@ -16804,7 +16850,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // rejected for a Task-family value (nothing can await an unnamed
             // binding, so it is the same abandonment one scope later). The
             // remaining scope-end remedy is the NAMED form only.
-            if (isTaskShapedRef(t)) {
+            // fix #4443 (v0.302, §17.13 Keying rule): the §17.13 keying strips
+            // nullability — a non-null `Task?` IS a Task-family value here, and
+            // discarding it is the same abandonment. Use `isTaskFamilyRef`
+            // (nullability-stripped); the strict `isTaskShapedRef` would let a
+            // `Task?` discard compile, which is the v0.302 spec-ahead-of-impl.
+            if (isTaskFamilyRef(t)) {
                 ctx_.diagnostics().report(
                     Severity::Error, ds->value->span.begin,
                     "cannot discard a `Task` — disposing it abandons a running "
