@@ -687,3 +687,123 @@ BEZEL_TEST(sema_extension,
             found = true;
     BEZEL_EXPECT_TRUE(found);
 }
+
+// ---------------------------------------------------------------------------
+// §26.4 (v0.303, issue #4448) — a bare identifier in an extension head's
+// FUNCTION-TYPE slot (`extension Array<(T) -> T>`) binds NO type parameter
+// and is a compile error naming §26.4 — not the generic "unresolved type
+// name `T`" fallback the compiler used to emit (and emitted twice, once per
+// occurrence of `T`). The fix detects the function-type slot during the
+// §26.4 type-parameter-binding walk
+// (`Resolver::bindExtensionTargetTypeParams`), reports the §26.4 diagnostic
+// exactly once at the offending identifier, and suppresses the redundant
+// "unresolved type name" cascade. The diagnostic message names the rule
+// (§26.4), the slot class ("function slot"), and the reason ("a function
+// type's parameter and return slots are not argument positions").
+//
+// The spec's own examples are `extension Array<(T) -> T>` and the nested
+// twin `extension IEnumerable<Array<(T) -> T>>` — both must hit the
+// new diagnostic, and BOTH must produce it exactly once.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(sema_extension,
+           function_slot_bare_identifier_cites_26_4_4448) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension Array<(T) -> T> "
+        "  public method NoOp(): int => 0; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    int section264Hits = 0;
+    bool hasFunctionSlotHit = false;
+    bool hasUnresolvedTypeName = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("\xC2\xA7""26.4") != std::string::npos) {
+            ++section264Hits;
+            if (d.message.find("function slot") != std::string::npos)
+                hasFunctionSlotHit = true;
+        }
+        if (d.message.find("unresolved type name") != std::string::npos)
+            hasUnresolvedTypeName = true;
+    }
+    // The §26.4 diagnostic must fire — at least once, with the spec
+    // section citation and the slot-class word. The "function slot"
+    // wording names the structural shape the rule covers, distinguishing
+    // it from the existing nullable-marked and bare-identifier cases.
+    BEZEL_EXPECT_TRUE(hasFunctionSlotHit);
+    // The fix requires EXACTLY one diagnostic per extension head, not
+    // one per bare identifier. The pre-fix output was two
+    // `unresolved type name `T`` errors (one per `T` occurrence).
+    BEZEL_EXPECT_EQ(section264Hits, 1);
+    // The pre-fix "unresolved type name `T`" cascade must be gone — the
+    // §26.4 rule is the diagnostic of record.
+    BEZEL_EXPECT_FALSE(hasUnresolvedTypeName);
+}
+
+BEZEL_TEST(sema_extension,
+           function_slot_nested_in_generic_arg_cites_26_4_4448) {
+    // The spec's nesting-clause composed example:
+    // `extension IEnumerable<Array<(T) -> T>>` binds nothing either.
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<Array<(T) -> T>> "
+        "  public method NoOp(): int => 0; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    int section264Hits = 0;
+    bool hasFunctionSlotHit = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("\xC2\xA7""26.4") != std::string::npos) {
+            ++section264Hits;
+            if (d.message.find("function slot") != std::string::npos)
+                hasFunctionSlotHit = true;
+        }
+    }
+    BEZEL_EXPECT_TRUE(hasFunctionSlotHit);
+    // Nested case: still EXACTLY one diagnostic per extension head.
+    BEZEL_EXPECT_EQ(section264Hits, 1);
+}
+
+// §26.4 accept-control (per the issue's "Regression tests" section):
+// `extension IEnumerable<Array<T>>` is the spec's own worked example of
+// binding T through a nested generic argument — the new function-slot
+// diagnostic must NOT fire on a bare identifier inside a real argument
+// position even when nested under another generic instantiation.
+BEZEL_TEST(sema_extension,
+           nested_bare_identifier_in_arg_position_still_binds_4448) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<Array<T>> "
+        "  public method FirstCount(): int => this.Count; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §26.4 accept-control (per the issue's "Regression tests" section):
+// `extension Dictionary<K, Array<V>>` is the spec's other worked example —
+// two bare identifiers in argument positions at distinct nesting depths.
+// The function-slot diagnostic must not fire here either.
+BEZEL_TEST(sema_extension,
+           two_bare_identifiers_in_nested_args_still_both_bind_4448) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension Dictionary<K, Array<V>> "
+        "  public method KeyAndFirstVal(): K "
+        "    var k := this.FirstKey(); "
+        "    return k; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    // Note: this particular body may still error elsewhere (FirstKey may
+    // not exist on Dictionary), but the function-slot diagnostic must not
+    // fire — there is no function type in the target. We assert the
+    // diagnostic did NOT fire rather than asserting the program compiles
+    // clean: the body shape is incidental; the diagnostic target is the
+    // head.
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        BEZEL_EXPECT_EQ(d.message.find("function slot"),
+                        std::string::npos);
+    }
+}

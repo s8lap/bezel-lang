@@ -470,9 +470,16 @@ int Resolver::builtinTypeArity(std::string_view n) {
 // so `Array<byte>`'s own head `Array` was wrongly bound as a fresh free type
 // parameter (silently discarding the `<byte>` argument) and the extension
 // target unified with any `IEnumerable<X>` receiver.
-void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
-                                              Scope& extScope,
-                                              Scope* parent) {
+//
+// `functionSlotDiagReported` is shared with the recursive calls so the §26.4
+// diagnostic fires EXACTLY ONCE per extension head (per issue #4448,
+// v0.303, the spec's "should report once per extension head, at the
+// offending identifier" wording) — even when the function-type slot is
+// nested under multiple generic-instantiation heads
+// (`extension IEnumerable<Array<(T) -> T>>`).
+void Resolver::bindExtensionTargetTypeParams(
+        const ast::Type& target, Scope& extScope, Scope* parent,
+        bool& functionSlotDiagReported) {
     for (const auto& ga : target.genericArgs) {
         if (!ga) continue;
         if (ga->kind == ast::TypeKind::Named && ga->name &&
@@ -480,7 +487,8 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
             // Concrete generic-instantiation head (e.g. `Array` in
             // `Array<byte>` / `Array<T>`): not a free type parameter.
             // Recurse to bind any nested bare identifiers in its own args.
-            bindExtensionTargetTypeParams(*ga, extScope, parent);
+            bindExtensionTargetTypeParams(*ga, extScope, parent,
+                                          functionSlotDiagReported);
             continue;
         }
         if (ga->kind == ast::TypeKind::Named &&
@@ -550,6 +558,101 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
                 }
             }
             extScope.names[paramName] = nullptr;
+            continue;
+        }
+        if (ga->kind == ast::TypeKind::Function) {
+            // §26.4 (v0.303, issue #4448): "Argument positions" are a
+            // constructed generic type's argument positions and nothing
+            // else — a function type's parameter and return slots are
+            // NOT among them, so `extension Array<(T) -> T>` binds no
+            // `T`, and the bare identifier there is a compile error
+            // naming this rule rather than an unresolved-name error.
+            // The nesting clause composes only through generic
+            // arguments — `extension IEnumerable<Array<(T) -> T>>`
+            // binds nothing either. This is the same near-miss, same
+            // treatment as the nullable-marked argument-position
+            // diagnostic above (which is itself §26.4's other named
+            // reject): do NOT fall through to the generic "unresolved
+            // type name `T`" fallback, because that is actively
+            // misleading here — `T` is not a typo, it is written in
+            // exactly the position a type-parameter head would occupy
+            // (had the surrounding slot been an argument position
+            // rather than a function-type slot). Report THIS rule
+            // here, at the first offending bare identifier inside the
+            // function type, naming the section and the reason.
+            auto tryBare = [&](const ast::Type* t) -> std::string_view {
+                if (t && t->kind == ast::TypeKind::Named &&
+                    t->name && t->name->parts.size() == 1 &&
+                    !t->nullable) {
+                    std::string_view n = t->name->parts[0];
+                    // The §26.4 diagnostic REPLACES the generic "unresolved
+                    // type name" fallback (per issue #4448: "a compile
+                    // error naming this rule rather than an unresolved-
+                    // name error"). Skip any bare identifier that would
+                    // resolve normally — i.e. primitives, built-in types
+                    // (Array / String / Exception / ...), and types
+                    // already in scope via the enclosing module —
+                    // because for those `resolveNamed` does NOT emit
+                    // "unresolved type name" and there is nothing to
+                    // replace. The bare form matters precisely because
+                    // it would otherwise cascade two `unresolved type
+                    // name `T`` errors for one mistake (#4192's repro);
+                    // a resolvable identifier is not that mistake.
+                    if (primitiveFromName(n) != PrimitiveType::None)
+                        return {};
+                    if (isBuiltinTypeName(n))
+                        return {};
+                    if (lookupName(n, parent) != nullptr)
+                        return {};
+                    return n;
+                }
+                return {};
+            };
+            std::string_view firstBare;
+            SourceLocation firstBareLoc = ga->span.begin;
+            for (const auto& p : ga->funcParams) {
+                auto n = tryBare(p.type.get());
+                if (!n.empty()) {
+                    // Register the unbound name anyway so the recursive
+                    // resolution of this same argument below does not
+                    // cascade a second, redundant "unresolved type
+                    // name" diagnostic over the identical span — this
+                    // rule is the diagnostic of record for the
+                    // declaration, exactly as the nullable-marked arm
+                    // above does. The same suppression is required for
+                    // any *other* bare identifiers that appear in the
+                    // same function type: each would otherwise fall
+                    // through to ordinary name resolution and trigger
+                    // an "unresolved type name" error of its own.
+                    extScope.names[n] = nullptr;
+                    if (firstBare.empty()) {
+                        firstBare = n;
+                        firstBareLoc = p.type->span.begin;
+                    }
+                }
+            }
+            if (ga->funcReturn) {
+                auto n = tryBare(ga->funcReturn.get());
+                if (!n.empty()) {
+                    extScope.names[n] = nullptr;
+                    if (firstBare.empty()) {
+                        firstBare = n;
+                        firstBareLoc = ga->funcReturn->span.begin;
+                    }
+                }
+            }
+            if (!firstBare.empty() && !functionSlotDiagReported) {
+                ctx_.diagnostics().report(
+                    Severity::Error, firstBareLoc,
+                    "bare identifier `" + std::string(firstBare) +
+                    "` in an extension's target-type function slot binds "
+                    "nothing (§26.4): a function type's parameter and "
+                    "return slots are not argument positions \xE2\x80\x94 "
+                    "binding reaches only a constructed generic type's "
+                    "argument positions, at any nesting depth through "
+                    "generic arguments");
+                functionSlotDiagReported = true;
+            }
         }
     }
 }
@@ -701,7 +804,13 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
         // head, not a free type parameter, even though it is a bare
         // single-segment non-nullable name. See bindExtensionTargetTypeParams.
         if (ext->targetType) {
-            bindExtensionTargetTypeParams(*ext->targetType, extScope, parent);
+            // §26.4 (v0.303, #4448): track whether the function-slot
+            // diagnostic has fired for THIS extension head; reset per
+            // top-level `extension` so nested extensions each get their
+            // own once-per-head budget.
+            bool functionSlotDiagReported = false;
+            bindExtensionTargetTypeParams(*ext->targetType, extScope, parent,
+                                          functionSlotDiagReported);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
         // fix #4144 (§26.2, v0.295): reject a target kind the closed
