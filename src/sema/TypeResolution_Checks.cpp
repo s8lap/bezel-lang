@@ -4415,11 +4415,62 @@ void Resolver::checkTypeDuplicates(TypeSymbol* t) {
             "another member of the same type; §11.3 lists the member "
             "kinds — uniqueness is a well-formedness requirement)");
     }
+    // fix #4444: reservation of the three Object-virtual names against
+    // choice-case names — §35.1 (v0.302). Runs alongside the duplicate
+    // walk because it is the choice-specific counterpart to §11.3's
+    // member-naming rule: cases ARE members (§35.1, "case names… may
+    // not collide with any member name"), and the reservation sits one
+    // rung further out — the name itself is off-limits regardless of
+    // whether anything else holds it. Keying it on classification is
+    // explicitly declined (§35.1 DECLINED.md) — the use-site compile
+    // error the §35.7 auto-package removes exists on exactly the
+    // classifications where the synthesis does NOT fire, so the
+    // reservation must hold there precisely.
+    checkChoiceCaseReservedNames(t);
     // Recurse into nested types.
     for (Symbol* m : t->members) {
         if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
             if (nt->type) checkTypeDuplicates(nt->type);
         }
+    }
+}
+
+// fix #4444 (§35.1, v0.302). The three names §35.7 calls "the member
+// §35.7 lets the author declare" are reserved against choice case names
+// on every classification, whether or not a member of that name is
+// declared. Holding the reservation even on choices that declare the
+// member would still be a compile error (the case and the member would
+// be §11.3 duplicates by the walk above), but keying it on "a member
+// is declared" would silently legalize the case on every choice that
+// does NOT declare it — exactly the gap #4444 closes.
+//
+// The reservation is choice-specific (records, enums, and classes do
+// not have cases), so the predicate is intentionally narrow: the three
+// exact strings, no more, no less. Any widening is a separate ruling.
+static bool isChoiceCaseReservedName(std::string_view n) {
+    return n == "Equals" || n == "GetHashCode" || n == "ToString";
+}
+
+void Resolver::checkChoiceCaseReservedNames(const TypeSymbol* t) {
+    if (!t) return;
+    if (t->kind != ast::TypeDeclKind::Choice) return;
+    for (const Symbol* m : t->members) {
+        auto* ccs = dynamic_cast<const ChoiceCaseSymbol*>(m);
+        if (!ccs) continue;
+        if (!isChoiceCaseReservedName(ccs->name)) continue;
+        // The diagnostic names the case, the choice, the reserved name,
+        // the spec section that imposes the reservation, the §35.7
+        // declared-member fix, and a concrete REMEDY (rename the case) —
+        // exactly the kind of compile error §11.3 / §35.1 produces
+        // elsewhere in this file.
+        ctx_.diagnostics().report(
+            Severity::Error, ccs->declLoc,
+            std::string("choice `") + std::string(t->name) +
+            "`: case `" + std::string(ccs->name) + "` is named `" +
+            std::string(ccs->name) + "`, which is reserved against case "
+            "names on every classification (§35.1, v0.302); rename the "
+            "case, because the name is reserved for the member §35.7 "
+            "lets the author declare");
     }
 }
 
