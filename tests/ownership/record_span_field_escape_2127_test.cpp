@@ -27,8 +27,11 @@
 #include <string>
 
 #include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
+#include "support/ownership_support.hpp"  // parseAndCheckOwnership, hasErrorMessage (#4428 §9.7 v0.301)
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
+using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 // ===========================================================================
@@ -123,12 +126,22 @@ BEZEL_TEST(record_span_field_escape_2127, readonly_span_field_in_frame_accepted)
     BEZEL_EXPECT_EQ(r.exitCode, 21);
 }
 
-// §9.7 POSITIVE control for the carried-source escape check: a span-field record
-// constructed DIRECTLY from a PARAM array's span, then returned. The parameter's
-// array outlives this method's frame, so the carried source is NOT escape-bound
-// and the return must stay accepted (the new-form counterpart of #1966's
-// spanvar_of_param_array_returned_accepted). == 5.
-BEZEL_TEST(record_span_field_escape_2127, param_sourced_direct_returned_accepted) {
+// fix #4428 (§9.7, v0.301): a span-field record constructed DIRECTLY from a
+// PARAM array's span, then returned — is REJECTED at the return site, naming
+// §9.7 v0.301. The pre-fix text pinned the opposite verdict ("the parameter
+// outlives this method's frame, so the carried source is NOT escape-bound
+// and the return must stay accepted"); that was the soundness hole #4428 —
+// the §9.7 v0.301 ruling closes the parameter arm: "a record type announces
+// no source set at all, so a caller has nothing but the receiver to re-
+// establish and a parameter-sourced record return would hand back a borrow
+// no call site could bound". The S10 sibling below
+// (param_sourced_spanvar_returned_accepted, the INDIRECT `var s := a.AsSpan();
+// return new Holder(s);` form) stays accepted — its return is rooted at the
+// span local `s`, not at the parameter `a`, and `s` carries the borrow's
+// provenance through the §28.3 / §9.7 transitivity walk so the call-site
+// freeze re-establishes the parameter-sourced borrow at the binding site.
+// // per §9.7 v0.301; the callee-side rejection is reportIfParameterRoot.
+BEZEL_TEST(record_span_field_escape_2127, param_sourced_direct_returned_rejected_9_7_v301) {
     std::string src =
         "module M; record Holder(S: ArraySpan<int>); class C "
         "  public static method View(a: Array<int>): Holder "
@@ -140,9 +153,10 @@ BEZEL_TEST(record_span_field_escape_2127, param_sourced_direct_returned_accepted
         "    return h.S[0]; "
         "  end Main; "
         "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `a`"));
 }
 
 // §9.7 POSITIVE control: the same param-sourced return through an INTERMEDIATE

@@ -205,17 +205,29 @@ BEZEL_TEST(own_record_escape, return_record_null_source_clean_9_7) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL (§9.7): a borrow-bearing record built from a *parameter* borrow
-// (whose source is the caller's frame, not a scope-bound local) is accepted —
-// consistent with the existing param-borrow treatment (return_member_call_on_
-// param_clean). Only an owned scope-bound local triggers the §9.7 rejection in
-// this slice.
-BEZEL_TEST(own_record_escape, return_record_borrowing_param_clean_9_7) {
+// fix #4428 (§9.7, v0.301): a borrow-bearing record built from a *parameter*
+// borrow is REJECTED at the return site. The §9.7 v0.301 ruling closes the
+// parameter-sourced arm of the borrow-return admission set — "a record type
+// announces no source set at all, so a caller has nothing but the receiver to
+// re-establish and a parameter-sourced record return would hand back a borrow
+// no call site could bound" (spec §9.7 v0.301). The pre-fix control pinned
+// the opposite verdict (BEZEL_EXPECT_FALSE hasErrors), which was the
+// soundness hole #4428 — its comment "consistent with the existing param-
+// borrow treatment" conflated the §28.3 caller-side rule (a parameter-source
+// is fine to bind at the call site) with the §9.7 callee-side rule (a
+// parameter-source cannot be the ADMITTED return arm of a borrow-bearing
+// record). The two rules operate at different sides and the call-site shape
+// can re-establish a parameter source only when the declaration announces it
+// — which a record type does not. Renamed and re-polarized here. // per
+// §9.7 v0.301; the callee-side rejection is reportIfParameterRoot.
+BEZEL_TEST(own_record_escape, return_record_borrowing_param_diagnosed_9_7_v301) {
     auto r = parseAndCheckOwnership(wrapRecord(
         "public static method Wrap(c: R): Holder "
         "  return new Holder(c); "
         "end Wrap;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `c`"));
 }
 
 // =====================================================================

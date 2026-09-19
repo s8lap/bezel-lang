@@ -1542,6 +1542,15 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         }
     }
     checkBorrowReturnedThroughOwningType(exprBody);
+    // fix #4428 (§9.7, v0.301): the `=>` expression-body sibling of the
+    // block-body `handleReturn -> checkRecordBorrowEscapesOnReturn` call.
+    // Mirrors the block-body return-site coverage so an expression-bodied
+    // `static method Trim(s: ReadOnlySpan<byte>): ReadOnlySpan<byte> =>
+    // s.Slice(1);` reaches the parameter-root rejection exactly as
+    // `return s.Slice(1);` does. A no-op when the body's static type is not
+    // a borrow-bearing record or a builtin span view (the function's first
+    // gate is `isBorrowBearingRecordOrSpan(rt)`). // per §9.7 v0.301
+    checkRecordBorrowEscapesOnReturn(exprBody);
     // §28.3 (v0.180, #1547): the `=>` expression-body sibling of the
     // handleReturn call — rejects `static method Pick(a: Res, b: Res): Res =>
     // a;` exactly as the block-body `return a;` form is rejected. A no-op

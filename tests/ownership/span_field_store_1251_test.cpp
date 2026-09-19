@@ -51,6 +51,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::OwnershipResult;
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -279,27 +280,52 @@ BEZEL_TEST(span_field_store_1251, record_own_borrow_bearing_component_accepted) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A span in a LOCAL, reassigned, passed to a method parameter (call-bounded),
-// passed to an `IReadOnlySpan<T>` parameter (§8.6's sanctioned box), and
-// returned from a PARAMETER-rooted source — none of these is a field store.
+// fix #4428 (§9.7, v0.301): the pre-#4428 version of this test exercised
+// a parameter-rooted return (`Head(a: Array<int>): ArraySpan<int> { return
+// a.AsSpan(0, 1); }`) as a positive control alongside the field-store shapes
+// (`sp` reassignment, `Len(arr.AsSpan())` call). The field-store legs stay
+// accepted — `sp` is a local, `arr.AsSpan()` borrows an escape-bound local,
+// neither is a field store. The `Head` parameter-rooted return is REJECTED
+// by the §9.7 v0.301 caller-side check, exactly as the issue pin describes.
+// Split here so the field-store legs keep their clean control AND the §9.7
+// v0.301 caller-side check gets its own regression pin in one place.
+// // per §9.7 v0.301.
 BEZEL_TEST(span_field_store_1251, span_local_call_and_param_rooted_return_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
         "  static method Len(v: IReadOnlySpan<int>): int return v.Length; "
         "  end Len; "
-        "  static method Head(a: Array<int>): ArraySpan<int> "
-        "    return a.AsSpan(0, 1); "
-        "  end Head; "
         "  public static method Main(): int "
         "    using var arr := new Array<int>(); "
         "    arr.Add(1); arr.Add(2); "
         "    var sp := arr.AsSpan(); "
         "    sp := arr.AsSpan(1); "
-        "    return sp.Length + Len(arr.AsSpan()) + Head(arr).Length; "
+        "    return sp.Length + Len(arr.AsSpan()); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// fix #4428 (§9.7, v0.301): the `Head` leg from the pre-#4428 control is now
+// the regression test for the parameter-rooted return rejection. A static
+// method `Head(a: Array<int>): ArraySpan<int> { return a.AsSpan(0, 1); }` is
+// rejected — `a` is a plain parameter of the returning method, the returned
+// span is a borrow (§4.14/§4.15) of its backing `a`, and the call site has
+// no way to re-establish a parameter-sourced borrow against its own actuals.
+// // per §9.7, §4.14, §4.15; callee-side reportIfParameterRoot in
+// Ownership_Checks.cpp's projection branch.
+BEZEL_TEST(span_field_store_1251, param_rooted_return_rejected_9_7_v301) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  static method Head(a: Array<int>): ArraySpan<int> "
+        "    return a.AsSpan(0, 1); "
+        "  end Head; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned span is rooted at parameter `a`"));
 }
 
 // A value-typed record (no borrow-carrying field) is not borrow-bearing at all

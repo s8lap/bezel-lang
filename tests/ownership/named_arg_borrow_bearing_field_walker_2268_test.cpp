@@ -46,24 +46,25 @@ bool hasError(const std::string& src, const std::string& needle) {
 }
 
 // ===========================================================================
-// DIRECTION 1 — FALSE REJECT (over-rejection, now ACCEPTED).
+// DIRECTION 1 — FALSE REJECT (#2150 fixed, #4428 closes the parameter arm).
 //
 // §9.7 / §22.5: a record `Holder(S: ArraySpan<int>, N: int)` declared with
 // the span field FIRST. A return of `new Holder(N := s.Count, S :=
-// p.AsSpan())` with `s` a scope-bound owned local (using var) must NOT be
-// rejected: the int field's `s.Count` is a value (no borrow), and the
-// span field's `p.AsSpan()` borrows `p` (a parameter, not escape-bound).
-// The walker iterates the BOUND field, so the int field is skipped and the
-// span field's arg (`p.AsSpan()`, rooted at `p`) is not flagged.
-//
-// PRE-FIX: walker iterated args by source index and matched args[0]
-// (`N := s.Count`, an int) against field[0] (`S: span`, borrow-carrying);
-// `identifierRoot(s.Count)` is `s`, a scope-bound owned local → spurious
-// §9.7 rejection. (Confirmed on origin/main: the program is rejected with
-// the §9.7 message even though the runtime value is sound.)
+// p.AsSpan())` with `s` a scope-bound owned local (using var) — the post-
+// #2150 walker iterates the BOUND field and skips the int field's `s.Count`
+// (a value, no borrow) so it no longer falsely rejects on `s`. The span
+// field's arg (`p.AsSpan()`, rooted at `p`, a parameter) is the BORROW source,
+// and §9.7 v0.301 closes the parameter arm — "a record type announces no
+// source set at all, so a caller has nothing but the receiver to re-establish
+// and a parameter-sourced record return would hand back a borrow no call
+// site could bound" — so the program is REJECTED on the `S` field's arg.
+// Renamed and re-polarized below; the pre-#2150 false-reject on `s` (a
+// pre-existing bug pinned by the test name) is no longer reproducible either
+// way, because the test's parameter arm was the original false-accept.
+// // per §9.7, §22.5, v0.301.
 // ===========================================================================
-BEZEL_TEST(named_arg_walker_2268, false_reject_span_param_value_local_accepted) {
-    auto r = runAot(
+BEZEL_TEST(named_arg_walker_2268, span_field_param_rooted_rejected_9_7_v301) {
+    auto r = parseAndCheckOwnership(
         "module M; "
         "record Holder(S: ArraySpan<int>, N: int); "
         "class C "
@@ -71,14 +72,10 @@ BEZEL_TEST(named_arg_walker_2268, false_reject_span_param_value_local_accepted) 
         "    var s := new Array<int>(); s.Add(11); "
         "    return new Holder(N := s.Count, S := p.AsSpan()); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.N; "
-        "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 8);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }
 
 // ===========================================================================
@@ -126,14 +123,15 @@ BEZEL_TEST(named_arg_walker_2268, under_reject_span_field_binds_escape_bound_rej
 // CONTROL — declaration-order named args: a `new Holder(S := p.AsSpan(),
 // N := s.Count)` call where the NAMED args are in declaration order. The
 // walker iterates the BOUND field, so the span field gets `p.AsSpan()`
-// (borrow from param p, no escape) and the int field gets `s.Count`
-// (value, skipped). This compiles cleanly with or without the fix (the
-// named-arg lookup returns the same answer as positional indexing in
-// declaration order) — guards that the new lookup path doesn't break
-// the trivial no-reorder case.
+// (borrow from param p) and the int field gets `s.Count` (value, skipped).
+// §9.7 v0.301 closes the parameter arm: this is REJECTED at the return
+// site on the `S` field's argument (`p.AsSpan()`, rooted at the parameter
+// `p`). Re-polarized from the pre-#4428 ACCEPT text; the named-arg lookup
+// is still load-bearing — see DIRECTION 2 (named-arg, borrow-first), which
+// gates the SAME logic in reverse field order.
 // ===========================================================================
-BEZEL_TEST(named_arg_walker_2268, declaration_order_named_args_accepted) {
-    auto r = runAot(
+BEZEL_TEST(named_arg_walker_2268, declaration_order_named_args_rejected_9_7_v301) {
+    auto r = parseAndCheckOwnership(
         "module M; "
         "record Holder(S: ArraySpan<int>, N: int); "
         "class C "
@@ -141,22 +139,21 @@ BEZEL_TEST(named_arg_walker_2268, declaration_order_named_args_accepted) {
         "    var s := new Array<int>(); s.Add(11); "
         "    return new Holder(S := p.AsSpan(), N := s.Count); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.N; "
-        "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 8);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }
 
 // ===========================================================================
 // CONTROL — positional args unchanged (§9.7 precision #2150 covered this
-// shape; the named-arg fix must not regress the positional leg).
+// shape; the named-arg fix must not regress the positional leg). The
+// §9.7 v0.301 ruling closes the parameter arm: this is REJECTED at the
+// return site on the `S` field's argument (`p.AsSpan()`, rooted at the
+// parameter `p`).
 // ===========================================================================
-BEZEL_TEST(named_arg_walker_2268, positional_args_still_accepted) {
-    auto r = runAot(
+BEZEL_TEST(named_arg_walker_2268, positional_args_rejected_9_7_v301) {
+    auto r = parseAndCheckOwnership(
         "module M; "
         "record Holder(S: ArraySpan<int>, N: int); "
         "class C "
@@ -164,14 +161,10 @@ BEZEL_TEST(named_arg_walker_2268, positional_args_still_accepted) {
         "    var s := new Array<int>(); s.Add(11); "
         "    return new Holder(p.AsSpan(), s.Count); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.N; "
-        "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 8);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }
 
 } // namespace
