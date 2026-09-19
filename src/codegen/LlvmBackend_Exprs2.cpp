@@ -10862,7 +10862,63 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // mismatch — the same fix lowerConditional applies to `if` branches.
         bool armDiv = diverged_;
         if (!armDiv) {
-            if (!v) return nullptr;
+            // fix #4469 (§19.7, v0.306): a void/unit-typed arm body
+            // (`(case … of Inner.IOk(var c) => Console.WriteLine(...), …)`
+            // where every arm is a void-returning call) yields `v == nullptr`
+            // from lowerExpr — the void-result normalization at
+            // LlvmBackend_Exprs.cpp:90 collapses the call's `void` typed
+            // result to a sentinel null. Pre-fix the `if (!v) return nullptr`
+            // here bailed out of lowerCaseExpr BEFORE the deferred
+            // `CreateBr(endBB)` loop fired, leaving the inner `case.end`
+            // basic block empty (no terminator) AND the second-and-later
+            // arms never processed. The outer `lowerCaseStmt`'s
+            // `if (!armTerm) builder_.CreateBr(endBB)` then branched FROM
+            // wherever the void call's lowering had left the insert point
+            // (the cat.* machinery's last block, e.g. cat.done70) TO the
+            // outer `casestmt.end` — which is well-formed for the outer
+            // stmt, but the inner case.expression's `case.end` was left
+            // dangling and the IR verifier rejected it. Mirror
+            // lowerConditional's void handling (§17): let the arm be
+            // recorded in `incomings` with a void placeholder so the
+            // deferred branch fires, and skip PHI construction below
+            // (`void` is not a first-class type and cannot form a PHI).
+            if (!v) {
+                if (resultTy && resultTy->isVoidTy()) {
+                    // void result: record the arm's convergence block so
+                    // the deferred branch fires; v itself stays null.
+                    incomings.push_back(
+                        {nullptr, builder_.GetInsertBlock()});
+                    diverged_ = false;
+                    builder_.SetInsertPoint(nextBB);
+                    continue;
+                }
+                // fix #4469 (§19.7, v0.306): a case-expression used in
+                // statement position — its arm body is `Console.WriteLine(...)`
+                // or any other void-returning call — lowers to a null `v`
+                // (the void sentinel at LlvmBackend_Exprs.cpp:90). sema does
+                // not record an exprType on the case expression when every
+                // arm body is Unit/void (§19.2's "no common type, no
+                // recording" rule), so resultSemaTy is null and resultTy
+                // defaults to i32 above — `resultTy->isVoidTy()` is false.
+                // Without this path the `if (!v) return nullptr` here bails
+                // out of lowerCaseExpr BEFORE the deferred
+                // `CreateBr(endBB)` loop fires, leaving `case.end` with
+                // no predecessors and the second-and-later arms never
+                // processed — the IR verifier rejects `case.end` as
+                // unterminated. Promote `resultTy` to void for this case
+                // expression and proceed exactly like the explicit-void
+                // arm above. (The PHI construction is skipped at the end
+                // by the existing post-loop `resultTy->isVoidTy()` guard.)
+                if (!resultSemaTy && !resultTy->isVoidTy()) {
+                    resultTy = llvm::Type::getVoidTy(llvm_);
+                    incomings.push_back(
+                        {nullptr, builder_.GetInsertBlock()});
+                    diverged_ = false;
+                    builder_.SetInsertPoint(nextBB);
+                    continue;
+                }
+                return nullptr;
+            }
             if (resultTy)
                 v = coerceNumericToType(v, resultTy,
                                         isUnsignedTargetExpr(*arm.exprBody));
@@ -11072,6 +11128,11 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             bool hasNullPtr = false, hasNonPtr = false;
             llvm::Value* nonPtrSample = nullptr;
             for (auto& [v, bb] : incomings) {
+                // fix #4469: void-returning arms contribute a null `v` (the
+                // void sentinel); they have no LLVM type and skip the
+                // widen-vs-mismatch classification entirely. The void-IR
+                // branch at line 11213 below handles them.
+                if (!v) continue;
                 if (isNullPtr(v)) { hasNullPtr = true; }
                 else if (!v->getType()->isPointerTy()) {
                     // A genuine non-pointer VALUE arm (bare scalar/struct) — the
@@ -11123,6 +11184,51 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     }
 
     builder_.SetInsertPoint(endBB);
+    llvm::PHINode* phi = nullptr;
+    if (incomings.empty()) {
+        // CG40: every arm diverged — endBB has no predecessors and the caller
+        // emits nothing into it; an empty block is malformed IR. Cap with
+        // `unreachable` and report divergence, exactly as lowerConditional does.
+        builder_.CreateUnreachable();
+        diverged_ = true;
+        return llvm::PoisonValue::get(resultTy);
+    }
+    // fix #4469: a unit/void-typed case expression (§4.7) has every arm
+    // yielding a null `v` (the void sentinel from lowerExpr's
+    // normalization at LlvmBackend_Exprs.cpp:90) and the case's §20
+    // result type is `void` — void is NOT a first-class type and cannot
+    // form a PHI. Skip PHI construction AND the resultSlot/scrutEndBB
+    // dance (they assume a non-void PHI result to thread through a slot
+    // for the dispose-call register-clobber); emit the normal-edge
+    // scrut dispose and a fresh scrutEndBB terminator if there IS an
+    // owned scrutinee (the dispose still runs), then return nullptr.
+    // endBB has predecessors from the deferred-branch loop above, so the
+    // IR is well-formed — the case-expression-as-statement-position
+    // ExpressionStmt shape the issue measured.
+    if (resultTy && resultTy->isVoidTy()) {
+        if (ce.scrutinee && scrutOwnedSlot) {
+            llvm::Value* scrutVal = builder_.CreateLoad(
+                ptrTy(), scrutOwnedSlot, "casescrut.load");
+            if (!scrutOwnIsOwningCollection)
+                emitDisposeAndReclaim(scrutVal);
+            else
+                freeUnboundOwnedOwningCollectionTemp(scrutVal, scrutTy);
+            if (!disposeStack_.empty()) {
+                auto& scope = disposeStack_.back();
+                for (auto it = scope.begin(); it != scope.end(); ++it) {
+                    if (it->slot == scrutOwnedSlot) {
+                        scope.erase(it);
+                        break;
+                    }
+                }
+            }
+            auto* scrutEndBB = llvm::BasicBlock::Create(
+                llvm_, "casescrut.end", currentFn_);
+            builder_.CreateBr(scrutEndBB);
+            builder_.SetInsertPoint(scrutEndBB);
+        }
+        return nullptr;
+    }
     // K8 full-expression boundary (#1795): dispose the case-scrutinee owned
     // temporary on the normal edge. The scrut slot holds a fresh non-null
     // pointer (always populated by the store registered above) so the dispose
@@ -11141,16 +11247,6 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         resultSlot = entryAlloca(incomings[0].first->getType());
     }
 
-    builder_.SetInsertPoint(endBB);
-    llvm::PHINode* phi = nullptr;
-    if (incomings.empty()) {
-        // CG40: every arm diverged — endBB has no predecessors and the caller
-        // emits nothing into it; an empty block is malformed IR. Cap with
-        // `unreachable` and report divergence, exactly as lowerConditional does.
-        builder_.CreateUnreachable();
-        diverged_ = true;
-        return llvm::PoisonValue::get(resultTy);
-    }
     phi = builder_.CreatePHI(incomings[0].first->getType(),
                              incomings.size());
     for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);
