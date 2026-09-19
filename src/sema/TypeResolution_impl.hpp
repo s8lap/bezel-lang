@@ -153,6 +153,17 @@ public:
         const std::vector<const ast::Type*>& argAsts,
         const std::vector<TypeRef*>& argRefs, TypeSymbol* tsym);
 
+    // fix #4465: flush any deferred type-bound failures accumulated by the
+    // immediately preceding checkGenericConstraintsAtUseSite call on THIS
+    // Resolver. The deferred failures are normally reported by
+    // recheckDeferredTypeBounds on the resolveTypes-time Resolver after all
+    // base sets are populated, but when checkGenericConstraintsAtUseSite runs
+    // on a temporary Resolver in ExprTC (checkGenericConstraintsAtExpr), that
+    // Resolver is discarded without ever flushing — so the deferred failures
+    // are silently dropped. This public flush is called from the ExprTC path
+    // only, after all types are fully resolved, so rechecking now is safe.
+    void flushDeferredTypeBoundFailures();
+
     // §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
     // #3290): value-site pass for `static readonly` fields/auto-properties
     // whose declared type is a borrow-bearing record, a non-owning choice

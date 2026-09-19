@@ -7238,6 +7238,17 @@ void Resolver::recheckDeferredTypeBounds() {
     deferredTypeBoundFailures_.clear();
 }
 
+void Resolver::flushDeferredTypeBoundFailures() {
+    for (const auto& d : deferredTypeBoundFailures_) {
+        ctx_.diagnostics().report(
+            Severity::Error, d.loc,
+            std::string("type argument `") + d.argName +
+            "` does not satisfy the constraint `where " + d.param +
+            ": " + d.boundName + "` (§14.2)");
+    }
+    deferredTypeBoundFailures_.clear();
+}
+
 // §11.8 (v0.176, #807): a class/record declaring `: I<...>` where I carries
 // STATIC members (static methods / static operators) must itself supply
 // matching statics — exact signatures per the §11.2 matching rule applied to

@@ -539,6 +539,12 @@ bool checkSendableConstraintsLate(const ast::SourceFile& src,
 // common-shape case (concrete typeArgs) is handled. See the comment on
 // `Resolver::checkGenericConstraintsAtUseSite` for the full rationale
 // and the deferred-nested edge case.
+//
+// fix #4465: the deferred type-bound failures pushed by
+// checkGenericConstraintsAtUseSite were NEVER reported — the temporary
+// Resolver `r` is discarded without flushing. At ExprTC time all types
+// are fully resolved, so flushing now correctly reports the constraint
+// violation at the static-call site.
 bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    SourceLocation useSite,
                                    const std::vector<const ast::Type*>& argAsts,
@@ -546,6 +552,7 @@ bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    TypeSymbol* tsym) {
     Resolver r(ctx);
     r.checkGenericConstraintsAtUseSite(useSite, argAsts, argRefs, tsym);
+    r.flushDeferredTypeBoundFailures();
     return !ctx.diagnostics().hasErrors();
 }
 
