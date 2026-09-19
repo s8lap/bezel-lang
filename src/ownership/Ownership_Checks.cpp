@@ -18090,6 +18090,19 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                            "` itself `scoped` to store it (§28.14, v0.177)");
                 return;
             }
+            // §28.14 v0.301 (#4429): a VALUE-TYPED parameter (string, int,
+            // …) is captured by value into the lambda's heap capture cell
+            // and contributes no borrow source (spec §28.3, "a value-typed
+            // capture contributes nothing"). Mirror the LocalSymbol branch's
+            // filter below to fix the asymmetry that previously rejected
+            // value-typed parameter captures while admitting the same
+            // capture as a value-typed local. Null declType stays
+            // conservative (treated as a reference — admit and let the
+            // downstream check classify it).
+            const sema::TypeRef* pDeclTy = nullptr;
+            if (ps->declType) pDeclTy = ctx_.resolvedType(*ps->declType);
+            else pDeclTy = ps->resolvedDeclType;
+            if (pDeclTy && !isBorrowableType(pDeclTy)) continue;
             anyCapture = true;
             nonThisCaptures.push_back(id);  // a param is not `this` (forms 3/4)
             // Parameters precede every local — declaration order holds. An
