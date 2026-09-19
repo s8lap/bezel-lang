@@ -3150,7 +3150,7 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
 // "value-typed returns") is a copy and can never outlive its source, so
 // it is never a borrow escape and is reported here as may-borrow = false.
 bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
-    // #791 / §28.9 / §27.6: a method/property REFERENCE `recv.M` (a member access
+    // #791 / §28.3 / §27.6: a method/property REFERENCE `recv.M` (a member access
     // resolving to a method or property, used as a function value) captures `recv`
     // as a BORROW in its closure cell — `recv.GetN` ≡ `() => recv.GetN()`. It is
     // therefore a borrow of the receiver, NOT a value copy, even though its type
@@ -3392,7 +3392,7 @@ void MethodOwnership::collectIdentifiersIn(
     // method-scope local capture (literals, default/typeof/nameof, …).
 }
 
-// fix #3656 (§9.7 / §28.9, v0.286): the per-statement action is now a single
+// fix #3656 (§9.7 / §28.3, v0.286): the per-statement action is now a single
 // `fn`; the statement recursion (control-flow forms and their nested bodies)
 // is owned by `forEachNestedStmt`. This walker still scans the control-flow
 // forms' OWN expression positions (condition / iterable / withExpr /
@@ -3462,7 +3462,7 @@ void MethodOwnership::collectIdentifiersInStmt(
             if (is->target) collectIdentifiersIn(*is->target, out);
             return;
         }
-        // §9.7 / §28.9 (v0.220, #2181): a capture appearing ONLY under a
+        // §9.7 / §28.3 (v0.220, #2181): a capture appearing ONLY under a
         // control-flow statement of a block-bodied lambda is as much a capture
         // of the enclosing-method local as a top-level-statement one, and must
         // reach the SAME escape check. The walker descends into every nested
@@ -4430,7 +4430,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                         continue;
                     findLambdas(*a.value);
                 }
-                // fix #3702 (§28.9, v0.286): the SIGSEGV residual of #3564.
+                // fix #3702 (§28.3, v0.286): the SIGSEGV residual of #3564.
                 // `return mk();` is a CallExpr whose callee is a function-
                 // typed local whose value comes from a lambda-literal
                 // initializer. `findLambdas` historically descended into a
@@ -4480,7 +4480,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                                 ls->decl)) {
                             calleeInit = ld->initializer.get();
                         }
-                        // fix #3591 (§21.1 / §27.5 / §28.9, v0.286): §21.1's
+                        // fix #3591 (§21.1 / §27.5 / §28.3, v0.286): §21.1's
                         // runtime `const` is a SEPARATE AST node
                         // (LocalConstDecl) from `var`'s LocalDecl, and
                         // §21.1 explicitly admits a `const` binding a
@@ -4581,16 +4581,16 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     "instead)");
                 return;  // one diagnostic per return is enough
             }
-            // fix #3546 (§31.1, v0.283), narrowed by fix #3564 (§28.9,
+            // fix #3546 (§31.1, v0.283), narrowed by fix #3564 (§28.3,
             // v0.286): from `EscapeScope::LambdaBody` the §27.5 leg just
             // below and the §9.7 leg after it still answer about the WRONG
             // scope — `isRefOutParam` resolves the enclosing METHOD's
             // parameter and `recordBorrowLocalSource_` is method-scope
             // provenance, neither of which the lambda-body seeding supplies.
-            // The §28.9 leg at the bottom is no longer in that set: fix #3564
+            // The §28.3 leg at the bottom is no longer in that set: fix #3564
             // re-seeds `states_` from the lambda body's own owned
             // obligations, which is exactly that leg's input. See the header
-            // for the per-leg rationale. // per §31.1, §28.9, v0.286
+            // for the per-leg rationale. // per §31.1, §28.3, v0.286
             // §27.5 / §28.6 (#1217): a `ref` or `out` parameter is a pointer
             // into the CALLER's stack frame (§22.3). The pointer is valid only
             // for the duration of this method call. A closure that captures a
@@ -4618,7 +4618,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // §9.7 (#2144): "A borrow-bearing record may not be captured by a
             // closure that escapes its source's scope." A captured local of
             // borrow-bearing record / builtin-span type is a VALUE — never
-            // Owned in `states_`, so the §28.9 owned-capture leg below never
+            // Owned in `states_`, so the §28.3 owned-capture leg below never
             // sees it — but it carries its borrow's source set in
             // recordBorrowLocalSource_ (collectRecordBorrowSource, the
             // #1726/#1966 provenance machinery). Resolve the carried sources;
@@ -4717,7 +4717,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // call is answering about. A captured lambda parameter is not in
             // `states_`, so it is naturally excluded. In
             // `EscapeScope::Method` only an enclosing-method local/owned-param
-            // can match; in `EscapeScope::LambdaBody` (fix #3564, §28.9,
+            // can match; in `EscapeScope::LambdaBody` (fix #3564, §28.3,
             // v0.286) `states_` holds ONLY the lambda body's own owned
             // obligations, seeded by `seedLambdaBodyOwnedLocals`, so a local
             // declared in the lambda body whose closure escapes that body
@@ -4738,7 +4738,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 //       (so `savedMethodStates` holds the enclosing-method state
                 //        and the symbol IS present there — but we want the
                 //        CURRENT state, not the saved one)
-                // The §28.9 Owned leg below handles the non-disposed case.
+                // The §28.3 Owned leg below handles the non-disposed case.
                 if (st->state == OwnershipState::Disposed) {
                     report(
                         Severity::Error, id->span.begin,
@@ -4774,7 +4774,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 }
             }
             if (!st) continue;
-            // §28.9: capturing an *owned* local (a `using var` or an
+            // §28.3: capturing an *owned* local (a `using var` or an
             // owned-producing local / `owned` parameter) is a borrow whose
             // source is the local's enclosing scope; the returned closure
             // outlives that scope. Only the Owned state carries this
@@ -4783,7 +4783,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // capturing one is not constrained and is not diagnosed here.
             if (st->state != OwnershipState::Owned) continue;
             // Belt-and-braces: confirm the captured local's declared type is
-            // a class/interface reference (the only thing a §28.9 borrow can
+            // a class/interface reference (the only thing a §28.3 borrow can
             // alias). An Owned non-reference would be surprising, but the
             // type gate keeps the check from ever firing on a value-typed
             // local even if a future producer marked one Owned.
@@ -5891,7 +5891,7 @@ static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym) {
 }
 
 void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
-    // §28.9 / §9.7 indirect form: `return holder;` where `holder` is a bare
+    // §28.3 / §9.7 indirect form: `return holder;` where `holder` is a bare
     // local whose tracked borrow-source aliases a still-owned scope-bound
     // local. The returned expression must be the bare holder identifier — a
     // value projection off the holder (`holder.SomeInt`, `holder()`) returns
@@ -6027,7 +6027,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     }
     if (!st || !st->source) return;
     // The source must still be a live scope-bound obligation at the return
-    // point: an owned scope-bound local (§28.9 / §9.7) or a catch-bound
+    // point: an owned scope-bound local (§28.3 / §9.7) or a catch-bound
     // exception variable (§31.1, issue #392). If an owned source was already
     // disposed / moved out, there is no live borrow to dangle (and a separate
     // diagnostic would have covered misuse); a catch binding is always live
