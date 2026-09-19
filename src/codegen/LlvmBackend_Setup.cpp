@@ -15931,7 +15931,31 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // currentFn_ matching the analyzed function (a lambda/thunk body lowered
     // mid-function is not analyzed → its closure locals just leak, never
     // double-freed).
-    if (v && currentFn_ == closureReleaseEligibleFn_ &&
+    //
+    // fix #4425 (§27.5 / §28.9, v0.301): the prior `v &&` guard REQUIRED a
+    // non-null init — `var f: () -> int;` (no init, just a typed annotation)
+    // also enters `closureReleaseEligible_` via the no-init typed local path
+    // (the candidates walker at line 28303+ runs it through the escape walk
+    // and, after the override extension this commit installs, arms release for
+    // reassigned + never-called + not-returned + non-captured-cell locals),
+    // but lowerLocalDecl's `v &&` guard rejected it because `v` was nullptr
+    // at this site (no initializer value to store). The cell is allocated
+    // LATER — at the `f := lambda(...)` AssignmentStmt lowering — but
+    // disposeStack_ entries registered here run at SCOPE END, after every
+    // assignment has executed. bz_closure_release is null-safe (verified
+    // against the runtime header at src/runtime/bezel_runtime_refcounting.cpp
+    // line 331), so an armed disposal on a still-null slot is a no-op, and
+    // a non-null slot at scope end releases the cell exactly once — matching
+    // the `var f := lambda()` shape the existing `v &&` guard already
+    // accepted. The "no captured cell" guard inside this if-body stays sound:
+    // a captured-cell slot would be in cellVars_ and the envdtor would own
+    // the cell's release; the closureRelease disposal would double-free.
+    // closureReleaseEligible_ is gated to non-captured-cell locals (via the
+    // override's `!w.isCapturedCellSlot_` check at line 28478), so the new
+    // `v`-relaxed condition is exactly the same set of locals the existing
+    // `v &&` guard accepted, plus the no-init typed case the prior guard
+    // excluded.
+    if (currentFn_ == closureReleaseEligibleFn_ &&
         closureReleaseEligible_.count(static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
         // #429 / §27.5: register boxedCellFree BEFORE closureRelease so that
@@ -27453,6 +27477,15 @@ struct ClosureEscapeWalker {
     // IdentifierExpr callee, AssignmentStmt target, IncrementStmt target,
     // etc.) is observed while `inLambda` is true.
     bool isCapturedCellSlot_ = false;
+    // fix #4425 (§27.5 / §28.9, v0.301): true when target is RETURNED via a
+    // ReturnStmt's value expression (e.g. `return lambdaRef`). A returned local
+    // transfers its +1 out of the slot at the function exit; an additional
+    // scope-end `bz_closure_release` would UAF (or double-free, depending on
+    // caller's release site). Mirrors the existing isCapturedCellSlot_ gate:
+    // both answer "is the slot's +1 already claimed by another release site?".
+    // Set when the ReturnStmt stmt() arm visits a value that IS the target
+    // ident.
+    bool isReturned_ = false;
 
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -27952,6 +27985,23 @@ struct ClosureEscapeWalker {
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            // fix #4425 (§27.5 / §28.9, v0.301): mark target RETURNED when the
+            // ReturnStmt's value expression IS a bare identifier naming the
+            // target. The walker's existing expr() call (with safeRead=false)
+            // already sets `escaped = true` via the FINDING [1] read arm, but
+            // the post-walk override needs to know whether the escape was
+            // ALSO a return transfer (which transfers the +1 out of the slot,
+            // blocking a scope-end release) vs. some other escape source that
+            // the override does not consider. Without this, the override
+            // would arm scope-end release for a reassigned-and-returned local
+            // and double-free alongside the caller's release at function exit.
+            // A `return` of a NON-bare expression containing target (e.g.
+            // `return lambdaRef()` — the call result, not the local itself) is
+            // NOT a return transfer of target: the cell's lifetime is the
+            // call return, and the existing call-site release handles it. So
+            // only the bare-ident case marks isReturned_.
+            if (r->value && isTargetIdent(r->value.get()))
+                isReturned_ = true;
             expr(r->value.get(), /*safeRead=*/false); return;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
@@ -28432,8 +28482,27 @@ void Emitter::collectClosureReleaseEligible(
         // fires; `escaped` keeps its original value. The pre-existing
         // escape-walk verdict — non-escaping → scope-end arms normally,
         // escaping → no scope-end arm — is preserved untouched.
+        //
+        // fix #4425 (§27.5 / §28.9, v0.301): extend the override to ALSO fire
+        // when `calleeCallCount == 0` — the local is reassigned but never
+        // called. Pre-#4425 the override required `calleeCallCount > 1 ||
+        // uncountableCalleeSeen`, so a reassigned + never-called local stayed
+        // `escaped = true` and never entered `closureReleaseEligible_` — the
+        // cell +1 it holds at scope end leaks (a 40 B × N allocations leak
+        // per execution, measured on the cycle-8 #4261 refutation/fix
+        // investigation that surfaced it). The fix is sound: with zero call
+        // sites, no call-site release exists to balance a scope-end release
+        // (the single-call counter-shape is exactly what the existing override
+        // declines), so adding `calleeCallCount == 0` to the disjunction
+        // completes the coverage without disturbing the single-call
+        // discipline. The `!isReturned_` guard is the SAME distinction as
+        // `!isCapturedCellSlot_`: both reject "the slot's +1 is already
+        // claimed by a different release site" — a `return lambdaRef` transfers
+        // the +1 to the caller, so a scope-end release would double-free.
         if (w.escaped && w.escapedDueToReassign && !w.isCapturedCellSlot_ &&
-            (w.calleeCallCount > 1 || w.uncountableCalleeSeen)) {
+            !w.isReturned_ &&
+            (w.calleeCallCount > 1 || w.calleeCallCount == 0 ||
+             w.uncountableCalleeSeen)) {
             w.escaped = false;
         }
         if (!w.escaped)
