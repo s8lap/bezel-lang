@@ -2759,6 +2759,35 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 builtinOutOwnedArg(call->callee.get(), pos)) {
                 ++pos; continue;
             }
+            // fix #4023 (§28.3 K3.4, v0.294): a `move`/`await` TOP-LEVEL
+            // argument is a WRITE/consume position — validated and marked
+            // exclusively by `recordMovesIn`/`recordMovesInArgs`
+            // (`markMovedByName`/`recordFieldMove`), which runs AFTER this
+            // checkRead walk and needs to observe the argument's ORIGINAL
+            // Disposed/MovedFrom state to report the precise §28.3 "cannot
+            // move from disposed/already-moved local" ERROR. The blank
+            // `checkRead(*a.value, false)` recurses through the generic
+            // `UnaryExpr` → `IdentifierExpr` arms, which — for a Disposed
+            // source — report the (correct for a plain read, wrong for a
+            // move site) §28.2 use-after-dispose WARNING and then POISON
+            // the tracked state as a side effect. `markMovedByName`'s
+            // Poisoned fallthrough (by design silent, see its own comment)
+            // never fires, so the precise error is MASKED and the program
+            // is silently ACCEPTED instead of rejected. Measured pre-fix:
+            // `var y := Factory.Make(move x);` on an already-`Dispose()`d
+            // `x` compiled with only the Warning above (no Error) and
+            // SEGV'd under ASan reading freed memory inside the callee;
+            // the byte-identical `using var h := new Holder(move x);`
+            // ctor-argument spelling was and remains correctly rejected
+            // ("cannot move from disposed local `x` (§28.3)"). This is
+            // the SAME `isTopLevelConsumingForm` carve-out `readOperand`
+            // (the new-arms section below) and `readNullCondReceiver`
+            // (the `NullCondCallExpr` arm further below) already apply for
+            // every other read position `checkRead` walks — the bare
+            // `CallExpr` argument loop was the one position that still ran
+            // the unguarded `checkRead(*a.value, false)` predating #3971.
+            // // per §28.3 K3.4, v0.294, #3971, #4023
+            if (isTopLevelConsumingForm(*a.value)) { ++pos; continue; }
             checkRead(*a.value, false);
             ++pos;
         }
