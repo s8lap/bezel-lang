@@ -899,8 +899,15 @@ private:
     // instantiation head per §26.4 — that head name (`Array`) must NOT be
     // bound as a free type parameter; instead we recurse into its own
     // generic args to find any nested bare identifiers.
+    //
+    // `functionSlotDiagReported` is threaded through the recursion
+    // (#4448, v0.303) so the §26.4 function-slot diagnostic fires
+    // EXACTLY ONCE per extension head, even when function-type slots
+    // are nested under multiple generic-instantiation heads
+    // (`extension IEnumerable<Array<(T) -> T>>`).
     void bindExtensionTargetTypeParams(const ast::Type& target,
-                                        Scope& extScope, Scope* parent);
+                                        Scope& extScope, Scope* parent,
+                                        bool& functionSlotDiagReported);
 
     // fix #4144 (§26.2, v0.295): reject an ExtensionDecl whose resolved
     // target kind is outside §26.2's closed extendable list (a nullable
