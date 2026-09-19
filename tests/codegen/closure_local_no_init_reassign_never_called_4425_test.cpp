@@ -67,18 +67,6 @@
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
-namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
-
 // ── Row A: the issue's exact repro shape (var f: () -> int; f := lambda()...;
 // return 0;). 1000x amplified via an outer MakeClosure() so the 40 B/call leak
 // clears LSan reporting floors. Pre-fix: 40000 bytes / 1000 allocations
@@ -102,7 +90,6 @@ BEZEL_TEST(closure_local_no_init_reassign_never_called_4425,
         "    return total mod 97; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // 0 + 1000 * 0 = 0; mod 97 = 0
 }
@@ -134,7 +121,6 @@ BEZEL_TEST(closure_local_no_init_reassign_never_called_4425,
         "    return total mod 97; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // 0 + 1000 * 0 = 0; mod 97 = 0
 }
@@ -161,7 +147,6 @@ BEZEL_TEST(closure_local_no_init_reassign_never_called_4425,
         "    return total mod 97; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

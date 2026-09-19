@@ -48,17 +48,6 @@
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
-namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
-
 // Verbatim reproducer from the issue body — outer `while` loop with a
 // lambda that READS the loop control variable `i` (via `i mod 2`), the
 // `case` / `Sink.Take(move x)` ownership-transfer shape, and a per-iteration
@@ -101,7 +90,6 @@ BEZEL_TEST(lambda_captures_loop_var_4130, verbatim_reproducer_200_iterations) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // no leaks
 }
@@ -126,7 +114,6 @@ BEZEL_TEST(lambda_captures_loop_var_4130, minimal_capture_only_500_iterations) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -169,7 +156,6 @@ BEZEL_TEST(lambda_captures_loop_var_4130, control_loop_var_not_read_500_iteratio
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -198,7 +184,6 @@ BEZEL_TEST(lambda_captures_loop_var_4130, value_visible_10_iterations) {
         "    return sum; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 45);   // 0+1+...+9
 }
