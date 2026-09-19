@@ -8180,6 +8180,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // path). Positional binding via calleeMd2/pos2 mirrors the
                     // out-var inference above; the common positional call gets
                     // the hint, named/overloaded forms simply do not.
+                    // fix #4443 (v0.302, §28.3 Keying rule): a parameter typed
+                    // `(…) -> Task?` / `(…) -> Task<T>?` is mint-announcing at
+                    // its declared type (nullability stripped per §28.3 Keying);
+                    // use the stripped `isTaskFamilyRef` so the lambda body is
+                    // checked under the peeled-element context the same way.
                     if (lam->isAsync && calleeMd2 &&
                         pos2 < calleeMd2->params.size() &&
                         calleeMd2->params[pos2].type) {
@@ -8187,7 +8192,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 *calleeMd2->params[pos2].type)) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 pt->funcReturn &&
-                                isTaskShapedRef(pt->funcReturn) &&
+                                isTaskFamilyRef(pt->funcReturn) &&
                                 !pt->funcReturn->genericArgs.empty())
                                 pendingLambdaReturnType_ =
                                     pt->funcReturn->genericArgs.front();
@@ -9150,6 +9155,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // compile error; the async-iterator interfaces are method-level
         // forms (§30.7, `yield` is rejected in lambda bodies) and do not
         // apply here.
+        // fix #4443 (v0.302, §17.13 Keying rule): this site STAYS strict
+        // (`isTaskShapedRef`, non-nullable). §30.1's async-readiness mapping
+        // is about the DECLARED wrapper — a `Task?` ascription is a different
+        // question (the §17.13 Keying-strips-nullability ruling does not
+        // extend to the declared-wrapper check).
         if (hasAscription && lam->isAsync && !isTaskShapedRef(ascribedRet)) {
             ctx_.diagnostics().report(
                 Severity::Error, lam->span.begin,
@@ -9412,6 +9422,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // wider-integer literal hint, the §22.4 postcondition plumbing).
         // Without one the lambda keeps its no-return-context inference
         // posture unchanged.
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable)
+        // — peeling the task wrapper (§30.1/§30.6) is keyed on the declared
+        // wrapper; the ascription check above already rejected a non-Task-
+        // family ascription, and a `Task?` ascription is the same question
+        // the negation check decided.
         if (hasAscription && lam->isAsync && isTaskShapedRef(ascribedRet)) {
             // per §30.1/§30.6: peel the task wrapper — `Task` behaves as a
             // void-method context; `Task<T>`/`OwningTask<T>` as a value-
@@ -9687,6 +9702,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // task pointer into the element-sized async result slot (corruption /
         // SIGSEGV). The legitimate `(…) -> Task<Task<U>>` case is exempt because
         // lamRetHint (= Task<U>) is itself Task-shaped.
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable).
+        // lamRetHint is the peeled element type threaded in from the declared
+        // ascription (non-nullable per §30.1), and a body's static type at
+        // this position is the body's declared wrapper check — a `Task?` body
+        // is a different question the dedicated diagnostics handle.
         if (lam->isAsync && lam->exprBody && lamRetHint &&
             !isTaskShapedRef(lamRetHint) &&
             isTaskShapedRef(ctx_.exprType(*lam->exprBody))) {

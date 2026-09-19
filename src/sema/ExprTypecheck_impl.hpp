@@ -641,8 +641,16 @@ private:
     bool pendingLambdaArgContext_ = false;
 
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
-    // (the async task wrapper). Used to detect a forgotten `await`.
+    // (the async task wrapper). Used to detect a forgotten `await`. STRICT
+    // (non-nullable): use for §30.1 / §30.6's declared-wrapper checks where a
+    // `Task?` is a different question.
     bool isTaskShapedRef(const TypeRef* t) const;
+
+    // fix #4443 (v0.302, §17.13 / §28.3 Keying rule): the task-family
+    // predicate with nullability STRIPPED. Used by §17.13's discard + anonymous-
+    // binding halves and by §28.3's mint-announcing sites (calls-mint, function-
+    // slot threading) where the rule keys on "is this a Task-family value".
+    bool isTaskFamilyRef(const TypeRef* t) const;
 
     // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
     // class-or-interface slot that triggers the Concrete-slot function bodies
