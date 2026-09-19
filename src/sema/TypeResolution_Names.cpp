@@ -2857,6 +2857,179 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     underlying =
                         substituteAliasGenericArgs(underlying, aliasSubst,
                                                     t.span.begin);
+                    // fix #4464 (§14.2, §27.8, v0.298): a generic type alias
+                    // may carry `where` clauses (§27.8: "uses of the alias must
+                    // satisfy it"). The substitution above substituted the
+                    // concrete args into the alias body, but the alias's own
+                    // `where` clauses were never checked against those concrete
+                    // args. Walk each GenericParamSymbol's constraints (populated
+                    // by SymbolCollection::collectGenericParams from
+                    // aliasDecl->genericConstraints) and validate the concrete
+                    // substitution against each bound.
+                    for (std::size_t gi = 0; gi < aliasSym->genericParams.size();
+                         ++gi) {
+                        auto* gp =
+                            dynamic_cast<GenericParamSymbol*>(aliasSym->genericParams[gi]);
+                        if (!gp || gp->constraints.empty()) continue;
+                        auto it = aliasSubst.find(gp->name);
+                        if (it == aliasSubst.end()) continue;
+                        TypeRef* arg = it->second;
+                        if (!arg) continue;
+                        // Build a scope for resolving constraint bounds: module
+                        // names plus the alias's own generic-param markers.
+                        Scope boundModule;
+                        if (ctx_.module()) {
+                            for (Symbol* child : ctx_.module()->children) {
+                                if (!child->name.empty())
+                                    boundModule.names[child->name] = child;
+                            }
+                        }
+                        Scope boundScope;
+                        boundScope.parent = &boundModule;
+                        for (const auto& g : aliasDecl->genericParams) {
+                            boundScope.names[g.name] = nullptr;
+                        }
+                        for (const auto& c : gp->constraints) {
+                            // Spellings for TypeRef* args (no ast::Type needed).
+                            auto typeRefSpelling =
+                                [](const TypeRef* r) -> std::string {
+                                if (!r) return "<type>";
+                                if (r->kind == TypeRef::Kind::Named) {
+                                    if (r->declaration)
+                                        return std::string(r->declaration->name);
+                                    if (!r->importedName.empty())
+                                        return std::string(r->importedName);
+                                } else if (r->kind == TypeRef::Kind::Primitive) {
+                                    // Mirror the names in primitiveFromName (TypeResolution.cpp).
+                                    switch (r->primitive) {
+                                        case PrimitiveType::Bool:    return "bool";
+                                        case PrimitiveType::Char:    return "char";
+                                        case PrimitiveType::String:   return "string";
+                                        case PrimitiveType::Int:      return "int";
+                                        case PrimitiveType::UInt:     return "uint";
+                                        case PrimitiveType::Long:     return "long";
+                                        case PrimitiveType::ULong:    return "ulong";
+                                        case PrimitiveType::Byte:     return "byte";
+                                        case PrimitiveType::SByte:   return "sbyte";
+                                        case PrimitiveType::Short:   return "short";
+                                        case PrimitiveType::UShort:  return "ushort";
+                                        case PrimitiveType::Float:   return "float";
+                                        case PrimitiveType::Double:   return "double";
+                                        case PrimitiveType::Decimal:  return "decimal";
+                                        case PrimitiveType::Object:   return "Object";
+                                        default: break;
+                                    }
+                                }
+                                return "<type>";
+                            };
+                            std::string argName = typeRefSpelling(arg);
+
+                            // "type" bound: satisfied when arg conforms to the bound
+                            // type (BFS over arg's base types).
+                            if (c.kind == "type") {
+                                TypeRef* bound = nullptr;
+                                if (c.astBound) {
+                                    bound = resolveType(*c.astBound, &boundScope);
+                                } else if (c.importedBound) {
+                                    bound = c.importedBound;
+                                }
+                                if (!bound) continue;
+                                bool satisfied = argSatisfiesTypeBound(arg, bound);
+                                // A "type" bound that is itself a type parameter:
+                                // resolve it through aliasSubst to get the concrete
+                                // bound before emitting the diagnostic.
+                                if (!satisfied &&
+                                    bound->kind == TypeRef::Kind::Named &&
+                                    !bound->declaration && bound->astNode &&
+                                    bound->astNode->name &&
+                                    bound->astNode->name->parts.size() == 1) {
+                                    std::string_view bpName =
+                                        bound->astNode->name->parts.front();
+                                    auto jt = aliasSubst.find(bpName);
+                                    if (jt != aliasSubst.end() && jt->second &&
+                                        jt->second->declaration) {
+                                        bound = jt->second;
+                                        satisfied = argSatisfiesTypeBound(arg, bound);
+                                    }
+                                }
+                                if (!satisfied) {
+                                    std::string boundName;
+                                    if (bound->kind == TypeRef::Kind::Named) {
+                                        if (bound->declaration) {
+                                            boundName = bound->declaration->name;
+                                        } else if (!bound->importedName.empty()) {
+                                            boundName = bound->importedName;
+                                            if (!bound->genericArgs.empty()) {
+                                                std::string withArgs = boundName + "<";
+                                                for (std::size_t i = 0;
+                                                     i < bound->genericArgs.size();
+                                                     ++i) {
+                                                    if (i > 0) withArgs += ", ";
+                                                    withArgs +=
+                                                        typeRefSpelling(
+                                                            bound->genericArgs[i]);
+                                                }
+                                                withArgs += '>';
+                                                boundName = std::move(withArgs);
+                                            }
+                                        }
+                                    }
+                                    if (boundName.empty()) boundName = "<type>";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, t.span.begin,
+                                        std::string("type argument `") +
+                                            argName +
+                                            "` does not satisfy the "
+                                            "constraint `where " +
+                                            std::string(gp->name) + ": " +
+                                            boundName + "` (§14.2)");
+                                }
+                                continue;
+                            }
+                            // All other constraint kinds ("class", "value", "notnull",
+                            // "new", …): checked inline using the same logic as
+                            // checkOneConstraint.
+                            bool violated = false;
+                            std::string reason;
+                            if (c.kind == "notnull") {
+                                violated = arg->nullable;
+                                reason = "notnull";
+                            } else if (c.kind == "class") {
+                                // §14.2: non-nullable reference types only.
+                                if (arg->nullable) {
+                                    violated = true;
+                                } else {
+                                    TypeCategory cat = categorize(arg);
+                                    violated = (cat == TypeCategory::Value);
+                                }
+                                reason = "class";
+                            } else if (c.kind == "value") {
+                                // §14.2: non-nullable value types only.
+                                if (arg->nullable) {
+                                    violated = true;
+                                } else {
+                                    TypeCategory cat = categorize(arg);
+                                    violated = (cat == TypeCategory::Reference);
+                                }
+                                reason = "value";
+                            } else if (c.kind == "new") {
+                                bool decided = false;
+                                bool ok = argSatisfiesNew(arg, decided);
+                                violated = (decided && !ok);
+                                reason = "new()";
+                            }
+                            // "sendable" and "hashable" are deferred (require
+                            // late resolution, same as checkOneConstraint).
+                            if (violated) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, t.span.begin,
+                                    std::string("type argument `") + argName +
+                                        "` does not satisfy the constraint `where " +
+                                        std::string(gp->name) + ": " + reason +
+                                        "` (§14.2)");
+                            }
+                        }
+                    }
                     // Copy the underlying kind and payload into ref. The nullable
                     // flag on ref was already set from the syntactic `?` suffix in
                     // resolveType; the underlying type's nullable flag is
