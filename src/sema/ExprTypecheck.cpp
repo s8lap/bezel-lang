@@ -1593,6 +1593,28 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // default). A non-empty primary param list is a non-parameterless
             // constructor (mirroring Resolver::argSatisfiesNew).
             //
+            // fix #4446 (§14.2, v0.302): an `abstract` or `closed` class does
+            // NOT satisfy `new()` (§14.2 v0.302; per spec §12.5, `new` on such
+            // a class is itself a compile error, so admitting the substitution
+            // would satisfy a constraint whose sole purpose — `new T()` in the
+            // generic body — the language forbids on the substituted type).
+            // §22.7's implicit parameterless constructor (which `abstract` and
+            // `closed` classes still take, since §12.8 inserts a `base()` chain
+            // to it) is NOT enough — the substitution is unconstructible at
+            // every call site, on the same footing as the Interface arm above.
+            // Mirrors the §11.7 own `isInstanceless = abstract || closed` test
+            // this file already uses for §19.6 leaf-set extraction (line 2455).
+            // The diagnostic at the substitution site is the existing §14.2
+            // "type argument ... does not satisfy the constraint `where T:
+            // new()`" wording (TypeResolution_Names.cpp:3025 for the type-alias
+            // path; ExprTypecheck_Calls.cpp:3396 for the call-site re-check) —
+            // the predicate answering false here is what makes those sites
+            // fire.
+            if (hasModifier(d, "abstract") || hasModifier(d, "closed")) {
+                decided = true;
+                return false;
+            }
+            //
             // fix #3141: `hasPositionalFields` is on the TypeSymbol (#501) and
             // the parameters themselves are FieldSymbols on both sides (#2516),
             // so an imported primary-constructor class no longer answers "no
