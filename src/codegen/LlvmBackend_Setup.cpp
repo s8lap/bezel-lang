@@ -10156,6 +10156,29 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     // slot can be registered for atexit disposal below.
                     const sema::TypeRef* ft =
                         fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+                    // fix #4467 (§8.6 / §15.1, v0.298 — 3rd sibling of #4335
+                    // local-decl-init / #4427 instance-field-auto-property /
+                    // #4317 IndexExpr/whole-array/return): box a value-typed
+                    // (record) element into its box representation before the
+                    // store below. `ft` is the field's resolved TypeRef; for
+                    // an `[N]IHolder`-typed static field this resolves to the
+                    // `InlineArray` TypeRef whose `arrayElement` is the
+                    // interface `IHolder` — exactly the `elemSemaTy`
+                    // boxForTarget needs to classify an interface target.
+                    // `ft == nullptr` is the safe no-op per boxForTarget's own
+                    // guard (returns v unchanged on a null declTy), AND an
+                    // inferred array type could not have deduced an interface
+                    // element from a `new RecHolder(...)` first element in
+                    // the first place, so the only case that matters (the
+                    // declared-element-type case) is covered. boxForTarget
+                    // is a no-op for a CLASS element (already a bare pointer,
+                    // isBoxableValueType false) and for any non-
+                    // Object/interface element type, so every already-working
+                    // shape is unaffected.
+                    const sema::TypeRef* elemSemaTy =
+                        (ft && ft->kind == sema::TypeRef::Kind::InlineArray)
+                            ? ft->arrayElement
+                            : nullptr;
                     bool isOwnedInlineArr =
                         ft && ft->kind == sema::TypeRef::Kind::InlineArray &&
                         ft->arrayOwned;
@@ -10185,6 +10208,9 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                                 continue;
                             }
                         }
+                        // fix #4467 (§8.6 / §15.1): see block comment above.
+                        ev = boxForTarget(ev, elemSemaTy,
+                                          cl->elements[i].get());
                         if (ev->getType() != elemTy &&
                             ev->getType()->isIntegerTy() &&
                             elemTy->isIntegerTy()) {
