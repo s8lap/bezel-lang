@@ -12243,6 +12243,12 @@ private:
     static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     static bool exprContainsAwait(const ast::Expr* e);
 
+    // fix #4461 (§30.5 Pattern A kind 1, §30.6, v0.306): narrow predicate for
+    // the Task-factory CallExpr shape (`Task.FromOwnedResult(...)` etc.)
+    // `detectAsyncPatternAKind` rejects on a non-`await` Pattern A return.
+    // // per §30.5 Pattern A, §30.6, v0.306
+    static bool isTaskFactoryCallExpr(const ast::Expr* valueExpr);
+
     // §30.9 / §31.2 (#438): detect an `await` in a try POSITION that is STILL
     // deferred — i.e. inside a catch arm body, a catch guard, or a `finally`
     // body. `await` in a try BODY is now supported (the resume block is lowered
@@ -13576,6 +13582,23 @@ private:
     // function that decides "Pattern A borrow". Reset to false after
     // lowerExpr returns in lowerStmt, like its kind-2 twin.
     bool asyncBorrowedReturn_ = false;
+    // fix #4462 (§30.5 Pattern A, §30.6, v0.306): set true by `lowerLocalDecl`
+    // when the init is `await <plain Task<T:class>>` AND the LocalDecl has the
+    // `using` modifier (the consuming binding `using var x := await t;`).
+    // Read by `lowerAwait`, which extends its `takeResultAfter` decision to
+    // fire for plain Task (the OwningTask half already fires unconditionally
+    // via `taskTy->headName() == "OwningTask"`). Without this, the consumer's
+    // `using var x := await t;` cascade-disposes the class value at its
+    // scope end AND the kind-1 disposer attached to the task at producer
+    // completion (the `emitAsyncPatternAResultDecision` kind-2 chained path
+    // that fires when the producer's body is `return await
+    // Task.FromOwnedResult(new X)`) then disposes the same freed value at
+    // `t`'s scope end — a heap-use-after-free, invisible on plain builds
+    // (the freed bucket is exactly the glibc 16-byte tcache width and is
+    // immediately reused) and caught only by ASan (#2633 oracle). Saving/
+    // restoring across `lowerExpr(*init)` so a nested LocalDecl in the same
+    // scope starts from the right value.
+    bool awaitConsumesPlainTaskResult_ = false;
     // §30.1 (#1521): the current plain (non-iterator) async method's frame,
     // published by emitAsyncMethod right after buildStateMachineFrame so
     // emitAsyncOwnedParamAutoDispose can walk frame.captures from EVERY
