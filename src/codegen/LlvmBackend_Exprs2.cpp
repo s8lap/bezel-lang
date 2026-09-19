@@ -6397,6 +6397,24 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         if (!v->getType()->isIntegerTy(32))
                             v = builder_.CreateTrunc(v, i32());
                         maxCount = v;
+                        // fix #4445 (stdlib §6.3, v0.302): guard the two-arg
+                        // constructor's ArgumentException contract —
+                        //   max < 1 → ArgumentException
+                        //   initial > max → ArgumentException
+                        // (The one-arg form defaults max to INT_MAX, so both
+                        // conditions are inert and never reach here.) Thrown
+                        // BEFORE allocation, so no semaphore leaks on the
+                        // guard path. Mirrors the Channel(capacity) guard
+                        // (v0.174 / #809, just above in this block).
+                        emitGuardThrow(
+                            builder_.CreateOr(
+                                builder_.CreateICmpSLT(maxCount,
+                                                       builder_.getInt32(1),
+                                                       "sem.max.bad"),
+                                builder_.CreateICmpSGT(initCount, maxCount,
+                                                       "sem.init.bad"),
+                                "sem.bad"),
+                            "ArgumentException");
                     }
                 }
                 auto* allocFn = declareC("bz_semaphore_new",
