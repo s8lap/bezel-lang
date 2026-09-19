@@ -166,11 +166,37 @@ using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
+// Pre-ruling §28.3 wording — every #4003 / #4028 row was originally pinned
+// to this ERROR text.  v0.303 / #4450 retires the ERROR: a `move x` after
+// `x.Dispose()` now draws §28.2's consume-side WARNING instead, so the
+// rows' `hasErrors() == true` and `hasErrorMessage(...)` assertions flip.
+// `kDisposedMoveError` is kept as a documented historical reference for
+// the pre-ruling verdict; the new wording the rows now pin is
+// `kDisposedMoveWarn`.
 constexpr char kDisposedMoveError[] =
     "cannot move from disposed local `x` (§28.3)";
+constexpr char kDisposedMoveWarn[] =
+    "move from a local `x` already disposed at this point (§28.2)";
+
+// The pre-/post-ruling consistency predicate every #4003 / #4028 NEGATIVE
+// row pins: a `move x` whose source `x` has been explicitly disposed on
+// every path reaching the consume (the "dominating kill" of §28.2, v0.303)
+// emits a single §28.2 WARNING — the consume-side wording above — and
+// nothing else.  Pre-ruling this was a §28.3 ERROR; the ruling is the
+// severity change, not a relaxation of the program's static analysis
+// (the conditional-kill `maybeConsumed` arm still errors).  Returns true
+// iff the diagnostic matches; used by every NEGATIVE row below.
+inline bool hasMoveAfterDisposeWarning(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find(kDisposedMoveWarn) != std::string::npos)
+            return true;
+    return false;
+}
 
 // Shared `Res`/`Holder` shapes: `Res` is a plain disposable class; `Holder`'s
 // constructor consumes an `owned r: Res` and disposes it, mirroring the
@@ -196,13 +222,15 @@ std::string program(const std::string& classesAndMain) {
 }  // namespace
 
 // =============================================================================
-// CONTROL — the pre-existing direct spelling was already correctly rejected
-// before this fix and must stay rejected with the IDENTICAL diagnostic text
-// (proves the new arms route `move` validation through the SAME authority,
-// not a second drifting copy).
+// CONTROL — the pre-existing direct spelling was already correctly handled
+// before this fix and must stay handled with the SAME diagnostic text (proves
+// the new arms route `move` validation through the SAME authority, not a
+// second drifting copy).  Under v0.303 / #4450 the text is the §28.2
+// consume-side WARNING; the assertion uses `hasMoveAfterDisposeWarning`,
+// the shared predicate defined above.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           direct_new_ctor_move_of_disposed_local_rejected_28_3_control) {
+           direct_new_ctor_move_of_disposed_local_warns_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -211,18 +239,21 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // =============================================================================
 // NEGATIVE (issue #4003's own repro) — `MemberAccessExpr` wrapping a `new`
 // whose owned argument is `move`d from an already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean (hasErrors() is false), then SEGVs
-// under ASan (measured; see file header).
+// FAILS WITHOUT THE FIX (#4003 — the new arm): compiles clean
+// (hasErrors() is false), then SEGVs under ASan (measured; see file
+// header).  Post-ruling (#4450) the diagnostic is a §28.2 WARNING; the
+// pre-ruling §28.3 ERROR is what the row originally pinned, hence the
+// rename to `_warns_28_2_4450`.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           member_access_wrapping_new_ctor_move_of_disposed_local_rejected) {
+           member_access_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -231,35 +262,44 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // The same case through the STRONG AOT oracle (real `bezelc` + link + exec):
-// proves not merely that a diagnostic fired, but that NO EXECUTABLE was ever
-// produced — the sibling fix #3989/#3990 held its own new arms to this same
-// bar (`aot_..._rejected_no_program_28_3` rows).
+// the program now COMPILES (with a warning), so the pre-fix "rejection"
+// oracle cannot stand.  The checked-disposal backstop §28.2 promises is
+// the new soundness claim — a member access through the surviving borrow
+// of a logically-disposed instance raises `DisposedAccessException` in
+// checked mode.  Same shape the regression file for #4450 uses for the
+// other consume positions; this row is the `MemberAccessExpr`-wrapper
+// analogue so every #4003 wrapper kind has its own checked-mode row.
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_member_access_wrapping_new_ctor_move_of_disposed_local_rejected_no_program_28_3) {
-    JitResult r = runAot(program(
+    aot_member_access_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4450) {
+    JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
         "    var x := new Res(1); x.Dispose(); "
-        "    var y := (new Holder(move x)).v; "
-        "    return y; "
+        "    try "
+        "      var y := (new Holder(move x)).v; "
+        "      return 0; "
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // =============================================================================
 // NEGATIVE — `IndexExpr` wrapping a `new` (via a user-declared indexer)
 // whose owned argument is `move`d from an already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4003 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           index_expr_wrapping_new_ctor_move_of_disposed_local_rejected) {
+           index_expr_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -281,8 +321,8 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // =============================================================================
@@ -291,10 +331,11 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
 // (not a `CallExpr`) so this test does NOT also exercise the separate,
 // pre-existing `checkRead`/`CallExpr`-argument masking bug filed as #4023 —
 // `checkRead` has no `NewExpr` arm, so it never reaches this `move` at all.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4003 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           postfix_bang_wrapping_new_ctor_move_of_disposed_local_rejected) {
+           postfix_bang_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -303,17 +344,18 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // =============================================================================
 // NEGATIVE — `NullCondMemberExpr` (`?.`) wrapping a static-method call whose
 // owned argument is `move`d from an already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4003 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           null_cond_member_wrapping_factory_move_of_disposed_local_rejected) {
+           null_cond_member_wrapping_factory_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class Factory "
         "  public static method Make(owned r: Res): owned Holder? "
@@ -327,18 +369,19 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y ?? -1; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // =============================================================================
 // NEGATIVE — `NullCondCallExpr` (`f?(...)`, a null-conditional invocation of
 // a nullable owned-parameter callable) whose argument is `move`d from an
 // already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4003 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           null_cond_call_wrapping_lambda_move_of_disposed_local_rejected) {
+           null_cond_call_wrapping_lambda_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Res "
@@ -355,17 +398,18 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return y ?? -1; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 // =============================================================================
 // NEGATIVE (#4028) — `TypeTestExpr` (`is`) wrapping a `new` whose owned
 // argument is `move`d from an already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4028 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(record_moves_in_wrapper_arms_4003,
-           type_test_wrapping_new_ctor_move_of_disposed_local_rejected_4028) {
+           type_test_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4028_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -374,32 +418,41 @@ BEZEL_TEST(record_moves_in_wrapper_arms_4003,
         "    return (if y then 1 else 0); "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
+// The AOT oracle's half for the row above.  Program now COMPILES (with a
+// warning), so the checked-disposal backstop is what makes admitting it
+// sound — same shape the regression file for #4450 uses for the other
+// consume positions.
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_type_test_wrapping_new_ctor_move_of_disposed_local_rejected_no_program_4028) {
-    JitResult r = runAot(program(
+    aot_type_test_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4028_4450) {
+    JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
         "    var x := new Res(1); x.Dispose(); "
-        "    var y := (new Holder(move x)) is Object; "
-        "    return (if y then 1 else 0); "
+        "    try "
+        "      var y := (new Holder(move x)) is Object; "
+        "      return (if y then 1 else 0); "
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // =============================================================================
 // NEGATIVE (#4028) — `InterpolatedStringExpr` (`$"...{expr}..."`) wrapping a
 // `new` whose owned argument is `move`d from an already-disposed local.
-// FAILS WITHOUT THE FIX: compiles clean, then SEGVs under ASan (measured).
+// FAILS WITHOUT THE FIX (#4028 — the new arm): compiles clean, then SEGVs
+// under ASan (measured).  Post-ruling the verdict is §28.2 WARNING.
 // =============================================================================
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    interpolated_string_wrapping_new_ctor_move_of_disposed_local_rejected_4028) {
+    interpolated_string_wrapping_new_ctor_move_of_disposed_local_warns_28_2_4028_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -408,22 +461,26 @@ BEZEL_TEST(
         "    return s.Length; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMoveAfterDisposeWarning(r));
 }
 
 BEZEL_TEST(
     record_moves_in_wrapper_arms_4003,
-    aot_interpolated_string_wrapping_new_ctor_move_of_disposed_local_rejected_no_program_4028) {
-    JitResult r = runAot(program(
+    aot_interpolated_string_wrapping_new_ctor_move_of_disposed_local_raises_in_checked_mode_4028_4450) {
+    JitResult r = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
         "    var x := new Res(1); x.Dispose(); "
-        "    var s := $\"result={new Holder(move x)}\"; "
-        "    return s.Length; "
+        "    try "
+        "      var s := $\"result={new Holder(move x)}\"; "
+        "      return 0; "
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // =============================================================================

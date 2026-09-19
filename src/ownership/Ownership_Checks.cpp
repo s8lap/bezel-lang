@@ -10375,10 +10375,32 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     if (st->state == OwnershipState::Disposed) {
+        // §28.2 (v0.303): under a *dominating* Dispose()/discard, EVERY use
+        // — read, borrow, AND consume (a `move`, an `owned` argument, a
+        // `using var` adoption) — draws §28.2's use-after-dispose WARNING,
+        // not §28.3's consume-table ERROR. The Disposed state here was set
+        // by a prior explicit Dispose() that dominates this consume site on
+        // every path (otherwise `lookupState` would have surfaced the
+        // `maybeConsumed` join flag, which still errors below), so the
+        // severity ruling applies: demote this arm to Warning. The
+        // diagnostic TEXT stays specific — "move from a local already
+        // disposed" rather than the read-side wording `checkRead` uses — so
+        // a programmer reading the warning still sees the consume shape and
+        // the disposed state at a glance; the message cites §28.2 explicitly
+        // to mark the regime change from the prior §28.3 error text.
+        //
+        // Conditional-kill arms (the `maybeConsumed` branch below, and
+        // `markDisposedByName`'s own maybeConsumed arm) are UNCHANGED — the
+        // ruling is the severity of the dominating kill, not a relaxation of
+        // the conditional kill, which is §28.3's harder contract and the
+        // checked-disposal backstop the language relies on. // per §28.2,
+        // v0.303, #4450 (closes the implementation half of #3975)
         report(
-            Severity::Error, loc,
-            std::string("cannot move from disposed local `") +
-            std::string(name) + "` (§28.3)");
+            Severity::Warning, loc,
+            std::string("move from a local `") + std::string(name) +
+            "` already disposed at this point (§28.2) — "
+            "use-after-dispose is undefined behaviour in unchecked mode "
+            "and raises DisposedAccessException in checked mode");
         // fix #3931 sibling sweep: deferred to the emit pass for the reason
         // traced in `markDisposedByName`'s MovedFrom arm above — a
         // suppressed-phase poison collapses the loop-header meet and silences
