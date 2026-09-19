@@ -5267,6 +5267,54 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         return true;
     };
 
+    // fix #4428 (§9.7, v0.301): the parameter-rooted rejection. §9.7's
+    // admitted-return set for a borrow-bearing record is receiver-sourced,
+    // static-storage-sourced, or the null-source form — and the closing text
+    // expressly excludes "a plain parameter of the returning method" (the
+    // shape #4428 names — `public static method Trim(s: ReadOnlySpan<byte>):
+    // ReadOnlySpan<byte> => s.Slice(1);` — carries a borrow of `s`, a
+    // parameter, and the call site cannot re-establish the source against
+    // anything but the receiver the record type announces no source set).
+    // `this` (an IdentifierExpr with name "this", which sema leaves
+    // unresolved) is NOT a ParameterSymbol and falls through this check,
+    // so the receiver-sourced arm stays admitted — exactly the §4.14
+    // `FrameBuffer.ScanLine` shape that constructs the span off `this`'s
+    // own fields. A static-storage source (the `static`-getter form) is
+    // also not a parameter, so its arm is untouched. Per §9.7 v0.301; the
+    // callee-side arm that closes this gap.
+    auto reportIfParameterRoot =
+        [&](const ast::IdentifierExpr* root, SourceLocation loc,
+            bool spanForm) -> bool {
+        if (!root) return false;
+        // A `this` IdentifierExpr resolves to no symbol — sema treats it as
+        // an implicit-meaning identifier (ExprTypecheck_Exprs.cpp:1457-1494).
+        // Skip it; the receiver-sourced arm admits this case upstream.
+        if (root->name == "this") return false;
+        sema::Symbol* sym = ctx_.exprSymbol(*root);
+        if (!sym) return false;
+        if (!methodParamSet_.count(sym)) return false;
+        report(
+            Severity::Error, loc,
+            spanForm
+                ? (std::string("returned span is rooted at parameter `") +
+                   std::string(root->name) +
+                   "` — a span (§4.14/§4.15) is a borrow of its backing "
+                   "Array / OwningBuffer and may not outlive it, but the "
+                   "caller has no way to re-establish a parameter-sourced "
+                   "borrow against its own actuals, so §9.7 rejects the "
+                   "return (v0.301; expose the backing storage and "
+                   "re-derive the span at the call site instead)")
+                : (std::string("returned borrow-bearing record carries a "
+                   "borrow of parameter `") +
+                   std::string(root->name) +
+                   "` — a borrow-bearing record may not outlive the "
+                   "source of any borrow it carries, and a plain parameter "
+                   "of the returning method has no source the caller can "
+                   "re-establish (§9.7, v0.301; bind the source in the "
+                   "caller's scope and build the record there instead)"));
+        return true;
+    };
+
     // §9.7 transitivity (#2127): report the escape of a returned record / span
     // whose CARRIED borrow source is the escape-bound local `src` (identified by
     // name, forked span / record / catch — the same three wordings as
@@ -5371,6 +5419,23 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             if (reportIfScopeBoundOwned(argRoot, ne->span.begin,
                                         /*spanForm=*/typeIsSpan))
                 return true;  // one diagnostic per return is enough
+            // (a') fix #4428 (§9.7, v0.301): the argument root is a plain
+            //      parameter of the returning method (`new Holder(s.AsSpan())`
+            //      — root `s`). The scope-bound-owned check above does not
+            //      catch parameters (they are not in `states_`); §9.7 closes
+            //      the parameter arm explicitly — re-establish the source the
+            //      caller-side has nothing to anchor against. For a user record
+            //      (`recordTs` set) only BORROW-CARRYING-field args are walked
+            //      above, so every arg here is a borrow source — safe to reject
+            //      unconditionally. For a builtin span (no user record decl)
+            //      the conservative every-arg loop below walks offset/length
+            //      args too, which are not borrow sources; the caller below
+            //      filters to the first arg only — the buffer — in that case.
+            if (!typeIsSpan) {
+                if (reportIfParameterRoot(argRoot, ne->span.begin,
+                                          /*spanForm=*/typeIsSpan))
+                    return true;
+            }
             // (b) §9.7 transitivity (#2127): the argument is itself a borrow-
             //     bearing local whose CARRIED source is a live escape-bound
             //     obligation — a span var (`var s := local.AsSpan(); return new
@@ -5456,6 +5521,22 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
                 const ast::CallArgument& a = ne->args[i];
                 if (!a.value) continue;
                 if (checkArg(*a.value)) return;
+                // fix #4428 (§9.7, v0.301): the parameter-root check above is
+                // gated to user records only (checkArg's (a') arm). For a
+                // builtin span constructor every arg is conservatively scanned,
+                // so the (a') arm can't fire — but the buffer (the FIRST arg
+                // by stdlib §4.14/§4.15 convention) IS the borrow source, while
+                // start/length are offsets. Reject the span construction only
+                // when the BUFFER's root is a parameter — `new Span<T>(s, 0, 1)`
+                // where `s` is a parameter. `new Span<T>(_buf.Data, 0, 1)` (a
+                // static-field buffer) is admitted unchanged — the §9.7
+                // static-storage-sourced arm keeps it sound.
+                if (i == 0) {
+                    const ast::IdentifierExpr* bufRoot = identifierRoot(*a.value);
+                    if (reportIfParameterRoot(bufRoot, ne->span.begin,
+                                              /*spanForm=*/typeIsSpan))
+                        return;
+                }
             }
         }
         return;
@@ -5473,7 +5554,19 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // and require the receiver ROOT (`identifierRoot` peels the member/call/
     // index chain) to be a tracked owned local. // per §9.7, §4.14, §4.15
     if (!typeIsSpan) return;  // a user record → not the span gap
-    reportIfScopeBoundOwned(identifierRoot(e), e.span.begin, /*spanForm=*/true);
+    const ast::IdentifierExpr* projRoot = identifierRoot(e);
+    // fix #4428 (§9.7, v0.301): the parameter arm. Today, `local.AsSpan()` /
+    // `local[i]` with `local` a tracked owned local is rejected; with `local`
+    // a plain parameter (`s.Slice(1)` returning a span view of `s`) it slips
+    // through, because parameters are not in `states_` — a use-after-free
+    // shape, since the caller's actuals carry the source the record type
+    // announces nothing about. Reject the parameter root here, ahead of the
+    // scope-bound-owned check below. The receiver-sourced arm (this IdentifierExpr
+    // — sema leaves it unresolved) and the static-storage arm (a static-field
+    // IdentifierExpr) are unaffected, since neither is a ParameterSymbol.
+    if (reportIfParameterRoot(projRoot, e.span.begin, /*spanForm=*/true))
+        return;
+    reportIfScopeBoundOwned(projRoot, e.span.begin, /*spanForm=*/true);
 }
 
 bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
@@ -9840,8 +9933,27 @@ void MethodOwnership::collectRecordBorrowRoots(
         // The carried source is the identifier at the root of the chain:
         // `buf.AsSpan()` / `s.Slice(r)` → `buf` / `s`, a bare alias `s` → `s`.
         if (const ast::IdentifierExpr* r = identifierRoot(sub)) {
-            if (sema::Symbol* sym = ctx_.exprSymbol(*r))
-                if (sym != self) srcs.push_back(sym);
+            sema::Symbol* sym = ctx_.exprSymbol(*r);
+            if (!sym) return;
+            // fix #4428 (§9.7, v0.301): the type-name root. For a static call
+            // `Util.Trim(s.AsSpan())`, `identifierRoot` peels the chain to the
+            // type name `Util` (a TypeSymbol) — not a borrow source. The pre-fix
+            // code added it to srcs anyway, polluting the provenance map with
+            // a meaningless "source" the consume-site freeze treats as live
+            // (TypeSymbols are never owned, so the freeze is never triggered —
+            // and yet the carried borrow's actual source is the parameter `s`,
+            // which the callee-side fix now rejects at the return site, so the
+            // the type-name-rooted path no longer reaches this branch for the
+            // it was the only thing that reached it). Skip TypeSymbol roots;
+            // for admitted forms (receiver-sourced `this`/field and
+            // static-storage-sourced static field), the chain's root is
+            // neither — `this` resolves to no symbol (so the `!sym` arm
+            // already skips it), and a static-field identifier is a
+            // FieldSymbol (preserved through unchanged). The pre-fix pollution
+            // was the only way a TypeSymbol could land in srcs. // per §9.7
+            // v0.301
+            if (dynamic_cast<sema::TypeSymbol*>(sym)) return;
+            if (sym != self) srcs.push_back(sym);
         }
     };
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {

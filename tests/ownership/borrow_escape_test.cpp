@@ -561,16 +561,27 @@ BEZEL_TEST(own_escape, return_span_of_using_var_array_diagnosed) {
         r, "returned span views"));
 }
 
-// §9.7 / §4.14 (#1959 POSITIVE control — must NOT be over-rejected): a span
-// viewing a PARAM Array outlives the caller's frame (the caller's array
-// persists past this method's exit), so returning it is sound.
-BEZEL_TEST(own_escape, return_span_of_param_array_clean) {
+// fix #4428 (§9.7, v0.301): a span viewing a PARAM Array — `View(a:
+// Array<int>): ArraySpan<int> { return a.AsSpan(); }` — is REJECTED at the
+// return site. The pre-#4428 text ("a span viewing a PARAM Array outlives
+// the caller's frame, so returning it is sound") conflated the §28.3
+// caller-side rule (a parameter-source is fine to bind at the call site) with
+// the §9.7 callee-side rule (a parameter-source cannot be the ADMITTED return
+// arm of a borrow-bearing record or span). The §9.7 v0.301 ruling closes the
+// parameter arm — "a caller has nothing but the receiver to re-establish and
+// a parameter-sourced record return would hand back a borrow no call site
+// could bound" (v0.301). The receiver-sourced (`this._buf.AsSpan()`)
+// counterpart stays accepted — the `this`-rooted arm is the §9.7 ADMITTED
+// return shape. // per §9.7, §4.14, §4.15, v0.301.
+BEZEL_TEST(own_escape, return_span_of_param_array_rejected_9_7_v301) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method View(a: Array<int>): ArraySpan<int> "
         "    return a.AsSpan(); "
         "  end View; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned span is rooted at parameter `a`"));
 }
 
 // §9.7 / §4.14 (#1959 POSITIVE control): a span viewing an owned FIELD of
