@@ -8365,6 +8365,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // value-disposer argument is null.
     if (actualTy && (actualTy->headName() == "SortedSet" ||
                      builtinTypeName(actualTy) == "SortedSet")) {
+        // fix #4099 (stdlib §4.18, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedSet<T>` coerced to
+        // `IEnumerable<T>` here used to silently admit an element type that
+        // is eligible ONLY via the auto-hashable (§9.2) or class/interface
+        // (hasObjectHeaderEquality) branches — both of which establish
+        // hashing/equality but not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). Reuses the shared authority
+        // `reportSortedElementNeedsCompareTo` (LlvmBackend_Calls3.cpp) rather
+        // than a fourth inline copy of the predicate (LANE_RULES §15). The
+        // poison-value return mirrors the indexer's own — well-formed no-op.
+        if (reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<T>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (outWrapMade) *outWrapMade = true;
         // Snapshot the source FIRST, then free the source. The snapshot is
         // built FROM the live source dict (bz_dict_keys_gen reads the key
@@ -8433,6 +8450,32 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // splits that obligation into the half the source free discharges and
         // the half the snapshot's slot-1 Dispose does — so the gate is handed
         // the SOURCE type and admits every shape those two disposers cover.
+        //
+        // fix #4099 (stdlib §4.17, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedDictionary<K, V>`
+        // coerced to `IEnumerable<DictionaryEntry<K, V>>` here used to
+        // silently admit a key type eligible ONLY via the auto-hashable
+        // (§9.2) or class/interface (hasObjectHeaderEquality) branches —
+        // hashing/equality, not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). The plain `Dictionary<K, V>` arm
+        // is unaffected — its `where K: IEquatable<K>` constraint (§4.8)
+        // admits any key with structural equality, which is the right
+        // contract for an unordered map. The poison-value return mirrors
+        // the indexer's own — well-formed no-op. This check fires BEFORE
+        // `dictEntryWrapShapeSupported` so a SortedDictionary<Pt, int> widened
+        // to `IEnumerable<DictionaryEntry<Pt, int>>` is rejected even when
+        // the wrap helper declines (the helper's own decline is the
+        // historical fail-loud path, not a silent admit — but it was
+        // unreachable in the rejection lane without this check landing
+        // first).
+        if (builtinTypeName(actualTy) == "SortedDictionary" &&
+            reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<DictionaryEntry<K, V>>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (!dictEntryWrapShapeSupported(targetTy, actualTy)) return v;
         // The two halves are derived TOGETHER, at the one site that decides
         // both, so a shape can never take one without the other. Both stay null

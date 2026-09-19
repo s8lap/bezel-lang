@@ -15167,12 +15167,57 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // key bytes from it), and the snapshot is independent of the
                 // source's allocation once built — so reversing the order
                 // would UAF on the source's key bytes.
-                llvm::Value* srcSet = v;  // capture BEFORE the snapshot
-                llvm::Value* wrap = wrapSortedSetAsIEnumerable(srcSet, declTR);
-                if (wrap) {
-                    v = wrap;
-                    if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
-                        freeDictSourceNow(srcSet, /*valDisposer=*/nullptr);
+                //
+                // fix #4099 (stdlib §4.18, v0.306 follow-up): the local-decl
+                // twin of `wrapAsIEnumerableForTarget`'s check. A SortedSet<T>
+                // initializer here used to silently admit an element type
+                // eligible ONLY via auto-hashable (§9.2) or class/interface
+                // identity. Reject before the wrap, mirroring the indexer /
+                // for-in surface fix #3976 closed. The poison-value slot
+                // stores a well-formed no-op; the compile fails on the Error
+                // regardless.
+                if (reportSortedElementNeedsCompareTo(
+                        initTR, initTR->genericArgs[0], init->span.begin,
+                        "the `IEnumerable<T>` coercion")) {
+                    v = llvm::PoisonValue::get(ptrTy());
+                } else {
+                    llvm::Value* srcSet = v;  // capture BEFORE the snapshot
+                    llvm::Value* wrap = wrapSortedSetAsIEnumerable(srcSet, declTR);
+                    if (wrap) {
+                        v = wrap;
+                        if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                            freeDictSourceNow(srcSet, /*valDisposer=*/nullptr);
+                    }
+                }
+            } else if (initTR && isDictTypeName(initTR) &&
+                       builtinTypeName(initTR) == "SortedDictionary") {
+                // fix #4099 (stdlib §4.17, v0.306 follow-up): the SortedDictionary
+                // local-decl twin of `wrapAsIEnumerableForTarget`'s check. A
+                // SortedDictionary<K, V> initializer here used to silently
+                // admit a key type eligible ONLY via auto-hashable (§9.2) or
+                // class/interface identity. The plain Dictionary<K, V> arm
+                // below is unaffected (its `where K: IEquatable<K>` constraint
+                // admits any key with structural equality — the right
+                // contract for an unordered map). Reject before the wrap
+                // helper's `dictEntryWrapShapeSupported` gate (which itself
+                // declines the rich-key shapes with a historical fall-through
+                // to the raw bz_dict_t* — fail-loud, not silent-admit, but
+                // unreachable in the rejection lane without this check
+                // landing first). Mirrors fix #3976's indexer / for-in
+                // surface.
+                if (reportSortedElementNeedsCompareTo(
+                        initTR, initTR->genericArgs[0], init->span.begin,
+                        "the `IEnumerable<DictionaryEntry<K, V>>` coercion")) {
+                    v = llvm::PoisonValue::get(ptrTy());
+                } else if (dictEntryWrapShapeSupported(declTR, initTR)) {
+                    llvm::Value* srcDict = v;
+                    llvm::Value* wrap =
+                        wrapSortedDictionaryAsIEnumerable(srcDict, declTR);
+                    if (wrap) {
+                        v = wrap;
+                        if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                            freeDictSourceNow(srcDict);
+                    }
                 }
             } else if (initTR && isDictTypeName(initTR) &&
                        dictEntryWrapShapeSupported(declTR, initTR)) {
