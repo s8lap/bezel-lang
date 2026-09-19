@@ -11644,6 +11644,47 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                         ev = db > eb ? builder_.CreateSExt(ev, elemTy)
                                      : builder_.CreateTrunc(ev, elemTy);
                     }
+                    // fix #4427 / #4335 / #4317 (§15.1 / §8.6, v0.298): the
+                    // sibling of #4335's local-decl-init inline-array
+                    // store fix — the field-init / property-init branch of
+                    // this `emitOwnFieldInit` walk. The issue's literal
+                    // repro `public Items: [1]IHolder := [new
+                    // RecHolder("x")];` SIGSEGVs because this per-element
+                    // store loop never calls `boxForTarget`: the record's
+                    // raw (unboxed) bytes (an 8-byte string fat-pointer
+                    // word for `RecHolder(V: string)`) are stored directly
+                    // into the box-pointer-shaped slot, and a later
+                    // `.GetV()` dispatch reads those bytes as
+                    // `{vtable*, rc, payload}` and walks off the tiny
+                    // string global. Mirror the lowerLocalDecl call
+                    // (`boxForTarget(ev, elemSemaTy, cl->elements[i].get())`)
+                    // exactly: `fieldRt` is the field's DECLARED sema
+                    // TypeRef (from `fd->type` / `pd->type`, with the
+                    // #2874 imported fallback applied above), so its
+                    // `arrayElement` is the interface element TypeRef that
+                    // `boxForTarget`'s `isObjectOrInterfaceTarget` predicate
+                    // needs to recognise this as a boxing site. `fieldRt`
+                    // itself cannot be null here: this whole branch is
+                    // gated on `if (fieldRt) { … }` (line ~11565), and the
+                    // `arrayElement` read is gated on the
+                    // `fieldRt->kind == InlineArray` predicate (defense in
+                    // depth against an unexpected semantic kind). The same
+                    // `boxForTarget` is a no-op for a CLASS element
+                    // (already a bare pointer, `isBoxableValueType` false)
+                    // and for any non-Object/interface element type, so
+                    // every already-working shape is unaffected — see the
+                    // `*_class_element_unaffected_control` rows in #4335's
+                    // test file for the analogous controls.
+                    {
+                        const sema::TypeRef* elemSemaTy =
+                            (fieldRt &&
+                             fieldRt->kind ==
+                                 sema::TypeRef::Kind::InlineArray)
+                                ? fieldRt->arrayElement
+                                : nullptr;
+                        ev = boxForTarget(ev, elemSemaTy,
+                                          cl->elements[i].get());
+                    }
                     builder_.CreateStore(
                         ev, builder_.CreateGEP(fieldTy, fieldGep,
                             {builder_.getInt32(0), builder_.getInt32(i)}));
