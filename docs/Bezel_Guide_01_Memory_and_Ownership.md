@@ -126,6 +126,32 @@ Three things to copy from this:
 
 `owned` is only for class- or interface-typed fields. `string` and function-typed fields are runtime-managed and cannot be `owned` (the compiler will tell you).
 
+**The back-reference's guarantee is yours — unless you say `scoped`.** `_owner` above is admitted because it comes from a constructor parameter, and that is exactly how much the compiler checks: a borrow of a *local* may never land in a field (the local dies at scope end, which the object outlives), while a borrow of a plain parameter or of `this` may (spec §28.3). Whether the `Customer` really outlives the `BankAccount` is *not* checked — it is a recorded trust clause (spec §28.3; kernel K4.3), and a wrong guess is a `DisposedAccessException` in checked disposal mode (spec §28.2) and undefined behavior in a release build. That is the right trade for most back-references, and it is what this guide's examples use. When you want the compiler to *prove* the lifetime instead, mark the parameter `scoped` — and the argument too:
+
+```bezel
+class Statement
+  private _account: BankAccount;                       // a plain field, exactly as before
+  public constructor(scoped account: BankAccount)
+    _account := account;                               // OK: a plain field of the object being built
+  end constructor;
+  public method Print()
+    Console.WriteLine(_account.Balance.ToString());
+  end Print;
+end Statement;
+
+method PrintStatement(customer: Customer)
+  using var acct := new BankAccount(customer);         // the source: declared BEFORE the holder
+  using var stmt := new Statement(scoped acct);        // the marker at the call site, too (spec §22.3)
+  stmt.Print();
+end PrintStatement;                                    // stmt disposed first, then acct — the order the proof relies on
+```
+
+Three things together make this static: the source must be declared *before* the holder, the source is **frozen** while the holder lives (no `move`, no reassignment, no `acct.Dispose()`), and locals are disposed in reverse declaration order. So `acct` provably outlives `stmt`, its destructor included — spec §28.14 calls this fully static with no residual trust; checked mode is defense-in-depth only. The `scoped` keyword changes nothing about the field: it is the same plain back-reference, and a plain (non-`scoped`) parameter stored the §5 way stays legal under the trust regime. A source that is itself a plain *parameter* of the enclosing method needs no freeze — it already outlives every local.
+
+Four shapes the compiler rejects, each with a one-line remedy. `new Statement(scoped new BankAccount(customer))` — a fresh temporary dies at the end of the statement; bind it to a `using var` first. `var stmt := new Statement(scoped acct)` — the holder must be a `using var` local (or `this`) so the compiler has a lifetime to bound by; a plain `var` holder admits no borrow argument at all. `class Statement(scoped account: BankAccount)` — a primary-constructor parameter admits only plain and `owned` (spec §22.10); declare the field and the constructor as above. And inside `Statement`, the scoped parameter may be stored in a plain field of `this` or forwarded to another `scoped` parameter on `this`, never returned or stored in another object (spec §28.14).
+
+When to reach for it: holders that are built and discarded next to their source — readers, cursors, views, guards. When the holder will outlive the scope it was built in, the freeze would outlive it too; keep the plain form there and let checked mode stand behind it.
+
 ---
 
 ## 6. Returning ownership: factory and transfer methods
@@ -396,7 +422,31 @@ case Connect(host) of                 // fresh call: owning match
 end;
 ```
 
-**Three one-line rules.** First: `_ := x;` disposes `x` *now* and ends the binding — a marker-free consume, no marker. Afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way: a straight-line read is a use-after-dispose warning (spec §28.2) plus a checked-mode fault, while a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge (see Guide 2 §6). Second: a **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. Third: `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
+**Letting a callee keep your lambda — `scoped`.** A plain function-typed parameter is *call-bounded*: the callee may invoke it or pass it on, but may not store it — not in a field, not in a collection that outlives the call, not inside a returned closure. Try, and the diagnostic reads: parameter `cb` is call-bounded; declare it `scoped` to store it. The reason is that a closure's real lifetime is the lifetime of whatever it captured, and a plain signature says nothing about that. `scoped` is the signature that does say it: *I will keep this, for as long as the object that stores it lives* (spec §28.14):
+
+```bezel
+class Timer
+  private scoped _onTick: (() -> ())?;               // a scoped field: invoke, overwrite, clear — never read out
+  public method OnTick(scoped handler: () -> ())
+    _onTick := handler;                               // OK: a scoped field of the object being subscribed to
+  end OnTick;
+  public method Tick()
+    if _onTick <> null then _onTick(); end;
+  end Tick;
+end Timer;
+
+using var conn := new Connection("...");             // the captured source: declared BEFORE the timer
+using var timer := new Timer();
+timer.OnTick(lambda() => conn.Send(heartbeat));      // bounding object: timer, the receiver
+timer.Tick();
+// conn is frozen while timer lives: no move, no reassignment, no conn.Dispose()
+```
+
+The admission is the same one §5 states for a stored borrow, with the lambda's captures in place of the argument: the object that stores the callback must be a `using var` local (or `this`), every captured class-typed source must be declared *before* it, and those sources are frozen until it is disposed. Swap the two `using var` lines above and the `OnTick` call is rejected naming `conn`; bind the timer with a plain `var` and only capture-free lambdas are admitted. Pass a lambda literal or a method reference — those are the forms whose captures the compiler can read at the call site; a function-typed local that has been reassigned is not. On the callee side the rules are the mirror image: store only in a `scoped` field of the same object, or forward to a `scoped` parameter on `this`; never return it, bind it to a local, or store it in another object. One obligation stays yours: if your class hands the callback to anything that could fire it after the class is disposed — a worker, a registry — sever that at disposal (the stdlib's `EventSource` does so in its destructor).
+
+You have already met the shape in the standard library: `IEvent<T>.Subscribe(scoped handler)` returns an owned `Subscription`, so `using var sub := button.Clicked.Subscribe(lambda(e) => …)` bounds the handler by `sub` (stdlib §6.5); `TaskScope.Spawn(scoped body)` bounds child captures by the scope (Guide 4 §4); and `ScopeGuard`'s constructor is `scoped`, which is why its captures freeze (§10).
+
+**Three one-line rules.** First: `_ := x;` disposes `x` *now* and ends the binding — a marker-free consume, no marker. Afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way: a straight-line read is a use-after-dispose warning (spec §28.2) plus a checked-mode fault, while a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge (see Guide 2 §6). Second: a **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter, and a callee that must *keep* a callback declares the parameter `scoped` (above). Third: `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
 
 ---
 
@@ -424,7 +474,7 @@ DoWork();
 g.Dismiss();             // success: keep the registration
 ```
 
-The undo is the same `Unregister(id)` call the flag version buried in its `finally` — a unit-returning method, so the lambda is `() -> ()` by construction. On any throwing edge the guard's disposal runs the undo (`using var` covers every exit, §2); `Dismiss()` disarms it, and dismissing twice is a no-op. The `scoped` constructor parameter is what lets the guard *store* your lambda (spec §28.14), and the admission has a price you should meet before it bites: **the locals your lambda captures are frozen while the guard is live** — they may not be moved from, reassigned, or disposed. So the build-guard-commit-*hand-it-out* shape does not compile as written:
+The undo is the same `Unregister(id)` call the flag version buried in its `finally` — a unit-returning method, so the lambda is `() -> ()` by construction. On any throwing edge the guard's disposal runs the undo (`using var` covers every exit, §2); `Dismiss()` disarms it, and dismissing twice is a no-op. The `scoped` constructor parameter is what lets the guard *store* your lambda (§9; spec §28.14), and the admission has a price you should meet before it bites: **the locals your lambda captures are frozen while the guard is live** — they may not be moved from, reassigned, or disposed. So the build-guard-commit-*hand-it-out* shape does not compile as written:
 
 ```bezel
 public method Open(): owned Session
@@ -463,7 +513,9 @@ When *not* to reach for it: if the thing to undo is a **value**, it has an owner
 | Create something and clean it up here | `using var x := new T(...);` |
 | Use something you don't own | take it as a plain (non-`owned`) parameter |
 | Hold a resource inside an object | `private owned _f: T := ...;` |
-| Point back at something that outlives you | `private _f: T := ...;` (no `owned`) |
+| Point back at something that outlives you | `private _f: T := ...;` (no `owned`) — the outliving is your promise, checked mode the backstop (§5) |
+| Point back at something that outlives you, compiler-proved | `constructor(scoped p: T) _f := p; end constructor;` and `new X(scoped p)` — `using var` holder, `p` declared before it and frozen while it lives (§5) |
+| Let a callee keep your lambda | declare the parameter `scoped`, store it in a `scoped` field; call it with a lambda literal (§9) |
 | Hand a new object to the caller | return type `: owned T`, `return x;` |
 | Hand an owned local to a method that takes it | `M(move x)` (marker required) |
 | Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
