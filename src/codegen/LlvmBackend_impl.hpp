@@ -16884,6 +16884,20 @@ private:
 
     llvm::Value* implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy);
 
+    // fix #1748 (§22.7 "Observing `this` during construction", recorded
+    // residual, v0.306): the checked-disposal-mode watermark guard for a
+    // just-loaded instance-field READ. `e` is the read expression (a
+    // MemberAccessExpr for a qualified `recv.field`, or an IdentifierExpr
+    // for the implicit-`this` bare form) whose sema type carries the
+    // field's declared nullability; `val`/`elemTy` are the value CG8/CG9
+    // just loaded and its LLVM slot type. No-op outside checkedDisposal_,
+    // for a diverged block, for a non-pointer slot, or for a field whose
+    // sema type is not sema::isNonNullableReferenceType — see the .cpp
+    // definition for the full rationale (why this cannot be caught
+    // statically, and why an unconditional guard here is sound).
+    void emitFieldWatermarkGuard(const ast::Expr& e, llvm::Value* val,
+                                 llvm::Type* elemTy);
+
     // Slice CG2: integer binary operators. NOTE (§6.1): `+ - * / mod`
     // are *overflow-checked* in Bezel (raise OverflowException) and
     // `/`÷0 raises DivideByZeroException — those checks need the

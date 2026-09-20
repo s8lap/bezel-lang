@@ -6363,6 +6363,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         llvm::Value* recvPtr = nullptr;
         if (llvm::Value* addr = fieldAddr(*ma, elemTy, &recvPtr)) {
             llvm::Value* val = builder_.CreateLoad(elemTy, addr);
+            // fix #1748 (§22.7 residual, v0.306): checked-disposal watermark
+            // guard — see emitFieldWatermarkGuard for the full rationale.
+            emitFieldWatermarkGuard(*ma, val, elemTy);
             // #1039: a fresh `new <class>().valueField` read leaves the receiver
             // temp owned by nothing — dispose it now that the value is copied
             // out (no-op unless the receiver is a fresh `new` of a heap class
@@ -6605,7 +6608,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // implicit-`this` field read.
         llvm::Type* elemTy = nullptr;
         if (llvm::Value* addr = implicitFieldAddr(e, elemTy)) {
-            return builder_.CreateLoad(elemTy, addr);
+            llvm::Value* val = builder_.CreateLoad(elemTy, addr);
+            // fix #1748 (§22.7 residual, v0.306): checked-disposal watermark
+            // guard — see emitFieldWatermarkGuard for the full rationale.
+            // The bare-identifier form (`_name` inside a `this`-capturing
+            // closure) is exactly the shape the issue's probe uses: rule 3
+            // ("closures observe at invocation, not at capture") is not
+            // gated by rule 1's DA check, so a closure invoked synchronously
+            // from the constructor body before `_name` is assigned reaches
+            // this CG9 path with no compile-time diagnostic.
+            emitFieldWatermarkGuard(e, val, elemTy);
+            return val;
         }
         // #625 / §12 / §31: bare `Message` inside a user class that inherits
         // a built-in exception — sema resolved it as the inherited Exception

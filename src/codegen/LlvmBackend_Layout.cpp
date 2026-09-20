@@ -7127,4 +7127,101 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
 }
 
 
+// fix #1748 (§22.7 "Observing `this` during construction", recorded
+// residual, v0.306): rules 1-3's static observation gate (checkDefiniteAssignment)
+// rejects every UNSAFE `this`-observation it can SEE, but is explicitly "not a
+// completeness guarantee" (the spec's own words, same bound as §22.13's cycle
+// approximation): a virtual call reached through a non-virtual helper invoked
+// after the gate, external code reached by an admitted `this`-escape that
+// dispatches back, or a during-construction closure invocation (rule 3:
+// "closures observe at invocation, not at capture" — deliberately NOT gated by
+// rule 1) can all still read a field before its constructor-body assignment
+// runs. None of those routes are visible to the DA pass — a closure body's
+// field reads are exempt from the enclosing constructor's DA tracking by
+// design (rule 3), and a helper/escape call site has no static link back to
+// "am I being invoked mid-construction" — so the field read reaches codegen
+// with no compile-time diagnostic. The spec's own runtime backstop: "a read of
+// a non-nullable reference field still at that null watermark raises
+// NullReferenceException (§31.4) in checked disposal mode (§28.2) and,
+// unchecked, observes the watermark `null` with undefined behavior ... the
+// same checked/unchecked split as use-after-dispose." Before this fix,
+// checked-disposal mode had NO watermark guard at all: a program built with
+// --checked-disposal segfaulted identically to an unchecked build instead of
+// raising NullReferenceException (measured: a `this`-capturing closure
+// invoked synchronously from the constructor body, reading a field before the
+// statement that assigns it — SIGSEGV in both modes pre-fix).
+//
+// Scoped to non-nullable REFERENCE fields only (sema::isNonNullableReferenceType)
+// — a value-typed or nullable field has a well-defined §7.9 default and is
+// never reported, matching the spec's own "reference-typed field" wording.
+// `elemTy->isPointerTy()` is a belt-and-braces match against the LLVM shape
+// isNonNullableReferenceType predicts (a bare generic type parameter reads as
+// a non-nullable reference type even before monomorphization; an
+// unspecialized generic body's fallback lowering for such a field is not a
+// pointer, so the guard correctly declines there rather than misreading
+// fallback bits as an address).
+//
+// Gated on checkedDisposal_ only — not on "are we inside a constructor" or
+// "inside a this-capturing closure" — matching the spec's checked/unchecked
+// split and mirroring the existing checked-disposal DisposedAccessException
+// guard's shape (fieldAddr, above, issue #621): in a checked build this fires
+// on EVERY class/record instance-field read, regardless of whether it happens
+// during construction. That is deliberately sound rather than merely
+// sufficient: after construction completes, a non-nullable reference field
+// can never legitimately be null (§7.9's definite-assignment guarantee), so
+// the guard is a provably-false no-op on every ordinary post-construction
+// read, and it closes all three residual routes above uniformly — the
+// runtime VALUE being the null watermark is exactly the condition the spec
+// names, independent of which route produced it. A narrower guard keyed to
+// "lexically inside a constructor" would miss the helper-call and
+// this-escape routes entirely, since neither is lexically inside the
+// constructor body.
+void Emitter::emitFieldWatermarkGuard(const ast::Expr& e, llvm::Value* val,
+                                      llvm::Type* elemTy) {
+    if (!checkedDisposal_ || diverged_ || !val || !elemTy) return;
+    if (!elemTy->isPointerTy()) return;
+    const sema::TypeRef* fty = ctx_.exprType(e);
+    // fix #1748 follow-up (§7.10 "Generics and nullability", v0.306): a bare
+    // type parameter `T` is only *conservatively* non-nullable. §7.10's own
+    // words: "A field ... of bare type T ... follows §7.9's non-nullable-
+    // reference rules ... since T may be instantiated non-nullable; *reads*
+    // remain conservatively possibly-null per this section." That
+    // conservatism exists to make §7.9's DEFINITE-ASSIGNMENT obligation sound
+    // (the field must be assigned SOMETHING), not to claim every read is
+    // non-null: `new Box<string?>(null)` assigns null legitimately, and
+    // §7.10's "idempotent `?` under substitution" rule makes the substituted
+    // field genuinely `string?` there — `sema::isNonNullableReferenceType`
+    // itself has no way to see that (it reads the unsubstituted declared
+    // TypeRef, which for a bare `T` field is always Named/no-declaration,
+    // §7.10's own conservative default). Resolve through the active
+    // monomorphization binding first — `resolveTypeParamRef` is the same
+    // `genericSubstSemaTy_` lookup already trusted elsewhere in this file for
+    // the identical bare-T ambiguity (issue #567's hash-collection dispatch,
+    // #568's nullable-value unwrap) — so a nullable instantiation's read
+    // reports its true substituted type instead of T's declared-site
+    // pessimism. Empirically confirmed, not assumed: `BEZEL_DUMP_IR=1` on
+    // `new Box<string?>(null); var s := b.Get();` under --checked-disposal
+    // shows `Box$Get$spec` as bare `getelementptr`/`load`/`ret`, byte-for-
+    // byte the same shape the plain (unchecked) build already emits there —
+    // no compare, because resolveTypeParamRef found genericSubstSemaTy_["T"]
+    // = `string?` and isNonNullableReferenceType declined on the nullable
+    // result. If resolution does NOT find a binding (genericSubstSemaTy_ has
+    // no entry for this name — an unspecialized generic body is already
+    // excluded above by elemTy->isPointerTy(), i32 there, not ptr, so this
+    // is only a genuinely unrelated/headless reference type, e.g. an
+    // imported builtin whose name collides with no active generic param),
+    // resolveTypeParamRef returns `fty` UNCHANGED and classification falls
+    // through to isNonNullableReferenceType's existing, pre-#1748 posture
+    // for that shape (the same one every other call site in this codebase
+    // already relies on) — this fix adds no NEW guess in the raising
+    // direction; it only stops MIS-guessing on the one shape (a resolvable
+    // bare T) that #1748's original fix did not consider.
+    fty = resolveTypeParamRef(fty);
+    if (!fty || !sema::isNonNullableReferenceType(fty)) return;
+    emitGuardThrow(
+        builder_.CreateICmpEQ(val, llvm::ConstantPointerNull::get(ptrTy())),
+        "NullReferenceException");
+}
+
+
 }  // namespace bezel::codegen
