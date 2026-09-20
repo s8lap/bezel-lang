@@ -15029,6 +15029,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #4249 (§17.7, v0.306): the OTHER side of the `!inLambda_` gate
+        // just above. §17.7 excludes a lambda's ascribed return from the
+        // shorthand's grant in as many words — "It is **not** permitted at an
+        // expression body or at a lambda's ascribed return" — so #4208
+        // deliberately declined to TYPE the shorthand here. But declining to
+        // type it is not diagnosing it: the untyped NewExpr fell straight
+        // through to codegen's #2491 zero/null backstop, so
+        // `lambda(): W => do return new(); end` compiled with an `internal:`
+        // Warning at most and then SEGV'd (exit 139, measured 60/60) on the
+        // first member read of the null it returned — a memory-safety crash
+        // reachable from ordinary source, which is why #4249 asks for the
+        // reject rather than a wire. `currentReturnType_` is the lambda's own
+        // ascription here (§27.3/#2101 routes a lambda body's `return`
+        // through this same `returnCtx_ == ValueMethod` machinery); it may be
+        // null when the lambda has no ascription, which the shared authority
+        // handles — that shape is outside §17.7's family entirely.
+        if (rs->value && inLambda_) {
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(rs->value.get())) {
+                if (!shNe->type)
+                    rejectNewShorthandAtLambdaReturn(*shNe, currentReturnType_);
+            }
+        }
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
         checkOutPostcondAtReturn(rs->value.get(), rs->span.begin);

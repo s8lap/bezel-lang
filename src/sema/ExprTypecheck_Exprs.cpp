@@ -1059,6 +1059,37 @@ bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
     return false;
 }
 
+// fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
+// above and `rejectNewOnNonInstantiableKind` below — same shape, one
+// authority, per this repo's "duplicated classification predicates"
+// caution, CLAUDE.md / LANE_RULES.md §6). See the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. In one line: §17.7
+// grants the `new()` shorthand only positions (i), (ii), (iii) and the
+// `return e;` STATEMENT of (v), and excludes this one verbatim — "It is
+// **not** permitted at an expression body or at a lambda's ascribed
+// return". #4208 held that carve-out by declining to TYPE the shorthand
+// here (`!inLambda_`), but an untyped NewExpr is exactly what codegen's
+// #2491 zero/null backstop swallows, so the position compiled and
+// SEGV'd instead of being rejected. Both spellings of the excluded
+// position route here.
+void ExprTC::rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                               const TypeRef* rt) {
+    std::string named = "new T(...)";
+    if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration)
+        named = "new " + std::string(rt->declaration->name) + "(...)";
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "the `new()` shorthand is not permitted at a lambda's return. "
+        "§17.7 grants the shorthand exactly four positions — field "
+        "initializers, typed local-variable declarations, default "
+        "parameter values, and a `return` statement of a method with a "
+        "declared return type — and excludes this one: \"It is not "
+        "permitted at an expression body or at a lambda's ascribed "
+        "return\". (A lambda whose return type arrives only by target "
+        "inference is outside the written-declared-type family "
+        "altogether.) Name the type explicitly (`" + named + "`) (§17.7)");
+}
+
 // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298; sibling to
 // `rejectNewOnEnumOrChoice` above, same shape as #4170's own fix): the
 // single authority for "does `new` construct a value of this NAMED
@@ -9499,6 +9530,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
                     lamBodyAdmittedLiteral = clE;
                 }
+            }
+            // fix #4249 (§17.7, v0.306): the expression-body spelling of the
+            // position the ReturnStmt visitor rejects for the block-body
+            // spelling (ExprTypecheck.cpp). §17.7 excludes BOTH in one
+            // clause — "It is **not** permitted at an expression body or at
+            // a lambda's ascribed return" — and member (v)'s third
+            // declared-result position is itself "a `return` operand or
+            // expression body checked against a lambda's return-type
+            // ascription" (§27.3), so rejecting only the statement form
+            // would leave the identical silent miscompile one keystroke
+            // away. Measured at e672e7e1: `lambda(): W => new()` compiled
+            // with NO diagnostic at all (not even #2491's `internal:`
+            // Warning the block-body form emits) and SEGV'd on the first
+            // member read. Runs BEFORE the body visit, which for a typeless
+            // NewExpr would type nothing and report nothing.
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(lam->exprBody.get())) {
+                if (!shNe->type)
+                    rejectNewShorthandAtLambdaReturn(
+                        *shNe,
+                        currentReturnType_ ? currentReturnType_
+                                           : lamTargetRet);
             }
             visitExpr(*lam->exprBody);
             // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310

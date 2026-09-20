@@ -2832,6 +2832,34 @@ private:
     bool rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
                                          const TypeRef* rt);
 
+    // fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
+    // and `rejectNewOnNonInstantiableKind` above, same shape): the single
+    // authority for "§17.7 does not admit the `new()` shorthand HERE".
+    // §17.7's written-declared-type family gives its member (v) three
+    // declared-result positions, and the shorthand's own subset takes only
+    // the first: "The shorthand is permitted at the written-declared-type
+    // positions (i), (ii), (iii) and the `return e;` statement of (v) ...
+    // It is **not** permitted at an expression body or at a lambda's
+    // ascribed return". #4208 wired position (iii) and the `return e;`
+    // statement of (v), and gated that wiring on `!inLambda_` so the
+    // carve-out held — but declining to TYPE the shorthand is not the same
+    // as DIAGNOSING it. The untyped NewExpr simply fell through to codegen's
+    // #2491 zero/null backstop, so both spellings of a lambda's ascribed
+    // return — `lambda(): W => do return new(); end` (an `internal:` Warning,
+    // measured) and `lambda(): W => new()` (no diagnostic at all, measured) —
+    // compiled and then SEGV'd (exit 139, 60/60 runs) on the first member
+    // read of the null they returned. That is the same silent-wrong-answer
+    // class #4170/#4176 closed at the other shorthand sites, and #4208
+    // removed from the method-return position, left standing at this one.
+    // Reports the §17.7 exclusion at the operand's own span. `rt` may be
+    // null (a lambda whose return type would arrive only by target
+    // inference — outside the written-declared-type family entirely, per
+    // §17.7's "A lambda whose return type arrives only by target inference
+    // ... [is] outside the family"); it is used only to name the type in
+    // the suggested explicit spelling.
+    void rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                           const TypeRef* rt);
+
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the
     // silent-zero-fill defect shape). Returns true when the record
