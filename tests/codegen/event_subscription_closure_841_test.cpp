@@ -216,6 +216,44 @@ const char* k841CapturingHandlerRepro =
     "  return box.V; "  // 2
     "end Main; end C;";
 
+// fix #4509 (§27.5 / §28.9, v0.306): the LOOP-AMPLIFIED spelling of the repro
+// above, for the leak leg only. The one-shot form is a VACUOUS leak oracle: the
+// capture cell it allocates is the last one, so its pointer is routinely still
+// discoverable by LeakSanitizer's conservative stack scan and the row passes
+// whether or not the cell was ever freed. That is not a hypothesis — on the
+// pre-#4509 compiler the one-shot form reported clean while
+// `LSAN_OPTIONS=use_stacks=0` on the SAME binary reported 8 B / 1 allocation,
+// and 200 iterations reported 1592 B / 199 allocations. CLAUDE.md's oracle rule
+// ("ship the loop, 50-500 iterations") is exactly this case.
+//
+// `total == 400` proves all 200 handlers ran, so the amplification is of the
+// live shape. Returns 7.
+const char* k841CapturingHandlerReproLoop =
+    "module M; "
+    "record Ev(N: int); "
+    "class Box "
+    "  public V: int := 0; "
+    "  public method Add(x: int) V := V + x; end Add; "
+    "end Box; "
+    "class Button "
+    "  public event Clicked: Ev; "
+    "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+    "end Button; "
+    "class C public static method Main(): int "
+    "  var total := 0; "
+    "  for var i in 0..<200 do "
+    "    using var box := new Box(); "
+    "    using var b := new Button(); "
+    "    do "
+    "      using var sub := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+    "      b.Fire(2); "
+    "    end; "
+    "    total := total + box.V; "
+    "  end; "
+    "  if total = 400 then return 7; end; "
+    "  return 1; "
+    "end Main; end C;";
+
 // §24 / §27.5 / #841 NON-CAPTURING: a non-capturing handler has no env
 // (null closure environment).  bz_closure_release must be null-safe.
 // A static counter verifies the handler fired.  Returns 7.
@@ -343,6 +381,14 @@ const char* k841BoundLocalCapturing =
 BEZEL_TEST(codegen_event_subscription_closure_841,
            capturing_handler_env_released_on_sub_dispose_24_27_5) {
     expectValueAndLeakFree(k841CapturingHandlerRepro, 2);
+    // fix #4509 (§27.5 / §28.9, v0.306): the same claim, amplified, because the
+    // one-shot leg above can pass by stack-scan REACHABILITY rather than by
+    // reclamation (see k841CapturingHandlerReproLoop's note). Strictly stronger
+    // than what this row asserted before; the one-shot legs are kept as-is.
+    BEZEL_EXPECT_EQ(run(k841CapturingHandlerReproLoop), 7);
+    int lsanLoop = runUnderLeakSanitizer(k841CapturingHandlerReproLoop);
+    if (lsanLoop != -1)  // toolchain unavailable: skip, as the helper does
+        BEZEL_EXPECT_EQ(lsanLoop, 0);
 }
 
 // 841-b: a non-capturing handler (null env) — bz_closure_release must be

@@ -6824,6 +6824,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // (after every main-loop disposal in this scope), not here — the owner
         // disposal reads the object through the cell and must run first.
         if (it->boxedCellFreeDeferred) continue;
+        // fix #4509 (§27.5 / §28.9, v0.306): a refcounted capture cell's FRAME
+        // reference is dropped in the same SECOND PASS, for the same ordering
+        // reason — the owner's disposal reads the object through the cell, so
+        // the frame may not let go until every main-loop entry has run.
+        if (it->cellRelease) continue;
         // #383 / §31.1: the caught exception object. On a normal handled exit
         // it is freed (destructor + base chain + block, via its vtable); on the
         // unwind path it is SKIPPED — a re-raise/throw leaving the arm keeps it
@@ -8320,6 +8325,57 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         }
         builder_.CreateCall(freeFn(), {cell});
         // Null the guarded holder so a later re-entry allocates a fresh cell.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
+    }
+
+    // fix #4509 (§27.5 / §28.9, v0.306) SECOND PASS, second half: drop the
+    // DECLARING FRAME's reference to each refcounted capture cell this scope
+    // owns. Placed beside #1017's deferred free and after it for the identical
+    // ordering reason — every reads-through-cell disposal in this scope has
+    // run, so the frame has no further access path through the cell.
+    //
+    // WHAT IS DIFFERENT from the loop above, and it is the point of the fix:
+    // that one FREES, under a static proof that no env outlives the frame.
+    // This one RELEASES, under no such proof — the cell is freed here only if
+    // the runtime count says the frame was the last holder, and stays alive for
+    // an env that outlived it. That is why this arm can be armed for the cells
+    // #1017's cannot: the cells an escaping capturer reaches
+    // (`declsCapturedByEscaping_`), which before this had no reclaim site at
+    // all and simply leaked, 8 B per capture (#4509: 1592 B over 200
+    // iterations, measured identical with and without #1882's check).
+    //
+    // BOTH EDGES, exactly once: a given exit goes one way only, so the normal
+    // and unwind emissions of this pass are alternatives, not a pair. There is
+    // no `skipCellFreeOnUnwind` analogue here — that flag exists because a
+    // FREE on the unwind edge could outrun a #1422 zombie drain still reading
+    // the cell; a release cannot, since a reader that still holds a counted
+    // reference keeps the cell alive by construction.
+    //
+    // THE HOLDER IS NULLED afterwards, exactly as `boxedCellFree` nulls its
+    // own, and for a reason that is easy to get wrong the other way (this code
+    // did, and the regression is worth recording). A scope can be RE-ENTERED:
+    // a captured local declared inside a `while` body has its declaring scope
+    // exited once per iteration, so this release runs once per iteration — but
+    // the cell HOLDER is a function-entry alloca that keeps the previous
+    // iteration's cell pointer whenever the next iteration does not reach the
+    // capture site again (a capture behind an `if`, say). Without the null,
+    // iteration 1 releases iteration 0's cell a SECOND time; with an env still
+    // holding it, that is a use-after-free, measured on
+    // `codegen_const_narrowing_capture_2597.loop_declared_const_captures_per_iteration_spec_27_5`
+    // (`const t` bound behind an `if` inside a `while`, captured by a closure
+    // that outlives the loop). Nulling makes the re-entry release a null, which
+    // `bz_cell_release` treats as a no-op, and leaves `boxLocalSlot`'s guard to
+    // allocate a fresh cell on the next capture — the same contract the free
+    // above relies on. The frame's reference is gone either way once this has
+    // run, so the holder is genuinely dead at this point.
+    for (const auto& d : scope) {
+        if (!d.cellRelease) continue;
+        llvm::Value* cell =
+            builder_.CreateLoad(ptrTy(), d.slot, "cell.rc.ptr");
+        builder_.CreateCall(
+            declareC("bz_cell_release", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {cell});
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
     }
 

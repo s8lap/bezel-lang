@@ -3105,8 +3105,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // `using var` (class dispose etc.) are excluded here; the
                             // runtime-managed cell free is preserved, or the cell
                             // leaks (the #1418 4-byte leak on `return count`).
+                            // fix #4509: `cellRelease` is preserved beside
+                            // them and for the same reason — returning the
+                            // local yields a COPY of the cell's contents, not
+                            // the frame's counted reference to the cell, which
+                            // still has to be dropped here.
                             return e.slot == retSlot &&
-                                   !e.boxedCellFree && !e.boxedCellFreeDeferred;
+                                   !e.boxedCellFree &&
+                                   !e.boxedCellFreeDeferred && !e.cellRelease;
                         }),
                     scope.end());
             }
@@ -4432,9 +4438,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // reference — the same use-after-free trade
                         // `inlineOwnedArrayCell` is in the list to avoid. The
                         // residue is the pre-existing §27.5 leak, unchanged.
+                        // fix #4509 (§27.5 / §28.9, v0.306): `cellRelease`
+                        // joins the list for the same reason as its
+                        // neighbours — it drops a COUNTED reference held by
+                        // the declaring frame, and the scope exit already
+                        // dropped it. Replaying it on the abandonment /
+                        // Dispose edge would be a second drop of one
+                        // reference: an over-release, and with an env still
+                        // holding the cell, a use-after-free.
                         if (d.closureRelease || d.boxedCellFree ||
                             d.boxedCellFreeDeferred || d.inlineOwnedArrayCell ||
-                            d.capturedCellContentRelease)
+                            d.capturedCellContentRelease || d.cellRelease)
                             continue;
                         if (d.iterEnumDispose) {
                             auto* alloca =

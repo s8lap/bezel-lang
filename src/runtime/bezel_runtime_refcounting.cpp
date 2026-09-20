@@ -633,3 +633,62 @@ static void bz_drain_borrow_table(void) {
     // the libstdc++ cv destructor is lock-free).
     (void)drained.size();
 }
+
+// ---------------------------------------------------------------------------
+// fix #4509 (§27.5 / §28.9, v0.306): CAPTURE-CELL reference counting.
+//
+// The full protocol is documented at the declarations in bezel_runtime.h. In
+// one line: the declaring frame's reference to a capture cell is implicit and
+// unannounced, every closure env that captures the cell announces itself with
+// `bz_cell_retain`, and each of them — envs and frame alike — lets go with
+// `bz_cell_release`; the last one out frees the cell.
+//
+// WHY A SIDE TABLE and not a header word: see bezel_runtime.h. The pattern is
+// the one `g_identity_hashes` above already uses, mutex and all.
+//
+// WHY THE FIRST RETAIN RECORDS 2: the frame's reference exists from the
+// `calloc` in `boxLocalSlot` and is never announced — announcing it would mean
+// teaching all three allocation sites which cells are refcounted, which they
+// cannot know (the classification is made later, at the capture site). So the
+// table's invariant is "entry present ⇒ value == frame + live envs", and the
+// first env to arrive establishes it at 2. A cell that no env ever retains
+// stays out of the table entirely, and `bz_cell_release` on it is a plain
+// `free` — which is exactly what the pre-#4509 scope-end path emitted, so an
+// unclassified cell is byte-identical.
+//
+// EXACTLY-ONCE: codegen emits one retain per env capture-store, one release in
+// that env's envdtor, and one release at the declaring scope's end (on both the
+// normal and the unwind edge, a given exit going one way only). So releases ==
+// 1 + N and the count reaches 0 exactly once. An env that is never released
+// (a leaked closure) leaves the cell alive — the leak direction, which is the
+// PRIME DIRECTIVE's safe side.
+//
+// ADDRESS REUSE is not a hazard: the entry is erased under the lock in the same
+// critical section that decides to free, so a later `calloc` handing back the
+// same address finds no stale entry.
+// ---------------------------------------------------------------------------
+static std::unordered_map<void*, int64_t> g_cell_rc;
+static std::mutex                         g_cell_rc_mtx;
+
+extern "C" void bz_cell_retain(void* cell) {
+    if (!cell) return;
+    std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+    auto it = g_cell_rc.find(cell);
+    if (it == g_cell_rc.end()) g_cell_rc.emplace(cell, 2);  // frame + this env
+    else ++it->second;
+}
+
+extern "C" void bz_cell_release(void* cell) {
+    if (!cell) return;
+    {
+        std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+        auto it = g_cell_rc.find(cell);
+        if (it != g_cell_rc.end()) {
+            if (--it->second > 0) return;
+            g_cell_rc.erase(it);
+        }
+        // Not in the table: no env ever retained it, so the frame is the only
+        // holder and this release is the cell's one and only free.
+    }
+    free(cell);
+}

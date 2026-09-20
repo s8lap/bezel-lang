@@ -16994,9 +16994,13 @@ void Emitter::consumeLastLambdaCapturedCells() {
                 // the slot, not a value reached by dereferencing the slot as a
                 // cell pointer). All other disposals use boxedStorage(slot)
                 // which dereferences the cell — unsafe to free beforehand.
+                // fix #4509 (§27.5 / §28.9, v0.306): `cellRelease` is a
+                // runtime-managed drop of the frame's reference to the cell
+                // holder — it never dereferences the slot as a cell pointer —
+                // so it belongs with these, not with the readers below.
                 if (existing.stringRelease || existing.closureRelease ||
                     existing.boxRelease    || existing.boxedCellFree ||
-                    existing.boxedCellFreeDeferred)
+                    existing.boxedCellFreeDeferred || existing.cellRelease)
                     continue;
                 // This existing disposal READS THROUGH the cell; freeing the
                 // cell via boxedCellFree would be a UAF.
@@ -35495,6 +35499,15 @@ void Emitter::collectCellFreeEligible(
     // Key space: the same as cellFreeEligible_ (DeclSymbol* / ParameterSymbol*).
     for (const auto& [decl, _] : escapingCapturersOf)
         declsCapturedByEscaping_.insert(decl);
+
+    // fix #4509 (§27.5 / §28.9, v0.306): preserve the nested-widening keys past
+    // this function's scope. #4509's refcount route must decline them — it
+    // cannot count an env created at a capture site inside a nested lambda
+    // body, because the classification there is short-circuited on
+    // `currentFn_`. See nestedWidenedCellKeys_'s declaration for the measured
+    // use-after-free that follows from not declining.
+    for (const void* key : nestedWidenedKeys)
+        nestedWidenedCellKeys_.insert(key);
 
     // A captured entity qualifies iff:
     //   - it appears in capturedByNonEscaping (at least one non-escaping lambda

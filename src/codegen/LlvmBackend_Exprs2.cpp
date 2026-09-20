@@ -1215,6 +1215,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // local patches were tried and each is unsound, see #2718. Write paths
         // this gate does not see are #2719.
         bool                   suppressContentRcInEnvdtor = false;
+        // fix #4509 (§27.5 / §28.9, v0.306): this capture's cell is REFCOUNTED
+        // — the env announces itself with `bz_cell_retain` at the capture-store
+        // and drops that reference with `bz_cell_release` in the envdtor, and
+        // the declaring scope's end drops the frame's implicit one (a
+        // `Disposal::cellRelease` entry in the #1017 SECOND PASS). Set only for
+        // a cell that every STATIC route declines — an escaping capturer exists
+        // (`declsCapturedByEscaping_`) so `cellFreeEligible_` refused the
+        // scope-end free, and neither #694's nor #3426's envdtor route armed —
+        // i.e. exactly the cells that leak today. Because those cells have NO
+        // free emitted for them anywhere, adding a balanced retain/release pair
+        // cannot introduce a double free; the worst arithmetic error is a
+        // surviving leak. Disjoint from `freeCellInEnvdtor` by construction.
+        bool                   retainCellInEnv = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -2432,6 +2445,109 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(decl), &lam))
             ce.freeCellInEnvdtor = true;
+        // fix #4509 (§27.5 / §28.9, v0.306): REFCOUNT this cell when — and only
+        // when — every static route has declined it, which is exactly the set
+        // that leaks today. The three declines, read off the sets that make
+        // them rather than respelled:
+        //
+        //   * the SCOPE-END route refused because an escaping lambda captures
+        //     the local (`declsCapturedByEscaping_`, #4210) and so it is not in
+        //     `cellFreeEligible_` — an escaping env holds a raw cell pointer
+        //     that MAY outlive the frame, which is a statement about what
+        //     cannot be PROVEN, not about what happens;
+        //   * #3426's shared-cell envdtor route refused (no
+        //     `sharedCellEnvdtorFreeOwner_` entry);
+        //   * #694's envdtor route refused — it needs the sole capturer to be
+        //     DEFINITELY escaping, and `definitelyEscapingLambdas_`'s own
+        //     condition (b) declines "a lambda merely passed as an argument"
+        //     because it "proves nothing about when its env dies".
+        //
+        // All three are the same missing fact: WHEN the escaped env dies. That
+        // is a runtime quantity, so answer it at runtime — the frame and every
+        // env each hold a counted reference and the last one out frees the
+        // cell. This is the narrow, cell-only half of the model #2718 sketches;
+        // it deliberately does not touch the cell's CONTENTS accounting, which
+        // is that issue's separate (and harder) half.
+        //
+        // SAFETY, stated as the property that makes this a narrow change: for
+        // this set of cells today's codegen emits NO free at all — that is the
+        // defect. So adding a balanced retain/release pair cannot turn a free
+        // into a double free; the only arithmetic failure available is a
+        // surviving leak, which is the PRIME DIRECTIVE's safe direction.
+        //
+        // DELIBERATELY EXCLUDED, each a separate shape with its own reclaim
+        // story: a for-var (fresh cell per iteration, #4129/#4161), an inline
+        // owned array (the #747/#782 element-dispose-through-cell pairing), a
+        // cell reached by the §27.5/#1135 NESTED-lambda widening
+        // (`nestedWidenedCellKeys_`) — the protocol needs EVERY env to announce
+        // itself, and a capture site inside a nested lambda body runs with
+        // `currentFn_` set to the inner function, where this classification is
+        // short-circuited, so such an env would hold the cell uncounted; that
+        // is not theoretical, it is the measured UAF on
+        // `outer_called_twice_one_escapes_no_uaf` — and a captured PARAMETER
+        // (`declScopeDepth_` holds LOCALS only, per #3403).
+        // SCOPE OF THIS FIRST CUT, and the second half is measured, not
+        // assumed. A capture whose CONTENTS the envdtor or the box machinery
+        // also accounts for — a `string`/`string?`, a function type, a boxed
+        // value (`releaseBoxInEnvdtor`), or one under #2706's
+        // `suppressContentRcInEnvdtor` — is left alone. Two reasons, both
+        // load-bearing:
+        //
+        //   * The cell's lifetime is entangled there with the CONTENTS
+        //     refcount that #2718 leaves open ("rc(contents) must equal the
+        //     LIVE ENV COUNT"), and #4509 is deliberately only the cell half.
+        //   * Measured: for that shape the count cannot reach zero today
+        //     anyway, so arming it reclaims nothing. On
+        //     `const_narrowing_lambda_capture_value_2597` the escaping
+        //     closure is itself never released (the #4422/#4431 family), so
+        //     the cell keeps a live holder and `use_stacks=0` reports the
+        //     SAME 64 B / 3 allocations with and without this fix — while the
+        //     extra load+call+store perturbs the frame enough to move an
+        //     unrelated pre-existing 48 B closure leak out of LSan's
+        //     conservative stack scan and flip that row's one-shot oracle.
+        //     Reclaiming nothing is not worth unmasking somebody else's leak,
+        //     so it waits for #4509's follow-up alongside #2718.
+        const bool contentsAlsoManaged =
+            ce.releaseBoxInEnvdtor || ce.suppressContentRcInEnvdtor ||
+            (ce.semaTy &&
+             ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
+               ce.semaTy->primitive == sema::PrimitiveType::String) ||
+              ce.semaTy->kind == sema::TypeRef::Kind::Function));
+        if (!isForVar && !isInlineOwnedArray && !contentsAlsoManaged &&
+            !ce.freeCellInEnvdtor &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            declsCapturedByEscaping_.count(static_cast<const void*>(decl)) &&
+            !nestedWidenedCellKeys_.count(static_cast<const void*>(decl)) &&
+            !cellFreeEligible_.count(static_cast<const void*>(decl)) &&
+            !sharedCellEnvdtorFreeOwner_.count(static_cast<const void*>(decl)) &&
+            !(singleCaptureLocals_.count(static_cast<const void*>(decl)) &&
+              definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)))) {
+            auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
+            if (ddit != declScopeDepth_.end() && ddit->second >= 1 &&
+                ddit->second <= disposeStack_.size()) {
+                ce.retainCellInEnv = true;
+                // The frame's release goes in the scope that DECLARED the
+                // local (`declScopeDepth_` records disposeStack_.size() at the
+                // declaration, so the scope's index is one less), where the
+                // #1017 SECOND PASS runs it after every reads-through-cell
+                // disposal in that scope. One entry per cell holder, however
+                // many lambdas capture it — the second capture reaches
+                // boxLocalSlot's already-boxed path with the same `newSlot`,
+                // so the dedup is an identity test on the holder.
+                const std::size_t ownerIdx = ddit->second - 1;
+                bool alreadyRegistered = false;
+                for (const auto& existing : disposeStack_[ownerIdx])
+                    if (existing.slot == newSlot && existing.cellRelease) {
+                        alreadyRegistered = true;
+                        break;
+                    }
+                if (!alreadyRegistered) {
+                    Disposal dcr{newSlot, nullptr};
+                    dcr.cellRelease = true;
+                    disposeStack_[ownerIdx].push_back(dcr);
+                }
+            }
+        }
         captures.push_back(ce);
     }
 
@@ -3557,6 +3673,23 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             llvm::Value* dst = builder_.CreateStructGEP(
                 envTy, envAlloc, static_cast<unsigned>(i));
             builder_.CreateStore(ce.envValue, dst);
+            // fix #4509 (§27.5 / §28.9, v0.306): announce this env as a holder
+            // of a REFCOUNTED capture cell. Emitted HERE, at the one site that
+            // stores the cell pointer into an env, so the retain and the store
+            // are the same event — one retain per env, on whatever path builds
+            // the env, with no way for a conditional capture path to retain a
+            // cell it never stored. The matching drop is in this lambda's
+            // envdtor; the frame's own drop is the `Disposal::cellRelease`
+            // registered at the capture site. See CaptureEntry::retainCellInEnv.
+            //
+            // This is a reference to the CELL, which is a different object from
+            // the cell's CONTENTS — the retain the long note below declines is
+            // on the contents, and that reasoning is untouched.
+            if (ce.retainCellInEnv)
+                builder_.CreateCall(
+                    declareC("bz_cell_retain", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy()}),
+                    {ce.envValue});
             // #429 / #672 / §27.5 / §28.9: NO extra retain at capture-store time.
             //
             // RATIONALE: per §28.3/§28.9, ALL captures are borrows from the
@@ -3768,6 +3901,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // escaped), and this is the single holder, so this is the cell's
                 // only free — no double-free; the defining scope is gone before the
                 // escaped closure dies, so no later access through the cell — no UAF.
+                // fix #4509 (§27.5 / §28.9, v0.306): drop THIS env's counted
+                // reference to a refcounted capture cell. Runs after the
+                // content-release branches above, which read through the cell,
+                // and is the mirror of the `bz_cell_retain` at the env's
+                // capture-store. The cell is freed here only if this env is the
+                // last holder — if the frame has already let go and no sibling
+                // env remains. When the frame is still live (the ordinary case
+                // for a subscription disposed inside the declaring scope) the
+                // count merely falls and the frame's own later read through the
+                // cell is safe; when the env OUTLIVES the frame the order is
+                // reversed and this is the free. Neither order needs a static
+                // proof, which is the whole point.
+                //
+                // Mutually exclusive with `freeCellInEnvdtor` below: that flag
+                // arms only on #694/#3426's proven-sole-holder routes, which
+                // are preconditions this classification excludes.
+                if (ce.retainCellInEnv)
+                    builder_.CreateCall(
+                        declareC("bz_cell_release", llvm::Type::getVoidTy(llvm_),
+                                 {ptrTy()}),
+                        {cell});
                 if (ce.freeCellInEnvdtor) {
                     // fix #4210 (§27.5 / §28.9, v0.298): store the freed cell
                     // pointer to the module-level global so boxLocalSlot detects

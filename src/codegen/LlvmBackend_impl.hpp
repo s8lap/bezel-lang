@@ -2043,6 +2043,24 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #4509 (§27.5 / §28.9, v0.306): drop the DECLARING FRAME's
+        // reference to a REFCOUNTED capture cell (`bz_cell_release`), rather
+        // than free it outright. Registered once per cell holder, in the scope
+        // that declared the captured local, for exactly the cells no static
+        // route can name a free site for — one whose capturers include a
+        // conservatively-escaping lambda (see `CaptureEntry::retainCellInEnv`).
+        // Emitted in the #1017 SECOND PASS beside `boxedCellFreeDeferred`, and
+        // for the same reason: it must run AFTER every reads-through-cell
+        // disposal in the scope. It differs from that flag in what it emits and
+        // in what it proves — `boxedCellFreeDeferred` is a free that a static
+        // proof licensed, this is a release whose safety the RUNTIME count
+        // establishes, so it is correct even when an env outlives the frame.
+        // Mutually exclusive with `boxedCellFree` / `boxedCellFreeDeferred`:
+        // those arm only where no escaping capturer exists, this only where one
+        // does. Reads nothing through the cell, so it is in the
+        // `consumeLastLambdaCapturedCells` / LlvmBackend_Stmts.cpp exclusion
+        // lists beside them.
+        bool cellRelease = false;
         // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): parallel to
         // `dictEntryKeyRelease` (LlvmBackend_Setup.cpp) but for a
         // string-keyed `DictionaryEntry<string,V>` local captured by a
@@ -13038,6 +13056,7 @@ private:
               unwindUnsafeCellFree_(e.unwindUnsafeCellFree_),
               sharedCellEnvdtorFreeOwner_(e.sharedCellEnvdtorFreeOwner_),
               declsCapturedByEscaping_(e.declsCapturedByEscaping_),  // fix #4210
+              nestedWidenedCellKeys_(e.nestedWidenedCellKeys_),  // fix #4509
               cellFreeEligibleFn_(e.cellFreeEligibleFn_) {}
         ~CaptureReclaimSetScope() {
             e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
@@ -13066,6 +13085,8 @@ private:
                 std::move(sharedCellEnvdtorFreeOwner_);
             e_.declsCapturedByEscaping_ =
                 std::move(declsCapturedByEscaping_);  // fix #4210
+            e_.nestedWidenedCellKeys_ =
+                std::move(nestedWidenedCellKeys_);  // fix #4509
             e_.cellFreeEligibleFn_ = cellFreeEligibleFn_;
         }
         CaptureReclaimSetScope(const CaptureReclaimSetScope&) = delete;
@@ -13109,6 +13130,7 @@ private:
         // boxedCellFree arming condition to prevent double-free when an escaping
         // lambda also captures the same local as a non-escaping lambda.
         std::unordered_set<const void*> declsCapturedByEscaping_;
+        std::unordered_set<const void*> nestedWidenedCellKeys_;  // fix #4509
         llvm::Function* cellFreeEligibleFn_;
     };
 
@@ -16075,6 +16097,22 @@ private:
     // condition to prevent double-free when an escaping lambda also captures
     // the same local as a non-escaping lambda.
     std::unordered_set<const void*> declsCapturedByEscaping_;
+    // fix #4509 (§27.5 / §28.9, v0.306): the §27.5/#1135 NESTED-lambda widening
+    // keys, preserved out of `collectCellFreeEligible`'s local
+    // `nestedWidenedKeys`. #3426 already declines these as envdtor-free owners
+    // (its condition (d)) because the widening records NO owner node; #4509's
+    // refcount route declines them for the STRICTER reason that it cannot even
+    // COUNT them. Its protocol needs every env holding a cell to announce
+    // itself, and a capture site inside a NESTED lambda body runs with
+    // `currentFn_` set to the inner function, where the classification is
+    // short-circuited — the bypass #2718's closing comment names. Such an env
+    // would hold the cell without a counted reference, and the frame's release
+    // could then reach zero while it is still reading. Measured as exactly that
+    // use-after-free on
+    // `codegen_deeply_nested_escaping_lambda_3804.outer_called_twice_one_escapes_no_uaf`
+    // before this set was consulted. Declining leaves the pre-existing leak,
+    // which that row already pins as its accepted trade-off.
+    std::unordered_set<const void*> nestedWidenedCellKeys_;
     // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
     bool isSharedCellEnvdtorFreeOwner(const void* key,
                                       const ast::LambdaExpr* lam) const {

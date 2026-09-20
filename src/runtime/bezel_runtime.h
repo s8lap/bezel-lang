@@ -1337,6 +1337,38 @@ int32_t bz_identity_hash_table_size(void);
 // only the cell + env block, never a captured value. null is a no-op.
 void bz_closure_retain(void* c);
 void bz_closure_release(void* c);
+// fix #4509 (§27.5 / §28.9, v0.306): CAPTURE-CELL reference counting.
+//
+// A captured local is promoted to a shared heap CELL (`boxLocalSlot`). The
+// declaring frame holds one reference to it (the cell-holder alloca) and every
+// closure env that captures the local holds another. When at least one of those
+// envs belongs to a lambda the escape analysis can only class as
+// CONSERVATIVELY escaping — "merely passed as an argument", which proves
+// nothing about when the env dies — no static route can name a single safe free
+// site, so today nobody frees the cell at all (the 8 B/capture leak #4509
+// measures). These two entry points make that decision at RUNTIME instead: the
+// last holder to let go frees the cell, whichever it is.
+//
+// PROTOCOL, and it is opt-in per cell. `bz_cell_retain` is emitted at an env's
+// capture-store and `bz_cell_release` in that env's `envdtor` and once at the
+// declaring scope's end, and ONLY for cells codegen has classed as refcounted
+// (see `CaptureEntry::retainCellInEnv`). A cell nobody retains never enters the
+// table, and `bz_cell_release` on such a cell is a plain `free` — so the two
+// protocols coexist and an unclassified cell keeps byte-identical behaviour.
+//
+// The count is kept in a side table rather than in a header word on the cell
+// (the layout #2718 sketches) deliberately: the cell holds a value of arbitrary
+// type at offset 0 and is read through by `boxedStorage`, every lambda body,
+// and several by-value struct GEPs, so a header is an ABI change across all of
+// them, while a side table is none. It costs a lock + hash per capture and per
+// drop, which is the simplicity-over-speed trade this project makes until the
+// compiler is functionally complete.
+//
+// The FIRST retain records 2, not 1: the frame's own reference is implicit (it
+// exists from `calloc` and is never announced), so the first env to arrive is
+// the second holder. null is a no-op for both.
+void bz_cell_retain(void* cell);
+void bz_cell_release(void* cell);
 // #4475 (§28.2): closure-as-object use-after-dispose guard. Set/read the
 // per-instance disposed flag (offset 40, see layout above). bz_closure_mark_disposed
 // is idempotent (subsequent calls no-op). bz_closure_is_disposed returns 0 for
