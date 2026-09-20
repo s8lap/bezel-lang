@@ -5470,6 +5470,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool isOwnedSetRecv = recvTy && recvTy->astNode &&
             recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
             recvTy->headName() == "OwningSet";
+        // fix #3491 / stdlib §4.10: isBorrowingSetRecv — the borrowing
+        // counterpart of isOwnedSetRecv, i.e. this call's receiver is exactly
+        // a `Set<T>` (class T). Gates the dedup handling for `.Add`/`.TryAdd`
+        // below on a BORROWING class-element set — Array<T>/Stack<T>/Queue<T>
+        // (which share the generic Add/Push/Enqueue handler further down)
+        // must keep their plain-append behavior.
+        bool isBorrowingSetRecv = recvTy && recvTy->astNode &&
+            recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "Set";
         // stdlib §4.10 / §8.3 (#837): OwningSet<T>.Add(owned item) for class-typed
         // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
         // user `Equals` override) it silently disposes the passed item rather than
@@ -5494,6 +5503,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // call on the dup branch). Mirrors the OwningArray.Add/Insert and
             // user-method nulling paths (#1955 / #1918).
             nullTransferredOwnedLocalSlot(call.args[0].value.get());
+            return llvm::ConstantInt::get(i32(), 0);  // unit
+        }
+        // fix #3491 / stdlib §4.10 / §8.3: Set<T>.Add(item: T) for class-typed
+        // T must DEDUPLICATE exactly like OwningSet<T>.Add above — "the
+        // element type supplies the identity" (§4.10) and adding an
+        // already-present element leaves the set unmodified. Before this fix
+        // a borrowing Set<T> with a class element fell through to the generic
+        // array Add/Push/Enqueue handler further below, which just appends
+        // unconditionally: `Count` grew and the element was stored twice even
+        // though `Contains` already reported it present (issue #3491).
+        // Uses the SAME shared emitArrayBackedSetInsert helper as
+        // OwningSet<T>.Add — the one fix-at-the-shared-path-once — but with a
+        // NULL dupDisposer (arrElemPol was computed with owningFamily=false
+        // above, so its ClassBorrow row already carries a null disposerThunk,
+        // per §28.11 v0.135: a BORROWING Set<T> must never dispose a rejected
+        // duplicate, unlike OwningSet<T>). `item` is a pure borrow
+        // (`Add(item: T)`, no `owned`) either way — appended or not.
+        // fix #1881 / §28.3: mirror the generic borrowing Add path's rule for
+        // a fresh owned producer argument used only as a borrow (`st.Add(new
+        // C(...))`) — Set<T>.Add never takes ownership of `item`, dup or not,
+        // so such a producer must still be disposed at the end of this full
+        // expression.
+        if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
+            isBorrowingSetRecv && arrElemIsClass && !arrIsOwning) {
+            llvm::Value* item = lowerExpr(*call.args[0].value);
+            if (!item) return nullptr;
+            if (!emitSetDedupInsert(item)) return nullptr;
+            if (isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return llvm::ConstantInt::get(i32(), 0);  // unit
         }
         // fix #1474 / stdlib §4.10: OwningSet<T>.UnionWith(owned other:
@@ -5894,8 +5932,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Semantics: scan the array for an EQUAL element; if not found, append
         // and return true; if found, dispose the passed item (caller transferred
         // ownership; §4.10 "on false, the item is disposed") and return false.
+        // fix #3491: widened to also cover the BORROWING Set<T>.TryAdd(item):
+        // bool (isBorrowingSetRecv) — before this fix no handler existed for a
+        // class-element receiver with arrIsOwning=false, so the call lowered
+        // to nullptr and the caller's local degraded to codegen's #2434
+        // zero-init fallback (the `bool` result was silently `false`
+        // regardless of the answer). arrElemPol was computed with
+        // owningFamily=arrIsOwning above, so on the borrowing arm its
+        // ClassBorrow row already carries a null disposerThunk — the
+        // `if (arrElemPol.disposerThunk)` dup-branch guard below therefore
+        // already does the right thing unmodified: a borrowing Set<T> must
+        // NOT dispose a rejected duplicate (§28.11 v0.135), only
+        // OwningSet<T> does.
         if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
-            arrElemIsClass && arrIsOwning) {
+            arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -5955,6 +6005,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "ta.r");
             phi->addIncoming(builder_.getFalse(), foundBB);
             phi->addIncoming(builder_.getTrue(), newBB);
+            // fix #3491 / #1881 / §28.3: a BORROWING Set<T>.TryAdd never takes
+            // ownership of `item` (dup or newly-inserted alike — the dup
+            // branch above deliberately does NOT dispose it, per §28.11's
+            // borrowing-column rule). Mirror the generic borrowing Add path's
+            // rule for a fresh owned producer argument used only as a borrow
+            // (`st.TryAdd(new C(...))`): dispose it here so it does not leak.
+            // Not applicable to the owning arm — OwningSet<T>.TryAdd's `owned
+            // item` always has its ownership resolved above (transferred into
+            // the array on insert, disposed on the dup path).
+            if (!arrIsOwning && isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return phi;
         }
         // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T): owned T —
