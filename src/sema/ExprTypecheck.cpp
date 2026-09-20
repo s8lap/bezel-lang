@@ -13066,6 +13066,17 @@ void ExprTC::checkCollectionLiteralElementAssignability(
                         // An unresolved element type keeps the rejection:
                         // #4351's contract is no weaker for anything this
                         // cannot prove to be a boxed value.
+                        //
+                        // UN-MASKED RESIDUAL (#4478). Admitting a record
+                        // element here exposes a pre-existing §8.6 hole that
+                        // this rejection had been incidentally hiding: a
+                        // boxed BORROW-BEARING record escaping its source
+                        // scope is not rejected, and that escape is a
+                        // measured heap-use-after-free. The defect is
+                        // #4478's, not this guard's — nothing here creates
+                        // it, and re-widening this rejection would not be
+                        // the fix for it — but a reader who reaches this
+                        // line without `git log` needs the pointer.
                         const TypeRef* elTy = ctx_.exprType(*el);
                         const bool constructsClassInstance =
                             !elTy || elTy->kind != TypeRef::Kind::Named ||
