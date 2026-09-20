@@ -8413,6 +8413,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // two issues name). The other free-standing callers,
         // `emitDisposals(stringReleases)`, dispose only strings and never trip
         // the gate, so this guard costs them nothing.
+        //
+        // ⚠ WHAT THIS CHECK DOES *NOT* CAUSE, recorded because it looks exactly
+        // like a regression and was investigated as one (#4509). Emitting the
+        // check adds two blocks and a `bz_exc_addr` load to the tail of a
+        // scope-end pass, which perturbs `main`'s register/stack layout — and
+        // that is enough to move a §27.5 capture cell OUT of LeakSanitizer's
+        // conservative stack scan. `codegen_event_subscription_closure_841.
+        // capturing_handler_env_released_on_sub_dispose_24_27_5` is a ONE-SHOT
+        // LSan row over a `using var` class local captured by a lambda passed
+        // to `Event<T>.Subscribe`; its 8-byte cell has no owner (§27.5 / §28.9:
+        // the scope-end route declines on `declsCapturedByEscaping_`, and both
+        // envdtor routes decline because a lambda "merely passed as an
+        // argument" proves nothing about when its env dies — see
+        // `sharedCellEnvdtorFreeOwner_`'s declaration, condition (b)). The row
+        // passes on base only because the cell pointer stays REACHABLE, not
+        // because the cell is freed.
+        //
+        // Measured (generated code uninstrumented over an ASan-instrumented
+        // runtime — the row's own recipe): with this check disabled, one-shot
+        // clean but `LSAN_OPTIONS=use_stacks=0` reports the same 8 B / 1 alloc;
+        // loop-amplified to 200 iterations, 1592 B / 199 allocs, BYTE-IDENTICAL
+        // with and without this check. So the leak is wholly pre-existing and
+        // this check neither creates nor widens it. Do NOT narrow the gate to
+        // silence that row: narrowing would re-mask a real leak and would drop
+        // a §28.4 disposal point the issue this change closes is about. #4509
+        // tracks the cell's missing owner; the durable test-side remedy is the
+        // loop amplification this project's own oracle rules already require.
         if (hi != kAllLiveScopes)
             emitDisposalFaultCheck(excAtPassEntry, hi);
     }
