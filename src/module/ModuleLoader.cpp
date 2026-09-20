@@ -1,7 +1,7 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
-#include <cstdlib>   // std::strtoll (fix #3183)
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -183,6 +183,29 @@ std::vector<sema::ContractRecord> toContractRecords(
     return out;
 }
 
+// fix #4508 (§15.1 / §2.8.3 rule 4, v0.306): the ONE decode of an inline array's
+// EXTENT from its textual form, shared by every reader that needs the number.
+//
+// `MetaType::arraySize` carries the extent as a folded decimal (#3183); the
+// synthetic reconstruction source `metaTypeToSourceText` writes carries the same
+// digits; and `Loader::convert` turns them into `TypeRef::arraySizeValue`. Three
+// readers, one rule — and two of the three are the §14/#705 signature-key
+// renderers that must agree BYTE FOR BYTE (`metaTypeSigText` vs
+// `astTypeToSigText`), so a second copy of the rule is a silent
+// stops-matching defect waiting to happen. Returns the extent, or -1 for any
+// shape that is not a well-formed positive decimal — including the empty string
+// an old artifact carries and the deliberate omission for a size the exporter
+// could not fold, which #3183 keeps failing loudly downstream.
+static long long metaInlineArrayExtent(std::string_view s) {
+    if (s.empty() || s.size() > 18) return -1;  // 18 digits < 2^63, no overflow
+    long long n = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return -1;
+        n = n * 10 + (c - '0');
+    }
+    return n > 0 ? n : -1;
+}
+
 // One reconstruction context for a single loadMetadata call. Holds the
 // name → reconstructed-TypeSymbol map so a MetaType::Named referring to another
 // exported type of the same module resolves to its symbol (§2.5 by-name
@@ -303,16 +326,14 @@ struct Loader {
                 // leaves `arraySizeValue` at -1, which is the condition
                 // `sema::serializationComponentTypeIsEmittable` and
                 // `Emitter::lowerTypeRef` both key on to fail LOUDLY.
-                if (!mt.arraySize.empty()) {
-                    const std::string& s = mt.arraySize;
-                    bool allDigits = true;
-                    for (char c : s)
-                        if (c < '0' || c > '9') { allDigits = false; break; }
-                    if (allDigits && s.size() <= 18) {
-                        long long n = std::strtoll(s.c_str(), nullptr, 10);
-                        if (n > 0) ref->arraySizeValue = n;
-                    }
-                }
+                //
+                // fix #4508: the acceptance rule moved VERBATIM into
+                // `metaInlineArrayExtent` (semantically identical — a
+                // well-formed positive decimal of at most 18 digits, -1
+                // otherwise, which is already this field's default) so the two
+                // §14/#705 signature-key renderers decode the same text the
+                // same way. See that helper's header.
+                ref->arraySizeValue = metaInlineArrayExtent(mt.arraySize);
                 break;
             }
             case TypeKind::Function: {
@@ -1443,6 +1464,32 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
 // the nullable '?' suffix: stubs do not reliably preserve nullability for
 // primitive types, and nullable-vs-non-nullable overloads are rare; the key's
 // purpose is to distinguish base types, not nullability.
+//
+// THE KEY HAS TWO OBLIGATIONS, and this function is one of THREE renderers that
+// must discharge both together (fix #4508):
+//
+//   (a) two DIFFERENT signatures must get DIFFERENT keys — otherwise the
+//       last-writer / first-match of the attachment loops binds an exporter's
+//       body to the wrong imported overload;
+//   (b) the SAME signature must get the SAME key on BOTH SIDES of whichever
+//       comparison it is in — otherwise attachment silently stops and the
+//       importer rejects a program the exporter compiled (§14/#662).
+//
+// The comparisons, and so the renderers that must stay byte-identical:
+//   * metaMemberSigKey (this function)  vs  freshMethodSigKey (astTypeToSigText)
+//     — MetaType vs the RE-PARSED SYNTHETIC STUB's AST, at the importedMethods
+//     map;
+//   * metaMemberSigKey (this function)  vs  typeRefSigText — MetaType vs the
+//     imported ParameterSymbol's `resolvedDeclType`, at the ctor-body and
+//     method-body attachment loops.
+//
+// Obligation (b) is why parameter NAMES are not rendered inside a function type
+// (§27.1, v0.306: a name is decoration — its own table spells every function
+// type without one — and metaTypeToSourceText omits it from the stub, so the
+// AST side could never see it) while parameter MODIFIERS are (§27.1: "`(T) ->
+// ()` and `(owned T) -> ()` are distinct function types", and the modifier
+// string round-trips verbatim through the wire, the stub source and
+// Loader::convert).
 static std::string metaTypeSigText(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
         switch (mt.primitive) {
@@ -1477,7 +1524,60 @@ static std::string metaTypeSigText(const MetaType& mt) {
         // Nullable omitted intentionally (see comment above).
         return s;
     }
-    return "?";  // Unit, Function, InlineArray: placeholder
+
+    // fix #4508 (§3.1 / §15.1 / §27.1 / §22.6, v0.306): render the three
+    // remaining SPELLABLE kinds instead of collapsing them onto one "?".
+    //
+    // THE DEFECT. Unit, Function and InlineArray all keyed "?", so §22.6
+    // overloads differing ONLY at such a parameter — legal declarations; §27.1
+    // makes `(int) -> int` and `(bool) -> int` distinct types, §15.1 makes
+    // `[2]int` a type of its own — were indistinguishable to the §14/#705
+    // matcher. The attachment loops then bound the exporter's body to the
+    // wrong imported overload (`importedMethods[key] = …` is an assignment,
+    // and the ctor/method loops `break` on the first key match), which is a
+    // SILENT cross-module wrong value: a call the exporter compiles to one
+    // answer returns the other overload's. Unit additionally MISMATCHED, since
+    // both mirrors already render it "()" — so a unit-typed parameter stopped
+    // ctor-body attachment outright and the importer rejected the program.
+    if (mt.kind == TypeKind::Unit) return "()";
+
+    // §27.1 / A.5 `FunctionType ::= "(" (FuncParamType …)? ")" "->" "owned"?
+    // Type`; children[0..n-1] are the parameters and children[n] the return
+    // (ModuleMetadata.hpp). Modifiers in, names out — see the header.
+    if (mt.kind == TypeKind::Function) {
+        const std::size_t n = mt.children.empty() ? 0 : mt.children.size() - 1;
+        std::string s = "(";
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i) s += ',';
+            if (i < mt.funcParamMods.size() && !mt.funcParamMods[i].empty())
+                s += mt.funcParamMods[i] + " ";
+            s += metaTypeSigText(mt.children[i]);
+        }
+        s += ")->";
+        if (mt.funcReturnOwned) s += "owned ";
+        s += mt.children.empty() ? "?" : metaTypeSigText(mt.children[n]);
+        return s;
+    }
+
+    // §15.1 / A.5 `InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type`.
+    // The extent decodes through the ONE shared rule so this side and
+    // typeRefSigText's `arraySizeValue` (which Loader::convert produces from
+    // the same text through the same helper) cannot drift; an extent the
+    // exporter could not fold renders "?" on BOTH, keeping them in lockstep
+    // rather than agreeing on a wrong number. The element mirrors convert()'s
+    // own `children.front()` read for the same reason. A.5 gives an inline
+    // array no nullable form, so there is none to omit.
+    if (mt.kind == TypeKind::InlineArray) {
+        const long long n = metaInlineArrayExtent(mt.arraySize);
+        std::string s = "[";
+        s += n > 0 ? std::to_string(n) : "?";
+        if (mt.arrayOwned) s += " owned";
+        s += ']';
+        s += mt.children.empty() ? "?" : metaTypeSigText(mt.children.front());
+        return s;
+    }
+
+    return "?";  // Error: the sentinel kind has no canonical spelling
 }
 
 // §14/#705: canonical signature key for a MetaMember method or constructor:
@@ -1498,12 +1598,49 @@ static std::string metaMemberSigKey(std::string_view name,
 
 // §14/#705: canonical type text from an ast::Type node produced by re-parsing
 // a synthetic stub.  Mirrors metaTypeSigText so that a fresh MethodSymbol's
-// param type produces the same key as the MetaParam it was generated from.
-// Only Named (which covers both user-declared names and primitive keywords)
-// is handled; other shapes return "?" (a no-match sentinel).
+// param type produces the same key as the MetaParam it was generated from —
+// see metaTypeSigText's header for the two obligations both sides discharge.
+// A shape with no canonical spelling returns "?" (a no-match sentinel).
 static std::string astTypeToSigText(const ast::Type* t) {
     if (!t) return "?";
     if (t->kind == ast::TypeKind::Unit) return "()";
+
+    // fix #4508 (§27.1 / §15.1 / A.5, v0.306): the mirrors of
+    // metaTypeSigText's two new arms. The stub this AST was parsed from is
+    // `metaTypeToSourceText`'s output for the very MetaType the other side
+    // renders, so the two agree spelling for spelling: modifiers rendered
+    // (§27.1 identity), names not (metaTypeToSourceText omits them), nullable
+    // not (both sides omit it), generic args joined with a bare ','.
+    if (t->kind == ast::TypeKind::Function) {
+        std::string s = "(";
+        for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+            if (i) s += ',';
+            if (!t->funcParams[i].modifier.empty())
+                s += std::string(t->funcParams[i].modifier) + " ";
+            s += astTypeToSigText(t->funcParams[i].type.get());
+        }
+        s += ")->";
+        if (t->funcReturnOwned) s += "owned ";
+        s += astTypeToSigText(t->funcReturn.get());
+        return s;
+    }
+    if (t->kind == ast::TypeKind::InlineArray) {
+        // The stub spells the extent as the folded decimal the wire carried
+        // (#3183), so decoding the literal's own lexeme through the SHARED
+        // rule reproduces metaTypeSigText's number exactly. Anything else — a
+        // non-literal extent, which a stub never produces — renders "?" on
+        // this side, the same no-match sentinel the other side uses for an
+        // extent it could not fold.
+        const auto* lit =
+            dynamic_cast<const ast::IntLiteralExpr*>(t->arraySize.get());
+        const long long n = lit ? metaInlineArrayExtent(lit->text) : -1;
+        std::string s = "[";
+        s += n > 0 ? std::to_string(n) : "?";
+        if (t->arrayOwned) s += " owned";
+        s += ']';
+        s += astTypeToSigText(t->arrayElement.get());
+        return s;
+    }
     if (t->kind == ast::TypeKind::Named && t->name &&
         !t->name->parts.empty()) {
         // In Bezel's grammar, primitive keywords (int, bool, string, …) parse
@@ -1547,7 +1684,11 @@ static std::string freshMethodSigKey(const sema::MethodSymbol* ms) {
 // §14/#705: canonical type text from a reconstructed TypeRef (an imported
 // ParameterSymbol's resolvedDeclType).  Mirrors metaTypeSigText so the same
 // signature key is produced for a MetaParam and its corresponding
-// ParameterSymbol (used for ctor-body attachment matching in facet b).
+// ParameterSymbol (used for ctor-body and method-body attachment matching in
+// facet b) — see metaTypeSigText's header for the two obligations. This side's
+// input is `Loader::convert(MetaType)`, a field-for-field structural copy of
+// the very MetaType the other side renders, so the two stay in lockstep by
+// construction (fix #4508).
 static std::string typeRefSigText(const sema::TypeRef* tr) {
     if (!tr) return "?";
     switch (tr->kind) {
@@ -1593,8 +1734,36 @@ static std::string typeRefSigText(const sema::TypeRef* tr) {
             // Nullable omitted (mirrors metaTypeSigText).
             return s;
         }
+        // fix #4508 (§27.1 / §15.1, v0.306): the third mirror. `funcParams`,
+        // `funcReturnOwned`, `arrayOwned` and `arraySizeValue` are all copied
+        // verbatim from the MetaType by Loader::convert (the extent through
+        // the same `metaInlineArrayExtent` rule), so rendering them in the
+        // same order with the same punctuation is byte-identical to
+        // metaTypeSigText for every type both can see.
+        case sema::TypeRef::Kind::Function: {
+            std::string s = "(";
+            for (std::size_t i = 0; i < tr->funcParams.size(); ++i) {
+                if (i) s += ',';
+                if (!tr->funcParams[i].modifier.empty())
+                    s += std::string(tr->funcParams[i].modifier) + " ";
+                s += typeRefSigText(tr->funcParams[i].type);
+            }
+            s += ")->";
+            if (tr->funcReturnOwned) s += "owned ";
+            s += typeRefSigText(tr->funcReturn);
+            return s;
+        }
+        case sema::TypeRef::Kind::InlineArray: {
+            std::string s = "[";
+            s += tr->arraySizeValue > 0 ? std::to_string(tr->arraySizeValue)
+                                        : "?";
+            if (tr->arrayOwned) s += " owned";
+            s += ']';
+            s += typeRefSigText(tr->arrayElement);
+            return s;
+        }
         default:
-            return "?";  // Error, InlineArray, Function: placeholder
+            return "?";  // Error: the sentinel kind has no canonical spelling
     }
 }
 
