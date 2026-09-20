@@ -208,7 +208,7 @@ BEZEL_TEST(inline_array_nested_via_generic_alias_uaf,
         "  public V: string; "
         "  public constructor(v: string) V := v; end constructor; "
         "end WidgetAliasUafOk; "
-        "type NestedAliasUafClass<T> := [1]T; "
+        "type NestedAliasUafClass<T> := [1 owned]T; "
         "class HelperNestedAliasUafClass "
         "  public static method Wrap(v: string): NestedAliasUafClass<WidgetAliasUafOk> "
         "    return [new WidgetAliasUafOk(v)]; "
