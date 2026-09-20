@@ -23,19 +23,23 @@
 //
 // These tests observe the fix via static counters bumped by each
 // destructor, mirroring the destructor-count convention of
-// exception_disposal_test.cpp. A throwing destructor's exception is not
-// caught by the enclosing method's OWN pending-checks at the disposal call
-// site in this compiler revision (a separate, broader gap — the exception
-// actually PROPAGATING from the disposal point to a caller's `try`/`catch`
-// — tracked apart from this fix), so the counters are read from inside a
-// `catch` arm that ends up receiving the eventual pending-check fault
-// (triggered by the first subsequent call in the program, here the static
-// field reads themselves) rather than from a `catch` around the `Dispose()`
-// call directly. This keeps each test deterministic regardless of exactly
-// which call site first observes the pending exception, while still
-// proving — via the counters, which are bumped strictly during
-// `Dispose()`, before any of this dispatching happens — that every
-// remaining generated Dispose() step ran.
+// exception_disposal_test.cpp. Each program returns the SAME weighted
+// counter sum from the `try`'s normal exit and from its `catch` arm, so
+// the assertion is about the counters alone and is independent of where
+// the fault is observed.
+//
+// That independence was originally load-bearing: when #1546 landed, a
+// throwing destructor's exception was not caught by the enclosing method's
+// own pending checks at the disposal call site (a separate, broader gap —
+// the exception actually PROPAGATING from the disposal point to a caller's
+// `try`/`catch`), so the counters had to be readable from whichever site
+// first happened to observe the pending exception. That gap is now CLOSED
+// (§28.4, issues #1878/#1882): `o.Dispose()` propagates from the disposal
+// point and the `catch` arm below is what runs. The rows are unchanged —
+// both exits still return the same value — and they keep proving what
+// #1546 is about: that every remaining generated `Dispose()` step ran,
+// since the counters are bumped strictly during `Dispose()`, before any
+// of the dispatching happens.
 
 #include "support/codegen_support.hpp"
 #include "support/aot_support.hpp"

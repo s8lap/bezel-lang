@@ -10117,10 +10117,38 @@ private:
     // is lowered, so no normal-exit edge can name it and the marking has no
     // subject. Removed with mode 6 and the `undischargedOwned` parameter.)
 
+    // fix #1882 (§28.4, v0.306): the `unwindDisposeHi` sentinel — "every scope
+    // that is still live is still live", i.e. dispose disposeStack_ down to
+    // unwindScopeDepth_ from its current top. Every pre-#1882 caller means
+    // this, because a pending check after a CALL is emitted while no scope is
+    // mid-teardown. A SCOPE-END disposal pass is the one caller that cannot:
+    // the scope it just finished disposing is still ON disposeStack_ (its
+    // owner pops it after the pass returns), so it passes that scope's index
+    // and the unwind edge disposes only the scopes OUTSIDE it — re-running the
+    // pass that just threw would double-release the entries that do not null
+    // their own slot.
+    static constexpr std::size_t kAllLiveScopes =
+        static_cast<std::size_t>(-1);
+
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars
     // first), else continue.
-    void emitPendingCheck();
+    void emitPendingCheck(std::size_t unwindDisposeHi = kAllLiveScopes);
+
+    // fix #1878 + #1882 (§28.4, v0.306): load the in-flight-exception slot so a
+    // disposal site can bracket its dispatch and tell a fault the disposal
+    // RAISED from one that was already propagating when it started. Emitted at
+    // the site's current insert point, which dominates the check below.
+    llvm::Value* snapshotInFlightExc();
+
+    // fix #1878 + #1882 (§28.4, v0.306): §28.4's "the exception propagates from
+    // the disposal point". Fires iff the slot is non-null AND differs from
+    // `excBefore` (a `snapshotInFlightExc()` taken before the disposal) — a
+    // plain non-null test misroutes somebody else's in-flight exception, which
+    // for a §29.7 iterator-abandonment teardown means leaking the frame. See
+    // the definition for the measured case.
+    void emitDisposalFaultCheck(llvm::Value* excBefore,
+                                std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // CG20 + #792 / §22.13: route the pending exception ONLY when `cond` is
     // true. emitPendingCheck computes its own condition (bz_exc != null, ANDed
@@ -10132,7 +10160,8 @@ private:
     // misrouted here — it stays in bz_exc and routes at the next natural
     // pending check. The unwind block (scope disposal + #1216 supersede) is
     // shared verbatim with emitPendingCheck.
-    void emitPendingCheckIf(llvm::Value* cond);
+    void emitPendingCheckIf(llvm::Value* cond,
+                            std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
     // When the constructor of an in-flight `new T(...)` throws, the freshly-

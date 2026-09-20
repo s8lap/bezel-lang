@@ -2336,7 +2336,46 @@ void Emitter::emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi) {
 }
 
 
-void Emitter::emitPendingCheck() {
+llvm::Value* Emitter::snapshotInFlightExc() {
+    return builder_.CreateLoad(ptrTy(), emitExcSlot(), "disp.preexc");
+}
+
+
+void Emitter::emitDisposalFaultCheck(llvm::Value* excBefore,
+                                     std::size_t unwindDisposeHi) {
+    // fix #1878 + #1882 (§28.4, v0.306): route a fault RAISED BY THE DISPOSAL
+    // that `excBefore` brackets, and only that.
+    //
+    // The obvious condition — `emitPendingCheck`'s plain `bz_exc != null` — is
+    // WRONG here, and measurably so. A disposal site is one of the few places
+    // reached with an exception ALREADY in the slot, and not only inside a user
+    // destructor body (#1468's case, which `emitPendingCheck` does gate on): the
+    // §29.7 abandonment disposal of an `await for` iterator runs the iterator's
+    // compiler-generated teardown — sync-fallback destructor included — while
+    // the exception that abandoned the loop is in flight. A plain non-null test
+    // fires there on somebody else's exception, branches out of the teardown and
+    // LEAKS the iterator frame (measured: 80 bytes, `async_iter_early_-
+    // abandonment_dispose_1525.exception_from_loop_body_disposes_and_preserves_-
+    // the_exception`). That is the #1468 defect class exactly, one context wider.
+    //
+    // So compare against the value in the slot before the disposal ran: fire iff
+    // an exception is in flight AND it is not the one that was already there.
+    // This is the same "did this operation RAISE" shape `emitEnsureStaticInit`
+    // passes to `emitPendingCheckIf`, and it subsumes #1468's disposer-entry
+    // gate — inside a destructor body the bracketed value IS the entry
+    // exception. Supersession still works: `DisposeCore` frees the superseded
+    // instance and leaves the NEW one in the slot (#2358), so the pointer
+    // differs and the check fires on the survivor.
+    llvm::Value* after =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "disp.postexc");
+    llvm::Value* inFlight = builder_.CreateICmpNE(
+        after, llvm::ConstantPointerNull::get(ptrTy()));
+    llvm::Value* isNew = builder_.CreateICmpNE(after, excBefore);
+    emitPendingCheckIf(builder_.CreateAnd(inFlight, isNew), unwindDisposeHi);
+}
+
+
+void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     llvm::Value* pending = builder_.CreateICmpNE(
         exc, llvm::ConstantPointerNull::get(ptrTy()));
@@ -2369,7 +2408,7 @@ void Emitter::emitPendingCheck() {
         llvm::Value* isNew = builder_.CreateICmpNE(exc, entryExc);
         pending = builder_.CreateAnd(pending, isNew);
     }
-    emitPendingCheckIf(pending);
+    emitPendingCheckIf(pending, unwindDisposeHi);
 }
 
 // #792 / §22.13: the shared route block for a conditional pending check. Branch
@@ -2379,7 +2418,8 @@ void Emitter::emitPendingCheck() {
 // the #1468 disposer "is-new" gate) and delegates here; emitEnsureStaticInit
 // passes a "the static-init guard RAISED a new exception" condition so a
 // pre-existing in-flight exception is not misrouted at the static-access site.
-void Emitter::emitPendingCheckIf(llvm::Value* cond) {
+void Emitter::emitPendingCheckIf(llvm::Value* cond,
+                                 std::size_t unwindDisposeHi) {
     auto* unwind =
         llvm::BasicBlock::Create(llvm_, "call.unwind", currentFn_);
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
@@ -2413,7 +2453,17 @@ void Emitter::emitPendingCheckIf(llvm::Value* cond) {
             {currentCaughtExc_});
         emitDisposeAndReclaim(currentCaughtExc_);
     }
-    emitUnwindDisposals();
+    // fix #1882 (§28.4, v0.306): kAllLiveScopes is every pre-existing caller's
+    // meaning and keeps emitUnwindDisposals' behaviour bit-for-bit. A SCOPE-END
+    // disposal pass passes its own scope's index instead: that scope's entries
+    // were just discharged by the pass that raised this exception, and it is
+    // still on disposeStack_ (its owner pops it after the pass returns), so
+    // re-disposing it here would double-release every entry that does not null
+    // its own slot (a plain `stringRelease` is exactly such an entry).
+    if (unwindDisposeHi == kAllLiveScopes)
+        emitUnwindDisposals();
+    else
+        emitUnwindDisposalsInRange(unwindScopeDepth_, unwindDisposeHi);
     builder_.CreateBr(unwindBB());
     builder_.SetInsertPoint(cont);
 }

@@ -5245,6 +5245,12 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // owned TEMPORARY explicitly disposed (no second reclaim
         // path, but no slot to null either) is the deferred sub-
         // case noted in #415.
+        // fix #1878 (§28.4, v0.306): bracket the dispatch below so the check at
+        // the end of this chain can tell a fault THIS disposal raised from one
+        // that was already propagating when the statement was reached (an
+        // `x.Dispose()` inside an iterator `finally` run during §29.7
+        // abandonment is such a place). See emitDisposalFaultCheck.
+        llvm::Value* excBeforeDispose = snapshotInFlightExc();
         llvm::Type* slotTy = nullptr;
         llvm::Value* slot =
             explicitDisposeOwnedReceiverSlot(target,
@@ -5338,6 +5344,38 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             builder_.CreateBr(dcont);
             builder_.SetInsertPoint(dcont);
         }
+        // fix #1878 (§28.4, v0.306): "The exception propagates from the
+        // **disposal point** — the explicit `Dispose()` call, ...". Every arm
+        // above dispatches the object's vtable Dispose, which runs the USER
+        // destructor body; when that body throws, `Dispose` returns with the
+        // exception parked in the bz_exc slot (emitDisposerCore's `dtor.threw`
+        // /`dtor.restore` tail leaves it there after completing the remaining
+        // owned-field and base-chain steps, #1546). Every OTHER user-code call
+        // in this backend is followed by a pending check — this one was not, so
+        // the in-flight exception simply stayed in the slot and control fell
+        // through to the next statement. Two contradictory manifestations
+        // followed from that single omission: with no later pending check in
+        // the function the exception was SILENTLY SWALLOWED (the reported
+        // `r.Dispose(); Console.WriteLine("no-throw")` printing "no-throw" and
+        // exiting 0), and with one — any later call, including the §22.13
+        // static-init guard — it surfaced at that unrelated site instead, which
+        // is typically OUTSIDE the `try` whose body held the disposal point, so
+        // it escaped the enclosing `catch` as unhandled (#1882's face of the
+        // same gap at the scope-end site).
+        //
+        // The check is bracketed (`excBeforeDispose` above) rather than a plain
+        // "is anything in flight": a `Dispose()` reached while an exception is
+        // already propagating — an `x.Dispose()` inside an iterator `finally`
+        // running under §29.7 abandonment, a destructor body on an unwind edge
+        // (#1468) — must route ONLY a genuinely new fault and leave the
+        // propagating one alone. It is a no-op on every non-throwing disposal
+        // (the slot is unchanged), which is why it can sit here unconditionally.
+        //
+        // Placed after the whole arm chain rather than inside each arm so the
+        // reclaim tail (identity-hash reap, CauseChain reclaim, `free`) and the
+        // slot-null still run before the exception leaves — §28.4's "physical
+        // reclamation still occurs — a cleanup fault never leaks the object".
+        emitDisposalFaultCheck(excBeforeDispose);
     }
     // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
     // exit. Every built-in branch above released the receiver
