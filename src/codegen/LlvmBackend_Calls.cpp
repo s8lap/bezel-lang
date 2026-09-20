@@ -3492,9 +3492,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // generic i32 path below loads the element and truncs it to i32
             // (`trunc ptr … to i32` → malformed IR). Instead, dispatch the
             // element ordering through the element's `CompareTo` (string:
-            // ordinal strcmp on the data pointers, mirroring the Sort()
-            // comparator), returning the winning element pointer. (Related:
-            // Math.Min/Max IComparable, #1148/#1141.)
+            // `bz_str_compare_cp`, the width-aware §9.6 relation #4487/#4495
+            // route every ordinal string comparison through), returning the
+            // winning element pointer. (Related: Math.Min/Max IComparable,
+            // #1148/#1141.)
             if (call.args.empty()) {
                 sema::TypeRef* elemTypeRef =
                     (recvTy && !recvTy->genericArgs.empty())
@@ -3577,22 +3578,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         ptrFn, {recv, idx, builder_.getInt64(esz)});
                     llvm::Value* el  = builder_.CreateLoad(ptrTy(), ep, "mm.el");
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
-                    // cmp = (el <=> acc): el.CompareTo(acc), or strcmp(el, acc).
+                    // cmp = (el <=> acc): el.CompareTo(acc), or the §9.6
+                    // ordinal string relation.
+                    //
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to
+                    // extract each string's raw `.data` pointer and call
+                    // plain `strcmp` — byte-wise AND NUL-terminated, disagreeing
+                    // with `CompareTo`/`SortedSet<string>` after #4487 moved
+                    // those to `bz_str_compare_cp`. `el`/`acc` are already the
+                    // full string OBJECTS (not just `.data`), so this routes to
+                    // the SAME width-aware relation #4487 established rather
+                    // than a second spelling of "ordinal string comparison"
+                    // (the drift #2590 records).
                     llvm::Value* cmp = nullptr;
                     if (isStrElem) {
-                        llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), el, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {el, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (ifaceCmpFn) {
                         // fix #2770: §13 itable dispatch of the element's own
                         // `CompareTo` — the identical dispatch a written-out
@@ -3718,7 +3721,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // IComparable<U> (§14.2) or string (§9.6). Mirror the no-selector
             // pointer path (above), but project each element through the
             // selector first; compare the projected values via CompareTo /
-            // ordinal strcmp and return the winning projection. The result is a
+            // `bz_str_compare_cp` (§9.6) and return the winning projection. The
+            // result is a
             // borrow (§28.3, tracked in the ownership pass); codegen returns the
             // pointer and takes no disposal obligation. ---
             if (uRef) {
@@ -3793,20 +3797,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
                     llvm::Value* cmp = nullptr;
                     if (uIsStr) {
-                        llvm::Value* pvData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), pv, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
-                                                  "mm.cmp");
+                        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                        // through the same width-aware relation #4487
+                        // established — see the no-selector Min()/Max() arm
+                        // above for the full citation. `pv`/`acc` are already
+                        // the full string OBJECTS.
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {pv, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (uIfaceCmpFn) {
                         // fix #2770: the thunk's ABI is slot ADDRESSES, and the
                         // projection `pv` is a value, so spill it to an entry
@@ -4027,7 +4026,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* el  = builder_.CreateLoad(elemLLTy, ep, "mon.el");
             llvm::Value* acc = builder_.CreateLoad(elemLLTy, accSlot, "mon.acc");
             // For class/string/interface (pointer) elements, use
-            // ordinal strcmp (string), itable CompareTo (interface,
+            // bz_str_compare_cp (string, §9.6), itable CompareTo (interface,
             // #2770), or direct CompareTo call (class). For numeric
             // primitive elements, use direct icmp/fcmp.
             llvm::Value* shouldUpdate;
@@ -4056,26 +4055,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
             if (isStrElem || cmpMs || ifaceCmpFn) {
-                // Pointer-typed element: string-ordinal strcmp (string),
+                // Pointer-typed element: §9.6 ordinal string relation,
                 // itable CompareTo (interface, #2770), or direct
                 // CompareTo call (class).
                 llvm::Value* cmp = nullptr;
                 if (isStrElem) {
-                    llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), el, 0));
-                    llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), acc, 0));
-                    auto* strcmpFn = module_->getFunction("strcmp");
-                    if (!strcmpFn) {
-                        auto* ft = llvm::FunctionType::get(
-                            i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn = llvm::Function::Create(
-                            ft, llvm::Function::ExternalLinkage, "strcmp",
-                            module_.get());
-                    }
-                    cmp = builder_.CreateCall(strcmpFn,
-                                              {elData, accData},
-                                              "mon.cmp");
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                    // through the same width-aware `bz_str_compare_cp`
+                    // relation #4487 established — see the Min()/Max() arm
+                    // above for the full citation. `el`/`acc` are already
+                    // the full string OBJECTS.
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmp = builder_.CreateCall(
+                        cmpCpFn, {el, acc, builder_.getInt32(0)}, "mon.cmp");
                 } else if (ifaceCmpFn) {
                     cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
                                               "mon.cmp");
@@ -4866,7 +4859,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<M.Name>,
             // interface IComparable → bz$ifacecmp$<M.Name>,
-            // string → bz$strcmp, int/other → bz$intcmp.  Both reference-type
+            // string → bz$strcmp (routes through bz_str_compare_cp, fix #4495),
+            // int/other → bz$intcmp.  Both reference-type
             // names are MODULE-QUALIFIED (`mangledTypeName`), per §2.8.3
             // rule 3 — see buildObjectCompareToThunk for what the unqualified
             // class name cost (#3512).
@@ -4899,7 +4893,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // bz_array_sort as the comparator and called through.
                 if (!cmpFn) return nullptr;
             } else if (isStringElem) {
-                // String comparator: load two ptr elements, call strcmp on their data.
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this thunk used
+                // to extract each element's raw `.data` pointer and call plain
+                // `strcmp` — byte-wise AND NUL-terminated, disagreeing with
+                // `CompareTo`/`SortedSet<string>` after #4487 moved those to
+                // `bz_str_compare_cp`. `bz$strcmp` (the internal name is
+                // unchanged so no other reference to it needs to move) now
+                // routes through that SAME width-aware relation instead of
+                // being a second spelling of "ordinal string comparison" —
+                // the drift #2590 records.
                 auto* cmpName2 = "bz$strcmp";
                 cmpFn = module_->getFunction(cmpName2);
                 if (!cmpFn) {
@@ -4909,24 +4911,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
                     llvm::IRBuilder<> cmpB2(bb2);
                     // Each argument is a ptr* (pointer to bz.string*).
-                    // Load the bz.string* from each slot, then load data pointer.
+                    // Load the bz.string* from each slot — bz_str_compare_cp
+                    // takes the string OBJECTS directly, so no further
+                    // `.data`-field extraction is needed.
                     llvm::Value* aSlot = &*cmpFn->arg_begin();
                     llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    // Load data pointer (field 0) from bz.string struct
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    // Call strcmp
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn2 = declareC("bz_str_compare_cp", i32(),
+                                              {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn2, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 // Integer comparator
@@ -5175,6 +5170,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // would reach bz_array_sort as the comparator and be called.
                 if (!cmpFn2) return nullptr;
             } else if (isStringElem2) {
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): the `.Sorted()`
+                // twin of the `Sort()` thunk above — both build the SAME
+                // internal function name `bz$strcmp`, so only whichever runs
+                // first in a module actually emits the body, but the source is
+                // a separate inline copy (per narrow #3488's own note that this
+                // arm has drifted from Sort()'s before) and must be fixed here
+                // too. See the Sort() arm's comment for the full citation.
                 auto* cmpName = "bz$strcmp";
                 cmpFn2 = module_->getFunction(cmpName);
                 if (!cmpFn2) {
@@ -5187,17 +5189,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 auto* cmpName = "bz$intcmp";
@@ -10958,27 +10953,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return t && t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::String;
         };
-        // fix #2785: ORDINAL comparison on the two data pointers — the same
+        // fix #2785: ORDINAL comparison on the two string OBJECTS — the same
         // lowering `Array<string>.Min()` already uses (tryLowerCollectionInstanceCall's
         // `isStrElem` arm), so `Math.Min` and the collection form agree by
         // construction. stdlib §9.6 fixes string ordering as ordinal.
+        //
+        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to extract
+        // each operand's raw `.data` pointer and call plain `strcmp` —
+        // byte-wise AND NUL-terminated, disagreeing with `CompareTo`/
+        // `SortedSet<string>` after #4487 moved those to `bz_str_compare_cp`.
+        // Routes through that SAME width-aware relation now, keeping the
+        // "agree by construction" comment above true post-#4487 too.
         auto emitStrCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
             if (!a || !b || !a->getType()->isPointerTy() ||
                 !b->getType()->isPointerTy())
                 return nullptr;
-            llvm::Value* aData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), a, 0));
-            llvm::Value* bData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), b, 0));
-            auto* strcmpFn = module_->getFunction("strcmp");
-            if (!strcmpFn) {
-                auto* ft =
-                    llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                strcmpFn = llvm::Function::Create(
-                    ft, llvm::Function::ExternalLinkage, "strcmp",
-                    module_.get());
-            }
-            return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
+            auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                     {ptrTy(), ptrTy(), i32()});
+            return builder_.CreateCall(cmpCpFn, {a, b, builder_.getInt32(0)},
+                                       "mm.strcmp");
         };
         // fix #2786 (stdlib §2.2, spec §14.2, v0.240): the float fallback below
         // is reached by anything the integer, CompareTo (#1141/#1148/#2782) and
