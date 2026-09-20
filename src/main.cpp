@@ -24,7 +24,7 @@ constexpr const char* kVersion = "bezelc " BEZEL_VERSION;
 
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
-           "[--import <artifact>]... [--checked-disposal] "
+           "[--import <artifact>]... [--checked-disposal] [--checked-contracts] "
            "[--sanitize=address] [--experimental-scoped-await-bind] "
            "<source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
@@ -42,6 +42,21 @@ void printUsage(std::ostream& out) {
            "member access on a\n"
            "                     disposed instance raises DisposedAccess"
            "Exception (§31.4)\n"
+           "  --checked-contracts enable checked-contracts mode (§22.16): "
+           "`ensures`\n"
+           "                     clauses evaluate at every normal-completion "
+           "path and\n"
+           "                     `invariant` clauses evaluate at construction "
+           "exit and\n"
+           "                     public-method entry/exit; a false clause "
+           "raises\n"
+           "                     ContractViolationException. Without this flag "
+           "(the\n"
+           "                     §22.16 release default) unproven `ensures`/"
+           "invariant\n"
+           "                     clauses are NOT emitted at codegen. "
+           "`requires` clauses\n"
+           "                     are always-on regardless of this flag\n"
            "  --sanitize=address instrument the GENERATED code with LLVM "
            "AddressSanitizer and\n"
            "                     link the executable against the ASan runtime, "
@@ -117,6 +132,18 @@ int main(int argc, char** argv) {
             // instance-member entry emits a disposed-flag test; access on a
             // disposed instance raises DisposedAccessException (§31.4).
             codegenOpts.checkedDisposal = true;
+            continue;
+        }
+        if (arg == "--checked-contracts") {
+            // §22.16 (issue #4386): enable checked-contracts mode. `ensures`
+            // clauses evaluate at every normal-completion path; `invariant`
+            // clauses evaluate at construction exit and public-method entry/
+            // exit; a false clause raises ContractViolationException. Without
+            // this flag (the §22.16 release default) the clause evaluations
+            // are NOT emitted at codegen — clauses are pure, so non-evaluation
+            // is unobservable for any program whose checked clauses never
+            // fault. `requires` is always-on regardless of this flag.
+            codegenOpts.checkedContracts = true;
             continue;
         }
         if (arg == "--experimental-scoped-await-bind") {

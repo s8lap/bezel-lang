@@ -285,6 +285,11 @@ function(bezel_add_test_binary group)
     # target_link_libraries), so a fresh tree building one test target alone
     # never builds the archive; make the edge explicit.
     add_dependencies(${tgt} bezel_runtime)
+    # fix #4386: CLI-surface tests (e.g. checked_contracts_4386_cli) exec the
+    # real bezelc binary via BEZELC_PATH (set with $<TARGET_FILE:bezelc>);
+    # the option produces no dependency edge of its own, so make the build
+    # edge explicit.
+    add_dependencies(${tgt} bezelc)
     add_test(NAME ${tgt} COMMAND ${tgt})
     set(BEZEL_TEST_TARGETS ${BEZEL_TEST_TARGETS} ${tgt} PARENT_SCOPE)
 endfunction()
