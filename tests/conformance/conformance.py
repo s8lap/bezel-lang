@@ -120,6 +120,51 @@ def _indent_four(code):
     return indented + ("\n" if trailing_nl else "")
 
 
+# -----------------------------------------------------------------------
+# Synthesized `Main` signature.
+#
+# The stmt/mixed wraps put the block's statements in a synthesized `Main`. A
+# block whose statements contain a top-level `await` — the docs' §30 async
+# fragments — then fails on "`await` is valid only inside an `async` method or
+# `async` lambda", which is a property of the SCAFFOLDING, not of the document:
+# spec §33.2 (v0.306) admits `public static async method Main(): Task` as one of
+# the four accepted entry-point signatures. Promoting the synthesized signature
+# when, and only when, the body needs it is therefore enclosing scaffolding in
+# exactly the sense wrap_mixed already is: no token of the document is added,
+# rewritten, reordered, or dropped. Measured on this corpus: 25 cases carry the
+# await-outside-async diagnostic and every one of them loses it under the
+# promotion.
+#
+# `await` is detected as a whole word not preceded by `.` (so `x.await` — not
+# Bezel, but possible in a doc's prose-ish block — does not trigger) and not
+# inside a line comment. A false positive is harmless: an `async` Main with no
+# `await` is well-formed (§30.1 does not require one), so the promotion can only
+# add capability.
+# -----------------------------------------------------------------------
+
+_AWAIT_RE = re.compile(r'(?<![\w.])await(?![\w])')
+
+
+def _strip_line_comments(code):
+    """Drop `//` tails so a mention of `await` in a comment does not promote the
+    signature. Naive w.r.t. `//` inside a string literal, which would only ever
+    cost a harmless promotion (see above)."""
+    return "\n".join(re.sub(r'//.*$', '', line) for line in code.splitlines())
+
+
+def needs_async_main(body):
+    """True when the synthesized `Main` must be `async` to hold `body`."""
+    return bool(_AWAIT_RE.search(_strip_line_comments(body)))
+
+
+def main_header(body, indent="  "):
+    """The synthesized `Main` declaration line for a statement body, per §33.2's
+    accepted signatures."""
+    if needs_async_main(body):
+        return indent + "public static async method Main(): Task\n"
+    return indent + "public static method Main()\n"
+
+
 def classify_wrap(code):
     """Return (wrap_mode, wrapped_src) for a fragment body. A pure translation
     of run_conformance.sh wrap_fragment()'s heuristic cascade; the wrapped_src
@@ -190,7 +235,7 @@ def classify_wrap(code):
 
     # 7. Default: treat as statements in Main.
     return (WRAP_STMT,
-            "module Conf;\nclass W\n  public static method Main()\n"
+            "module Conf;\nclass W\n" + main_header(code)
             + _indent_four(code) + "\n  end Main;\nend W;\n")
 
 
@@ -314,7 +359,7 @@ def wrap_mixed(code):
     out += groups["moddecl"]
     out.append("\nclass W\n")
     out += groups["member"]
-    out.append("  public static method Main()\n")
+    out.append(main_header("".join(groups["stmt"])))
     out += [_indent_four(item) for item in groups["stmt"]]
     out.append("\n  end Main;\nend W;\n")
     return WRAP_STMT, "".join(out)
@@ -356,7 +401,12 @@ ENV_MEMBER = "member"    # a member of the synthesized class W
 ENV_TYPE = "type"        # a top-level declaration beside the module's others
 
 _ENV_HEADER_RE = re.compile(r'^//@\s+(local|member|type)\s+(\S+)\s*$')
-_ENV_MAIN_ANCHOR_RE = re.compile(r'^(\s*)public static method Main\(\)\s*$')
+# Matches both synthesized `Main` spellings — the plain one and the §33.2
+# `async … : Task` promotion (see main_header). A `local` env binding anchors on
+# whichever one the wrap emitted; before the promotion existed this regex saw
+# only the plain form, and an async-promoted case would have failed `env-error`.
+_ENV_MAIN_ANCHOR_RE = re.compile(
+    r'^(\s*)public static (?:async )?method Main\(\)(?:\s*:\s*Task)?\s*$')
 _ENV_CLASS_ANCHOR_RE = re.compile(r'^class W\s*$')
 
 

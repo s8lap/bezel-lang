@@ -172,6 +172,81 @@ class ClassifyWrapTest(unittest.TestCase):
 # The composite ("mixed") wrap — opt-in via the `wrap:mixed` manifest note.
 # -----------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# needs_async_main / main_header — the synthesized `Main` signature.
+#
+# spec §33.2 (v0.306) admits `public static async method Main(): Task` as one of
+# the four accepted entry-point signatures, so promoting the synthesized Main
+# for a body that awaits is enclosing scaffolding, not an edit of the document.
+# -----------------------------------------------------------------------
+
+class NeedsAsyncMainTest(unittest.TestCase):
+    def test_await_statement_needs_async(self):
+        self.assertTrue(cf.needs_async_main("var x := await FetchAsync(u);\n"))
+
+    def test_await_using_needs_async(self):
+        self.assertTrue(cf.needs_async_main("await using var c := await Open();\n"))
+
+    def test_await_for_needs_async(self):
+        self.assertTrue(cf.needs_async_main("await for var l in S() do end;\n"))
+
+    def test_no_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("var x := 1;\nDoWork();\n"))
+
+    def test_await_only_in_a_line_comment_does_not(self):
+        # A prose comment mentioning the keyword must not change the wrap.
+        self.assertFalse(cf.needs_async_main("var x := 1;   // then await it\n"))
+
+    def test_identifier_containing_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("var awaited := 1;\nawaiter.Go();\n"))
+
+    def test_member_named_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("x.await;\n"))
+
+    def test_main_header_promotes_only_when_needed(self):
+        self.assertEqual(cf.main_header("var x := 1;\n"),
+                         "  public static method Main()\n")
+        self.assertEqual(cf.main_header("var x := await F();\n"),
+                         "  public static async method Main(): Task\n")
+
+
+class AsyncMainWrapTest(unittest.TestCase):
+    def test_stmt_wrap_promotes_main(self):
+        mode, src = cf.classify_wrap("var x := await FetchAsync(u);\n")
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertIn("public static async method Main(): Task", src)
+        # The document's own text is untouched: only the enclosing lines differ.
+        self.assertIn("var x := await FetchAsync(u);", src)
+
+    def test_stmt_wrap_leaves_plain_main_alone(self):
+        _, src = cf.classify_wrap("var x := 1;\n")
+        self.assertIn("public static method Main()", src)
+        self.assertNotIn("async", src)
+
+    def test_mixed_wrap_promotes_main(self):
+        _, src = cf.wrap_mixed("record P(X: int);\nvar v := await F();\n")
+        self.assertIn("public static async method Main(): Task", src)
+        self.assertIn("record P(X: int);", src)
+
+    def test_mixed_wrap_ignores_await_inside_a_member(self):
+        # The `await` lives in a class-member item, which classify_top_level_item
+        # sorts into `member` — the Main body has none, so no promotion.
+        _, src = cf.wrap_mixed(
+            "public async method M(): Task\n  await F();\nend M;\n"
+            "var x := 1;\n")
+        self.assertIn("public static method Main()", src)
+
+    def test_env_local_still_anchors_on_a_promoted_main(self):
+        # The `local` splice anchors on the Main declaration line; before the
+        # promotion the anchor regex saw only the plain spelling, so an
+        # async-promoted case would have failed with `env-error`.
+        _, src = cf.classify_wrap("var y := await F(x);\n")
+        entries = cf.parse_env("//@ local x\nvar x: int := 1;\n")
+        out = cf.splice_env(src, ["x"], entries)
+        self.assertIn("var x: int := 1;", out)
+        self.assertIn("public static async method Main(): Task", out)
+
+
 class SplitTopLevelItemsTest(unittest.TestCase):
     def test_split_is_lossless(self):
         # The scaffolding must never drop or rewrite a byte of the doc block.
