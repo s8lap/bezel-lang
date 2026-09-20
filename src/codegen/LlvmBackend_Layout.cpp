@@ -2718,16 +2718,66 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // payload bytes out of the wrapper. So once the operand is proven to be a
     // fresh, solely-owned box, releasing it here is exactly-once.
     //
-    // TWO independent proofs, either of which suffices:
+    // THREE independent proofs, any one of which suffices:
     //   * the mint-identity check below (`lastBoxMint_`), which covers every
     //     box minted IN THIS FRAME while lowering the operand — the inline
     //     indexer/property read paths (shape 2);
     //   * `isUserMethodBoxReturnCall`, the SAME predicate `isPlusOneBoxProducer`
     //     case (b) uses to arm the bound-local release, which covers a box
     //     minted by a locally-compiled `boxReturnMethods_` callee at its return
-    //     edge and transferred to us (shape 1).
+    //     edge and transferred to us (shape 1);
+    //   * `isUserPropertyBoxRead` (fix #4497, §8.6 / §28.9 / §23.3, v0.306) —
+    //     the PROPERTY twin of the previous one, reusing #2760's predicate
+    //     rather than re-spelling "is this a fresh box" a third time. A
+    //     locally-compiled, non-virtual `Object`-typed property whose getter
+    //     provably mints at every exit hands this frame exactly +1, the same
+    //     way a `boxReturnMethods_` call does.
     // Anything else keeps leaking — the safe direction (a bounded leak over a
     // double free), and what the filed residuals track.
+    //
+    // WHY #4497 EXISTED. #2760 gave the two §23.3 accessor body spellings one
+    // reclaim rule, but wired it into `boxLocalAssignmentSourceKind` only —
+    // the classifier for a box BOUND to a local. At a type-test site the
+    // EXPRESSION-bodied getter is inlined, so its mint is visible through
+    // `lastBoxMint_` and was already reclaimed; the BLOCK-bodied getter mints
+    // in `bz$prop$<N>$get` and neither existing disjunct saw it. MEASURED on
+    // `ea93ea1c` via `scripts/agent_check.sh --probe --asan` over
+    // `if h.O is int then … end;` ×200: block-bodied 4800 B / 200
+    // allocations, expression-bodied clean. §28.9's *Accessor faces are
+    // uniform across type kinds* paragraph says the two spellings are
+    // "semantically indistinguishable at every read site"; this is the read
+    // site at which that had not yet been made true.
+    //
+    // ⚠ WHY NOT HOIST THE WHOLE `boxLocalAssignmentSourceKind` HERE, which is
+    // the tidier-looking "one authority" move: it is UNSOUND at this site, and
+    // that is MEASURED, not reasoned. That classifier also answers +1 for
+    // `isBoxableValueType(srcTy)`, and at a type test the operand's resolved
+    // type is its §12.7-NARROWED type — so inside `if o is int then` a nested
+    // `o is T` on the bare identifier would classify as a fresh box and
+    // release the box the LOCAL still owns and still releases at scope end.
+    // That variant was built (`freshBoxTemp` = `boxLocalAssignmentSourceKind(
+    // te.operand.get()) == 1`) and run under `agent_check.sh --probe --asan`
+    // on exactly that nested shape ×200: `ERROR: AddressSanitizer: attempting
+    // double-free`, abort. The narrow disjunct above cannot reach it — an
+    // IDENTIFIER operand is not a `MemberAccessExpr`, so
+    // `isUserPropertyBoxRead` answers false for it, exactly as
+    // `isUserMethodBoxReturnCall` does.
+    //
+    // DELIBERATELY NOT WIDENED, with numbers. Two other property-read faces
+    // still leak 24 B/read, and both are OUT of #4497's subject because
+    // neither DIVERGES between the two §23.3 body spellings — the property of
+    // this site that made #4497 a defect rather than a residual. Measured
+    // ×200 under `agent_check.sh --probe --asan`, block-bodied and
+    // expression-bodied alike:
+    //   * `var ob: Object := h.O as Object;` — the #3351 `as <reference
+    //     type>` local-bind arm, which gates on `isUserMethodBoxReturnCall`
+    //     only: 4800 B / 200 for BOTH spellings;
+    //   * `Take(h.O)` — argument position, #2876's residual family:
+    //     4800 B / 200 for BOTH spellings.
+    // Since both spellings are equally unreclaimed there, §28.9's "the two
+    // accessor body spellings … are semantically indistinguishable at every
+    // read site" is not violated at those faces; they are the ordinary
+    // unbound-value leak the #2876 family tracks.
     llvm::Value* savedBoxMint = lastBoxMint_;
     lastBoxMint_ = nullptr;
     // fix #3090 (§12.7 / §8.6, v0.252): a type test whose operand is a BARE
@@ -2763,7 +2813,8 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     const bool freshBoxTemp =
         obj && obj->getType()->isPointerTy() &&
         ((lastBoxMint_ && obj == lastBoxMint_) ||
-         isUserMethodBoxReturnCall(te.operand.get()));
+         isUserMethodBoxReturnCall(te.operand.get()) ||
+         isUserPropertyBoxRead(te.operand.get()));   // fix #4497
     lastBoxMint_ = savedBoxMint;
     // Release the operand's wrapper. Call ONLY where `obj` is provably dead:
     // never on an `as` whose target is a REFERENCE type, because that arm
