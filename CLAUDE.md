@@ -526,14 +526,24 @@ dispose-count/ASan-clean for a double-free.
    before believing it. Note the zero-builders preflight guards only the **ASan**
    leg; the plain leg has no such refusal, which is why the agent drain must be
    preventive.
-4. **Pre-gate ratchet sweep** — build-free, ~70s, fails closed. Running these by
-   hand on one batch found three RED that would each have failed the cycle:
+4. **Pre-gate ratchet sweep** — build-free, fails closed. Running these by hand on
+   one batch found three RED that would each have failed the cycle. ⚠ **Derive the
+   list from the gate; do not hardcode it.** A hardcoded six-item list drifted out of
+   date and silently omitted `check_toolchain_skip_surface`, which the gate treats as
+   a `CYCLE FAILURE` — a ~50 min cycle would have burned on a known-fail:
    ```sh
-   for s in check_ambiguous_ran_false check_deprecated_jit_oracle check_localdecl_only_walkers \
-            check_vacuous_tests check_enumerable_grid_spellings check_imported_symbol_reads; do
-     printf '%-38s ' "$s"; python3 "scripts/$s.py" --strict >/dev/null 2>&1 && echo PASS || echo FAIL
+   for s in $(grep -oE 'scripts/check_[a-z_]+\.py' scripts/gate_full_cycle.sh | sort -u); do
+     printf '%-42s ' "$(basename "$s" .py)"
+     python3 "$s" --strict >/dev/null 2>&1 && echo PASS || echo FAIL
    done
    ```
+   ⚠ **Adding `runAotChecked` rows legitimately raises `checked_calls` and turns
+   `check_toolchain_skip_surface` RED.** That is a *denominator* rise, not a new
+   silent-skip site. Before `--update --force`, verify what the ratchet's own
+   diagnostic asks: the new rows carry no `wasSkipped()`/`find("SKIP")` guard, no
+   early return, assert `r.ran` unconditionally, and `absorbing_sites` did **not**
+   rise. Bank it **once at batch level**, not per lane — several lanes adding checked
+   rows would otherwise all collide on the single baseline file.
 5. **No untracked `scripts/`** — ratchet #3413 fails the cycle on any `.sh`
    hardcoding an absolute checkout path. Park strays in
    `/var/tmp/bezel-scratch/<run>/parked/`.
