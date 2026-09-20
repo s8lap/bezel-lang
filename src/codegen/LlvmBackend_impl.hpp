@@ -13177,10 +13177,12 @@ private:
             : e_(e),
               boxReleaseEligible_(e.boxReleaseEligible_),
               boxReassignedLocals_(e.boxReassignedLocals_),
+              pureBoxBindings_(e.pureBoxBindings_),   // fix #3447
               boxReleaseEligibleFn_(e.boxReleaseEligibleFn_) {}
         ~BoxReclaimSetScope() {
             e_.boxReleaseEligible_ = std::move(boxReleaseEligible_);
             e_.boxReassignedLocals_ = std::move(boxReassignedLocals_);
+            e_.pureBoxBindings_ = std::move(pureBoxBindings_);
             e_.boxReleaseEligibleFn_ = boxReleaseEligibleFn_;
         }
         BoxReclaimSetScope(const BoxReclaimSetScope&) = delete;
@@ -13190,6 +13192,7 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> boxReleaseEligible_;
         std::unordered_set<const void*> boxReassignedLocals_;
+        std::unordered_set<const void*> pureBoxBindings_;
         llvm::Function* boxReleaseEligibleFn_;
     };
 
@@ -15501,6 +15504,92 @@ private:
     // sidecar bit has no reserved frame field; that shape remains conservatively
     // leaked rather than reading an uninitialized bit after resume.
     std::unordered_set<const void*> boxReassignedLocals_;
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): locals whose slot PROVABLY
+    // holds, for the whole of their scope, exactly the §8.6 box minted at
+    // their own initializer — `isPlusOneBoxProducer` AND SLOT-NEVER-WRITTEN
+    // (no assignment, no increment, no `ref`/`out` alias, including from
+    // inside a lambda body).
+    //
+    // ⚠ SLOT-NEVER-WRITTEN IS NOT "NON-ESCAPING", and the difference is the
+    // whole point of `slotWriteMode`. This set DOES contain locals that
+    // escape — `var o: Object := 7; Store(o); … o.Equals(q);` puts `o` here
+    // even though `boxReleaseEligible_` rejects it — because an escape does
+    // not change what the SLOT holds, and what the slot holds is the entire
+    // receiver-side claim. Non-escaping is the property one would cite to
+    // justify RELEASING `o`; it is emphatically not what this set carries, and
+    // reading it that way would license a release this set does not support.
+    //
+    // WHAT IT LICENSES. Such a local's runtime word 0 is a BOX VTABLE, and
+    // every box vtable's `kEqualsSlot` is filled by LlvmBackend_Setup with a
+    // compiler-generated thunk (`bz$box$eq`, `bz$boxeq$<T>`, and the
+    // inline-array / range / span variants). None of those thunks stores
+    // `other`: they read its word 0 and payload and return an `i1`. So for
+    // `knownBox.Equals(x)` the ARGUMENT is a call-bounded borrow — §8.6's own
+    // reading of a member call on a box ("it borrows the payload for the
+    // call's duration") applied to the other operand — and the argument's box
+    // needs no escape suppression.
+    //
+    // ⚠ THE INVARIANT IS "THE USER METHOD NEVER RECEIVES THE BOX POINTER",
+    // NOT "no user method is reachable". The blunter phrasing is false:
+    // `boxRecordEqualsThunkCore`'s ENUM arm calls `emitEnumEquals`, which
+    // DOES dispatch a user-declared `Equals(E)` from the boxed path. What
+    // makes that safe is a narrower gate in a DIFFERENT function — the
+    // `selfTy->isIntegerTy() && otherTy->isIntegerTy()` test in
+    // `emitEnumEquals` (LlvmBackend_Setup.cpp) — which passes the unboxed
+    // integer payload and DECLINES any `Object?`-signature override, leaving
+    // it to the default. A change that relaxed that gate (the adjacent
+    // "declares user equality" rescue is openly contemplated at the
+    // choice-vtable site) would hand a user body the box pointer and
+    // invalidate this relaxation, and no executable ratchet ties the two
+    // together — so anyone touching `emitEnumEquals`'s parameter test must
+    // re-read this.
+    //
+    // WARNING The receiver's box-ness is LOAD-BEARING, and is exactly what
+    // #3480's measured UAF turns on: when the receiver is a user CLASS
+    // reference the vtable slot holds the user's override, which the spec
+    // (v0.306, §28.14's *deliberate asymmetry* paragraph — which refers to
+    // §28.3's borrowed-field rule: "a parameter-sourced object borrow may be
+    // stored into a field under §28.3's borrowed-field rule — a structural
+    // check whose residual is the caller's trust") lets store its borrowed
+    // `Object?` parameter into a field taking no `bz_box_retain` — an
+    // ADMITTED program in which any caller-side release is a use-after-free.
+    // That case is not in this set and keeps its conservative leak.
+    std::unordered_set<const void*> pureBoxBindings_;
+
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): is `recv` an expression whose
+    // runtime value is provably a §8.6 box — so that §8.1's universal
+    // `Equals` on it necessarily dispatches to a compiler-generated
+    // box-equals thunk, which borrows its argument for the call's duration
+    // and stores nothing? Two shapes answer yes; anything else fails closed,
+    // which costs a bounded leak and never a use-after-free.
+    bool knownBoxReceiverShape(const ast::Expr* recv, bool allowPureBinding) {
+        if (!recv) return false;
+        // (a) a local whose slot provably holds the box its own initializer
+        //     minted (see `pureBoxBindings_`).
+        if (allowPureBinding)
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+                if (auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    if (loc->decl &&
+                        pureBoxBindings_.count(
+                            static_cast<const void*>(loc->decl)))
+                        return true;
+        // (b) a receiver whose STATIC type is a boxable value type. §8.1's
+        //     universal `Equals` on such a receiver is answered by this
+        //     backend boxing the receiver ITSELF
+        //     (`lowerValueSemUniversalEquals`: "Boxing both sides and
+        //     dispatching is not a workaround, it is §8.1's own model"), from
+        //     a statically-known `recvTy` — so the vtable the dispatch reads
+        //     is `boxVtableFor(recvTy)` BY CONSTRUCTION, with no analysis at
+        //     all, and its `kEqualsSlot` is the same family of compiler
+        //     thunks. Arm (b) is inert at `lowerUniversalEqualsDispatch`'s
+        //     three sites (their receivers are Object/interface/class by
+        //     construction); it exists for the escape walker, where it is the
+        //     twin of #3447's own relaxation for the shape
+        //     `record.Equals(<Object local>)`.
+        const sema::TypeRef* rt = ctx_.exprType(*recv);
+        return rt && (isBoxableValueType(rt) || isNullableValueTy(rt));
+    }
 
     // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): every LocalDecl
     // that is REASSIGNED by a statement-level `AssignmentStmt` in the current

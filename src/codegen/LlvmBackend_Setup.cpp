@@ -32791,6 +32791,29 @@ struct BoxEscapeWalker {
     // fix #2960: shared Emitter classifier, returning +1 box / 0 non-box /
     // -1 unknown. Unknown assignment provenance makes the local ineligible.
     std::function<int(const ast::Expr*)> assignmentSourceKind;
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): "is this RECEIVER expression
+    // provably a §8.6 box at runtime?" — the Emitter's
+    // `knownBoxReceiverShape` (see it and `pureBoxBindings_` for the full
+    // warrant). Left EMPTY for the phase-1 walk that computes the set arm (a)
+    // of that predicate reads, so the relaxation can never feed on itself.
+    std::function<bool(const ast::Expr*)> isKnownBoxReceiver;
+    // fix #3447 (§8.6 / §28.9, v0.306): PHASE-1 mode. The question phase 1
+    // asks is NOT "does the box escape" but the strictly weaker "can anything
+    // overwrite this slot" — a local passed as a call argument still HOLDS the
+    // box its initializer minted, and that is all the RECEIVER-side
+    // classification needs. In this mode a read never sets `escaped`; only a
+    // genuine write to the slot sets `slotWritten`: an assignment or increment
+    // whose target is the local, or the local passed under a `ref`/`out`
+    // modifier (including from inside a lambda body, which this walker
+    // descends into). Without the separation the classification would be
+    // self-defeating on the symmetric shapes — in `oi.Equals(q); q.Equals(oi);`
+    // each operand's ARGUMENT appearance would disqualify the other's
+    // RECEIVER, so BOTH operands would be denied and #3447's leak would
+    // survive the fix on that shape entirely (measured pre-fix at 9600 B /
+    // 400 allocations over 200 iterations — 2 boxes per iteration, one per
+    // operand).
+    bool slotWriteMode = false;
+    bool slotWritten = false;
     bool escaped = false;
     bool sawManagedAssignment = false;
     bool sawBoxAssignment = false;
@@ -32899,13 +32922,89 @@ struct BoxEscapeWalker {
     // if sa.SequenceEqual(sp) then … end;` leaked 32 B / 1 allocation (9600 B
     // / 300 loop-amplified) because `sp` never joined `boxReleaseEligible_`
     // for this call shape and no `bz_box_release` was ever emitted for it.
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): is this call `<knownBox>.
+    // Equals(x)` — §8.1's universal one-argument `Equals` on a receiver whose
+    // slot provably holds a §8.6 box? Then the argument position is a
+    // CALL-BOUNDED BORROW and not an escape.
+    //
+    // The proof is a property of BOX VTABLES, not of the callee's source: a
+    // box's word 0 is a box vtable, and every box vtable's `kEqualsSlot` is
+    // filled by this file with a compiler-generated thunk — `bz$box$eq`
+    // (pointer identity), `bz$boxeq$<T>` (§8.3 payload comparison) and the
+    // inline-array / range / span variants — none of which stores `other`:
+    // they load its word 0, compare payloads, and return `i1`. Hence the box
+    // passed as `other` is dead at the call's end and the argument's own
+    // §28.9 discharge is unaffected by the call.
+    //
+    // ⚠ The load-bearing claim is that THE USER METHOD NEVER RECEIVES THE BOX
+    // POINTER — not that no user method is reachable from a box vtable, which
+    // is false. `boxRecordEqualsThunkCore`'s enum arm calls `emitEnumEquals`,
+    // which DOES dispatch a user-declared `Equals(E)`; what protects this
+    // relaxation is that function's `selfTy->isIntegerTy() &&
+    // otherTy->isIntegerTy()` gate, which hands over the unboxed integer
+    // payload and declines an `Object?`-signature override outright. Relaxing
+    // that gate — the adjacent "declares user equality" rescue is explicitly
+    // contemplated at the choice box-vtable site — would invalidate this, and
+    // nothing executable ties the two together.
+    //
+    // MEASURED, pre-fix, on the issue's own repro (×500, LSan):
+    // `var oi: Object := 7; var q: Object := 9; oi.Equals(q)` leaked 12000 B
+    // in 500 allocations — exactly one box per iteration, `q`'s, because the
+    // argument position made `q` escape and suppressed its scope-end release
+    // while the receiver `oi` kept its own (the #2060 direct-receiver
+    // relaxation). This is the OTHER OPERAND of that same relaxation.
+    //
+    // THREE LOAD-BEARING GATES, each excluding a shape where the callee is
+    // not one of those thunks:
+    //   * exactly one argument and the member name `Equals` — §8.1's
+    //     universal member, the only one that reaches `lowerObjectEquals`;
+    //   * NO resolved `MethodSymbol` on the callee. The sites that answer
+    //     `Equals` on an Object/interface/class receiver do so precisely
+    //     because there is no MethodSymbol (see `universalEqualsFormalTy`);
+    //     a resolved symbol means a user or homogeneous overload, whose
+    //     parameter is not the box;
+    //   * the receiver is a `pureBoxBindings_` local. A user CLASS receiver
+    //     dispatches to a user override, which may store its argument — see
+    //     `pureBoxBindings_`'s own warning and #3480.
+    bool isKnownBoxEqualsArg(const ast::Expr* callee,
+                             const std::vector<ast::CallArgument>& args) const {
+        if (!isKnownBoxReceiver || args.size() != 1) return false;
+        const ast::Expr* recv = nullptr;
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+            if (m->member != "Equals") return false;
+            if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*m)))
+                return false;
+            recv = m->target.get();
+        } else if (auto* m =
+                       dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
+            if (m->member != "Equals") return false;
+            if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*m)))
+                return false;
+            recv = m->target.get();
+        } else {
+            return false;
+        }
+        return isKnownBoxReceiver(recv);
+    }
+
+    // fix #3447: a `ref`/`out` argument is the one ARGUMENT position that can
+    // write the tracked local's slot. Recorded separately from `escaped` so
+    // phase 1 (slotWriteMode) still sees it while ordinary reads do not.
+    void noteSlotWrites(const std::vector<ast::CallArgument>& args) {
+        for (auto& a : args)
+            if (!a.modifier.empty() && isTargetIdent(a.value.get()))
+                slotWritten = true;
+    }
+
     void walkArgs(const ast::Expr* callee,
                   const std::vector<ast::CallArgument>& args) {
+        noteSlotWrites(args);
         for (std::size_t i = 0; i < args.size(); ++i) {
             bool safe = args[i].name.empty() && args[i].modifier.empty() &&
                         (isConsoleNonRetainingArg(callee, i) ||
                          isSequenceEqualSpanNonRetainingArg(callee, i, ctx) ||
-                         isNarrowedRead(args[i].value.get())) &&
+                         isNarrowedRead(args[i].value.get()) ||
+                         isKnownBoxEqualsArg(callee, args)) &&
                         !inLambda;
             expr(args[i].value.get(), safe);
         }
@@ -32916,7 +33015,8 @@ struct BoxEscapeWalker {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
+            if (isTargetIdent(id) && (!safeRead || inLambda) && !slotWriteMode)
+                escaped = true;   // fix #3447: a READ never writes the slot
             return;
         }
         // `o is T` / `o as T`: the operand is a non-consuming read (`is` walks
@@ -33053,6 +33153,7 @@ struct BoxEscapeWalker {
                 } else {
                     expr(mem->target.get(), /*safeRead=*/false);
                 }
+                noteSlotWrites(c->args);   // fix #3447
                 for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
                 return;
             }
@@ -33063,15 +33164,18 @@ struct BoxEscapeWalker {
                 } else {
                     expr(mem->target.get(), /*safeRead=*/false);
                 }
+                noteSlotWrites(c->args);   // fix #3447
                 for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
                 return;
             }
             expr(c->callee.get(), /*safeRead=*/false);
+            noteSlotWrites(c->args);   // fix #3447
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
             expr(ix->target.get(), /*safeRead=*/false);
+            noteSlotWrites(ix->indices);   // fix #3447
             for (auto& a : ix->indices) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
@@ -33099,6 +33203,13 @@ struct BoxEscapeWalker {
             expr(th->operand.get(), /*safeRead=*/false); return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            // fix #3447: a constructor's `ref`/`out` parameter is a slot WRITE,
+            // and phase 1 (`slotWriteMode`) must see it even though the
+            // ordinary escape walk below already taints the local. Every
+            // argument vector this walker touches is now covered —
+            // `walkArgs`, the three `NullCondCallExpr` loops, the indexer's
+            // indices, and here — so "never written" really means never.
+            noteSlotWrites(n->args);
             for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
@@ -33259,6 +33370,7 @@ struct BoxEscapeWalker {
             // so it remains an escape (safe leak); compound/??= stores are not
             // implemented by the state-bit path and remain escapes too.
             if (isTargetIdent(as->target.get())) {
+                slotWritten = true;   // fix #3447
                 if (as->op != ":=") { escaped = true; return; }
                 expr(as->value.get(), /*safeRead=*/false);
                 if (escaped) return;
@@ -33275,7 +33387,10 @@ struct BoxEscapeWalker {
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
-            if (isTargetIdent(inc->target.get())) { escaped = true; return; }
+            if (isTargetIdent(inc->target.get())) {
+                slotWritten = true;   // fix #3447
+                escaped = true; return;
+            }
             expr(inc->target.get(), /*safeRead=*/false); return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
@@ -33431,11 +33546,58 @@ void Emitter::collectBoxReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306) — PHASE 1. Identify the locals
+    // whose slot provably holds, for their whole scope, exactly the box their
+    // own initializer minted: a `+1` box producer whose slot is NEVER WRITTEN
+    // — no assignment, no increment, and never passed under a `ref`/`out`
+    // modifier, including from inside a lambda body the walker descends into.
+    // That is what the loop below tests (`!w0.slotWritten`, set by the
+    // walker's assignment/increment arms and by `noteSlotWrites` for the
+    // `ref`/`out` case); escape analysis is NOT consulted here, and the ⚠
+    // below says why it must not be.
+    //
+    // WHY A SEPARATE PASS. Not determinism — `candidates` is a vector in AST
+    // source order and this set is only ever `count()`-queried, never
+    // iterated, so a single pass would have been perfectly deterministic. The
+    // reason is ASYMMETRY: in `oi.Equals(q); q.Equals(oi);` each operand's
+    // ARGUMENT appearance would disqualify the other's RECEIVER, because the
+    // entry it needs has not been computed yet. By that mechanism BOTH
+    // operands are denied and BOTH boxes keep leaking — not one of the two,
+    // as an earlier draft of this paragraph said. (INFERENCE about a design
+    // not taken, flagged as such; what is MEASURED is the pre-fix leak for
+    // that shape, 9600 B / 400 allocations at x200 = 2 boxes per iteration,
+    // which is case (B) of the regression test.)
+    //
+    // ⚠ The phase-1 verdict is NOT "more conservative" than phase 2's — it is
+    // WIDER. Phase 1 asks only whether the slot can be written, so it admits
+    // locals phase 2 rejects as escaping (`var o: Object := 7; Store(o);` is
+    // in `pureBoxBindings_` and not in `boxReleaseEligible_`). That is sound
+    // because the receiver-side claim is about what the SLOT HOLDS, which an
+    // escape does not change; it would NOT be sound as a licence to release
+    // `o` itself, and this set must never be read that way.
+    pureBoxBindings_.clear();
+    for (const ast::Node* ld : candidates) {
+        if (!isPlusOneBoxProducer(ld)) continue;
+        BoxEscapeWalker w0{
+            ctx_, static_cast<const void*>(ld),
+            [this](const ast::Expr* value) {
+                return boxLocalAssignmentSourceKind(value);
+            },
+            /*isKnownBoxReceiver=*/{}};
+        w0.slotWriteMode = true;   // "can the SLOT be written", not "does it escape"
+        for (auto& s : body) { w0.stmt(s.get()); if (w0.slotWritten) break; }
+        if (!w0.slotWritten)
+            pureBoxBindings_.insert(static_cast<const void*>(ld));
+    }
+
     for (const ast::Node* ld : candidates) {   // fix #3417: LocalDecl or LocalConstDecl
         BoxEscapeWalker w{
             ctx_, static_cast<const void*>(ld),
             [this](const ast::Expr* value) {
                 return boxLocalAssignmentSourceKind(value);
+            },
+            [this](const ast::Expr* r) {       // fix #3447
+                return knownBoxReceiverShape(r, /*allowPureBinding=*/true);
             }};
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         bool hasManagedBox =
