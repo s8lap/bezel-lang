@@ -2733,10 +2733,13 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                         // — needs the same §8.6 argument boxing, or
                         // `t.Equals(5)` inside a generic body drops exactly as
                         // the concrete `Object` receiver's did.
-                        if (llvm::Value* other =
-                                lowerUniversalEqualsArg(*call.args[0].value))
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        // fix #3480: same one-step dispatch as the concrete
+                        // `Object`-receiver spelling, so the three §8.1
+                        // `Equals` faces share one box-lifetime rule.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     }
                 }
             }
@@ -2923,7 +2926,17 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     // §22.5 order: the receiver was evaluated by the caller; the argument is
     // evaluated (and boxed) next. Minting the receiver's box afterwards copies
     // an SSA value the argument's evaluation cannot have changed.
-    llvm::Value* other = lowerUniversalEqualsArg(*call.args[0].value);
+    // fix #3480 (§8.6 / §28.9, v0.306): capture the argument's fresh mint.
+    // The RECEIVER here is a box THIS function is about to mint from a
+    // statically-known value type, so its vtable is `boxVtableFor(recvTy)` and
+    // the dispatch below necessarily lands on a compiler-generated box-equals
+    // thunk — the receiver-is-a-box premise holds by construction, without any
+    // analysis. The argument box is therefore dead after the comparison, on
+    // exactly the reasoning this function's own header already gives for the
+    // RECEIVER's box ("minted here, only READ by bz$boxeq").
+    llvm::Value* argMint = nullptr;
+    llvm::Value* other =
+        lowerUniversalEqualsArg(*call.args[0].value, &argMint);
     if (!other || !other->getType()->isPointerTy()) return nullptr;
     // `boxValue` publishes its mint in `lastBoxMint_` for #2865's reader; this
     // box is claimed HERE, so the caller's view of that field is restored.
@@ -2938,6 +2951,7 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     auto* relFn = declareC("bz_box_release", llvm::Type::getVoidTy(llvm_),
                            {ptrTy()});
     builder_.CreateCall(relFn, {boxedRecv});   // null-safe (§28.9)
+    if (argMint) builder_.CreateCall(relFn, {argMint});   // fix #3480
     return r;
 }
 
@@ -8319,11 +8333,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // was missing. This is fix #3422's sibling on the other
                         // operand: that one is the `()` RECEIVER, this the
                         // value-typed ARGUMENT.
-                        llvm::Value* other =
-                            lowerUniversalEqualsArg(*call.args[0].value);
-                        if (recv && other)
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        //
+                        // fix #3480 (§8.6 / §28.9, v0.306): the argument box's
+                        // §28.9 discharge now rides the SAME helper as its
+                        // mint, so the lifetime rule cannot be applied here and
+                        // forgotten at the `?.`, generic-T or value-receiver
+                        // spelling. `isKnownBoxReceiverExpr` is what makes it
+                        // admissible — see `lowerUniversalEqualsDispatch`.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     } else {
                         if (recv)
                             if (llvm::Value* r = lowerObjectGetHashCode(recv))
@@ -15092,10 +15112,11 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             // receiver arm, so §7.5's "nothing to its right in
                             // the chain is evaluated" still holds: a null
                             // receiver evaluates no argument and mints no box.
-                            llvm::Value* ncoOther =
-                                lowerUniversalEqualsArg(*call.args[0].value);
-                            if (ncoOther)
-                                ncoRes = lowerObjectEquals(recv, ncoOther);
+                            // fix #3480: the `?.` mirror discharges the
+                            // argument box on the SAME terms as the `.` form.
+                            ncoRes = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(nm.target.get()));
                         }
                         if (!ncoRes) return nullptr;
                         bool ncoRef = ncoRes->getType()->isPointerTy();

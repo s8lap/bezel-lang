@@ -8992,14 +8992,20 @@ private:
     // the `?.` mirror and the generic-T redirect cannot disagree about whether
     // the argument is boxed.
     //
-    // ⚠ THE FRESH BOX IS DELIBERATELY NOT RELEASED, and that is a MEASURED
-    // decision, not an oversight — do not "finish" this by adding a
-    // `bz_box_release` after the dispatch. #2952 discharges an argument-position
-    // box right after the call ONLY when `isCalleeParamNonEscaping` can prove
-    // the callee does not store the parameter; here the callee is a VTABLE
-    // DISPATCH (`lowerObjectEquals` → vtable[kEqualsSlot]) and so is not
-    // statically known at all. The release was implemented first and MEASURED
-    // to produce a heap-use-after-free under ASan on this program:
+    // ⚠ THE FRESH BOX IS RELEASED ONLY WHERE THE RECEIVER IS PROVABLY A BOX
+    // (fix #3480, v0.306) — see `lowerUniversalEqualsDispatch`, which owns
+    // that decision; this helper only REPORTS the mint through `freshMint`.
+    // Everywhere else the box is still deliberately left to leak, and that is
+    // a MEASURED decision rather than an oversight: #2952 discharges an
+    // argument-position box right after the call ONLY when
+    // `isCalleeParamNonEscaping` can prove the callee does not store the
+    // parameter, and here the callee is a VTABLE DISPATCH
+    // (`lowerObjectEquals` → vtable[kEqualsSlot]). It is statically known
+    // exactly when the RECEIVER's vtable is — which for a §8.6 box means a
+    // compiler-generated `bz$box$eq` / `bz$boxeq$<T>` thunk, and for a user
+    // class means the user's own override. The unconditional release was
+    // implemented first and MEASURED to produce a heap-use-after-free under
+    // ASan on this program:
     //
     //     class K
     //       public S: Object?;
@@ -9014,12 +9020,17 @@ private:
     // takes NO `bz_box_retain` and the caller's `+1` is the only reference.
     // §30.12's read-guard clause records the general shape ("a borrowed parameter
     // admits stores in the callee, which no caller-side rule can reject without
-    // rejecting the pass-and-read idiom wholesale"), so this is a program the
-    // compiler admits. Leaking is #2952's own stated conservative direction:
-    // "the compiler's escape analysis conservatively leaks rather than
-    // guessing." The residual leak (24 B per `Equals` call with a value-typed
-    // argument) is filed separately rather than traded for a UAF.
-    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr) {
+    // rejecting the pass-and-read idiom wholesale"), and §28.3's *deliberate
+    // asymmetry* paragraph states it as a rule ("a parameter-sourced object
+    // borrow may be stored into a field under §28.3's borrowed-field rule — a
+    // structural check whose residual is the caller's trust"), so this is a
+    // program the compiler admits. Leaking is #2952's own stated conservative
+    // direction: "the compiler's escape analysis conservatively leaks rather
+    // than guessing." The residual leak on THAT path (24 B per `Equals` call
+    // with a value-typed argument and a class receiver) stands rather than be
+    // traded for a UAF.
+    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr,
+                                         llvm::Value** freshMint = nullptr) {
         llvm::Value* savedBoxMint = lastBoxMint_;
         lastBoxMint_ = nullptr;
         llvm::Value* other = lowerExpr(argExpr);
@@ -9027,8 +9038,58 @@ private:
         // it keeps THIS argument's mint from leaking into a sibling
         // `boxForTarget`, or a previous mint into this one.
         other = boxForTarget(other, universalEqualsFormalTy(), &argExpr);
+        // fix #3480: hand back the box MINTED DURING THIS ARGUMENT'S lowering,
+        // if any — the mint-identity test #2865 established, reused here. It
+        // is the caller's decision whether discharging it is admissible (see
+        // `lowerUniversalEqualsDispatch`); this helper only reports the fact.
+        if (freshMint)
+            *freshMint = (other && lastBoxMint_ && other == lastBoxMint_)
+                             ? other : nullptr;
         lastBoxMint_ = savedBoxMint;
         return other;
+    }
+
+    // fix #3480 (§8.6 / §8.3 / §28.9 / §28.3, v0.306): lower `<recv>.Equals(
+    // <arg>)` for the sites this backend answers itself — argument boxing,
+    // vtable dispatch, and the argument box's §28.9 discharge — as ONE step,
+    // so the lifetime rule cannot be applied at three of the four `Equals`
+    // sites and forgotten at the fourth (this family's characteristic defect).
+    //
+    // `recvIsKnownBox` says the receiver's word 0 is provably a BOX VTABLE.
+    // Every box vtable's `kEqualsSlot` holds a compiler-generated thunk that
+    // reads `other` and returns an `i1` without storing it (see
+    // `pureBoxBindings_` for the enumeration), so the fresh argument box is
+    // dead the instant the dispatch returns and `bz_box_release` here is
+    // exactly-once.
+    //
+    // WHEN IT IS FALSE the box is LEFT TO LEAK, deliberately, and that is
+    // #3480's own measured verdict rather than a missing case: a user class
+    // receiver dispatches to a user `Equals` override, which the spec (v0.306
+    // §28.14's *deliberate asymmetry* paragraph, referring to §28.3's
+    // borrowed-field rule) permits to store its borrowed `Object?` parameter
+    // into a field — taking no `bz_box_retain`,
+    // because `collectBoxStorageFields` cannot classify a field whose only
+    // assignment source is an `Object?` PARAMETER. Releasing there was
+    // implemented and measured to produce a heap-use-after-free. A bounded
+    // leak is the conservative direction; a UAF is not.
+    llvm::Value* lowerUniversalEqualsDispatch(llvm::Value* recv,
+                                              const ast::Expr& argExpr,
+                                              bool recvIsKnownBox) {
+        llvm::Value* mint = nullptr;
+        llvm::Value* other = lowerUniversalEqualsArg(argExpr, &mint);
+        if (!recv || !other) return nullptr;
+        llvm::Value* r = lowerObjectEquals(recv, other);
+        if (!r) return nullptr;
+        if (recvIsKnownBox && mint) emitBoxRelease(mint);  // null-safe (§28.9)
+        return r;
+    }
+
+    bool isKnownBoxReceiverExpr(const ast::Expr* recv) {
+        // Arm (a) reads `pureBoxBindings_`, which describes the body
+        // `collectBoxReleaseEligible` last ran over; the same token check
+        // `lowerLocalDecl` applies to `boxReleaseEligible_`.
+        return knownBoxReceiverShape(recv,
+                                     currentFn_ == boxReleaseEligibleFn_);
     }
 
     // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): does the ARGUMENT's static type
