@@ -671,10 +671,10 @@ CompileResult Driver::compileObject(const std::string& path,
     // gates-the-front-end rule applies to this library/object path.
     if (unit && !diagnostics.hasErrors()) {
         // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), OFF BY DEFAULT — the
-        // library/object path mirrors compileExecutableObject. `opts` is read
-        // for this ONE bit here; the library build's codegen options stay the
-        // locally-built `libOpts` below, so no other flag's meaning changes on
-        // this path.
+        // library/object path mirrors compileExecutableObject. (#4488: `opts`
+        // is no longer read for this ONE bit only — see the `libOpts` block
+        // below, which now DERIVES the library build's codegen options from
+        // the caller's rather than default-constructing them.)
         maybeDesugarScopedAwaitBinds(opts.scopedAwaitBind, source, deps, *unit);
         // stdlib §2.20 (#2047): inject the auto-imported `Result<T, E>` choice
         // (the library/object path mirrors compileFile).
@@ -756,8 +756,42 @@ CompileResult Driver::compileObject(const std::string& path,
             // a library build, so importing this artifact into an executable
             // that has its own `Main` failed to link with a duplicate
             // definition of `main`.
-            codegen::CodegenOptions libOpts;
+            //
+            // fix #4488, per §28.2 and §22.16 (v0.306): DERIVE the library
+            // build's options from the caller's rather than default-
+            // constructing them. Both checked modes are, in the spec's own
+            // words, "a per-build choice between two conformance modes"
+            // (§28.2 "Use after disposal; checked disposal mode"; §22.16
+            // "`ensures` and `invariant` run under checked-contracts mode")
+            // — a *build*, not a translation unit. Their instrumentation is
+            // EMITTED into the code (the §28.2 disposed-flag entry guard and
+            // the §22.7 watermark guard; the §22.16 clause evaluations), so a
+            // dependency compiled without it simply has no checks and nothing
+            // at link time can add them back. Default-constructing `libOpts`
+            // therefore silently downgraded every `-c` artifact to unchecked,
+            // and a program built `--checked-disposal` ran its imported code
+            // unchecked while appearing to be in checked mode.
+            //
+            // Deriving (rather than copying field-by-field) is the point: a
+            // field added to CodegenOptions later is carried onto this path by
+            // default, so the next emitted flag cannot be forgotten here. Only
+            // the fields whose meaning is specific to the library artifact are
+            // overridden below, each with its reason.
+            codegen::CodegenOptions libOpts = opts;
+            // per §33.1/§2.4/§33.6 (#1563), as above: a library artifact is
+            // never the executable's main module.
             libOpts.isMainModule = false;
+            // NOT forwarded, deliberately (#4488): --sanitize=address is an
+            // *executable-build* option, not an emitted-semantics one. It
+            // requires the final link to pull in the ASan runtime that defines
+            // `__asan_report_*` / `asan.module_ctor`, and this path performs no
+            // link (main.cpp rejects `-c --sanitize=address` outright for that
+            // reason). Dropping it costs only redzone instrumentation inside
+            // the dependency: the executable's ASan runtime interposes malloc
+            // process-wide, so the dependency's allocations are still covered
+            // by leak/double-free detection — the fallback checkedDisposal and
+            // checkedContracts do not have.
+            libOpts.sanitizeAddress = false;
             auto module = codegen::emitModule(*unit, semaCtx, llvmCtx, libOpts);
             // §2.6 step 4: embed the public-interface metadata so an importer's
             // loader can read this object's interface (issue #328 inc 1/2/3).

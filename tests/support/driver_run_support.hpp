@@ -52,9 +52,12 @@
 //
 // ── WHY `compileObject` IS NOT WRAPPED ─────────────────────────────────────
 //
-// `Driver::compileObject` consults `opts` for exactly one bit
-// (`scopedAwaitBind`, #3048) and ignores `sanitizeAddress` — stated at
-// driver/Driver.hpp. Wrapping it would imply a coverage it cannot deliver. Leak
+// `Driver::compileObject` DERIVES the library build's options from `opts`
+// (fix #4488 — so the per-build checked modes of §28.2/§22.16 reach a `-c`
+// artifact) but still forces `sanitizeAddress` off: it is an executable-build
+// option that needs the final link to add the ASan runtime, and that path does
+// not link — stated at driver/Driver.hpp. Wrapping `compileObject` in this
+// header would therefore imply a coverage it cannot deliver. Leak
 // detection still covers the dependency's allocations regardless, because
 // linking the ASan runtime into the EXECUTABLE interposes `malloc`
 // process-wide; only redzone instrumentation (out-of-bounds, use-after-free) is
