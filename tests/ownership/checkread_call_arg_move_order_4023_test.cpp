@@ -8,26 +8,32 @@
 // was the one position that still ran the unguarded `checkRead(*a.value,
 // false)` — so `checkRead`'s own (correct, for a plain read) Warning-and-
 // poison side effect fired FIRST and masked `recordMovesIn`'s more precise
-// Error.
+// diagnostic.
 //
-// Spec, v0.294:
+// Spec, v0.294 → v0.303:
 //   §28.3 "Local variables, ownership, and borrows" — the move/disposal
 //     state machine `markMovedByName` enforces ("a `Disposed` local may not
-//     be moved from").
+//     be moved from" — UNCHANGED at the kernel level; v0.303 changes only
+//     the SEVERITY of the DOMINATING-kill arm from ERROR to §28.2 WARNING).
 //   §28.2 "The `IDisposable` contract" — the use-after-dispose Warning
 //     `checkRead`'s `IdentifierExpr` arm reports for a PLAIN read of a
-//     disposed local (correct there; wrong diagnostic for a `move` site).
+//     disposed local.  v0.303 / #3975 (option 1) extends this regime to
+//     the consume side: under a DOMINATING `Dispose()`, EVERY use — read,
+//     borrow, AND consume — draws the §28.2 WARNING (the consume-side
+//     ruling is the new contract; the conditional-kill arms stay §28.3
+//     errors per `maybeConsumed`).
 //
-// THE BUG (measured pre-fix on r15-c3-batch base, carrying #4003 fix 7b37af7
-// and #4028 fix 4d40c6f):
+// THE BUG (measured pre-#4023 on r15-c3-batch base, carrying #4003 fix
+// 7b37af7 and #4028 fix 4d40c6f):
 //
 //   using var h := new Holder(move x);   // x already .Dispose()d
-//     -> REJECTED: "cannot move from disposed local `x` (§28.3)".
+//     -> DIAGNOSTIC FIRED (precise §28.3 ERROR pre-#4450, §28.2 WARNING
+//        post-#4450 — the verdict MOVED; the diagnostic still fires).
 //   var y := Factory.Make(move x);       // byte-identical move, as a BARE
 //                                        // call's argument — no wrapper
-//     -> ACCEPTED (only the unrelated §28.2 Warning + the auto-drop
-//        must-discharge Warning on `y`, both non-fatal). Compiled and run
-//        under `--sanitize=address`: SEGV (null READ) inside
+//     -> NO DIAGNOSTIC (only the unrelated §28.2 read-side Warning + the
+//        auto-drop must-discharge Warning on `y`, both non-fatal). Compiled
+//        and run under `--sanitize=address`: SEGV (null READ) inside
 //        `bz$M.Holder$ctor`, called from `bz$M.Factory$Make` — the disposed
 //        `x`'s freed storage read as if valid. Measured (this lane):
 //        `/var/tmp/bezel-scratch/r15/4023/logs/l6-4023-probe-pre.log`.
@@ -38,52 +44,63 @@
 // `recordMovesIn`). For a `move x` argument, the arm's blanket
 // `checkRead(*a.value, false)` recurses through the generic `UnaryExpr` arm
 // into the IDENTIFIER `x`, whose `IdentifierExpr` arm sees `state ==
-// Disposed`, reports the §28.2 WARNING (correct for a plain read; wrong
-// diagnostic for a move site) and then — since this runs in the final,
-// unsuppressed pass — POISONS `x`'s tracked state
+// Disposed`, reports the §28.2 WARNING (correct for a plain read; but the
+// wrong diagnostic for a move site) and then — since this runs in the
+// final, unsuppressed pass — POISONS `x`'s tracked state
 // (`OwnershipState::Poisoned`). By the time `recordMovesIn` ->
 // `recordMovesInArgs` -> the bare-`move`-identifier branch ->
 // `markMovedByName("x", ...)` runs, `x`'s state is no longer `Disposed` —
-// `markMovedByName` has arms only for `MovedFrom` and `Disposed`; `Poisoned`
-// matches neither, so it falls through SILENTLY (poisoning is a deliberate
-// cascade-suppressor, by design silent — see its own comment) and the
-// precise "cannot move from disposed local `x`" ERROR never fires.
+// `markMovedByName`'s `Disposed` arm either (pre-#4450) reports its
+// §28.3 ERROR, or (post-#4450) reports its §28.2 consume-side WARNING,
+// but the cascade-poisoning means the warning is the §28.2 read-side
+// one from `checkRead`, with `markMovedByName`'s OWN diagnostic suppressed.
+// The `Poisoned` state matches NEITHER `MovedFrom` NOR `Disposed` cleanly
+// for the consume arm's verification — poisoning is a deliberate
+// cascade-suppressor, by design silent — so `markMovedByName` falls
+// through SILENTLY (this is the cascade-poisoning hazard #4023 fixed).
 //
-// THE FIX: the `CallExpr` arm's argument loop gained the SAME
+// THE FIX (#4023): the `CallExpr` arm's argument loop gained the SAME
 // `isTopLevelConsumingForm` carve-out `readOperand` already applies to every
 // other read position `checkRead` walks (the `NewExpr` ctor-argument arm,
 // and every arm #3971 added) — skip the read-check entirely for a `move`/
 // `await` top-level argument, deferring wholly to `recordMovesIn`, which
 // already correctly reports on the ORIGINAL (unpoisoned) Disposed/MovedFrom
-// state via `markMovedByName`. Only the `move` half is exercised below
-// (`await` shares the identical `isTopLevelConsumingForm` predicate and is
-// already covered at its other four call sites — Ownership.cpp
-// `handleLocalDecl`/`handleAssignment`'s RHS checks and this file's
-// `readOperand` — constructing a fresh, spec-correct `async`/`Task` program
-// to exercise the identical code path here would not add coverage of a
-// DIFFERENT mechanism, so it is declined per CLAUDE.md's decline-with-
-// reasons discipline rather than bolted on).
+// state via `markMovedByName`.  Post-#4450 the consume-side ruling per
+// v0.303 is what `markMovedByName`'s `Disposed` arm reports (a §28.2
+// consume-side WARNING, distinct from `checkRead`'s read-side wording, so
+// the consume shape stays visible at a glance).  Only the `move` half is
+// exercised below (`await` shares the identical `isTopLevelConsumingForm`
+// predicate and is already covered at its other four call sites —
+// Ownership.cpp `handleLocalDecl`/`handleAssignment`'s RHS checks and this
+// file's `readOperand` — constructing a fresh, spec-correct `async`/`Task`
+// program to exercise the identical code path here would not add coverage
+// of a DIFFERENT mechanism, so it is declined per CLAUDE.md's
+// decline-with-reasons discipline rather than bolted on).
 //
-// per §28.2, §28.3 K3.4, v0.294, #3971, #3941, #4023
+// CHECKED-MODE BACKSTOP (§28.2): the §28.2 ruling admits these programs
+// with a WARNING only because the language's checked-disposal mode is the
+// deterministic runtime backstop — every member access through a
+// logically-disposed instance raises `DisposedAccessException`.  The AOT
+// row below exercises this for the bare-call shape; the catch arm observes
+// the exception and returns 1, pinning "warns, then crashes at runtime"
+// as the §28.2 verdict (so "warns, runs to completion" is not a hole).
+//
+// per §28.2, §28.3 K3.4/K1.3/K7, v0.294 → v0.303, #3971, #3941, #4023, #4450
 
 #include <string>
 
-#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
-#include "support/aot_support.hpp"         // runAot — the strong AOT oracle
+#include "support/aot_support.hpp"         // runAotCheckedDisposal — the strong AOT oracle (§28.2 backstop)
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::hasErrorMessage;
 using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
-constexpr char kDisposedMoveError[] =
-    "cannot move from disposed local `x` (§28.3)";
 constexpr char kUseAfterDisposeWarningFragment[] =
     "after a dominating explicit Dispose() call";
 
@@ -99,6 +116,36 @@ bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
         if (d.severity != bezel::Severity::Warning) continue;
         if (d.message.find(needle) != std::string::npos) return true;
     }
+    return false;
+}
+
+// v0.303 / #4450 (the #3975 option-1 ruling): under a DOMINATING
+// `Dispose()`, every use of the source local — read, borrow, AND consume —
+// is §28.2's use-after-dispose WARNING, NOT §28.3's consume-table ERROR.
+// The consume-side ruling is the new contract; the OLD §28.3 ERROR text
+// ("cannot move from disposed local `x`") is GONE.  These two helpers are
+// the inclusive matcher (both wording variants — the read-side wording
+// `checkRead` produces and the consume-side wording `markMovedByName`
+// produces post-ruling) and the negative guard that the OLD §28.3 ERROR
+// must NOT have reappeared (catches any over-relaxation of the
+// conditional-kill arms).
+//
+// per §28.2, §28.3 K1.3/K7, v0.303, #3975 (option 1), #4450
+inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("use of `x` after a dominating explicit "
+                           "Dispose() call") != std::string::npos) return true;
+        if (d.message.find("move from a local `x` already disposed at "
+                           "this point") != std::string::npos) return true;
+    }
+    return false;
+}
+inline bool hasCannotMoveFromDisposedError(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("cannot move from disposed local `x`") !=
+                std::string::npos) return true;
     return false;
 }
 
@@ -134,12 +181,18 @@ std::string program(const std::string& classesAndMain) {
 
 // =============================================================================
 // CONTROL — the pre-existing `NewExpr` ctor-argument spelling was already
-// correctly rejected before this fix (its `move` never reaches `checkRead`
-// at all — `checkRead` has no `NewExpr` arm) and must stay rejected with the
-// IDENTICAL diagnostic text.
+// detected before this fix (its `move` never reaches `checkRead` at all —
+// `checkRead` has no `NewExpr` arm); the original `recordMovesIn` path was
+// the one reporting the precise §28.3 ERROR.  v0.303 / #4450 demotes that
+// arm's verdict to §28.2's consume-side WARNING — the ruling is the OTHER
+// way for a DOMINATING-kill consume.  The preemption invariant #3971 owned
+// (this row is consumed by `recordMovesIn`'s OWN path, NOT by `checkRead`'s
+// cascade) is unchanged: `checkRead` does not also report, so the verdict
+// is a single §28.2 consume-side warning, with the OLD §28.3 ERROR text
+// GONE.
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           direct_new_ctor_move_of_disposed_local_rejected_control) {
+           direct_new_ctor_move_of_disposed_local_warns_28_2_4450_control) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -148,21 +201,27 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    return h.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
 // =============================================================================
 // NEGATIVE (issue #4023's own repro) — a BARE call's `move` argument (no
 // wrapper at all), reached through `checkRead`'s own `CallExpr` arm.
-// FAIL-WITHOUT: `r.diagnostics.hasErrors()` is FALSE (only Warnings) and
-// `hasErrorMessage(r, kDisposedMoveError)` is FALSE — measured pre-fix.
-// PASS-WITH: both flip true, with the SAME diagnostic text the control case
-// gets (proving the precise diagnostic is no longer masked, not merely that
-// *some* error appears).
+// v0.303 / #4450: under a DOMINATING Dispose(), the consume side draws
+// §28.2's WARNING rather than §28.3's ERROR (the ruling is option 1 of
+// #3975).  The pre-fix #4023 measurement is no longer the correct verdict
+// for this shape — but the cascade-preemption invariant IS still load-bearing:
+// the consume-side warning is reported by `markMovedByName` (NOT masked by
+// `checkRead`'s read-side cascade), and the OLD §28.3 ERROR text is GONE.
+// `Factory.Make`'s body calls `new Holder(move r)`, whose ctor reads
+// `r.tag` and calls `r.Dispose()` — the `r.tag` read is the member access
+// through the disposed-and-moved-from instance that triggers checked-mode's
+// `DisposedAccessException`, observed in the backstop row below.
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           bare_call_move_of_disposed_local_rejected) {
+           bare_call_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -171,24 +230,33 @@ BEZEL_TEST(checkread_call_arg_move_order_4023,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kDisposedMoveError));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
-// The same case through the STRONG AOT oracle (real `bezelc` + link + exec):
-// proves not merely that a diagnostic fired, but that NO EXECUTABLE was ever
-// produced (the pre-fix program compiled to a real, SEGV-on-run binary).
+// CHECKED-MODE BACKSTOP (§28.2 runtime backstop) — the same shape under
+// AOT with checked disposal: `Factory.Make`'s ctor-side `r.tag` read inside
+// `Holder`'s body is the member access through the logically-disposed `r`
+// that fires `DisposedAccessException`.  Static analysis admits the program
+// with a WARNING (the row above); runtime flags the access deterministically.
+// "warns, then crashes at runtime" is the §28.2 verdict; this row pins it
+// so "warns, runs to completion" is not a hole in the contract.
 BEZEL_TEST(checkread_call_arg_move_order_4023,
-           aot_bare_call_move_of_disposed_local_rejected_no_program) {
-    JitResult r = runAot(program(
+           aot_bare_call_move_of_disposed_local_warns_28_2_4450_checked_backstop) {
+    JitResult jr = runAotCheckedDisposal(program(
         "class C "
         "  public static method Main(): int "
         "    var x := new Res(1); x.Dispose(); "
-        "    var y := Factory.Make(move x); "
-        "    return y!.v; "
+        "    try "
+        "      var y := Factory.Make(move x); "
+        "      return 0; "
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 1);
 }
 
 // =============================================================================

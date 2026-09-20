@@ -1,10 +1,15 @@
-// Cross-module axis for fix #4023 (§28.3 K3.4, v0.294).
+// Cross-module axis for fix #4023 (§28.3 K3.4, v0.294) and the consume-side
+// ruling v0.303 / #4450 (option 1 of #3975) makes applicable to the
+// cross-module shape too.
 //
 // The single-module tests in checkread_call_arg_move_order_4023_test.cpp
 // prove `checkRead`'s `CallExpr` argument loop no longer masks
-// `recordMovesIn`'s precise "cannot move from disposed local `x`" diagnostic
-// for a `move` argument to a callee declared in the SAME module. Several
-// other fixes this run turned out to be local-axis-only (a predicate that
+// `markMovedByName`'s consume-side diagnostic for a `move` argument to a
+// callee declared in the SAME module. v0.303 demotes that diagnostic's
+// severity for the DOMINATING-kill arm from §28.3 ERROR to §28.2 WARNING —
+// the compile no longer fails, but the diagnostic text still prints to
+// stderr (warnings are emitted on the same stream). Several other fixes
+// this run turned out to be local-axis-only (a predicate that
 // dynamic_casts a symbol's `->decl` to an AST node type, which is null for
 // every non-generic IMPORTED symbol — see fix #3176's own commentary on
 // `recordMovesInArgs`' callee-formals resolver). This file confirms #4023's
@@ -25,8 +30,8 @@
 // This test exercises that combination empirically rather than resting on
 // the trace alone.
 //
-// per §28.2, §28.3 K3.4, §2.5 "Dependency resolution", v0.294, #3971,
-// #3941, #4023
+// per §28.2, §28.3 K3.4, §2.5 "Dependency resolution", v0.294 → v0.303,
+// #3971, #3941, #4023, #4450
 
 #include <cstdio>
 #include <fcntl.h>
@@ -58,7 +63,13 @@ void writeSource4023X(const std::string& path, const std::string& src) {
     out << src;
 }
 
-constexpr char kDisposedMoveError[] =
+constexpr char kConsumeSideUseAfterDisposeWarning[] =
+    "move from a local `x` already disposed at this point (§28.2)";
+// Negative guard: the OLD §28.3 ERROR text must NOT appear in stderr.
+// Catches any over-relaxation of the conditional-kill arms (which the
+// demotion did NOT touch — see spec §28.2 v0.303 ruling text: "the
+// conditional-kill arms stay §28.3 errors per `maybeConsumed`").
+constexpr char kOldDisposedMoveError[] =
     "cannot move from disposed local `x` (§28.3)";
 
 // The library module: `Res` (a plain disposable class) and `Factory`, whose
@@ -176,17 +187,28 @@ bool compileImportedApp4023X(std::string* capturedStderr) {
 }  // namespace bezel::ownership
 
 using bezel::ownership::compileImportedApp4023X;
-using bezel::ownership::kDisposedMoveError;
+using bezel::ownership::kConsumeSideUseAfterDisposeWarning;
+using bezel::ownership::kOldDisposedMoveError;
 
 // =============================================================================
 // NEGATIVE (cross-module) — the issue #4023 repro with the consuming callee
-// declared in a SEPARATE, imported module. Must be REJECTED with the same
-// precise diagnostic the single-module test gets, not merely "some error".
+// declared in a SEPARATE, imported module.  v0.303 / #4450 demoted the
+// consume-side diagnostic for a DOMINATING-kill arm from §28.3 ERROR to
+// §28.2 WARNING (option 1 of #3975), so the front-end's `success` no
+// longer trips on this shape — but the WARNING text still prints to stderr
+// (warnings share the diagnostic stream).  Pin: the compile succeeds, the
+// §28.2 consume-side warning text is in stderr, and the OLD §28.3 ERROR
+// text is NOT (negative guard against any over-relaxation of the
+// conditional-kill arms, which the demotion did NOT touch).
 // =============================================================================
 BEZEL_TEST(checkread_call_arg_move_order_4023_xmod,
-           imported_callee_bare_call_move_of_disposed_local_rejected) {
+           imported_callee_bare_call_move_of_disposed_local_warns_28_2_4450) {
     std::string stderrText;
     bool compiled = compileImportedApp4023X(&stderrText);
-    BEZEL_EXPECT_FALSE(compiled);
-    BEZEL_EXPECT_TRUE(stderrText.find(kDisposedMoveError) != std::string::npos);
+    BEZEL_EXPECT_TRUE(compiled);  // warnings don't fail the build
+    BEZEL_EXPECT_TRUE(stderrText.find(kConsumeSideUseAfterDisposeWarning) !=
+                      std::string::npos);
+    // Negative guard: OLD §28.3 ERROR text must NOT have re-appeared.
+    BEZEL_EXPECT_TRUE(stderrText.find(kOldDisposedMoveError) ==
+                      std::string::npos);
 }

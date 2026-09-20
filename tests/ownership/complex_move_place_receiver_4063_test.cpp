@@ -107,6 +107,28 @@ bool hasWarningMessage(const OwnershipResult& r, std::string_view needle) {
     return false;
 }
 
+// v0.303 / #4450 (the #3975 option-1 ruling): under a DOMINATING
+// `Dispose()`, every use of the source local — read, borrow, AND consume —
+// is §28.2's use-after-dispose WARNING, NOT §28.3's consume-table ERROR.
+// The control row below pins this for the bare-identifier `move x`
+// argument (consume-side wording, distinct from the read-side wording the
+// negative rows above use).  This inclusive helper matches BOTH wording
+// variants, mirroring the precedent in
+// move_after_dominating_dispose_warns_4450_test.cpp and
+// checkread_call_arg_move_order_4023_test.cpp.
+//
+// per §28.2, §28.3 K1.3/K7, v0.303, #3975 (option 1), #4450
+inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("use of `b` after a dominating explicit "
+                           "Dispose() call") != std::string::npos) return true;
+        if (d.message.find("move from a local `x` already disposed at "
+                           "this point") != std::string::npos) return true;
+    }
+    return false;
+}
+
 // Shared shapes: `Res` (plain disposable), `Box` (owns a NON-nullable `Res`
 // field `f`, the complex move-place receiver under test), `Holder` (consumes
 // an `owned r: Res`), `Factory.Make` (forwards a moved owned argument
@@ -324,29 +346,19 @@ BEZEL_TEST(complex_move_place_receiver_4063,
 
 // =============================================================================
 // CONTROL — a bare-identifier `move` of a DISPOSED local through a bare
-// CallExpr argument (`Factory.Make(move x)`) is REJECTED with the precise
-// §28.3 "cannot move from disposed local" ERROR (matching the byte-identical
-// `using var h := new Holder(move x);` ctor-argument spelling). This row
-// locked in the pre-#4023 §28.2-warning behaviour before fix #4023 landed;
-// cycle-14 re-land of #4023 flipped it to assert the precise-ERROR form.
+// CallExpr argument (`Factory.Make(move x)`) draws the §28.2 consume-side
+// WARNING (post-#4450 v0.303 ruling: under a DOMINATING Dispose(), every
+// use — read, borrow, AND consume — is §28.2, not §28.3).  Matches the
+// byte-identical `using var h := new Holder(move x);` ctor-argument
+// spelling pinned by
+// checkread_call_arg_move_order_4023_test.cpp's CONTROL row, proving the
+// same-state program through both a ctor-argument site and a method-call
+// site draws the SAME verdict under the ruling.
 //
-// Note on the spec question #3975 ("move-after-dominating-Dispose is a §28.2
-// warning or a §28.3 error depending only on the read position"): the v0.303
-// rule that the question was waiting on landed (§28.2 (v0.303) splits severity
-// by kill kind, never by use form) and the implementation half is owned by
-// the separate fix #4450 (demote the dominating-kill arms of
-// `markMovedByName`/`markDisposedByName` to `Severity::Warning`). That
-// demotion, when landed, will flip this row BACK to the §28.2-warning form
-// again — the row's name and assertion are deliberately tied to whichever
-// side of that ruling is currently implemented. Until then, with #4023
-// landed and #4450 still open, this row pins the precise-error behaviour
-// #4023 produces — and proves the byte-identical same-state program through
-// both a ctor-argument site (the CONTROL case in
-// checkread_call_arg_move_order_4023_test.cpp) and a method-call site is
-// rejected with the same diagnostic text.
+// per §28.2, §28.3 K1.3/K7, v0.303, #4023, #4450
 // =============================================================================
 BEZEL_TEST(complex_move_place_receiver_4063,
-           control_bare_identifier_move_of_disposed_local_rejected_28_3) {
+           control_bare_identifier_move_of_disposed_local_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(program(
         "class C "
         "  public static method Main(): int "
@@ -355,7 +367,11 @@ BEZEL_TEST(complex_move_place_receiver_4063,
         "    return y!.v; "
         "  end Main; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // OLD §28.3 ERROR text must NOT have re-appeared (negative guard
+    // against any over-relaxation of the conditional-kill arms, which
+    // the demotion did NOT touch).
     BEZEL_EXPECT_TRUE(
-        hasErrorMessage(r, "cannot move from disposed local `x` (§28.3)"));
+        !hasErrorMessage(r, "cannot move from disposed local `x` (§28.3)"));
 }

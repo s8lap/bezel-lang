@@ -553,6 +553,15 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
 // now measures, and it is a stronger claim than the old one — measured, it
 // still fails if the sibling guards are removed, because the loop spelling
 // then draws NOTHING AT ALL while the straight-line twin still warns.
+//
+// ⚠ v0.303 / #4450 wording note (post-ruling): `Sink.Take(move x)` is a
+// top-level consuming form at the CallExpr argument position, and #4023's
+// `isTopLevelConsumingForm` skip deliberately drops `checkRead`'s walk
+// before it reaches the `x` identifier — so the §28.2 warning this row
+// asserts is the CONSUME-SIDE wording (`kMoveAfterDisposeWarn`, produced
+// by `markMovedByName`'s now-demoted Disposed arm), NOT the read-side
+// `kUseAfterDispose` produced by `checkRead`.  Both rows of this
+// loop-vs-straight-line twin therefore pin the consume-side wording.
 BEZEL_TEST(loop_body_read_after_consume_3931,
            while_body_move_after_dispose_warns_28_2_like_straight_line) {
     const char* kBody =
@@ -566,12 +575,19 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "  i := i + 1; "
         "end; "
         "return t;"));
-    // The §28.2 warning fires, at a real location...
+    // The §28.2 consume-side warning fires, at a real location — the
+    // post-ruling consume-side wording (produced by `markMovedByName`'s
+    // demoted Disposed arm, the sole authority once #4023's skip has
+    // taken `checkRead` out of the picture for this argument position).
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(loop, bezel::Severity::Warning, kUseAfterDispose));
-    BEZEL_EXPECT_TRUE(diagHasRealLocation(loop, kUseAfterDispose));
+        diagWithSeverity(loop, bezel::Severity::Warning, kMoveAfterDisposeWarn));
+    BEZEL_EXPECT_TRUE(diagHasRealLocation(loop, kMoveAfterDisposeWarn));
     // ...and it is a WARNING, not an error: §28.2's dominating-kill regime.
     BEZEL_EXPECT_FALSE(loop.diagnostics.hasErrors());
+    // The OLD §28.3 ERROR text must NOT fire — the ruling moved the
+    // verdict off §28.3's consume-table for the dominating kill.
+    BEZEL_EXPECT_FALSE(
+        diagWithSeverity(loop, bezel::Severity::Error, kCannotMoveDisposed));
 
     // The straight-line twin — same consume, same read position, no loop —
     // must reach the identical verdict.  This equality IS the #3931
@@ -581,8 +597,10 @@ BEZEL_TEST(loop_body_read_after_consume_3931,
         "t := t + Sink.Take(move x); "
         "return t;"));
     BEZEL_EXPECT_TRUE(
-        diagWithSeverity(sl, bezel::Severity::Warning, kUseAfterDispose));
+        diagWithSeverity(sl, bezel::Severity::Warning, kMoveAfterDisposeWarn));
     BEZEL_EXPECT_FALSE(sl.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(
+        diagWithSeverity(sl, bezel::Severity::Error, kCannotMoveDisposed));
 }
 
 // markMovedByName's MOVED-FROM arm (the third guarded sibling).  ⚠ THESE
