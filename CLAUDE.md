@@ -398,6 +398,191 @@ is `--single-oracle MODE`, which says loudly that it is not a full acceptance.
 Running `scripts/gate.sh` directly gates ONE oracle and now prints that its
 `GATE PASS` is not an acceptance verdict — use it for diagnosis, not to land.
 
+## Autonomous run discipline (lanes, gates, tests)
+
+These rules are not style preferences — every one was paid for in a lost gate
+cycle, a shipped regression, or hours of dead wall-clock. They bind **lane
+agents and coordinators alike**; a lane brief should assume them rather than
+restate them.
+
+### Never weaken a test to make it pass
+
+A test oracle encodes the spec's expected behaviour. Lowering its bar silences
+the bug instead of fixing it, and **a green test with a weakened oracle is worse
+than a red test with a strict one** — the red one is actionable, the green one
+hides a regression that resurfaces as a crash. Forbidden, without exception:
+turning `EXPECT_EQ` into `EXPECT_NE`, relaxing `exitCode == 0` to `!= 0` or
+`== 99`, flipping `ASSERT_TRUE(leaksAtLeast(p, N))` to `ASSERT_FALSE`, deleting
+`didNotCrash` / `assertNoLeak` markers, or adding a `DISABLED_` prefix. A fix
+that "passes" this way is **reverted and re-dispatched**. Precedent: a lane
+weakened a `runChecked == 0` row to `leaksAtLeast(prog, 11000)` and justified it
+as "the post-fix safe leak is correct" — which is exactly the rationale that
+hides a use-after-free. *Strengthening* an oracle is always welcome; if you
+believe an oracle is wrong, say so and stop — do not quietly change it.
+
+⚠ The rule cuts **both** ways. A fix that reverses behaviour (admits what was
+rejected, or rejects what was admitted) **must** update the tests that pinned the
+old behaviour — the gate's REAL-vs-FLAKY arbitration re-runs a failing test alone
+5× and classifies a deterministic-but-now-obsolete test as REAL even though the
+compiler is right. One cycle burned 5 regressions this way. Before committing,
+`git grep` every test named in the commit message and every test in the files
+touched; name the flipped tests and their new expectation in the commit body.
+
+### A regression test must pin THE BUG, not the neighbourhood
+
+Every fix ships a spec-cited test that **fails on the pre-fix code and passes
+with the fix**, and you must prove FAIL-WITHOUT mechanically rather than assume
+it. A test that merely exercises the same area gives no protection: a spec-cited
+gtest for a visited-set-on-walk fix once used a non-cyclic 2-level diamond that
+never revisits a node, so deleting the fix would not have failed it. The input
+must be the issue's actual repro — assert termination for a hang, no-crash for a
+crash, the corrected value for wrong-code, acceptance for an over-rejection,
+dispose-count/ASan-clean for a double-free.
+
+### Oracles that pass vacuously
+
+- **One-shot leak repros.** LSan reports *unreachable* allocations; a single run
+  can leave the allocation reachable from a live stack slot or register, so the
+  row passes on both sides of the fix. Measured: clean one-shot on fixed and
+  unfixed compilers; loop-amplified to 500 iterations it showed 18,500 B / 1,000
+  allocations pre-fix and clean post-fix. **Ship the loop** (50–500 iterations).
+- **`failedAtCompileTimeWithRealLocation` on a crash.** The crash's own backstop
+  diagnostic carries a real location, so the helper returns true on both sides.
+  When the pre-fix behaviour is a crash/IR-verifier failure/signal, assert the
+  *specific* diagnostic. (Caught because FAIL-WITHOUT showed 2 of 4 rows failing.)
+- **The native ASan leg is vacuous in lane worktrees** — `asanRuntimeObject()` is
+  empty there, the helper returns `-1`, and `if (asan == -1) return;` passes the
+  leg. A lane *and* its reviewer can both see green while the gate's shared
+  checkout catches the regression. Never accept a lane-local ASan green as
+  evidence, and always confirm the test *program* actually compiles.
+- **"Compile it N times" is blind to hash-ORDERING defects.** Bucket sharing
+  depends on pairwise address *differences*, and ASLR shifts every allocation by
+  a constant — so 40 compiles yield one identical object even when the ordering
+  is genuinely defective. The oracle buys zero; don't specify it.
+- **8-bit exit truncation is not a compiler bug.** `runAot`'s `exitCode` is
+  `WEXITSTATUS`-masked: 298 reads as 42, 1006 as 238. Never assert a value above
+  255 — move the observable to stdout.
+- **"Pre-existing" needs a named baseline.** If the lane measured against a
+  mid-batch commit it has only shown "*my* fix didn't cause this". The baseline
+  must be `origin/main`.
+
+### Lane hygiene
+
+- **`cd` into your worktree as the literal first action**, and never leave it.
+  All writes, builds, `git` commands and test files go there. Lanes have written
+  regression tests into the shared checkout because that is the path of least
+  resistance; the brief must make the `cd` a precondition, not an after-the-fact
+  `git status` check.
+- **Never `git stash`.** `refs/stash` is shared across all worktrees of a repo,
+  so one lane's `pop` can silently take another lane's uncommitted changes — this
+  happened. To test fail-without, copy the file to `/var/tmp/bezel-scratch`,
+  `git checkout -- <file>`, rebuild, then restore. Same hazard for
+  `git checkout <rev> -- src/` inside a revert-proof script: killing it mid-run
+  leaves the tree at the old revision.
+- **A lane never runs the full suite** (`run_parallel` / `check`) — that is the
+  gate's job. Use `scripts/agent_check.sh [--area <group>] <filter>`. Five lanes
+  each cold-building their own test group once put 77 concurrent `clang++` in an
+  18-core slice, pinned ccache at 80G with 7,600 evictions, and left one lane at
+  9% after 45 minutes with zero `error:` lines — which reads exactly like a build
+  failure and is not one.
+- ⚠ **Rebuild the TEST binary, not just `bezelc`.** `runAot`/`runAotChecked` do
+  **not** exec `build/bezelc`; they fork an **in-process `Driver::compileFile`**
+  linked into `bezel_tests_<area>`. So after any `src/` edit **or any
+  cherry-pick**, a `bezelc`-only rebuild leaves the tests running the OLD
+  compiler. This has twice produced a confident wrong diagnosis (~30 min and
+  ~15 min). Assert no source is newer than the binary before trusting a result.
+  Equally, `git checkout <ref>` does **not** rebuild `bezelc` — a bisect that
+  skips the rebuild measures the same binary at both ends and concludes
+  "pre-existing".
+- **Never run two `cmake --build` on one build dir** — make does not lock, both
+  schedule the same targets, and killing them leaves a tree the gate refuses.
+- **Cherry-pick from inside the integration worktree**, not the main checkout —
+  the integration branch is generally *not* what `main` has checked out, and a
+  cherry-pick run from the wrong cwd lands on `main`. Confirm with
+  `git branch --show-current` before every pick.
+- Scratch, worktrees and build dirs never go in `/tmp` — it is a 16 GB tmpfs with
+  a uid quota, and exhausting it makes **every** Bash call return exit 1 with no
+  output, which looks exactly like a harness failure. Use
+  `/var/tmp/bezel-scratch/` or `/mnt/fast/`.
+- Uncommitted WIP recovered from a crashed run is an **unverified hypothesis**,
+  not work that is 80% done. Re-derive the diagnosis from the issue and HEAD:
+  5 of 5 inherited WIPs were once defective, and two would have shipped a bug.
+
+### Gate protocol
+
+1. **Never launch a gate you expect to fail.** Run every targeted filter for
+   every known regression on the candidate HEAD first; if any FAILs, fix forward
+   and re-check before launching. A gate you know will fail is performative and
+   creates push pressure that leads to weakened oracles.
+2. **Zero agents for the gate's full duration (~50 min)** — no fix, review or
+   probe agents, and no replacements dispatched. Read-only work is fine. "It's
+   just reading code" is a snapshot, not a guarantee: an agent can move to
+   "needs to rebuild" on any turn.
+3. **Zero builders.** `pgrep -x 'clang++|clang|cc1plus|bezel_tests|cmake|ld.mold|ld.lld'`
+   must be empty. Contention is indistinguishable from a real regression: one
+   concurrent builder produced "shard crash / undercount — NOT trustworthy" plus
+   53 phantom failures that all passed in isolation. If a FAIL carries the
+   undercount banner, re-run each suspect alone with `BEZEL_TEST_FILTER=<substr>`
+   before believing it. Note the zero-builders preflight guards only the **ASan**
+   leg; the plain leg has no such refusal, which is why the agent drain must be
+   preventive.
+4. **Pre-gate ratchet sweep** — build-free, ~70s, fails closed. Running these by
+   hand on one batch found three RED that would each have failed the cycle:
+   ```sh
+   for s in check_ambiguous_ran_false check_deprecated_jit_oracle check_localdecl_only_walkers \
+            check_vacuous_tests check_enumerable_grid_spellings check_imported_symbol_reads; do
+     printf '%-38s ' "$s"; python3 "scripts/$s.py" --strict >/dev/null 2>&1 && echo PASS || echo FAIL
+   done
+   ```
+5. **No untracked `scripts/`** — ratchet #3413 fails the cycle on any `.sh`
+   hardcoding an absolute checkout path. Park strays in
+   `/var/tmp/bezel-scratch/<run>/parked/`.
+6. **Check the fast-disk symlinks.** Both `/var/tmp/bezel-scratch/aot-bincache`
+   and `.../aot-harness` must be **symlinks** into the fast disk. If either has
+   been replaced by a real directory the gate runs on slow storage —
+   `scripts/lane_setup.sh` refuses to clobber a real dir, so it silently does
+   nothing in that state. Observed: bincache a real dir on sda3, 47% hit rate,
+   codegen shards at 75–93% of the 1800s ceiling. Watch `df -h /mnt/fast` too.
+7. **A reboot or hard kill leaves a stale pidfile**, because it is removed in an
+   EXIT trap — the next gate may then refuse with "another gate is running".
+   Confirm the recorded PID is really dead (`kill -0`) before removing it.
+
+On FAIL: **never revert, never bisect** — narrow fix-forward only, and keep the
+pool at zero agents until the fix lands and the targeted filters are green.
+
+### Pool size and model choice
+
+Fan-out is the standard mode, not an escalation: the build/test loop is ~2 min
+while most of the per-merge time is serial cognition. Run a **firm N=6** agents
+in flight (producers + reviewers) and refill a slot in the same turn it frees —
+except during a gate, when it is zero. Keep lanes **file-disjoint**: no two on
+the same hot dispatch function (`typeCall`, `lowerBinary`, the `tryLower*Call`
+family), and at most one disposal/ownership/async/iterator lane at a time.
+Bundle at most 2–3 closely-related issues per lane, one commit per issue.
+
+**Sonnet is the default; dispatch Opus UPFRONT** — never as a fallback after a
+Sonnet attempt came back short — when the task spans ≥2 predicates across files,
+needs nested closure/captured-cell reasoning, is a 3+-issue cluster with one root
+cause, has a suspect root cause, follows a *refuted* partial fix, or is **any
+gate-failure fix-forward** (always Opus). Judge difficulty, not topic. If a
+Sonnet fix regresses more than it fixes, revert it and re-dispatch as Opus.
+
+### Commits
+
+End every commit message with exactly one trailer line and nothing else — no
+`Signed-off-by`, no second trailer:
+
+```
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+```
+
+Cite the spec section **and** revision in the body (`§28.2, v0.303`); the gate
+runs `scripts/check_src_citations.py` and every `§`-citation in `src/` must
+resolve. `narrow #N` is the partial-fix convention — but a closing keyword in a
+**sibling commit's body** still auto-closes the issue, so `git log --grep="#N"`
+before assuming work is outstanding. An OPEN issue is not evidence the work is
+undone, and the open count is not a metric.
+
 ## When in doubt
 
 The project's overall discipline is: ship the part that fits cleanly now, decline-with-reasons the part that fights the foundations, keep adjacent open questions explicitly scoped. If you're not sure whether a given piece of work fits cleanly: stop, open an issue, describe what you're trying to do and what's giving you pause. The project has reached its current state by catching defects early and recording decisions with reasoning. That discipline continues to apply.
