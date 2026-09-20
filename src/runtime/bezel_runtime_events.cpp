@@ -487,22 +487,18 @@ void* bz_string_split(const char* s, int64_t s_len,
     return arr;
 }
 
-// per §9.6 Compare(a, b, ignoreCase): ordinal comparison, optionally folding
-// ASCII case. Lexicographic over min(len) bytes; equal prefixes break on length.
-int32_t bz_string_compare(const char* a, int64_t a_len,
-                          const char* b, int64_t b_len, int32_t ignore_case) {
-    if (!a) a_len = 0;
-    if (!b) b_len = 0;
-    int64_t n = a_len < b_len ? a_len : b_len;
-    for (int64_t i = 0; i < n; ++i) {
-        int ca = (unsigned char)a[i];
-        int cb = (unsigned char)b[i];
-        if (ignore_case) { ca = tolower(ca); cb = tolower(cb); }
-        if (ca != cb) return ca < cb ? -1 : 1;
-    }
-    if (a_len == b_len) return 0;
-    return a_len < b_len ? -1 : 1;
-}
+// fix #4487 (stdlib §9.6 + spec §4.6, v0.306): `bz_string_compare` stood here.
+// It took (data, len) for each operand and NOT the storage width, so it walked
+// min(a_len, b_len) BYTES over a CODE-POINT length — the #535 defect class —
+// and two different non-ASCII strings compared EQUAL ("日本".CompareTo("日x",
+// true) was 0, measured on 4d9d186a). The width is not recoverable from that
+// signature, so the helper could not be repaired in place; every caller had
+// the string OBJECT in hand and now calls `bz_str_compare_cp`
+// (bezel_runtime_strings.cpp), which decodes each operand at its own width via
+// `bz_str_cp` and folds through the shared `bz_char_to_lower`. Deleting this
+// one rather than leaving it beside its replacement is deliberate: a second
+// "ordinal string comparison" that disagrees with the first is exactly the
+// drift that caused #2590.
 
 // per §9.6 Split(separators: Array<char>): split on any of `nsep` single-code-
 // point separators. Width-1 (byte) mode, matching bz_string_split. Each emitted

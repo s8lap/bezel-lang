@@ -825,7 +825,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // with `pt == String && m == "Compare"` any more. The replacement
     // instance member `CompareTo(other[, ignoreCase])` lowers in
     // tryLowerStringMethod (LlvmBackend_String.cpp), reusing the same
-    // `bz_string_compare` runtime helper the 3-arg form used here.
+    // ordinal string comparison the 3-arg form used here (`bz_str_compare_cp`
+    // since fix #4487; `bz_string_compare` before it).
     // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
     // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
     if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&
@@ -15831,12 +15832,11 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     // comparator — bz_dict_keys_str would treat those 8-byte pointer buffers
     // as char data and produce garbage bytes for the bz_string_t readback.
     // buildValueHashTrampoline's elementHashFn / elementEqFn already route
-    // string elements through bz_str_hash / bz_string_compare; we mirror that
-    // here for the runtime-allocated `int (*)(const void*, const void*)` that
-    // bz_sort_kv_gen requires. The string comparator below dereferences both
-    // keys[i] into their bz_string_struct* and forwards data/len to
-    // bz_string_compare — same content ordering SortedDictionary<string,V>
-    // gets from its strcmp-driven bz_sort_kv_str path.
+    // string elements through bz_str_hash / the ordinal string comparison; we
+    // mirror that here for the runtime-allocated
+    // `int (*)(const void*, const void*)` that bz_sort_kv_gen requires. The
+    // string comparator below dereferences both keys[i] into their
+    // bz_string_struct* and forwards them to bz_str_compare_cp.
     using K = sema::TypeRef::Kind;
     bool isStringElem = elemTy->kind == K::Primitive &&
                         elemTy->primitive == sema::PrimitiveType::String;
@@ -15867,10 +15867,22 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     } else {
         // #2550 string comparator: two `void*` args (each pointing to a
         // malloc(8) buffer holding a bz_string_struct* pointer value).
-        // Single-load each to recover the bz_string_struct*, then load
-        // data/len and forward to bz_string_compare — yielding the same
-        // ordinal ordering SortedDictionary<string,V> gets from its
-        // strcmp-driven bz_sort_kv_str path.
+        // Single-load each to recover the bz_string_struct*, then forward
+        // both to bz_str_compare_cp.
+        //
+        // fix #4487 (stdlib §4.18 + §9.6, v0.306): this used to load data/len
+        // off each operand and call `bz_string_compare`, which walked
+        // `min(len)` BYTES over a CODE-POINT length (the #535 defect class),
+        // so every non-ASCII element whose first `len` storage BYTES matched
+        // another's compared EQUAL and the "ascending order" §4.18 promises
+        // silently degraded to insertion order. Measured on HEAD (4d9d186a):
+        // a SortedSet<string> given "日本", "日x", "日a" enumerated
+        // 日本,日x,日a — the insertion order — because all three share the
+        // storage bytes `E5 65`. §4.18 defines this order as the element
+        // type's own `CompareTo`, and §9.6 gives `string.CompareTo` the
+        // ordinal code-point relation, so this comparator MUST be the same
+        // relation the `CompareTo` member is: it is now literally the same
+        // runtime call.
         llvm::Function* strCmp = nullptr;
         if (auto* existing = module_->getFunction("bz$sscmp$string"))
             strCmp = existing;
@@ -15893,15 +15905,10 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
                 ptrTy(), strCmp->getArg(0), "sa");
             llvm::Value* bStr = builder_.CreateLoad(
                 ptrTy(), strCmp->getArg(1), "sb");
-            llvm::Value* aData = loadStringData(aStr);
-            llvm::Value* aLen  = loadStringLen(aStr);
-            llvm::Value* bData = loadStringData(bStr);
-            llvm::Value* bLen  = loadStringLen(bStr);
-            auto* cmpFnRt = declareC("bz_string_compare",
-                i32(), {ptrTy(), i64(), ptrTy(), i64(), i32()});
+            auto* cmpFnRt = declareC("bz_str_compare_cp",
+                i32(), {ptrTy(), ptrTy(), i32()});
             llvm::Value* res = builder_.CreateCall(cmpFnRt,
-                {aData, aLen, bData, bLen,
-                 llvm::ConstantInt::get(i32(), 0)},
+                {aStr, bStr, llvm::ConstantInt::get(i32(), 0)},
                 "scmp");
             builder_.CreateRet(res);
             builder_.restoreIP(savedIP);

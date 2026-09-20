@@ -1350,89 +1350,53 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
 
 
 llvm::Value* Emitter::emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
-    // Compare strings lexicographically by code-point sequence (§4.6 §9.6).
-    // Returns negative/0/positive: compare min(lenL,lenR) code points first;
-    // on tie, compare lengths. Fast path: same storage width → memcmp.
-    // Slow path: different widths → per-code-point loop. Fixes #1480.
-    llvm::Value* lenL = loadStringLen(l);
-    llvm::Value* lenR = loadStringLen(r);
-    llvm::Value* minLen = builder_.CreateSelect(
-        builder_.CreateICmpSLT(lenL, lenR), lenL, lenR, "str.minlen");
-    // Precompute length tiebreak (used by both paths on equal prefix).
-    llvm::Value* lenDiff = builder_.CreateSub(
-        builder_.CreateTrunc(lenL, i32()),
-        builder_.CreateTrunc(lenR, i32()), "str.lendiff");
-    llvm::Value* dataL = loadStringData(l);
-    llvm::Value* dataR = loadStringData(r);
-    auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-
-    // Width check: fast path for equal widths; slow path for mixed (§4.6).
-    llvm::Value* wL8 = loadStringWidth(l);
-    llvm::Value* wR8 = loadStringWidth(r);
-    llvm::Value* sameW = builder_.CreateICmpEQ(wL8, wR8, "str.ord.samew");
-    auto* ordFastBB  = llvm::BasicBlock::Create(llvm_, "str.ord.fast",  currentFn_);
-    auto* ordSlowBB  = llvm::BasicBlock::Create(llvm_, "str.ord.slow",  currentFn_);
-    auto* ordMergeBB = llvm::BasicBlock::Create(llvm_, "str.ord.merge", currentFn_);
-    builder_.CreateCondBr(sameW, ordFastBB, ordSlowBB);
-
-    // Fast path: same width — memcmp(data, data, minLen*width); tiebreak on len.
-    builder_.SetInsertPoint(ordFastBB);
-    llvm::Value* wL64 = builder_.CreateZExt(loadStringWidth(l), i64(), "ordw");
-    llvm::Value* minByteSz = builder_.CreateMul(minLen, wL64, "str.minbytes");
-    llvm::Value* fastCmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minByteSz},
-                                                  "str.cmp");
-    llvm::Value* fastCmpZero = builder_.CreateICmpEQ(
-        fastCmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
-    llvm::Value* ordFastResult = builder_.CreateSelect(
-        fastCmpZero, lenDiff, fastCmpRes, "str.ord.fast");
-    auto* ordFastEnd = builder_.GetInsertBlock();
-    builder_.CreateBr(ordMergeBB);
-
-    // Slow path: different storage widths — decode each operand at its own width.
-    // per §4.6: storage width is invisible; comparison is on the code-point sequence.
-    builder_.SetInsertPoint(ordSlowBB);
-    auto* ordIdxS   = entryAlloca(i64());
-    builder_.CreateStore(builder_.getInt64(0), ordIdxS);
-    auto* ordCondBB = llvm::BasicBlock::Create(llvm_, "str.ord.scond", currentFn_);
-    auto* ordBodyBB = llvm::BasicBlock::Create(llvm_, "str.ord.sbody", currentFn_);
-    auto* ordNextBB = llvm::BasicBlock::Create(llvm_, "str.ord.snext", currentFn_);
-    auto* ordDiffBB = llvm::BasicBlock::Create(llvm_, "str.ord.sdiff", currentFn_);
-    auto* ordDoneBB = llvm::BasicBlock::Create(llvm_, "str.ord.sdone", currentFn_);
-    builder_.CreateBr(ordCondBB);
-
-    builder_.SetInsertPoint(ordCondBB);
-    llvm::Value* ordSi = builder_.CreateLoad(i64(), ordIdxS, "str.ord.si");
-    builder_.CreateCondBr(builder_.CreateICmpSLT(ordSi, minLen), ordBodyBB, ordDoneBB);
-
-    builder_.SetInsertPoint(ordBodyBB);
-    llvm::Value* ordCpL = loadCodePoint(l, ordSi);
-    llvm::Value* ordCpR = loadCodePoint(r, ordSi);
-    builder_.CreateCondBr(builder_.CreateICmpEQ(ordCpL, ordCpR, "str.ord.cpeq"),
-                          ordNextBB, ordDiffBB);
-
-    builder_.SetInsertPoint(ordNextBB);
-    builder_.CreateStore(builder_.CreateAdd(ordSi, builder_.getInt64(1)), ordIdxS);
-    builder_.CreateBr(ordCondBB);
-
-    // ordDiffBB only reachable from ordBodyBB → ordCpL/ordCpR are in scope (§SSA dom).
-    builder_.SetInsertPoint(ordDiffBB);
-    llvm::Value* cpDiff = builder_.CreateSub(
-        builder_.CreateTrunc(ordCpL, i32()),
-        builder_.CreateTrunc(ordCpR, i32()), "str.ord.cpdiff");
-    auto* ordDiffEnd = builder_.GetInsertBlock();
-    builder_.CreateBr(ordMergeBB);
-
-    builder_.SetInsertPoint(ordDoneBB);
-    auto* ordDoneEnd = builder_.GetInsertBlock();
-    builder_.CreateBr(ordMergeBB);
-
-    // Merge: fast result, or first-differing cp diff, or equal-prefix length tiebreak.
-    builder_.SetInsertPoint(ordMergeBB);
-    auto* phi = builder_.CreatePHI(i32(), 3, "str.ord");
-    phi->addIncoming(ordFastResult, ordFastEnd);  // same-width: memcmp + len tiebreak
-    phi->addIncoming(cpDiff,        ordDiffEnd);  // mixed: first differing code point
-    phi->addIncoming(lenDiff,       ordDoneEnd);  // mixed: equal prefix, len tiebreak
-    return phi;
+    // fix #4487 (stdlib §9.6 + spec §4.6, v0.306): the ONE ordinal string
+    // comparison. Spec §4.6 defines `<`/`<=`/`>`/`>=` on `string` as "ordinal
+    // lexicographic comparison of the CODE-POINT sequence", and stdlib §9.6
+    // gives `CompareTo` the same ordinal relation, so this function and the
+    // two `CompareTo` arities must answer identically — they now share one
+    // runtime implementation, `bz_str_compare_cp`.
+    //
+    // What stood here was a two-path inline lowering: a `memcmp(dataL, dataR,
+    // minLen * width)` fast path when the two operands had the SAME storage
+    // width, and a per-code-point loop only when the widths DIFFERED (#1480's
+    // fix). The fast path is correct only at width 1. At width 2/4 `memcmp`
+    // orders by the LITTLE-ENDIAN storage bytes — low byte first — which §4.6
+    // forbids outright, since the per-string width is an implementation detail
+    // no result may depend on. Measured on HEAD (4d9d186a) before this fix:
+    //
+    //     "日本".CompareTo("日x")  -> NEGATIVE (U+672C > U+0078, so it must
+    //                                         be POSITIVE)
+    //     "Āa" < "ĀĀ"              -> false (0x61 < 0x100, so it must be true)
+    //
+    // Only the SIGN of the first is a reproducible measurement, and the sign
+    // is the whole defect. glibc's `memcmp` may return the byte difference or
+    // merely the sign, and the two measurements of this program disagree: -76
+    // on the box it was first reproduced on (the analytic difference
+    // 0x2C - 0x78) and -1 on a reviewer's rebuild. Do not cite a magnitude —
+    // stdlib §2.8 does not specify one.
+    //
+    // The #1480 tests kept passing because they only ever compared operands of
+    // DIFFERENT widths (which took the correct slow path) or differed at an
+    // ASCII position (where byte order and code-point order agree).
+    //
+    // Repairing the fast path is not the fix: it would leave a second copy of
+    // the ordering rule in the backend beside the runtime's, which is the
+    // #2590 drift this issue exists to close. Routing through the runtime also
+    // deletes six basic blocks from every string comparison site.
+    //
+    // MAGNITUDE: the helper returns -1/0/+1 rather than the byte/code-point
+    // difference this used to produce. stdlib §2.8 specifies the SIGN only
+    // ("a negative number if a < b, zero if equal, a positive number if a >
+    // b"), and every caller here consumes it through a comparison against 0.
+    //
+    // Null operands: §4.6 requires non-nullable ordering operands, so a
+    // well-typed program never passes null. `bz_str_compare_cp` nonetheless
+    // treats null as the empty string (it inherits `bz_string_compare`'s
+    // documented null handling), where this lowering would have dereferenced
+    // it — strictly more defensive, and no well-typed program can observe it.
+    auto* fn = declareC("bz_str_compare_cp", i32(), {ptrTy(), ptrTy(), i32()});
+    return builder_.CreateCall(fn, {l, r, builder_.getInt32(0)}, "str.ord");
 }
 
 
@@ -1705,10 +1669,22 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // case-folded. `other` is non-nullable (checkBuiltinStringCallArgs'
     // #2315 gate covers this position for both CompareTo arities, so a
     // well-typed call's `other` is guaranteed non-null here — the same
-    // premise the 1-arg arm above rests on for emitStringOrdCmp). Routed
-    // through the runtime helper `bz_string_compare` — the same one the
-    // retired static `Compare(a, b, ignoreCase)` used — so the case-folding
-    // logic lives in one testable place shared by both call shapes.
+    // premise the 1-arg arm above rests on for emitStringOrdCmp).
+    //
+    // fix #4487 (stdlib §9.6 + spec §4.6, v0.306): this passed
+    // `loadStringData` (the RAW BUFFER) and `loadStringLen` (the CODE-POINT
+    // count) to `bz_string_compare`, which then walked `min(a_len, b_len)`
+    // BYTES — the #535 defect class. For a width-2 operand it read only the
+    // first `len` of the `len*width` data bytes, so two DIFFERENT strings
+    // compared EQUAL. Measured on HEAD (4d9d186a) before this fix:
+    // "日本".CompareTo("日x", true) = 0, "š".CompareTo("a", true) = 0,
+    // "š".CompareTo("ɡ", true) = 0. (No UB was involved — that helper's
+    // `tolower` calls were on `(unsigned char)` values and in-domain — only
+    // wrong values.) It now takes the string OBJECTS, so `bz_str_compare_cp`
+    // decodes each at its own width and the `ignoreCase` fold goes through
+    // `bz_char_to_lower`, the one shared case policy (#4420/#4483, #2590).
+    // Both `CompareTo` arities and the §4.6 ordering operators are now the
+    // same runtime relation, which is what those two documents require.
     if (method == "CompareTo" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
         llvm::Value* other = getStrArg(0);
@@ -1717,12 +1693,9 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (!ic) return nullptr;
         llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
             ? ic : builder_.CreateZExt(ic, i32());
-        auto* fn = declareC("bz_string_compare", i32(),
-                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
-        return builder_.CreateCall(
-            fn, {loadStringData(self), loadStringLen(self),
-                 loadStringData(other), loadStringLen(other), ic32},
-            "str.cmp.ci");
+        auto* fn = declareC("bz_str_compare_cp", i32(),
+                            {ptrTy(), ptrTy(), i32()});
+        return builder_.CreateCall(fn, {self, other, ic32}, "str.cmp.ci");
     }
 
     // §9.6 / #535: StartsWith(prefix: string): bool — code-point comparison.

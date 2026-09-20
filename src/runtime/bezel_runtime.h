@@ -1378,15 +1378,6 @@ void bz_box_release(void* b);
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len);
 
-// per §9.6 Compare(a, b, ignoreCase: bool): int — ordinal string comparison
-// over code points (width-1/byte mode). Returns negative/0/positive like the
-// 2-arg form. When `ignore_case` is non-zero, each byte is compared under its
-// simple ASCII case-folded form (tolower), per §9.6's note that ignoreCase
-// comparison is ordinal case-folding with no culture tailoring. Either pointer
-// may be null (a null string compares as empty: null==null is 0, null<non-empty).
-int32_t bz_string_compare(const char* a, int64_t a_len,
-                          const char* b, int64_t b_len, int32_t ignore_case);
-
 // per §9.6 Split(separators: Array<char>): owned Array<string>. Splits `s` at
 // every position where ONE OF the `nsep` code points in `seps` occurs (each
 // separator is a single code point — the §9.6 char-set overload). A run of two
@@ -1420,6 +1411,23 @@ int32_t bz_str_lastindexof(const void* self, const void* sub);
 // the runtime holds one case policy rather than two. Either pointer may be
 // null (null equals only null); widths may differ (§4.6).
 int32_t bz_str_equals_ignorecase(const void* self, const void* other);
+// fix #4487 (stdlib §9.6 + spec §4.6, v0.306): the ONE ordinal string
+// comparison — CompareTo(other), CompareTo(other, ignoreCase), and the
+// </<=/>/>= operators, which both documents define as the same relation
+// ("ordinal lexicographic comparison of the code-point sequence", §4.6).
+// Returns -1/0/+1 (stdlib §2.8 specifies the SIGN only, not the magnitude).
+//
+// It REPLACES bz_string_compare(a_data, a_len, b_data, b_len, ignore_case),
+// which is deleted: that signature carried no storage width, so it walked
+// min(a_len, b_len) BYTES over a CODE-POINT length (the #535 defect class)
+// and two different non-ASCII strings compared EQUAL. Every former caller
+// has the string OBJECT in hand and now passes it here, so the width is no
+// longer discarded. The fold is bz_char_to_lower — the same shared helper
+// #4420 introduced and #4483 reused — so the runtime holds ONE case policy.
+// Either pointer may be null (a null operand compares as EMPTY, exactly as
+// bz_string_compare documented); widths may differ (§4.6).
+int32_t bz_str_compare_cp(const void* self, const void* other,
+                          int32_t ignore_case);
 // Substring(start, count): fresh string of `count` code points from `start`.
 void*   bz_str_substring(const void* self, int64_t start, int64_t count);
 // stdlib §3.3 / #971 item 1: the ReadOnlyStringSpan search + compare family.

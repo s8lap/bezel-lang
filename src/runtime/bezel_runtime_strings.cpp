@@ -542,6 +542,97 @@ extern "C" int32_t bz_str_equals_ignorecase(const void* self_p, const void* othe
     return 1;
 }
 
+// fix #4487 (stdlib §9.6 + spec §4.6, v0.306): the ONE ordinal string
+// comparison — `CompareTo(other)`, `CompareTo(other, ignoreCase)`, and the
+// `<` / `<=` / `>` / `>=` operators, all of which the two documents define as
+// the SAME relation.
+//
+// Spec §4.6 (v0.306): "`s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal
+// lexicographic comparison of the code-point sequence." Stdlib §9.6 (v0.306):
+// "All comparison and equality methods in this version are ordinal (code-
+// point-based), including the `ignoreCase` overloads". Stdlib §2.8: the result
+// is negative / zero / positive — its MAGNITUDE is not specified, so this
+// returns -1 / 0 / +1.
+//
+// It replaces `bz_string_compare(a_data, a_len, b_data, b_len, ignore_case)`,
+// which this commit deletes. That helper could not be repaired in place: its
+// signature takes a raw data pointer and a length and NOT the storage width,
+// so it was structurally unable to answer the question its callers asked. Its
+// callers handed it `loadStringData` (the raw buffer) and `loadStringLen` (the
+// CODE-POINT count), and it walked `min(a_len, b_len)` BYTES — the #535 defect
+// class. For a width-2 string it therefore read only the first `len` of the
+// `len*width` data bytes, one byte at a time. Measured on HEAD (4d9d186a)
+// before this fix:
+//
+//     "日本".CompareTo("日x", true)  ->   0   two DIFFERENT strings, EQUAL
+//     "š".CompareTo("a", true)       ->   0   U+0161 vs 'a', EQUAL
+//     "š".CompareTo("ɡ", true)       ->   0   U+0161 vs U+0261, EQUAL
+//
+// (For `"日本"` vs `"日x"`, both width 2: data bytes `E5 65 2C 67` against
+// `E5 65 78 00`, compared over n = 2 BYTES, are both `E5 65`, and the lengths
+// are equal.) Unlike #4483 there is no UB here — `bz_string_compare`'s
+// `tolower` calls were on `(unsigned char)` values and in-domain — only wrong
+// values.
+//
+// The 1-arg form did not route through that helper at all: it was an inlined
+// `memcmp(dataL, dataR, minLen*width)` fast path in `emitStringOrdCmp`
+// (LlvmBackend_String.cpp), correct only at width 1. At width 2/4 it ordered
+// by the LITTLE-ENDIAN storage bytes, i.e. by low byte first — which §4.6
+// forbids outright, since the per-string width is invisible to the language
+// and no result may depend on it. Measured on the same HEAD:
+//
+//     "日本".CompareTo("日x")  -> NEGATIVE; U+672C > U+0078, so it must be > 0
+//     "Āa" < "ĀĀ"              -> false  (0x61 < 0x100, so it must be true)
+//
+// MAGNITUDE CAVEAT: only the SIGN of that is a reproducible measurement, and
+// the sign is the whole defect. glibc's `memcmp` is required to return a
+// value whose sign orders the buffers; it is free to return the byte
+// difference or just the sign, and the two measurements taken of this program
+// disagree — -76 on the box this was first reproduced on (the analytic byte
+// difference 0x2C - 0x78) and -1 on a reviewer's rebuild. NEGATIVE-where-
+// §4.6-requires-POSITIVE reproduces on both. Nothing below asserts a
+// magnitude; stdlib §2.8 does not specify one.
+//
+// Decoding per code point via `bz_str_cp` — the same width-aware reader the
+// rest of the `bz_str_*` family uses — decides both forms at each position, so
+// each operand is read at its OWN width and mixed widths need no special case.
+// The `ignoreCase` fold is `bz_char_to_lower`, the SAME shared helper #4420
+// introduced and #4483 reused, so the runtime holds exactly one case policy:
+// the surviving second copy is what the #4483 reviewer flagged here, and two
+// copies of a classification rule drifting apart is what caused #2590. Within
+// ASCII that is the simple case fold §9.6 specifies; above ASCII it is
+// identity, so two code points above ASCII compare equal iff they ARE the same
+// code point (#4481 owns widening that, and this commit does not).
+//
+// Comparison is on `uint32_t` code points, so it is by scalar value (§4.5: a
+// char is a Unicode scalar up to U+10FFFF, always non-negative).
+//
+// NULL OPERANDS are treated as the EMPTY string, deliberately reproducing
+// `bz_string_compare`'s documented behaviour (`if (!a) a_len = 0;`) so that
+// every moved call site keeps the contract it was written against. §4.6 says
+// ordering requires non-nullable operands, so a well-typed program never
+// reaches this; note it is NOT `bz_str_equals_ignorecase`'s "null equals only
+// null" rule, which answers an EQUALITY question where null is a value.
+extern "C" int32_t bz_str_compare_cp(const void* self_p, const void* other_p,
+                                     int32_t ignore_case) {
+    const auto* a = (const bz_string_struct*)self_p;
+    const auto* b = (const bz_string_struct*)other_p;
+    int64_t a_len = a ? a->len : 0;
+    int64_t b_len = b ? b->len : 0;
+    int64_t n = a_len < b_len ? a_len : b_len;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t ca = bz_str_cp(a, i);
+        uint32_t cb = bz_str_cp(b, i);
+        if (ignore_case) {
+            ca = (uint32_t)bz_char_to_lower((int32_t)ca);
+            cb = (uint32_t)bz_char_to_lower((int32_t)cb);
+        }
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    if (a_len == b_len) return 0;                 // §9.6: lengths in code points
+    return a_len < b_len ? -1 : 1;
+}
+
 // per §9.6 / #535: Substring(start, count): owned string — code-point slice.
 // Returns a fresh +1 string of `count` code points starting at code-point
 // index `start`. Clamps `count` to the available tail if needed.
