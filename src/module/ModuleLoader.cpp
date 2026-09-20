@@ -1367,7 +1367,73 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
         if (mt.nullable) s += "?";
         return s;
     }
-    // Fallback for unsupported shapes (Function, InlineArray): use a placeholder.
+    // fix #4480 (§3.1, §15.1, §27.1, Appendix A.5, v0.306): render the three
+    // remaining renderable shapes instead of substituting `Object`. This
+    // function produces the SYNTHETIC RECONSTRUCTION SOURCE an importer
+    // re-parses (field-initializer replay #2874/#3671/#3723, ctor/dtor body
+    // re-parse #662c, base-clause argument re-parse #3911), so a placeholder
+    // here silently replays an exporter's declaration at a type the exporter
+    // never wrote. For a function-typed field that happened to be harmless —
+    // a function type is a reference type deriving from `Object` (§3), the
+    // replayed lambda re-announces its own parameter types, and the slot is a
+    // `ptr` either way — but none of those three mitigations hold for an
+    // inline array, whose type is neither a reference type nor `ptr`-shaped.
+
+    // §3.1 / A.5 `TypeNoNullable ::= … | "(" ")"`: the unit type. Reached
+    // mainly as a function type's return (`(string) -> ()`); a method's own
+    // unit return is already omitted by buildMethodStub before it gets here.
+    if (mt.kind == TypeKind::Unit) return "()";
+
+    // §15.1 / A.5 `InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type`.
+    // The size is textual on the wire and already a folded decimal (#3183).
+    // An inline array has NO nullable form (A.5), so `nullable` is not
+    // rendered. An UNFOLDABLE size reaches the wire empty — #3183 keeps that
+    // shape failing loudly rather than acquiring a wrong number, and there is
+    // no source spelling for an unknown extent — so it falls through below.
+    if (mt.kind == TypeKind::InlineArray && !mt.arraySize.empty() &&
+        mt.children.size() == 1) {
+        std::string s = "[" + mt.arraySize;
+        if (mt.arrayOwned) s += " owned";
+        s += "]";
+        s += metaTypeToSourceText(mt.children[0]);
+        return s;
+    }
+
+    // §27.1 / A.5 `FunctionType ::= "(" (FuncParamType …)? ")" "->" "owned"?
+    // Type`, with `children[0..n-1]` the parameters and `children[n]` the
+    // return (ModuleMetadata.hpp).
+    //
+    // Parameter MODIFIERS are rendered and parameter NAMES are not: §27.1
+    // makes the modifier "part of the type" — "`(T) -> ()` and `(owned T) ->
+    // ()` are distinct function types" — while its own table spells every
+    // function type without names (`method Foo(x: int): bool` ↔ `(int) ->
+    // bool`), so a name is decoration that A.5 admits and identity ignores.
+    //
+    // §27.2: the nullable form must be PARENTHESISED — `((int) -> bool)?` —
+    // because in `-> T?` the `?` binds to the return type.
+    if (mt.kind == TypeKind::Function && !mt.children.empty()) {
+        const std::size_t n = mt.children.size() - 1;  // children[n] = return
+        std::string s = "(";
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i) s += ", ";
+            if (i < mt.funcParamMods.size() && !mt.funcParamMods[i].empty())
+                s += mt.funcParamMods[i] + " ";
+            s += metaTypeToSourceText(mt.children[i]);
+        }
+        s += ") -> ";
+        if (mt.funcReturnOwned) s += "owned ";
+        s += metaTypeToSourceText(mt.children[n]);
+        if (mt.nullable) s = "(" + s + ")?";
+        return s;
+    }
+
+    // What remains has no source spelling at all: the `Error` sentinel (a type
+    // the exporter could not resolve — "should not normally be emitted",
+    // ModuleMetadata.hpp), an inline array whose extent did not fold, and a
+    // structurally malformed Function/InlineArray. The placeholder is kept for
+    // those rather than emitting text that cannot parse: a stub that fails to
+    // parse would take down reconstruction for the whole type, where a wrong
+    // declared type on one member surfaces at that member's own use site.
     return "Object";
 }
 
