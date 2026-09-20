@@ -126,13 +126,48 @@ BEZEL_TEST(
 
 // A class element + a record element in the SAME static-init literal —
 // the class slot must no-op `boxForTarget` and the record slot must box.
+//
+// #4351 RETARGET (the CLASS element only). `[2]IHolder` is a NON-owning
+// inline array, so per §15.1 (v0.306) "the initializer expressions must
+// be borrows of class instances already owned elsewhere" — the former
+// `new Widget("cls")` element is a fresh producer with no outer owner
+// and `f837b164` correctly rejects it. The RECORD element stays a `new`:
+// it **boxes** at the interface slot (§8.6) and a box is runtime-managed
+// (§28.9), so §15.1's borrow contract has nothing to bind — that is the
+// axis this row pins, and it must keep running on the NON-owning shape.
+// The class owner is a `static owned readonly` field. Its authority as a
+// sufficient owner is §28.3's producers table — "Static field access
+// `T.f` … with class- or interface-typed result | Borrowed (source: the
+// declaring type's static storage — K2's always-live source … disposed
+// only at program exit, §22.13)" — resting on kernel K2's named-location
+// bullet, which names static storage "the one distinguished *always-live*
+// source". (NOT §28.3 "clause 2": §28.3's borrow-lifetime rules are an
+// unnumbered bullet list; the numbered clauses 1–4 are K2's.)
+//
+// ORDERING is NOT declaration order. §22.13: "Within a single type,
+// static fields are initialized in textual declaration order. Across
+// types, a type's static fields are initialized lazily on first use."
+// `WidgetHome` and `StaticStore3` are distinct types, so their textual
+// order is irrelevant — the ordering comes from the DEPENDENCY: reading
+// `WidgetHome.W` inside `StaticStore3`'s initializer is the first use
+// that triggers WidgetHome's lazy initialization, at that point. §22.13's
+// cross-type dependency graph is what keeps that edge acyclic. Measured:
+// declaring WidgetHome AFTER StaticStore3 compiles and still returns 8.
+//
+// This program emits a §22.12 rule 4 warning on the owner field
+// ("static readonly field `W` has class type `Widget` which is
+// reachable from every domain …", #1363). Expected, and inert here:
+// nothing in this row asserts on diagnostics.
 BEZEL_TEST(
     inline_array_interface_record_static_init_4467,
     static_init_mixed_class_and_record_boxed_spec_15_1_8_6) {
     auto r = run(
+        "class WidgetHome "
+        "  public static owned readonly W: Widget := new Widget(\"cls\"); "
+        "end WidgetHome; "
         "class StaticStore3 "
         "  public static readonly _items: [2]IHolder := "
-        "    [new Widget(\"cls\"), new RecHolder(\"he\" + \"llo\")]; "
+        "    [WidgetHome.W, new RecHolder(\"he\" + \"llo\")]; "
         "end StaticStore3; ",
         "return StaticStore3._items[0].GetV().Length + "
         "       StaticStore3._items[1].GetV().Length;");
@@ -196,12 +231,30 @@ BEZEL_TEST(inline_array_interface_record_static_init_4467,
 
 // A genuinely conforming class as a single inline-array element at the
 // static init — this was already correct pre-fix and must stay correct.
+//
+// #4351 RETARGET. The element was `new Widget("hello")`, which §15.1
+// (v0.306) rejects at a NON-owning `[1]IHolder` slot — the slot stores a
+// borrow and a fresh producer has no outer owner. Retargeted to the
+// spec's own sanctioned shape, "a borrow of a class instance already
+// owned elsewhere": a `static owned readonly` field. §28.3's producers
+// table classifies a static field read as Borrowed with the declaring
+// type's static storage as its source — kernel K2's "one distinguished
+// *always-live* source" — and §22.13 disposes it at program exit. (See
+// the mixed row above for why this is NOT "§28.3 clause 2", for the
+// lazy-on-first-use cross-type ordering, and for the expected §22.12
+// rule 4 warning on the owner field.)
+// The NON-owning `[1]IHolder` static-init shape — the runtime-init branch's
+// per-element store loop this file exists to pin — is unchanged, which
+// `[1 owned]IHolder` would not have preserved.
 BEZEL_TEST(inline_array_interface_record_static_init_4467,
            static_init_class_element_unaffected_control) {
     auto r = run(
+        "class WidgetHome "
+        "  public static owned readonly W: Widget := "
+        "    new Widget(\"he\" + \"llo\"); "
+        "end WidgetHome; "
         "class StaticStoreCls "
-        "  public static readonly _items: [1]IHolder := "
-        "    [new Widget(\"he\" + \"llo\")]; "
+        "  public static readonly _items: [1]IHolder := [WidgetHome.W]; "
         "end StaticStoreCls; ",
         "return StaticStoreCls._items[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);

@@ -176,6 +176,32 @@ BEZEL_TEST(
 // box. Exercises the per-element loop hitting the new `boxForTarget`
 // call on every iteration (not just the first) — proving the fix lives
 // in the loop body, not at literal-construction time.
+//
+// #4351 RETARGET (the CLASS element only). `[2]IHolder` is a NON-owning
+// inline array, so per §15.1 (v0.306) "the initializer expressions must
+// be borrows of class instances already owned elsewhere, and those
+// owners must outlive the inline array" — a `new Widget(...)` element is
+// a fresh producer with no outer owner and `f837b164` correctly rejects
+// it. The RECORD element is NOT retargeted: `new RecHolder(...)` at an
+// interface slot **boxes** (§8.6) and a box is runtime-managed (§28.9),
+// so §15.1's borrow contract has nothing to bind — that is the axis this
+// row exists to pin and it must keep running on the NON-owning shape.
+// `f837b164`'s `using var w := …; [w]` recipe is unavailable at a FIELD
+// initializer (no local is in scope), so the owner is a `static owned
+// readonly` field instead. The authority for that being a sufficient
+// owner is §28.3's producers table — "Static field access `T.f` … with
+// class- or interface-typed result | Borrowed (source: the declaring
+// type's static storage — K2's always-live source … disposed only at
+// program exit, §22.13)" — resting on kernel K2's named-location bullet,
+// which names static storage "the one distinguished *always-live*
+// source". (NOT §28.3 "clause 2": §28.3's borrow-lifetime rules are an
+// unnumbered bullet list; the numbered clauses 1–4 are K2's, and its
+// clause 2 is Union under composition.)
+//
+// This program emits a §22.12 rule 4 warning on the owner field
+// ("static readonly field `W` has class type `Widget` which is
+// reachable from every domain …", #1363). Expected, and inert here:
+// nothing in this file asserts on diagnostics.
 BEZEL_TEST(
     inline_array_interface_record_field_init_4427,
     field_init_mixed_class_and_record_boxed_spec_15_1_8_6) {
@@ -190,9 +216,12 @@ BEZEL_TEST(
         "  public constructor(s: string) _s := s; end constructor; "
         "  public method GetV(): string return _s; end GetV; "
         "end Widget; "
+        "class WidgetHome "
+        "  public static owned readonly W: Widget := new Widget(\"cls\"); "
+        "end WidgetHome; "
         "class Holder3 "
         "  public Items: [2]IHolder := "
-        "    [new Widget(\"cls\"), new RecHolder(\"he\" + \"llo\")]; "
+        "    [WidgetHome.W, new RecHolder(\"he\" + \"llo\")]; "
         "end Holder3; "
         "class C ";
     auto r = runAot(prelude3 +
@@ -217,6 +246,20 @@ BEZEL_TEST(
 // correct. The field's slot holds a bare pointer; `boxForTarget`'s
 // `isBoxableValueType` predicate on the source returns false for a
 // class expression, so the value flows through unboxed.
+//
+// #4351 RETARGET. The element was `new Widget("hello")`, which §15.1
+// (v0.306) rejects at a NON-owning `[1]IHolder` slot — the slot stores a
+// borrow and a fresh producer has no outer owner. Retargeted to the
+// spec's own sanctioned shape, "a borrow of a class instance already
+// owned elsewhere": a `static owned readonly` field. §28.3's producers
+// table classifies a static field read as Borrowed with the declaring
+// type's static storage as its source — kernel K2's "one distinguished
+// *always-live* source" — and §22.13 disposes it at program exit. (See
+// the note on the mixed row above for why this is NOT "§28.3 clause 2",
+// and for the expected §22.12 rule 4 warning on the owner field.)
+// The NON-owning `[1]IHolder` field shape — the `emitOwnFieldInit`
+// per-element store loop this file exists to pin — is unchanged, which
+// `[1 owned]IHolder` would not have preserved.
 BEZEL_TEST(inline_array_interface_record_field_init_4427,
            field_init_class_element_unaffected_control) {
     const std::string preludeC =
@@ -227,8 +270,12 @@ BEZEL_TEST(inline_array_interface_record_field_init_4427,
         "  public constructor(s: string) _s := s; end constructor; "
         "  public method GetV(): string return _s; end GetV; "
         "end Widget; "
+        "class WidgetHome "
+        "  public static owned readonly W: Widget := "
+        "    new Widget(\"he\" + \"llo\"); "
+        "end WidgetHome; "
         "class HolderC "
-        "  public Items: [1]IHolder := [new Widget(\"he\" + \"llo\")]; "
+        "  public Items: [1]IHolder := [WidgetHome.W]; "
         "end HolderC; "
         "class C ";
     auto r = runAot(preludeC +
