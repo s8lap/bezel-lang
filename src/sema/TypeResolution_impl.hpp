@@ -534,6 +534,17 @@ private:
     // values" — the declaration-side premise of the positional-only index-
     // argument rule (A.4 IndexerDecl records the ParamList over-admission).
     void checkIndexerParamDefaults();
+    // fix #4494 (§22.5 "Defaults and modifiers", v0.306): "Every parameter
+    // after the first defaulted parameter must itself have a default." Runs
+    // over every LOCAL formal list that admits a default, reading the rule's
+    // two facts through `sema::FormalsView` — the same view the §22.5 binder
+    // runs on. See the definition in TypeResolution_Checks.cpp for what it
+    // covers and what it deliberately does not.
+    void checkParamDefaultOrdering();
+    void checkParamListDefaultOrdering(sema::FormalsView params,
+                                       const std::vector<SourceLocation>& locs,
+                                       const std::string& what,
+                                       SourceLocation fallback);
 
     // §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains enforcement.
     //   Rule 2: a mutable (non-readonly, non-const) static field or static

@@ -2830,6 +2830,161 @@ void Resolver::checkIndexerParamDefaults() {
     }
 }
 
+// fix #4494 (§22.5 "Defaults and modifiers", v0.306). The paragraph's closing
+// sentence, verbatim: "Every parameter after the first defaulted parameter must
+// itself have a default."
+//
+// It was unenforced. MEASURED on 3975958e: `class B(n: int := 41, s: string)`
+// with `new B(1, "ab")` compiled at exit 0 with no diagnostic, and the program
+// ran and returned 3.
+//
+// WHY IT MATTERS BEYOND TIDINESS. A parameter that can never be omitted sitting
+// BEHIND one that can makes the earlier one's default unreachable by any
+// positional call — it is reachable only by NAMING, which is precisely the
+// machinery §22.5 is about. The §22.5 binder already DEPENDS on the rule:
+// `sema::FormalsView::ofNames` represents a built-in row's optionality as a
+// single "how many leading parameters are required" count and says so in as
+// many words ("the registry's rows put every defaulted parameter LAST … §22.5
+// requires it"), a shape that cannot express an interleaved list at all. So the
+// gap admitted declarations one of the binder's five formal sources
+// structurally cannot represent.
+//
+// THE RULE IS READ THROUGH `sema::FormalsView`, deliberately. Its two facts are
+// exactly `name(i)` and `hasDefault(i)`, which is the same view and the same
+// pair of accessors `bindArgsToParams` runs on — so the declaration check and
+// the call-site binder can never disagree about which parameters are optional,
+// and the AST-vs-imported split stays inside `formalParam*`'s sanctioned
+// accessors (SymbolCollection.cpp) instead of being re-spelled here as a
+// `dynamic_cast<const ast::MethodDecl*>(ms->decl)` family, which would be four
+// new #3152 imported-symbol seam reads for a fact the symbol already carries.
+//
+// WHAT THIS COVERS: every LOCAL formal list that can carry a `:= Expr` — a
+// method and an operator (both are a `MethodSymbol`, and `FormalsView::of`
+// resolves the `ast::MethodDecl` / `ast::OperatorDecl` split through
+// `methodDeclParams`), a constructor, and a §22.10 primary-constructor
+// parameter list (the positional-field view) — at every nesting depth
+// (`visitTypeAndNested`, #3574/#3597) and inside extensions (`ExtensionSymbol`,
+// which `forEachTypeAndNested` deliberately does not visit; see
+// NestedTypeWalk.hpp, so the extension arm is walked explicitly here).
+//
+// WHAT IT DOES NOT, each with its reason:
+//   * IMPORTED declarations. The rule is a property of the DECLARATION, so it
+//     is caught when the declaring module is compiled. This walk starts from
+//     `ctx_.module()->children`, which is the local module — the same scoping
+//     `checkIndexerParamDefaults` uses, for the same reason.
+//   * Indexer parameter lists. §23.5 forbids a default on ANY indexer
+//     parameter and `checkIndexerParamDefaults` (a few hundred lines above)
+//     already reports it, so the ordering rule can never be the first thing
+//     wrong with one; adding it here would only double-report. An indexer is a
+//     `PropertySymbol`, so the member walk below skips it structurally rather
+//     than by a special case.
+//   * Record positional fields. A.3 `PositionalField` admits no default syntax
+//     at all (the parser routes records through `parsePositionalFieldList`), so
+//     the rule is vacuous there — the walk still visits them and finds
+//     nothing, rather than special-casing, which a control row pins.
+//   * Lambda parameters (§27.4). `parseLambdaParam` parses no `:=` default, so
+//     no lambda formal list can violate the rule.
+//   * `extern` declarations (§32). They parse through the same
+//     `parseParamList` and so CAN syntactically carry a default; whether §32
+//     admits one at all is a separate question this fix does not answer, and
+//     answering it here would be a second new rejection smuggled into a
+//     one-sentence fix.
+//
+// ONE diagnostic per list, at the FIRST offending parameter: the rule names a
+// single boundary ("the first defaulted parameter"), so a list with three
+// offenders has one defect, not three.
+// // per §22.5, fix #4494
+void Resolver::checkParamListDefaultOrdering(
+    sema::FormalsView params, const std::vector<SourceLocation>& locs,
+    const std::string& what, SourceLocation fallback) {
+    std::size_t firstDefaulted = params.size();
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (params.hasDefault(i)) {
+            if (firstDefaulted == params.size()) firstDefaulted = i;
+            continue;
+        }
+        // `>= i` and not `> i`: the FIRST defaulted parameter is not "after"
+        // itself, so slot `firstDefaulted` must never report against itself.
+        if (firstDefaulted >= i) continue;
+        SourceLocation at = (i < locs.size() && locs[i].line != 0) ? locs[i]
+                                                                  : fallback;
+        ctx_.diagnostics().report(
+            Severity::Error, at,
+            what + ": parameter `" + std::string(params.name(i)) +
+                "` declares no default but follows defaulted parameter `" +
+                std::string(params.name(firstDefaulted)) +
+                "` — every parameter after the first defaulted parameter must "
+                "itself have a default (§22.5); give it a default, or move it "
+                "ahead of `" +
+                std::string(params.name(firstDefaulted)) + "`");
+        return;
+    }
+}
+
+void Resolver::checkParamDefaultOrdering() {
+    if (!ctx_.module()) return;
+    // Per-parameter locations, symbol-side. `ParameterSymbol::declLoc` is
+    // stamped from `ast::Param::loc` by `SymbolCollection::collectParams`, and
+    // a §22.10 positional field's is on its `posParam` — both are members of
+    // the SYMBOL, so a precise diagnostic costs no AST classification read.
+    auto paramLocs = [](const std::vector<Symbol*>& ps) {
+        std::vector<SourceLocation> out;
+        out.reserve(ps.size());
+        for (Symbol* p : ps) out.push_back(p ? p->declLoc : SourceLocation{});
+        return out;
+    };
+    auto fieldLocs = [](const std::vector<const Symbol*>& fs) {
+        std::vector<SourceLocation> out;
+        out.reserve(fs.size());
+        for (const Symbol* f : fs) {
+            const auto* fld = dynamic_cast<const FieldSymbol*>(f);
+            out.push_back(fld && fld->posParam ? fld->posParam->loc
+                                               : SourceLocation{});
+        }
+        return out;
+    };
+    auto checkMembers = [&](const std::vector<Symbol*>& members,
+                            const std::string& ownerDesc) {
+        for (Symbol* m : members) {
+            if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                const std::string what =
+                    (ms->isOperator
+                         ? "operator `" + std::string(ms->operatorToken) + "`"
+                         : "method `" + std::string(ms->name) + "`") +
+                    ownerDesc;
+                checkParamListDefaultOrdering(sema::FormalsView::of(*ms),
+                                              paramLocs(ms->params), what,
+                                              m->declLoc);
+            } else if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                checkParamListDefaultOrdering(sema::FormalsView::of(*cs),
+                                              paramLocs(cs->params),
+                                              "constructor" + ownerDesc,
+                                              m->declLoc);
+            }
+        }
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
+            visitTypeAndNested(t, [&](TypeSymbol* ts) {
+                if (!ts) return;
+                const std::string owner = " of `" + std::string(ts->name) + "`";
+                if (ts->hasPositionalFields) {
+                    const std::vector<const Symbol*> fields =
+                        recordPositionalFieldSymbols(ts);
+                    if (!fields.empty())
+                        checkParamListDefaultOrdering(
+                            sema::FormalsView::of(fields), fieldLocs(fields),
+                            "primary constructor" + owner, ts->declLoc);
+                }
+                checkMembers(ts->members, owner);
+            });
+        } else if (auto* ex = dynamic_cast<ExtensionSymbol*>(child)) {
+            checkMembers(ex->members,
+                         " of extension `" + std::string(ex->name) + "`");
+        }
+    }
+}
+
 // §25.2 (#746 R41): comparison operators must be overloaded as a complete group
 // — `<`, `>`, `<=`, `>=` together; `=` and `<>` together. A partial group was
 // silently accepted, and then using a missing member (`v1 <= v2` with only

@@ -325,6 +325,9 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticIndexers();
     // §23.5 (v0.241, #2758): indexer parameters may not declare defaults.
     checkIndexerParamDefaults();
+    // §22.5 (v0.306, #4494): every parameter after the first defaulted
+    // parameter must itself have a default.
+    checkParamDefaultOrdering();
     // §25.2 (#746): comparison/equality operators must form a complete group.
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
