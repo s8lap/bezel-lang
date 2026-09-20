@@ -5334,6 +5334,44 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     return true;
 }
 
+// fix #2590 (§2.8.2 / §9.2 / §22.8 / §28.9, v0.306): the ONE predicate that
+// says whether an imported member's declared type may be recovered from the
+// `importedMemberType` side table for a direct closure dispatch
+// (`recv.F(args)` where `F` is a function-typed field or auto-property).
+//
+// An imported member carries no `ast::FieldDecl`/`ast::PropertyDecl` — the
+// importer (ModuleLoader) reconstructs the Symbol from dependency metadata —
+// so its resolved type rides `ctx_.importedMemberType()`. #2300 (fields) and
+// #2589 (auto-properties) each added that fallback behind its OWN copy of a
+// receiver-kind allowlist, and both copies excluded `Record` for the same
+// stated reason: at the time, an imported record's function-typed field was
+// never INITIALIZED across the module boundary, so the read yielded a null
+// closure pointer and routing the direct invoke through `emitClosureCall`
+// would only convert #2477's silent zero-init into a SIGSEGV (#2590's own
+// repro). That premise no longer holds: the imported-record field-initializer
+// replay (#2874's parsed-AST carriage, #3671's `buildRecordValue` consumer,
+// #3723's writer-side `(isGenericType || Record)` widening) now runs the
+// exporter's initializer at the consumer's `new` site, so the record read
+// lands a real closure pointer — measured: the local-bind spelling
+// `var g := b.F; g(5)` returns the correct value on an imported record, while
+// the direct spelling `b.F(5)` still degrades to 0. §2.8.2 clause 1 requires a
+// consumer to type-check and run "every well-formed use of the module's public
+// surface"; §9.2 makes a function-typed record field such a use, and §28.9
+// makes its value runtime-managed with unbounded lifetime (so no ownership
+// rule distinguishes the record receiver from the class one).
+//
+// Interface is admitted for both member kinds: an interface declares no
+// fields (§11.2 — its members are methods, properties, indexers and events,
+// all bodiless), so the FieldSymbol arm simply never observes that
+// alternative. One predicate, no per-arm drift — the drift between the two
+// copies is what left the record case half-open in the first place.
+static bool importedMemberTypeAdmitsClosureDispatch(
+    const sema::TypeSymbol* parent) {
+    return parent && (parent->kind == ast::TypeDeclKind::Class ||
+                      parent->kind == ast::TypeDeclKind::Interface ||
+                      parent->kind == ast::TypeDeclKind::Record);
+}
+
 // fix #2963 (codegen, v0.240): the one place that classifies a null return.
 //
 // The whole dispatch body lives in `lowerCallDispatch`; this wrapper observes
@@ -6679,18 +6717,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // through the LocalSymbol path with the field read supplying the
         // closure pointer; only the FieldSymbol callee path missed the type.
         //
-        // Gated on a CLASS receiver: an imported RECORD function-typed field
-        // has a SEPARATE, deeper pre-existing defect — the cross-module field
-        // READ itself yields a bad closure pointer (the local-bind workaround
-        // `g := r.F; g(n)` segfaults on an imported record on origin/main,
-        // independent of this fix). Routing the record direct-invoke through
-        // emitClosureCall here would only turn that case's silent zero-init
-        // into a segfault without fixing the underlying read. The record
-        // field-read ABI is filed separately and out of scope for #2300
-        // (which is class-specific); leave the record direct-invoke on its
-        // pre-fix #2477 zero-init path until that lands.
-        if (!rt && fs->parent &&
-            fs->parent->kind == ast::TypeDeclKind::Class) {
+        // #2300 gated this on a CLASS receiver, because an imported RECORD's
+        // function-typed field was then never initialized across the module
+        // boundary — the read yielded null and dispatching here would have
+        // turned #2477's silent zero-init into a SIGSEGV (#2590). fix #2590
+        // (§2.8.2 / §9.2 / §28.9, v0.306) retires that carve-out: the
+        // field-initializer replay (#2874/#3671/#3723) now lands a real
+        // closure pointer at the consumer's `new` site, so a record receiver
+        // is as sound here as a class one. The allowlist itself moved to the
+        // single `importedMemberTypeAdmitsClosureDispatch` predicate above —
+        // see it for why one copy, shared with the PropertySymbol arm below,
+        // replaces the two that had drifted apart.
+        if (!rt && importedMemberTypeAdmitsClosureDispatch(fs->parent)) {
             if (sema::TypeRef* it = ctx_.importedMemberType(fs))
                 rt = it;
         }
@@ -6738,17 +6776,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the backing-field closure value; for a computed/block property the
     // getter yields it directly), and emitClosureCall on that pointer.
     //
-    // Gated on a CLASS or INTERFACE receiver for the imported-type fallback.
-    // An imported RECORD function-typed property read shares the separate
-    // deeper defect filed as #2590 (the cross-module field/closure READ
-    // yields a bad pointer): verified empirically, opening this gate to
-    // Record segfaults the imported-record direct-invoke (exit 139) — the
-    // same ABI defect #2300's record gate guards against for fields. The
-    // LOCAL record case (which has an AST decl and a sound read path) is
-    // covered by the `pd->type` branch above. Interface is included because
-    // the imported interface property read dispatches through the itable
-    // (lowerVirtualPropertyGet), which yields a sound closure pointer —
-    // verified: `i.F(10)` on an imported `IFunc` returns 11, no segfault.
+    // #2589 gated the imported-type fallback on a CLASS or INTERFACE
+    // receiver: an imported RECORD's function-typed auto-property shared the
+    // #2590 defect (its backing field was never initialized across the module
+    // boundary, so opening this gate produced a SIGSEGV rather than the #2477
+    // zero-init). fix #2590 (§2.8.2 / §9.2 / §23.1 / §28.9, v0.306) retires
+    // that carve-out for the same reason the FieldSymbol arm's above is
+    // retired — the #2874/#3671/#3723 replay initializes the backing field at
+    // the consumer's `new` site — and both arms now ask the SINGLE
+    // `importedMemberTypeAdmitsClosureDispatch` predicate instead of keeping
+    // one receiver-kind allowlist each. The LOCAL record case (which has an
+    // AST decl and a sound read path) is covered by the `pd->type` branch
+    // below and is untouched. Interface stays admitted because the imported
+    // interface property read dispatches through the itable
+    // (lowerVirtualPropertyGet), which yields a sound closure pointer.
     // The `rt->kind == Function` guard still gates dispatch, so a non-
     // function-typed property read (`obj.N`, an int) is wholly unaffected —
     // it never enters this arm's dispatch.
@@ -6757,12 +6798,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             sema::TypeRef* rt = nullptr;
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                 if (pd->type) rt = ctx_.resolvedType(*pd->type);
-            } else if (ps->parent &&
-                       (ps->parent->kind == ast::TypeDeclKind::Class ||
-                        ps->parent->kind == ast::TypeDeclKind::Interface)) {
-                // Imported class/interface property: no ast::PropertyDecl
-                // (the importer reconstructs the PropertySymbol from
-                // dependency metadata), so the resolved type rides the
+            } else if (importedMemberTypeAdmitsClosureDispatch(ps->parent)) {
+                // Imported class/interface/record property: no
+                // ast::PropertyDecl (the importer reconstructs the
+                // PropertySymbol from dependency
+                // metadata), so the resolved type rides the
                 // importedMemberType side table — mirroring #2300's
                 // imported-field fallback and every other imported-property
                 // read site (LlvmBackend_Exprs.cpp ~L4844
