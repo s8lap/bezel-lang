@@ -58,8 +58,14 @@ SLICE=bezel-heavy.slice
 # base; overcommit caused kernel OOM). New envelope leaves ~9G headroom for
 # system + interactive + Claude, while still fitting 1 gate suite + 1 gate
 # build under the cap.
+# ManagedOOMMemoryPressure=auto opts this slice out of Fedora's per-slice default
+# (/usr/lib/systemd/user/slice.d/10-oomd-per-slice-defaults.conf sets kill@80% on
+# EVERY user slice). Without it systemd-oomd can kill the whole slice mid-gate and
+# the run reads it as a shard crash. MemoryMax below is the real bound: a runaway
+# is contained by the cgroup limit, which is more precise than an oomd slice kill.
 systemctl --user set-property "$SLICE" \
   CPUQuota=1800% CPUWeight=60 MemoryHigh=18G MemoryMax=22G IOWeight=50 \
+  ManagedOOMMemoryPressure=auto \
   >/dev/null 2>&1 || true
 
 case "$kind" in
@@ -81,8 +87,16 @@ case "$kind" in
     # 10G has ample headroom for the page-cache file mapping.
     cw=10000; iw=800; mem="${BEZEL_SUITE_MEM:-10G}" ;;
   *)
-    # probe: tiny; outside the slice, its own small cage, no accounting overhead.
-    exec systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
+    # probe: tiny; its own small cage, separate accounting from the heavy ops.
+    # It must still NOT default into app.slice: that is where the interactive
+    # terminal and the Claude session live, and probe pressure there gets THEM
+    # killed by systemd-oomd rather than the probe (three konsole tabs died this
+    # way on 2026-09-20, one taking a running gate with it). Give probes their own
+    # slice, likewise opted out of the kill-on-pressure default.
+    systemctl --user set-property bezel-probe.slice \
+      MemoryMax=6G ManagedOOMMemoryPressure=auto >/dev/null 2>&1 || true
+    exec systemd-run --user --scope -q -p Slice=bezel-probe.slice \
+      -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
 esac
 
 exec systemd-run --user --scope -q \

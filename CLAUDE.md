@@ -546,6 +546,23 @@ dispose-count/ASan-clean for a double-free.
 7. **A reboot or hard kill leaves a stale pidfile**, because it is removed in an
    EXIT trap — the next gate may then refuse with "another gate is running".
    Confirm the recorded PID is really dead (`kill -0`) before removing it.
+8. ⚠ **systemd-oomd can kill your terminal — and the gate with it.** Fedora's
+   `/usr/lib/systemd/user/slice.d/10-oomd-per-slice-defaults.conf` sets
+   `ManagedOOMMemoryPressure=kill` at 80% on **every** user slice, and KDE sets it
+   on each transient konsole scope (with `Limit=0`, i.e. oomd's 60% default). When
+   a gate build drives memory pressure, oomd kills the *highest-pressure child of
+   `app.slice`* — which is an interactive terminal tab, **not** the build. The tab
+   is not killed for being large (2.1 GB when it happened); it is collateral damage.
+   Measured 2026-09-20: three konsole tab scopes killed (16:20:34 ×2, 21:35:45). The
+   21:35:45 kill took a Claude session **and the gate orchestrator** with it — SIGKILL,
+   so no EXIT trap ran, leaving a stale `gate.pid`, no verdict, no ASan leg, and
+   orphaned shard workers that ran to completion in `bezel-heavy.slice` and wrote a
+   log at 22:06. The symptom reads as "the session crashed" plus "the gate vanished".
+   `setsid` does **not** protect against this: it changes the session, not the cgroup.
+   Mitigations, all applied: opt `bezel-heavy.slice` and `bezel-probe.slice` out with
+   `ManagedOOMMemoryPressure=auto` (the `MemoryMax` cage is the real bound and is more
+   precise than an oomd slice kill); keep probe work **out of `app.slice`**; and
+   opt the terminal's own scope out at the user level.
 
 On FAIL: **never revert, never bisect** — narrow fix-forward only, and keep the
 pool at zero agents until the fix lands and the targeted filters are green.
