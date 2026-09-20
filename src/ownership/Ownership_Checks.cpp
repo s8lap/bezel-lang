@@ -4520,7 +4520,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                         // return-position CallExpr could be a `const mk :=
                         // lambda(): int => ...;` — the same #3702 / #3564
                         // escape shape, one binding-form over — and the
-                        // method-level §28.9 escape check silently never
+                        // method-level §28.3 escape check silently never
                         // visited its initializer lambda. Measured: identical
                         // to the #3702 repro, replacing `var mk := ...` with
                         // `const mk := ...` compiled clean and disposed the
