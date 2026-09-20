@@ -33710,6 +33710,20 @@ void Emitter::collectCellFreeEligible(
         // soundness argument (calledAtMostOnce is the multiplicity guard).
         const std::unordered_map<const void*, Emitter::TransparentForwardTarget3804>&
             transparentForwardTargets3804;
+        // fix #4470 (§27.5 / §28.9 / §28.14, v0.298): the set of capture
+        // KEYS already added to `capturedByNonEscaping` (and `capturedByEscaping`
+        // via `collectLambdaCaptures(isNonEscaping=false)`) by the #3804
+        // transparent-forwarder branch above. The nested-WIDENING keys-insert
+        // below skips these so the SHARED-CELL envdtor route
+        // (`isSharedCellEnvdtorFreeOwner`, #3426) can fire for the nested
+        // lambda — see that branch's own comment for the full soundness
+        // argument (calledAtMostOnce is the multiplicity guard, the
+        // forwarder's envdtor is the cell's sole reclaim path because the
+        // enclosing function's scope-end boxedCellFree is disarmed by
+        // `capturedByEscaping` having the key, and the envdtor's release runs
+        // strictly AFTER every non-escaping co-capturer's own scope-end
+        // release). Populated by the #3804 branch only.
+        std::unordered_set<const void*>& transparentForwarderCaptures4470;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -33982,6 +33996,94 @@ void Emitter::collectCellFreeEligible(
                         // `inVarInit`/`isNonEscaping`/`currentParentStmt`).
                         if (transparentTailNonEscaping.count(
                                 static_cast<const void*>(nl))) {
+                            // fix #4470
+                            std::unordered_set<const sema::Symbol*> nlCaps;
+                            if (nl->exprBody)
+                                walkExpr(ctx, nl->exprBody.get(), nlCaps);
+                            for (auto& ss : nl->stmts)
+                                walkStmt(ctx, ss.get(), nlCaps);
+                            if (const std::vector<sema::Symbol*>* nlParams =
+                                    ctx.lambdaParams(nl)) {
+                                for (sema::Symbol* p : *nlParams)
+                                    nlCaps.erase(p);
+                            }
+                            for (const sema::Symbol* s : nlCaps) {
+                                const void* key = nullptr;
+                                bool isInlineOwnedArray = false;
+                                if (auto* loc =
+                                        dynamic_cast<const sema::LocalSymbol*>(
+                                            s)) {
+                                    if (loc->decl) {
+                                        key = static_cast<const void*>(
+                                            loc->decl);
+                                        // fix #4470: skip move-only OWNING
+                                        // inline-array ([N owned]T? /
+                                        // [N owned]T, #782) captures here —
+                                        // the SHARED-CELL envdtor route only
+                                        // frees the cell pointer, not the
+                                        // OWNED elements boxed inside it, so
+                                        // arming it for a #782 local would
+                                        // disarm the scope-end boxedCellFree
+                                        // (declsCapturedByEscaping_ would
+                                        // record the key) and the elements
+                                        // would leak (the 3805 test's
+                                        // `[2 owned]Cell?` regression is
+                                        // exactly this). The scope-end route
+                                        // already handles #782 via its
+                                        // element-dispose-through-cell
+                                        // mechanism (LlvmBackend_Exprs2.cpp
+                                        // `inlineN`); the SHARED-CELL route
+                                        // exists for plain (int/string/class)
+                                        // captures only.
+                                        if (auto* ld =
+                                                dynamic_cast<const ast::LocalDecl*>(
+                                                    loc->decl)) {
+                                            const sema::TypeRef* rt =
+                                                ld->type ? ctx.resolvedType(
+                                                    *ld->type)
+                                                         : (ld->initializer
+                                                              ? ctx.exprType(
+                                                                  *ld->initializer)
+                                                              : nullptr);
+                                            if (rt &&
+                                                rt->kind ==
+                                                    sema::TypeRef::Kind::
+                                                        InlineArray &&
+                                                rt->arrayOwned)
+                                                isInlineOwnedArray = true;
+                                        }
+                                    }
+                                } else if (dynamic_cast<
+                                               const sema::ParameterSymbol*>(
+                                               s)) {
+                                    key = static_cast<const void*>(s);
+                                }
+                                if (!key) continue;
+                                if (isInlineOwnedArray) {
+                                    // #4470: let the scope-end route reclaim
+                                    // this capture cell — it has the #782
+                                    // element-disposal machinery the
+                                    // SHARED-CELL envdtor route lacks.
+                                    transparentForwarderCaptures4470.insert(
+                                        key);
+                                    continue;
+                                }
+                                transparentForwarderCaptures4470.insert(key);
+                                // Also record the inner as the SOLE escaping
+                                // capturer of this key so
+                                // sharedCellEnvdtorFreeOwner_ is populated
+                                // (condition (a) requires escapingCapturersOf
+                                // [key] = {inner}); and add the key to
+                                // capturedByNonEscaping (condition (c) for the
+                                // SHARED-CELL route). This is the
+                                // transparent-tail twin of the #3804 widening
+                                // above — same shape, same argument.
+                                capturedByNonEscaping.insert(key);
+                                escapingCapturersOf[key].insert(
+                                    static_cast<const void*>(nl));
+                            }
+                            em.definitelyEscapingLambdas_.insert(
+                                static_cast<const void*>(nl));
                             collectLambdaCaptures(nl, em,
                                                   /*isNonEscaping=*/true);
                             return;
@@ -34037,6 +34139,78 @@ void Emitter::collectCellFreeEligible(
                             if (ftIt != transparentForwardTargets3804.end() &&
                                 ftIt->second.target == nl &&
                                 ftIt->second.calledAtMostOnce) {
+                                // fix #4470 (§27.5 / §28.9 / §28.14, v0.298):
+                                // extend the SHARED-CELL envdtor route
+                                // (`isSharedCellEnvdtorFreeOwner`, #3426) to the
+                                // BLOCK-BODY `var f := lambda() => do var y; ...
+                                // return lambda() => x + y; end` shape — a
+                                // nested lambda at `lam`'s tail that genuinely
+                                // escapes `lam`'s frame (the #3805
+                                // transparent-tail-non-escaping branch above
+                                // handles the bare-exprBody twin) AND `lam`
+                                // itself is called at most once
+                                // (`calledAtMostOnce` proves nl is instantiated
+                                // at most once per enclosing-function call). The
+                                // cell shared by `lam` and `nl` is therefore
+                                // freed by exactly one envdtor (nl's), strictly
+                                // after every non-escaping co-capturer's own
+                                // scope-end release. Without this widening:
+                                //   - `x` is in capturedByNonEscaping (outer
+                                //     captures x as non-escaping in Main) AND
+                                //     in nestedWidenedKeys (the original
+                                //     widening's conservative bucket — no owner
+                                //     named) so condition (c) and (d) of
+                                //     sharedCellEnvdtorFreeOwner_ both decline
+                                //     and x's 4-byte int cell leaks (the issue).
+                                //   - `y` is in nestedWidenedKeys but NOT in
+                                //     capturedByNonEscaping (only nl captures
+                                //     y, and the `isNonEscaping=false` call
+                                //     routes y to capturedByEscaping alone), so
+                                //     condition (c) declines and y's 4-byte int
+                                //     cell also leaks.
+                                // The fix walks `nl`'s body to find its
+                                // captured enclosing-scope symbols (filtering
+                                // out nl's own params, the #3823 fix's exact
+                                // filter) and adds them to BOTH
+                                // capturedByNonEscaping (so condition (c) holds
+                                // for y, and x's existing entry is preserved)
+                                // AND transparentForwarderCaptures4470 (so the
+                                // nested-WIDENING keys-insert below skips them,
+                                // removing condition (d)'s barrier). nl itself
+                                // is added to `em.definitelyEscapingLambdas_`
+                                // so condition (b) holds — `collectDefinitely
+                                // EscapingLambdas` ran on the OUTER (parent)
+                                // function's body and never saw the nested
+                                // lambda literal.
+                                std::unordered_set<const sema::Symbol*> nlCaps;
+                                if (nl->exprBody)
+                                    walkExpr(ctx, nl->exprBody.get(), nlCaps);
+                                for (auto& ss : nl->stmts)
+                                    walkStmt(ctx, ss.get(), nlCaps);
+                                if (const std::vector<sema::Symbol*>* nlParams =
+                                        ctx.lambdaParams(nl)) {
+                                    for (sema::Symbol* p : *nlParams)
+                                        nlCaps.erase(p);
+                                }
+                                for (const sema::Symbol* s : nlCaps) {
+                                    const void* key = nullptr;
+                                    if (auto* loc =
+                                            dynamic_cast<const sema::LocalSymbol*>(
+                                                s)) {
+                                        if (loc->decl)
+                                            key = static_cast<const void*>(
+                                                loc->decl);
+                                    } else if (dynamic_cast<
+                                                   const sema::ParameterSymbol*>(
+                                                   s)) {
+                                        key = static_cast<const void*>(s);
+                                    }
+                                    if (!key) continue;
+                                    capturedByNonEscaping.insert(key);
+                                    transparentForwarderCaptures4470.insert(key);
+                                }
+                                em.definitelyEscapingLambdas_.insert(
+                                    static_cast<const void*>(nl));
                                 inVarInit = false;
                                 currentParentStmt = nullptr;
                                 collectLambdaCaptures(nl, em,
@@ -34236,6 +34410,21 @@ void Emitter::collectCellFreeEligible(
                     }
                     if (!key) continue;
                     capturedByEscaping.insert(key);
+                    // fix #4470 (§27.5 / §28.9 / §28.14, v0.298): the
+                    // #3804 transparent-forwarder branch above already
+                    // recorded `key`'s SOLE escaping capturer (the forwarder
+                    // `nl`) and added it to `capturedByNonEscaping` so the
+                    // SHARED-CELL envdtor route can fire. Adding it here to
+                    // `nestedWidenedKeys` would re-decline it via condition
+                    // (d), re-leaking the cell. Skip these — the
+                    // forwarder-branch widening above is the SOLE owner
+                    // record; the conservative nestedWidenedKeys bucket is
+                    // only for nested lambdas the forwarder proof does not
+                    // apply to (the `isNonEscaping=false` collectLambda
+                    // Captures call above has already added the key to
+                    // `escapingCapturersOf`, satisfying the
+                    // sharedCellEnvdtorFreeOwner_ condition (a)).
+                    if (transparentForwarderCaptures4470.count(key)) continue;
                     nestedWidenedKeys.insert(key);
                 }
             }
@@ -34791,12 +34980,22 @@ void Emitter::collectCellFreeEligible(
                 static_cast<const void*>(it->second.target));
     }
 
+    // fix #4470 (§27.5 / §28.9 / §28.14, v0.298): the LambdaFinder tracks
+    // which capture KEYS the #3804 transparent-forwarder branch already
+    // accounted for (added to capturedByNonEscaping + escapingCapturersOf +
+    // em.definitelyEscapingLambdas_), so the nested-WIDENING keys-insert
+    // below can skip them — the conservative nestedWidenedKeys bucket
+    // would otherwise re-decline the SHARED-CELL envdtor route via
+    // condition (d) and the cell would leak.
+    std::unordered_set<const void*> transparentForwarderCaptures4470;
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
                         capturedByNonEscaping, capturedByEscaping,
                         capturedByNonEscapingUnwindUnsafe,
                         escapingCapturersOf, nestedWidenedKeys,
                         transparentTailNonEscaping3805,
-                        forwardTargets3804};
+                        forwardTargets3804,
+                        transparentForwarderCaptures4470,
+                        {}};  // usingInitOf — populated lazily by stmt()
     for (auto& s : body) finder.stmt(s.get());
 
     // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
