@@ -249,7 +249,7 @@ enum class EscapeScope {
 // §28.3 states the two kinds as ONE category — "a captured owned binding — an
 // owned local or `owned` parameter of the enclosing body" — and *Auto-drop
 // (affine)* gives the parameter its scope end explicitly: "for an `owned`
-// parameter, at the end of the method". `checkClosureEscapesOnReturn`'s §28.9
+// parameter, at the end of the method". `checkClosureEscapesOnReturn`'s §28.3
 // leg has always answered for BOTH (it reads `states_`, which `run()` seeds
 // with the `owned` parameters, and it has a `ParameterSymbol` arm), while
 // `ownedLocalBorrowSource` answered for locals only. Two channels of ONE escape
@@ -508,9 +508,9 @@ public:
     //     method level by `checkBorrowStoreEscape`'s `Dest::OuterLocal` arm
     //     since fix #3520; inside a lambda body it compiled clean and
     //     heap-use-after-freed (measured rc=139 / ASan UAF on 5d052b3).
-    //   * #3564 — the §28.9 owned-scope-bound-local RETURN channel (`using var
+    //   * #3564 — the §28.3 owned-scope-bound-local RETURN channel (`using var
     //     r := new R(); return lambda() => r.V();` inside a lambda body).
-    //     Rejected at method level by `checkClosureEscapesOnReturn`'s §28.9
+    //     Rejected at method level by `checkClosureEscapesOnReturn`'s §28.3
     //     leg; inside a lambda body it compiled clean and leaked its 56 bytes
     //     while the returned closure read storage the lambda invocation owns.
     // Both are closed by giving this driver the lambda body's OWN scope
@@ -527,7 +527,7 @@ public:
     void checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam);
 
     // fix #3564: seed `states_` with the owned scope-bound locals declared in
-    // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.9 leg (and
+    // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.3 leg (and
     // `checkBorrowStoreEscape`'s owned-source legs) can answer about that
     // body. Resolution goes through `findLocalSymbol` (node-keyed, so it
     // matches a `LocalConstDecl` too) and `localIsOwnedObligation` — the
@@ -2105,7 +2105,7 @@ private:
     //   * the §31.1 caught-exception leg runs — `isCatchBorrow` reads a
     //     sema-set flag (`sema::LocalSymbol::isCatchBinding`, issue 3521), so
     //     it classifies the captured identifier exactly from anywhere;
-    //   * the §28.9 owned-local leg runs (fix #3564) — the caller has cleared
+    //   * the §28.3 owned-local leg runs (fix #3564) — the caller has cleared
     //     `states_` and re-seeded it from the lambda body's own owned
     //     obligations, so `isOwnedTrackedLocal` now answers about the right
     //     scope. A method-scope local resolves to nothing there, deliberately:
