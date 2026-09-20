@@ -385,6 +385,104 @@ extern "C" void* bz_char_to_string(int32_t cp) {
     return strObj;
 }
 
+// fix #4420 (stdlib §9.5, v0.306): char classification / simple-case-mapping,
+// lowered here ONCE and shared by both call sites that used to hit
+// <ctype.h> directly (LlvmBackend_Calls2.cpp's char.Is*/To* dispatch, and
+// string.IsNullOrWhiteSpace's per-code-point loop). C11 §7.4p1 requires a
+// <ctype.h> argument to be representable as `unsigned char` (0-255) or equal
+// to `EOF`; a Bezel char is a 32-bit Unicode scalar up to U+10FFFF (§4.5), so
+// the old code's raw `isalpha(cp)` etc. was undefined for any code point
+// above U+00FF (typical glibc indexes a 384-entry table off the argument —
+// an out-of-bounds read returning a plausible-looking bool, not merely a
+// wrong one).
+//
+// §9.5 declares every `Is*` predicate TOTAL over the Unicode general
+// category ("each char gets an answer, and none of them raises"). Two of
+// the eight predicates are exactly decidable for the FULL char domain
+// without any Unicode Character Database table, because their category is
+// a small, closed, version-stable list — not a slice of a much larger
+// table:
+//   - IsControl / Cc is *defined* as exactly the C0 and C1 control codes
+//     (U+0000-U+001F, U+007F, U+0080-U+009F) and nothing else.
+//   - IsWhiteSpace / the Unicode White_Space property is the ~25-code-point
+//     PropList.txt list (ASCII whitespace + NEL/NBSP/line & paragraph
+//     separators/the various Zs spaces), long-stable.
+// bz_char_is_control / bz_char_is_white_space implement those closed lists
+// directly and do not consult libc at all.
+//
+// The remaining six (IsDigit/Nd, IsLetter/L*, IsLetterOrDigit, IsUpper/Lu,
+// IsLower/Ll, IsPunctuation/P*) and the two case-mapping members
+// (ToUpper/ToLower) span thousands of code points scattered across nearly
+// every Unicode block (Arabic-Indic digits, CJK punctuation, per-script
+// case pairs, …) — there is no small closed list, so they are only
+// decidable within ASCII (0x00-0x7F), where the "C"-locale libc answer IS
+// definitionally the Unicode general-category answer (verified: glibc's
+// "C"-locale ctype tables return false for isalpha/isdigit/isalnum/isupper/
+// islower/ispunct/isspace for EVERY code point above 0x7F, so restricting
+// the libc call to ASCII changes nothing about the pre-fix answer for
+// 0x80-0xFF and removes the UB for 0x100+ at the same time). Above ASCII
+// these report the domain-safe default — `false` for the predicates,
+// the code point unchanged for ToUpper/ToLower, consistent with §9.5's own
+// "return the argument unchanged where it has [no case mapping]" — rather
+// than guessing from an incomplete slice of a category table (issue #4420:
+// "do not close this by widening a category table"). Full correctness above
+// ASCII needs Unicode Character Database data the runtime does not embed;
+// that is left as a follow-up, not invented here.
+static inline int bz_char_is_ascii_domain(int32_t cp) {
+    return cp >= 0 && cp <= 0x7F;
+}
+
+extern "C" int32_t bz_char_is_control(int32_t cp) {
+    uint32_t u = (uint32_t)cp;
+    return (u <= 0x1F) || (u == 0x7F) || (u >= 0x80 && u <= 0x9F);
+}
+
+extern "C" int32_t bz_char_is_white_space(int32_t cp) {
+    switch ((uint32_t)cp) {
+        case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: // TAB..CR
+        case 0x20:                                             // SPACE
+        case 0x85:                                             // NEL
+        case 0xA0:                                             // NO-BREAK SPACE
+        case 0x1680:                                           // OGHAM SPACE MARK
+        case 0x2000: case 0x2001: case 0x2002: case 0x2003:
+        case 0x2004: case 0x2005: case 0x2006: case 0x2007:
+        case 0x2008: case 0x2009: case 0x200A:  // EN QUAD .. HAIR SPACE
+        case 0x2028:                                           // LINE SEPARATOR
+        case 0x2029:                                           // PARAGRAPH SEPARATOR
+        case 0x202F:                                           // NARROW NO-BREAK SPACE
+        case 0x205F:                                           // MEDIUM MATHEMATICAL SPACE
+        case 0x3000:                                           // IDEOGRAPHIC SPACE
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+extern "C" int32_t bz_char_is_digit(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isdigit(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_letter(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isalpha(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_letter_or_digit(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isalnum(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_upper(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isupper(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_lower(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (islower(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_punctuation(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (ispunct(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_to_upper(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? toupper(cp) : cp;
+}
+extern "C" int32_t bz_char_to_lower(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? tolower(cp) : cp;
+}
+
 // per §9.6 / #535: Substring(start, count): owned string — code-point slice.
 // Returns a fresh +1 string of `count` code points starting at code-point
 // index `start`. Clamps `count` to the available tail if needed.

@@ -593,43 +593,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        // Widen to i32 for libc functions if needed.
+        // Widen to i32 for the runtime helper if needed.
         if (!arg->getType()->isIntegerTy(32))
             arg = builder_.CreateSExt(arg, i32());
-        // Map Bezel method names to libc functions.
+        // fix #4420 (stdlib §9.5, v0.306): these used to lower directly onto
+        // <ctype.h> (isdigit/isalpha/.../toupper/tolower), which is
+        // undefined for any argument not representable as `unsigned char`
+        // (0-255) or `EOF` (C11 §7.4p1). A Bezel char is a 32-bit Unicode
+        // scalar up to U+10FFFF (§4.5), so any code point above U+00FF was
+        // an out-of-bounds libc table read, not merely a wrong answer. The
+        // bz_char_* runtime helpers (bezel_runtime_strings.cpp) are the ONE
+        // shared, UB-free lowering — also used by string.IsNullOrWhiteSpace
+        // below — see their definitions for exactly which categories are
+        // Unicode-exact across the full range (IsControl/Cc, IsWhiteSpace/
+        // White_Space — each a closed, stable code-point list) versus
+        // ASCII-only pending full Unicode category data (IsDigit/IsLetter/
+        // IsLetterOrDigit/IsUpper/IsLower/IsPunctuation/ToUpper/ToLower).
         const char* fnName = nullptr;
-        if (m == "IsDigit") fnName = "isdigit";
-        else if (m == "IsLetter") fnName = "isalpha";
-        else if (m == "IsLetterOrDigit") fnName = "isalnum";
-        else if (m == "IsWhiteSpace") fnName = "isspace";
-        else if (m == "IsUpper") fnName = "isupper";
-        else if (m == "IsLower") fnName = "islower";
-        else if (m == "IsPunctuation") fnName = "ispunct";
-        else if (m == "IsControl") fnName = "iscntrl";   // stdlib §9.5 (sweep #7)
+        bool boolResult = true;
+        if (m == "IsDigit") fnName = "bz_char_is_digit";
+        else if (m == "IsLetter") fnName = "bz_char_is_letter";
+        else if (m == "IsLetterOrDigit") fnName = "bz_char_is_letter_or_digit";
+        else if (m == "IsWhiteSpace") fnName = "bz_char_is_white_space";
+        else if (m == "IsUpper") fnName = "bz_char_is_upper";
+        else if (m == "IsLower") fnName = "bz_char_is_lower";
+        else if (m == "IsPunctuation") fnName = "bz_char_is_punctuation";
+        else if (m == "IsControl") fnName = "bz_char_is_control";   // stdlib §9.5 (sweep #7)
+        else if (m == "ToUpper") { fnName = "bz_char_to_upper"; boolResult = false; }
+        else if (m == "ToLower") { fnName = "bz_char_to_lower"; boolResult = false; }
         if (fnName) {
-            auto* fn = module_->getFunction(fnName);
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
-            }
+            auto* fn = declareC(fnName, i32(), {i32()});
             llvm::Value* res = builder_.CreateCall(fn, {arg}, std::string(fnName) + ".res");
-            return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
-        }
-        if (m == "ToUpper") {
-            auto* fn = module_->getFunction("toupper");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "toupper", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "toupper.result");
-        }
-        if (m == "ToLower") {
-            auto* fn = module_->getFunction("tolower");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "tolower.result");
+            if (boolResult)
+                return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
+            return res;
         }
         // char.ToString(c): string — convert char code point to string.
         // Uses the same path as c.ToString() for a char value.
@@ -764,11 +761,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        auto* isspaceFn = module_->getFunction("isspace");
-        if (!isspaceFn) {
-            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-            isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
-        }
+        // fix #4420 (stdlib §9.6/§9.5, v0.306): this used to call raw
+        // isspace(cp) on the loaded code point, which — like the char.Is*
+        // dispatch above — is undefined above U+00FF (C11 §7.4p1); a
+        // width≥2 string's code points reach this loop unmasked via
+        // loadCodePoint (which is already width-aware, not "width=1 chars
+        // only" as the stale comment here used to claim). Routed through the
+        // same bz_char_is_white_space helper as char.IsWhiteSpace so the
+        // fix is one shared lowering, not two — see that helper's comment
+        // for why it is Unicode-exact (the White_Space property) across the
+        // full char domain, unlike libc's ASCII-only "C"-locale isspace.
+        auto* isspaceFn = declareC("bz_char_is_white_space", i32(), {i32()});
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* isNull = builder_.CreateICmpEQ(
             arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
@@ -789,7 +792,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
         builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
-        // For now: only check width=1 chars (ASCII whitespace check).
+        // loadCodePoint decodes the code point at the string's actual
+        // per-string storage width (1/2/4 bytes, §4.6) — every code point
+        // is checked, not just width-1 (ASCII) strings.
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
         llvm::Value* cp = loadCodePoint(arg, idxB);
         llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});

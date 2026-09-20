@@ -1432,6 +1432,25 @@ int32_t bz_strspan_seqequal(const void* self, int64_t s_start, int64_t s_len,
 // #1282: char.ToString() / char interpolation — a single-code-point string at
 // the narrowest storage width (preserves the full Unicode scalar, no truncation).
 void*   bz_char_to_string(int32_t cp);
+// fix #4420 (stdlib §9.5, v0.306): the single shared, UB-free lowering for
+// every char classification / simple-case-mapping member — see the
+// definitions in bezel_runtime_strings.cpp for exactly which categories are
+// Unicode-exact across the FULL char domain (IsControl/Cc, IsWhiteSpace/
+// White_Space — each a closed, version-stable code-point list) versus
+// ASCII-only pending full Unicode category data (everything else). Replaces
+// the direct <ctype.h> calls that were undefined above U+00FF. Also used by
+// string.IsNullOrWhiteSpace's per-code-point loop (§9.6), so the fix is one
+// lowering, not two.
+int32_t bz_char_is_digit(int32_t cp);
+int32_t bz_char_is_letter(int32_t cp);
+int32_t bz_char_is_letter_or_digit(int32_t cp);
+int32_t bz_char_is_white_space(int32_t cp);
+int32_t bz_char_is_upper(int32_t cp);
+int32_t bz_char_is_lower(int32_t cp);
+int32_t bz_char_is_control(int32_t cp);
+int32_t bz_char_is_punctuation(int32_t cp);
+int32_t bz_char_to_upper(int32_t cp);
+int32_t bz_char_to_lower(int32_t cp);
 // §9.6 / #1295: PadLeft/PadRight — width-aware padding to `totalWidth` code
 // points with `padChar` (leftAlign=1 for PadRight, self-then-pad; 0 for PadLeft,
 // pad-then-self). Preserves code points > U+00FF (fixed-width storage, §4.6).
