@@ -1323,11 +1323,26 @@ int32_t bz_identity_hash_table_size(void);
 // +1-retained string / class / box captures.  Foundation: all producers store
 // envdtor = null (calloc zero-fill + explicit store); behaviour is identical
 // to the prior 24-byte layout.
+// `disposed` (off 40, #4475): §28.2 use-after-dispose guard. One-byte flag set
+// to 1 by an explicit `c.Dispose()` (codegen emits bz_closure_mark_disposed
+// before the release under --checked-disposal). bz_closure_release reads the
+// byte at last-drop and, when set, QUARANTINES the cell instead of freeing —
+// a deliberate memory leak parallel to bz_array_mark_disposed /
+// bz_dict_mark_disposed (the same shape that lets a post-dispose member
+// access throw DisposedAccessException under --checked-disposal instead of
+// UAF). Outside --checked-disposal the byte is never written, so the legacy
+// "free on last drop" path is unchanged.
 // A closure owns NEITHER its captures (they are borrows per §28.9 / §28.3) nor
 // the boxed cells backing them in the current foundation state; release frees
 // only the cell + env block, never a captured value. null is a no-op.
 void bz_closure_retain(void* c);
 void bz_closure_release(void* c);
+// #4475 (§28.2): closure-as-object use-after-dispose guard. Set/read the
+// per-instance disposed flag (offset 40, see layout above). bz_closure_mark_disposed
+// is idempotent (subsequent calls no-op). bz_closure_is_disposed returns 0 for
+// null (a null closure is never "disposed" — it never held anything).
+void bz_closure_mark_disposed(void* c);
+int8_t bz_closure_is_disposed(void* c);
 
 // ---------------------------------------------------------------------------
 // Boxed value-type reference counting (§8.6 / §28.9, issue #422 boxes
