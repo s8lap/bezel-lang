@@ -292,6 +292,52 @@ public:
         const ast::NewExpr& ne) const {
         return positionalBinding(ne);
     }
+    // fix #4491 (§22.5 "Optional parameters and named arguments" / §22.8
+    // step 0 / §22.10, v0.306): the §22.10 INHERITANCE-CLAUSE twin of the
+    // table above — the §22.5 binding of `class D(v: int) : B(s := "c",
+    // n := v)`'s clause arguments to `B`'s primary-constructor parameter
+    // slots. Vector entry `j` holds the 0-based index into
+    // `ast::TypeDecl::primaryBaseCtorArgs` that supplies base positional
+    // field `j`, or -1 when the clause omits that slot — the same shape and
+    // the same producer (`bindArgsToParams` over
+    // `FormalsView::of(recordPositionalFieldSymbols(base))`) as the
+    // `new`-site and `base(...)`-chain halves above.
+    //
+    // WHY A SEPARATE TABLE rather than a third key on
+    // `newExprPositionalBindings_`. That table is keyed on
+    // `const ast::Expr*`, and the inheritance clause has NO `ast::Expr` node
+    // of its own: its arguments are a bare `std::vector<ast::CallArgument>`
+    // hanging off the `ast::TypeDecl`. The only Expr-shaped pointer available
+    // is a clause ARGUMENT's own value expression, and that collides — in
+    // `class D(v: int) : B(s := new Q(b := 1, a := 2), n := v)` the first
+    // argument's value IS a `NewExpr` that `checkPositionalNewArgsFromSymbols`
+    // already publishes its own §22.5 binding for.
+    //
+    // WHY THE KEY IS THE ARGUMENT VECTOR'S ADDRESS and not the declaring
+    // `ast::TypeDecl*`. Both identify the clause, but only this one is
+    // reachable from codegen WITHOUT a `dynamic_cast<const ast::TypeDecl*>(
+    // t->decl)` — the #3152 imported-symbol seam read, which answers null for
+    // every imported class. Codegen already holds exactly this pointer: it
+    // reads the clause through `sema::primaryBaseCtorArgsOf(t)`, the one
+    // accessor that returns the LOCAL `&td->primaryBaseCtorArgs` for a local
+    // class and the ModuleLoader-replayed
+    // `&t->importedPrimaryBaseCtorArgs` (#3911) for an imported one. Keying
+    // on what that accessor returns makes the local/imported split a POINTER
+    // IDENTITY rather than a second hand-written guard: sema publishes only
+    // for the local vector, so an imported class's replayed vector finds no
+    // entry and codegen keeps its textual-order fallback, with nothing to
+    // keep in sync and no seam read added.
+    void setInheritanceClauseBinding(
+        const std::vector<ast::CallArgument>* clauseArgs,
+        std::vector<int> binding) {
+        if (clauseArgs) inheritanceClauseBindings_[clauseArgs] = std::move(binding);
+    }
+    const std::vector<int>* inheritanceClauseBinding(
+        const std::vector<ast::CallArgument>* clauseArgs) const {
+        if (!clauseArgs) return nullptr;
+        auto it = inheritanceClauseBindings_.find(clauseArgs);
+        return it == inheritanceClauseBindings_.end() ? nullptr : &it->second;
+    }
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
     // for the rationale. Populated by the typecheck pass from
@@ -983,6 +1029,24 @@ private:
     // has two call sites, one binder).
     std::unordered_map<const ast::Expr*, std::vector<int>>
         newExprPositionalBindings_;
+    // fix #4491 (§22.5 / §22.8 step 0 / §22.10, v0.306): the §22.10
+    // inheritance clause's §22.5 argument binding, keyed on the ADDRESS of
+    // the clause's own `ast::TypeDecl::primaryBaseCtorArgs` vector — the
+    // pointer `sema::primaryBaseCtorArgsOf` hands both sides. Populated by
+    // `ExprTC::visitTopDecl`'s primary-base-ctor-args walk, read by codegen's
+    // `Emitter::prePopulateBasePositionalFields` (case (a)). See the
+    // setter/getter comments above for why this is a table of its own rather
+    // than a third key shape on `newExprPositionalBindings_`, and why the key
+    // is the vector rather than the declaration.
+    //
+    // ⚠ AST-KEYED, and the snapshot test knows it. `ast::CallArgument` is not
+    // an `ast::Node`, so this declaration does not spell
+    // `std::unordered_map<const ast::…>` like the tables around it;
+    // `tests/module/semacontext_ast_side_table_snapshot_test.cpp` was widened
+    // to a second needle for exactly this shape so the table cannot slip past
+    // the "record a reconstruction disposition" gate on a spelling.
+    std::unordered_map<const std::vector<ast::CallArgument>*, std::vector<int>>
+        inheritanceClauseBindings_;
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs. Populated by the typecheck pass at the
     // SAME site it computes `substituteMemberType` for the §7

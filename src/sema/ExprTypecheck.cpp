@@ -11425,17 +11425,112 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     }
                 }
             }
+            // fix #4491 (§22.5 "Optional parameters and named arguments" /
+            // §22.8 step 0 / §22.10, v0.306): publish the clause's §22.5
+            // argument BINDING, and use it below instead of the index `ai`.
+            //
+            // §22.5 says a named argument's name — not its position — picks
+            // the parameter ("naming an argument changes which parameter it
+            // binds to, never when it runs"), and names the reach of the
+            // rule: "every construction site in the language reaches it
+            // through the same binding — a call, a `new` expression, and a
+            // record construction alike". A §22.10 inheritance clause is such
+            // a site: `class D(v: int) : B(s := "clause", n := v)` supplies
+            // `B`'s primary parameter list. Nothing bound it by name — both
+            // this loop's #3750 modifier check AND codegen's
+            // `prePopulateBasePositionalFields` case (a) paired clause
+            // argument `i` with base positional field `i` — so the clause
+            // above stored the `string` pointer into `B`'s 4-byte `n` slot
+            // and the integer into its `string` slot (measured on e9239ab4:
+            // `Show()` printed `5811392`, then SEGV at `0x11` inside
+            // `bz_string_to_utf8z`, issue 4491).
+            //
+            // ONE binder body, as for the `new` site (#3196), the `this(...)`
+            // chain (#3583) and the `base(...)` chain (#4484): the same
+            // `bindArgsToParams` over the same
+            // `FormalsView::of(recordPositionalFieldSymbols(base))`. The
+            // channel is a table of its own only because the clause has no
+            // `ast::Expr` node to key on (see SemaContext.hpp).
+            //
+            // `emit=false`, matching #4484's `base(...)` half: §22.5 ARITY
+            // checking of an inheritance clause is a pre-existing and
+            // separate gap — measured on e9239ab4, each of `: B(n := v)`
+            // (under-supplied), `: B(v, "a", 3)` (over-supplied),
+            // `: B(v, n := 2, s := "a")` (doubly bound) and
+            // `: B(zz := v, s := "a")` (no such parameter) compiles with ZERO
+            // diagnostics against `class B(n: int, s: string)`. Making the
+            // binder loud here is a NEW rejection belonging to that gap (the
+            // clause twin of #4496), not to this binding-order defect, so a
+            // clause the binder declines publishes nothing and keeps exactly
+            // today's textual-order lowering.
+            //
+            // Published only when the clause binds the base's PRIMARY
+            // parameter list — no explicit non-static base constructor of the
+            // clause's arity — which is the arity arm of codegen's own
+            // `baseClauseExplicitCtor` guard (the predicate that decides
+            // whether case (a) stores these slots at all). A clause that
+            // binds an explicit base constructor publishes nothing and keeps
+            // whichever disposition it has today.
+            // // per §22.5, fix #4491; SEAM-DEBT: the clause twin of #4496
+            std::vector<int> clauseFieldToArg;
+            if (baseTs && baseTs->hasPositionalFields) {
+                bool explicitCtorOfThisArity = false;
+                for (Symbol* m : baseTs->members) {
+                    auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                    if (!other || other->isStatic) continue;
+                    if (other->params.size() ==
+                        td->primaryBaseCtorArgs.size()) {
+                        explicitCtorOfThisArity = true;
+                        break;
+                    }
+                }
+                const std::vector<const Symbol*> fields =
+                    recordPositionalFieldSymbols(baseTs);
+                if (!explicitCtorOfThisArity && !fields.empty() &&
+                    td->primaryBaseCtorArgs[0].value) {
+                    const std::string desc =
+                        std::string("inheritance-clause base call to the "
+                                    "primary constructor of `") +
+                        std::string(baseTs->name) + "`";
+                    BindResult b = bindArgsToParams(
+                        sema::FormalsView::of(fields),
+                        td->primaryBaseCtorArgs,
+                        td->primaryBaseCtorArgs[0].value->span.begin, desc,
+                        /*emit=*/false);
+                    if (b.ok) {
+                        clauseFieldToArg = b.paramToArg;
+                        ctx_.setInheritanceClauseBinding(
+                            &td->primaryBaseCtorArgs, b.paramToArg);
+                    }
+                }
+            }
+            // The base positional field clause argument `ai` binds to. Empty
+            // binding (nothing published) degenerates to the textual-order
+            // `argument i ↔ field i` pairing this loop has always used, which
+            // is the same answer for an all-positional clause — fix #4491.
+            auto clauseFieldForArg = [&](std::size_t ai) -> std::size_t {
+                if (clauseFieldToArg.empty()) return ai;
+                for (std::size_t pi = 0; pi < clauseFieldToArg.size(); ++pi)
+                    if (clauseFieldToArg[pi] == static_cast<int>(ai))
+                        return pi;
+                return basePosParams.size();
+            };
             for (std::size_t ai = 0;
                  ai < td->primaryBaseCtorArgs.size(); ++ai) {
                 const auto& arg = td->primaryBaseCtorArgs[ai];
                 if (!arg.value) continue;
                 visitExpr(*arg.value);
-                // Same check as runMethodBody's parameter-default path, but
-                // keyed on the BASE class's positional parameter at index ai
-                // — the inheritance-clause binds positionally.
-                if (ai < basePosParams.size() &&
-                    basePosParams[ai]->posParam &&
-                    basePosParams[ai]->posParam->modifier.empty() &&
+                // Same check as runMethodBody's parameter-default path, on
+                // the BASE class's positional parameter the clause argument
+                // BINDS to. fix #4491: that is `clauseFieldForArg(ai)`, not
+                // `ai` — §22.5 binds `: B(r := new Res())` to the `r` slot
+                // wherever `r` sits, so reading the slot at the argument's
+                // SOURCE position asked the wrong parameter's modifier and
+                // both missed the rejection and raised it on the wrong one.
+                const std::size_t fi = clauseFieldForArg(ai);
+                if (fi < basePosParams.size() &&
+                    basePosParams[fi]->posParam &&
+                    basePosParams[fi]->posParam->modifier.empty() &&
                     exprIsOwnedProducerOfNonTrivialDisposeClass(*arg.value)) {
                     ctx_.diagnostics().report(
                         Severity::Error, arg.value->span.begin,

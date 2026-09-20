@@ -4630,12 +4630,27 @@ void Emitter::prePopulateBasePositionalFields(
     // SECOND time and keeping the second value.
     bool chainedPrimaryOwnsSlots = false;
 
-    // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step
-    // 0 / §22.10, v0.306): the §22.5 BINDING of the base call's arguments to
-    // the base's positional slots, as sema published it
-    // (`ExprTC::publishBaseChainPrimaryBinding` →
-    // `SemaContext::setPositionalBinding`, the SAME table and the SAME binder
-    // body the `new` site reads through `storePrimaryCtorPositionalArgs`).
+    // fix #4484 / fix #4491 (§22.5 "Optional parameters and named arguments"
+    // / §22.8 step 0 / §22.10, v0.306): the §22.5 BINDING of the base call's
+    // arguments to the base's positional slots, as sema published it. BOTH
+    // arms of this function now have a channel, and they are different ones
+    // because the two shapes have different identities:
+    //
+    //   case (b), the `base(...)` chain — `ExprTC::publishBaseChainPrimary
+    //     Binding` → `SemaContext::setPositionalBinding`, keyed on the chain
+    //     `CallExpr` (#4484, on the table #3583 widened to
+    //     `const ast::Expr*`).
+    //   case (a), the §22.10 inheritance clause — `ExprTC::visitTopDecl`'s
+    //     primary-base-ctor-args walk → `SemaContext::
+    //     setInheritanceClauseBinding`, keyed on the declaring
+    //     `ast::TypeDecl` (#4491), because the clause's arguments are a bare
+    //     `std::vector<ast::CallArgument>` with no `ast::Expr` node of their
+    //     own to key on.
+    //
+    // Both are computed by the ONE binder body every other construction site
+    // runs (`bindArgsToParams` over
+    // `FormalsView::of(recordPositionalFieldSymbols(base))`) — the same one
+    // the `new` site reads through `storePrimaryCtorPositionalArgs`.
     // Entry `pi` holds the index into `baseArgVals` — which is the base call's
     // SOURCE argument index, because the fill loops below push one value per
     // argument in source order — that supplies base positional field `pi`, or
@@ -4645,8 +4660,9 @@ void Emitter::prePopulateBasePositionalFields(
     // the textual-order pairing `argument i ↔ field i` this function has
     // always used, which is bit-identical for an all-positional call and is
     // the pre-fix behaviour for every shape sema declines to bind (an over- or
-    // under-supplied `base(...)` — §22.5 arity at this site is a separate,
-    // pre-existing gap, see the sema helper's comment).
+    // under-supplied `base(...)` or clause — §22.5 arity at this site is a
+    // separate, pre-existing gap: #4496 for the chain, and its clause twin,
+    // measured in the sema helper's comment).
     std::vector<int> baseFieldToArg;
     // The base positional field a given SOURCE argument index binds to, and
     // its inverse. Stated once because three places below need them: the §4.7
@@ -4698,7 +4714,41 @@ void Emitter::prePopulateBasePositionalFields(
     // pre-population still owes the arguments there.
     if (t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty() &&
         !baseClauseExplicitCtor(baseTs, *baseArgs).fn) {
-        for (const auto& arg : *baseArgs) {
+        // fix #4491 (§22.5 / §22.8 step 0 / §22.10, v0.306): install the
+        // §22.5 binding sema published for THIS inheritance clause, before
+        // anything below reads `fieldForArg` / `argForField`. This is case
+        // (a) — the `: B(s := "c", n := v)` spelling — the twin of the
+        // `base(...)` arm #4484 closed, and it mispaired identically:
+        // measured on e9239ab4, `class D(v: int) : B(s := "clause", n := v)`
+        // over `class B(n: int, s: string)` printed `5811392` for `n` (the
+        // string pointer's low 32 bits) and then SEGVed at `0x11` inside
+        // `bz_string_to_utf8z`.
+        //
+        // The channel is `SemaContext::inheritanceClauseBinding`, keyed on
+        // the ADDRESS of the clause's argument vector, because the clause has
+        // no `ast::Expr` node to key on (see SemaContext.hpp for why a third
+        // key on the `const ast::Expr*` table would collide with a clause
+        // argument that is itself a `new` expression).
+        //
+        // `baseArgs` is exactly that key: it is what
+        // `sema::primaryBaseCtorArgsOf(t)` returned a few lines above, which
+        // is `&td->primaryBaseCtorArgs` for a LOCAL class and the
+        // ModuleLoader-replayed `&t->importedPrimaryBaseCtorArgs` (#3911) for
+        // an imported one. Sema publishes only for the local vector, so the
+        // local/imported split here is POINTER IDENTITY — an imported class
+        // finds no entry and keeps the textual-order fallback — with no
+        // `dynamic_cast<const ast::TypeDecl*>(t->decl)` to add a #3152 seam
+        // read, and no second guard to keep in sync with the accessor.
+        if (const std::vector<int>* pub =
+                ctx_.inheritanceClauseBinding(baseArgs))
+            baseFieldToArg = *pub;
+        // §22.5 "Evaluation order": the supplied arguments run in call-site
+        // TEXTUAL order "for positional and named arguments alike", so this
+        // loop stays source-indexed and `baseArgVals` stays source-indexed;
+        // only the STORE below is re-keyed by the binding (fix #4491, the
+        // same split #4484 made on the `base(...)` arm).
+        for (std::size_t ai = 0; ai < baseArgs->size(); ++ai) {
+            const auto& arg = (*baseArgs)[ai];
             if (!arg.value) { baseArgVals.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);
             // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause
@@ -4706,14 +4756,20 @@ void Emitter::prePopulateBasePositionalFields(
             // site above. A null `v` here used to ABANDON the whole
             // pre-population (`clear(); break;`), so `class D(): B(C.Nothing())`
             // left EVERY one of B's positional fields at its calloc zero.
-            // `baseArgVals.size()` is the index of the slot this argument is
-            // about to occupy — the store loop below pairs `baseArgVals[i]` with
-            // `basePosFields[i]` — so the rescue asks about the field this
-            // argument actually lands in, not an unrelated one.
-            if (!v && baseArgVals.size() < basePosFields.size())
-                v = unitValueForTarget(
-                    v, recordMemberTypeResolved(basePosFields[baseArgVals.size()]),
-                    arg.value.get());
+            // fix #4491: the slot whose TYPE the §4.7 rescue must read is the
+            // one §22.5 BINDS this argument to, not the one at its source
+            // position — `: B(u := C.Nothing(), n := 1)` must rescue against
+            // the `u` slot's unit type. `fieldForArg` degenerates to the
+            // source index when no binding was published, which is the
+            // pre-#4491 `baseArgVals.size()` this replaced (every iteration
+            // either pushes or breaks, so the two agree exactly).
+            if (!v) {
+                const std::size_t fi = fieldForArg(ai);
+                if (fi < basePosFields.size())
+                    v = unitValueForTarget(
+                        v, recordMemberTypeResolved(basePosFields[fi]),
+                        arg.value.get());
+            }
             if (!v) { baseArgVals.clear(); break; }
             baseArgVals.push_back(v);
         }
@@ -4923,12 +4979,16 @@ void Emitter::prePopulateBasePositionalFields(
     // ⚠ fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306) corrects what this
     // paragraph used to assert. It said "a base call with NAMED arguments
     // publishes no binding at this site, so it produces no `baseArgVals` at
-    // all and reaches this loop with `numToStore == 0`". That is true of case
-    // (a) — the §22.10 inheritance clause, which has no `SemaContext` binding
-    // at all — and FALSE of case (b): the explicit `base(...)` chain arm
-    // above lowers `chainCall->args` unconditionally, named or not, so a
+    // all and reaches this loop with `numToStore == 0`". That was FALSE of
+    // case (b): the explicit `base(...)` chain arm above lowers
+    // `chainCall->args` unconditionally, named or not, so a
     // named base call arrived here with a FULL `baseArgVals` that the store
-    // loop then paired by textual position. Measured on 4d9d186a, `base(s :=
+    // loop then paired by textual position. ⚠ fix #4491 removes the other
+    // half of that sentence too: case (a) — the §22.10 inheritance clause —
+    // lowers ITS arguments unconditionally as well, and now publishes a
+    // binding of its own (`SemaContext::inheritanceClauseBinding`), so
+    // "no `SemaContext` binding at all" no longer describes it either.
+    // Measured on 4d9d186a, `base(s :=
     // "x", n := 1)` against `class B(n: int, s: string)` printed `4627856`
     // for `n` — the low 32 bits of the string pointer — and SIGSEGVed in
     // `bz_string_to_utf8z` dereferencing the integer `1` as a string; with a
@@ -4997,7 +5057,10 @@ void Emitter::prePopulateBasePositionalFields(
     // `publishBaseChainPrimaryBinding`) — so whenever `baseFieldToArg` is
     // non-empty, `baseCs` is null and `ctorArgVals` goes unread one level
     // down. Widening the pairing here on an unreachable path would be an
-    // untestable change.
+    // untestable change. fix #4491 note: the clause arm's publication gate is
+    // the SAME arity question (no explicit non-static base constructor of the
+    // clause's arity, see `ExprTC::visitTopDecl`), so the argument holds
+    // unchanged now that case (a) can also fill `baseFieldToArg`.
     const sema::ConstructorSymbol* baseCs = nullptr;
     if (!baseArgVals.empty()) {
         baseCs = ctorByArity(baseTs, baseArgVals.size(), nullptr);

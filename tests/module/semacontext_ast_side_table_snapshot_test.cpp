@@ -162,6 +162,57 @@ const Entry kAstKeyedTables[] = {
      "/var/tmp/bezel-scratch/adjudicate-4484/{withfield,nofield}/ (the two "
      "probes the 2x2 was derived from) and "
      "/var/tmp/bezel-scratch/c15-4484/xmod/{lib2,app2}.bzl (shape 1)."},
+    {"inheritanceClauseBindings_",
+     "NOT carried, and UNREACHABLE BY KEY TYPE. fix #4491 (§22.5 / §22.8 step 0 / "
+     "§22.10, v0.306) — the §22.10 INHERITANCE-CLAUSE half of the §22.5 "
+     "binding family whose other three keys live on "
+     "`newExprPositionalBindings_` above (the `new` site #3196, the "
+     "`this(...)` chain #3583, the `base(...)` chain #4484). Published by "
+     "`ExprTC::visitTopDecl`'s primary-base-ctor-args walk, read by codegen's "
+     "`Emitter::prePopulateBasePositionalFields` (case (a)). "
+     "It is a table of its OWN for a structural reason, not a stylistic one: "
+     "the clause's arguments are a bare `std::vector<ast::CallArgument>` on "
+     "the `ast::TypeDecl` with NO `ast::Expr` node to key on, and the only "
+     "Expr-shaped pointer available — a clause argument's own value — "
+     "COLLIDES with `checkPositionalNewArgsFromSymbols`'s key whenever that "
+     "argument is itself a `new` expression "
+     "(`class D(v: int) : B(s := new Q(b := 1, a := 2), n := v)`). "
+     "THE KEY IS THE ARGUMENT VECTOR'S ADDRESS, i.e. exactly what "
+     "`sema::primaryBaseCtorArgsOf(t)` returns, so the local/imported split "
+     "is pointer identity rather than a `dynamic_cast<const "
+     "ast::TypeDecl*>(t->decl)` seam read (#3152) plus a hand-written guard. "
+     "It is why this table needed the SECOND needle in the scanner below. "
+     "WHY THE DISPOSITION IS STRONGER THAN THE `base(...)` HALF'S ABOVE, and "
+     "is not that entry restated: the vector this keys on lives on the "
+     "`ast::TypeDecl` of the class DECLARING the clause, i.e. in a class "
+     "HEADER. ModuleLoader's `parseAndAttach*` paths re-parse member BODIES "
+     "(method, constructor, destructor, property, extension property, field "
+     "initializer) into `freshCtx`; none re-parses a class header, so no "
+     "`ast::TypeDecl` carrying a `primaryBaseCtorArgs` list is ever created "
+     "in a fresh context and no entry can be written there to be dropped. "
+     "CROSS-MODULE, MEASURED ON BOTH SIDES rather than argued: "
+     "(1) NON-GENERIC — `public class B(n: int, s: string)` and "
+     "`public class D(v: int) : B(s := \"clause\", n := v)` both in a library, "
+     "`new D(9)` in the importer. #4491 FIXES it: pre-fix the program printed "
+     "`4439440` — the string pointer's low half read as `n` — then SEGVed "
+     "(exit 139); post-fix `9` / `clause`, exit 0. The clause is in the "
+     "declaring module's own AST, so the binding is published and read in "
+     "that module's compile and no reparse is involved. "
+     "(2) GENERIC (`public class G<T>(v: int) : B(...)` in the library, "
+     "`new G<int>(9)` in the importer) — NOT fixed, and NOT this defect. "
+     "Post-fix it prints `0` and a blank line at exit 0: the base slots are "
+     "calloc-zero because the pre-population does not run there AT ALL, so "
+     "there is no mispaired store to correct. The tell is #4484's own: "
+     "garbage for `n` means the mispairing happened, `0` means it did not. "
+     "The generic-ness is not what decides it — the SAME generic clause in "
+     "a SINGLE module prints `9` / `clause` correctly — the module seam is. "
+     "If that pre-existing calloc-zero gap is ever closed for an imported "
+     "class, this binding must be carried with it (an imported class's clause "
+     "arguments live on `TypeSymbol::importedPrimaryBaseCtorArgs`, #3911, a "
+     "vector with no `ast::TypeDecl` at all), or the textual mispairing "
+     "becomes reachable there. Reproducers: "
+     "/var/tmp/bezel-scratch/c15-4491/xmod/{lib,app}.bzl (case 1) and "
+     "/var/tmp/bezel-scratch/c15-4491/xmod/{glib,gapp}.bzl (case 2)."},
     {"stmtOperatorSymbols_",
      "NOT carried, and INERT for a different reason than the WRITE being "
      "unreachable (contrast the `new`-site half above). fix #3628 (§22.15 "
@@ -229,12 +280,27 @@ const Entry kAstKeyedTables[] = {
      "without changing the topology."},
 };
 
-// Every member name declared as `std::unordered_map<const ast::…> name_;`,
-// in declaration order. Scans forward from each match to the terminating `;`
-// so a declaration wrapped across lines is handled.
+// Every member name declared as an AST-keyed `std::unordered_map`, in
+// declaration order. Scans forward from each match to the terminating `;` so a
+// declaration wrapped across lines is handled.
+//
+// ⚠ TWO NEEDLES since fix #4491, and the second one is the point. A table
+// keyed on an AST NODE spells `std::unordered_map<const ast::…>`. But not
+// every AST-owned fact HAS a node to key on: `ast::CallArgument` is not an
+// `ast::Node` (it carries no span), so a §22.10 inheritance clause's argument
+// list is keyed by the ADDRESS of the `std::vector<ast::CallArgument>` living
+// on its `ast::TypeDecl`, spelling `std::unordered_map<const
+// std::vector<ast::…>`. That table is every bit as AST-keyed, and every bit as
+// subject to the reconstruction judgement this test exists to force — and the
+// single original needle would have let it in unnoticed, which is precisely
+// the "seventh table" failure mode described at the top of this file. The two
+// needles cannot double-count: after `const ` the second spells `std::`, so
+// neither string is a substring of the other.
 std::vector<std::string> scanAstKeyedTableNames(const std::string& src) {
     std::vector<std::string> out;
-    const std::string needle = "std::unordered_map<const ast::";
+    const std::string needles[] = {"std::unordered_map<const ast::",
+                                   "std::unordered_map<const std::vector<ast::"};
+    for (const std::string& needle : needles)
     for (std::size_t at = src.find(needle); at != std::string::npos;
          at = src.find(needle, at + 1)) {
         // Skip accessor return types in the public section: those are preceded
