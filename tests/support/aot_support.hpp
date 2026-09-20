@@ -1329,10 +1329,25 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 //       which contains the archived runtime — sound, just coarser.)
 //   (c) COMPILE/LINK MODE — the CodegenOptions bits that change the emitted
 //       object AND the link line: sanitizeAddress (plain vs --sanitize=address
-//       → -fsanitize=address -g), checkedDisposal (§28.2 guards), isMainModule.
+//       → -fsanitize=address -g), checkedDisposal (§28.2 guards),
+//       checkedContracts (§22.16 `ensures`/`invariant` evaluation — added by
+//       fix #2877, see modeString), isMainModule.
 //       Each mode is a DISTINCT artifact and keys separately, so a plain, an
 //       ASan, and a checked-disposal build of the same source never collide.
 //   (d) the PROGRAM SOURCE TEXT — exactly the bytes writeSource() wrote.
+//   (e) BEHAVIOUR-CHANGING ENVIRONMENT (per #2877) — the variables the
+//       in-process compiler reads that no hashed artifact covers
+//       (BEZEL_OWNERSHIP_LAMBDA_DATAFLOW, BEZEL_VERIFY_IR) plus the
+//       BEZEL_AOT_CACHE_SALT escape hatch. Folded in ONLY when set, so this
+//       component alone never moves a key — which is NOT the same as saying the
+//       key is unchanged: (c)'s `;cc=` bit, added by the same fix, moves every
+//       key and orphans the whole pre-#2877 store on purpose.
+//
+// (a) additionally carries a LINK-PROVENANCE guard (per #2877): the archive's
+// hash is trusted only for a binary the build system DECLARED (the CMake
+// manifest build/tests/test_binaries.txt), because a binary hand-linked with an
+// object that shadows an archive member is a different compiler under the same
+// archive. See runningExeIsADeclaredTestBinary.
 //
 // VALUE: the linked executable ONLY. Only SUCCESSFUL compile+link products are
 // cached; every reject / compiler-crash / compile-timeout path runs the REAL
@@ -1353,11 +1368,16 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 // SPLIT (k3): the key above is now the FIRST of three lookups — see the "two-
 // level split" comment on computeObjectKey/computeLinkKey below for the object
 // and link keys that make a compiler-only or runtime-only rebuild keep half the
-// store warm. This key's composition is deliberately UNCHANGED so entries
-// stored before the split are still served.
+// store warm. THE SPLIT left this key's composition deliberately UNCHANGED, so
+// entries stored before the split were still served by it. (Read as a claim
+// about the split only: fix #2877 later added `;cc=` to (c), which does move
+// every KE key — deliberately, since a pre-#2877 entry cannot be attributed to
+// either §22.16 mode. Orphaned, never mis-served.)
 //
 // KNOBS: BEZEL_AOT_CACHE=0 disables (default ON); BEZEL_AOT_CACHE_DIR overrides
-// the location; BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
+// the location; BEZEL_AOT_CACHE_SALT (per #2877) isolates a run's entries
+// without disabling the cache or paying for a cold private dir;
+// BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
 // (shard) exit. BEZEL_DUMP_IR bypasses the cache entirely (a served product
 // cannot print the IR the flag asks for). GC: once per process, under an flock so only one shard sweeps,
 // if the store exceeds the cap (BEZEL_AOT_CACHE_MAX_GB, default 64 GiB — sized
@@ -1499,6 +1519,130 @@ inline bool computeToolchainIdentity(std::array<uint8_t, 32>& out) {
     return toolchainIdentityFrom(clangVer, ldVer, llvmInfo, out);
 }
 
+// ── per #2877: the LINK-PROVENANCE guard on the k2 compiler identity ───────
+//
+// The STALE-CORE GUARD below (`coreTime <= exeTime`) establishes that core.a is
+// not NEWER than the running binary. That is an ORDERING, not a provenance
+// proof: it does not establish that this binary was linked FROM those bytes. A
+// binary linked from the same archive PLUS one object that shadows an archive
+// member contains a DIFFERENT compiler, is newer than core.a, and therefore
+// passes the guard and keys its products under core.a's identity.
+//
+// That is not hypothetical, and it is not exotic. It is the routine lane recipe
+// for a cheap FAIL-WITHOUT — recompile the ONE changed src/ file at its parent
+// revision and put the object ahead of the archive on the link line, so `ld`
+// takes the explicit object and never extracts the member it shadows:
+//
+//     clang++ … PureChecker_parent.o test_main.cpp.o -o t_parent \
+//             build/libbezel_core.a …
+//
+// #2877 records what that produced, measured: `t_parent` stored PRE-fix
+// executables under keys minted from the POST-fix archives, and the next run of
+// the real binary was SERVED them — 5 of 6 reject rows "ran" and returned the
+// pre-fix answer, while `BEZEL_AOT_CACHE=0` on the same binary was 12/12 green.
+// The benign direction is a spurious FAIL; the dangerous one is its mirror
+// image — a test asserting the OLD behaviour passing against a compiler that no
+// longer produces it.
+//
+// #3669's verify-on-read does NOT cover this. It compares the entry's byte SIZE
+// against a `.sz` sidecar, i.e. it detects a TORN entry; a wrong-but-complete
+// product has a perfectly consistent size, so it is served. (Consistent with
+// the gate's `verify_rejects=0` against `hits=8353`.)
+//
+// The property that separates the two binaries is not a timestamp: it is
+// whether the BUILD SYSTEM produced this binary from a rule that consumes
+// libbezel_core.a. tests/CMakeLists.txt already generates
+// <build>/tests/test_binaries.txt naming every test binary it links, and
+// CLAUDE.md already makes that manifest the blessed answer to "which binaries
+// are the suite" ("never hardcode a binary path"). A binary the manifest names
+// was linked by that rule; a binary it does not name was linked by something
+// else, and the archive says nothing about that binary's compiler.
+//
+// FAILS OPEN, deliberately. This store is shared by every lane and the gate,
+// and the fallback identity (/proc/self/exe) keys PER BINARY: a false negative
+// here would split the cache six ways and re-cool it on every test-only relink,
+// a far larger cost than the defect. So an absent or unreadable manifest keeps
+// exactly today's behaviour, and ONLY a manifest that is readable and does not
+// name this binary downgrades the identity to the conservative exe hash.
+//
+// "Unreadable" means the bytes could not be obtained — absent, permission-
+// denied, an I/O error, or empty. A manifest that IS read but is CORRUPT (junk
+// rows, truncated mid-row, rows naming binaries this build never linked) does
+// NOT fail open: no row matches, so the identity downgrades to the exe hash and
+// this binary isolates itself. That is the safe direction, and it is a real
+// state a half-written file can be in, so it is named rather than left to be
+// inferred from the fail-open sentence above.
+
+// PURE core of the guard: does `manifestText` (`<group> TAB <path> TAB <n>`,
+// one line per binary) name a file that IS `exePath`?
+//
+// Compared with fs::equivalent (device+inode), never by string. A lane's
+// `build/` is a SYMLINK to /mnt/fast/lane-builds/<name> (scripts/lane_setup.sh),
+// so the manifest's CMake-spelled path and /proc/self/exe's resolved path name
+// the same file with different text; inode identity is immune to that and to
+// every other spelling difference. A COPY of a declared binary is correctly NOT
+// equivalent — a copy is exactly the undeclared case this guard exists for.
+inline bool manifestDeclaresExe(std::string_view manifestText,
+                                const std::string& exePath) {
+    std::size_t pos = 0;
+    while (pos < manifestText.size()) {
+        const std::size_t nl = manifestText.find('\n', pos);
+        const std::size_t end =
+            (nl == std::string_view::npos) ? manifestText.size() : nl;
+        const std::string_view line = manifestText.substr(pos, end - pos);
+        pos = end + 1;
+        // field 2 of a TAB-separated line; anything else is not a manifest row.
+        const std::size_t t1 = line.find('\t');
+        if (t1 == std::string_view::npos) continue;
+        const std::string_view rest = line.substr(t1 + 1);
+        const std::size_t t2 = rest.find('\t');
+        const std::string path(
+            rest.substr(0, t2 == std::string_view::npos ? rest.size() : t2));
+        if (path.empty()) continue;
+        std::error_code ec;
+        // fs::equivalent REPORTS an error for a path that does not exist, so the
+        // ec check is load-bearing: a manifest row for a binary this build has
+        // not linked yet must not throw and must not match.
+        if (fs::equivalent(path, exePath, ec) && !ec) return true;
+    }
+    return false;
+}
+
+// Where that manifest lives, derived from the one build-tree path this header
+// already has compiled in: tests/CMakeLists.txt writes it to
+// ${CMAKE_CURRENT_BINARY_DIR}/test_binaries.txt = <build>/tests/, and
+// BEZEL_CORE_LIB_PATH is <build>/libbezel_core.a.
+//
+// Derived rather than passed as a new -D on purpose: a new compile definition
+// moves the ccache key of every test TU (a full ~2,000-TU rebuild) and, because
+// the PCH's REUSE_FROM requires identical definitions across bezel_tests_pch and
+// all six groups, it would have to be the same string for all of them anyway —
+// i.e. it would buy nothing this derivation does not already have. The layout
+// coupling is pinned by aot_cache_key_test's
+// `manifest_path_derivation_finds_the_real_cmake_manifest` row, so it fails
+// loudly instead of rotting into a silent fail-open.
+inline std::string testBinaryManifestPath() {
+#ifdef BEZEL_CORE_LIB_PATH
+    const fs::path core(BEZEL_CORE_LIB_PATH);
+    if (!core.has_parent_path()) return {};
+    return (core.parent_path() / "tests" / "test_binaries.txt").string();
+#else
+    return {};
+#endif
+}
+
+// The live guard. TRUE ("trust core.a") whenever the manifest cannot be read at
+// all — see FAILS OPEN above.
+inline bool runningExeIsADeclaredTestBinary() {
+    const std::string manifest = testBinaryManifestPath();
+    if (manifest.empty()) return true;  // fail OPEN
+    std::ifstream in(manifest, std::ios::binary);
+    if (!in) return true;               // fail OPEN
+    const std::string text((std::istreambuf_iterator<char>(in)), {});
+    if (in.bad() || text.empty()) return true;  // fail OPEN
+    return manifestDeclaresExe(text, "/proc/self/exe");
+}
+
 // The per-process build identity, computed ONCE (hashing the ~100 MB core
 // archive or the test binary is a few hundred ms; amortized over the whole
 // shard it is negligible).
@@ -1570,7 +1714,13 @@ inline const BuildIdentity& buildIdentity() {
             const auto coreTime =
                 fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore);
             const auto exeTime = fs::last_write_time("/proc/self/exe", ecExe);
-            if (!ecCore && !ecExe && coreTime <= exeTime) {
+            // per #2877: the mtime ordering is necessary but NOT sufficient —
+            // it does not establish that THIS binary was linked from these
+            // bytes. Require additionally that the build system declared this
+            // binary (see the LINK-PROVENANCE comment above). Evaluated LAST so
+            // the manifest read is short-circuited away on the stale-core path.
+            if (!ecCore && !ecExe && coreTime <= exeTime &&
+                runningExeIsADeclaredTestBinary()) {
                 std::array<uint8_t, 32> coreHash;
                 if (sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
                     fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore2) ==
@@ -1646,6 +1796,95 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
     return id.usable ? &id.combined : nullptr;
 }
 
+// ── per #2877: BEHAVIOUR-CHANGING ENVIRONMENT INPUTS ───────────────────────
+//
+// Components (a)-(d) cover every ARTIFACT the compile reads; none of them cover
+// the ENVIRONMENT it reads. Two in-tree variables change what the in-process
+// compiler DOES without moving a byte of any hashed artifact:
+//
+//   BEZEL_OWNERSHIP_LAMBDA_DATAFLOW=1 — src/ownership/Ownership.cpp: ALSO runs
+//       the #4146 Stage 2-A CFG dataflow over lambda bodies, so it can reach a
+//       different ACCEPT/REJECT verdict than the default pre-pass alone.
+//   BEZEL_VERIFY_IR                   — src/codegen/LlvmBackend_impl.hpp: runs
+//       verifyModule, so a module the default path emits happily can fail.
+//
+// Both are #2877's shape exactly: a run that sets one is served the product of
+// a run that did not (its flag silently does nothing), and — the dangerous
+// direction — a run that does NOT set one can be served a product minted by a
+// run that did. BEZEL_DUMP_IR and BEZEL_AOT_TEST_CRASH_HOOK are already handled,
+// by BYPASSING the cache in cachedCompile; these two cannot take that route,
+// because they are meant to be usable across a whole suite run where the cache
+// is what makes the run affordable.
+//
+// BEZEL_AOT_CACHE_SALT has no compiler meaning: it is the operator escape hatch
+// #2877 asks for — one word that isolates an experiment's entries without the
+// cold cost of a private BEZEL_AOT_CACHE_DIR and without losing the cache
+// entirely to BEZEL_AOT_CACHE=0. It is the right tool for the hand-linked
+// compiler above when the provenance guard cannot see the difference (an
+// LD_PRELOAD, a patched libLLVM, a deliberately doctored archive).
+//
+// FOLDED IN ONLY WHEN SET. An unset environment yields the empty string and
+// therefore NO hash input at all, so THIS COMPONENT never moves a key. It does
+// not follow that pre-#2877 entries are still served: the `;cc=` bit that fix
+// #2877 adds to both mode strings moves every key on its own and deliberately
+// orphans the whole pre-#2877 store (see modeString). The point of the
+// conditional fold is narrower — that the environment must not add a SECOND,
+// gratuitous key shift, and must not keep shifting keys on every future run.
+// Always folding a "none" marker would do exactly that, for no benefit.
+//
+// ENCODING CAVEAT (recorded, not fixed — see fix #2877's commit body). The
+// `NAME=value;` join is neither escaped nor length-prefixed, so a salt may
+// forge the separator: BEZEL_AOT_CACHE_SALT='a;BEZEL_VERIFY_IR=1' produces the
+// same text as SALT=a with BEZEL_VERIFY_IR=1 set, and the two therefore share a
+// key. Adversarial only — an operator choosing their own salt is not an
+// attacker — but composeObjectKey length-prefixes the prelude against precisely
+// this, so the rigour here is inconsistent with the rest of the file.
+//
+// COVERAGE CAVEAT (likewise recorded, not fixed). `BEZEL_VERIFY_IR=` — set but
+// EMPTY — is skipped here, while LlvmBackend_impl.hpp:896 tests the variable's
+// PRESENCE, not its value. That spelling therefore enables verifyModule while
+// contributing nothing to the key, so a cache hit silently skips the
+// verification the flag asked for. BEZEL_OWNERSHIP_LAMBDA_DATAFLOW has no such
+// gap: it requires atoi(...) == 1, which an empty value cannot satisfy.
+//
+// Read ONCE. The compiler consults these at compile time inside the forked
+// child, which inherits the parent's environment; a test that mutated the
+// environment mid-process could not change what a already-computed key covered,
+// so memoizing here is honest rather than a shortcut. `withEnvironment` is the
+// pure seam the key test drives instead.
+inline const std::string& cacheKeyEnvironment() {
+    static const std::string* v = new std::string([] {
+        static const char* const kNames[] = {
+            "BEZEL_AOT_CACHE_SALT",
+            "BEZEL_OWNERSHIP_LAMBDA_DATAFLOW",
+            "BEZEL_VERIFY_IR",
+        };
+        std::string s;
+        for (const char* n : kNames) {
+            const char* e = std::getenv(n);
+            if (!e || *e == '\0') continue;
+            s += n;
+            s += '=';
+            s += e;
+            s += ';';
+        }
+        return s;
+    }());
+    return *v;
+}
+
+// PURE: `mode` with the environment component appended, or `mode` UNCHANGED
+// when the environment contributes nothing. Both halves are load-bearing and
+// both are pinned in aot_cache_key_test: the "unchanged" half is what keeps the
+// shared store warm, the "moves" half is what makes the isolation real.
+inline std::string withEnvironment(std::string mode, std::string_view envText) {
+    if (envText.empty()) return mode;
+    mode += "env:";
+    mode.append(envText);
+    mode += ';';
+    return mode;
+}
+
 // The mode component of the key (c): every CodegenOptions bit that alters the
 // emitted object or the link line. The schema tag is bumped if the key
 // composition ever changes, so old entries fall out cleanly — "k1;"→"k2;" with
@@ -1659,13 +1898,31 @@ inline std::string modeString(const codegen::CodegenOptions& opts) {
     std::string s = "k2;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    // fix #2877 (§22.16, v0.303): checkedContracts was added by #4386 and never
+    // reached either mode string, so `runAot(src)` (which defaults the bit ON)
+    // and `runAot(src, CodegenOptions{})` (the §22.16 release default, OFF)
+    // computed the SAME key for the same source — and those two forms exist
+    // precisely to be paired on ONE source, which is what the contract corpus
+    // does. Measured pre-fix on this tree: identical KE 03161ae5… and identical
+    // K1 540a926b… for the two modes, i.e. whichever ran first minted the entry
+    // and the other was served it. That is #2877's wrong-product-under-a-
+    // matching-identity, reached by the ordinary suite rather than by any
+    // hand-linked binary. Folding the bit in shifts EVERY key, so entries minted
+    // before it was tracked — which cannot be attributed to either mode — are
+    // orphaned rather than risked; that is exactly what #3006 did for the
+    // toolchain, and for the same reason, so the "k2;"/"k3o;" tags stay put.
+    s += ";cc="; s += opts.checkedContracts ? '1' : '0';
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
     // Proposal 0082 stage-1 prototype (#3048): a FRONT-END desugaring, but one
     // that changes the emitted object (a program that did not compile now
     // does), so it belongs in the key like any codegen-mode bit.
     s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';
     s += ';';
-    return s;
+    // per #2877: contributes NO hash input when the environment is clean (the
+    // default), so this component alone never moves a key. The KE key still
+    // moves — by the `;cc=` bit above, which orphans the pre-#2877 store on
+    // purpose. See cacheKeyEnvironment for why the fold is conditional anyway.
+    return withEnvironment(std::move(s), cacheKeyEnvironment());
 }
 
 inline std::string toHex(const std::array<uint8_t, 32>& d) {
@@ -1720,9 +1977,10 @@ inline std::string computeCacheKey(std::string_view source,
 //
 // THE THREE KEYS (all SHA-256, all hex):
 //   KE ("k2;", unchanged) = H(compiler ‖ runtime ‖ mode ‖ source) → exe.
-//        The unchanged fast path: one hash, one hardlink, no object I/O, and —
-//        because its composition is untouched — every entry stored by the
-//        pre-split harness is still served.
+//        The fast path: one hash, one hardlink, no object I/O. The SPLIT left
+//        its composition untouched, so pre-split entries were still served by
+//        it; fix #2877's `;cc=` bit has since moved it (see modeString), which
+//        orphans those entries rather than mis-serving them.
 //   K1 ("k3o;") = H(compiler ‖ codegen-mode ‖ stdlib-prelude ‖ source) → object.
 //        The prelude (Driver::preludeSourceFingerprint) is the text the driver
 //        injects into EVERY compilation unit, so it is as much an input to the
@@ -1751,7 +2009,8 @@ inline std::string computeCacheKey(std::string_view source,
 
 // The codegen-mode component of K1: every CodegenOptions bit that alters the
 // EMITTED OBJECT. All of them do (sanitizeAddress adds the AddressSanitizer
-// pass, checkedDisposal emits §28.2 guards, isMainModule decides whether a
+// pass, checkedDisposal emits §28.2 guards, checkedContracts emits the
+// §22.16 `ensures`/`invariant` evaluations, isMainModule decides whether a
 // native `main` is lowered, scopedAwaitBind runs the #3048 front-end
 // desugaring), so this is modeString's set under its own schema tag —
 // kept as a separate function so that if the two ever diverge (an option that
@@ -1760,10 +2019,15 @@ inline std::string codegenModeString(const codegen::CodegenOptions& opts) {
     std::string s = "k3o;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    s += ";cc="; s += opts.checkedContracts ? '1' : '0';   // fix #2877, see modeString
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
     s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';   // #3048, see modeString
     s += ';';
-    return s;
+    // per #2877: the OBJECT is what BEZEL_OWNERSHIP_LAMBDA_DATAFLOW and
+    // BEZEL_VERIFY_IR actually change, so K1 is the key that must carry them.
+    // K2 needs nothing: it is keyed on the object's CONTENT hash, so a
+    // differently-compiled object already produces a different link key.
+    return withEnvironment(std::move(s), cacheKeyEnvironment());
 }
 
 // Driver::linkRecipeSignature, memoized per ASan mode (it is a pure function of
