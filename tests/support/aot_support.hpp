@@ -556,6 +556,10 @@ inline bool hasSanitizerReport(const std::string& text) {
 // therefore invisible to the sweep. One definition, three consumers; the third
 // is support/driver_run_support.hpp.
 using bezel::test::forceSanitizeAddress;
+// §22.16 / issue #4386: re-export the suite-wide checked-contracts override
+// (parallel to `forceSanitizeAddress` above) so `runAot` can consult it at
+// every AOT compile.
+using bezel::test::forceCheckedContracts;
 
 // #1822: re-emit a fired sanitizer report to the harness's real stderr (fd 2) so
 // the whole-suite sweep (scripts/asan_sweep.sh) can grep the shard log for the
@@ -2640,6 +2644,10 @@ inline JitResult runAot(std::string_view source,
     // public signature and every call site unchanged.
     codegen::CodegenOptions opts = optsIn;
     if (aot_detail::forceSanitizeAddress()) opts.sanitizeAddress = true;
+    // §22.16 / issue #4386: consult the suite-wide checked-contracts sweep
+    // override (parallel to the ASan sweep above) so an external trigger can
+    // flip every AOT program into checked-contracts mode uniformly.
+    if (aot_detail::forceCheckedContracts()) opts.checkedContracts = true;
 
     std::string infraWhy;
     aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
@@ -2773,8 +2781,19 @@ inline JitResult runAot(std::string_view source,
 }
 
 // Convenience: default (release) codegen options — full parity with runJit.
+//
+// §22.16 / issue #4386: defaults `checkedContracts = true` to preserve the
+// pre-#4386 always-on behavior for the contract test corpus. The pre-#4386
+// codegen emitted `ensures`/`invariant` evaluations unconditionally, so the
+// existing contract tests assume a violated clause raises
+// ContractViolationException under `runAot(source)`. Without this default
+// those tests would break the moment the production default flipped to the
+// §22.16 release default (clauses not emitted). Tests that want the §22.16
+// release default pass `CodegenOptions{}` explicitly to the two-arg form.
 inline JitResult runAot(std::string_view source) {
-    return runAot(source, codegen::CodegenOptions{});
+    codegen::CodegenOptions opts;
+    opts.checkedContracts = true;
+    return runAot(source, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,6 +2825,37 @@ inline JitResult runAot(std::string_view source) {
 inline JitResult runAotCheckedDisposal(std::string_view source) {
     codegen::CodegenOptions opts;
     opts.checkedDisposal = true;  // §28.2 checked-disposal MODE (not ASan)
+    return runAot(source, opts);
+}
+
+// ---------------------------------------------------------------------------
+// runAotCheckedContracts — the AOT counterpart of `--checked-contracts`
+// (issue #4386 / §22.16, parallel to runAotCheckedDisposal above). When
+// checked-contracts MODE is on, `ensures` clauses evaluate at every normal-
+// completion path and `invariant` clauses evaluate at every construction-exit
+// / public-method-entry / public-method-exit point; a false clause raises
+// ContractViolationException. This is exactly what `bezelc --checked-contracts`
+// (main.cpp) sets (opts.checkedContracts = true) and matches the pre-#4386
+// always-on behavior. The unchecked counterpart is
+// `runAot(program, codegen::CodegenOptions{})` (the two-arg form with the
+// production default — opts.checkedContracts defaults to false) so a test
+// can directly assert that the §22.16 release default is "clauses are not
+// emitted at codegen". Orthogonal to `runAotCheckedDisposal` — the two modes
+// are independent per-build choices and can be combined by passing both bits
+// in `CodegenOptions`.
+//
+// Drives the SAME forked Driver::compileFile + subprocess-run path as runAot
+// (via the runAot(source, opts) overload) — the shipping AOT oracle —
+// differing from plain runAot by exactly one bit, opts.checkedContracts. A
+// program whose checked clauses fault therefore raises
+// ContractViolationException (which a `catch ContractViolationException` arm
+// can observe, e.g. returning 1) here, whereas under plain runAot the
+// clauses are skipped and the fault is unobservable. The return type is
+// JitResult, so `.ran` / `.exitCode` / `.diagnostics` call sites are
+// untouched.
+inline JitResult runAotCheckedContracts(std::string_view source) {
+    codegen::CodegenOptions opts;
+    opts.checkedContracts = true;  // §22.16 checked-contracts MODE (not ASan)
     return runAot(source, opts);
 }
 
@@ -2867,6 +2917,16 @@ inline JitResult runAotCheckedImpl(std::string_view source,
                                     const char* name,
                                     bool detectLeaks,
                                     codegen::CodegenOptions opts = {}) {
+    // §22.16 / issue #4386: default `checkedContracts = true` to preserve the
+    // pre-#4386 always-on behavior for the ASan/LSan test corpus. The
+    // pre-#4386 codegen emitted `ensures`/`invariant` evaluations
+    // unconditionally, so the existing contract tests assume a violated
+    // clause raises ContractViolationException under `runAotChecked(source)`
+    // and `runAotCheckedLenient(source)`. Without this default those tests
+    // would break the moment the production default flipped to the §22.16
+    // release default (clauses not emitted). Tests that want the §22.16
+    // release default pass `CodegenOptions{}` explicitly to the two-arg form.
+    opts.checkedContracts = true;
     JitResult r;
     aot_detail::ensureInfraTallyAtExit();
 

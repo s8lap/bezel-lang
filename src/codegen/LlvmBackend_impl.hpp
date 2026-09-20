@@ -611,6 +611,7 @@ public:
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
           builder_(llvmCtx),
           checkedDisposal_(opts.checkedDisposal),
+          checkedContracts_(opts.checkedContracts),
           isMainModule_(opts.isMainModule) {}
 
     std::unique_ptr<llvm::Module> run() {
@@ -919,6 +920,12 @@ private:
     // disposed-flag test on every instance-member entry; emitDisposeAndReclaim
     // suppresses the heap-free (quarantine) so the flag remains readable.
     bool checkedDisposal_ = false;
+    // §22.16 / issue #4386: in checked-contracts mode the `ensures` epilogue
+    // (armEnsuresEpilogue) and the `invariant` check (emitInvariantCheck) emit
+    // the clause-evaluation call. In unchecked (release) mode — the default —
+    // both are no-ops at codegen, so `ensures`/`invariant` clauses are pure
+    // (never evaluated). `requires` is always-on regardless of this bit.
+    bool checkedContracts_ = false;
     // per §33.1/§2.4/§33.6 (#1563): true when this compilation unit is the
     // executable's main module, so a qualifying `Main` (§33.2) is lowered as
     // the native process entry point. False for a library (`-c`) build — see

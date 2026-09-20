@@ -36,6 +36,20 @@ struct CodegenOptions {
     // Default false = unchecked (release) mode: zero extra cost.
     bool checkedDisposal = false;
 
+    // §22.16 / issue #4386: enable checked-contracts mode. When true,
+    // `ensures` clauses evaluate at every normal-completion path (after
+    // result + out-slot binding, before scope-end disposals) and `invariant`
+    // clauses evaluate at every construction-exit / public-method-entry /
+    // public-method-exit point; a false clause raises
+    // ContractViolationException (§31.4). When false (the §22.16 release
+    // default), `ensures`/`invariant` evaluations are NOT emitted at codegen
+    // — clauses are pure, so non-evaluation is unobservable for any program
+    // whose checked clauses never fault. `requires` is always-on regardless
+    // of this bit (gated only on the clause kind, not on this flag). The two
+    // modes are independent per-build choices — checkedDisposal and
+    // checkedContracts are orthogonal.
+    bool checkedContracts = false;
+
     // per §33.1/§2.4/§33.6: is this compilation unit the executable's **main
     // module** — the module named as the build's executable target? Only the
     // main module's qualifying `Main` (§33.2) is the process entry point: it

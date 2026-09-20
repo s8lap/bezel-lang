@@ -6199,6 +6199,15 @@ bool Emitter::armEnsuresEpilogue(
     const ast::Type* returnTypeNode,
     std::string_view typeName, std::string_view memberName,
     const sema::TypeSymbol* invariantClass) {
+    // §22.16 / issue #4386: in unchecked (release) mode — the default — the
+    // ensures epilogue is NOT armed, so `ensures` clauses are not emitted at
+    // codegen and the body's returns do not redirect through any epilogue
+    // block (they go through emitReturn's direct-ret path). The
+    // `ensuresResultSlot_` allocation, the `ensuresExitBB_` basic block, and
+    // the `insideInvariantCheck_` machinery are all skipped. `requires` is
+    // always-on regardless of this bit (gated only on the clause kind, not on
+    // this flag).
+    if (!checkedContracts_) return false;
     bool hasEnsures = false;
     for (const auto& c : clauses)
         if (c.kind == ast::ContractClause::Kind::Ensures && c.expr) {
@@ -6485,6 +6494,12 @@ void Emitter::finalizeEnsuresEpilogue() {
 void Emitter::emitInvariantCheck(llvm::Value* thisVal,
                                  const sema::TypeSymbol* classType,
                                  bool disposeAndFreeOnThrow) {
+    // §22.16 / issue #4386: in unchecked (release) mode — the default —
+    // invariant checks are NOT emitted at any of the construction-exit /
+    // public-method-entry / public-method-exit points. Clauses are pure, so
+    // non-evaluation is unobservable for any program whose checked clauses
+    // never fault. `requires` is always-on regardless of this bit.
+    if (!checkedContracts_) return;
     if (!classType || insideInvariantCheck_) return;
     // Find source-defined invariants across the base chain. A class with no
     // invariants at any level is a no-op (the common case).
