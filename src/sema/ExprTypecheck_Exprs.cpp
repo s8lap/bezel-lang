@@ -5717,58 +5717,140 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     // wrong: `true < false` compiled to `true`, and `string? < string?`
     // segfaulted on a null operand. Reject both here. Only `=`/`<>` are valid
     // on bool / `string?` (the general equality path below is unaffected).
-    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+    //
+    // fix #4500 (§3.5 / §6.2 / §5.1, v0.306): the ARITHMETIC operators
+    // `+ - * /` join this gate's operator set rather than growing a second,
+    // parallel `bool`-operand check further down. §3.5 answers ONE question
+    // for both families — "does the intrinsic-operator table admit an operand
+    // of this type?" — by enumerating each group BY OPERAND TYPE:
+    // "**Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`, `float`, `double`, `decimal`: `+`, `-`, `*`, `/` …"
+    // (no `bool`) beside "**Ordering** … on every primitive **except
+    // `bool`**". §5.1's table has no row out of `bool` ("Between integers and
+    // `bool`" is on its never-implicit list), so §6.2's disposition applies:
+    // "If no implicit conversion exists between the operand types … the
+    // operation is a compile error and an explicit cast is required". The
+    // remedy is the same one the ordering arm already names — `int(b)`.
+    //
+    // Measured on HEAD before this fix (bezelc @ 8fd7cabf, docs v0.306), one
+    // compile + one run each: `decimal * bool` and `double * bool` compiled
+    // with NO diagnostic and the program printed `-2`; `bool + bool` printed
+    // `True` and `bool * bool` printed `False` (arithmetic answered in the
+    // boolean domain); `int * bool` and `int + bool` emitted malformed IR
+    // ("Call parameter type does not match function signature",
+    // `@llvm.smul.with.overflow.i32(i32, i1)`) and died in LLVM's verifier.
+    // One clean rejection replaces all four outcomes, in either operand order
+    // and at a same-typed `bool op bool` pair alike — the gate is per-OPERAND
+    // (§3.5's table is read per operand type), not per pair, so it does not
+    // depend on the other operand being numeric.
+    //
+    // NOT folded in, deliberately: `mod` (§6.1), and the bitwise/shift set
+    // `& | ^ << >>` (§6.5) already reject a `bool` operand further down, each
+    // under its OWN spec rule with its own remedy ("boolean operations use
+    // `and`/`or`/`not`" for bitwise; "`mod` is defined on the integer types and
+    // `decimal`" for mod). Those are not copies of this rule that drifted —
+    // they are different sections answering different questions, they already
+    // agree with §3.5's table, and their wording is pinned by lit rows. What
+    // was missing was §3.5's ARITHMETIC bullet, and it is added here, at the
+    // one site that already answered the identical question for ordering.
+    if (op == "<" || op == ">" || op == "<=" || op == ">=" ||
+        op == "+" || op == "-" || op == "*" || op == "/") {
         // #1574: bool ordering. §7.11's relational-lifting excludes `bool?`
         // for the same reason, so checking the primitive kind here (ignoring
-        // nullability) covers a `bool?` operand too.
+        // nullability) covers a `bool?` operand too. The same reading covers
+        // the arithmetic arm (#4500): §7.11 lifts an operator "only where it
+        // is defined on the underlying type `T`", and `+ - * /` are defined
+        // nowhere on `bool`.
         auto isBool = [](const TypeRef* t) {
             return t && t->kind == TypeRef::Kind::Primitive &&
                    t->primitive == PrimitiveType::Bool;
         };
+        auto isStringPrim = [](const TypeRef* t) {
+            return t && t->kind == TypeRef::Kind::Primitive &&
+                   t->primitive == PrimitiveType::String;
+        };
         TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
         TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
-        if (isBool(lt) || isBool(rt)) {
+        const bool ordering =
+            (op == "<" || op == ">" || op == "<=" || op == ">=");
+        // §4.6 is the MORE SPECIFIC authority for `string + <anything>`:
+        // `+` on a string operand is concatenation (a declared `String.operator
+        // +`, §3.5), not §3.5's numeric-arithmetic bullet, and its remedy is
+        // interpolation or `.ToString()` — not `int(b)`. That check lives
+        // below and already covers every non-string right operand, `bool`
+        // included, so this gate stands aside for exactly that pair rather
+        // than answering it with advice that does not fit.
+        const bool deferToStringConcat =
+            (op == "+") && (isStringPrim(lt) || isStringPrim(rt));
+        if ((isBool(lt) || isBool(rt)) && !deferToStringConcat) {
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "operator `" + std::string(op) + "` is not defined for `bool` "
-                "operands (\xC2\xA7""3.5) \xE2\x80\x94 no ordering of `false`/`true` is "
-                "defined; only `=`/`<>` are valid on bool. To order by a flag,"
-                " convert explicitly (`int(b)`).");
-            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                "operands (\xC2\xA7""3.5) \xE2\x80\x94 " +
+                (ordering
+                     ? std::string(
+                           "no ordering of `false`/`true` is "
+                           "defined; only `=`/`<>` are valid on bool. To order "
+                           "by a flag, convert explicitly (`int(b)`).")
+                     : std::string(
+                           "\xC2\xA7""3.5 defines arithmetic (`+`, `-`, `*`, `/`) "
+                           "on the numeric types only, and \xC2\xA7""5.1 admits no "
+                           "implicit conversion out of `bool`, so the operation "
+                           "is a compile error (\xC2\xA7""6.2). To compute with a "
+                           "flag, convert explicitly (`int(b)`).")));
+            // Error recovery, mirroring the unit-operand gate above: an
+            // ordering yields `bool`; an arithmetic yields the OTHER
+            // (non-bool) operand's type when there is one, else `int`.
+            if (ordering) {
+                ctx_.setExprType(&be,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (!isBool(lt) && lt) {
+                ctx_.setExprType(&be, lt);
+            } else if (!isBool(rt) && rt) {
+                ctx_.setExprType(&be, rt);
+            } else {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            }
             return;
         }
-        // #1575: ordering on `string` requires non-nullable operands; a
-        // `string?` operand is a compile error (narrow first, §7.4) — the same
-        // use-requires-narrowing discipline as member access on a nullable
-        // reference. Distinct from §7.11 lifting, which is confined to nullable
-        // VALUE types and does NOT extend to `string`. Previously a `string?`
-        // operand fell through to ordinal-compare codegen and segfaulted on a
-        // null operand; `=`/`<>` stay null-safe (§8.4) and are unaffected.
-        auto nullableStringOperand = [&](const ast::Expr* operand) -> bool {
-            if (!operand) return false;
-            const TypeRef* t = ctx_.exprType(*operand);
-            if (!t || t->kind != TypeRef::Kind::Primitive ||
-                t->primitive != PrimitiveType::String || !t->nullable)
-                return false;
-            // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
-            // known non-null even though exprType keeps the nullable flag
-            // (null-narrowing does not rewrite exprType). This is the same
-            // question §7.11's own gates ask, so it is the same predicate
-            // (#3298) rather than a fifth copy of the lookup.
-            return !isNarrowedNonNullRead(operand);
-        };
-        if (nullableStringOperand(be.left.get()) ||
-            nullableStringOperand(be.right.get())) {
-            ctx_.diagnostics().report(
-                Severity::Error, be.span.begin,
-                "operator `" + std::string(op) + "` requires non-nullable "
-                "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
-                "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
-                "use-requires-narrowing discipline as member access on a "
-                "nullable reference. Equality (`=`/`<>`) stays null-safe "
-                "(\xC2\xA7""8.4) and is unaffected.");
-            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-            return;
+        // The #1575 `string?` rule below is ORDERING-only: §4.6 defines
+        // `<`/`<=`/`>`/`>=` on `string`, while `+` on a string operand is the
+        // §4.6 CONCATENATION rule, checked below with its own nullability
+        // handling. Arithmetic therefore stops here.
+        if (ordering) {
+            // #1575: ordering on `string` requires non-nullable operands; a
+            // `string?` operand is a compile error (narrow first, §7.4) — the same
+            // use-requires-narrowing discipline as member access on a nullable
+            // reference. Distinct from §7.11 lifting, which is confined to nullable
+            // VALUE types and does NOT extend to `string`. Previously a `string?`
+            // operand fell through to ordinal-compare codegen and segfaulted on a
+            // null operand; `=`/`<>` stay null-safe (§8.4) and are unaffected.
+            auto nullableStringOperand = [&](const ast::Expr* operand) -> bool {
+                if (!operand) return false;
+                const TypeRef* t = ctx_.exprType(*operand);
+                if (!t || t->kind != TypeRef::Kind::Primitive ||
+                    t->primitive != PrimitiveType::String || !t->nullable)
+                    return false;
+                // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
+                // known non-null even though exprType keeps the nullable flag
+                // (null-narrowing does not rewrite exprType). This is the same
+                // question §7.11's own gates ask, so it is the same predicate
+                // (#3298) rather than a fifth copy of the lookup.
+                return !isNarrowedNonNullRead(operand);
+            };
+            if (nullableStringOperand(be.left.get()) ||
+                nullableStringOperand(be.right.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) + "` requires non-nullable "
+                    "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
+                    "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
+                    "use-requires-narrowing discipline as member access on a "
+                    "nullable reference. Equality (`=`/`<>`) stays null-safe "
+                    "(\xC2\xA7""8.4) and is unaffected.");
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
         }
     }
     // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
