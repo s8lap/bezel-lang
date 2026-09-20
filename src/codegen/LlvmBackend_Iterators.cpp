@@ -2687,69 +2687,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
         };
 
-        // fix #4468 (§27.5 / §29.7, v0.299): release each closure (function-typed)
-        // LOCAL declared in the iterator body — `var f := lambda(...) => ...;`
-        // mints a +1 cell into f's frame slot, and the §28.3 scope-end
-        // `bz_closure_release` the local-decl machinery registers is unreachable
-        // in a sync iterator body (MoveNext returns at the yield, so the body's
-        // `}` is never visited). Without this loop the cell leaks every time the
-        // enumerator is disposed after a partial or full yield (LSan: 40 B). The
-        // reverse-declaration order matches §28.4's destructor rule; the loop
-        // visits only declared function-typed locals — same gate as
-        // `releaseClosureCaptures` above but on the `bodyLocals` set, not on
-        // `frame.captures`. bz_closure_release is null-safe, so the SOURCE's
-        // (untouched) calloc-zeroed slots are a no-op here, and the CLONE's
-        // post-MoveNext slots release the cell + env block at rc 0. The loop is
-        // intentionally NOT gated on `releaseClosures`: the existing flag
-        // addresses PARAMETER closure releases (a source-only concern); the
-        // LOCAL slot's +1 lives on the driven frame (the CLONE), so the cleanup
-        // must fire regardless. Reassignment (#4422) releases the prior cell at
-        // the AssignmentStmt site, so the field read here is the live cell.
-        //
-        // The function-type check tolerates BOTH the annotated form
-        // `var f: () -> int := lambda() => 42;` (resolvedType on `ld->type`)
-        // and the inferred form `var f := lambda() => 42;` (exprType on the
-        // initializer — sema inferred `() -> int` and stamped it on the
-        // LambdaExpr node). The latter is the #4468 minimal repro and the
-        // common case; without the exprType fallback the leak persists.
-        auto releaseLocalClosures = [&]() {
-            for (auto bit = frame.bodyLocals.rbegin();
-                 bit != frame.bodyLocals.rend(); ++bit) {
-                const ast::Node* node = bit->first;
-                // Frame-local ForStmt iterable / source fields are pushed into
-                // bodyLocals by #944 and are ptr-typed iterators — not a
-                // function-typed local declaration. Cast to LocalDecl /
-                // LocalConstDecl to skip them and read the declared type only
-                // when the node IS a local binding.
-                const ast::Type* declType = nullptr;
-                const ast::Expr* init = nullptr;
-                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(node)) {
-                    declType = ld->type.get();
-                    init = ld->initializer.get();
-                } else if (auto* lc =
-                               dynamic_cast<const ast::LocalConstDecl*>(node)) {
-                    declType = lc->type.get();
-                    init = lc->value.get();
-                } else {
-                    continue;
-                }
-                // Only function-typed locals carry a closure cell +1 the frame
-                // owes. Other locals are discharged by disposeOwnedLocals /
-                // disposeYieldedVal / the §28.3 scope-end dispose machinery.
-                sema::TypeRef* pt = declType ? ctx_.resolvedType(*declType)
-                                             : nullptr;
-                if (!pt && init) pt = ctx_.exprType(*init);
-                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
-                auto fit = frame.localFields.find(node);
-                if (fit == frame.localFields.end()) continue;
-                unsigned fieldIdx = fit->second;
-                llvm::Value* fptr =
-                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
-                llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "itcl.cl");
-                emitClosureRelease(cl);   // null-safe
-            }
-        };
-
         // §29 (#1120): dispose the outstanding yielded owned value stored in the
         // current_val frame field — BUT ONLY if the enumerator actually owns it
         // (current_val_owned == 1, set when the yielded expression was a `new`).
@@ -2871,7 +2808,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             disposeOwnedParams();      // §29.8 (#945)
             disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
-            releaseLocalClosures();    // #4468 §27.5/§29.7: drop frame's +1 on function-typed locals
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
@@ -3058,7 +2994,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             disposeOwnedParams();      // §29.8 (#945): after the finally chains
             disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
-            releaseLocalClosures();    // #4468 §27.5/§29.7: drop frame's +1 on function-typed locals
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
