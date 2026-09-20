@@ -87,7 +87,6 @@ const char* kProgram =
 BEZEL_TEST(closure_dispose_then_invoke_4475,
            checked_disposal_raises_disposed_exception_28_2) {
     JitResult r = runAotCheckedDisposal(kProgram);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // SEGV (139) is the WITHOUT-fix result; DisposedAccessException is
     // any other nonzero exit (bezel exceptions return a nonzero status —
@@ -136,7 +135,6 @@ BEZEL_TEST(closure_dispose_then_invoke_4475,
         "    return x; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -157,7 +155,6 @@ BEZEL_TEST(closure_dispose_then_invoke_4475,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
