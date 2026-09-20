@@ -2787,7 +2787,53 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             // `CallExpr` argument loop was the one position that still ran
             // the unguarded `checkRead(*a.value, false)` predating #3971.
             // // per §28.3 K3.4, v0.294, #3971, #4023
-            if (isTopLevelConsumingForm(*a.value)) { ++pos; continue; }
+            //
+            // fix #4141 (§28.3 K1.3, v0.298): CARVE-OUT to #4023 — for a
+            // top-level `move x` whose source identifier is currently in
+            // the `maybeConsumed` state (a join-fact, set by `joinInto`'s
+            // §28.3 Owned ⊓ MovedFrom meet — see this file ~line 9142),
+            // ALSO run `checkRead` over the argument so the read-side
+            // diagnostic ("local `x` may have already been consumed on
+            // another branch and may not be read here (maybe-consumed
+            // join, §28.3)") fires alongside the consume-side one
+            // (`markMovedByName`'s own maybeConsumed arm, which checks
+            // the FLAG not the STATE so it survives the cascade poison).
+            // §28.3 K1.3 lists read, borrow, and consume as the three
+            // uses a maybe-consumed join forbids — a `move` is BOTH a
+            // read (the slot is dereferenced to hand the receiver the
+            // pointer) AND a consume (the slot is zeroed). The consume-
+            // side diagnostic is the precise one; the read-side is a
+            // correct companion at this position and is what the
+            // regression-test Row 6 / 7 / 13 of #4141 (a lambda-body
+            // `while true do move x; break; end; move x;` shape) pins.
+            // The cascade-poisoning hazard #4023 fixed — `checkRead`'s
+            // `Disposed` arm masking `markMovedByName`'s precise §28.3
+            // ERROR via the Poisoned fallthrough — does NOT apply here:
+            // the `maybeConsumed` FLAG survives the state poison, so
+            // `markMovedByName`'s `if (st->maybeConsumed)` arm fires
+            // regardless, and the precise §28.3 consume-side ERROR is
+            // NOT masked. For `Disposed` / `MovedFrom` / `Uninitialized`
+            // sources the original #4023 skip remains correct (those
+            // are the states that trigger the cascade-mask bug).
+            // Limited to bare-identifier operands (`move x` / `await x`);
+            // complex move places (`move recv.field`, `move recv[i]`)
+            // reach `recordFieldMove` instead of `markMovedByName` and
+            // are unaffected either way.
+            // // per §28.3 K1.3, §28.3 K7, v0.298, #4141, #4023
+            if (isTopLevelConsumingForm(*a.value)) {
+                bool sourceMaybeConsumed = false;
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        a.value.get())) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get())) {
+                        if (auto* st = lookupState(id->name)) {
+                            if (st->maybeConsumed) sourceMaybeConsumed = true;
+                        }
+                    }
+                }
+                if (sourceMaybeConsumed) checkRead(*a.value, false);
+                ++pos; continue;
+            }
             checkRead(*a.value, false);
             ++pos;
         }
