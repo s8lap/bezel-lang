@@ -5102,6 +5102,27 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // arm's inline copy of them was the one the
             // collection arms next door were missing.
         }
+    } else if (recvTy && recvTy->kind == sema::TypeRef::Kind::Function) {
+        // fix #4475 (§28.2 v0.30x): explicit `c.Dispose()` on a closure-typed
+        // value. The closure cell is NOT a vtable-backed class — its word 0
+        // is the `fn` pointer, not a class vtable, so the user-class arm
+        // below (emitDynamicDispose → slot 2 dispatch) would read fn+0x10 as
+        // a function pointer and WILD-JUMP. Without this arm the existing
+        // codegen silently produced a SEGV on the Dispose call itself.
+        //
+        // Emit the SAME `bz_closure_release(c)` that the auto-dispose path
+        // uses, but preceded by `bz_closure_mark_disposed(c)` so the
+        // release's last-drop path QUARANTINES instead of freeing — the
+        // closure-invoke guard then reads the disposed flag and throws
+        // DisposedAccessException (§31.4). The mark is gated on
+        // --checked-disposal: outside that mode the byte stays 0 and the
+        // release frees as before (unchecked mode's UB allowance per §28.2).
+        auto* mkFn = declareC("bz_closure_mark_disposed",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        if (checkedDisposal_) builder_.CreateCall(mkFn, {recv});
+        auto* relFn = declareC("bz_closure_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(relFn, {recv});
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
@@ -6148,6 +6169,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (!closurePtr || !rt ||
             rt->kind != sema::TypeRef::Kind::Function)
             return nullptr;
+        // fix #4475 (§28.2 v0.30x): under --checked-disposal, an explicit
+        // `c.Dispose()` BEFORE the invoke must raise DisposedAccessException
+        // (§31.4) instead of UAF-reading the freed cell. The explicit
+        // Dispose arm emits `bz_closure_mark_disposed(c)` which sets the
+        // closure's disposed flag (offset 40); the release that follows
+        // quarantines the cell at last-drop instead of freeing it (the
+        // same shape bz_array_mark_disposed / bz_dict_mark_disposed use).
+        // We read the flag here and throw on non-zero. Sibling to the
+        // channel/semaphore/stream disposed-flag guards (#4354, #4357,
+        // #4336). Outside --checked-disposal the flag is never written,
+        // so the guard's read sees the calloc zero-fill and the throw is
+        // unreachable.
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_closure_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag = builder_.CreateCall(
+                isFn, {closurePtr}, "cd.cdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
         // Load fn_ptr from closure[0].
         llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
         // Load env_ptr from closure[1].

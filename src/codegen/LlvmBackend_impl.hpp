@@ -4166,19 +4166,25 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
-    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544): the closure-cell heap layout —
+    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544) / #4475 (§28.2): the
+    // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
-    //     i64 kind (off 32) }
-    //   = 40 bytes.
+    //     i64 kind (off 32), i8 disposed (off 40) }
+    //   = 48 bytes (LLVM may pad the tail to 8-byte alignment = 48 bytes).
     // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
     // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
     // unchanged; envdtor (field index 3, off 24) is the #672 typed env-disposer;
-    // kind (field index 4, off 32) is NEW (#1544): a FnValKind tag recording which
-    // §27.7.1 equality rule the value obeys, consulted only by
-    // bz_closure_value_equals / bz_closure_same (never by retain/release). The
-    // values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_* constants.
+    // kind (field index 4, off 32) is the §27.7.1 FnValKind tag, consulted only
+    // by bz_closure_value_equals / bz_closure_same (never by retain/release).
+    // The values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_*
+    // constants. disposed (field index 5, off 40, #4475) is the §28.2
+    // use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+    // bz_closure_mark_disposed on an explicit `c.Dispose()` (codegen only,
+    // under --checked-disposal), read at the closure-invoke guard site.
     // Every closure-cell producer calloc's this size and stores rc := 1,
-    // envdtor := null, and kind := the producer-appropriate FnValKind.
+    // envdtor := null, kind := the producer-appropriate FnValKind, and
+    // disposed := 0 (calloc zero-fill; explicit initClosureDisposed() is
+    // provided as documentation).
     enum FnValKind : int64_t {
         // Lambda or value-shaped-receiver (record/enum/primitive) ref: equals
         // only itself (reference identity on the cell). §27.7.1 first & third.
@@ -4192,7 +4198,10 @@ private:
     llvm::StructType* closureCellType() {
         if (!closureCellTy_)
             closureCellTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy(), i64()}, "bz.closure");
+                llvm_,
+                {ptrTy(), ptrTy(), i64(), ptrTy(), i64(),
+                 llvm::Type::getInt8Ty(llvm_)},
+                "bz.closure");
         return closureCellTy_;
     }
 

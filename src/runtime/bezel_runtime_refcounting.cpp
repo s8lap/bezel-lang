@@ -270,7 +270,7 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
-// increment; issue #672 typed env-disposer foundation).
+// increment; issue #672 typed env-disposer foundation; #4475 dispose flag).
 //
 // Function-typed values (lambda closures — capturing or not — and method
 // references) are RUNTIME-MANAGED (§28.9): "Runtime management governs the
@@ -280,14 +280,21 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 //     void* env     (off  8),
 //     int64_t rc    (off 16),
 //     void* envdtor (off 24),
-//     int64_t kind  (off 32) }  = 40 bytes.
+//     int64_t kind  (off 32),
+//     int8_t disposed (off 40) }  = 48 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
 // keep their offsets: every codegen call site loads fn at offset 0 and env at
 // GEP index 1, both unmoved. `kind` (off 32, §27.7.1 / #1544) tags the
 // function-value equality rule (see bezel_runtime_internal.hpp's BZ_FVK_*
-// constants); retain/release never read it.
+// constants); retain/release never read it. `disposed` (off 40, #4475) is the
+// §28.2 use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+// bz_closure_mark_disposed on an explicit `c.Dispose()`. bz_closure_release
+// reads it at last-drop: when 1, the cell is QUARANTINED instead of freed (a
+// deliberate leak parallel to bz_array_mark_disposed), so a post-dispose
+// invoke's guard can read the flag and throw DisposedAccessException instead
+// of UAF-reading freed memory.
 //
 // #672 TYPED ENV-DISPOSER (foundation). `envdtor` (off 24) is a per-lambda
 // typed disposal function emitted by codegen beside the trampoline. When
@@ -326,6 +333,10 @@ static const int64_t BZ_CLOSURE_RC_OFFSET = 16;
 // Byte offset of the env pointer inside the closure cell (after fn).
 // #672: byte offset of the envdtor pointer inside the closure cell (after rc).
 static const int64_t BZ_CLOSURE_ENVDTOR_OFFSET = 24;
+// #4475 (§28.2): byte offset of the disposed flag (after kind). Single byte
+// is enough — the flag is binary. calloc zero-fill makes a fresh cell read
+// as "not disposed" (0), which is the only safe default.
+static const int64_t BZ_CLOSURE_DISPOSED_OFFSET = 40;
 
 extern "C" void bz_closure_retain(void* c) {
     if (!c) return;
@@ -355,11 +366,50 @@ extern "C" void bz_closure_release(void* c) {
         typedef void (*envdtor_t)(void*);
         ((envdtor_t)envdtor_fn)(env);
     }
-    // Free the env block (uniquely owned by this cell; allocations in
-    // lowerLambda/makeMethodThunk each produce one fresh env per cell).
-    // free(NULL) is safe (a non-capturing closure carries a null env).
-    free(env);
+    // #4475 (§28.2): if the closure was EXPLICITLY DISPOSED (codegen emits
+    // bz_closure_mark_disposed under --checked-disposal on `c.Dispose()`),
+    // the disposed flag is 1. The cell must stay alive (quarantined) so the
+    // closure-invoke guard can read the flag and throw DisposedAccessException
+    // instead of UAF-reading a freed cell at fn (offset 0). free the env block
+    // (it is uniquely owned) but NOT the cell. Outside --checked-disposal the
+    // flag is never written, so the legacy free-on-last-drop path is unchanged
+    // and calloc's zero-fill keeps the byte at 0.
+    int8_t disposed = 0;
+    memcpy(&disposed, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    free(env);  // env is owned by this cell; release it either way.
+    if (disposed) {
+        // Quarantine: do NOT free(c). The cell becomes a deliberate leak
+        // until the process exits (the same lifetime-end semantics as
+        // bz_array_mark_disposed / bz_dict_mark_disposed). The disposed flag
+        // is still readable, and the rc remains 0, so a future retain on the
+        // same pointer would be unsound — but the codegen stops retaining
+        // post-dispose (the `c.Dispose()` arm in --checked-disposal nulls
+        // the slot after the mark, parallel to channel/semaphore, so any
+        // second access goes through the same guard).
+        return;
+    }
     free(c);
+}
+
+// #4475 (§28.2): mark a closure-typed value as disposed. Called by codegen
+// BEFORE the explicit `c.Dispose()` release under --checked-disposal, so the
+// release's last-drop path sees the flag and quarantines instead of freeing.
+// Idempotent — repeated calls are no-ops. null is a no-op.
+extern "C" void bz_closure_mark_disposed(void* c) {
+    if (!c) return;
+    int8_t one = 1;
+    memcpy((uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, &one, sizeof(int8_t));
+}
+
+// #4475 (§28.2): read the per-instance disposed flag. Returns 0 for null
+// (a null closure is never "disposed" — it never held anything). The codegen
+// guard at the closure-invoke lower site calls this and throws
+// DisposedAccessException on a nonzero return.
+extern "C" int8_t bz_closure_is_disposed(void* c) {
+    if (!c) return 0;
+    int8_t d = 0;
+    memcpy(&d, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    return d;
 }
 
 // ---------------------------------------------------------------------------
