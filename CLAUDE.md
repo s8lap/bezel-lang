@@ -518,8 +518,16 @@ dispose-count/ASan-clean for a double-free.
    probe agents, and no replacements dispatched. Read-only work is fine. "It's
    just reading code" is a snapshot, not a guarantee: an agent can move to
    "needs to rebuild" on any turn.
-3. **Zero builders.** `pgrep -x 'clang++|clang|cc1plus|bezel_tests|cmake|ld.mold|ld.lld'`
-   must be empty. Contention is indistinguishable from a real regression: one
+3. **Zero builders** — check it with **`scripts/no_builders.sh`**, never by hand.
+   ⚠ The recipe this line used to give, `pgrep -x 'clang++|clang|cc1plus|...'`, is
+   **broken in the one direction that matters**: `pgrep -x` matches the process
+   name as an anchored extended regex, so `+` is a metacharacter and
+   `pgrep -xc 'clang++'` returns **0 while 31 clang++ processes are running**
+   (measured 2026-09-21). That alternation only ever fired via `cmake`, so a box
+   compiling hard with no cmake alive reported CLEAN. A precondition that cannot
+   fail is worse than none — it is the same vacuous-oracle class as a one-shot
+   LSan row. The script matches on `ps -eo comm=` with fixed strings and fails
+   closed. Contention is indistinguishable from a real regression: one
    concurrent builder produced "shard crash / undercount — NOT trustworthy" plus
    53 phantom failures that all passed in isolation. If a FAIL carries the
    undercount banner, re-run each suspect alone with `BEZEL_TEST_FILTER=<substr>`
@@ -531,6 +539,8 @@ dispose-count/ASan-clean for a double-free.
    list from the gate; do not hardcode it.** A hardcoded six-item list drifted out of
    date and silently omitted `check_toolchain_skip_surface`, which the gate treats as
    a `CYCLE FAILURE` — a ~50 min cycle would have burned on a known-fail:
+   Run **`scripts/ratchet_sweep.sh`**, which derives the list from the gate and
+   fails closed if it derives none. Equivalent by hand (never a hardcoded list):
    ```sh
    for s in $(grep -oE 'scripts/check_[a-z_]+\.py' scripts/gate_full_cycle.sh | sort -u); do
      printf '%-42s ' "$(basename "$s" .py)"
