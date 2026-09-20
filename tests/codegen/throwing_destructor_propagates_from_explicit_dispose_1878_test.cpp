@@ -23,15 +23,20 @@
 // after".
 //
 // ROOT CAUSE / FIX: `Emitter::emitExplicitDisposeChain`
-// (src/codegen/LlvmBackend_Calls2.cpp) now calls `emitPendingCheck()` once,
+// (src/codegen/LlvmBackend_Calls2.cpp) now calls `emitDisposalFaultCheck` once,
 // after the whole dispatch-arm chain, so the exception propagates from the
 // disposal point while the reclaim tail (identity-hash reap, CauseChain
 // reclaim, `free`, slot-null) has already run — §28.4's "physical reclamation
-// still occurs". The check's condition is `emitPendingCheck`'s verbatim: bz_exc
-// non-null, ANDed inside a destructor body with #1468's "different from the
-// exception captured at disposer entry", so an `x.Dispose()` executed while an
-// exception is already unwinding this frame routes only a genuinely NEW
-// exception.
+// still occurs".
+//
+// The check is BRACKETED, not a plain "is anything in flight": it snapshots the
+// bz_exc slot before the dispatch (`snapshotInFlightExc`) and fires only when
+// the slot ends up non-null AND different. A disposal site is one of the few
+// places reached with somebody else's exception already in the slot — a
+// destructor body on an unwind edge (#1468), an `x.Dispose()` inside an
+// iterator `finally` running under §29.7 abandonment — and a plain non-null
+// test misroutes those. What the comparison guarantees, and the one case it
+// does not cover, is written out at `emitDisposalFaultCheck`'s definition.
 //
 // FAILS WITHOUT / PASSES WITH: every row below except
 // `non_throwing_destructor_still_falls_through` (the no-spurious-unwind
@@ -183,11 +188,20 @@ BEZEL_TEST(throwing_destructor_propagates_from_explicit_dispose_1878,
 
 // §28.4 — "Before it propagates, the remaining steps of the generated
 // `Dispose()` still run ... and physical reclamation still occurs — a cleanup
-// fault never leaks the object." Under ASan/LSan: the owned field's destructor
-// must have run (encoded in the exit code) AND neither the owner's block, the
-// field's block nor the in-flight exception may leak while the fault travels
-// from the disposal point to the handler. `r.ran` is the leak oracle here —
-// the exit code alone would pass with a leaked owner block.
+// fault never leaks the object." The owned field's destructor must have run
+// (encoded in the exit code) while the fault travels from the disposal point to
+// the handler, and the program must stay ASan/LSan-clean doing it.
+//
+// ⚠ The EXIT CODE is what flips here; do not read `r.ran` as this row's leak
+// oracle. The pre-fix compiler is ASan-clean on this program too — the
+// swallowed exception stays reachable from the global in-flight slot, so LSan
+// does not flag it — and a single iteration is exactly the shape this project's
+// own lesson calls vacuous for leak claims. `runAotChecked` is kept because it
+// is free here and would catch a double-free or UAF introduced later, but the
+// contract this row pins is the behavioural one: handler ran AND owned field
+// disposed. The leak-shaped claims that ARE load-bearing live in the two
+// `..._does_not_leak_the_frame_spec_29_7` rows of the #1882 file, where the
+// three-way measurement is written out.
 BEZEL_TEST(throwing_destructor_propagates_from_explicit_dispose_1878,
            remaining_dispose_steps_run_and_nothing_leaks_spec_28_4) {
     auto r = runAotChecked(
@@ -212,6 +226,6 @@ BEZEL_TEST(throwing_destructor_propagates_from_explicit_dispose_1878,
         "    end; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);          // no leak / double-free / UAF
+    BEZEL_EXPECT_TRUE(r.ran);          // no double-free / UAF (NOT a leak claim)
     BEZEL_EXPECT_EQ(r.exitCode, 11);   // handler ran AND the owned field was disposed
 }

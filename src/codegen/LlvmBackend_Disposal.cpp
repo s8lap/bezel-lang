@@ -2366,6 +2366,20 @@ void Emitter::emitDisposalFaultCheck(llvm::Value* excBefore,
     // exception. Supersession still works: `DisposeCore` frees the superseded
     // instance and leaves the NEW one in the slot (#2358), so the pointer
     // differs and the check fires on the survivor.
+    //
+    // ⚠ WHAT THE COMPARISON GUARANTEES, EXACTLY. It is an ADDRESS test over a
+    // recycling allocator, so it is ABA-exposed: with `excBefore` = E1@A, a
+    // first disposal that throws E2 makes #2358's supersede tail free E1 —
+    // releasing A — and a second disposal that throws E3 can have `malloc`
+    // hand back A. Then `after == excBefore` and this check does NOT fire. So
+    // the guarantee is one-directional: firing implies a NEW fault (no false
+    // positive, which is the property that matters — a false positive is the
+    // measured iterator-frame leak above), while not firing does NOT imply no
+    // fault. The miss degrades to base behaviour: E3 stays in the bz_exc slot
+    // and the enclosing unwind's next pending check routes it, one site later
+    // than §28.4 would like. Not reproduced, and not worth an identity counter
+    // unless it is; recorded so the next reader does not mistake this for a
+    // total test.
     llvm::Value* after =
         builder_.CreateLoad(ptrTy(), emitExcSlot(), "disp.postexc");
     llvm::Value* inFlight = builder_.CreateICmpNE(
@@ -2594,6 +2608,15 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     builder_.CreateCall(fnTy, disposeFn, {obj});
+    // fix #1882 (§28.4, v0.306): this call can run a USER destructor body, so
+    // it can leave an exception in the bz_exc slot. Record that fact for
+    // emitDisposals' post-pass propagate check — this function is the single
+    // funnel every disposal site's dispatch goes through, so counting here
+    // makes the gate exact for present and future arms alike. Counting rather
+    // than setting a flag keeps nesting honest: a pass reads the DIFFERENCE
+    // across itself, so a lazily-emitted inner function built mid-pass cannot
+    // clear a bit the pass still needs.
+    ++userCodeDisposalCount_;
 }
 
 
@@ -6323,6 +6346,32 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // (#2869 needed a separate `undischargedOwned` question for the one edge where
     // they diverged; see the declaration in LlvmBackend_impl.hpp.)
     const bool dropUndischarged = isUnwind;
+    // fix #1882 (§28.4, v0.306): snapshot the user-code counter so the
+    // post-pass propagate check below fires only for a pass that could actually
+    // have raised, and bracket the slot so it fires only on a fault THIS pass
+    // raised. See the tail of this function for the rule. The bracket is a
+    // load at the pass's own entry point, which dominates every block the pass
+    // goes on to create.
+    //
+    // ⚠ EMISSION COST, stated plainly because it is easy to overclaim here:
+    // `emitPendingCheck`/`emitPendingCheckIf` ARE byte-identical for every
+    // pre-existing caller (they take the `kAllLiveScopes` default), but THIS
+    // snapshot is not free — it is emitted at the top of every non-unwind,
+    // non-empty pass whether or not the gate goes on to trip, and
+    // `bz_exc_addr` carries no attributes, so LLVM cannot DCE the dead ones.
+    // A program with no disposal semantics therefore gains one call + load per
+    // scope exit. It is the same shape every call site already emits for its
+    // own pending check, so it is in line with existing cost rather than a new
+    // class of it. The cheap remedy, if this ever shows up in a profile, is to
+    // save the insert point here and materialise the snapshot lazily at the
+    // tail only when the gate trips — deliberately not done now, because the
+    // saved-insert-point dance is the kind of complexity this project trades
+    // away for simplicity until the compiler is functionally complete.
+    const unsigned dispatchesAtPassEntry = userCodeDisposalCount_;
+    llvm::Value* excAtPassEntry = nullptr;
+    if (!isUnwind && !scope.empty() && builder_.GetInsertBlock() &&
+        !builder_.GetInsertBlock()->getTerminator())
+        excAtPassEntry = snapshotInFlightExc();
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an
         // awaited Pattern A `Task<T:class>` temporary produced by an anonymous
@@ -7025,6 +7074,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 auto* dynFn = declareC("bz_array_free_dynamic",
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(dynFn, {arr});
+                // fix #1878 (§28.4, v0.306): the backing is statically erased
+                // here (§28.11: a borrowing list interface may be backed by an
+                // owning array), so the disposer consulted at runtime MAY be
+                // the class-element cascade. Count it — an over-count costs a
+                // dead pending check, an under-count swallows a fault.
+                ++userCodeDisposalCount_;
             } else {
                 llvm::Value* disp = it->collectionElemDisposer
                     ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
@@ -7033,6 +7088,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {arr, disp});
+                // fix #1878 (§28.4, v0.306): "the owning container's cascade"
+                // is a disposal point too. bz_array_free walks the live slots
+                // calling this thunk, which for a class element dispatches the
+                // element's own vtable Dispose — user code, reached WITHOUT
+                // emitDynamicDispose, so the pass gate has to be told here.
+                if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                    ++userCodeDisposalCount_;
             }
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
@@ -7102,6 +7164,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
+            // fix #1878 (§28.4, v0.306): the OwningDictionary value cascade —
+            // same reasoning as the collection arm above. dictKeyDisposer is
+            // deliberately NOT counted: it is the #4091 borrowing-builtin
+            // thunk, which frees inner collection headers and never reaches a
+            // user destructor.
+            if (elementDisposerRunsUserCode(it->dictValueDisposer))
+                ++userCodeDisposalCount_;
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
@@ -7136,6 +7205,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {list, disp});
+            // fix #1878 (§28.4, v0.306): the OwningLinkedList element cascade —
+            // same reasoning as the collection arm above, on the node value
+            // pointer rather than an array slot.
+            if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                ++userCodeDisposalCount_;
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
@@ -8247,6 +8321,100 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         builder_.CreateCall(freeFn(), {cell});
         // Null the guarded holder so a later re-entry allocates a fresh cell.
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
+    }
+
+    // fix #1882 (§28.4, v0.306): "The exception propagates from the **disposal
+    // point** — ... the `using var`/auto-drop scope-end site ...". A destructor
+    // that throws during THIS pass leaves its exception parked in the bz_exc
+    // slot (the generated `DisposeCore`'s `dtor.threw`/`dtor.restore` tail,
+    // #1546) and returns normally; nothing here ever looked. The exception then
+    // sat in the slot until some LATER, unrelated pending check picked it up —
+    // typically the §22.13 static-init guard of the next static access, which
+    // is usually OUTSIDE the `try` whose body held the disposal point, so it
+    // escaped the enclosing `catch` as UNHANDLED (the reported repro: a
+    // `using var` disposed inside a `try`/`catch Exception`, exit 70 instead of
+    // the catch arm running). With no later check in the function at all the
+    // same omission SWALLOWED it silently instead (#1878's face). Both
+    // manifestations, and their maddening dependence on unrelated surrounding
+    // code, are this one missing check.
+    //
+    // WHY AT THE END OF THE PASS, not after each disposal. §28.4: "In a
+    // multi-value cleanup pass ... a throwing disposer does not skip the
+    // remaining values: every remaining disposal still runs. If a later
+    // disposal in the same pass also throws, the later exception supersedes the
+    // earlier one". Checking per entry would branch out on the first fault and
+    // skip the rest; checking once at the end lets the whole pass run and lets
+    // each `DisposeCore`'s own entry-exception supersede tail (#2358) do the
+    // §31.2 record-before-drop accounting between them. Whatever survives the
+    // pass is what propagates — exactly the spec's "N−1 chronological entries"
+    // shape.
+    //
+    // WHY isUnwind IS EXCLUDED: an unwind pass's caller branches to the unwind
+    // target itself the moment the pass returns, and a fault raised *during* it
+    // has already superseded the in-flight exception inside `DisposeCore`. A
+    // check here would only re-route to the same place.
+    //
+    // WHY THE COUNTER GATE: `emitPendingCheckIf` materialises the enclosing
+    // scopes' unwind disposals at its branch target, so emitting it at EVERY
+    // scope end — including the overwhelming majority that dispose only strings,
+    // closures and capture cells — would duplicate that code for passes that
+    // provably cannot raise. `userCodeDisposalCount_` counts the constructs this
+    // change is about: a vtable `Dispose` dispatch through `emitDynamicDispose`,
+    // and an owning container's element cascade through the `bz$elemDispose`
+    // thunk (§28.4's "the owning container's cascade", which reaches the element
+    // destructor via `bz_array_free`/`bz_dict_free`/`bz_llist_free` rather than
+    // via `emitDynamicDispose`, and so announces itself at those three arms).
+    //
+    // The gate is SOUND-BY-UNDERCOUNT, NOT EXACT — see the counter's own
+    // declaration for the enumeration of routes that reach a user destructor
+    // without being counted (nested-collection and `Shared`/`Weak` element
+    // thunks, the TCS element thunk, the task-owned result disposer, and the
+    // enumerator-frame arm below, which dispatches vtable slot 1 by hand).
+    // An uncounted route means the fault keeps BASE behaviour — it stays in the
+    // slot for a later check, exactly as before this change — never a
+    // double-dispose or a lost object. Those disposal points are pre-existing
+    // gaps neither #1878 nor #1882 names, and are tracked separately.
+    //
+    // WHY THE CHECK IS BRACKETED rather than a plain "is anything in flight":
+    // a scope-end pass is routinely reached with somebody else's exception
+    // already in the slot — a destructor body on an unwind edge (#1468), and,
+    // one context wider, the §29.7 abandonment teardown of an `await for`
+    // iterator, which runs the iterator's compiler-generated cleanup (its
+    // sync-fallback destructor included) while the exception that abandoned the
+    // loop propagates. A plain non-null test fires there on that exception,
+    // branches out of the teardown, and leaks the iterator frame — measured at
+    // 80 bytes before this was bracketed. `emitDisposalFaultCheck` compares
+    // against `excAtPassEntry` instead, so only a fault THIS pass raised routes.
+    if (!isUnwind && excAtPassEntry &&
+        userCodeDisposalCount_ != dispatchesAtPassEntry) {
+        // The scope being torn down is still on disposeStack_ (its owner pops
+        // it after this returns), so exclude it — and everything nested inside
+        // it, which is already gone — from the unwind edge's disposals. A
+        // free-standing vector (a mid-expression atom scope that was never
+        // pushed) is not found and keeps the all-live-scopes meaning.
+        std::size_t hi = kAllLiveScopes;
+        for (std::size_t i = 0; i < disposeStack_.size(); ++i)
+            if (&disposeStack_[i] == &scope) { hi = i; break; }
+        // A pass over a FREE-STANDING vector — one that is not on
+        // disposeStack_ at all — is NOT a scope end, and must not take this
+        // check. The only such callers that can trip the gate are the §29.7
+        // iterator / async-iterator ABANDONMENT teardowns
+        // (`emitDisposals(one)`, LlvmBackend_Iterators.cpp and
+        // LlvmBackend_Async.cpp), which run inside the generated enumerator
+        // `Dispose` and still have work to finish after this pass: the
+        // remaining `IterCleanup` entries, the yielded value, the owned
+        // parameters and locals, and the FRAME FREE itself. Branching to
+        // `unwindBB()` from there abandons all of it and leaks the frame —
+        // measured 88 B (async `await for`) and 48 B (sync `for`) when the
+        // abandoned iterator's own `using var` destructor throws. Base
+        // behaviour there is to fall through and let a later check find the
+        // fault; that disposal point keeps base behaviour and is tracked
+        // separately (§29.7 is not one of the disposal points §28.4 or these
+        // two issues name). The other free-standing callers,
+        // `emitDisposals(stringReleases)`, dispose only strings and never trip
+        // the gate, so this guard costs them nothing.
+        if (hi != kAllLiveScopes)
+            emitDisposalFaultCheck(excAtPassEntry, hi);
     }
 }
 

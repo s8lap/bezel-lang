@@ -2618,6 +2618,61 @@ private:
     // exception propagates out of them (§28.3). 0 = dispose all (the
     // function propagate path).
     std::size_t unwindScopeDepth_ = 0;
+    // fix #1878 + #1882 (§28.4, v0.306): how many disposal emissions that can
+    // run USER code have been emitted so far in this module. Read only as a
+    // difference across a disposal pass, so its absolute value is meaningless
+    // and it never needs resetting per function. emitDisposals uses it to gate
+    // §28.4's propagate-from-the-disposal-point check, which would otherwise
+    // duplicate the enclosing scopes' unwind disposals at EVERY scope end.
+    //
+    // Counted: a vtable `Dispose` dispatch through `emitDynamicDispose`, and an
+    // owning container's element cascade whose per-element callback is
+    // `elementDisposerThunk()` (see elementDisposerRunsUserCode).
+    //
+    // ⚠ THIS IS A SOUND UNDERCOUNT, NOT AN EXACT CLASSIFICATION. Do not read it
+    // as "every route to a user destructor is counted" — an earlier revision of
+    // this comment said exactly that and it was false. Measured routes that do
+    // reach a user destructor and are NOT counted:
+    //
+    //   * `nestedCollectionDisposerThunk` — an `OwningArray<OwningArray<R>>`
+    //     cascades into the inner collection, and from there into `R`'s
+    //     destructor, without ever being `elementDisposerThunk()`.
+    //   * `sharedReleaseThunk` / `weakReleaseThunk` — `bz_shared_release` calls
+    //     the control block's `dispose_value`, which IS the element's vtable
+    //     `Dispose`. (An earlier revision of this comment listed the
+    //     Shared/Weak handle among the callbacks that "cannot reach user code";
+    //     that was wrong.)
+    //   * `tcsElementDisposerThunk`, and the `taskOwnedResultDisposer` arm.
+    //   * the iterator/enumerator-frame arm in emitDisposals, which dispatches
+    //     vtable slot 1 directly rather than through `emitDynamicDispose` — so
+    //     "the single funnel" is not literally true either.
+    //
+    // An uncounted route is not a regression and not a hazard: the gate simply
+    // does not fire, and the fault keeps BASE behaviour (it stays in the bz_exc
+    // slot for a later pending check) rather than being routed from its own
+    // disposal point. Those are pre-existing §28.4 gaps that neither #1878 nor
+    // #1882 names, tracked separately. Anything ADDED here must keep that
+    // direction: counting too little degrades to base, counting too much only
+    // costs a dead check.
+    unsigned userCodeDisposalCount_ = 0;
+
+    // fix #1878 (§28.4, v0.306): does this per-element / per-value disposer
+    // callback dispatch the element's own vtable `Dispose` DIRECTLY? Exactly
+    // one thunk does — `elementDisposerThunk()`, §28.4's "the owning
+    // container's cascade" in its plain form. The container arms use this to
+    // trip the propagate gate, because such a cascade reaches the element's
+    // destructor through a runtime loop rather than through emitDynamicDispose.
+    //
+    // ⚠ A `false` here does NOT mean "cannot reach user code": the nested-
+    // collection thunk and the `Shared`/`Weak` release thunks reach a user
+    // destructor by a longer path and answer false. See
+    // `userCodeDisposalCount_` for the full enumeration and for why
+    // undercounting is the safe direction.
+    bool elementDisposerRunsUserCode(const llvm::Value* disposer) const {
+        return disposer != nullptr && elementDisposerThunk_ != nullptr &&
+               disposer == static_cast<const llvm::Value*>(
+                               elementDisposerThunk_);
+    }
     // CG22: per-built-in-exception-type descriptor and vtable globals
     // (§31.4 hierarchy), keyed by type name (built-in exception types have
     // no user TypeSymbol). A shared no-op Dispose serves all of them.
