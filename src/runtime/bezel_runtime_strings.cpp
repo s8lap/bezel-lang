@@ -483,6 +483,65 @@ extern "C" int32_t bz_char_to_lower(int32_t cp) {
     return bz_char_is_ascii_domain(cp) ? tolower(cp) : cp;
 }
 
+// fix #4483 (stdlib §9.6, v0.306): string.Equals(other, ignoreCase: true) —
+// ordinal, code-point-wise, case-folded equality.
+//
+// This replaces a codegen-inlined "case-fold each side into a fresh buffer,
+// then compare the buffers" loop (LlvmBackend_String.cpp) that carried TWO
+// independent defects at one site:
+//
+//   1. It called <ctype.h>'s tolower() on a code point produced by the
+//      WIDTH-AWARE decoder, so anything above U+00FF was passed outside
+//      tolower's domain — undefined per C11 §7.4p1, the same defect class
+//      #4420 removed from char.* and string.IsNullOrWhiteSpace. ASan cannot
+//      see it (glibc's ctype tables are uninstrumented libc), and on glibc
+//      tolower happens to range-check and hand the argument back, which is
+//      exactly why it survived: benign HERE, on THIS libc, still undefined.
+//
+//   2. It truncated the folded code point to ONE BYTE and stored it at a
+//      hardcoded stride of 1 while the source index advanced one CODE POINT
+//      at a time, then labelled the result width=1 (§4.6). So every code
+//      point above U+00FF was silently replaced by its low byte and distinct
+//      strings compared EQUAL. Measured on HEAD before this fix:
+//      "š".Equals("a", true) → true (U+0161's low byte is 0x61 = 'a'),
+//      "š".Equals("ɡ", true) → true (U+0161 and U+0261 share low byte 0x61),
+//      "á".Equals("ǡ", true) → true (U+00E1 and U+01E1 share low byte 0xE1).
+//      All three must be false.
+//
+// Folding per code point decides the comparison position by position, so no
+// buffer is materialised at all — which also removes the two allocations per
+// operand (data + header) the old lowering never disposed (76 bytes in 4
+// allocations for a single call, measured; the `ignoreCase := false` arm
+// leaked nothing). That is a consequence of deleting the buffer, not a leak
+// fix undertaken here (#4482 owns this area's disposal gaps).
+//
+// The fold is bz_char_to_lower — the SAME shared helper char.ToLower and the
+// rest of the #4420 family use — so the runtime holds exactly one case
+// policy; two copies of a classification rule drifting apart is #2590. Within
+// ASCII that is precisely the simple case fold §9.6's `ignoreCase` overloads
+// specify; above ASCII it is identity, so two code points above ASCII compare
+// equal iff they ARE the same code point. That is #4420's domain-safe answer
+// and deliberately NOT a widened category table: full simple case folding
+// above ASCII needs Unicode Character Database data this runtime does not
+// embed, and #4481 tracks that (no-UB, wrong-value-only) range.
+//
+// The operands' storage widths are irrelevant and may differ (§4.6 adaptive
+// storage): bz_str_cp decodes each side at its own width, exactly as the
+// bz_str_* search family above does. Either pointer may be null (null equals
+// only null), mirroring emitStringEq's null-safety on the `=` path.
+extern "C" int32_t bz_str_equals_ignorecase(const void* self_p, const void* other_p) {
+    if (!self_p || !other_p) return self_p == other_p ? 1 : 0;
+    const auto* a = (const bz_string_struct*)self_p;
+    const auto* b = (const bz_string_struct*)other_p;
+    if (a->len != b->len) return 0;               // §9.6: lengths in code points
+    for (int64_t i = 0; i < a->len; ++i) {
+        if (bz_char_to_lower((int32_t)bz_str_cp(a, i)) !=
+            bz_char_to_lower((int32_t)bz_str_cp(b, i)))
+            return 0;
+    }
+    return 1;
+}
+
 // per §9.6 / #535: Substring(start, count): owned string — code-point slice.
 // Returns a fresh +1 string of `count` code points starting at code-point
 // index `start`. Clamps `count` to the available tail if needed.

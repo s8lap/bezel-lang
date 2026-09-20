@@ -1410,6 +1410,16 @@ int32_t bz_str_endswith(const void* self, const void* suffix);
 int32_t bz_str_contains(const void* self, const void* sub);
 int32_t bz_str_indexof(const void* self, const void* sub);
 int32_t bz_str_lastindexof(const void* self, const void* sub);
+// fix #4483 (stdlib §9.6, v0.306): Equals(other, ignoreCase: true) — ordinal,
+// code-point-wise equality under the simple case fold. Replaces a codegen-
+// inlined lowering that (a) passed width-aware code points to <ctype.h>'s
+// tolower (undefined above U+00FF, C11 §7.4p1 — the #4420 defect class) and
+// (b) truncated each folded code point to ONE BYTE at a hardcoded stride of
+// 1, so distinct strings above U+00FF compared equal. The fold is
+// bz_char_to_lower, the same shared helper the #4420 char.* family uses, so
+// the runtime holds one case policy rather than two. Either pointer may be
+// null (null equals only null); widths may differ (§4.6).
+int32_t bz_str_equals_ignorecase(const void* self, const void* other);
 // Substring(start, count): fresh string of `count` code points from `start`.
 void*   bz_str_substring(const void* self, int64_t start, int64_t count);
 // stdlib §3.3 / #971 item 1: the ReadOnlyStringSpan search + compare family.
