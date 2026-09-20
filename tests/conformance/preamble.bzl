@@ -27,10 +27,24 @@ public interface IBankAccount
 end IBankAccount;
 
 public class Connection
-  public constructor(name: string := "") end constructor;
+  private _name: string := "";
+  public constructor(name: string := "")
+    _name := name;
+  end constructor;
+  // 2026-09-21: the members the §28/§29.12 owning-collection fragments and
+  // Guide 5 §1/§3/§6 read off a pooled connection. Each is forced by its call
+  // site — `conn.Ping()`, `c.SendShutdown()`, `b.Configure()` are bare
+  // statements (no arguments, result discarded); `c.Name` is interpolated /
+  // written to Console.WriteLine (a string); `c.IsBusy()` is a lambda body
+  // under `not` (a bool).
+  public property Name: string => _name;
   public method View(): int => 0;
   public method Close() end Close;
   public method Flush() end Flush;
+  public method Ping() end Ping;
+  public method Configure() end Configure;
+  public method SendShutdown() end SendShutdown;
+  public method IsBusy(): bool => false;
   destructor end destructor;
 end Connection;
 
@@ -51,6 +65,9 @@ end TransactionCache;
 
 public class Transaction
   public constructor() end constructor;
+  // spec §29.12 Mutation during iteration reads `if t.IsExpired then …` — a
+  // bool, forced by its position as the `if` condition.
+  public property IsExpired: bool => false;
   destructor end destructor;
 end Transaction;
 
