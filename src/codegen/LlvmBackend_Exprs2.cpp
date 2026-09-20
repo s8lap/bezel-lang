@@ -4122,19 +4122,30 @@ namespace {
 // null `cs` (no explicit constructor bound — the call goes straight to the
 // primary) answers false, because the primary constructor is precisely the one
 // that does NOT skip step 0. File-local rather than an `Emitter` member: it
-// reads only the AST and has exactly one caller.
+// reads only the AST, and both of its callers are in this file — the `new`
+// site (#3583) and, since fix #3562, the explicit `base(...)`-chain arm of
+// `prePopulateBasePositionalFields`, which asks the identical question about
+// the BASE constructor the chain call binds to.
 bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
     if (!cs || cs->isStatic) return false;
     // The chain FORM of a constructor body has no symbol-side channel: nothing
     // on `ConstructorSymbol` records "chains via `this(...)`" — only the body's
     // first statement does, and an imported constructor has no body to read. So
-    // the cast below answers false for an import. That is inert today because
-    // both imported callers gate on `!hasAnyConstructor(t)` before reaching
-    // here, and an imported primary constructor plus a convenience constructor
-    // is non-functional end to end regardless (measured identical before and
-    // after fix #3583). If that is ever fixed by carrying the chain form across
-    // the wire, this read must be routed through the new channel rather than
-    // kept.
+    // the cast below answers false for an import. That falseness is inert at
+    // both call sites, but for DIFFERENT reasons, and conflating them hides a
+    // live gap:
+    //   * at the `new` site (#3583) the imported arms gate on
+    //     `!hasAnyConstructor(t)` before reaching here, and an imported primary
+    //     constructor plus a convenience constructor is non-functional end to
+    //     end regardless (measured identical before and after fix #3583);
+    //   * at the `base(...)`-chain site (#3562) there is NO such gate. False
+    //     there means the blind positional pre-population still runs for an
+    //     imported base whose `base(...)` binds a convenience constructor —
+    //     i.e. the cross-module face of #3562 is UNFIXED, and this answer
+    //     preserves that behaviour rather than making it inert.
+    // If the chain form is ever carried across the wire, this read must be
+    // routed through the new channel rather than kept, and the `base(...)`
+    // site's cross-module face closes with it.
     // SEAM-DEBT: #3625 no symbol-side channel for a constructor body's chain form
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd || cd->body.empty() || !cd->body[0]) return false;
@@ -4605,6 +4616,20 @@ void Emitter::prePopulateBasePositionalFields(
 
     std::vector<llvm::Value*> baseArgVals;
 
+    // fix #3562 (§22.8 step 0 / §22.5 / §22.10, v0.306): set when the explicit
+    // `base(...)` arm below declines to fill `baseArgVals` because the call
+    // binds a §22.10 convenience constructor whose chained-to primary runs
+    // §22.8 step 0 for these slots. It suppresses the §22.5 DEFAULT loop as
+    // well as the argument stores, because step 0 owns a slot's default
+    // exactly as it owns its argument: §22.5 says the value an omitted
+    // defaulted parameter is passed IS its default, so the default is part of
+    // the one store step 0 makes, not a separate obligation this function
+    // still owes. Without it, suppressing the argument fill leaves
+    // `numToStore == 0` and the unconditional #3777 loop below reaches slots
+    // it had never touched before — evaluating a non-constant default a
+    // SECOND time and keeping the second value.
+    bool chainedPrimaryOwnsSlots = false;
+
     // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): read the inheritance-
     // clause argument EXPRESSIONS via `primaryBaseCtorArgsOf`, NOT a raw
     // `dynamic_cast<ast::TypeDecl*>(t->decl)` — the latter is null for
@@ -4678,7 +4703,67 @@ void Emitter::prePopulateBasePositionalFields(
         if (cd && !cd->body.empty()) {
             bool isThis = false;
             const ast::CallExpr* chainCall = chainCallOf(*cd->body[0], isThis);
-            if (chainCall && !isThis && !chainCall->args.empty()) {
+            // fix #3562 (§22.8 step 0 / §22.10 / §12.8, v0.306): ...but NOT
+            // when the `base(...)` call binds to an explicit constructor of
+            // the base that chains via `this(...)`. This is case (a)'s #3742
+            // question — "is `emitChainCall` about to lower these very
+            // expressions and CALL a constructor whose own §22.8 step 0 writes
+            // the same positional slots?" — asked on the arm that never asked
+            // it. The fill loop below pairs chain argument `i` with the base's
+            // positional field `i`, which describes the base's PRIMARY
+            // parameter list; a §22.10 convenience constructor's parameter
+            // list is a DIFFERENT list, so position `i` does not name field
+            // `i` at all. §22.8 puts step 0 for such a call inside the
+            // chained-to primary ("a constructor that chains via `this(...)`
+            // skips steps 0 and 2 … primary-parameter capture happens inside
+            // the chained-to primary"), which `emitChainCall` reaches through
+            // the ctor call, so this pre-population is redundant there as well
+            // as wrong.
+            //
+            // Measured on 7f29b8ce: `class B(x: int, y: int)` +
+            // `constructor(a: int, d: decimal) this(a, 42);` reached from
+            // `class D : B` with `constructor() base(1, 7.5m);` emitted
+            // `store %bz.decimal …, ptr <GEP y>` — a 16-byte store into the
+            // 4-byte `y` slot at offset 16 of a 24-byte object, i.e. an
+            // 8-byte heap-buffer-overflow that ASan reports as
+            // "WRITE of size 16 … 7 bytes after 24-byte region". The narrower
+            // ptr-into-int form of the same store (`s: string` in that
+            // position) corrupts the trailing padding silently — ASan's
+            // 8-byte fast path reads the granule the misaligned store starts
+            // in and misses it — which is why the oracle for this is the
+            // 16-byte one.
+            //
+            // The predicate is §22.8's own, the one #3583 put at the `new`
+            // site, over the SAME constructor `emitChainCall` will select
+            // (`ctorForArgs(targetCls, call->args)` there for a positional
+            // chain). It answers false for a null target (the call goes
+            // straight to the primary — the #3523 shape, where this
+            // pre-population is still owed) and false for an imported base
+            // constructor (SEAM-DEBT #3625: no symbol-side channel carries a
+            // constructor body's chain form), so both keep today's behaviour.
+            //
+            // WHY `.fn` IS NOT ASKED HERE, unlike case (a)'s #3742 guard.
+            // That guard declines only for a resolved AND CALLABLE base
+            // constructor, because a resolved-but-not-callable one makes
+            // `emitImplicitBase` fall through without lowering anything and
+            // the pre-population still owes the arguments. This predicate has
+            // no such hole to cover: `ctorForArgs` is the SAME selector
+            // `emitChainCall` uses for a positional chain, and `emitChainCall`
+            // — unlike `emitImplicitBase` — has no callability precondition to
+            // fail; on a `ctorFns_` miss or a false `fillOmittedCtorArgs` it
+            // abandons the call, which would leave these slots calloc-zero.
+            // No program reaching that state was constructible: the target
+            // here is a LOCAL constructor (`ctorChainsViaThis` needs an
+            // `ast::ConstructorDecl` body), and a local constructor's function
+            // is declared for every class codegen emits. Recorded rather than
+            // guarded, because adding `.fn`'s callability test would re-admit
+            // the mispairing for exactly the shapes it is meant to exclude.
+            const bool baseCallChainsThis =
+                chainCall && !isThis && !chainCall->args.empty() &&
+                ctorChainsViaThis(ctorForArgs(baseTs, chainCall->args));
+            if (baseCallChainsThis) chainedPrimaryOwnsSlots = true;
+            if (chainCall && !isThis && !chainCall->args.empty() &&
+                !baseCallChainsThis) {
                 // Temporarily bind ctor params to their values so that the
                 // chain-call arg expressions (which reference ctor params) can
                 // be evaluated correctly. Save and restore paramSlots_.
@@ -4774,7 +4859,18 @@ void Emitter::prePopulateBasePositionalFields(
     // with no arguments at all into a base whose positional parameters are ALL
     // defaulted is exactly the same defect (measured: SEGV), and it produces no
     // `baseArgVals`.
-    for (std::size_t i = numToStore; i < basePosFields.size(); ++i) {
+    // fix #3562 (§22.5 / §22.8 step 0 / §22.10, v0.306): ...but NOT for a
+    // base call whose chained-to primary runs step 0 for these slots — see
+    // `chainedPrimaryOwnsSlots` above. Measured on the intermediate state that
+    // suppressed only the argument stores, with `class B(n: int, k: int :=
+    // Counter.Next())` reached through `constructor(w: int, v: int) this(v);`
+    // from `base(9, 3)`: `k=2 cnt=2` where §22.8 step 1 admits one evaluation
+    // and `k=1 cnt=1`. The `owned` form of the same default (§22.5 admits a
+    // factory returning an owned instance) leaked the first object outright —
+    // "LeakSanitizer: 16 byte(s) in 1 object(s)" — because the second store
+    // overwrote it before any destructor could run.
+    for (std::size_t i = numToStore;
+         !chainedPrimaryOwnsSlots && i < basePosFields.size(); ++i) {
         sema::FieldSymbol* fs = basePosFields[i];
         auto idxIt = fieldIndex_.find(fs);
         if (idxIt == fieldIndex_.end()) continue;
