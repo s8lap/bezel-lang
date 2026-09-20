@@ -8071,6 +8071,17 @@ const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames() 
     return kNonConstructibleBuiltinInterfaceNames;
 }
 
+// fix #4472 (§14.2, v0.302; follow-up to fix #4446) — see the header
+// declaration (TypeResolution.hpp) for the full rationale and the three
+// call sites this unifies.
+bool isAbstractOrClosedClass(const TypeSymbol* d) {
+    if (!d) return false;
+    for (auto mod : d->modifiers) {
+        if (mod == "abstract" || mod == "closed") return true;
+    }
+    return false;
+}
+
 bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     decided = false;
     if (!arg) return false;
@@ -8215,6 +8226,22 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // a primary constructor carries its params on the TypeDecl, not a
             // ConstructorSymbol; treat a non-empty primary param list as a
             // non-parameterless constructor.
+            //
+            // fix #4472 (§14.2, v0.302; follow-up to fix #4446 — this arm was
+            // the un-fixed duplicate "Site A" the issue names): an `abstract`
+            // or `closed` class does NOT satisfy `new()` even when the ctor
+            // scan below would otherwise say yes (§22.7's implicit
+            // parameterless constructor is not enough — §12.5 makes `new` on
+            // such a class a compile error regardless). Shared with
+            // `ExprTC::groundSatisfiesNew` (#4446) and
+            // `checkMethodGenericConstraints`'s "new" item
+            // (ExprTypecheck_Calls.cpp) through ONE function rather than a
+            // third copy of the modifier test — see
+            // `sema::isAbstractOrClosedClass`'s own comment (TypeResolution.hpp).
+            if (isAbstractOrClosedClass(d)) {
+                decided = true;
+                return false;
+            }
             //
             // fix #3141: read `hasPositionalFields` off the TypeSymbol (#501)
             // and the parameters themselves as FieldSymbols (#2516) — through

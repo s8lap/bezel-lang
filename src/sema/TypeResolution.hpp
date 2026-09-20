@@ -327,4 +327,30 @@ TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym
 bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
                       const common::RecordSubstEnv* incoming = nullptr);
 
+// fix #4472 (§14.2, v0.302; follow-up to fix #4446): does ground CLASS
+// declaration `d` fail `where T: new()` because it is `abstract` or
+// `closed`? §14.2 v0.302: "Nor does an `abstract` or `closed` class
+// [satisfy `new()`], whether it declares a `public` parameterless
+// constructor or takes §22.7's implicit one: §12.5 makes `new` on such a
+// class a compile error, so admitting the substitution would satisfy a
+// constraint whose sole purpose — `new T()` in the generic body — the
+// language forbids on the substituted type." (`d` is assumed to already be
+// `ast::TypeDeclKind::Class`; the caller's own kind switch establishes
+// that — this function only reads `d->modifiers`.)
+//
+// THREE call sites ask this exact question as part of their own "does this
+// class satisfy new()" arm: `ExprTC::groundSatisfiesNew` (ExprTypecheck.cpp,
+// fixed by #4446), `Resolver::argSatisfiesNew` (TypeResolution_Checks.cpp),
+// and the inline Class arm of `checkMethodGenericConstraints`'s "new" item
+// (ExprTypecheck_Calls.cpp) — #4446's own SCOPE NOTE named the latter two
+// as separate, un-fixed duplicates and filed the gap as #4472. Rather than
+// growing a third independently-maintained copy of the modifier test, all
+// three now call this ONE function; the surrounding ctor-enumeration logic
+// (primary-constructor parameter check, accessible-parameterless-ctor scan)
+// stays separate per call site — each has a differently-shaped result
+// protocol (bool return + decided out-param vs. satisfied/decided pair vs.
+// early continue), so unifying that too is a larger, separately-scoped
+// refactor outside what #4472 asks for.
+bool isAbstractOrClosedClass(const TypeSymbol* d);
+
 } // namespace bezel::sema

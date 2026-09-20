@@ -1610,7 +1610,20 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // path; ExprTypecheck_Calls.cpp:3396 for the call-site re-check) —
             // the predicate answering false here is what makes those sites
             // fire.
-            if (hasModifier(d, "abstract") || hasModifier(d, "closed")) {
+            //
+            // fix #4472 follow-up (§14.2, v0.302): this fix's own SCOPE NOTE
+            // named two further duplicate arms — `Resolver::argSatisfiesNew`
+            // (TypeResolution_Checks.cpp) and `checkMethodGenericConstraints`'s
+            // inline Class arm (ExprTypecheck_Calls.cpp) — that lacked this
+            // exact test. Rather than leave this arm's own local
+            // `hasModifier(d, "abstract") || hasModifier(d, "closed")` as a
+            // THIRD independently-maintained copy once those two were fixed,
+            // all three now ask the SAME shared predicate,
+            // `sema::isAbstractOrClosedClass` (TypeResolution.hpp) — see its
+            // own comment for the unification rationale. This call site's
+            // observable behavior is unchanged (`isAbstractOrClosedClass` is
+            // the identical two-modifier test, moved verbatim).
+            if (isAbstractOrClosedClass(d)) {
                 decided = true;
                 return false;
             }

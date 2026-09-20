@@ -3366,7 +3366,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // parameterless and so satisfied
                                         // `new()` at this call-site re-check.
                                         decided = true;
-                                        if (argDecl->hasPositionalFields &&
+                                        // fix #4472 (§14.2, v0.302; follow-up
+                                        // to fix #4446 — this arm was the
+                                        // un-fixed duplicate "Site B" the
+                                        // issue names, the direct-call-site
+                                        // re-check for the issue's own
+                                        // `Make<Shape>()` repro): an
+                                        // `abstract`/`closed` class never
+                                        // satisfies `new()`, regardless of
+                                        // the ctor scan below. Shared with
+                                        // `ExprTC::groundSatisfiesNew` and
+                                        // `Resolver::argSatisfiesNew` through
+                                        // ONE function — see
+                                        // `sema::isAbstractOrClosedClass`
+                                        // (TypeResolution.hpp).
+                                        if (isAbstractOrClosedClass(argDecl)) {
+                                            satisfied = false;
+                                        } else if (argDecl->hasPositionalFields &&
                                             !recordPositionalFieldSymbols(argDecl)
                                                  .empty()) {
                                             satisfied = false;  // primary ctor has params
