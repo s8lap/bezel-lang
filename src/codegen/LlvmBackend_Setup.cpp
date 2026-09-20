@@ -10470,9 +10470,19 @@ void Emitter::emitEnsureInitFns() {
             *module_, i32(), /*isConstant=*/false,
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantInt::get(i32(), 0), "bz$" + cls + "$initprogress");
+        // fix #4486 (§22.13, v0.306): this type's snapshot of the thread-local
+        // monotonic bz_static_init_epoch at the moment ITS OWN CAS wins (set
+        // in initB below) — see that global's comment (bezel_runtime_
+        // concurrency.cpp) and emitStaticPartialReadGuard for the same-type-
+        // vs-cross-type comparison this feeds.
+        auto* epochGV = new llvm::GlobalVariable(
+            *module_, i32(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i32(), 0), "bz$" + cls + "$initepoch");
         initStateGV_[t]    = stateGV;
         initOwnerGV_[t]    = ownerTidGV;
         initProgressGV_[t] = progressGV;
+        initEpochGV_[t]    = epochGV;
 
         // #798: a public non-generic type's ensureinit is EXPORTED so an importer
         // can trigger its static init on first cross-module use (§22.13). The
@@ -10619,6 +10629,16 @@ void Emitter::emitEnsureInitFns() {
         // sufficient there), run sfinit then cctor with pending-exc checks.
         builder_.SetInsertPoint(initB);
         builder_.CreateStore(builder_.CreateCall(tidFn, {}, "owntid"), ownerTidGV);
+        // fix #4486 (§22.13, v0.306): bump the thread-local monotonic
+        // bz_static_init_epoch and snapshot the NEW value as `t`'s own —
+        // see that global's comment (bezel_runtime_concurrency.cpp) for why
+        // this (not a save/restore-around-this-run marker) is the signal
+        // emitStaticPartialReadGuard needs to tell a same-type forward-
+        // reference escape from genuine cross-type re-entrancy.
+        llvm::Function* epochBumpFn =
+            declareC("bz_static_init_epoch_bump", i32(), {});
+        builder_.CreateStore(
+            builder_.CreateCall(epochBumpFn, {}, "epoch.new"), epochGV);
         // #792 / §22.13: snapshot any PRE-EXISTING in-flight exception before
         // running sfinit/cctor. The lazy init can be triggered while an exception
         // is already propagating — most notably an async-iterator `finally`
@@ -10928,7 +10948,9 @@ void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
     if (idx < 0) return;                        // always-assigned slot → no guard
     auto ownIt = initOwnerGV_.find(owner);
     auto prIt  = initProgressGV_.find(owner);
-    if (ownIt == initOwnerGV_.end() || prIt == initProgressGV_.end()) return;
+    auto epIt  = initEpochGV_.find(owner);
+    if (ownIt == initOwnerGV_.end() || prIt == initProgressGV_.end() ||
+        epIt == initEpochGV_.end()) return;
     if (!currentFn_) return;
 
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
@@ -10961,7 +10983,55 @@ void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
     llvm::Value* progress = builder_.CreateLoad(i32(), prIt->second, "pg.progress");
     llvm::Value* notAssigned = builder_.CreateICmpUGE(
         llvm::ConstantInt::get(i32(), static_cast<uint64_t>(idx)), progress);
-    llvm::Value* shouldRaise = builder_.CreateAnd(sameThread, notAssigned);
+    // fix #4486 (§22.13, v0.306): the backstop's own wording distinguishes a
+    // touch that is "ordinary execution" (a same-type forward reference that
+    // escaped StaticInitCycles.cpp's compile-time approximation through a
+    // function value, virtual dispatch, or a module boundary) from one that
+    // is "re-entrant" (the T -> U -> T signature). See
+    // bz_static_init_epoch's comment (bezel_runtime_concurrency.cpp) for why
+    // the signal is a monotonic epoch comparison, not a "currently executing
+    // type" marker: CURRENT > OWNER's own snapshot means some OTHER type's
+    // init has started on this thread since OWNER's own began (even if that
+    // type has since finished) — genuine cross-type re-entrancy; equal means
+    // none has — a same-type escape. Only the cross-type case raises the
+    // synthesized TypeInitializationException below; the same-type case
+    // falls through to contBB and lets the caller's plain load observe the
+    // field's raw not-yet-assigned (null-watermark, for a non-nullable
+    // reference) value — checked-disposal mode's ordinary watermark guard
+    // (emitFieldWatermarkGuard, called at both static-field read sites in
+    // LlvmBackend_Exprs.cpp) then raises NullReferenceException, and an
+    // unchecked build observes the watermark with undefined behavior,
+    // exactly as §22.13's text states.
+    //
+    // SCOPE (fix #4486 review follow-up, caught by
+    // static_foldable_forward_ref_1309_test.cpp regressing): this same-type
+    // carve-out applies ONLY to a `static readonly` field. §22.13's
+    // same-type residual is specifically the escape hatch for the
+    // READONLY-only forward-reference compile-time check ("Forward
+    // references between `static readonly` fields of the same type are a
+    // compile error") — a MUTABLE static field was never subject to that
+    // check (fix #1309, isReadonlyStaticField above, same file), so it has
+    // no residual to escape: rule 2's general cycle backstop governs it
+    // unconditionally, same-type or cross-type, exactly as before this fix.
+    // `isReadonly` is a compile-time property of `fs`, so a mutable field
+    // skips the epoch machinery entirely rather than branching on it at
+    // runtime.
+    bool isReadonly = false;
+    for (auto mod : fs->modifiers) {
+        if (mod == "readonly") { isReadonly = true; break; }
+    }
+    llvm::Value* shouldRaise;
+    if (isReadonly) {
+        llvm::Value* curEpoch = builder_.CreateCall(
+            declareC("bz_static_init_epoch_get", i32(), {}), {}, "pg.curepoch");
+        llvm::Value* ownerEpoch =
+            builder_.CreateLoad(i32(), epIt->second, "pg.ownerepoch");
+        llvm::Value* crossType = builder_.CreateICmpUGT(curEpoch, ownerEpoch);
+        shouldRaise = builder_.CreateAnd(
+            builder_.CreateAnd(sameThread, notAssigned), crossType);
+    } else {
+        shouldRaise = builder_.CreateAnd(sameThread, notAssigned);
+    }
     builder_.CreateCondBr(shouldRaise, raiseBB, contBB);
 
     // raise: synthesize the backstop TIE (naming the owner). It escapes via the

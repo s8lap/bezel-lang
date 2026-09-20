@@ -6409,7 +6409,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
-            return builder_.CreateLoad(gv->getValueType(), gv);
+            {
+                llvm::Value* val = builder_.CreateLoad(gv->getValueType(), gv);
+                // fix #4486 (§22.13, v0.306): the static-storage counterpart of
+                // #1748's instance-field watermark guard (see
+                // emitFieldWatermarkGuard's own comment) — a same-type forward
+                // reference that escapes emitStaticPartialReadGuard's cycle
+                // backstop (routed through a function value, virtual dispatch,
+                // or a module boundary) falls through to here still holding
+                // the field's null-watermark default; this raises
+                // NullReferenceException for it in checked-disposal mode.
+                emitFieldWatermarkGuard(e, val, gv->getValueType());
+                return val;
+            }
         }
         // fix #2547 (sibling of #2477): the third #605 / generic-new(T) silent-
         // zero family shape — a bare MemberAccessExpr read `obj.f` (no parens,
@@ -6602,7 +6614,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
-            return builder_.CreateLoad(gv->getValueType(), gv);
+            {
+                llvm::Value* val = builder_.CreateLoad(gv->getValueType(), gv);
+                // fix #4486 (§22.13, v0.306): the static-storage counterpart of
+                // #1748's instance-field watermark guard — see the identical
+                // comment at the qualified `Type.Count` static-read site above.
+                emitFieldWatermarkGuard(e, val, gv->getValueType());
+                return val;
+            }
         }
         // CG9: a bare identifier resolving to an instance field is an
         // implicit-`this` field read.

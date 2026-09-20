@@ -1403,6 +1403,13 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initStateGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initOwnerGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initProgressGV_;
+    // fix #4486 (§22.13, v0.306): initEpoch snapshots, at this type's own
+    // CAS-win, the POST-bump value of the thread-local monotonic
+    // `bz_static_init_epoch` (bezel_runtime_concurrency.cpp) — see that
+    // global's own comment for the full same-type-vs-cross-type rationale.
+    // emitStaticPartialReadGuard compares the CURRENT epoch against this
+    // snapshot to classify a same-thread partial-state touch.
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initEpochGV_;
     // Per-type sfinit / cctor functions, indexed for ensureinit emission. Built
     // from staticCtors_ in declareStaticInitializers.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;

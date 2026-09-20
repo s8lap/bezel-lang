@@ -147,6 +147,61 @@ extern "C" uint64_t bz_current_thread_id() {
     return id;
 }
 
+// fix #4486 / §22.13, v0.306: the runtime backstop's own text — "the runtime
+// attributes each touch to the innermost static initialization in progress
+// on the thread; a touch of T is re-entrant when that innermost
+// initialization belongs to a different type ... and is ordinary execution
+// when it is T's own" — needs a per-thread signal that tells a same-type
+// forward-reference escape (T's own init, via a function value / virtual
+// dispatch / module boundary, reads T's own later field) apart from genuine
+// cross-type re-entrancy (the T -> U -> T signature).
+//
+// A per-type "currently executing" marker does NOT work: by the time the
+// offending read happens, the INTERVENING type U's own sfinit/cctor has
+// typically already RUN TO COMPLETION — §22.13 itself requires this ("all of
+// [U's] static fields are initialized before any of its methods can run on
+// behalf of an outside observer"), so U's state is DONE, not in-progress,
+// at the read. (Measured: a save/restore-around-sfinit design, tried first,
+// mis-classified static_init_cycle_backstop_1553_test.cpp's own cross-type
+// kIntCycle/kStrCycle programs as same-type, because B.GetX()'s static
+// method body — which calls the escaping lambda — runs strictly AFTER B's
+// sfinit has returned and popped back to A.)
+//
+// The signal that DOES survive past U's completion is INTERLEAVING: a
+// thread-local MONOTONIC epoch, bumped on every type's CAS-win (fresh
+// 0->1 transition to in-progress) on this thread. Each type snapshots the
+// POST-bump epoch at its own CAS-win (bz$T$initepoch, emitEnsureInitFns,
+// LlvmBackend_Setup.cpp). At a read of a not-yet-assigned field of OWNER:
+// comparing the CURRENT epoch against OWNER's own snapshot tells whether
+// ANY other type's init has EVER started on this thread since OWNER's own
+// began (even if that other type has since finished) — equal means none did
+// (OWNER never yielded, dynamically, to a different type's own init: a
+// same-type escape); greater means at least one did (a T -> U -> ... -> T
+// chain: cross-type re-entrancy), regardless of U's CURRENT state.
+//
+// Known residual (documented, not exercised by any shipped test): if U was
+// ALREADY fully initialized before this call chain began (an earlier,
+// unrelated touch), calling into U's now-ordinary code does not bump the
+// epoch, so a read it triggers back into OWNER is classified same-type. The
+// pre-fix behavior for that shape was "always raise TypeInitializationException"
+// (unconditionally, for every shape this backstop reaches); this is a strictly
+// narrower, spec-aligned classification for the shapes both the existing and
+// new regression tests exercise, not a completeness guarantee — matching the
+// compile-time approximation's own accepted incompleteness one section up.
+extern "C" thread_local uint32_t bz_static_init_epoch = 0;
+
+// Called from the emitted `initB` block (emitEnsureInitFns) at the moment a
+// type's CAS wins (0->1): bump this thread's epoch and return the NEW value,
+// which the caller stores into that type's own `bz$T$initepoch` snapshot.
+extern "C" uint32_t bz_static_init_epoch_bump() {
+    return ++bz_static_init_epoch;
+}
+
+// Called from emitStaticPartialReadGuard: the CURRENT epoch, no side effect.
+extern "C" uint32_t bz_static_init_epoch_get() {
+    return bz_static_init_epoch;
+}
+
 // ---------------------------------------------------------------------------
 // bz_static_init_wait / bz_static_init_notify — §22.12 rule 1 (v0.228) cross-
 // domain blocking for lazy static initialization (#1391, the "blocking half";
