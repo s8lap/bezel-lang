@@ -62,6 +62,21 @@
 // case — a leak is invisible without a sanitizer, so LSan is the oracle that
 // moves and the plain rows pin that nothing is freed early.
 
+// WARNING NO TOOLCHAIN-SKIP GUARD, DELIBERATELY (#3733). An earlier revision
+// of this file opened every checked row with a return-early guard over a local
+// predicate that tested the result text for the SKIP literal. That is what
+// check_toolchain_skip_surface.py calls an ABSORBING SITE: on a box without the
+// ASan link toolchain the row returns early and reports a clean PASS, so the
+// file proves nothing and says nothing — the same vacuous-green class as a
+// one-shot LSan row, and indistinguishable from a real green.
+// `scripts/check_toolchain_skip_surface.py` counts those sites and ratchets
+// them down; these rows contributed to a +19 rise it caught. The runtime half
+// of #3733 — the counter, the printed notice, the shard JSON and
+// `run_parallel.sh`'s floor — already makes a missing toolchain loud, so the
+// guard was dead weight. With it gone `BEZEL_EXPECT_TRUE(r.ran)` is the first
+// assertion in every checked row and a toolchain-less box fails loudly.
+// Do not re-add it.
+
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked / …Lenient
@@ -73,15 +88,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: the checked helpers return ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // =====================================================================
 // (A) THE ISSUE'S OWN REPRO, loop-amplified. Two `Object` locals, the
@@ -244,7 +250,6 @@ const char* kValueReceiverObjectArgument =
 BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
            object_local_argument_box_is_released_spec_8_6) {
     JitResult r = runAotChecked(kObjectLocalArgument);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 7200 B / 300 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -265,7 +270,6 @@ BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
 BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
            symmetric_both_positions_released_spec_8_6) {
     JitResult r = runAotChecked(kSymmetricBothPositions);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 9600 B / 400 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -283,7 +287,6 @@ BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
 BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
            self_argument_released_exactly_once_spec_8_3) {
     JitResult r = runAotChecked(kSelfArgument);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 4800 B / 200 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -302,7 +305,6 @@ BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
 BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
            class_receiver_argument_box_is_not_released_spec_28_3) {
     JitResult r = runAotCheckedLenient(kClassReceiverUafGuard);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // THE oracle: with a release armed here the freed box reads back wrong
     // and `seen` never reaches 200 (measured; ASan stays silent).
@@ -322,7 +324,6 @@ BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
 BEZEL_TEST(codegen_object_equals_object_local_arg_box_reclaim_3447,
            value_receiver_object_local_argument_released_spec_8_1) {
     JitResult r = runAotChecked(kValueReceiverObjectArgument);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 4800 B / 200 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }

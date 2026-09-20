@@ -71,6 +71,21 @@
 // The PLAIN (unsanitized) exit code is identical before and after in every
 // case — a leak is invisible without a sanitizer.
 
+// WARNING NO TOOLCHAIN-SKIP GUARD, DELIBERATELY (#3733). An earlier revision
+// of this file opened every checked row with a return-early guard over a local
+// predicate that tested the result text for the SKIP literal. That is what
+// check_toolchain_skip_surface.py calls an ABSORBING SITE: on a box without the
+// ASan link toolchain the row returns early and reports a clean PASS, so the
+// file proves nothing and says nothing — the same vacuous-green class as a
+// one-shot LSan row, and indistinguishable from a real green.
+// `scripts/check_toolchain_skip_surface.py` counts those sites and ratchets
+// them down; these rows contributed to a +19 rise it caught. The runtime half
+// of #3733 — the counter, the printed notice, the shard JSON and
+// `run_parallel.sh`'s floor — already makes a missing toolchain loud, so the
+// guard was dead weight. With it gone `BEZEL_EXPECT_TRUE(r.ran)` is the first
+// assertion in every checked row and a toolchain-less box fails loudly.
+// Do not re-add it.
+
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked / …Lenient
@@ -82,13 +97,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // =====================================================================
 // (A) THE ISSUE'S OWN REPRO, loop-amplified: a BLOCK-bodied `Object`
@@ -243,7 +251,6 @@ const char* kMixedReturnGetter =
 BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
            block_bodied_object_getter_box_is_reclaimed_spec_28_9) {
     JitResult r = runAotChecked(kBlockBodiedGetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 4800 B / 200 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -264,7 +271,6 @@ BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
 BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
            expression_bodied_object_getter_box_is_reclaimed_spec_28_9) {
     JitResult r = runAotChecked(kExpressionBodiedGetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: 4800 B / 200 allocations
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -282,7 +288,6 @@ BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
 BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
            class_and_string_returning_getters_are_not_box_producers_spec_8_6) {
     JitResult r = runAotChecked(kNonBoxingGetters);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // clean before AND after
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -301,8 +306,12 @@ BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
 BEZEL_TEST(codegen_object_property_getter_box_reclaim_2760,
            mixed_return_getter_is_not_a_box_producer_spec_28_9) {
     JitResult r = runAotCheckedLenient(kMixedReturnGetter);
-    if (wasSkipped(r)) return;
-    BEZEL_EXPECT_TRUE(r.ran);          // a release on the class exit faults
+    // UNMEASURED-CLAIM FIX: this line previously read "a release on the class
+    // exit faults". That was never measured, and the sibling #2633 finding in
+    // object_equals_*_test.cpp says the opposite is likely — an over-release
+    // there reads back silently wrong rather than faulting. The load-bearing
+    // assertion is the exit code below; `r.ran` only pins that the program ran.
+    BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
