@@ -95,15 +95,23 @@ BEZEL_TEST(lambda_inline_array_interface_element_4331,
 // the interface-typed slot. Pre-fix: SIGSEGV (exit 139, the same null-array
 // path as the class case). Post-fix: returns 5.
 // per §15.1 / §8.6 (issue #4331)
-// See note above: switched to `[1 owned]` for #4351 (sema rejects `new ...`
-// at a non-owning interface slot per §15.1).
+// #4351 RESTORE (`narrow #4351`, this batch). `f837b164` moved this row to
+// `[1 owned]IHolder` because its §15.1 check rejected the `new RecHolder(...)`
+// element at a non-owning slot. That rejection was an over-reach: a record
+// element at an interface slot BOXES (§8.6) and a box is runtime-managed
+// (§28.9), so §15.1's borrow contract never applied to it. With the predicate
+// narrowed to the element's own constructed type, the NON-OWNING form this row
+// was written for is admissible again and is restored here. Oracle unchanged.
+// The sibling CLASS rows in this file stay on `[N owned]`: a `new Widget(...)`
+// element IS a fresh class producer that §15.1 correctly rejects at a
+// non-owning slot, and a lambda body has no enclosing local to borrow from.
 BEZEL_TEST(lambda_inline_array_interface_element_4331,
            record_element_expr_bodied_lambda_boxed_spec_15_1_8_6) {
     BEZEL_EXPECT_EQ(run(
         kPrelude +
         "class C "
         "  public static method Main(): int "
-        "    var f: () -> [1 owned]IHolder := lambda() => [new RecHolder(\"hello\")]; "
+        "    var f: () -> [1]IHolder := lambda() => [new RecHolder(\"hello\")]; "
         "    var outer := f(); "
         "    return outer[0].GetV().Length; "
         "  end Main; "
@@ -150,14 +158,23 @@ BEZEL_TEST(lambda_inline_array_interface_element_4331,
 
 // ── CONTROL: multi-element inline array with record element.
 // per §15.1 / §8.6 (issue #4331, control)
-// See note above: switched to `[2 owned]` for #4351.
+// #4351 RESTORE (`narrow #4351`, this batch). `f837b164` moved this row to
+// `[2 owned]IHolder` because its §15.1 check rejected the `new RecHolder(...)`
+// element at a non-owning slot. That rejection was an over-reach: a record
+// element at an interface slot BOXES (§8.6) and a box is runtime-managed
+// (§28.9), so §15.1's borrow contract never applied to it. With the predicate
+// narrowed to the element's own constructed type, the NON-OWNING form this row
+// was written for is admissible again and is restored here. Oracle unchanged.
+// The sibling CLASS rows in this file stay on `[N owned]`: a `new Widget(...)`
+// element IS a fresh class producer that §15.1 correctly rejects at a
+// non-owning slot, and a lambda body has no enclosing local to borrow from.
 BEZEL_TEST(lambda_inline_array_interface_element_4331,
            record_element_multi_elem_expr_bodied_lambda_spec_15_1_8_6) {
     BEZEL_EXPECT_EQ(run(
         kPrelude +
         "class C "
         "  public static method Main(): int "
-        "    var f: () -> [2 owned]IHolder := lambda() => [new RecHolder(\"hi\"), new RecHolder(\"!\")]; "
+        "    var f: () -> [2]IHolder := lambda() => [new RecHolder(\"hi\"), new RecHolder(\"!\")]; "
         "    var outer := f(); "
         "    return outer[0].GetV().Length + outer[1].GetV().Length; "
         "  end Main; "

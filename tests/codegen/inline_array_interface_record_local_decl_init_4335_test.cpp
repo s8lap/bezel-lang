@@ -103,30 +103,46 @@ JitResult run(const std::string& mainBody,
 
 // The issue's OWN literal repro — local-decl init of an inline-array-of-
 // interface literal whose element is a genuinely conforming record.
-// NOTE: switched to `[1 owned]` (the spec-conformant form per §15.1.1 /
-// #4336 / `569a680`): the non-owning `[1]IHolder` is a BORROW slot per §15.1
-// and the `new RecHolder(...)` initializer is now rejected by #4351's sema
-// fix. The owning form takes ownership of the fresh record on construction
-// and exercises the SAME local-decl-init boxing path this test pins.
+// #4351 RESTORE (`narrow #4351`, this batch). `f837b164` moved this row
+// to `[1 owned]IHolder` because its §15.1 check rejected the `new
+// RecHolder(...)` element at a non-owning slot. That rejection was an
+// over-reach: a record element at an interface slot BOXES (§8.6) and a
+// box is runtime-managed (§28.9), so §15.1's borrow contract never
+// applied to it. With the predicate narrowed to the element's own
+// constructed type, the NON-OWNING form this row was written for is
+// admissible again and is restored here. Oracle unchanged.
+// Measured, settling `f837b164`'s "run on the owning form identically"
+// claim: with #4335's `boxForTarget` call gated off for NON-owning arrays
+// only (a simulated reintroduction of #4335's defect), the owning form of
+// this very row still returned 5 while the non-owning form below SIGSEGVs
+// (exit 139). The owning-form row could not detect a regression of the
+// bug it is named for.
 BEZEL_TEST(inline_array_interface_record_local_decl_init_4335,
            local_decl_init_record_element_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [1 owned]IHolder := [new RecHolder(\"he\" + \"llo\")]; "
+        "var outer: [1]IHolder := [new RecHolder(\"he\" + \"llo\")]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
-// Same shape, a SECOND slot of a `[2 owned]IHolder` — proves the fix is not
+// Same shape, a SECOND slot of a `[2]IHolder` — proves the fix is not
 // slot-0-specific. Both elements are records of different payloads so a
 // "first element only" defect would still slip a length from the second
 // into the first.
-// See note above: switched to `[2 owned]` for #4351.
+// #4351 RESTORE (`narrow #4351`, this batch). `f837b164` moved this row
+// to `[2 owned]IHolder` because its §15.1 check rejected the `new
+// RecHolder(...)` element at a non-owning slot. That rejection was an
+// over-reach: a record element at an interface slot BOXES (§8.6) and a
+// box is runtime-managed (§28.9), so §15.1's borrow contract never
+// applied to it. With the predicate narrowed to the element's own
+// constructed type, the NON-OWNING form this row was written for is
+// admissible again and is restored here. Oracle unchanged.
 BEZEL_TEST(
     inline_array_interface_record_local_decl_init_4335,
     local_decl_init_record_element_second_slot_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [2 owned]IHolder := "
+        "var outer: [2]IHolder := "
         "  [new RecHolder(\"he\" + \"llo\"), new RecHolder(\"world\")]; "
         "return outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -151,12 +167,19 @@ BEZEL_TEST(
 // Exercises the per-element loop hitting the new `boxForTarget` call on
 // every iteration (not just the first) — proving the fix lives in the
 // loop body, not at literal-construction time.
-// See note above: switched to `[2 owned]` for #4351.
+// #4351 RESTORE (`narrow #4351`, this batch). `f837b164` moved this row
+// to `[2 owned]IHolder` because its §15.1 check rejected the `new
+// RecHolder(...)` element at a non-owning slot. That rejection was an
+// over-reach: a record element at an interface slot BOXES (§8.6) and a
+// box is runtime-managed (§28.9), so §15.1's borrow contract never
+// applied to it. With the predicate narrowed to the element's own
+// constructed type, the NON-OWNING form this row was written for is
+// admissible again and is restored here. Oracle unchanged.
 BEZEL_TEST(
     inline_array_interface_record_local_decl_init_4335,
     local_decl_init_two_record_elements_both_boxed_spec_15_1_8_6) {
     auto r = run(
-        "var outer: [2 owned]IHolder := "
+        "var outer: [2]IHolder := "
         "  [new RecHolder(\"he\" + \"llo\"), new RecHolder(\"world\")]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
