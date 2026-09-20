@@ -12037,20 +12037,56 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
 // the rule spelled out in codegen is what this project has repeatedly paid
 // for (see `sema::FormalsView`'s header on #3141/#3173).
 //
-// `emit=false`, unlike the `this(...)` arm's `emit=true`. That arm is §22.8
-// step 0's only site for a convenience-bound construction, so #3583 made a
-// call the binder cannot bind a loud error rather than a calloc-zero object.
-// Here the §22.5 ARITY checking of a `base(...)` call is a pre-existing and
-// separate gap (nothing in sema checks it today, and an over- or
-// under-supplied `base(...)` reaches codegen silently); turning it loud is a
-// new rejection that belongs to that gap, not to this binding-order defect.
-// A call this binder declines therefore publishes nothing and codegen keeps
-// its textual-order fallback — exactly today's behaviour for exactly today's
-// shapes. That gap is tracked as #4496, which measures both of its faces:
-// `base(1, n := 2, s := "x")` (naming a parameter already bound
-// positionally) and the under-supplied `base(1)` each compile with ZERO
-// diagnostics and SIGSEGV, identically before and after this fix.
-// // per §22.5, fix #4484, SEAM-DEBT #4496
+// `emit=true` since fix #4496 (§22.5, v0.306), matching the `this(...)` arm.
+// #4484 left it false on purpose and filed the gap; this is that gap closed.
+//
+// §22.5 states both halves of the binding as REJECTIONS, not as preferences:
+// "Each supplied argument binds exactly one parameter and each parameter is
+// bound by at most one supplied argument: naming a parameter already bound
+// positionally …, or naming the same parameter twice, is a compile error at
+// the call naming that parameter", and "Every parameter that declares no
+// default must be bound, positionally or by name". Nothing enforced either
+// for a `base(...)` chain: measured on e9239ab4, against
+// `class Base(n: int, s: string)`,
+//
+//   base(1, n := 2, s := "x")   `bezelc` exit 0, no diagnostic; the binary
+//                                printed `1` and then SEGVed in
+//                                `bz_string_to_utf8z` at 0xa — the integer
+//                                `2` dereferenced as a string pointer
+//   base(1)                      `bezelc` exit 0, no diagnostic; the `s`
+//                                slot stayed calloc-zero (a NULL string
+//                                pointer, printed as a blank line; an
+//                                interpolating consumer SEGVs on it)
+//
+// Both are silent MISCOMPILES, not merely missing diagnostics: the
+// pre-population stores whatever the malformed argument list happens to
+// yield. Making the binder loud replaces both with the §22.5 rejection the
+// spec already prescribes — and the diagnostics are not new text, they are
+// the same five strings `bindArgsToParams` emits for a `new T(...)`, a
+// method call, an imported callee and a `this(...)` chain.
+//
+// WHAT IS STILL NOT CHECKED HERE, stated because each is a REACHABLE silent
+// shape rather than a hypothetical, and because the guards above are what
+// keeps them out (they are gates on PUBLISHING a binding that now double as
+// gates on checking):
+//
+//   * `base()` with NO arguments — `chain.args.empty()` returns before the
+//     binder runs. An explicit zero-argument `base()` into a base whose
+//     primary parameters are required is therefore still accepted silently.
+//     Left alone deliberately: §12.8 makes the IMPLICIT chain a `base()`
+//     too ("If neither base(...) nor this(...) is written, the compiler
+//     inserts an implicit base() call"), so rejecting the explicit spelling
+//     without settling what the implicit one means in the same shape would
+//     make two spellings of one call disagree. Filed rather than folded in.
+//   * A `base(...)` that binds an EXPLICIT base constructor — the arity
+//     early-return above. That call's own checking is a separate path and a
+//     separate question from this one.
+//   * §5.1 ASSIGNABILITY of each bound argument to its slot's type. The
+//     binder answers arity, parameter names and required-parameter coverage
+//     only; `base("bad", 1)` against `class Base(n: int, s: string)` still
+//     reaches a wild store. That is the same family #3583's comment records
+//     as outstanding for the `this(...)` arm, and it is unchanged here.
+// // per §22.5, fix #4484, fix #4496
 void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
     if (chain.args.empty()) return;
     // Codegen's `Emitter::baseClassOf`: the first CLASS entry of `baseTypes`.
@@ -12082,8 +12118,11 @@ void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
     const std::string desc =
         std::string("`base(...)` chain to the primary constructor of `") +
         std::string(base->name) + "`";
+    // fix #4496 (§22.5, v0.306): `emit=true` — see the header comment. A
+    // binding the rule REJECTS is now reported here instead of publishing
+    // nothing and letting codegen store a mispaired object.
     BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain.args,
-                                    chain.span.begin, desc, /*emit=*/false);
+                                    chain.span.begin, desc, /*emit=*/true);
     if (b.ok) ctx_.setPositionalBinding(&chain, b.paramToArg);
 }
 
