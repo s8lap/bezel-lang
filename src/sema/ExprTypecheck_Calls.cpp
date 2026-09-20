@@ -11946,13 +11946,28 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 // is filed rather than smuggled in.
 void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
     if (cd.isStatic || !currentType_) return;
-    if (currentType_->kind != ast::TypeDeclKind::Class ||
-        !currentType_->hasPositionalFields)
-        return;
     if (cd.body.empty() || !cd.body[0]) return;
     bool isThis = false;
     const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
-    if (!chain || !isThis) return;
+    if (!chain) return;
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` arm.
+    // §22.8 gives step 0 for a base whose primary parameter list the chain
+    // call binds exactly one lowering site — codegen's
+    // `prePopulateBasePositionalFields`, case (b) — and that site paired
+    // `chainCall->args[i]` with the base's positional field `i` in TEXTUAL
+    // order, never consulting `arg.name`. §22.5 is explicit that "naming an
+    // argument changes which parameter it binds to, never when it runs", and
+    // that "every construction site in the language reaches it through the
+    // same binding — a call, a `new` expression, and a record construction
+    // alike". Publishing the binding here is what makes that true of this
+    // site as well: the binder body is the one `bindArgsToParams` over
+    // `FormalsView::of(fields)` that the `new` site (#3196) and the
+    // `this(...)` chain site (#3583) already run, and the channel is the one
+    // `SemaContext` table #3583 widened its key to `const ast::Expr*` for.
+    if (!isThis) { publishBaseChainPrimaryBinding(*chain); return; }
+    if (currentType_->kind != ast::TypeDeclKind::Class ||
+        !currentType_->hasPositionalFields)
+        return;
     // The chain may target an explicit SIBLING constructor rather than the
     // primary. Codegen takes its primary-constructor branch exactly when
     // `ctorByArity` finds no other non-static constructor of the call's arity
@@ -11990,6 +12005,86 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
                                       /*target=*/nullptr, currentType_);
         ctx_.setPositionalBinding(chain, b.paramToArg);
     }
+}
+
+// fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
+// §22.10, v0.306): the `base(...)` twin of `publishPrimaryCtorChainBinding`
+// above — publish the §22.5 argument BINDING for an explicit derived
+// constructor whose body opens with a `base(...)` call that binds the BASE
+// class's PRIMARY parameter list.
+//
+// §22.8 step 0 captures a primary constructor's parameters into their fields,
+// and for this shape — a base with a primary constructor and no explicit
+// constructor of the call's arity — the ONLY code that writes those fields is
+// codegen's `Emitter::prePopulateBasePositionalFields`, case (b). That site
+// paired chain argument `i` with the base's positional field `i` in TEXTUAL
+// order and never read `arg.name`, so `base(s := "x", n := 1)` against
+// `class B(n: int, s: string)` stored the string pointer into the 4-byte `n`
+// slot and the integer into the `string` slot — measured: `4627856` printed
+// for `n`, then SIGSEGV inside `bz_string_to_utf8z` dereferencing `0x9` as a
+// string (issue 4484). §22.5 states the rule this violates twice: "naming an
+// argument changes which parameter it binds to, never when it runs", and
+// "every construction site in the language reaches it through the same
+// binding — a call, a `new` expression, and a record construction alike".
+//
+// The binding is therefore computed by the SAME binder body every other
+// construction site uses (`bindArgsToParams` over
+// `sema::FormalsView::of(recordPositionalFieldSymbols(base))`, #3173/#3178)
+// and published on the SAME `SemaContext` table, whose key #3583 already
+// widened from `ast::NewExpr*` to `const ast::Expr*` precisely so a chain
+// `CallExpr` could be a key. #3791 closed this §22.5 gap for `emitChainCall`;
+// the pre-population site was never asked the question, and a SECOND copy of
+// the rule spelled out in codegen is what this project has repeatedly paid
+// for (see `sema::FormalsView`'s header on #3141/#3173).
+//
+// `emit=false`, unlike the `this(...)` arm's `emit=true`. That arm is §22.8
+// step 0's only site for a convenience-bound construction, so #3583 made a
+// call the binder cannot bind a loud error rather than a calloc-zero object.
+// Here the §22.5 ARITY checking of a `base(...)` call is a pre-existing and
+// separate gap (nothing in sema checks it today, and an over- or
+// under-supplied `base(...)` reaches codegen silently); turning it loud is a
+// new rejection that belongs to that gap, not to this binding-order defect.
+// A call this binder declines therefore publishes nothing and codegen keeps
+// its textual-order fallback — exactly today's behaviour for exactly today's
+// shapes. That gap is tracked as #4496, which measures both of its faces:
+// `base(1, n := 2, s := "x")` (naming a parameter already bound
+// positionally) and the under-supplied `base(1)` each compile with ZERO
+// diagnostics and SIGSEGV, identically before and after this fix.
+// // per §22.5, fix #4484, SEAM-DEBT #4496
+void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
+    if (chain.args.empty()) return;
+    // Codegen's `Emitter::baseClassOf`: the first CLASS entry of `baseTypes`.
+    TypeSymbol* base = nullptr;
+    for (TypeSymbol* b : currentType_->baseTypes) {
+        if (b && b->kind == ast::TypeDeclKind::Class) { base = b; break; }
+    }
+    if (!base || !base->hasPositionalFields) return;
+    // Only when the call binds the base's PRIMARY parameter list. Codegen
+    // reaches that arm exactly when `ctorForArgs(baseTs, chainCall->args)`
+    // finds no explicit base constructor to bind (whose own §22.8 step 0 then
+    // writes these slots from inside the chained-to primary — fix #3562), so
+    // the same question is asked here by its dominant arity arm. When an
+    // arity match exists this publishes nothing and codegen keeps whichever
+    // disposition it has today: declining the stores outright for a local
+    // base (#3562's guard), or the textual-order fallback for an imported one
+    // (SEAM-DEBT #3625). Publishing a PRIMARY-parameter binding for a call
+    // that binds a convenience constructor's parameter list would be the very
+    // mispairing #3562 removed.
+    const std::size_t n = chain.args.size();
+    for (Symbol* m : base->members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic) continue;
+        if (other->params.size() == n) return;
+    }
+    const std::vector<const Symbol*> fields =
+        recordPositionalFieldSymbols(base);
+    if (fields.empty()) return;
+    const std::string desc =
+        std::string("`base(...)` chain to the primary constructor of `") +
+        std::string(base->name) + "`";
+    BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain.args,
+                                    chain.span.begin, desc, /*emit=*/false);
+    if (b.ok) ctx_.setPositionalBinding(&chain, b.paramToArg);
 }
 
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.

@@ -2559,6 +2559,14 @@ private:
     // §22.8-step-0 body serves the chain site as well as the `new` site. See
     // the definition in ExprTypecheck_Calls.cpp.
     void publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd);
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
+    // of the above — the §22.5 binding of a derived constructor's leading
+    // `base(...)` arguments to the BASE class's primary-constructor parameter
+    // list, read by codegen's `prePopulateBasePositionalFields`. Called only
+    // from `publishPrimaryCtorChainBinding`, which owns the chain-call
+    // recognition both arms share. See the definition in
+    // ExprTypecheck_Calls.cpp.
+    void publishBaseChainPrimaryBinding(const ast::CallExpr& chain);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,

@@ -4630,6 +4630,45 @@ void Emitter::prePopulateBasePositionalFields(
     // SECOND time and keeping the second value.
     bool chainedPrimaryOwnsSlots = false;
 
+    // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step
+    // 0 / §22.10, v0.306): the §22.5 BINDING of the base call's arguments to
+    // the base's positional slots, as sema published it
+    // (`ExprTC::publishBaseChainPrimaryBinding` →
+    // `SemaContext::setPositionalBinding`, the SAME table and the SAME binder
+    // body the `new` site reads through `storePrimaryCtorPositionalArgs`).
+    // Entry `pi` holds the index into `baseArgVals` — which is the base call's
+    // SOURCE argument index, because the fill loops below push one value per
+    // argument in source order — that supplies base positional field `pi`, or
+    // -1 when the call omits that slot.
+    //
+    // EMPTY means "no binding published": every loop below then falls back to
+    // the textual-order pairing `argument i ↔ field i` this function has
+    // always used, which is bit-identical for an all-positional call and is
+    // the pre-fix behaviour for every shape sema declines to bind (an over- or
+    // under-supplied `base(...)` — §22.5 arity at this site is a separate,
+    // pre-existing gap, see the sema helper's comment).
+    std::vector<int> baseFieldToArg;
+    // The base positional field a given SOURCE argument index binds to, and
+    // its inverse. Stated once because three places below need them: the §4.7
+    // unit rescue (which must know the slot's TYPE), the argument store loop,
+    // and the §22.5 default-fill loop (which must know which slots the call
+    // did NOT supply — with named arguments that is no longer a trailing run).
+    auto fieldForArg = [&](std::size_t ai) -> std::size_t {
+        if (baseFieldToArg.empty()) return ai;
+        for (std::size_t pi = 0; pi < baseFieldToArg.size(); ++pi)
+            if (baseFieldToArg[pi] == static_cast<int>(ai)) return pi;
+        return basePosFields.size();
+    };
+    auto argForField = [&](std::size_t pi) -> int {
+        if (baseFieldToArg.empty())
+            return pi < baseArgVals.size() ? static_cast<int>(pi) : -1;
+        if (pi >= baseFieldToArg.size()) return -1;
+        const int ai = baseFieldToArg[pi];
+        return (ai >= 0 && static_cast<std::size_t>(ai) < baseArgVals.size())
+                   ? ai
+                   : -1;
+    };
+
     // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): read the inheritance-
     // clause argument EXPRESSIONS via `primaryBaseCtorArgsOf`, NOT a raw
     // `dynamic_cast<ast::TypeDecl*>(t->decl)` — the latter is null for
@@ -4764,6 +4803,19 @@ void Emitter::prePopulateBasePositionalFields(
             if (baseCallChainsThis) chainedPrimaryOwnsSlots = true;
             if (chainCall && !isThis && !chainCall->args.empty() &&
                 !baseCallChainsThis) {
+                // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): install
+                // the §22.5 binding sema published for THIS `base(...)` call
+                // before anything below reads `fieldForArg` / `argForField`.
+                // This is the arm the issue names: the call binds the base's
+                // PRIMARY parameter list (the `ctorChainsViaThis` arm above
+                // has already taken every call that binds an explicit base
+                // constructor out of this path), and those parameters are
+                // exactly `basePosFields` — so a named argument names one of
+                // them and §22.5 binds it there, wherever it sits in the
+                // argument list.
+                if (const std::vector<int>* pub =
+                        ctx_.positionalBinding(*chainCall))
+                    baseFieldToArg = *pub;
                 // Temporarily bind ctor params to their values so that the
                 // chain-call arg expressions (which reference ctor params) can
                 // be evaluated correctly. Save and restore paramSlots_.
@@ -4793,18 +4845,30 @@ void Emitter::prePopulateBasePositionalFields(
                         paramSlots_[cs->params[pi]] = slot;
                     }
                 }
-                for (const auto& arg : chainCall->args) {
+                // §22.5 "Evaluation order": the SUPPLIED arguments are
+                // evaluated in call-site TEXTUAL order, "for positional and
+                // named arguments alike; naming an argument changes which
+                // parameter it binds to, never when it runs". So this loop
+                // stays in source order and `baseArgVals` stays source-
+                // indexed; only the STORE below is re-keyed by the binding.
+                for (std::size_t ai = 0; ai < chainCall->args.size(); ++ai) {
+                    const auto& arg = chainCall->args[ai];
                     if (!arg.value) { baseArgVals.clear(); break; }
                     llvm::Value* v = lowerExpr(*arg.value);
                     // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the explicit
                     // `base(...)`-chain face of the same gap — same reasoning
                     // and same pairing as the primaryBaseCtorArgs loop above.
-                    if (!v && baseArgVals.size() < basePosFields.size())
-                        v = unitValueForTarget(
-                            v,
-                            recordMemberTypeResolved(
-                                basePosFields[baseArgVals.size()]),
-                            arg.value.get());
+                    // fix #4484: the slot whose TYPE the §4.7 rescue must
+                    // read is the one §22.5 BINDS this argument to, not the
+                    // one at its source position — `base(u := C.Nothing(),
+                    // n := 1)` must rescue against the `u` slot's unit type.
+                    if (!v) {
+                        const std::size_t fi = fieldForArg(ai);
+                        if (fi < basePosFields.size())
+                            v = unitValueForTarget(
+                                v, recordMemberTypeResolved(basePosFields[fi]),
+                                arg.value.get());
+                    }
                     if (!v) { baseArgVals.clear(); break; }
                     baseArgVals.push_back(v);
                 }
@@ -4815,13 +4879,20 @@ void Emitter::prePopulateBasePositionalFields(
     }
 
     // Store the base-call arg values into the base's positional-param field slots.
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the pairing is
+    // `argForField` — the §22.5 binding when sema published one for this base
+    // call, the textual-order `argument i ↔ field i` otherwise. This loop used
+    // to run `for i in [0, min(baseArgVals.size(), basePosFields.size()))` and
+    // store `baseArgVals[i]` into `basePosFields[i]`, which is the same thing
+    // for an all-positional call and a wrong-slot store for a named one.
     llvm::StructType* baseSt = classStruct(baseTs);
-    std::size_t numToStore = std::min(baseArgVals.size(), basePosFields.size());
-    for (std::size_t i = 0; i < numToStore; ++i) {
+    for (std::size_t i = 0; i < basePosFields.size(); ++i) {
+        const int ai = argForField(i);
+        if (ai < 0) continue;
         sema::FieldSymbol* fs = basePosFields[i];
         auto idxIt = fieldIndex_.find(fs);
         if (idxIt == fieldIndex_.end()) continue;
-        llvm::Value* v = baseArgVals[i];
+        llvm::Value* v = baseArgVals[static_cast<std::size_t>(ai)];
         if (!v) continue;
         llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
         v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
@@ -4846,14 +4917,33 @@ void Emitter::prePopulateBasePositionalFields(
     // The `int` twin was non-fatal and therefore worse — it read back 0 rather
     // than the declared default, compiling clean.
     //
-    // The two arms above supply slots `[0, numToStore)` and never a later one:
-    // both evaluate the base call's arguments left to right, and a base call
-    // with NAMED arguments publishes no binding at this site, so it produces no
-    // `baseArgVals` at all and reaches this loop with `numToStore == 0` — which
-    // is the correct conservative answer for it (a named base call that omits a
-    // default is the pre-existing named-arg chain-binding gap, filed separately;
-    // filling every slot from its default would be wrong there, and this loop
-    // does not, because a required slot has no default to fill from).
+    // WHICH SLOTS THIS LOOP OWES. Every slot the base call did not SUPPLY,
+    // which `argForField` answers per slot.
+    //
+    // ⚠ fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306) corrects what this
+    // paragraph used to assert. It said "a base call with NAMED arguments
+    // publishes no binding at this site, so it produces no `baseArgVals` at
+    // all and reaches this loop with `numToStore == 0`". That is true of case
+    // (a) — the §22.10 inheritance clause, which has no `SemaContext` binding
+    // at all — and FALSE of case (b): the explicit `base(...)` chain arm
+    // above lowers `chainCall->args` unconditionally, named or not, so a
+    // named base call arrived here with a FULL `baseArgVals` that the store
+    // loop then paired by textual position. Measured on 4d9d186a, `base(s :=
+    // "x", n := 1)` against `class B(n: int, s: string)` printed `4627856`
+    // for `n` — the low 32 bits of the string pointer — and SIGSEGVed in
+    // `bz_string_to_utf8z` dereferencing the integer `1` as a string; with a
+    // `decimal` in the trailing slot the same mispairing is a clean
+    // "heap-buffer-overflow … WRITE of size 16 … 11 bytes after 32-byte
+    // region" (issue 4484). The comment described ONE arm as though it
+    // described the function, which is how the defect stayed hidden through
+    // #3562's work on the very same lines.
+    //
+    // Since #4484 the supplied slots are whatever §22.5 bound, so they are no
+    // longer necessarily a prefix `[0, numToStore)` — `base(s := "x")`
+    // against `class B(n: int := 1, s: string)` supplies slot 1 and owes slot
+    // 0 its default. This loop therefore asks `argForField` per slot instead
+    // of starting at a watermark. For a call sema declined to bind, or an
+    // all-positional one, `argForField` answers exactly the old watermark.
     //
     // Runs BEFORE the `baseArgVals.empty()` early return on purpose: a `base()`
     // with no arguments at all into a base whose positional parameters are ALL
@@ -4869,8 +4959,9 @@ void Emitter::prePopulateBasePositionalFields(
     // factory returning an owned instance) leaked the first object outright —
     // "LeakSanitizer: 16 byte(s) in 1 object(s)" — because the second store
     // overwrote it before any destructor could run.
-    for (std::size_t i = numToStore;
+    for (std::size_t i = 0;
          !chainedPrimaryOwnsSlots && i < basePosFields.size(); ++i) {
+        if (argForField(i) >= 0) continue;  // supplied — fix #4484
         sema::FieldSymbol* fs = basePosFields[i];
         auto idxIt = fieldIndex_.find(fs);
         if (idxIt == fieldIndex_.end()) continue;
@@ -4896,6 +4987,17 @@ void Emitter::prePopulateBasePositionalFields(
     // Recurse: the base class itself may also have a base with positional params
     // (e.g. C(z): B(z): A(z) — B's and A's params both need pre-population).
     // Find what ctor symbol the base class has (if any) for use in recursion.
+    //
+    // fix #4484 note: `baseArgVals` is handed down in SOURCE order, which the
+    // recursion's own case (b) would bind to `baseCs->params[pi]` by position.
+    // That is NOT re-keyed by the §22.5 binding above, deliberately: the shape
+    // is unreachable. `baseCs` is non-null only when the base declares an
+    // explicit non-static constructor of this arity, and sema publishes a
+    // binding for this call only when it declares NONE (see
+    // `publishBaseChainPrimaryBinding`) — so whenever `baseFieldToArg` is
+    // non-empty, `baseCs` is null and `ctorArgVals` goes unread one level
+    // down. Widening the pairing here on an unreachable path would be an
+    // untestable change.
     const sema::ConstructorSymbol* baseCs = nullptr;
     if (!baseArgVals.empty()) {
         baseCs = ctorByArity(baseTs, baseArgVals.size(), nullptr);
