@@ -5201,6 +5201,124 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     return fromLeft ? fromLeft : fromRight;
 }
 
+// fix #4501 (§5.1 / §6.2 / §17.3 / §8.4, v0.306): the ONE place that answers
+// "does §5.1 admit an implicit conversion between these two operand types?"
+//
+// WHY IT IS ONE PLACE NOW. `typeBinary` carried TWO copies of this question:
+// one in the equality/relational arm (#1204) and one in the §6.2
+// arithmetic-promotion arm. The two agreed on the numeric-vs-numeric case and
+// both had the SAME hole — each made `isPromotablePrimitive(lt) &&
+// isPromotablePrimitive(rt)` a PRECONDITION OF REJECTING, so a pair in which
+// either operand was not a promotable numeric fell through the check entirely
+// and was silently admitted. That inverted the rule: §5.1 lists the pairs that
+// DO convert, and §6.2 makes a pair with no conversion a compile error, so
+// "not on the promotion list" is a reason to reject, never a reason to skip.
+//
+// Measured on 16e992f0 (docs v0.306), one compile + one run each:
+//   `string = 0`      -> reached codegen; `icmp eq ptr %2, i32 0` (+ five more
+//                        malformed instructions) -> "IR verification failed";
+//                        on an assertions-enabled LLVM the same IR aborts the
+//                        compiler in `ICmpInst::AssertOK` (SIGABRT, exit 134,
+//                        the symptom #4501 reports).
+//   `bool = "x"`      -> the same.
+//   `decimal = "x"`   -> "SExt only operates on integer".
+//   `bool = 0`        -> compiled with NO diagnostic and the program printed
+//                        `True`: a fabricated answer, the worst of the four.
+//
+// §17.3 fixes the authority for the equality arm: "`=` and `<>` invoke
+// `Equals` with a null-safe wrapper (§8.4)". `string` has no `Equals(int)` and
+// `bool` has no `Equals(int)`; the candidate set is empty, and §5.1 supplies
+// no conversion that would make one applicable. For the relational and
+// arithmetic arms the authority is §6.2 directly.
+//
+// WHAT IS NOT REJECTED, deliberately:
+//   * `Object` on either side. §5.1's reference conversions include "any type
+//     to `Object`" (boxing, §8.6), so `o = 5` IS admissible under §8.4 —
+//     `Object.Equals(Object?)` (§8.1) is the applicable candidate. (That row
+//     currently fails in LLVM's IR verifier; it is a CODEGEN defect with its
+//     own issue, and rejecting it here would be a false reject with no
+//     authority behind it.)
+//   * A nullable operand on either side: `s = null`, `x = null` and the
+//     lifted forms are §8.4/§7.11 questions answered elsewhere.
+//   * Identical primitives, and §5.1 widening pairs in either direction.
+//   * Named/unit/inline-array/function operands — the record, choice,
+//     interface, enum, `Object` and unit gates above own those, each with its
+//     own wording.
+//
+// THE LITERAL ESCAPE IS NOW KEYED ON THE OTHER OPERAND. §5.1's constant
+// narrowing lets an untyped integer constant adopt the other operand's type,
+// which is why `uint > 1000` must keep compiling (#1204). But a numeric
+// constant can only adopt a type a numeric constant can HAVE: §5.1's rule is
+// written over "any integer type whose range contains its value", and §4.3/
+// §4.4 give the float and decimal forms. It cannot adopt `bool` or `string`.
+// The old spelling asked only "is either side literal-derived?", so the `0` in
+// `string = 0` and in `bool = 0` exempted the pair all by itself — a second,
+// independent reason those two rows were admitted, and the reason fixing the
+// `isPromotablePrimitive` precondition alone would not have closed them.
+bool ExprTC::reportNoImplicitConversionBetweenOperands(
+    const ast::BinaryExpr& be, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt, bool allowLiteralAdoption) {
+    if (!lt || !rt) return false;
+    if (lt->kind != TypeRef::Kind::Primitive ||
+        rt->kind != TypeRef::Kind::Primitive)
+        return false;
+    if (lt->nullable || rt->nullable) return false;
+    if (lt->primitive == rt->primitive) return false;
+    if (lt->primitive == PrimitiveType::None ||
+        rt->primitive == PrimitiveType::None)
+        return false;
+    // §5.1 reference conversions: "any type to `Object`" (boxing, §8.6).
+    if (lt->primitive == PrimitiveType::Object ||
+        rt->primitive == PrimitiveType::Object)
+        return false;
+    // §5.1 numeric/char widening, either direction.
+    if (primitiveWidens(lt->primitive, rt->primitive) ||
+        primitiveWidens(rt->primitive, lt->primitive))
+        return false;
+    if (allowLiteralAdoption) {
+        // §5.1 constant narrowing — see the header comment: the constant adopts
+        // the OTHER operand's type, so the escape requires that type to be one
+        // a numeric constant can have.
+        if (isLiteralDerivedExpr(be.left.get()) &&
+            isPromotablePrimitive(rt->primitive))
+            return false;
+        if (isLiteralDerivedExpr(be.right.get()) &&
+            isPromotablePrimitive(lt->primitive))
+            return false;
+    }
+    const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
+                             isPromotablePrimitive(rt->primitive);
+    const std::string head =
+        std::string("operator `") + std::string(op) +
+        "` has no implicit conversion between operand types `" +
+        primitiveSpelling(lt->primitive) + "` and `" +
+        primitiveSpelling(rt->primitive) + "`";
+    if (bothNumeric) {
+        // The pre-existing §6.2 mixed-numeric wording, byte-for-byte: several
+        // lit rows pin it (`sema_mixed_numeric__*`, `sema_521_incompatible__*`).
+        ctx_.diagnostics().report(
+            Severity::Error, be.span.begin,
+            head + " (§6.2); add an explicit cast (§5.2) to convert"
+                   " one operand to the other's type.");
+    } else if (op == "=" || op == "<>") {
+        ctx_.diagnostics().report(
+            Severity::Error, be.span.begin,
+            head + " (§5.1) — `=`/`<>` invoke `Equals` "
+                   "(§17.3/§8.4) and §5.1 admits no conversion "
+                   "between these operand types, so there is no applicable "
+                   "`Equals` for the pair. Compare values of the same type, or "
+                   "convert one operand explicitly (§5.2) — for a flag, "
+                   "`int(b)`; for a rendering, `.ToString()` (§8.5).");
+    } else {
+        ctx_.diagnostics().report(
+            Severity::Error, be.span.begin,
+            head + " (§5.1) — §5.1's table has no row between "
+                   "them, so the operation is a compile error (§6.2); "
+                   "convert one operand explicitly (§5.2).");
+    }
+    return true;
+}
+
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     const auto& op = be.op;
     // §25: a user-defined operator overload takes precedence over the
@@ -6209,39 +6327,22 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return;
             }
         }
-        // per §6.2/§5.1 (#1204): relational/equality operators require that
-        // the two operand types be compatible (one must implicitly widen to
-        // the other, §5.1).  When both operands are non-nullable, non-literal
-        // typed primitives with no widening relation (e.g. `int` vs `uint`,
-        // `double` vs `decimal`), reject with the same §6.2 diagnostic the
-        // arithmetic path uses.  An operand that is a literal-derived
-        // expression (a bare integer or float literal, or a unary/binary
-        // expression built entirely from such literals) is treated as
-        // "adoptable" and does NOT trigger the rejection — this preserves
-        // patterns like `ulong > 1000` or `ulong > 0 - 5` which work without
-        // an explicit cast because the constant has no declared signedness.
+        // per §6.2/§5.1 (#1204) and §17.3/§8.4 (fix #4501, v0.306):
+        // relational and equality operators require the two operand types to
+        // be compatible — one must implicitly convert to the other (§5.1).
+        // This arm and the §6.2 arithmetic-promotion arm below are now ONE
+        // call rather than two near-identical copies: see
+        // `reportNoImplicitConversionBetweenOperands` for the rule, the four
+        // measured rows the shared hole admitted (`string = 0`, `bool = 0`,
+        // `bool = "x"`, `decimal = "x"`), and why `Object`, nullable operands
+        // and the §5.1 constant-narrowing escape (`ulong > 1000`) stay
+        // admitted. `and`/`or` are excluded: their operands are checked
+        // against `bool` by the §7.11/§6 gates above, not by a conversion.
         if (op != "and" && op != "or") {
             TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
             TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
-            if (lt && rt &&
-                lt->kind == TypeRef::Kind::Primitive &&
-                rt->kind == TypeRef::Kind::Primitive &&
-                !lt->nullable && !rt->nullable &&
-                lt->primitive != rt->primitive &&
-                !primitiveWidens(lt->primitive, rt->primitive) &&
-                !primitiveWidens(rt->primitive, lt->primitive) &&
-                isPromotablePrimitive(lt->primitive) &&
-                isPromotablePrimitive(rt->primitive) &&
-                !isLiteralDerivedExpr(be.left.get()) &&
-                !isLiteralDerivedExpr(be.right.get())) {
-                ctx_.diagnostics().report(
-                    Severity::Error, be.span.begin,
-                    std::string("operator `") + std::string(op) +
-                    "` has no implicit conversion between operand types `" +
-                    primitiveSpelling(lt->primitive) + "` and `" +
-                    primitiveSpelling(rt->primitive) +
-                    "` (§6.2/§5.1); add an explicit cast (§5.2) to convert"
-                    " one operand to the other's type.");
+            if (reportNoImplicitConversionBetweenOperands(
+                    be, op, lt, rt, /*allowLiteralAdoption=*/true)) {
                 ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 return;
             }
@@ -6622,19 +6723,18 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
                 // §6.2: no implicit conversion between the operand types
                 // (e.g. `double` and `decimal`, `float` and `decimal`,
-                // signed/unsigned same-or-narrower-width pairs).
-                if (isPromotablePrimitive(lt->primitive) &&
-                    isPromotablePrimitive(rt->primitive)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, be.span.begin,
-                        std::string("operator `") + std::string(op) +
-                        "` has no implicit conversion between operand types `" +
-                        primitiveSpelling(lt->primitive) + "` and `" +
-                        primitiveSpelling(rt->primitive) +
-                        "` (§6.2); add an explicit cast (§5.2) to convert one"
-                        " operand to the other's type.");
+                // signed/unsigned same-or-narrower-width pairs) — and, since
+                // fix #4501, any other primitive pair §5.1 does not relate
+                // (`string * int` died in LLVM's IR verifier before). This is
+                // the SAME call the equality/relational arm above makes; the
+                // two copies that used to answer it independently shared one
+                // hole, which is what made both #4500's and #4501's rows
+                // invisible. `allowLiteralAdoption` is false here because this
+                // arm has never had the #1204 escape — preserved exactly, not
+                // unified, since adding it would newly ADMIT `ulong + 1000`.
+                if (reportNoImplicitConversionBetweenOperands(
+                        be, op, lt, rt, /*allowLiteralAdoption=*/false))
                     return;
-                }
             }
         }
         // The result follows the (normalized) left operand: `lt` is already

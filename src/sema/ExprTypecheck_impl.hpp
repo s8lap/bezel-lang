@@ -1480,6 +1480,28 @@ private:
     // distinct). Identity is handled by the caller.
     static bool primitiveWidens(PrimitiveType from, PrimitiveType to);
 
+    // fix #4501 (§5.1/§6.2/§17.3/§8.4, v0.306): THE answer to "does §5.1
+    // admit an implicit conversion between these two operand types?", asked
+    // once for every binary operator that needs it. `typeBinary` carried TWO
+    // copies of this question — one in the equality/relational arm, one in the
+    // §6.2 arithmetic-promotion arm — and BOTH bailed out on any pair that was
+    // not numeric-vs-numeric, which is how `string = 0`, `bool = 0`,
+    // `bool = "x"` and `decimal = "x"` reached codegen. Reports and returns
+    // true iff the pair is inadmissible; the caller then does its own
+    // error-recovery typing.
+    //
+    // `allowLiteralAdoption` is the §5.1 constant-narrowing escape ("`uint >
+    // 1000`"): the equality/relational arm has had it since #1204 and the
+    // arithmetic arm never has. That asymmetry is PRE-EXISTING and left
+    // untouched here — removing the escape would be a false reject and adding
+    // it to arithmetic would newly ADMIT `ulong + 1000`, a separate question
+    // from this fix (filed as its own issue).
+    bool reportNoImplicitConversionBetweenOperands(const ast::BinaryExpr& be,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption);
+
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
     // interface)? BFS, cycle-guarded.
