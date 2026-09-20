@@ -53,17 +53,21 @@
 // 1. Both forms are now pinned here, and to the SAME value, so a future
 // divergence in EITHER direction goes red.
 //
-// ⚠ THE BOX LEAKS, KNOWINGLY, EXACTLY AS THE BLOCK FORM'S DOES. Measured on
-// the fixed compiler: 64 reads leak 1536 bytes in 64 allocations (24 B/read) —
-// byte-for-byte identical to the block form's, which #2760 already tracks and
-// which #2703 shipped for the same reason. §28.9 makes a box runtime-managed
-// and "exempt from manual disposal", so no free belongs at the accessor; who
-// owes the release is #2760's open question for BOTH forms. The trade taken
-// here is a bounded leak in place of a silent wrong answer (and, on the
-// argument path, in place of a failed build). Consequently the boxing cases
-// below use the PLAIN oracle: LeakSanitizer forces exit code 1, which would
-// destroy the value assertion. The two over-correction guards, where nothing
-// should be minted at all, DO run checked.
+// ⚠ THE LEAK THIS BLOCK USED TO RECORD IS FIXED (#2760, v0.306). It read:
+// "THE BOX LEAKS, KNOWINGLY, EXACTLY AS THE BLOCK FORM'S DOES … who owes the
+// release is #2760's open question for BOTH forms." §28.9's *Accessor faces
+// are uniform across type kinds* paragraph answered that question — a getter's
+// fresh runtime-managed production "remains admissible … and the
+// implementation reclaims the production; how is not specified" — and #2760
+// implemented it for both §23.3 body spellings at once, keying the release on
+// the READER'S BINDING. The leak-clean rows for these very programs now live
+// in object_property_getter_box_reclaim_2760_test.cpp (×200, runAotChecked).
+//
+// The boxing cases below still use the PLAIN oracle, which is now a
+// CONSERVATIVE choice rather than a necessary one: these rows exist to pin the
+// #2761 VALUE (the expression form must agree with the block form), and the
+// leak oracle for the same shapes is #2760's file. The two over-correction
+// guards, where nothing should be minted at all, DO run checked.
 //
 // ⚠ NOT FIXED, AND DELIBERATELY PINNED AS STILL-BROKEN BELOW: the
 // VIRTUAL/vtable face (`public virtual property O: Object => 0;`). That

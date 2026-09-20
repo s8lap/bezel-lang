@@ -15924,6 +15924,19 @@ private:
     // Parallel to isUserMethodClosureReturnCall for closures.
     bool isUserMethodBoxReturnCall(const ast::Expr* init) const;
 
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): true when `init` is a READ of
+    // a user-defined, locally-compiled, NON-VIRTUAL property whose declared
+    // type is Object or an interface AND whose getter body provably always
+    // produces a boxable value source — so `boxForTarget` at the getter's
+    // return edge always mints a fresh rc=1 box the read hands back. The
+    // property twin of `isUserMethodBoxReturnCall`; see
+    // `boxReturnPropertyMemo_` for the §28.9 warrant. Non-virtual is
+    // LOAD-BEARING: an override could return a class reference through the
+    // same `Object` face, and releasing THAT as a box is a UAF, not a leak.
+    bool isUserPropertyBoxRead(const ast::Expr* init);
+    // Uncached core of isUserPropertyBoxRead (memoized by it).
+    bool computeIsBoxReturnProperty(const sema::PropertySymbol* ps);
+
     // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: true when `target` is
     // an Object- or interface-typed CLASS instance field / auto-property lvalue
     // (NOT a local / param / ref-param / array element / static field / record
@@ -16051,6 +16064,33 @@ private:
     // are lowered. A call to such a method is recognized as a +1 box producer
     // by isUserMethodBoxReturnCall / isPlusOneBoxProducer.
     std::unordered_set<const sema::MethodSymbol*> boxReturnMethods_;
+
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): the PROPERTY analogue of
+    // `boxReturnMethods_`, memoized per PropertySymbol. §28.9's *Accessor
+    // faces are uniform across type kinds* paragraph settles the question
+    // #2760 asked ("ruling needed before implementing"): an `Object`-typed
+    // getter whose body produces a fresh runtime-managed value "remains
+    // admissible ... and the implementation reclaims the production; how is
+    // not specified" — so the shape is legal and the leak is a defect, and
+    // the SAME sentence makes the two body spellings of §23.3 (`get => e`
+    // and `get => do ... end`) "semantically indistinguishable at every read
+    // site", which is why one predicate covers both. The box the getter mints
+    // at its return edge is therefore discharged by the READER'S BINDING at
+    // that binding's release point, exactly as a `boxReturnMethods_` call's
+    // is — no obligation reaches user code, per the same paragraph's
+    // "a getter never transfers a reclamation obligation to its reader".
+    //
+    // ⚠ SCOPE: this predicate is consulted from `boxLocalAssignmentSourceKind`
+    // only, so it closes the BOUND face. At an unbound type-test site
+    // (`if h.O is int then`) `lowerTypeTest`'s `freshBoxTemp` still asks
+    // `lastBoxMint_ || isUserMethodBoxReturnCall`, which the INLINED
+    // expression-body form satisfies by mint identity and the compiled
+    // block-body form cannot — measured 4800 B / 200 for the block form,
+    // clean for the expression form. The two §23.3 spellings therefore still
+    // diverge there; that residual is tracked as issue #4497 rather than
+    // claimed closed here.
+    // Value: true = every getter exit produces a fresh +1 box.
+    std::unordered_map<const sema::PropertySymbol*, bool> boxReturnPropertyMemo_;
     // Scan all MethodDecl bodies to populate boxReturnMethods_. A method is a
     // "box return method" if its declared return type is Object/interface,
     // it is locally compiled (not imported), and every ReturnStmt in its body

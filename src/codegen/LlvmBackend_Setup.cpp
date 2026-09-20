@@ -26948,6 +26948,139 @@ bool Emitter::isUserMethodBoxReturnCall(const ast::Expr* init) const {
 }
 
 
+// fix #2760 (§8.6 / §28.9 / §23.3, v0.306): see the declaration in
+// LlvmBackend_impl.hpp. The PROPERTY face of the one box-lifetime rule — a
+// §8.6 box is discharged by the holder of the binding it flows into, at that
+// binding's release point.
+//
+// WHY THIS IS NOT A SPEC QUESTION (#2760 asked for a ruling; §28.9 gives one).
+// §28.9's *Accessor faces are uniform across type kinds* paragraph, at v0.306:
+// "A getter body whose result is a fresh runtime-managed production (an
+// interpolation, a concatenation, a library call) remains admissible —
+// runtime-managed values are exempt from the ceremony — and the implementation
+// reclaims the production; how is not specified." That settles both halves the
+// issue was blocked on: reading 2 there ("A4 forbids the shape entirely") is
+// REFUTED — the shape "remains admissible" — and the leak is a defect, because
+// the implementation is required to reclaim. The same sentence also states the
+// two §23.3 body spellings are "semantically indistinguishable at every read
+// site", which is why ONE predicate serves the `get => e` and `get => do … end`
+// forms that #2760's own comment thread measured as byte-identical leaks.
+//
+// The `how` the spec leaves open is the recorded design decision (CLAUDE.md
+// rule 4): the reader's binding discharges it, i.e. the SAME mechanism
+// `boxReturnMethods_` already gives the method spelling, rather than a
+// statement-end release at the read site. That keeps §28.9's "no manual
+// disposal" true (the release is compiler-inserted, never user-visible) and
+// keeps the accessor face a LEND (the getter transfers no obligation — the
+// caller-side release is the implementation reclaiming its own production, not
+// an obligation the reader can observe or must discharge).
+//
+// NON-VIRTUAL IS LOAD-BEARING, not defensive tidiness. The classification is
+// read off the statically-resolved PropertySymbol's OWN getter body; a virtual
+// property's override can return a class reference through the same `Object`
+// face, and handing a class instance to `bz_box_release` corrupts the
+// disposed-flag word at offset 8 — a UAF, which is categorically worse than
+// the leak being fixed. An abstract/interface property has no body at all and
+// is excluded by the same gate.
+bool Emitter::isUserPropertyBoxRead(const ast::Expr* init) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init);
+    if (!ma) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    if (ctx_.isImported(ps)) return false;   // its getter ran another module's
+                                             // boxForTarget, not this one's
+    auto it = boxReturnPropertyMemo_.find(ps);
+    if (it != boxReturnPropertyMemo_.end()) return it->second;
+    bool answer = computeIsBoxReturnProperty(ps);
+    boxReturnPropertyMemo_.emplace(ps, answer);
+    return answer;
+}
+
+// The uncached core of isUserPropertyBoxRead. Mirrors collectBoxReturnMethods'
+// per-method classification, applied to a property's GET accessor.
+bool Emitter::computeIsBoxReturnProperty(const sema::PropertySymbol* ps) {
+    // SEAM-ACCESSOR: gated by `isUserPropertyBoxRead`'s
+    // `if (ctx_.isImported(ps)) return false;` — this core is never reached
+    // for an imported symbol, whose getter ran its OWN module's
+    // `boxForTarget` and therefore cannot be a +1 producer for this one.
+    // Same gate `collectBoxReturnMethods` applies to `sym->decl`. #3152
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd || !pd->type) return false;
+    // A virtual/abstract/overriding property is dispatched dynamically; the
+    // body read here is not necessarily the body that runs. Fail closed.
+    for (auto& mod : pd->modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*pd->type);
+    if (!rt || !isObjectOrInterfaceTarget(rt)) return false;
+
+    auto boxableExpr = [&](const ast::Expr* e) {
+        if (!e) return false;
+        const sema::TypeRef* srcTy = ctx_.exprType(*e);
+        return srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy));
+    };
+    // Every `return <v>` in a block getter must carry a boxable value, and at
+    // least one must exist — the collectBoxReturnMethods rule verbatim (a
+    // fall-off-the-end getter produces nothing this can classify).
+    bool allBox = true, hasReturn = false;
+    std::function<void(const ast::Stmt*)> scanStmt;
+    auto scanStmts = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+        for (auto& s : v) scanStmt(s.get());
+    };
+    scanStmt = [&](const ast::Stmt* s) {
+        if (!s || !allBox) return;
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (rs->value) {
+                hasReturn = true;
+                if (!boxableExpr(rs->value.get())) allBox = false;
+            }
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            scanStmts(is->ifBranch.body);
+            for (auto& br : is->elifBranches) scanStmts(br.body);
+            scanStmts(is->elseBody);
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            scanStmts(ws->body);
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            scanStmts(fs->body);
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            scanStmts(d->body);
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            scanStmts(ts->body);
+            for (auto& c : ts->catches) if (c.body) scanStmt(c.body.get());
+            scanStmts(ts->finallyBody);
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms) scanStmts(arm.stmts);
+        }
+    };
+
+    // §23.3 form 1: `property O: Object => <expr>;` (the #2761 spelling —
+    // inlined at the read site, so the mint lands in the CALLER's frame).
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+        return boxableExpr(pd->exprBody.get());
+    // §23.3 form 2: an accessor block with a `get` arm. Both accessor body
+    // spellings count, per §28.9's "semantically indistinguishable" sentence.
+    if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (auto& acc : pd->accessors) {
+            if (acc.isSet) continue;
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                return boxableExpr(acc.exprBody.get());
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
+                scanStmts(acc.stmts);
+                return allBox && hasReturn;
+            }
+            return false;   // Abstract getter — no body to classify.
+        }
+    }
+    // PropertyBodyKind::Auto: the backing field HOLDS whatever was stored into
+    // it; a read is not a fresh mint, so it is not a +1 producer. (The store
+    // side is boxStorageFields_' job, and the field's own release is
+    // emitDisposerCore's.)
+    return false;
+}
+
+
 // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. A target expression is a box-storage-eligible
 // Object/interface-typed class instance field / auto-property lvalue iff:
@@ -32559,8 +32692,18 @@ int Emitter::boxLocalAssignmentSourceKind(const ast::Expr* valueExpr) {
                 return 1;
         }
     }
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): a read of a locally-compiled,
+    // non-virtual `Object`-typed property whose getter provably mints a box at
+    // every exit is a +1 producer exactly as a `boxReturnMethods_` CALL is —
+    // the same value, produced by the same `boxForTarget`, differing only in
+    // whether the getter body was inlined (§23.3's expression form) or
+    // compiled to `bz$prop$<N>$get` (its block form). It is placed HERE, in
+    // the one shared source classifier, rather than at the bind site, so the
+    // local-decl path, the reassignment path and `collectBoxReleaseEligible`
+    // cannot drift about it — the drift this family is made of.
     if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy) ||
-        isUserMethodBoxReturnCall(valueExpr))
+        isUserMethodBoxReturnCall(valueExpr) ||
+        isUserPropertyBoxRead(valueExpr))
         return 1;
     if (isObjectOrInterfaceTarget(srcTy)) return -1;
     return 0;
