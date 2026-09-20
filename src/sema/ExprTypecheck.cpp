@@ -13040,6 +13040,41 @@ void ExprTC::checkCollectionLiteralElementAssignability(
                 for (const auto& el : cl.elements) {
                     if (!el) continue;
                     if (dynamic_cast<const ast::NewExpr*>(el.get())) {
+                        // narrow #4351 (spec §15.1 / §8.6 / §28.9, v0.306):
+                        // the class-typed test above reads the SLOT type, but
+                        // §15.1's borrow-only contract is a statement about
+                        // what the slot *stores*. A `new R(...)` whose R is a
+                        // VALUE type (a record, enum, or choice) at an
+                        // `Object`- or interface-typed slot does not store a
+                        // class instance at all: it is **boxed** (§8.6 — "a
+                        // heap-allocated wrapper holds the value"), and a box
+                        // is runtime-managed (§28.9's "Boxed value types"
+                        // bullet), i.e. exempt from manual disposal and of
+                        // unbounded lifetime by construction. There is no
+                        // fresh owned producer to leave ownerless and no
+                        // borrow whose source could die, so §15.1's "must be
+                        // borrows of class instances already owned elsewhere"
+                        // has nothing to bind — exactly as §15.1's own
+                        // `var pt: [2]Point := [new Point(0, 0), …]` example
+                        // (a record element) is admitted at a NON-owning
+                        // slot. #4351's scope note already said records were
+                        // out of scope; keying the test on the element
+                        // EXPRESSION's constructed type rather than the slot
+                        // type is what makes that true at an interface slot
+                        // (#4427 field/property init, #4467 static init).
+                        //
+                        // An unresolved element type keeps the rejection:
+                        // #4351's contract is no weaker for anything this
+                        // cannot prove to be a boxed value.
+                        const TypeRef* elTy = ctx_.exprType(*el);
+                        const bool constructsClassInstance =
+                            !elTy || elTy->kind != TypeRef::Kind::Named ||
+                            !elTy->declaration ||
+                            elTy->declaration->kind ==
+                                ast::TypeDeclKind::Class ||
+                            elTy->declaration->kind ==
+                                ast::TypeDeclKind::Interface;
+                        if (!constructsClassInstance) continue;
                         ctx_.diagnostics().report(
                             Severity::Error, el->span.begin,
                             "collection-literal element is a fresh producer "
