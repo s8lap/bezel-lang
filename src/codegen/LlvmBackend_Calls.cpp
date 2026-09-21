@@ -1719,6 +1719,31 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         return builder_.CreateICmpEQ(el, target);
     }
 
+    // fix #4553 (§17.5 / §8.4, v0.306): a NULLABLE VALUE element — `Array<int?>`,
+    // `Set<Color?>`, a `T?` span slot — lowers to the tagged
+    // `{i8 hasValue, T value}` struct, and NO arm above claims it:
+    // `recordTypeOfRef` declines a primitive, the class arm needs two pointers,
+    // the string arm needs two pointers. It therefore fell through to the scalar
+    // comparison below, which emitted `icmp eq { i8, i32 } %el, %tgt` — an
+    // operand shape `ICmp` rejects outright, so the whole compile died in IR
+    // verification ("Invalid operand types for ICmp instruction").
+    //
+    // §17.5 fixes what the comparison must be: "Where the selected `Contains`
+    // parameter is **itself** nullable — `Array<int?>`'s `Contains(item: int?)`
+    // … — a nullable left operand is **admitted**: the test performed is the
+    // null-safe equality of §8.4, total over an absent operand". §8.4's rule is
+    // both-null → equal, exactly-one-null → not-equal, both-present → the inner
+    // type's equality — which `emitValueEquality`'s nullable-value branch
+    // already implements (issue #364), so route to it rather than re-deriving
+    // it here and risking a second spelling of one rule.
+    //
+    // Every caller of this helper gets the fix at once: `x in coll` (the §17.5
+    // lowering), `.Contains`, `.Remove`, `.IndexOf`, and the array-backed
+    // `Set<T>` dedup insert all compare elements through here.
+    if (isNullableValueTy(elemTy) && el->getType()->isStructTy() &&
+        target->getType()->isStructTy())
+        return emitValueEquality(el, target, elemTy);
+
     // String element: content equality (§4.6).
     if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
         return emitStringEq(el, target);
