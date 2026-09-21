@@ -1744,6 +1744,35 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         target->getType()->isStructTy())
         return emitValueEquality(el, target, elemTy);
 
+    // fix #4571 (§4.4/§8.3, v0.306): a non-nullable DECIMAL element —
+    // `Array<decimal>`, `LinkedList<decimal>`, the array-backed `Set<decimal>`
+    // dedup insert — lowers to the 16-byte `%bz.decimal` struct
+    // (decimalStructType(), `{i32×4}`). No arm above claims it: `recordTypeOfRef`
+    // declines a primitive, the class arm needs two pointers, and the
+    // nullable-value arm just above declines it too (a bare `decimal` is not a
+    // nullable-value SHAPE — `isNullableValueTy` is false for it; only `decimal?`
+    // would match, and that already routes correctly through the arm above). It
+    // therefore fell through to the scalar fallback at the bottom of this
+    // function, which built `icmp eq %bz.decimal %el, %tgt` — an operand shape
+    // `ICmpInst` rejects outright (int/ptr/vector-of-int-or-ptr only), so the
+    // whole compile died in IR verification ("Invalid operand types for ICmp
+    // instruction").
+    //
+    // `emitValueEquality` already has a non-nullable-decimal arm
+    // (LlvmBackend_Layout.cpp, fix #663) implementing the correct comparison —
+    // `bz_decimal_cmp`, scale-invariant per §4.4 (`3.0m == 3.00m` despite
+    // differing scale bits) — and fix #4562 routed the sibling
+    // `lowerValueSemMethodOn` dispatch (`decimal.Equals`) through that SAME
+    // helper for that SAME reason. Route here too rather than re-deriving a
+    // third spelling of one rule: narrow #4553, immediately above, made exactly
+    // this argument for the nullable-value shape ("route to it rather than
+    // spelling one rule twice").
+    if (elemTy && elemTy->kind == sema::TypeRef::Kind::Primitive &&
+        elemTy->primitive == sema::PrimitiveType::Decimal && !elemTy->nullable &&
+        el->getType() == decimalStructType() &&
+        target->getType() == decimalStructType())
+        return emitValueEquality(el, target, elemTy);
+
     // String element: content equality (§4.6).
     if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
         return emitStringEq(el, target);
