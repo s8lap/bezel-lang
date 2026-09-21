@@ -841,8 +841,24 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
         // The VIRTUAL arm above was already correct (the per-instantiation
         // `vt$<C>$specN` carries the specialized method), which is why only a
         // non-virtual `CompareTo` was affected.
+        // fix #3566 (second shape, stdlib §4.17 / §2.8.3 rule 4, v0.306): the
+        // `genericInst` gate asks whether the ELEMENT type is a constructed
+        // generic, which is the right question only while the `CompareTo`
+        // being specialized is declared by that element type. A NON-generic
+        // class over a generic base — `class DPlain: GBase<long>` — has no
+        // generic params of its own, so `genericInst` is false and the
+        // placeholder template was called: measured `first=3 last=2 count=3`
+        // (insertion order) on the identical `SortedDictionary` repro. The
+        // layout that matters belongs to `GBase<long>`, not to `DPlain`.
+        // `specializedClassCompareToFn` resolves the base's parameters from
+        // the base CLAUSE in that case, so the element type need not be
+        // generic at all; `instArgs` and `gpNames` are both empty here, which
+        // its own `instArgs.size() != gpNames.size()` guard admits, and the
+        // thunk name and cache key (`descIdentityKey(decl, {})`) are the
+        // pre-#3530 one-thunk-per-type form, unchanged.
         llvm::Function* target = nullptr;
-        if (genericInst)
+        if (genericInst || (cmpMs->parent && ty->declaration &&
+                            cmpMs->parent != ty->declaration))
             target = specializedClassCompareToFn(ty, cmpMs, gpNames, instArgs,
                                                  fnIt->second);
         if (!target) target = fnIt->second;
