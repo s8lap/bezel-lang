@@ -208,14 +208,22 @@ inline int asanBuildFailure(const char* stage, const char* tag = nullptr) {
     return -2;
 }
 
-// -3: the link under `-fsanitize=address` failed. `captured` is the link
-// command's stderr when the caller kept it (run_under_asan.hpp does; the
-// per-file copies redirect to /dev/null and pass nothing).
+// -3: the sanitizer link failed. `captured` is the link command's stderr when
+// the caller kept it (run_under_asan.hpp does; the per-file copies redirect to
+// /dev/null and pass nothing).
+//
+// Deliberately does NOT name `-fsanitize=address`: two runners in this family
+// (async_test.cpp, async_618_domain_serial_test.cpp) are parameterised on the
+// sanitizer and link `-fsanitize=` + san, so a TSan link failure would be
+// reported under an ASan banner. Measured while verifying #4569 — dropping the
+// `san == "address"` guard there produced 23 rows reporting
+// "`clang++ -fsanitize=address` failed" for a `-fsanitize=thread` link.
 inline int asanLinkFailure(const char* stage, const std::string& captured = {},
                            const char* tag = nullptr) {
     asan_detail::noteAsanInfraFailureOf(
         "link", tag,
-        std::string("`clang++ -fsanitize=address` failed at stage \"") +
+        std::string("the sanitizer link (clang++ -fsanitize=...) failed at "
+                    "stage \"") +
             (stage ? stage : "?") + "\"" +
             (captured.empty() ? std::string("; stderr was not captured")
                               : "; captured stderr:\n" + captured),
