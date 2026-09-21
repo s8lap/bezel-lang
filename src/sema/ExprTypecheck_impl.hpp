@@ -1491,11 +1491,13 @@ private:
     // error-recovery typing.
     //
     // `allowLiteralAdoption` is the §5.1 constant-narrowing escape ("`uint >
-    // 1000`"): the equality/relational arm has had it since #1204 and the
-    // arithmetic arm never has. That asymmetry is PRE-EXISTING and left
-    // untouched here — removing the escape would be a false reject and adding
-    // it to arithmetic would newly ADMIT `ulong + 1000`, a separate question
-    // from this fix (filed as its own issue).
+    // 1000`"): the equality/relational arm has had it since #1204. fix #4512
+    // (§5.1/§6.2, v0.306) enables it for the arithmetic arm too (`ulong +
+    // 1000` now admits, matching `ulong > 1000`) and narrows the escape's own
+    // predicates (`isLiteralDerivedExpr`, and the true-integer-only target
+    // check inside this function) to §5.1's exact domain — see that fix's
+    // citation trail for why the escape needed narrowing before it could be
+    // safely enabled for a second call site.
     bool reportNoImplicitConversionBetweenOperands(const ast::BinaryExpr& be,
                                                    std::string_view op,
                                                    const TypeRef* lt,
