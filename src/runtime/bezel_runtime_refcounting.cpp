@@ -127,8 +127,15 @@ extern "C" void bz_string_release(void* s) {
     int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
     if (__atomic_load_n(rcp, __ATOMIC_RELAXED) == BZ_STRING_RC_SENTINEL)
         return;                                // static/literal — never freed
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("string");
     // Last reference gone: free the data buffer, then the header. Read the data
     // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
     // empty-string case may carry a null data pointer).
@@ -347,8 +354,16 @@ extern "C" void bz_closure_retain(void* c) {
 extern "C" void bz_closure_release(void* c) {
     if (!c) return;
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site, e.g. #4540's racing releases) drives the count
+    // negative. Report it HERE, at the release that first goes negative,
+    // instead of falling through to a second free() below (see
+    // bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("closure");
     // Last reference gone.
     void* env;
     memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
@@ -468,8 +483,15 @@ extern "C" void bz_box_retain(void* b) {
 extern "C" void bz_box_release(void* b) {
     if (!b) return;
     int64_t* rcp = (int64_t*)((uint8_t*)b + BZ_BOX_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("box");
     // Last reference gone: free the box wrapper. The boxed value is a value type
     // (a leaf — no owned sub-objects), so nothing else is freed; the single
     // calloc'd cell is released exactly once. The box was proven non-escaping by
