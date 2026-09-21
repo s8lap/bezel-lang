@@ -11511,17 +11511,30 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // folded in).
             // // per §22.5, fix #4491
             std::vector<int> clauseFieldToArg;
-            if (baseTs && baseTs->hasPositionalFields) {
-                bool explicitCtorOfThisArity = false;
+            // fix #4551 (§22.5 / §22.6 / §22.10, v0.306): HOISTED out of the
+            // primary-list block below so the two arms read ONE answer.
+            // `explicitCtorOfThisArity` is what decides which of the two
+            // formal lists the clause binds — the base's §22.10 PRIMARY
+            // parameter list, or an explicit constructor — and each arm now
+            // CHECKS the clause it owns. Two independently computed copies
+            // could both fire (two diagnostics for one clause) or neither, so
+            // there is one.
+            bool explicitCtorOfThisArity = false;
+            // The count is the other half of §22.5's "report only where no
+            // candidate survives": with exactly one non-static constructor
+            // there is no sibling left to resolve to.
+            std::size_t nonStaticCtorCount = 0;
+            if (baseTs) {
                 for (Symbol* m : baseTs->members) {
                     auto* other = dynamic_cast<ConstructorSymbol*>(m);
                     if (!other || other->isStatic) continue;
+                    ++nonStaticCtorCount;
                     if (other->params.size() ==
-                        td->primaryBaseCtorArgs.size()) {
+                        td->primaryBaseCtorArgs.size())
                         explicitCtorOfThisArity = true;
-                        break;
-                    }
                 }
+            }
+            if (baseTs && baseTs->hasPositionalFields) {
                 const std::vector<const Symbol*> fields =
                     recordPositionalFieldSymbols(baseTs);
                 if (!explicitCtorOfThisArity && !fields.empty() &&
@@ -11658,6 +11671,93 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         clauseCtor = other;
                     }
                 }
+                // fix #4551 (§22.5 "Optional parameters and named arguments"
+                // / §22.6 / §22.10, v0.306): §22.5 VALIDITY for THIS arm —
+                // the last silent one in the family #4496 (the `base(...)`
+                // chain) and #4518 (the clause bound to the base's PRIMARY
+                // list) closed. #4520 left this binder `emit=false` and
+                // recorded why: its subject was binding ORDER, so a new
+                // rejection belonged to this gap. This is that deferral
+                // closed.
+                //
+                // MEASURED ON 1ee866a9, all against `class B` whose only
+                // constructor is `constructor(a: int, b: string)`, compiled
+                // AND RUN — every one at exit 0 with NO diagnostic:
+                //
+                //   : B(zz := v, b := "e")   printed `4` / `e`. The WORST
+                //                            row: the argument naming a
+                //                            parameter that does not exist
+                //                            was not inert — it supplied `a`
+                //                            BY POSITION, exactly the
+                //                            pre-#4518 behaviour of the
+                //                            primary-list arm.
+                //   : B(a := v, a := 2)      printed `0` and a blank line
+                //   : B(v, a := 2, b := "e") printed `0` and a blank line
+                //   : B(v, "e", 3)           printed `0` and a blank line
+                //
+                // The three quiet rows are `B`'s own declared field
+                // initializers: neither resolver found a callee, so
+                // `emitImplicitBase` fell through to its arity-0 fallback and
+                // the base was never constructed.
+                //
+                // WHERE IT REPORTS, per §22.5's OWN split — this is not a
+                // one-word flip, because unlike the primary-list arm the
+                // binder must first decide whether the clause even NAMES this
+                // constructor. §22.5: an unbound required parameter "makes
+                // the candidate inapplicable … so at an overloaded name an
+                // applicable sibling still resolves and the error is reported
+                // only where no candidate survives". So the binder is LOUD
+                // only when both hold:
+                //
+                //   * the base declares exactly ONE non-static constructor —
+                //     no sibling can survive this one's rejection; and
+                //   * the clause does not bind the base's §22.10 PRIMARY
+                //     parameter list instead, which is the hoisted
+                //     `explicitCtorOfThisArity` gate above. That gate is the
+                //     EXACT complement of the primary-list block's own, so a
+                //     clause is checked by exactly one of the two arms — and
+                //     `class D(v: int) : B(v, "x")` over a base with a
+                //     §22.10 primary list of arity 2 and a convenience
+                //     `constructor(a: int)` still binds the PRIMARY list and
+                //     is checked there, not rejected here.
+                //
+                // DECLINED, WITH REASONS (CLAUDE.md §4): §22.5 also says a
+                // doubly-bound parameter or one named by no parameter "is a
+                // compile error at the call naming that parameter — not an
+                // applicability failure", so those two are in principle
+                // reportable even against an OVERLOAD SET. Not done here: at
+                // an overload set the name a clause gives may belong to a
+                // SIBLING, and `bindArgsToParams` answers per candidate, so
+                // reporting from a single candidate's decline would reject
+                // working code. It needs a scan over every candidate before
+                // it can say "no parameter of any candidate is named `zz`",
+                // which is a second change to a different shape; filed rather
+                // than folded in. Likewise "no constructor of this arity at
+                // all" is left to whatever diagnoses an unresolvable base
+                // call today — nothing is published or reported for it here.
+                //
+                // Also unchanged: §5.1 ASSIGNABILITY of each bound argument
+                // to its slot's type, the same outstanding item #4496 and
+                // #4518 record for their arms.
+                const bool soleCandidate = nonStaticCtorCount == 1;
+                const bool clauseBindsPrimaryList =
+                    baseTs->hasPositionalFields && !explicitCtorOfThisArity;
+                const bool emitClauseCtorBinding =
+                    soleCandidate && !clauseBindsPrimaryList;
+                // fix #4551: with exactly one non-static constructor, the
+                // candidate scan above found it or found nothing — and
+                // "nothing" happens only when that one constructor has FEWER
+                // formals than the clause supplies, which is §22.5's
+                // over-supply rejection and must be reported against it
+                // rather than dropped.
+                if (!clauseCtor && !ambiguousArity && emitClauseCtorBinding) {
+                    for (Symbol* m : baseTs->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!other || other->isStatic) continue;
+                        clauseCtor = other;
+                        break;
+                    }
+                }
                 if (clauseCtor && !ambiguousArity) {
                     const std::string desc =
                         std::string("inheritance-clause base call to a "
@@ -11667,7 +11767,7 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         sema::FormalsView::of(*clauseCtor),
                         td->primaryBaseCtorArgs,
                         td->primaryBaseCtorArgs[0].value->span.begin, desc,
-                        /*emit=*/false);
+                        /*emit=*/emitClauseCtorBinding);  // fix #4551
                     if (cb.ok)
                         ctx_.setInheritanceClauseCtorBinding(
                             &td->primaryBaseCtorArgs, clauseCtor,
