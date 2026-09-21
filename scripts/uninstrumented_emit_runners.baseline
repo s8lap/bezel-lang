@@ -52,7 +52,6 @@
 1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
 1    tests/codegen/serialization_668_669_test.cpp
 1    tests/codegen/serialization_tier2_classes_test.cpp
-1    tests/codegen/serialization_tier3_graph_test.cpp
 1    tests/codegen/serialization_tier4_poly_test.cpp
 1    tests/codegen/set_dispose_leak_1012_test.cpp
 1    tests/codegen/shared_sync_689_contention_test.cpp
