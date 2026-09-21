@@ -1574,6 +1574,91 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                          isUnsignedInt;
                             bool isFP  = pt == P::Double || pt == P::Float;
                             if (isInt || isFP) {
+                                // fix #4559 (§8.1/§8.4/§8.6/§5.1, v0.306):
+                                // classify the ARGUMENT from its static type
+                                // BEFORE lowering it, so a reroute below does
+                                // not lower the argument expression a second
+                                // time (§22.5, exactly-once).
+                                // `IEquatable<T>.Equals(other: T)` binds T to
+                                // the receiver's own numeric FAMILY — an
+                                // int-kind receiver meeting a wider/narrower
+                                // int-kind argument is the #730 generic-
+                                // substitution widening this arm already
+                                // handles below and must keep handling.
+                                // Anything else — `Object`, an interface, a
+                                // class, `string`, a nullable value type, or
+                                // the OTHER numeric family (an int receiver
+                                // meeting an FP argument or vice versa) —
+                                // cannot be this overload: resolution can only
+                                // have reached `.Equals` through the universal
+                                // `Object.Equals(Object?)` member (§8.1),
+                                // whose formal is `Object?` and whose value
+                                // operand boxes per §8.6. The prior code took
+                                // the scalar fast path unconditionally and
+                                // SExt'd/FPExt'd whatever `rhs` turned out to
+                                // be — malformed IR ("SExt only operates on
+                                // integer" / "FPExt only operates on FP") —
+                                // measured for an `Object` argument (the
+                                // issue's own repro), an interface, a plain
+                                // class, `string`, a nullable primitive
+                                // (`int?`), and a cross-family primitive
+                                // (`double.Equals(int)`).
+                                const sema::TypeRef* argTy =
+                                    ctx_.exprType(*call->args[0].value);
+                                // Mirror the #730 bare-type-parameter
+                                // substitution applied to `tt` above (same
+                                // predicate, same map) so a generic
+                                // `Eq<T>(a: T, b: T) where T: IEquatable<T>`
+                                // body — where BOTH operands are the bare
+                                // parameter `T` — resolves `b`'s type exactly
+                                // as `a`'s was resolved, and the family check
+                                // below agrees with the receiver's family
+                                // instead of misreading an unsubstituted `T`
+                                // as "not this family" (#863).
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Named &&
+                                    !argTy->declaration &&
+                                    !genericSubstSemaTy_.empty() &&
+                                    argTy->astNode && argTy->astNode->name &&
+                                    argTy->astNode->name->parts.size() == 1) {
+                                    auto ait = genericSubstSemaTy_.find(
+                                        argTy->headName());
+                                    if (ait != genericSubstSemaTy_.end() &&
+                                        ait->second &&
+                                        ait->second->kind ==
+                                            sema::TypeRef::Kind::Primitive)
+                                        argTy = ait->second;
+                                }
+                                bool argSameFamily = argTy &&
+                                    !argTy->nullable &&
+                                    argTy->kind ==
+                                        sema::TypeRef::Kind::Primitive &&
+                                    (isFP
+                                         ? (argTy->primitive == P::Double ||
+                                            argTy->primitive == P::Float)
+                                         : (argTy->primitive == P::Int ||
+                                            argTy->primitive == P::Long ||
+                                            argTy->primitive == P::Short ||
+                                            argTy->primitive == P::SByte ||
+                                            argTy->primitive == P::Char ||
+                                            argTy->primitive == P::Bool ||
+                                            argTy->primitive == P::UInt ||
+                                            argTy->primitive == P::ULong ||
+                                            argTy->primitive == P::UShort ||
+                                            argTy->primitive == P::Byte));
+                                if (!argSameFamily) {
+                                    llvm::Value* lhs = lowerExpr(*ma->target);
+                                    if (!lhs) return nullptr;
+                                    // Box the receiver and dispatch through
+                                    // `lowerObjectEquals` — the exact shape
+                                    // `lowerValueSemUniversalEquals` already
+                                    // uses for `5.Equals(o)` (#3480) and the
+                                    // record/enum/choice receivers above, so
+                                    // this one rule stays at one call site
+                                    // rather than growing a second spelling.
+                                    return lowerValueSemUniversalEquals(
+                                        tt, lhs, *call);
+                                }
                                 llvm::Value* lhs = lowerExpr(*ma->target);
                                 llvm::Value* rhs = lowerExpr(*call->args[0].value);
                                 if (!lhs || !rhs) return nullptr;
