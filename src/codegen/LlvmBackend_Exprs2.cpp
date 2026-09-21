@@ -2474,18 +2474,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // defect. So adding a balanced retain/release pair cannot turn a free
         // into a double free; the only arithmetic failure available is a
         // surviving leak, which is the PRIME DIRECTIVE's safe direction.
+        // fix #4523: that claim is TRUE BUT INCOMPLETE, and the gap was a
+        // deterministic SIGSEGV. The failure mode #4509 did not enumerate is
+        // not a double free but an extra release registered into the WRONG
+        // BODY's scope — see the classification below for how the frame's
+        // release is now gated, and `declScopeDepthFn_` for why the depth alone
+        // could never license the index.
         //
         // DELIBERATELY EXCLUDED, each a separate shape with its own reclaim
         // story: a for-var (fresh cell per iteration, #4129/#4161), an inline
-        // owned array (the #747/#782 element-dispose-through-cell pairing), a
-        // cell reached by the §27.5/#1135 NESTED-lambda widening
-        // (`nestedWidenedCellKeys_`) — the protocol needs EVERY env to announce
-        // itself, and a capture site inside a nested lambda body runs with
-        // `currentFn_` set to the inner function, where this classification is
-        // short-circuited, so such an env would hold the cell uncounted; that
-        // is not theoretical, it is the measured UAF on
-        // `outer_called_twice_one_escapes_no_uaf` — and a captured PARAMETER
-        // (`declScopeDepth_` holds LOCALS only, per #3403).
+        // owned array (the #747/#782 element-dispose-through-cell pairing), and
+        // a captured PARAMETER (`declScopeDepth_` holds LOCALS only, per
+        // #3403). A cell reached by the §27.5/#1135 NESTED-lambda widening is
+        // NO LONGER excluded (fix #4523): its nested holder now announces
+        // itself like any other env, which is what #4509's exclusion was
+        // reaching for and could not express.
         // SCOPE OF THIS FIRST CUT, and the second half is measured, not
         // assumed. A capture whose CONTENTS the envdtor or the box machinery
         // also accounts for — a `string`/`string?`, a function type, a boxed
@@ -2513,27 +2516,94 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
              ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
                ce.semaTy->primitive == sema::PrimitiveType::String) ||
               ce.semaTy->kind == sema::TypeRef::Kind::Function));
-        if (!isForVar && !isInlineOwnedArray && !contentsAlsoManaged &&
-            !ce.freeCellInEnvdtor &&
-            currentFn_ == cellFreeEligibleFn_ &&
-            declsCapturedByEscaping_.count(static_cast<const void*>(decl)) &&
-            !nestedWidenedCellKeys_.count(static_cast<const void*>(decl)) &&
-            !cellFreeEligible_.count(static_cast<const void*>(decl)) &&
-            !sharedCellEnvdtorFreeOwner_.count(static_cast<const void*>(decl)) &&
-            !(singleCaptureLocals_.count(static_cast<const void*>(decl)) &&
-              definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)))) {
-            auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
-            if (ddit != declScopeDepth_.end() && ddit->second >= 1 &&
-                ddit->second <= disposeStack_.size()) {
-                ce.retainCellInEnv = true;
-                // The frame's release goes in the scope that DECLARED the
+        // fix #4523 (§27.5 / §28.9, v0.306): #4509's arming, restated as TWO
+        // independent obligations instead of one.
+        //
+        //   (1) EVERY env that stores the cell pointer must announce itself —
+        //       `bz_cell_retain` at its capture-store, `bz_cell_release` in its
+        //       envdtor. That pair is SELF-BALANCING: it needs no
+        //       `disposeStack_` entry, so it is correct in ANY body, including
+        //       a nested lambda's.
+        //   (2) The DECLARING FRAME's implicit reference (the one `calloc`
+        //       created and nobody announced) must be dropped exactly once, by
+        //       a `Disposal::cellRelease` in the scope that declared the local.
+        //       That registration INDEXES `disposeStack_`, so it is only
+        //       meaningful in the body whose `disposeStack_` the recorded depth
+        //       came from.
+        //
+        // #4509 conflated them: it gated (1) on the same test as (2) and then
+        // indexed `disposeStack_[declScopeDepth_[decl] - 1]` with a depth this
+        // body may not own. `declScopeDepth_` is module-wide and never cleared
+        // while `disposeStack_` is cleared per body, so for a lambda NESTED
+        // inside another lambda that indexed the nested body's freshly-cleared
+        // stack with the outer method's depth — an extra release into the wrong
+        // function's scope, which nulls the holder and segfaults the next read
+        // through it (#4523's repro). The numeric bound `<= disposeStack_.size()`
+        // was the only thing standing between that and a wild index: an
+        // arithmetic accident, not a proof.
+        //
+        // `declScopeDepthFn_` makes (2) fail-closed BY CONSTRUCTION — a depth
+        // is only ever indexed into the body that recorded it — and (1) is then
+        // free to be satisfied everywhere, which is what a refcount protocol
+        // actually needs. #4509 instead declined nested holders, which is the
+        // unsound direction: a declined holder reads through a cell the counted
+        // holders may already have freed.
+        //
+        // The DECISION is per DECL and taken ONCE, in the declaring body:
+        //   * a capture of a local can only appear in a lambda lexically inside
+        //     that local's scope, and the outermost such lambda's capture loop
+        //     runs while the declaring body is being lowered — before any
+        //     lambda nested in it, and before any later sibling;
+        //   * this loop over `capturedLocalDecls` has no early `continue`, so
+        //     every captured local reaches the decision;
+        //   * a refusal is STICKY (`cellRefcountDeclined_`) so a later sibling
+        //     cannot arm a cell an earlier sibling's env already holds
+        //     uncounted, and an arm is sticky (`refcountedCellDecls_`) so a
+        //     later site cannot decline one the frame is already counting.
+        // Params are absent from `declScopeDepth_` by construction (#3403), so
+        // a captured parameter never reaches (2) and is never armed.
+        const void* dkey = static_cast<const void*>(decl);
+        auto        ddit = declScopeDepth_.find(dkey);
+        auto        ddfn = declScopeDepthFn_.find(dkey);
+        // Is THIS body the one that declared the local, so that its recorded
+        // depth indexes the `disposeStack_` we are holding right now?
+        const bool inDeclaringFrame =
+            ddit != declScopeDepth_.end() && ddfn != declScopeDepthFn_.end() &&
+            ddfn->second == currentFn_ && ddit->second >= 1 &&
+            ddit->second <= disposeStack_.size();
+        bool armed = refcountedCellDecls_.count(dkey) != 0;
+        if (!armed && inDeclaringFrame && !cellRefcountDeclined_.count(dkey)) {
+            // The #4509 classification, unchanged except that
+            // `nestedWidenedCellKeys_` is gone: a nested-widened cell is now
+            // COUNTED by its nested holder rather than declined, which is what
+            // that set existed to avoid.
+            armed = !isForVar && !isInlineOwnedArray && !contentsAlsoManaged &&
+                    !ce.freeCellInEnvdtor &&
+                    currentFn_ == cellFreeEligibleFn_ &&
+                    declsCapturedByEscaping_.count(dkey) &&
+                    !cellFreeEligible_.count(dkey) &&
+                    !sharedCellEnvdtorFreeOwner_.count(dkey) &&
+                    !(singleCaptureLocals_.count(dkey) &&
+                      definitelyEscapingLambdas_.count(
+                          static_cast<const void*>(&lam)));
+            if (!armed) cellRefcountDeclined_.insert(dkey);
+        }
+        if (armed) {
+            // (1) — in every body, declaring or not.
+            ce.retainCellInEnv = true;
+            refcountedCellDecls_.insert(dkey);
+            if (inDeclaringFrame) {
+                // (2) — the frame's release goes in the scope that DECLARED the
                 // local (`declScopeDepth_` records disposeStack_.size() at the
                 // declaration, so the scope's index is one less), where the
                 // #1017 SECOND PASS runs it after every reads-through-cell
                 // disposal in that scope. One entry per cell holder, however
                 // many lambdas capture it — the second capture reaches
                 // boxLocalSlot's already-boxed path with the same `newSlot`,
-                // so the dedup is an identity test on the holder.
+                // so the dedup is an identity test on the holder. A generic
+                // method re-lowered per specialization re-registers in each
+                // specialization's own frame, which is why this is keyed on the
+                // holder and not on `refcountedCellDecls_`.
                 const std::size_t ownerIdx = ddit->second - 1;
                 bool alreadyRegistered = false;
                 for (const auto& existing : disposeStack_[ownerIdx])
@@ -11209,7 +11279,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 llvm::AllocaInst* slot = entryAlloca(inner->getType());
                 builder_.CreateStore(inner, slot);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
             // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
@@ -11249,13 +11319,13 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 builder_.CreateBr(ubContBB);
                 builder_.SetInsertPoint(ubContBB);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             } else {
                 llvm::AllocaInst* slot = entryAlloca(scrut->getType());
                 builder_.CreateStore(scrut, slot);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             }
         }
@@ -11938,8 +12008,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 // capture-cell lifetime at the arm scope, not at
                                 // the nested block that first captures it.
                                 if (!disposeStack_.empty())
-                                    declScopeDepth_[sp.nakedAnchor.get()] =
-                                        disposeStack_.size();
+                                    recordDeclScopeDepth(  // fix #4523
+                                        sp.nakedAnchor.get());
                                 locals_[sp.nakedAnchor.get()] = slot;
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
@@ -11951,7 +12021,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 // capture-cell lifetime at the arm scope, not at
                                 // the nested block that first captures it.
                                 if (!disposeStack_.empty())
-                                    declScopeDepth_[vbp] = disposeStack_.size();
+                                    recordDeclScopeDepth(vbp);  // fix #4523
                                 locals_[vbp] = slot;
                             } else if (sp.pattern) {
                                 // fix #3902 / §35.5: a REFUTABLE payload slot
@@ -13610,8 +13680,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
                     builder_.CreateStore(fv, slot);
                     if (!disposeStack_.empty())
-                        declScopeDepth_[sp.nakedAnchor.get()] =
-                            disposeStack_.size();
+                        recordDeclScopeDepth(  // fix #4523
+                            sp.nakedAnchor.get());
                     locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {

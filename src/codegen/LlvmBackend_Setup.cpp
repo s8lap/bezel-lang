@@ -14549,7 +14549,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // enclosing scope (and must not have its capture cell freed at an inner
     // lambda's scope). disposeStack_ already holds this local's scope.
     if (declNode && !disposeStack_.empty())
-        declScopeDepth_[declNode] = disposeStack_.size();
+        recordDeclScopeDepth(declNode);  // fix #4523
     // §15.1 / §16: collection literal `[e1, e2, …]` used as an inline-array
     // initializer.  lowerExpr returns null for CollectionLiteralExpr (not a
     // general expression), so handle it here where we have the slot.
@@ -35569,15 +35569,6 @@ void Emitter::collectCellFreeEligible(
     // Key space: the same as cellFreeEligible_ (DeclSymbol* / ParameterSymbol*).
     for (const auto& [decl, _] : escapingCapturersOf)
         declsCapturedByEscaping_.insert(decl);
-
-    // fix #4509 (§27.5 / §28.9, v0.306): preserve the nested-widening keys past
-    // this function's scope. #4509's refcount route must decline them — it
-    // cannot count an env created at a capture site inside a nested lambda
-    // body, because the classification there is short-circuited on
-    // `currentFn_`. See nestedWidenedCellKeys_'s declaration for the measured
-    // use-after-free that follows from not declining.
-    for (const void* key : nestedWidenedKeys)
-        nestedWidenedCellKeys_.insert(key);
 
     // A captured entity qualifies iff:
     //   - it appears in capturedByNonEscaping (at least one non-escaping lambda

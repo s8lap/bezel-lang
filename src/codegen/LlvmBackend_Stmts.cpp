@@ -10292,7 +10292,7 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             llvm::AllocaInst* slot = entryAlloca(scrut->getType());
             builder_.CreateStore(scrut, slot);
             if (!disposeStack_.empty())
-                declScopeDepth_[bp] = disposeStack_.size();
+                recordDeclScopeDepth(bp);  // fix #4523
             locals_[bp] = slot;
         }
         if (arm.guard) {

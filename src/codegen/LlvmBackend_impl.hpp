@@ -1296,6 +1296,49 @@ private:
     // LastCellEntry::isParam (fix #3403) carries the same fact without needing a
     // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
+    // fix #4523 (§27.5 / §28.9, v0.306): the FUNCTION each `declScopeDepth_`
+    // entry is a depth INTO. `declScopeDepth_` is module-wide and never cleared,
+    // while `disposeStack_` is cleared per body (lowerLambda, every async resume
+    // / iterator moveNext / thunk prolog). A depth recorded while lowering one
+    // body is therefore meaningless as an index into another body's
+    // `disposeStack_`, and nothing in the map itself says which body it came
+    // from. Any consumer that INDEXES `disposeStack_` with a depth from here
+    // must first check this map against `currentFn_`; consumers that only
+    // COMPARE depths within the current body (#969's nested-scope guard) do not.
+    // Written only through `recordDeclScopeDepth`, so the two maps cannot drift.
+    std::unordered_map<const void*, llvm::Function*> declScopeDepthFn_;
+    // fix #4523: record a local's declaring scope depth TOGETHER with the body
+    // that depth indexes. Every `declScopeDepth_` write goes through here — the
+    // pairing is the invariant, and a site that set one without the other would
+    // reintroduce exactly the cross-body mis-indexing this fixes.
+    void recordDeclScopeDepth(const void* declNode) {
+        declScopeDepth_[declNode]   = disposeStack_.size();
+        declScopeDepthFn_[declNode] = currentFn_;
+    }
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's per-DECL decision, made once
+    // and obeyed everywhere.
+    //
+    //   * `refcountedCellDecls_` — this local's capture cell is refcounted, so
+    //     EVERY env that stores its cell pointer must announce itself with
+    //     `bz_cell_retain` and drop it in its envdtor, whichever body builds
+    //     that env. The retain/envdtor-release pair is self-balancing and needs
+    //     no `disposeStack_` registration, so a holder in a NON-declaring body
+    //     joins the protocol instead of being declined out of it (the #4509
+    //     regression: a declined nested holder read through a cell the frame
+    //     had already released).
+    //   * `cellRefcountDeclined_` — a capture site in the declaring body looked
+    //     at this local and refused. STICKY: a later sibling lambda must not
+    //     arm a cell an earlier sibling's env is already holding uncounted.
+    //
+    // Both are keyed by the LocalDecl AST node because refcounted-ness is a
+    // property of the CELL, not of any one capturing lambda. The decision is
+    // always taken in the declaring body: a capture of a local can only appear
+    // in a lambda lexically inside that local's scope, and the outermost such
+    // lambda's capture loop runs while that body is being lowered — before any
+    // lambda nested within it. The locals capture loop in `lowerLambda` has no
+    // early `continue`, so every captured local reaches the decision.
+    std::unordered_set<const void*> refcountedCellDecls_;
+    std::unordered_set<const void*> cellRefcountDeclined_;
     // CG6: emitted LLVM function for each static method symbol.
     // fix #3550 (§23.3 / §23.4 / §30.5 / §28.4, v0.286): MapVector, NOT
     // unordered_map. The NestedBodyScope comment (LlvmBackend_Assign.cpp ~4665)
@@ -13063,7 +13106,6 @@ private:
               unwindUnsafeCellFree_(e.unwindUnsafeCellFree_),
               sharedCellEnvdtorFreeOwner_(e.sharedCellEnvdtorFreeOwner_),
               declsCapturedByEscaping_(e.declsCapturedByEscaping_),  // fix #4210
-              nestedWidenedCellKeys_(e.nestedWidenedCellKeys_),  // fix #4509
               cellFreeEligibleFn_(e.cellFreeEligibleFn_) {}
         ~CaptureReclaimSetScope() {
             e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
@@ -13092,8 +13134,6 @@ private:
                 std::move(sharedCellEnvdtorFreeOwner_);
             e_.declsCapturedByEscaping_ =
                 std::move(declsCapturedByEscaping_);  // fix #4210
-            e_.nestedWidenedCellKeys_ =
-                std::move(nestedWidenedCellKeys_);  // fix #4509
             e_.cellFreeEligibleFn_ = cellFreeEligibleFn_;
         }
         CaptureReclaimSetScope(const CaptureReclaimSetScope&) = delete;
@@ -13137,7 +13177,6 @@ private:
         // boxedCellFree arming condition to prevent double-free when an escaping
         // lambda also captures the same local as a non-escaping lambda.
         std::unordered_set<const void*> declsCapturedByEscaping_;
-        std::unordered_set<const void*> nestedWidenedCellKeys_;  // fix #4509
         llvm::Function* cellFreeEligibleFn_;
     };
 
@@ -16104,22 +16143,20 @@ private:
     // condition to prevent double-free when an escaping lambda also captures
     // the same local as a non-escaping lambda.
     std::unordered_set<const void*> declsCapturedByEscaping_;
-    // fix #4509 (§27.5 / §28.9, v0.306): the §27.5/#1135 NESTED-lambda widening
-    // keys, preserved out of `collectCellFreeEligible`'s local
-    // `nestedWidenedKeys`. #3426 already declines these as envdtor-free owners
-    // (its condition (d)) because the widening records NO owner node; #4509's
-    // refcount route declines them for the STRICTER reason that it cannot even
-    // COUNT them. Its protocol needs every env holding a cell to announce
-    // itself, and a capture site inside a NESTED lambda body runs with
-    // `currentFn_` set to the inner function, where the classification is
-    // short-circuited — the bypass #2718's closing comment names. Such an env
-    // would hold the cell without a counted reference, and the frame's release
-    // could then reach zero while it is still reading. Measured as exactly that
-    // use-after-free on
-    // `codegen_deeply_nested_escaping_lambda_3804.outer_called_twice_one_escapes_no_uaf`
-    // before this set was consulted. Declining leaves the pre-existing leak,
-    // which that row already pins as its accepted trade-off.
-    std::unordered_set<const void*> nestedWidenedCellKeys_;
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's `nestedWidenedCellKeys_` set
+    // is GONE, not moved. It existed to DECLINE a §27.5/#1135 nested-widened
+    // cell on the stated ground that "a capture site inside a NESTED lambda
+    // body runs with `currentFn_` set to the inner function, where the
+    // classification is short-circuited", so such an env would hold the cell
+    // uncounted. That ground was false — `cellFreeEligibleFn_` is set to the
+    // lambda's own function before its body is lowered
+    // (LlvmBackend_Exprs2.cpp), so `currentFn_ == cellFreeEligibleFn_` HOLDS
+    // there and the classification runs. What the set actually masked was the
+    // wrong-body `disposeStack_` index #4523 fixes. With the frame's release
+    // gated on `declScopeDepthFn_`, a nested holder RETAINS like any other and
+    // needs no `disposeStack_` entry, so there is nothing left to decline —
+    // and one question (may this cell be counted?) is answered in one place
+    // instead of two.
     // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
     bool isSharedCellEnvdtorFreeOwner(const void* key,
                                       const ast::LambdaExpr* lam) const {
