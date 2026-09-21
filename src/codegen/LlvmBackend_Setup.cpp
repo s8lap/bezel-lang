@@ -12400,6 +12400,15 @@ bool Emitter::fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
     // its defaults ride `ParameterSymbol::defaultText` and fold through
     // `importedCtorDefaultArgValue` — the same helper the imported `new`-site
     // fill uses (LlvmBackend_Exprs2.cpp, fix #3082).
+    // The failure mode #3152 guards against is a read that answers WRONG for an
+    // imported symbol. Here the null answer IS the imported case and is handled:
+    // `cd` non-null walks the source-written `ast::Param` defaults, `cd` null
+    // takes the imported path through `importedCtorDefaultArgValue` (the #2374
+    // shape, where a ConstructorSymbol ships no `ast::ConstructorDecl` at all).
+    // The ratchet cannot tell "branches on decl presence and handles both arms"
+    // from "reads decl and assumes it exists", so this carries a marker.
+    // SEAM-DEBT: #4550 — class-3 read on `target.decl` used as the
+    // local-vs-imported discriminator; both arms implemented, see above.
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(target.decl);
     const std::size_t nFormals = target.params.size();
     if (ordered.size() != nFormals) return false;
