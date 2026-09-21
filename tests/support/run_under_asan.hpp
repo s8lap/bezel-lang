@@ -125,13 +125,48 @@ inline std::string readAndRemoveCapture(const std::string& path) {
 // `[ INFRA ]` marker (tests/native_test_harness.hpp:284) -- same
 // "print inline with BEZEL_EXPECT_* output, fail unconditionally" shape,
 // extended here to the native-ASan-leg link/exec path those two don't cover.
+// #4504's marking is unconditional for every REAL caller. The one test that
+// must opt out is the #3676 ratchet, which INDUCES a link failure on purpose
+// to pin the -3 return contract -- for it, the marking is the mechanism under
+// test, not a verdict on the test. `ExpectAsanInfraFailure` suppresses the
+// marking for its scope and COUNTS the markers instead, so the ratchet asserts
+// both halves (the code is -3 AND the marker fired) rather than losing one.
+// Deliberately not a bare bool: a suppression that cannot be asserted against
+// is a suppression that can hide a missing marker.
+inline int& asanInfraFailureCount() {
+    static thread_local int n = 0;
+    return n;
+}
+
+inline bool& asanInfraFailureExpected() {
+    static thread_local bool v = false;
+    return v;
+}
+
+struct ExpectAsanInfraFailure {
+    int before;
+    ExpectAsanInfraFailure() : before(asanInfraFailureCount()) {
+        asanInfraFailureExpected() = true;
+    }
+    ~ExpectAsanInfraFailure() { asanInfraFailureExpected() = false; }
+    ExpectAsanInfraFailure(const ExpectAsanInfraFailure&) = delete;
+    ExpectAsanInfraFailure& operator=(const ExpectAsanInfraFailure&) = delete;
+    // How many `[ INFRA ]` markers fired inside this scope.
+    int count() const { return asanInfraFailureCount() - before; }
+};
+
 inline void noteAsanInfraFailure(const char* tag, const std::string& reason) {
     std::cout << "    [ INFRA ] runUnderAsan(tag=\"" << (tag ? tag : "?")
               << "\"): " << reason << "\n"
               << "    [ INFRA ] this is an INFRASTRUCTURE failure "
                  "(link/exec), NOT a sanitizer finding -- see #4504.\n";
     std::cout.flush();
-    ::bezel::test::currentTestFailed() = true;
+    ++asanInfraFailureCount();
+    // Suppressed ONLY inside an ExpectAsanInfraFailure scope (the #3676
+    // ratchet). Every other caller still fails unconditionally.
+    if (!asanInfraFailureExpected()) {
+        ::bezel::test::currentTestFailed() = true;
+    }
 }
 
 // Link `objPath` against the ASan runtime, run the resulting `exe` under
