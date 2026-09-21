@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "module/ModuleLoader.hpp"
@@ -174,7 +175,7 @@ static int xmodLsan694(
         auto mod = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!mod) return -1;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*mod, bObjPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*mod, bObjPath, err)) return -1;
     }
 
     auto cleanup = [&] {
@@ -579,7 +580,7 @@ BEZEL_TEST(xmod_string_refcount_694, s6_imported_string_escaping_no_asan_abort_4
         auto mod = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!mod) { std::remove(bObjPath.c_str()); return; }
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*mod, bObjPath, err)) { std::remove(bObjPath.c_str()); return; }
+        if (!bezel::test::emitObjectFileForTest(*mod, bObjPath, err)) { std::remove(bObjPath.c_str()); return; }
     }
 
     std::string linkCmd =

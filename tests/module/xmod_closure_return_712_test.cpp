@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "support/driver_run_support.hpp"
@@ -176,7 +177,7 @@ static int xmodLsan712(
         auto mod = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!mod) return -1;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*mod, bObjPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*mod, bObjPath, err)) return -1;
     }
 
     auto cleanup = [&] {
@@ -235,7 +236,7 @@ static int singleModLsan712(const std::string& src, int expectedCode) {
         auto mod = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!mod) return -1;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*mod, objPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*mod, objPath, err)) return -1;
     }
 
     auto cleanup = [&] {

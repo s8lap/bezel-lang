@@ -68,11 +68,8 @@
 1    tests/codegen/task_combinators_test.cpp
 1    tests/codegen/tsan_704_bz_exc_threadlocal_test.cpp
 1    tests/codegen/xmod_imported_generic_indexer_property_3346_3348_test.cpp
-2    tests/module/xmod_closure_return_712_test.cpp
 1    tests/module/xmod_owned_class_return_707_test.cpp
 1    tests/module/xmod_owned_return_autodrop_1415_test.cpp
-2    tests/module/xmod_string_refcount_694_test.cpp
-1    tests/sema/serialization_typedriven_703_test.cpp
 
 [overpromising_rows]
 1    tests/codegen/async_618_domain_serial_test.cpp
@@ -81,6 +78,3 @@
 2    tests/codegen/mutex_lock_647_test.cpp
 2    tests/codegen/semaphore_647_test.cpp
 2    tests/codegen/task_combinators_test.cpp
-1    tests/module/xmod_closure_return_712_test.cpp
-1    tests/module/xmod_string_refcount_694_test.cpp
-1    tests/sema/serialization_typedriven_703_test.cpp
