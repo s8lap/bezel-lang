@@ -16769,6 +16769,46 @@ private:
         llvm::Function* fn = nullptr;
     };
     std::vector<AwaitedTaskTemp> awaitedTaskTemps_;
+
+    // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): a fresh owned
+    // CLASS producer used only as the receiver of a call whose result is a
+    // non-nullable `string`. §28.3 disposes such a temporary "at the **end of
+    // the full expression** in which it is produced, after every use of it
+    // within that expression has completed" — so, unlike the value-result
+    // family, the reclaim may NOT be emitted inline after the call: the
+    // string result is still in flight through the rest of the expression and
+    // the receiver's destructor is user code that the spec sequences after it.
+    // MEASURED on §28.3's own shape, rule-corpus case s28_3_0043 —
+    // `Console.WriteLine(new Widget("temp").Describe());` — whose spec output
+    // is `widget temp` then `dispose temp`; an inline reclaim would print them
+    // the other way round, and `freshNewReceiverTempEligible` (which gates the
+    // inline path) therefore declines a `string` result outright, leaking the
+    // receiver. Same {slot, fn} contract as the two temp queues above.
+    struct K8RecvTemp {
+        llvm::AllocaInst* slot = nullptr;
+        llvm::Function* fn = nullptr;
+    };
+    std::vector<K8RecvTemp> k8RecvTemps_;
+
+    // The eligibility predicate for the queue above. NON-NULLABLE `string`
+    // only: a non-nullable `string` method return is minted `+1` BY THE CALLEE
+    // (the `emitStringRetain` in LlvmBackend_Stmts.cpp's return path and its
+    // expression-body twin, both gated `!nullable`), so the result owns its own
+    // reference and disposing the receiver — which releases the receiver's
+    // string fields — can never dangle it. A `string?` return does NOT mint
+    // (#2196 keeps that path un-refcounted), so it is excluded: there the
+    // result can be a borrow of a receiver field.
+    bool freshNewReceiverTempStringResult(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy) const;
+    // Register such a receiver at its PRODUCTION: an `unwindOnly` disposeStack_
+    // entry (the exception edge, exactly as registerFreshNewReceiverTempUnwind)
+    // plus a queue entry for the next K8 boundary (the normal edge).
+    void registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
+                                        llvm::Value* recvPtr,
+                                        const sema::TypeRef* resultTy);
+    // Emit the queued reclaims at a K8 full-expression boundary.
+    void flushK8RecvTemps();
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for

@@ -10822,6 +10822,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (!recvUnwindSlot) {
                 disposeFreshNewReceiverTempDeferred(
                     recvTempExpr, recv, ctx_.exprType(call), &call);
+                // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): the
+                // non-nullable-`string`-result arm that
+                // `freshNewReceiverTempEligible` declines (so `recvUnwindSlot`
+                // is null here) and `disposeFreshNewReceiverTempDeferred`
+                // declines too (its result must be a deferred-activation head,
+                // which a primitive never is — the two predicates are
+                // disjoint). §28.3 puts this reclaim at the K8 full-expression
+                // boundary rather than inline after the call; the queue entry
+                // carries it there, and the disposeStack_ entry the helper also
+                // pushes covers the exception edge.
+                registerFreshNewReceiverTempK8(recvTempExpr, recv,
+                                               ctx_.exprType(call));
             }
         }
     }

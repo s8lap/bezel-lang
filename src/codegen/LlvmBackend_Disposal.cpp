@@ -6563,6 +6563,79 @@ bool Emitter::unboundOwningChoiceTemp(const ast::Expr* e,
 }
 
 
+
+// fix #4552 / §28.3 *Unbound owned temporaries* (v0.306). See the declarations
+// in LlvmBackend_impl.hpp for the rule, the measured repro and the
+// non-nullable-`string`-only soundness argument.
+bool Emitter::freshNewReceiverTempStringResult(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy) const {
+    if (!recvExpr || !recvPtr || !resultTy) return false;
+    if (!isFreshOwnedClassProducer(recvExpr)) return false;
+    if (resultTy->kind != sema::TypeRef::Kind::Primitive) return false;
+    if (resultTy->primitive != sema::PrimitiveType::String) return false;
+    if (resultTy->nullable) return false;   // `string?` returns are NOT minted
+    if (!recvPtr->getType()->isPointerTy()) return false;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return false;
+    return true;
+}
+
+
+void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
+                                             llvm::Value* recvPtr,
+                                             const sema::TypeRef* resultTy) {
+    if (!freshNewReceiverTempStringResult(recvExpr, recvPtr, resultTy)) return;
+    if (disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;
+    if (!currentFn_) return;
+    // `entryAllocaNullPtr` (not a bare `entryAlloca`) for the #2733 reason the
+    // unwind registration documents: a disposal pass can be reached on a path
+    // that never executed the production store.
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;      // the normal edge is the K8 flush below
+    d.dynamicDispose = false;
+    disposeStack_.back().push_back(d);
+    k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_});
+}
+
+
+void Emitter::flushK8RecvTemps() {
+    // Mirrors flushFfiExprTemps / flushAwaitedTaskTemps exactly, including the
+    // two retains those document: an entry belonging to ANOTHER function is
+    // kept (a nested function body's boundary fires while the enclosing
+    // expression is still open), and a diverged (terminated) block drops the
+    // entry without emitting — the unwind edge's disposeStack_ walk has
+    // already reclaimed it and emitting after a terminator is invalid IR.
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    bool live = currentFn_ && bb && !bb->getTerminator();
+    std::vector<K8RecvTemp> keep;
+    for (const auto& t : k8RecvTemps_) {
+        if (t.fn != currentFn_) { keep.push_back(t); continue; }
+        if (!live) continue;
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), t.slot, "k8recv.load");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* dispBB =
+            llvm::BasicBlock::Create(llvm_, "k8recv.dispose", currentFn_);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "k8recv.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(obj);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Discharge at RUNTIME (not by erasing the registration): the
+        // disposeStack_ entry stays but now loads null, so scope end / return /
+        // unwind are all no-ops, and a LOOP re-arms the same entry-block alloca
+        // each iteration. Same discipline as the two sibling queues.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), t.slot);
+    }
+    k8RecvTemps_.swap(keep);
+}
+
+
 void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // fix #2892 / §28.10 (v0.241): the UNWIND-EXCLUSIVE entries (`unwindOnly`,
     // `releaseOnUnwindOnly`) fire when the scope's owned locals never reached

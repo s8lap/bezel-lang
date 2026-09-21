@@ -52,6 +52,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // at the await.
     if (!awaitedTaskTemps_.empty() && atBoundary)
         flushAwaitedTaskTemps();
+    // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): the same K8
+    // boundary reclaims a fresh owned-class receiver temporary whose call
+    // result is a non-nullable `string` — "disposed at the end of the full
+    // expression in which it is produced, after every use of it within that
+    // expression has completed". The inline-after-the-call reclaim the
+    // value-result family uses would run the receiver's destructor BEFORE the
+    // rest of the expression consumed the string, which §28.3 forbids and
+    // rule-corpus case s28_3_0043 pins.
+    if (!k8RecvTemps_.empty() && atBoundary)
+        flushK8RecvTemps();
     // fix #3421 (spec §4.7 *The unit type*, §21.1 *Variable declarations*,
     // v0.283): ONE representation for "this expression produced no lowered
     // value". LLVM `void` is not a value — it has no size and no alignment, so
