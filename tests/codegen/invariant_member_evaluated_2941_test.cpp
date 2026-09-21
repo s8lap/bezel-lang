@@ -216,7 +216,19 @@ BEZEL_TEST(invariant_member_evaluated_2941,
         "class D : B "
         "  public y: int := 0; "
         "  invariant(y >= 0); "
+        // fix #4549 (§12.8, v0.306): `D` now WRITES its `base(...)`
+        // chain. §12.8 inserts an implicit `base()` when none is
+        // written and "requires the base class to have a parameterless
+        // constructor"; `B` declares only `constructor(v: int)`, so
+        // this program was ill-formed and is rejected as of #4549.
+        // The ORACLE IS UNCHANGED (still `== 11` / `== 15`, and this
+        // file's subject — §22.16 inherited-invariant evaluation at
+        // construction exit — is untouched): `base(v)` sets `x := v`
+        // in `B`'s constructor and the body then assigns the same `v`
+        // to the same field, so every value the rows observe is the
+        // one they observed before.
         "  public constructor(v: int, w: int) "
+        "    base(v); "
         "    x := v; y := w; "
         "  end constructor; "
         "  public static method Main(): int "
@@ -243,7 +255,19 @@ BEZEL_TEST(invariant_member_evaluated_2941,
         "class D : B "
         "  public y: int := 0; "
         "  invariant(y >= 0); "
+        // fix #4549 (§12.8, v0.306): `D` now WRITES its `base(...)`
+        // chain. §12.8 inserts an implicit `base()` when none is
+        // written and "requires the base class to have a parameterless
+        // constructor"; `B` declares only `constructor(v: int)`, so
+        // this program was ill-formed and is rejected as of #4549.
+        // The ORACLE IS UNCHANGED (still `== 11` / `== 15`, and this
+        // file's subject — §22.16 inherited-invariant evaluation at
+        // construction exit — is untouched): `base(v)` sets `x := v`
+        // in `B`'s constructor and the body then assigns the same `v`
+        // to the same field, so every value the rows observe is the
+        // one they observed before.
         "  public constructor(v: int, w: int) "
+        "    base(v); "
         "    x := v; y := w; "
         "  end constructor; "
         "  public static method Main(): int "

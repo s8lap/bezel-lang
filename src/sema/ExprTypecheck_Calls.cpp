@@ -12145,7 +12145,25 @@ void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
     for (TypeSymbol* b : currentType_->baseTypes) {
         if (b && b->kind == ast::TypeDeclKind::Class) { base = b; break; }
     }
-    if (!base || !base->hasPositionalFields) return;
+    if (!base) return;
+    if (!base->hasPositionalFields) {
+        // fix #4549 (§12.8, v0.306): this early return is the half of §12.8's
+        // requirement #4519 could not reach. The binder below answers
+        // "parameterless?" only for a base carrying a §22.10 PRIMARY
+        // parameter list; a base whose only constructors are EXPLICIT has no
+        // positional fields at all, so an explicit `base()` into one was
+        // still accepted silently — measured on fcb4dbd5, `class B public
+        // constructor(a: int) …` with `class D : B  public constructor()
+        // base(); end` compiled at exit 0 and printed `0`, the base's `n`
+        // left at its calloc zero. The SHARED predicate answers for every
+        // constructor form, so this spelling and the IMPLICIT one
+        // (`visitTopDecl`) now give the same verdict on the same base.
+        if (chain.args.empty() &&
+            !baseHasParameterlessConstructor(base, chain.span.begin))
+            reportNoParameterlessBaseCtor(base, chain.span.begin,
+                                          /*implicitSpelling=*/false);
+        return;
+    }
     // Only when the call binds the base's PRIMARY parameter list. Codegen
     // reaches that arm exactly when `ctorForArgs(baseTs, chainCall->args)`
     // finds no explicit base constructor to bind (whose own §22.8 step 0 then
@@ -12180,6 +12198,120 @@ void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
     // its §22.5 default) on the shapes the binder now accepts.
     if (b.ok && !chain.args.empty())
         ctx_.setPositionalBinding(&chain, b.paramToArg);
+}
+
+// fix #4549 (§12.8 "Constructor chaining" / §22.5 "Optional parameters and
+// named arguments" / §22.7 / §22.10, v0.306): §12.8's requirement on the
+// inserted chain, as ONE predicate.
+//
+// §12.8 states it in the same sentence that inserts the chain:
+//
+//   "If neither `base(...)` nor `this(...)` is written, the compiler inserts
+//    an implicit `base()` call (which requires the base class to have a
+//    parameterless constructor; otherwise the chain must be explicit)."
+//
+// Two spellings reach it — the INSERTED chain (`ExprTC::visitTopDecl`) and
+// the explicit zero-argument `base()` (`publishBaseChainPrimaryBinding`,
+// #4519) — and #4549 exists because they disagreed: #4519 closed the
+// explicit one through the §22.5 binder over the base's PRIMARY parameter
+// list, which answers nothing for a base whose only constructors are
+// EXPLICIT and nothing at all for the implicit spelling. One body, read from
+// both, is what stops them drifting again.
+//
+// "PARAMETERLESS" IS THE §22.5 QUESTION, NOT AN ARITY TEST, and that is why
+// every arm below runs `bindArgsToParams` against an EMPTY argument list
+// rather than comparing a count. §22.5: "Every parameter that declares no
+// default must be bound, positionally or by name" — so a §22.10 primary list
+// or an explicit constructor whose parameters ALL carry defaults IS callable
+// with no arguments. The nearest existing predicate, `groundSatisfiesNew`
+// (TypeResolution_Checks.cpp), asserts the opposite for its own §14.2
+// purpose ("treat a non-empty primary param list as a non-parameterless
+// constructor") and is therefore NOT reusable here; running the one binder
+// body keeps this answer identical to the one every construction site gets.
+//
+// THE THREE CONSTRUCTOR FORMS, in the order a base can carry them:
+//
+//   (1) the §22.10 PRIMARY parameter list. §22.10 requires every explicit
+//       constructor of a primary-ctor class to chain via `this(...)` (the
+//       resolver enforces it — measured: `constructor of class `B`, which
+//       has a primary constructor, must chain to another constructor via
+//       `this(...)` (§22.10)`), so an all-defaulted primary list is reachable
+//       with no arguments whatever else the class declares.
+//   (2) an explicit non-static CONSTRUCTOR with no required parameter.
+//   (3) §22.7's implicit parameterless constructor, which a class gets
+//       exactly when it declares neither of the above.
+//
+// DECLINED, WITH REASONS (CLAUDE.md §4) — each would be a NEW rejection of a
+// program that compiles and RUNS correctly today, so each is left alone and
+// the predicate answers "constructible":
+//
+//   * ACCESSIBILITY (§12.5). A `private constructor()` on the base is not
+//     callable from a derived class in another module, but it IS today:
+//     measured on fcb4dbd5, `class B private constructor() n := 5; end` with
+//     `class D : B` compiles and prints `5`. Rejecting it is a separate,
+//     wider question (it needs the §12.5 module/visibility rule, not this
+//     one), and getting it wrong here would break working code.
+//   * `abstract` / `closed` (§12.5 / §22.7). §12.5 forbids `new` on such a
+//     class; being a BASE is what they are for. Measured: `abstract class B`
+//     with `class D : B` compiles and prints `4`.
+//   * A base carrying an all-defaulted PRIMARY list AND explicit
+//     constructors of non-zero arity. Arm (1) accepts it, which is what
+//     §22.5 says — but codegen does NOT construct it (measured on fcb4dbd5:
+//     `emitImplicitBase`'s arity-0 fallback resolves no `ConstructorSymbol`
+//     for a primary constructor, and its field-init fallback is gated on
+//     `!hasAnyConstructor(b)`, so the primary's defaults never run). That is
+//     a codegen defect on a LEGAL program, filed separately; rejecting the
+//     program here would be the wrong fix for it.
+// // per §12.8, fix #4549
+bool ExprTC::baseHasParameterlessConstructor(const TypeSymbol* base,
+                                             SourceLocation loc) {
+    if (!base) return true;  // no base class: §12.8 inserts no chain
+    // The binder is run with `emit=false` throughout, so `desc` is never
+    // rendered; it is named for the reader of a future `emit=true`.
+    const std::vector<ast::CallArgument> noArgs;
+    const std::string desc = "implicit `base()`";
+    // (1) the §22.10 primary parameter list.
+    if (base->hasPositionalFields) {
+        const std::vector<const Symbol*> fields =
+            recordPositionalFieldSymbols(base);
+        if (bindArgsToParams(sema::FormalsView::of(fields), noArgs, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return true;
+    }
+    // (2) an explicit non-static constructor with no required parameter.
+    bool anyExplicitCtor = false;
+    for (Symbol* m : base->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        anyExplicitCtor = true;
+        if (bindArgsToParams(sema::FormalsView::of(*cs), noArgs, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return true;
+    }
+    // (3) §22.7's implicit parameterless constructor — a class that declares
+    // neither an explicit constructor nor a primary parameter list.
+    return !anyExplicitCtor && !base->hasPositionalFields;
+}
+
+// fix #4549: see `baseHasParameterlessConstructor` above. The sentence naming
+// the defect is shared; only the remedy differs, because only the implicit
+// spelling can be made explicit and only the explicit one can be given
+// arguments. §12.8 names both.
+void ExprTC::reportNoParameterlessBaseCtor(const TypeSymbol* base,
+                                           SourceLocation loc,
+                                           bool implicitSpelling) {
+    if (!base) return;
+    const std::string what =
+        std::string("base class `") + std::string(base->name) +
+        "` has no parameterless constructor";
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        implicitSpelling
+            ? "implicit `base()` chain: " + what +
+                  "; the chain must be explicit (§12.8)"
+            : "`base()` chain: " + what + "; supply its arguments (§12.8)");
 }
 
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.

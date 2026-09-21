@@ -2625,6 +2625,24 @@ private:
     // parameterless constructor"). See the definition in
     // ExprTypecheck_Calls.cpp.
     void publishBaseChainPrimaryBinding(const ast::CallExpr& chain);
+    // fix #4549 (§12.8 / §22.5 / §22.7 / §22.10, v0.306): §12.8's
+    // "which requires the base class to have a parameterless constructor",
+    // as ONE predicate read by BOTH spellings of the same call — the
+    // IMPLICIT chain (`visitTopDecl`) and the explicit zero-argument
+    // `base()` (`publishBaseChainPrimaryBinding`). The two cannot drift
+    // because there is one body; see the definition in
+    // ExprTypecheck_Calls.cpp for what "parameterless" means for each of
+    // the three constructor forms a class can carry.
+    bool baseHasParameterlessConstructor(const TypeSymbol* base,
+                                         SourceLocation loc);
+    // fix #4549: the two spellings' diagnostics, reported from the two call
+    // sites above. `implicitSpelling` picks the remedy §12.8 names for the
+    // inserted chain ("otherwise the chain must be explicit") over the one
+    // an explicit `base()` admits (supply the arguments); the predicate and
+    // the sentence naming the defect are shared.
+    void reportNoParameterlessBaseCtor(const TypeSymbol* base,
+                                       SourceLocation loc,
+                                       bool implicitSpelling);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,

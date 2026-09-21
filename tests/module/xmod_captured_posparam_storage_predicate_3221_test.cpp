@@ -304,7 +304,18 @@ BEZEL_TEST(xmod_captured_posparam_storage_predicate_3221,
         "module App3221T2; import Lib3221T2; "
         "public class D3221T2: Base3221T2, ISerializable, IDeserializable "
         "  public property N: int := 3; "
+        // fix #4549 (§12.8, v0.306): the derived constructor now
+        // WRITES its `base(...)` chain. §12.8 inserts an implicit
+        // `base()` when none is written and "requires the base
+        // class to have a parameterless constructor"; this base
+        // declares the required positional parameter `v: int`, so
+        // the program was ill-formed and is rejected as of #4549.
+        // The ORACLE IS UNCHANGED (still `== 11`) and so is this
+        // row's subject: `v` is passed but never referenced in any
+        // body, so `posParamBodyRef` stays false and the base is
+        // storage-free exactly as before.
         "  public constructor(n: int) "
+        "    base(0); "
         "    N := n; "
         "  end constructor; "
         "end D3221T2; "
@@ -334,7 +345,18 @@ BEZEL_TEST(xmod_captured_posparam_storage_predicate_3221,
         "end BaseL3221T2; "
         "public class DL3221T2: BaseL3221T2, ISerializable, IDeserializable "
         "  public property N: int := 3; "
+        // fix #4549 (§12.8, v0.306): the derived constructor now
+        // WRITES its `base(...)` chain. §12.8 inserts an implicit
+        // `base()` when none is written and "requires the base
+        // class to have a parameterless constructor"; this base
+        // declares the required positional parameter `v: int`, so
+        // the program was ill-formed and is rejected as of #4549.
+        // The ORACLE IS UNCHANGED (still `== 11`) and so is this
+        // row's subject: `v` is passed but never referenced in any
+        // body, so `posParamBodyRef` stays false and the base is
+        // storage-free exactly as before.
         "  public constructor(n: int) "
+        "    base(0); "
         "    N := n; "
         "  end constructor; "
         "end DL3221T2; "

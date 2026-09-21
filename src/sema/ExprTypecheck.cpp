@@ -11762,6 +11762,110 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 currentScope_ = saveScope;
             }
         }
+        // fix #4549 (§12.8 "Constructor chaining" / §22.5 / §22.7 / §22.10,
+        // v0.306): the IMPLICIT `base()` chain, checked against §12.8's own
+        // requirement on it.
+        //
+        // §12.8: "If neither `base(...)` nor `this(...)` is written, the
+        // compiler inserts an implicit `base()` call (which requires the base
+        // class to have a parameterless constructor; otherwise the chain must
+        // be explicit)." Nothing asked that question — the chain is inserted
+        // by codegen (`Emitter::emitImplicitBase`), it is not an
+        // `ast::CallExpr` any publisher sees, and codegen's own arity-0
+        // fallback simply finds no constructor and constructs NOTHING.
+        //
+        // MEASURED ON fcb4dbd5, each compiled at exit 0 with no diagnostic and
+        // RUN, against `class B(n: int, s: string)`:
+        //
+        //   class D : B                      printed `0` and a blank line
+        //   class D(v: int) : B              printed `0` and a blank line
+        //   class D : B + `constructor()`    printed `0` and a blank line
+        //     writing no chain
+        //
+        // and against `class B public constructor(a: int) …` (no primary list
+        // at all, the form #4519's predicate could not reach):
+        //
+        //   class D : B                      printed `0`
+        //
+        // Both of `B`'s required primary parameters keep their calloc zero;
+        // `s` is a NULL string pointer that `Console.WriteLine` tolerates and
+        // an interpolating consumer (`$"n={n} s={s}"`) dereferences. These are
+        // silently HALF-CONSTRUCTED objects, not merely missing diagnostics.
+        //
+        // THE PREDICATE IS SHARED with the explicit zero-argument `base()`
+        // spelling (`publishBaseChainPrimaryBinding`, #4519) — see
+        // `baseHasParameterlessConstructor` (ExprTypecheck_Calls.cpp) for what
+        // "parameterless" means for each constructor form and for the three
+        // over-rejections it deliberately declines. #4549 exists because the
+        // two spellings of ONE call disagreed; one body is what stops that
+        // recurring.
+        //
+        // A §22.10 INHERITANCE CLAUSE WITH ARGUMENTS IS NOT THIS SHAPE.
+        // §22.10: "When a class with a primary constructor has a base class,
+        // the base call appears in the inheritance clause … This replaces an
+        // explicit `base(...)` call" — so `class D(v: int) : B(v)` writes the
+        // chain and §12.8 inserts none. A BARE `: B` clause writes no
+        // arguments and therefore does get the inserted chain, which is why
+        // the gate below is on `primaryBaseCtorArgs` being EMPTY rather than
+        // on the clause's presence.
+        // // per §12.8, fix #4549
+        if (td->kind == ast::TypeDeclKind::Class && currentType_ &&
+            td->primaryBaseCtorArgs.empty()) {
+            TypeSymbol* implicitBase = nullptr;
+            for (TypeSymbol* b : currentType_->baseTypes) {
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    implicitBase = b;
+                    break;
+                }
+            }
+            // The AST node naming that base, for the diagnostic's location:
+            // the `B` of `class D : B`. `baseTypes` may also list interfaces,
+            // so the entry is matched by resolved declaration rather than by
+            // position.
+            const ast::Type* baseTypeNode = nullptr;
+            if (implicitBase) {
+                for (const auto& bt : td->baseTypes) {
+                    if (!bt) continue;
+                    const TypeRef* rt = ctx_.resolvedType(*bt);
+                    if (rt && rt->kind == TypeRef::Kind::Named &&
+                        rt->declaration == implicitBase) {
+                        baseTypeNode = bt.get();
+                        break;
+                    }
+                }
+            }
+            if (implicitBase && baseTypeNode &&
+                !baseHasParameterlessConstructor(implicitBase,
+                                                 baseTypeNode->span.begin)) {
+                // Which spellings of "no chain written" this class actually
+                // has. A constructor whose leading statement is `this(...)`
+                // or `base(...)` writes its own chain and is not this defect
+                // (`ast::chainCallOfStmt` is the ONE spelling of that
+                // recognition, #3583); an `abstract` class is still checked,
+                // because its own derived classes construct it.
+                bool anyInstanceCtor = false;
+                for (const auto& m : td->members) {
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(
+                        m.get());
+                    if (!cd || cd->isStatic) continue;
+                    anyInstanceCtor = true;
+                    bool isThis = false;
+                    if (!cd->body.empty() && cd->body[0] &&
+                        ast::chainCallOfStmt(*cd->body[0], isThis))
+                        continue;
+                    reportNoParameterlessBaseCtor(implicitBase,
+                                                  cd->span.begin,
+                                                  /*implicitSpelling=*/true);
+                }
+                // No instance constructor at all: §22.7's implicit
+                // parameterless constructor for `td` itself chains to
+                // `base()`, and the `: B` clause is where a reader fixes it.
+                if (!anyInstanceCtor)
+                    reportNoParameterlessBaseCtor(implicitBase,
+                                                  baseTypeNode->span.begin,
+                                                  /*implicitSpelling=*/true);
+            }
+        }
         currentType_ = save;
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §26.1: inside an extension block, `this` is the receiver. For an
