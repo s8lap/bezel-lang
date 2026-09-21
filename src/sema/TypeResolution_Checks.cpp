@@ -3813,6 +3813,24 @@ bool Resolver::isBareGenericParamBinding(const TypeRef* bound,
            builtinTypeArity(boundAst->name->parts.front()) == kNotBuiltin;
 }
 
+// fix #2742 (§3.6 rule 2 "Per-instantiation evaluation for generics" / §14.1
+// *Instantiation and its site*, v0.306). See the header comment for the
+// contract and for why a non-shadowing method parameter is skipped too.
+//
+// This predicate had been hand-inlined at THREE recorders
+// (`owningElementSites_`, `owningBufferSpanMoveOnlySites_`, `asTargetSites_`)
+// and was missing from TWO (`hashContainerSites_` — #2742 itself — and
+// `moveOnlyElementSites_`, the same defect unreported). That is the Family I1
+// mechanism at the deferred-obligation recorder: the copies agreed when they
+// were written and one was later taught something the others were not. One
+// definition, five call sites, so a sixth recorder cannot silently omit it.
+bool Resolver::nameBoundByCurrentMethod(std::string_view name) const {
+    if (!currentMethodGenericParams_) return false;
+    for (const ast::GenericParam& gp : *currentMethodGenericParams_)
+        if (gp.name == name) return true;
+    return false;
+}
+
 // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713) — Pass 2 for the owning-
 // collection element check.
 //

@@ -2176,17 +2176,12 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         // generic-method bindings are not in instantiations_ at
                         // all. That residual is filed as #2736(a); a false
                         // reject would be strictly worse than carrying it.
-                        bool boundByMethod = false;
-                        if (currentMethodGenericParams_) {
-                            for (const ast::GenericParam& gp :
-                                 *currentMethodGenericParams_) {
-                                if (gp.name == el->headName()) {
-                                    boundByMethod = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!boundByMethod)
+                        //
+                        // fix #2742: the test itself now lives in ONE place
+                        // (Resolver::nameBoundByCurrentMethod) — it had been
+                        // hand-inlined here and at two more recorders while two
+                        // OTHER recorders lacked it entirely.
+                        if (!nameBoundByCurrentMethod(el->headName()))
                             owningElementSites_.push_back(
                                 {first, el->headName(), &t, currentOuterType_});
                     }
@@ -2420,7 +2415,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     hashRole = "element";
                 else if (first == "Dictionary" || first == "OwningDictionary")
                     hashRole = "key";
-                if (!hashRole.empty() && !ref.genericArgs.empty())
+                // fix #2742 (§3.6 rule 2 / §14.1, v0.306): apply the #2713
+                // MISATTRIBUTION guard here too. `checkHashContainerKeys`'
+                // Pass 2 recovers this site's bare parameter NAME and resolves
+                // it against `s.enclosingType->genericParams`; when a generic
+                // METHOD shadows an enclosing type parameter
+                // (`class Box<T>` + `method M<T>()`, which nothing forbids),
+                // the recorded `T` is the METHOD's and the check runs against
+                // `Box`'s — a different binding. MEASURED as a false reject:
+                // `Box2742<NoEq2742>` calling `M2742<int>()` over a body
+                // holding `new Set<T>()` was rejected naming `NoEq2742`, while
+                // the `Set`'s actual element type is the method's `int`.
+                // (The reverse direction — an ill-formed method binding
+                // admitted because the enclosing one is fine — is the same
+                // misattribution and is closed by the same guard; the residual
+                // "generic-method bindings are never re-checked at all" is
+                // #2736(a), and a false reject is strictly worse than carrying
+                // it, per #2713's own recorded trade-off.)
+                if (!hashRole.empty() && !ref.genericArgs.empty() &&
+                    !(isBareGenericParamBinding(
+                          ref.genericArgs[0],
+                          ref.genericArgs[0] ? ref.genericArgs[0]->astNode
+                                             : nullptr) &&
+                      nameBoundByCurrentMethod(ref.genericArgs[0]->headName())))
                     hashContainerSites_.push_back(
                         {first, hashRole, ref.genericArgs[0], &t,
                          currentOuterType_});  // #1384: for per-instantiation check
@@ -2451,6 +2468,19 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     }
                     for (const auto& slot : categorySlots) {
                         if (slot.first >= ref.genericArgs.size()) continue;
+                        // fix #2742 (sibling, same mechanism):
+                        // `checkElementCategoryInstantiations`' Pass 2 resolves
+                        // this site's bare parameter name against the ENCLOSING
+                        // TYPE's params exactly as the hash-container Pass 2
+                        // does, so it carries the identical #2713
+                        // misattribution when a generic METHOD shadows the
+                        // name. This recorder was one of the two that never got
+                        // the guard; it now asks the same shared predicate.
+                        const TypeRef* el = ref.genericArgs[slot.first];
+                        if (isBareGenericParamBinding(
+                                el, el ? el->astNode : nullptr) &&
+                            nameBoundByCurrentMethod(el->headName()))
+                            continue;
                         moveOnlyElementSites_.push_back(
                             {first, slot.second, ref.genericArgs[slot.first],
                              &t, currentOuterType_});
@@ -2525,19 +2555,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             // generic method may declare a parameter of the
                             // same name, and that name inside the method body
                             // denotes the METHOD's parameter whose bindings
-                            // `instantiations_` knows nothing about.
-                            bool boundByMethod = false;
-                            if (currentMethodGenericParams_) {
-                                for (const ast::GenericParam& gp :
-                                     *currentMethodGenericParams_) {
-                                    if (gp.name ==
-                                        el->astNode->name->parts.front()) {
-                                        boundByMethod = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!boundByMethod) {
+                            // `instantiations_` knows nothing about. fix #2742
+                            // made that one shared predicate.
+                            if (!nameBoundByCurrentMethod(
+                                    el->astNode->name->parts.front())) {
                                 owningBufferSpanMoveOnlySites_.push_back(
                                     {first,
                                      std::string(
@@ -3506,9 +3527,9 @@ void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
     // method parameter that does not shadow is skipped by the same test, which
     // is correct for the same reason — and is not a residual here, because
     // ExprTC::checkDeferredAsTargetInstantiations owns exactly that case.
-    if (currentMethodGenericParams_)
-        for (const ast::GenericParam& gp : *currentMethodGenericParams_)
-            if (gp.name == name) return;
+    // fix #2742: one shared predicate (Resolver::nameBoundByCurrentMethod),
+    // not a third hand-inlined copy of the loop.
+    if (nameBoundByCurrentMethod(name)) return;
     asTargetSites_.push_back({name, currentOuterType_, loc});
 }
 
