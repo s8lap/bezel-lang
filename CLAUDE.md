@@ -260,7 +260,13 @@ redundant fork+link+exec tasks.
 
 **Keep the repo root clean.** Ad-hoc `.bzl` probes, one-off `bezelc -o` outputs,
 and investigation scratch do NOT belong loose in the repo root — put them in
-`./scratch/` (gitignored) or `/var/tmp/bezel-scratch/`. Cleanup is automated, so
+`./scratch/` (gitignored) or `/var/tmp/bezel-scratch/`. ⚠ **Scratch goes in a
+LANE-UNIQUE subdir** (`/var/tmp/bezel-scratch/<lane-name>/`), never straight
+into `/var/tmp/bezel-scratch/` and never a shared short prefix. Measured
+2026-09-22: two lanes both wrote a probe `.bzl` under a common directory, one
+overwrote the other's file mid-run, and the victim's probe briefly read as
+"the bug fixed itself" — a false refutation, which is the expensive direction
+for this class of mistake. Cleanup is automated, so
 you should rarely sweep by hand: `scripts/gate_and_push.sh` runs
 `scripts/gc_scratch.sh` after every successful push, which (a) reaps worktrees
 whose commits are already in `origin/main` (branch refs are kept; WIP, locked,
