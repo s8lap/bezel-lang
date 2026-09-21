@@ -26,12 +26,31 @@
 // the test FAILs if any are observed.
 //
 // ORACLE INTEGRITY (LANE_RULES §"oracle strength").
-// `heap_uaf_count == 0` across N = 256 parallel attempts. NOT
-// `leaksAtLeast(...)` (the defect class is UAF, not LSan-detectable leak),
-// NOT `exitCode == 0` (the Bezel runtime appears to `_exit(0)` from
-// somewhere inside teardown before ASan finishes flushing — every observed
-// failure exits 0; the only signal is the truncated 5-line ASan report in
-// stderr).
+// Every ASan CORRUPTION headline the N = 256 parallel attempts produce must
+// be zero — `heap-use-after-free`, `double-free`, and the generic
+// `ERROR: AddressSanitizer` catch-all. NOT `exitCode == 0` (the Bezel runtime
+// appears to `_exit(0)` from somewhere inside teardown before ASan finishes
+// flushing — every observed failure exits 0; the only signal is the ASan
+// report `runAotChecked` copies into the diagnostics).
+//
+// fix #4540 (§28.3, v0.306) WIDENED THIS ORACLE, and the widening is the
+// point of that issue as much as the codegen change is. As first written the
+// row counted `heap-use-after-free` ONLY, and only inside an `if (!r.ran)`
+// arm. The #3460 residual of #4540 is a DOUBLE-FREE, produced by THIS test's
+// own reproducer on THIS test's own threads — four of them in the `--full`
+// ASan pass of gate `e89577e4`, stack
+// `bz_closure_release <- bz$async$M.C$Fill$Resume <- domain_drain` — and this
+// row reported `[ OK ]` for every one of them, because `double-free` matched
+// no substring anyone was counting. An oracle that names one spelling of
+// corruption certifies one spelling of corruption.
+//
+// The LEAK leg is measured and asserted too. Pre-#4540 the reproducer leaked
+// `68 byte(s) in 3 allocation(s)` in 1,972 of 2,000 runs: the owner's
+// `DisposeCore` released `_h` and NULLED the field before waiting for the
+// worker's borrow, so the worker's `this._h := lambda() => k;` then stored a
+// closure into a field nobody would ever release. That leak and the
+// double-free are the two interleavings of ONE placement bug, so a row that
+// tolerated the leak would have kept 98.6 % of the evidence off the record.
 //
 // SPEC CITATION.
 // §28.3 ("Local variables, ownership, and borrows") — "the borrow of the
@@ -129,6 +148,10 @@ BEZEL_TEST(codegen_async_frame_teardown_no_uaf_3460,
     // total = W * K = 256 attempts
 
     std::atomic<int> heap_uaf_count{0};
+    // fix #4540: the three counters the original row did not have.
+    std::atomic<int> double_free_count{0};
+    std::atomic<int> asan_error_count{0};
+    std::atomic<int> leak_count{0};
     std::atomic<int> ran_ok{0};
 
     // Warm the bincache so all 8 children share one compile result.
@@ -137,29 +160,58 @@ BEZEL_TEST(codegen_async_frame_teardown_no_uaf_3460,
     std::vector<std::thread> workers;
     workers.reserve(W);
     for (int w = 0; w < W; ++w) {
-        workers.emplace_back([&heap_uaf_count, &ran_ok]() {
+        workers.emplace_back([&heap_uaf_count, &double_free_count,
+                              &asan_error_count, &leak_count, &ran_ok]() {
             for (int i = 0; i < K; ++i) {
                 JitResult r = runAotChecked(kN24);
-                if (!r.ran) {
-                    for (const auto& d : r.diagnostics.diagnostics())
-                        if (d.message.find("heap-use-after-free") != std::string::npos) {
-                            heap_uaf_count.fetch_add(1, std::memory_order_relaxed);
-                            goto done;
-                        }
-                done:
-                    ;
-                } else {
-                    ran_ok.fetch_add(1, std::memory_order_relaxed);
+                // fix #4540: scan the diagnostics UNCONDITIONALLY. The `!r.ran`
+                // guard this replaces was not a filter, it was a blindfold:
+                // `runAotChecked` reports a fired sanitizer as ran=false WITH
+                // the report text, so gating the scan on `!r.ran` only ever
+                // skipped attempts that had nothing to report anyway — while
+                // making the row read as if a clean run could hide corruption.
+                // Counting per-attempt (a run is one hit at most per class)
+                // keeps the numbers comparable to the N above.
+                bool sawUaf = false, sawDoubleFree = false;
+                bool sawAsan = false, sawLeak = false;
+                for (const auto& d : r.diagnostics.diagnostics()) {
+                    if (d.message.find("heap-use-after-free") != std::string::npos)
+                        sawUaf = true;
+                    if (d.message.find("double-free") != std::string::npos)
+                        sawDoubleFree = true;
+                    if (d.message.find("ERROR: AddressSanitizer") != std::string::npos)
+                        sawAsan = true;
+                    if (d.message.find("ERROR: LeakSanitizer") != std::string::npos)
+                        sawLeak = true;
                 }
+                if (sawUaf) heap_uaf_count.fetch_add(1, std::memory_order_relaxed);
+                if (sawDoubleFree)
+                    double_free_count.fetch_add(1, std::memory_order_relaxed);
+                if (sawAsan) asan_error_count.fetch_add(1, std::memory_order_relaxed);
+                if (sawLeak) leak_count.fetch_add(1, std::memory_order_relaxed);
+                if (r.ran) ran_ok.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
     for (auto& t : workers) t.join();
 
     BEZEL_EXPECT_EQ(heap_uaf_count.load(), 0);
-    // Sanity: at least most runs reached `r.ran`. The diagnostic observed
-    // r.ran == true on every UAF failure (exit code 0; the truncated ASan
-    // report still surfaces via diagnostics), so a green `heap_uaf_count`
-    // together with a green `ran_ok` is the success signal.
+    // fix #4540 (§28.3, v0.306): the double-free leg. This is the spelling the
+    // four reports in gate `e89577e4` carried, and the one this row used to
+    // pass straight through.
+    BEZEL_EXPECT_EQ(double_free_count.load(), 0);
+    // fix #4540: the catch-all, so the NEXT spelling of corruption (a
+    // heap-buffer-overflow, a SEGV on an unknown address) does not need
+    // another gate cycle to be noticed.
+    BEZEL_EXPECT_EQ(asan_error_count.load(), 0);
+    // fix #4540: the leak leg — the common interleaving of the same bug.
+    BEZEL_EXPECT_EQ(leak_count.load(), 0);
+    // Sanity: at least most runs reached `r.ran`. Left at the original `> 0`
+    // DELIBERATELY. It is tempting to tighten it to `W * K` now that the leak
+    // is gone, but `r.ran` is also false for a harness TIMEOUT or an infra
+    // failure, neither of which is a memory-safety finding — and this row runs
+    // 256 forked compiles+execs inside a contended gate. The four counters
+    // above carry the whole memory-safety verdict and none of them can be
+    // moved by contention, so tightening this one would only buy flake.
     BEZEL_EXPECT_TRUE(ran_ok.load() > 0);
 }

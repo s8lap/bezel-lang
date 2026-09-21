@@ -2629,6 +2629,42 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // Dispose (a no-op if already run) and THEN reclaim the block exactly once.
     // The caller is responsible for null-ing its slot afterward where a second
     // dispatch through the same slot is reachable. free(null) is a no-op.
+    //
+    // fix #4540 (§28.3, §30.1, v0.306) — the #3460 residual. The cross-task
+    // borrow wait MUST run here, at the FRONT of the owner's teardown, not
+    // only in front of the physical `free` in emitReclaimBlock.
+    //
+    // #3460 placed it immediately before `free(obj)`, which closes exactly one
+    // race: the worker reading the object's BYTES after the owner unmapped
+    // them. But `emitDynamicDispose` below dispatches the vtable Dispose, and
+    // that runs the object's LOGICAL teardown — the destructor body and the
+    // owned/refcounted FIELD releases (bz$<C>$DisposeCore) — while the async
+    // frame that registered the borrow is still live and still writing those
+    // same fields. §28.3's "the borrow of the captured state must outlive any
+    // pending resumption" is a claim about the whole of the owner's teardown,
+    // not just about the heap block.
+    //
+    // Measured (issue #4540): `using var c := new C(); var t := c.Fill(7);`
+    // where the async `Fill` assigns `this._h := lambda() => k;` after an
+    // `await`. The owner's Dispose released `_h` (closure A) and only THEN
+    // waited; the worker's `this._h := B` read the same A and released it too
+    // — two releases against one reference. The loser's `__atomic_sub_fetch`
+    // returns -1, which is not `> 0`, so both callers fall into
+    // bz_closure_release's last-drop path and both `free(env)`:
+    // "AddressSanitizer: attempting double-free ... bz_closure_release <-
+    // bz$async$M.C$Fill$Resume <- domain_drain". Waiting first makes the
+    // worker's store happen-before the owner's field release, so each closure
+    // is released exactly once (and B is no longer stranded).
+    //
+    // Null-safe, and a no-op for the objects nobody borrowed (a mutex lock and
+    // a failed side-table lookup, no syscall). emitReclaimBlock keeps its own
+    // call: that function is also entered directly from the `await using` path
+    // (#3470), which never passes through here, and a second wait on an
+    // already-drained object costs the same failed lookup.
+    builder_.CreateCall(
+        declareC("bz_wait_for_borrows", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}),
+        {obj});
     emitDynamicDispose(obj);
     emitReclaimBlock(obj);
 }
