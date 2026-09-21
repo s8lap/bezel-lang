@@ -456,11 +456,24 @@ dispose-count/ASan-clean for a double-free.
   diagnostic carries a real location, so the helper returns true on both sides.
   When the pre-fix behaviour is a crash/IR-verifier failure/signal, assert the
   *specific* diagnostic. (Caught because FAIL-WITHOUT showed 2 of 4 rows failing.)
-- **The native ASan leg is vacuous in lane worktrees** — `asanRuntimeObject()` is
-  empty there, the helper returns `-1`, and `if (asan == -1) return;` passes the
-  leg. A lane *and* its reviewer can both see green while the gate's shared
-  checkout catches the regression. Never accept a lane-local ASan green as
-  evidence, and always confirm the test *program* actually compiles.
+- **The `-1` sentinel silently deletes the ASan leg — but NOT for the reason
+  this file used to give.** ⚠ The old wording here said "the native ASan leg is
+  vacuous in lane worktrees, `asanRuntimeObject()` is empty there" and told you
+  never to accept a lane-local ASan green. **That is false and was costing real
+  evidence.** `asanRuntimeObject()` (tests/native_test_harness.hpp) does not look
+  up a prebuilt artifact — it *compiles every runtime TU under
+  `-fsanitize=address` and `ld -r`-combines them*, memoized per sanitizer, so it
+  works in any worktree with a toolchain. Measured 2026-09-22: 285 lane runs, all
+  reporting `NATIVE SANITIZER: 0 check(s) skipped`, with the objects on disk under
+  `/var/tmp/bezel-scratch/rtobj/`. A lane-local ASan green IS evidence.
+  The real hazard is narrower and sharper: the `runUnderAsan*` helpers return
+  `-1` for **toolchain unavailable, compile failure AND link failure alike**, and
+  every caller writes `if (rc == -1) return;`. So a *link* break makes the
+  sanitizer leg vanish from every row in that file and report exactly the same
+  green — and `nativeSanitizerUnavailableSkips()` (#3626) counts only the first
+  of the three, so a suite-wide outage of the other two is invisible to the gate
+  (#4563). Confirm the leg RAN — `0 check(s) skipped`, or `nm` the emitted object
+  for `__asan_report*` — rather than assuming it did or assuming it didn't.
 - **"Compile it N times" is blind to hash-ORDERING defects.** Bucket sharing
   depends on pairwise address *differences*, and ASLR shifts every allocation by
   a constant — so 40 compiles yield one identical object even when the ordering
