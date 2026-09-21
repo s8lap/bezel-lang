@@ -12364,27 +12364,73 @@ bool Emitter::fillOmittedCtorArgs(const sema::ConstructorSymbol& target,
     const std::size_t nFormals = target.params.size();
     if (args.empty() || args.size() >= nFormals + 1) return true;  // nothing omitted
     const std::size_t nSupplied = args.size() - 1;
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the body moved to
+    // `fillOmittedCtorSlots`, which fills BY SLOT. This wrapper is the
+    // trailing-run case — the supplied arguments occupy `0 .. nSupplied-1`
+    // and the omitted ones are exactly the tail — so the two are the same
+    // computation on the same inputs and nothing here changes value.
     std::vector<llvm::Value*> ordered(nFormals, nullptr);
     for (std::size_t k = 0; k < nSupplied; ++k) ordered[k] = args[k + 1];
+    if (!fillOmittedCtorSlots(target, fnTy, coerceNumericDefaults, ordered))
+        return false;
+    for (std::size_t k = nSupplied; k < nFormals; ++k) args.push_back(ordered[k]);
+    return true;
+}
+
+// fix #4550 (§22.5 "Optional parameters and named arguments" / §22.8 step 1 /
+// §22.10, v0.306) — see LlvmBackend_impl.hpp for the contract.
+//
+// The PER-SLOT fill, and the body `fillOmittedCtorArgs` above now delegates
+// to. A NAMED §22.10 inheritance clause that omits a §22.5-defaulted parameter
+// does not leave a trailing RUN of omitted slots — `: B(k := 3)` against
+// `constructor(a: int := 1, k: int := 7)` leaves a HOLE at slot 0 — and the
+// trailing wrapper, which appends from `nSupplied`, cannot express that. The
+// LOCAL arm already worked per-slot (`fillOmittedParamDefaults`,
+// `buildOrderedArgs`' own body, walks `ordered` and fills every null it
+// finds); only the IMPORTED arm and the coercion loop were keyed on the tail,
+// and both are keyed on the slot here.
+bool Emitter::fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
+                                   llvm::FunctionType* fnTy,
+                                   bool coerceNumericDefaults,
+                                   std::vector<llvm::Value*>& ordered) {
+    // A LOCAL constructor carries its source-written `ast::Param` list, whose
+    // `defaultValue` is the real `ast::Expr` — strictly better than any
+    // rendered text (it can read an earlier parameter, `default(T)`, …). An
+    // IMPORTED one ships no `ast::ConstructorDecl` at all (the #2374 shape), so
+    // its defaults ride `ParameterSymbol::defaultText` and fold through
+    // `importedCtorDefaultArgValue` — the same helper the imported `new`-site
+    // fill uses (LlvmBackend_Exprs2.cpp, fix #3082).
+    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(target.decl);
+    const std::size_t nFormals = target.params.size();
+    if (ordered.size() != nFormals) return false;
+    // Which slots this call OMITS, captured before anything fills them: the
+    // §5.1 coercion below applies to the materialized defaults only, exactly
+    // as it did when they were identified by being past `nSupplied`.
+    std::vector<bool> omitted(nFormals, false);
+    bool anyOmitted = false;
+    for (std::size_t k = 0; k < nFormals; ++k)
+        if (!ordered[k]) { omitted[k] = true; anyOmitted = true; }
+    if (!anyOmitted) return true;
     if (cd) {
         if (cd->params.size() != nFormals) return false;
         if (!fillOmittedParamDefaults(cd->params, ordered,
                                       /*orderedExprs=*/nullptr))
             return false;
     } else {
-        for (std::size_t k = nSupplied; k < nFormals; ++k) {
+        for (std::size_t k = 0; k < nFormals; ++k) {
+            if (!omitted[k]) continue;
             ordered[k] = importedCtorDefaultArgValue(target, k);
             if (!ordered[k]) return false;
         }
     }
-    for (std::size_t k = nSupplied; k < nFormals; ++k) {
-        llvm::Value* dv = ordered[k];
+    for (std::size_t k = 0; k < nFormals; ++k) {
+        if (!omitted[k]) continue;
         // §5.1: widen an int default landing in a wider numeric formal, as the
         // imported `new`-site fill does. A no-op for a non-numeric pair.
         if (coerceNumericDefaults && fnTy && k + 1 < fnTy->getNumParams())
-            dv = coerceNumericToType(dv, fnTy->getParamType(k + 1),
-                                     /*srcUnsigned=*/false);
-        args.push_back(dv);
+            ordered[k] = coerceNumericToType(ordered[k],
+                                             fnTy->getParamType(k + 1),
+                                             /*srcUnsigned=*/false);
     }
     return true;
 }
@@ -13626,14 +13672,26 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                     // loop, which is also the only shape
                     // `baseClauseExplicitCtor` declares callable for a named
                     // clause (it requires `nFormals == args.size()` there).
+                    //
+                    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the
+                    // `paramToArg.size() == clsBaseArgs->size()` conjunct is
+                    // GONE. It said "only a binding that supplies every formal
+                    // re-keys this loop", which was #4520's own way of saying
+                    // "only the shape `baseClauseExplicitCtor` declares
+                    // callable for a named clause" — and that predicate now
+                    // also admits a named SHORT clause whose omitted slots
+                    // §22.5 fills from their defaults. Keeping the conjunct
+                    // would have left exactly that shape reading its arguments
+                    // by SOURCE POSITION, which is the mispairing #4520
+                    // removed. What still holds is constructor identity and a
+                    // binding that describes THIS formal list.
                     const std::vector<int>* ctorParamToArg = nullptr;
                     if (const sema::SemaContext::InheritanceClauseCtorBinding*
                             pub = ctx_.inheritanceClauseCtorBinding(
                                 clsBaseArgs)) {
                         if (pub->ctor == bce.cs &&
                             pub->paramToArg.size() ==
-                                sema::formalParamCount(*bce.cs) &&
-                            pub->paramToArg.size() == clsBaseArgs->size())
+                                sema::formalParamCount(*bce.cs))
                             ctorParamToArg = &pub->paramToArg;
                     }
                     // The FORMAL a given SOURCE argument binds to, and its
@@ -13649,11 +13707,17 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                 return pi;
                         return ai;  // unreachable for a total binding
                     };
+                    // fix #4550: an UNBOUND formal (one §22.5 leaves to its
+                    // default) has no source argument at all, and answering
+                    // `pi` for it — as this did — names whatever argument
+                    // happens to sit at that index. Answer an out-of-range
+                    // index instead; the one caller skips it.
                     auto argForFormal = [&](std::size_t pi) -> std::size_t {
                         if (!ctorParamToArg || pi >= ctorParamToArg->size())
                             return pi;
                         const int ai = (*ctorParamToArg)[pi];
-                        return ai >= 0 ? static_cast<std::size_t>(ai) : pi;
+                        return ai >= 0 ? static_cast<std::size_t>(ai)
+                                       : clsBaseArgs->size();
                     };
                     // §22.5 "Evaluation order": the supplied arguments are
                     // evaluated in call-site TEXTUAL order, "for positional
@@ -13662,8 +13726,15 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                     // this loop stays SOURCE-indexed and only the slot each
                     // value lands in is re-keyed — the same split #4484 and
                     // #4491 made on their own arms.
-                    std::vector<llvm::Value*> byFormal(clsBaseArgs->size(),
-                                                       nullptr);
+                    //
+                    // fix #4550: sized by the constructor's FORMAL count, not
+                    // by the clause's argument count. A named short clause
+                    // supplies fewer values than there are slots, and the
+                    // omitted ones are filled below from their §22.5 defaults
+                    // — per SLOT, because with names the omitted slots need
+                    // not be a trailing run.
+                    std::vector<llvm::Value*> byFormal(
+                        sema::formalParamCount(*bce.cs), nullptr);
                     for (std::size_t i = 0; i < clsBaseArgs->size(); ++i) {
                         const auto& a = (*clsBaseArgs)[i];
                         if (!a.value) { ok = false; break; }
@@ -13698,8 +13769,43 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                             /*srcUnsigned=*/false);
                         if (fi < byFormal.size()) byFormal[fi] = v;
                     }
-                    // A total binding fills every slot; the check is here so
-                    // that a partial one can never push a null into `args`
+                    // fix #3777 (§22.5 / §22.8 step 1 / §22.10, v0.286): the
+                    // §22.10 inheritance-clause face of the chain-call fill.
+                    // `baseClauseExplicitCtor` resolves a base constructor
+                    // whose parameters the clause OMITS (`class D(v: int) :
+                    // P(v)` over `P.constructor(n: int, s: string := "d")`),
+                    // so this loop owes those slots their §22.5 defaults —
+                    // through the SAME fill the `this(...)` / `base(...)`
+                    // chain uses, which is itself `buildOrderedArgs`'s own fill
+                    // body. Before this the clause resolved no callable
+                    // constructor at all and the base subobject was never
+                    // constructed: a `string`-typed omitted slot stayed a null
+                    // pointer and the first read SEGV'd.
+                    //
+                    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the
+                    // fill is PER SLOT (`fillOmittedCtorSlots`) and runs
+                    // BEFORE the values are appended, rather than
+                    // `fillOmittedCtorArgs` appending a trailing run after
+                    // them. With names the omitted slots need not be a
+                    // trailing run at all — `: B(k := 3)` against
+                    // `constructor(a: int := 1, k: int := 7)` leaves a HOLE at
+                    // slot 0 — and an append-to-the-end fill puts the default
+                    // in the wrong parameter. The two spellings agree exactly
+                    // where they overlap: for an all-positional clause every
+                    // supplied value already sits at its own index and the
+                    // holes are the tail.
+                    //
+                    // §22.5 "Evaluation order" is preserved by the split: the
+                    // SUPPLIED arguments were lowered above in call-site
+                    // textual order, and the omitted DEFAULTS are materialized
+                    // here, afterwards, in declaration order.
+                    const std::size_t nBaseFormals = bce.cs->params.size();
+                    if (ok && !fillOmittedCtorSlots(
+                                  *bce.cs, bce.fn->getFunctionType(),
+                                  /*coerceNumericDefaults=*/true, byFormal))
+                        ok = false;
+                    // Every slot must now hold a value; the check is here so
+                    // that a partial binding can never push a null into `args`
                     // (which LLVM would take as a malformed call) — it falls
                     // through to the same "not callable" disposition an
                     // abandoned argument already had.
@@ -13708,30 +13814,6 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                             if (!v) { ok = false; break; }
                     if (ok)
                         for (llvm::Value* v : byFormal) args.push_back(v);
-                    // fix #3777 (§22.5 / §22.8 step 1 / §22.10, v0.286): the
-                    // §22.10 inheritance-clause face of the chain-call fill.
-                    // `baseClauseExplicitCtor` now resolves a base constructor
-                    // whose trailing parameters the clause OMITS (`class D(v:
-                    // int) : P(v)` over `P.constructor(n: int, s: string :=
-                    // "d")`), so this loop owes those slots their §22.5
-                    // defaults — through the SAME `fillOmittedCtorArgs` the
-                    // `this(...)` / `base(...)` chain uses, which is itself
-                    // `buildOrderedArgs`'s own fill body. Before this the
-                    // clause resolved no callable constructor at all and the
-                    // base subobject was never constructed: a `string`-typed
-                    // omitted slot stayed a null pointer and the first read
-                    // SEGV'd.
-                    //
-                    // A short clause reaches here only when
-                    // `baseClauseExplicitCtor` declared it CALLABLE, which it
-                    // does only for an all-positional clause — see that
-                    // predicate for why the test lives there rather than here.
-                    const std::size_t nBaseFormals = bce.cs->params.size();
-                    if (ok && !fillOmittedCtorArgs(
-                                  *bce.cs, bce.fn->getFunctionType(),
-                                  /*coerceNumericDefaults=*/true, args,
-                                  /*outIsLocal=*/nullptr))
-                        ok = false;
                     if (ok && args.size() == nBaseFormals + 1) {
                         // fix #4077 (§22.10 "Constructor chaining" / §28.14 /
                         // §28.9, v0.295): the §22.10 INHERITANCE-CLAUSE twin
@@ -13781,8 +13863,15 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                 // not the one at source position `pi`
                                 // (`argForFormal` is the identity when no
                                 // binding was published).
+                                // fix #4550: `continue`, not `break` — an
+                                // out-of-range answer now means "§22.5 leaves
+                                // this slot to its default", which says
+                                // nothing about the slots after it. (A
+                                // materialized default is not a clause
+                                // expression, so it is not a +1 closure
+                                // producer this loop owes a release for.)
                                 const std::size_t sa = argForFormal(pi);
-                                if (sa >= clsBaseArgs->size()) break;
+                                if (sa >= clsBaseArgs->size()) continue;
                                 const auto& a = (*clsBaseArgs)[sa];
                                 if (!a.value) continue;
                                 if (!isPlusOneClosureProducer(a.value.get()))

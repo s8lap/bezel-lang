@@ -11599,17 +11599,64 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // belonging to that gap, filed rather than folded in; a clause
             // the binder declines publishes nothing and lowers exactly as it
             // does today.
+            //
+            // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the candidate
+            // scan falls back to constructors with MORE formals than the
+            // clause supplies.
+            //
+            // §22.5 admits omitting a parameter that declares a default, so a
+            // clause of arity N can legitimately name a constructor of arity
+            // M > N — and this scan, keyed on EXACT arity, found no candidate
+            // for one, published nothing, and codegen's
+            // `baseClauseExplicitCtor` then declared the clause "resolved but
+            // NOT callable" (its own #3777 exact-arity rule for a named
+            // clause). `emitImplicitBase` fell through to its arity-0
+            // fallback, found no parameterless constructor, and THE BASE WAS
+            // NEVER CONSTRUCTED: measured on fcb4dbd5, `class D(v: int) :
+            // B(a := v)` over `constructor(a: int, b: string := "zz")`
+            // compiled at exit 0 with no diagnostic and printed `0` and a
+            // blank line where `4` / `zz` is correct.
+            //
+            // THE WIDENING IS A FALLBACK, NOT A REPLACEMENT, and that is what
+            // keeps it from changing any program that resolves today. The
+            // EXACT-arity scan runs first and wins whenever it finds anything,
+            // so the constructor this publishes for an existing clause is the
+            // one it already published; the wider scan runs only where the
+            // narrow one found NOTHING, which is exactly the set of clauses
+            // that publish nothing today. Widening unconditionally would have
+            // turned a base declaring both `constructor(a: int)` and
+            // `constructor(a: int, b: string := "x")` into an ambiguity for
+            // `: B(a := v)`, losing a binding #4520 publishes.
+            //
+            // AMBIGUITY still publishes nothing, for #4520's reason: codegen
+            // picks the callee with `ctorForArgs` (which also discriminates by
+            // argument type) and checks pointer identity before reading the
+            // binding, so where the two could disagree the cost must be a lost
+            // fix, never a wrong-slot store.
             if (baseTs && td->primaryBaseCtorArgs[0].value) {
+                const std::size_t nClauseArgs = td->primaryBaseCtorArgs.size();
                 ConstructorSymbol* clauseCtor = nullptr;
                 bool ambiguousArity = false;
                 for (Symbol* m : baseTs->members) {
                     auto* other = dynamic_cast<ConstructorSymbol*>(m);
                     if (!other || other->isStatic) continue;
-                    if (formalParamCount(*other) !=
-                        td->primaryBaseCtorArgs.size())
-                        continue;
+                    if (formalParamCount(*other) != nClauseArgs) continue;
                     if (clauseCtor) { ambiguousArity = true; break; }
                     clauseCtor = other;
+                }
+                if (!clauseCtor && !ambiguousArity) {
+                    // fix #4550: no constructor of the clause's exact arity —
+                    // the omitted-default shape. A constructor with FEWER
+                    // formals can never take these arguments, so the test is
+                    // `>`, and the binder below is what decides whether the
+                    // omitted slots really are defaulted.
+                    for (Symbol* m : baseTs->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!other || other->isStatic) continue;
+                        if (formalParamCount(*other) <= nClauseArgs) continue;
+                        if (clauseCtor) { ambiguousArity = true; break; }
+                        clauseCtor = other;
+                    }
                 }
                 if (clauseCtor && !ambiguousArity) {
                     const std::string desc =

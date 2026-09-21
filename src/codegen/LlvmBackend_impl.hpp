@@ -14438,6 +14438,24 @@ private:
                              std::vector<llvm::Value*>& args,
                              bool* outIsLocal);
 
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the PER-SLOT face of
+    // the fill above, and its body — `fillOmittedCtorArgs` is now a thin
+    // trailing-run wrapper over it, so "what value does an omitted parameter
+    // take" still has exactly one answer in the emitter (CLAUDE.md §6).
+    //
+    // `ordered` is the call's arguments IN PARAMETER ORDER, sized
+    // `target.params.size()`, with a null at every slot §22.5 leaves to its
+    // default; this fills those slots in place. The trailing wrapper cannot
+    // serve a call whose omitted slots are a HOLE rather than a tail, which is
+    // exactly what a NAMED inheritance clause omitting a defaulted parameter
+    // produces (`: B(k := 3)` against `constructor(a: int := 1, k: int)`).
+    // Same contract otherwise: false = an omitted slot declares no default or
+    // its default failed to lower, and the caller abandons the call.
+    bool fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
+                              llvm::FunctionType* fnTy,
+                              bool coerceNumericDefaults,
+                              std::vector<llvm::Value*>& ordered);
+
     // CG16: emit a resolved chain call with `this` + lowered arguments.
     void emitChainCall(const ast::CallExpr* call, bool isThis,
                        sema::ConstructorSymbol* cs);

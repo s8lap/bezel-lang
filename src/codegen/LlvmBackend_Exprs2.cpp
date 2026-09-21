@@ -4809,23 +4809,47 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
     // now fills the omitted tail from the parameters' §22.5 defaults, exactly
     // as `emitChainCall` and every `new` site do.
     //
-    // A NAMED clause argument keeps the pre-#3777 exact-arity rule, and the
-    // test lives HERE rather than at the caller so that both readers of this
-    // predicate — `emitImplicitBase`, which evaluates the clause arguments, and
-    // `prePopulateBasePositionalFields`, which declines to evaluate them a
-    // second time — keep answering identically (the #3742 contract). The
-    // caller's fill loop pairs clause argument `i` with formal `i`
-    // POSITIONALLY, so it can only complete a TRAILING omitted tail; declaring
-    // a named short clause callable would make the evaluator skip it and the
-    // caller emit nothing. (fix #4520 re-keyed that fill loop by the §22.5
-    // binding, but sema publishes one only for a TOTAL binding over exactly
-    // these arguments — a named SHORT clause has none, so this exact-arity
-    // rule still stands for it. That shape's own silence is filed, not fixed.)
+    // The test lives HERE rather than at the caller so that both readers of
+    // this predicate — `emitImplicitBase`, which evaluates the clause
+    // arguments, and `prePopulateBasePositionalFields`, which declines to
+    // evaluate them a second time — keep answering identically (the #3742
+    // contract).
+    //
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): a NAMED SHORT clause
+    // is callable when sema published a §22.5 binding for THIS constructor.
+    //
+    // #3777 restricted the omitted-tail admission to an ALL-POSITIONAL clause,
+    // and its reason was true at the time: "The caller's fill loop pairs clause
+    // argument `i` with formal `i` POSITIONALLY, so it can only complete a
+    // TRAILING omitted tail; declaring a named short clause callable would make
+    // the evaluator skip it and the caller emit nothing." #4520 re-keyed that
+    // loop by the §22.5 binding, and this commit gives it a PER-SLOT default
+    // fill (`fillOmittedCtorSlots`), so both halves of the premise are gone —
+    // but only for a clause sema actually bound. Without a binding the caller
+    // still pairs by position, so the restriction stands for that case and a
+    // named short clause simply stays "resolved, but NOT callable".
+    //
+    // MEASURED ON fcb4dbd5: `class D(v: int) : B(a := v)` over
+    // `constructor(a: int, b: string := "zz")` compiled at exit 0 with no
+    // diagnostic and printed `0` and a blank line where `4` / `zz` is correct
+    // — `r.cs` resolved, this test failed it, and `emitImplicitBase` fell
+    // through to its arity-0 fallback, which found nothing, so the base
+    // subobject was NEVER CONSTRUCTED. The all-positional twin of the same
+    // program prints `4` / `zz` (that is #3777's own fix), so the plumbing
+    // works and it was the exact-arity rule that dropped it.
+    //
+    // The binding is checked for CONSTRUCTOR IDENTITY and for covering every
+    // formal, the same discipline `emitImplicitBase` applies before reading it
+    // — a disagreement costs the fix, never a wrong-slot store.
     const std::size_t nFormals = sema::formalParamCount(*r.cs);
-    if (it == ctorFns_.end() ||
-        it->second->arg_size() != nFormals + 1 ||
-        (!clauseAllPositional && nFormals != args.size()))
+    if (it == ctorFns_.end() || it->second->arg_size() != nFormals + 1)
         return r;  // resolved, but NOT callable: the caller still owes the args
+    if (!clauseAllPositional && nFormals != args.size()) {
+        const sema::SemaContext::InheritanceClauseCtorBinding* pub =
+            ctx_.inheritanceClauseCtorBinding(&args);
+        if (!pub || pub->ctor != r.cs || pub->paramToArg.size() != nFormals)
+            return r;  // resolved, but NOT callable
+    }
     r.fn = it->second;
     return r;
 }
