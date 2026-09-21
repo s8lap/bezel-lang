@@ -3022,6 +3022,18 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         recvTy->primitive != sema::PrimitiveType::Object &&
         (isEquals || isGetHashCode)) {
         if (isGetHashCode) {
+            // fix #4562 (§4.4/§8.3, v0.306): a `decimal` receiver lowers to a
+            // 16-byte STRUCT (decimalStructType()), not an LLVM int/float, so
+            // it matched neither shape check below and this arm answered
+            // `nullptr` for every decimal `GetHashCode()` call. Reuse
+            // `emitValueHashCode`'s own decimal arm (LlvmBackend_String.cpp)
+            // — the SAME `bz_decimal_hash` call the box-Equals thunk
+            // (`primBoxHashThunk`) and every decimal record/dictionary-key
+            // hash site already use — rather than re-deriving the runtime
+            // call here, so a decimal's boxed and unboxed `GetHashCode()`
+            // can never disagree.
+            if (recv->getType() == decimalStructType())
+                return emitValueHashCode(recv, recvTy);
             // §8.3-style: the value itself as an i32 hash (bit-pattern for FP).
             if (recv->getType()->isDoubleTy())
                 recv = builder_.CreateBitCast(recv, i64());
@@ -3033,6 +3045,44 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         // isEquals: value equality, returning i1 (Bool).
         if (!call.args[0].value) return nullptr;
+        // fix #4562 (§4.4/§8.3, v0.306): the DECIMAL twin of the FP/int shape
+        // checks below. A `decimal` receiver lowers to a struct, so it
+        // matched neither `isFloatingPointTy()` nor `isIntegerTy()` and this
+        // whole arm fell through to the unconditional `return nullptr;` at
+        // its end — for EVERY argument, including another decimal of the
+        // identical value — after already having (uselessly) lowered the
+        // argument. A caller further out then silently answered a bare
+        // `false`, with no diagnostic. Classify the ARGUMENT's static type
+        // BEFORE lowering it (§22.5: a reroute below must not lower it a
+        // second time) — the same settle-vs-dispatch split the record/enum/
+        // choice arms below use for their own `Equals`: an argument whose
+        // static type is decimal itself (§9.1's `IEquatable<decimal>` fast
+        // path) is compared directly via `emitValueEquality` — the same
+        // canonical per-value helper `=`, record-field equality, and the
+        // box-Equals thunk (`primBoxEqualsThunk`, #2793) all call, which
+        // routes a decimal payload through `bz_decimal_cmp` so `1.5m` and
+        // `1.50m` compare equal despite differing scale bits. Any other
+        // static shape (`Object`, an interface, a class, `string`, a
+        // nullable form, or an unresolved generic) can dynamically BE a
+        // boxed decimal and is routed through `lowerValueSemUniversalEquals`
+        // — the SAME box+dispatch+release helper #4559's sibling fix wired
+        // the int/FP family's mismatched-shape argument to, and every
+        // record/enum/choice receiver below already uses — so this stays
+        // the fourth face of one rule (§8.1's universal `Equals`) rather
+        // than a new dispatch site.
+        if (recv->getType() == decimalStructType()) {
+            const ast::Expr& argE = *call.args[0].value;
+            const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+            bool argIsDecimal = at && !at->nullable &&
+                at->kind == sema::TypeRef::Kind::Primitive &&
+                at->primitive == sema::PrimitiveType::Decimal;
+            if (!argIsDecimal)
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            llvm::Value* other = lowerExpr(argE);
+            if (!other || other->getType() != decimalStructType())
+                return nullptr;
+            return emitValueEquality(recv, other, recvTy);
+        }
         llvm::Value* other = lowerExpr(*call.args[0].value);
         if (!other) return nullptr;
         if (recv->getType()->isFloatingPointTy()) {
