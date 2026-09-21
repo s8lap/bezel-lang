@@ -3171,6 +3171,91 @@ static bool parseAndAttachBaseCtorArgs(
     return true;
 }
 
+// fix #4553 (§2.8.2 / §14.2, v0.306): the §14.1/#783 synthetic reconstruction
+// source renders the class header's generic parameter LIST but dropped its
+// `where` CONSTRAINTS, so `class Holder<T> where T: Base` came back as
+// `class Holder<T>`. A body that uses a constraint-provided member
+// (`Describe(item: T): string => item.Tag();`) then fails to type-resolve in
+// the fresh context, the #783 soundness gate declines to attach the decl,
+// `ms->decl` stays null, and codegen's HARD route at emitMethodCall falls
+// through to the defining module's i32-PLACEHOLDER template — emitting
+// `call ptr @"bz$Lib.Holder$Describe"(ptr, ptr)` against a `(ptr, i32)`
+// declaration, which LLVM's own verifier rejects ("Call parameter type does
+// not match function signature"). §2.8.2 requires an external instantiation
+// at an arbitrary constraint-satisfying type argument to behave identically to
+// a same-module one, so the constraint must survive the round trip.
+//
+// The clause can only be rendered if every TYPE constraint on it can be NAMED
+// inside the single-type synthetic source. This helper answers that and, as a
+// side effect, collects the exporting module's sibling `TypeSymbol`s the
+// constraint names so the caller can register them in the fresh context (the
+// #3645 sibling-registry mechanism, scoped here to CONSTRAINT types only).
+// Scoping it that narrowly is deliberate: registering ALL public siblings would
+// also admit bodies that reach an arbitrary sibling, which is the shape
+// `xmod_generic_method_783`'s T5 canary deliberately keeps gated. A constraint
+// is part of the generic's own public signature (§14.2) and rides the wire
+// already, so admitting exactly it adds no new reconstruction guesswork.
+//
+// Returns false → the caller renders NO `where` clause, i.e. exactly the
+// pre-fix behaviour (a constrained generic whose body does not USE the
+// constraint keeps reconstructing as before).
+static bool collectRenderableConstraintTypes(
+    const MetaTypeDecl& td, const std::string& moduleName,
+    sema::SemaContext& mainCtx,
+    std::vector<sema::TypeSymbol*>& outSiblings) {
+    for (const MetaGenericParam& gp : td.genericParams) {
+        // A.3 `Constraint ::= "class" | "value" | "notnull" | "sendable" |
+        // "hashable" | "new" "(" ")" | Type`. Whitelist rather than
+        // blacklist: an unrecognised spelling would be rendered verbatim into
+        // the synthetic source and fail to PARSE, which costs the whole body
+        // (the §14.1/#783 gate declines and a previously-working
+        // reconstruction becomes a reject). §14.4's `where T is owned` /
+        // `is not owned` modifier form rides this same vector and has a
+        // DIFFERENT surface syntax (`is`, not `:`), so it is excluded here by
+        // simply not being on the list.
+        for (const std::string& sc : gp.specialConstraints) {
+            if (sc != "class" && sc != "value" && sc != "notnull" &&
+                sc != "sendable" && sc != "hashable" && sc != "new")
+                return false;
+        }
+        for (const MetaType& ct : gp.constraintTypes) {
+            if (ct.kind != TypeKind::Named) return false;
+            // A.3 `Constraint`'s Type alternative is not nullable, and
+            // `metaTypeToSourceText` would render `Base?` — a syntax error in
+            // constraint position. Decline rather than emit it.
+            if (ct.nullable) return false;
+            // A generic constraint naming a constructed type (`where T:
+            // IComparable<U>`) needs its own argument list rendered and
+            // resolved; out of scope here — decline and keep pre-fix behaviour.
+            if (!ct.genericArgs.empty()) return false;
+            const std::string simple = metaNamedSimpleName(ct);
+            if (simple == td.name) continue;  // self-reference: declared here
+            bool isOwnParam = false;
+            for (const MetaGenericParam& p : td.genericParams)
+                if (p.name == simple) { isOwnParam = true; break; }
+            if (isOwnParam) continue;  // `where T: U` — bound by the header
+            sema::TypeSymbol* found = nullptr;
+            if (const std::vector<sema::TypeSymbol*>* sibs =
+                    mainCtx.importedTypesOf(moduleName)) {
+                for (sema::TypeSymbol* sib : *sibs) {
+                    if (!sib) continue;
+                    if (sib->qualifiedTypeName() == ct.namedName ||
+                        std::string(sib->name) == simple) {
+                        found = sib;
+                        break;
+                    }
+                }
+            }
+            // Not an imported public sibling (a stdlib/builtin interface, an
+            // `internal` sibling that was never exported, a third module's
+            // type): it cannot be named in the synthetic source, so decline.
+            if (!found) return false;
+            outSiblings.push_back(found);
+        }
+    }
+    return true;
+}
+
 // §14.1 / #783: build a synthetic class source for re-parsing ONE imported
 // generic method's body.  All fields are declared (so field references resolve),
 // every OTHER method is emitted as a signature-only stub (so self-calls resolve),
@@ -3192,9 +3277,17 @@ static bool parseAndAttachBaseCtorArgs(
 static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
                                               const MetaMember& target,
                                               bool nonGenericRecordFactoryPath,
-                                              const std::string& moduleName) {
+                                              const std::string& moduleName,
+                                              bool renderConstraints,
+                                              bool constraintNamesSibling) {
     std::string src = "module _783_reparsed_method_;\n";
-    if (nonGenericRecordFactoryPath && !moduleName.empty()) {
+    // fix #4553 (§2.8.2 / §14.2, v0.306): a rendered `where T: Base` names a
+    // sibling of the EXPORTING module, so the synthetic source must import it
+    // for the name to bind — the same line the #3645 arm emits. Only the
+    // CONSTRAINT types are registered in the fresh context (see
+    // collectRenderableConstraintTypes), so this import widens nothing else.
+    if ((nonGenericRecordFactoryPath || constraintNamesSibling) &&
+        !moduleName.empty()) {
         src += "import " + moduleName + ";\n";
     }
     src += metaVisibilityToKeyword(td.visibility);
@@ -3212,6 +3305,32 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4553 (§2.8.2 / §14.2, v0.306): the `where` clauses (A.3
+    // `GenericConstraints*`, rendered after the header). Without them `T` is
+    // unconstrained in the fresh context and a body that calls a
+    // constraint-provided member does not resolve — see
+    // collectRenderableConstraintTypes for why this is all-or-nothing.
+    if (renderConstraints) {
+        for (const MetaGenericParam& gp : td.genericParams) {
+            if (gp.constraintTypes.empty() && gp.specialConstraints.empty())
+                continue;
+            src += "  where " + gp.name + ": ";
+            bool firstC = true;
+            for (const std::string& sc : gp.specialConstraints) {
+                if (!firstC) src += ", ";
+                // A.3 `Constraint ::= ... | "new" "(" ")"` — the wire carries
+                // the bare `new`; the surface form takes the parens.
+                src += (sc == "new" ? std::string("new()") : sc);
+                firstC = false;
+            }
+            for (const MetaType& ct : gp.constraintTypes) {
+                if (!firstC) src += ", ";
+                src += metaTypeToSourceText(ct);
+                firstC = false;
+            }
+            src += "\n";
+        }
+    }
     // Fields (needed so implicit field references resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -3347,8 +3466,15 @@ static bool parseAndAttachMethodBody(
     sema::SemaContext& mainCtx,
     bool nonGenericRecordFactoryPath,
     const std::string& moduleName) {
+    // fix #4553 (§2.8.2 / §14.2, v0.306): decide whether the class header's
+    // `where` clauses can be reproduced, and collect the exporting module's
+    // sibling types they name so they can be registered below.
+    std::vector<sema::TypeSymbol*> constraintSiblings;
+    const bool renderConstraints = collectRenderableConstraintTypes(
+        td, moduleName, mainCtx, constraintSiblings);
     std::string source = buildSyntheticMethodSource(td, target,
-        nonGenericRecordFactoryPath, moduleName);
+        nonGenericRecordFactoryPath, moduleName, renderConstraints,
+        /*constraintNamesSibling=*/!constraintSiblings.empty());
 
     DiagnosticEngine freshDiag;
     Lexer freshLex(source, freshDiag);
@@ -3398,6 +3524,16 @@ static bool parseAndAttachMethodBody(
             }
         }
     }
+    // fix #4553 (§2.8.2 / §14.2, v0.306): register ONLY the sibling types the
+    // rendered `where` clauses name, so `where T: Base` binds to the REAL
+    // imported `Base` TypeSymbol and the body's `item.Tag()` resolves against
+    // it. Deliberately narrower than the #3645 arm above — a body reaching an
+    // arbitrary sibling stays gated (the T5 canary in
+    // tests/module/xmod_generic_method_783_test.cpp).
+    if (!moduleName.empty())
+        for (sema::TypeSymbol* sib : constraintSiblings)
+            if (sib && !sib->name.empty())
+                freshCtx.registerImportedType(moduleName, sib);
     sema::resolveTypes(*sf, freshCtx);
     if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
@@ -3529,6 +3665,15 @@ static bool parseAndAttachMethodBody(
         for (sema::Symbol* ps : syms)
             if (ps) freshLambdaParamSyms.insert(ps);
 
+    // fix #4553 (§2.8.2 / §14.2, v0.306): the constraint types registered into
+    // the fresh context above, as a set, so the MethodSymbol arm below can tell
+    // "a member the CONSTRAINT provides" (already an IMPORTED symbol — carry it
+    // over by identity) from "a member of some other type" (no binding, as
+    // before).
+    std::unordered_set<const sema::Symbol*> constraintSiblingSyms;
+    for (sema::TypeSymbol* sib : constraintSiblings)
+        if (sib) constraintSiblingSyms.insert(sib);
+
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
@@ -3567,8 +3712,24 @@ static bool parseAndAttachMethodBody(
             }
         } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
             auto it = importedMethods.find(freshMethodSigKey(fms));
-            if (it != importedMethods.end())
+            if (it != importedMethods.end()) {
                 mainCtx.setExprSymbol(expr, it->second);
+            } else if (fms->parent &&
+                       constraintSiblingSyms.count(fms->parent)) {
+                // fix #4553 (§2.8.2 / §14.2, v0.306): a call to a member the
+                // CONSTRAINT provides (`item.Tag()` under `where T: Base`).
+                // `importedMethods` only holds the reconstructed type's OWN
+                // members, so this arm used to drop the binding: codegen then
+                // saw no symbol for the callee, fell into the fieldAddr
+                // member-READ fallback, and reported the #2445 "no member
+                // `Tag` on substituted type `Local`" diagnostic instead of
+                // emitting the call. There is nothing to remap here — the
+                // constraint's type was registered into the fresh context AS
+                // the imported `TypeSymbol`, so `fms` already IS the symbol
+                // codegen consumes. Carry it over by identity, exactly as the
+                // body-local arm below does (#2818).
+                mainCtx.setExprSymbol(expr, fms);
+            }
         } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
             // fix #2818 (§14.1 monomorphization / §2.5 modules, v0.240): a
             // symbol DECLARED INSIDE the re-parsed body — a `var`/`const`
