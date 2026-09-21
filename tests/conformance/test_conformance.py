@@ -477,6 +477,39 @@ class IsCrashTest(unittest.TestCase):
             self.assertFalse(cf.is_crash(rc), rc)
 
 
+class SnippetTest(unittest.TestCase):
+    """_snippet budgets characters over the WHOLE line, path included — a
+    bezelc diagnostic opens with the absolute path of the file it compiled, so
+    without `strip_dir` the surviving message shrinks as the checkout gets
+    deeper (#4556)."""
+
+    def test_without_strip_dir_a_deep_path_eats_the_whole_budget(self):
+        deep = "/" + "/".join(["lane-worktree-segment"] * 6)
+        log = deep + "/cases/s5_4_0001.bzl:20:23: no member named 'reallyLong'\n"
+        snippet = cf._snippet(log, 120, 120)
+        self.assertNotIn("no member named", snippet)
+
+    def test_strip_dir_removes_the_prefix_before_the_budget_is_spent(self):
+        # cut_chars/head_bytes match the rule-corpus runner's compile-error
+        # tier (runner.py's `evaluate`, expect != reject/quiet branch).
+        deep = "/" + "/".join(["lane-worktree-segment"] * 6) + "/cases"
+        log = (deep + "/s5_4_0001.bzl:20:23: no member named 'reallyLongName' "
+               "in type 'Widget'\n")
+        snippet = cf._snippet(log, 120, 240, strip_dir=deep)
+        self.assertNotIn(deep, snippet)
+        self.assertIn("no member named 'reallyLongName'", snippet)
+
+    def test_strip_dir_is_a_noop_when_the_prefix_is_absent(self):
+        log = "s1_1_0001.bzl:1:1: boom\n"
+        self.assertEqual(cf._snippet(log, 10, 20),
+                         cf._snippet(log, 10, 20, strip_dir="/nonexistent"))
+
+    def test_strip_dir_none_matches_prior_behavior(self):
+        log = "/some/where/f.bzl:1:1: boom text\n"
+        self.assertEqual(cf._snippet(log, 12, 30),
+                         cf._snippet(log, 12, 30, strip_dir=None))
+
+
 class EvaluateRunTest(unittest.TestCase):
     def test_compiles_pass_on_clean_exit(self):
         ok, kind, detail = cf.evaluate_run("compiles", 0, "")
@@ -726,6 +759,56 @@ class RunCaseTest(unittest.TestCase):
                                            self.tmp, None, run=self._run_factory())
         self.assertEqual((status, kind, detail),
                          ("FAIL", "compile-error", "source file missing"))
+
+    def test_compile_error_detail_survives_a_deep_tmpdir(self):
+        # #4556: bezelc compiles the case as <tmpdir>/<case_id>_wrapped.bzl and
+        # its diagnostic opens with that absolute path. A lane worktree's
+        # tmpdir prefix routinely runs 100+ characters; without run_case's
+        # strip_dir=tmpdir it alone would consume the whole cut/head budget
+        # and the real message ("no member named ...") never survives.
+        deep_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            deep_root, ignore_errors=True))
+        deep_tmp = os.path.join(deep_root, *(["lane-worktree-segment"] * 5))
+        os.makedirs(deep_tmp)
+        case = self._case("f7", "module Conf;\nclass W\nend W;\n")
+
+        def fake(cmd, cwd=None):
+            if cmd[0] == self.bezelc:
+                wrap_file = cmd[-1]
+                return 1, (wrap_file + ":3:7: no member named "
+                          "'reallyLongName' in type 'W'\n")
+            return 0, ""
+
+        status, kind, detail = cf.run_case(case, self.bezelc, self.cases,
+                                           deep_tmp, None, run=fake)
+        self.assertEqual((status, kind), ("FAIL", "compile-error"))
+        self.assertIn("no member named 'reallyLongName'", detail)
+        self.assertNotIn(deep_tmp, detail)
+
+    def test_missing_diagnostic_detail_survives_a_deep_tmpdir(self):
+        # Same property (#4556), the `cls == "error"` / compile-succeeded
+        # branch: the compiler's own (successful) output can still carry the
+        # wrapped file's absolute path, e.g. in an unrelated warning.
+        deep_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            deep_root, ignore_errors=True))
+        deep_tmp = os.path.join(deep_root, *(["lane-worktree-segment"] * 5))
+        os.makedirs(deep_tmp)
+        case = self._case("f8", "module Conf;\nclass W\nend W;\n", cls="error")
+
+        def fake(cmd, cwd=None):
+            if cmd[0] == self.bezelc:
+                wrap_file = cmd[-1]
+                return 0, (wrap_file + ":1:1: warning: reallyLongDescriptive"
+                          "UnusedImportWarning\n")
+            return 0, ""
+
+        status, kind, detail = cf.run_case(case, self.bezelc, self.cases,
+                                           deep_tmp, None, run=fake)
+        self.assertEqual((status, kind), ("FAIL", "missing-diagnostic"))
+        self.assertIn("reallyLongDescriptiveUnusedImportWarning", detail)
+        self.assertNotIn(deep_tmp, detail)
 
 
 # -----------------------------------------------------------------------

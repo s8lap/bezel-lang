@@ -564,10 +564,25 @@ def _first_line(text):
     return no_cr if nl < 0 else no_cr[:nl]
 
 
-def _snippet(log, cut_chars, head_bytes):
+def _snippet(log, cut_chars, head_bytes, strip_dir=None):
     """`head -c N | tr '\\n' ' ' | cut -c1-M`: a flat one-line preview of the
-    compile log. ASCII diagnostics only — byte vs char slicing coincides."""
-    flat = log[:head_bytes].replace("\n", " ")
+    compile log. ASCII diagnostics only — byte vs char slicing coincides.
+
+    A bezelc diagnostic opens with the absolute path of the file it compiled,
+    and `cut_chars`/`head_bytes` budget characters over the WHOLE line, path
+    included — so the surviving message length is a function of how deep the
+    checkout happens to live, and a deep enough one truncates the message to
+    nothing (#4556). `strip_dir`, when given, is the directory the compiled
+    file lived in (the case corpus's `cases/`, or a doc-example run's per-run
+    tmpdir); its prefix (plus the path separator) is removed from the raw log
+    BEFORE the head/cut budget is spent, so the budget goes to the diagnostic
+    rather than to wherever the caller's checkout happens to be — the case id
+    is already the report's own first column, so the path carries no
+    information the report lacks."""
+    text = log or ""
+    if strip_dir:
+        text = text.replace(str(strip_dir).rstrip(os.sep) + os.sep, "")
+    flat = text[:head_bytes].replace("\n", " ")
     return flat[:cut_chars]
 
 
@@ -692,11 +707,11 @@ def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run,
     if case["cls"] == "error":
         if compile_rc != 0:
             return "PASS", "", ""
-        snippet = _snippet(compile_log, 80, 120)
+        snippet = _snippet(compile_log, 80, 120, strip_dir=tmpdir)
         return "FAIL", "missing-diagnostic", "compiled without error: " + snippet
 
     if compile_rc != 0:
-        snippet = _snippet(compile_log, 120, 200)
+        snippet = _snippet(compile_log, 120, 200, strip_dir=tmpdir)
         return "FAIL", "compile-error", snippet
 
     if wrap_mode in (WRAP_LIB, WRAP_AS_IS_LIB):

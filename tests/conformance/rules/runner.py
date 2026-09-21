@@ -78,9 +78,16 @@ def render_baseline(rows, header_note=""):
     return "\n".join(out) + "\n"
 
 
-def evaluate(row, compile_rc, compile_log, run_rc, run_out):
+def evaluate(row, compile_rc, compile_log, run_rc, run_out, cases_dir=None):
     """Did the compiler produce the verdict the case states? Pure.
-    Returns (verdict, detail) where verdict is 'pass' or 'fail'."""
+    Returns (verdict, detail) where verdict is 'pass' or 'fail'.
+
+    `cases_dir` (optional) is the directory the case's source file was
+    compiled from. A bezelc diagnostic opens with the absolute path of that
+    file, so every `_snippet` call below passes it through as `strip_dir`: the
+    character budget goes to the diagnostic instead of to however deep the
+    caller's checkout happens to live (#4556) — the case id is already the
+    row's first column, so the path carries no information the report lacks."""
     if compile_rc == 124:
         return "fail", "compile timed out"
     if conformance.is_crash(compile_rc):
@@ -91,9 +98,10 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
         if compile_rc != 0:
             return "pass", ""
         return "fail", "compiled, but the spec rejects this: " + \
-            conformance._snippet(compile_log, 90, 200)
+            conformance._snippet(compile_log, 90, 200, strip_dir=cases_dir)
     if compile_rc != 0:
-        return "fail", conformance._snippet(compile_log, 120, 240)
+        return "fail", conformance._snippet(compile_log, 120, 240,
+                                            strip_dir=cases_dir)
     if expect == "accept":
         return "pass", ""
     if expect == "quiet":
@@ -103,7 +111,8 @@ def evaluate(row, compile_rc, compile_log, run_rc, run_out):
         # cannot tell a suppressed warning from an emitted one.
         if WARNING_RE.search(compile_log or ""):
             return "fail", "the spec suppresses the diagnostic here, and the " \
-                "compiler emitted one: " + conformance._snippet(compile_log, 90, 200)
+                "compiler emitted one: " + conformance._snippet(
+                    compile_log, 90, 200, strip_dir=cases_dir)
         return "pass", ""
     if expect == "warn":
         # The case compiles AND the compiler says something about it. Which
@@ -180,7 +189,8 @@ def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
                                                                 dep)])
         if dep_rc != 0:
             return "fail", "dependency {} did not compile: {}".format(
-                dep, conformance._snippet(dep_log, 90, 200)), dep_log
+                dep, conformance._snippet(dep_log, 90, 200,
+                                          strip_dir=cases_dir)), dep_log
         imports += ["--import", artifact]
 
     out_exe = os.path.join(work, "out")
@@ -192,7 +202,8 @@ def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
     if compile_rc == 0 and row["shape"] == "program" and row["expect"] == "run":
         if os.path.exists(out_exe) and os.access(out_exe, os.X_OK):
             run_rc, run_out = run([out_exe])
-    verdict, detail = evaluate(row, compile_rc, compile_log, run_rc, run_out)
+    verdict, detail = evaluate(row, compile_rc, compile_log, run_rc, run_out,
+                               cases_dir=cases_dir)
     return verdict, detail, compile_log
 
 

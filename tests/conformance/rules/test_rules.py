@@ -907,6 +907,35 @@ class TestEvaluate(unittest.TestCase):
         self.assertIn("no runnable artifact",
                       runner.evaluate(row, 0, "", None, "")[1])
 
+    def test_a_deep_cases_dir_does_not_truncate_the_detail(self):
+        # #4556: a bezelc diagnostic opens with the absolute path of the case
+        # file it compiled, and _snippet's cut/head budget is spent over the
+        # WHOLE line — path included. A lane worktree's cases_dir routinely
+        # runs 100+ characters (CLAUDE.md: `.claude/worktrees/<name>/...`),
+        # which used to eat the entire budget and leave nothing of the
+        # message. Passing cases_dir through strips it before the budget is
+        # spent, so the message survives regardless of checkout depth.
+        cases_dir = "/" + "/".join(["lane-worktree-segment"] * 5) + "/cases"
+        log = (os.path.join(cases_dir, "s1_1_0001.bzl") +
+               ":20:23: no member named 'reallyLongMemberName' in type "
+               "'Widget'\n")
+        verdict, detail = runner.evaluate(self.row("accept"), 1, log, None, "",
+                                          cases_dir=cases_dir)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("no member named 'reallyLongMemberName'", detail)
+        self.assertNotIn(cases_dir, detail)
+
+    def test_without_cases_dir_a_deep_path_truncates_the_detail(self):
+        # The property that broke, pinned the other way: omitting cases_dir
+        # (the pre-#4556 call shape) reproduces the truncation.
+        cases_dir = "/" + "/".join(["lane-worktree-segment"] * 5) + "/cases"
+        log = (os.path.join(cases_dir, "s1_1_0001.bzl") +
+               ":20:23: no member named 'reallyLongMemberName' in type "
+               "'Widget'\n")
+        verdict, detail = runner.evaluate(self.row("accept"), 1, log, None, "")
+        self.assertEqual(verdict, "fail")
+        self.assertNotIn("no member named", detail)
+
 
 class TestDiagnosticReport(unittest.TestCase):
     def test_substring_match_is_case_insensitive(self):
@@ -1067,6 +1096,71 @@ class TestRunnerEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(runner.read_baseline(self.baseline)),
                          ["s28_5_0001", "s28_5_0002"])
+
+
+class TestRunCaseDeepCheckout(unittest.TestCase):
+    """#4556, end to end through run_case (not just evaluate): a bezelc
+    diagnostic opens with the absolute path of the case file it compiled — on
+    a real deep checkout, not just a synthetic string — and the surviving
+    report detail must not depend on how deep cases_dir happens to be."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.root, ignore_errors=True))
+        # Comparable to a lane worktree path (CLAUDE.md:
+        # `.claude/worktrees/<name>/...`), which is where #4556 was found.
+        self.cases_dir = os.path.join(
+            self.root, *(["lane-worktree-segment"] * 5), "cases")
+        os.makedirs(self.cases_dir)
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmpdir, ignore_errors=True))
+
+    def _write_case(self, case_id, text="module Conf;\n"):
+        with open(os.path.join(self.cases_dir, case_id + ".bzl"), "w") as f:
+            f.write(text)
+
+    def test_a_compile_failure_detail_survives_a_deep_cases_dir(self):
+        self._write_case("s5_4_0001")
+        row = {"case-id": "s5_4_0001", "expect": "accept", "check": "",
+              "shape": "lib", "title": "t", "issue": "", "section": "5.4"}
+
+        def fake(cmd, cwd=None):
+            # A real bezelc diagnostic opens with the file it was given —
+            # `cmd[-1]` here, exactly as run_case constructs `src`.
+            return 1, (cmd[-1] + ":20:23: no member named "
+                      "'reallyLongMemberName' in type 'Widget'\n")
+
+        verdict, detail, log = runner.run_case(row, "/fake/bezelc",
+                                               self.cases_dir, self.tmpdir,
+                                               run=fake)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("no member named 'reallyLongMemberName'", detail)
+        self.assertNotIn(self.cases_dir, detail)
+
+    def test_a_dependency_compile_failure_detail_survives_a_deep_cases_dir(self):
+        case_dir = os.path.join(self.cases_dir, "s5_4_0002")
+        os.makedirs(case_dir)
+        with open(os.path.join(case_dir, "main.bzl"), "w") as f:
+            f.write("module Conf;\n")
+        with open(os.path.join(case_dir, "dep.bzl"), "w") as f:
+            f.write("module Dep;\n")
+        row = {"case-id": "s5_4_0002", "expect": "accept", "check": "",
+              "shape": "lib", "title": "t", "issue": "", "section": "5.4",
+              "deps": "dep.bzl"}
+
+        def fake(cmd, cwd=None):
+            return 1, (cmd[-1] + ":3:1: no member named "
+                      "'reallyLongDependencyMemberName' in type 'Dep'\n")
+
+        verdict, detail, log = runner.run_case(row, "/fake/bezelc",
+                                               self.cases_dir, self.tmpdir,
+                                               run=fake)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("no member named 'reallyLongDependencyMemberName'",
+                      detail)
+        self.assertNotIn(self.cases_dir, detail)
 
 
 class TestCommittedCorpus(unittest.TestCase):
