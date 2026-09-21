@@ -48,6 +48,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
@@ -127,7 +128,7 @@ bool lowerAndLink(const std::string& source, std::string& obj,
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return false;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, obj, err)) return false;
+        if (!bezel::test::emitObjectFileForTest(*module, obj, err)) return false;
     }
     std::string linkCmd = "clang++ -fsanitize=address -g " + obj + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +

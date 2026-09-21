@@ -18,19 +18,14 @@
 
 1    tests/codegen/alias_owning_collection_disposal_1462_test.cpp
 1    tests/codegen/argpass_string_probe_test.cpp
-1    tests/codegen/argpass_string_refcount_test.cpp
 1    tests/codegen/async_618_domain_serial_test.cpp
 1    tests/codegen/async_lambda_488_test.cpp
 1    tests/codegen/async_test.cpp
 1    tests/codegen/atomic_647_test.cpp
-2    tests/codegen/box_refcount_test.cpp
-2    tests/codegen/boxed_cell_free_429_test.cpp
 2    tests/codegen/buffer_545_test.cpp
 1    tests/codegen/bug_465_test.cpp
 1    tests/codegen/bug_474_string_slice_test.cpp
-1    tests/codegen/capture_retain_429_test.cpp
 1    tests/codegen/closure_call_string_return_429_test.cpp
-2    tests/codegen/closure_refcount_test.cpp
 1    tests/codegen/collection_indexer_test.cpp
 1    tests/codegen/collection_literal_arg_999_test.cpp
 1    tests/codegen/collection_literal_user_type_fcl_2957_test.cpp
@@ -45,9 +40,6 @@
 1    tests/codegen/discard_named_owned_binding_1651_codegen_test.cpp
 1    tests/codegen/domain_spawn_choice_valuearg_3181_test.cpp
 2    tests/codegen/env_disposer_672_test.cpp
-1    tests/codegen/escaping_box_refcount_test.cpp
-1    tests/codegen/escaping_closure_refcount_test.cpp
-1    tests/codegen/escaping_string_refcount_test.cpp
 1    tests/codegen/event_leak_480_test.cpp
 2    tests/codegen/event_subscription_closure_841_test.cpp
 1    tests/codegen/exception_disposal_test.cpp
@@ -68,7 +60,6 @@
 1    tests/codegen/local_generic_class_method_monomorphization_3347_test.cpp
 1    tests/codegen/mutex_lock_647_test.cpp
 1    tests/codegen/objinit_usingvar_disposal_test.cpp
-1    tests/codegen/operator_string_refcount_test.cpp
 1    tests/codegen/owned_collection_iface_619_test.cpp
 1    tests/codegen/owned_dict_drain_628_test.cpp
 1    tests/codegen/owned_exception_field_test.cpp
@@ -90,7 +81,6 @@
 1    tests/codegen/static_owned_field_disposal_1212_test.cpp
 1    tests/codegen/string_accumulator_leak_1486_test.cpp
 1    tests/codegen/string_producer_leak_1481_1482_test.cpp
-2    tests/codegen/string_refcount_test.cpp
 1    tests/codegen/stringbuilder_append_producer_leak_1185_test.cpp
 1    tests/codegen/stringbuilder_tostring_borrow_consume_leak_1637_test.cpp
 1    tests/codegen/task_combinators_test.cpp
