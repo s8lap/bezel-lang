@@ -40557,6 +40557,33 @@ llvm::Value* Emitter::emitEnumEquals(llvm::Value* a, llvm::Value* b,
     if (a->getType() != b->getType() && a->getType()->isIntegerTy() &&
         b->getType()->isIntegerTy())
         b = builder_.CreateZExtOrTrunc(b, a->getType());
+    // fix #4565 (§10.5, v0.306): defense-in-depth. §10.5 defines enum
+    // equality as integer comparison ("`a`, `b` are the underlying
+    // integers" — the doc comment above), and §10.3's colon-list gate (fix
+    // #4565, TypeResolution_Names.cpp) now guarantees a locally-declared
+    // enum's underlying representation is always one of the eight integer
+    // primitives — so `a`/`b` should always be integer-typed by the time
+    // they reach this unconditional `CreateICmpEQ`. Before that gate,
+    // `enum Ratio: double` carried a `double` underlying type all the way
+    // here and this call emitted `icmp eq double %beq.sv, %beq.ov`, which
+    // `ICmpInst::AssertOK` rejects — a verifier abort (malformed IR) rather
+    // than a compile-time diagnostic. This is the same "icmp reached with
+    // operands no arm claims" class as #4511 and #4553's `s17_5_0004`. Guard
+    // the instruction itself so this function can never emit malformed IR,
+    // regardless of what other route might one day reach it with a
+    // non-integer pair — a codegen path able to emit unverifiable IR at all
+    // is a latent miscompile wherever such a route exists.
+    if (!a->getType()->isIntegerTy() || !b->getType()->isIntegerTy()) {
+        ctx_.diagnostics().report(
+            Severity::Error, ts ? ts->declLoc : SourceLocation{},
+            std::string("internal: emitEnumEquals: enum `") +
+                (ts ? std::string(ts->name) : std::string("<unknown>")) +
+                "` reached equality codegen with a non-integer underlying "
+                "representation — §10.5 defines enum equality as integer "
+                "comparison, and §10.3's colon-list gate should make this "
+                "unreachable (#4565)");
+        return llvm::ConstantInt::getFalse(llvm_);
+    }
     return builder_.CreateICmpEQ(a, b);
 }
 

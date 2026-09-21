@@ -1004,16 +1004,67 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // base classes (we don't enforce here — that's a separate
     // syntactic/structural check).
     std::size_t classBaseCount = 0;
+    // §10.3 (fix #4565): "The colon list is one list ... if its first item
+    // resolves to one of [the eight underlying-type] types, that item is the
+    // underlying type ...; otherwise the underlying type is `int` and every
+    // item names an interface." Only the list's FIRST item (index 0) may
+    // supply the underlying type, and only when it is one of the eight
+    // INTEGER primitive kinds — not any of PrimitiveType's other values
+    // (`double`, `float`, `decimal`, `bool`, `char`, `string`, `Object`).
+    std::size_t colonIndex = 0;
+    auto isEnumUnderlyingPrimitive = [](PrimitiveType p) {
+        switch (p) {
+            case PrimitiveType::Byte:  case PrimitiveType::SByte:
+            case PrimitiveType::Short: case PrimitiveType::UShort:
+            case PrimitiveType::Int:   case PrimitiveType::UInt:
+            case PrimitiveType::Long:  case PrimitiveType::ULong:
+                return true;
+            default: return false;
+        }
+    };
     for (const auto& bt : td.baseTypes) {
-        if (!bt) continue;
+        if (!bt) { ++colonIndex; continue; }
         TypeRef* ref = resolveType(*bt, &typeScope);
-        // §10.3 (#740): an enum's base type is its underlying integer type
-        // (a primitive, e.g. `: long`), which does NOT resolve to a TypeSymbol
-        // declaration and so is not a `baseTypes` entry. Record it on the enum's
-        // TypeSymbol so codegen lowers the enum to the right integer width.
-        if (tsym && td.kind == ast::TypeDeclKind::Enum && ref &&
-            ref->kind == TypeRef::Kind::Primitive) {
+        // §10.3 (#740, fix #4565): an enum's base type is its underlying
+        // integer type (a primitive, e.g. `: long`), which does NOT resolve
+        // to a TypeSymbol declaration and so is not a `baseTypes` entry.
+        // Record it on the enum's TypeSymbol so codegen lowers the enum to
+        // the right integer width. Pre-fix, this fired for ANY colon-list
+        // position and ANY Primitive kind — `enum Ratio: double` (`double`
+        // is Kind::Primitive but not one of the eight) was silently carried
+        // into codegen as the underlying type, and enum equality's
+        // unconditional `CreateICmpEQ` then emitted `icmp eq double`, which
+        // fails IR verification (#4565's measured repro).
+        if (tsym && td.kind == ast::TypeDeclKind::Enum && colonIndex == 0 &&
+            ref && ref->kind == TypeRef::Kind::Primitive &&
+            isEnumUnderlyingPrimitive(ref->primitive)) {
             tsym->enumUnderlyingType = ref;
+        } else if (tsym && td.kind == ast::TypeDeclKind::Enum &&
+                   colonIndex == 0 && ref &&
+                   ref->kind != TypeRef::Kind::Error &&
+                   !(ref->kind == TypeRef::Kind::Named &&
+                     (!ref->declaration ||
+                      ref->declaration->kind ==
+                          ast::TypeDeclKind::Interface))) {
+            // The "otherwise" branch's first-item failure (§10.3, v0.306):
+            // the head is neither an admissible underlying-type keyword nor
+            // an interface (a class, a record, another enum, or a
+            // non-integer primitive like `double`). Per the spec's own
+            // ruling (changelog: "§10.3's colon-list fallback names the
+            // underlying-type fact"), the diagnostic names the
+            // underlying-type fact rather than the literally-failing "not
+            // an interface" — a conformance case pins the rejection, not
+            // the wording (Appendix D).
+            std::string spelling = "?";
+            if (bt->name && !bt->name->parts.empty())
+                spelling = std::string(bt->name->parts.back());
+            ctx_.diagnostics().report(
+                Severity::Error, bt->span.begin,
+                std::string("enum `") + std::string(td.name) +
+                "`'s underlying type `" + spelling + "` is not one of the "
+                "eight admissible underlying types — byte, sbyte, short, "
+                "ushort, int, uint, long, ulong — or their reserved "
+                "PascalCase aliases, and is not an interface (§10.3)");
         }
         // §12 / §31.4 (#2950): a BUILT-IN exception base resolves to a Named
         // TypeRef with `declaration == nullptr` — it has no user TypeSymbol —
@@ -1143,6 +1194,7 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
                 }
             }
         }
+        ++colonIndex;
     }
     // Generic constraints.
     for (const auto& gc : td.genericConstraints) {
