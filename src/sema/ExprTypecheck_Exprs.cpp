@@ -2799,6 +2799,33 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 ? ctx_.primitiveTypeRef(PrimitiveType::String)
                                 : ctx_.primitiveTypeRef(PrimitiveType::Char));
                 }
+                // fix #4502 (§23.4, v0.306): every OTHER primitive — `bool`,
+                // `char`, and every numeric type (`byte` .. `decimal`),
+                // `Object` — declares no indexer. §23.4: "An indexer is a
+                // property whose name is replaced by `[parameters]`" —
+                // i.e. an indexer is a DECLARED member, and no primitive
+                // declares one; `string`'s `[i]`/`[range]` form (typed by
+                // the branch immediately above, §3.4/§4.6) is the sole
+                // built-in exception. Before this branch, `bool`/`int`/
+                // `decimal` (and every other non-`string` primitive) fell
+                // through this entire if/else-if chain with NO diagnostic:
+                // the IndexExpr was left untyped, exactly the hole the
+                // #2800 fix closed for a Named-declaration receiver with no
+                // indexer member (see the `!anyIndexer` branch ~900 lines
+                // below) — codegen's #2434 backstop degraded the read to a
+                // zero-initialized value and the program COMPILED AND RAN.
+                // Measured on d3b36b1c (docs v0.306): `var v := b[0];` on a
+                // `bool` local exited 0 (only the #2434 warning on stderr)
+                // and the program printed "ok". Reject cleanly instead,
+                // mirroring the #2800 wording so the message family reads
+                // the same regardless of receiver kind.
+                else if (tt->kind == TypeRef::Kind::Primitive) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("type `") + primitiveSpelling(tt->primitive) +
+                            "` does not declare an indexer — `a[i]` requires "
+                            "an indexer (§23.4)");
+                }
                 // issue #388: heap-collection indexer `a[i]` / `dict[key]`. The
                 // built-in collections resolve to a Named TypeRef with a null
                 // declaration (TypeResolution_Names) and carry their type
