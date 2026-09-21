@@ -28,6 +28,15 @@
 // sanitizer / wrong value) similarly each get a distinct `[ ASAN ]` marker
 // naming which one fired, without changing what they return.
 //
+// #4563: -2 joins them. It was already a distinct code HERE, but silent, and
+// the `if (rc < 0) return;` / `if (rc >= 0) BEZEL_EXPECT_EQ(rc, 0);` guards
+// this family carries swallow a silent -2 exactly as they swallowed -1. The
+// marker, not the number, is what makes an infra failure unignorable; the
+// numeric contract above is unchanged. The machinery moved to
+// support/asan_infra_failure.hpp so the ~77 hand-rolled per-file copies of this
+// helper — which had no -2 at all and returned -1 for EVERY build failure —
+// share the one implementation rather than growing a second.
+//
 // THREE FAMILIES, NOT ONE. Diffing all 42 copies (#3653 investigation, see the
 // commit body for the file-by-file table) found the copies do NOT all answer
 // the same question — they split cleanly into three shapes used by disjoint
@@ -56,6 +65,7 @@
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
 #include "native_test_harness.hpp"
+#include "support/asan_infra_failure.hpp"  // noteAsanInfraFailure / ExpectAsanInfraFailure (#4563)
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
@@ -84,19 +94,24 @@ inline int lowerToObjectForAsan(const std::string& source,
     bezel::Lexer lexer(source, diags);
     bezel::Parser parser(lexer, diags);
     auto unit = parser.parseCompilationUnit();
-    if (!unit) return -2;
+    // #4563: -2 was already DISTINCT from -1, but it was SILENT, and ~49 sites
+    // in this family guard with `if (rc < 0) return;` / `if (rc >= 0) EXPECT`,
+    // which swallow -2 exactly as they swallowed -1. `asanBuildFailure` returns
+    // the same -2 and additionally marks the test failed at the chokepoint.
+    if (!unit) return asanBuildFailure("parse");
     bezel::sema::SemaContext ctx(diags);
     bezel::sema::collectSymbols(*unit, ctx);
     bezel::sema::resolveTypes(*unit, ctx);
     bezel::sema::typecheckExpressions(*unit, ctx);
     bezel::sema::checkDefiniteAssignment(*unit, ctx);
     bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -2;
+    if (diags.hasErrors()) return asanBuildFailure("sema");
     llvm::LLVMContext llvmCtx;
     auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -2;
+    if (!module) return asanBuildFailure("emitModule");
     std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+        return asanBuildFailure("emitObjectFile");
     return 0;
 }
 
@@ -117,57 +132,14 @@ inline std::string readAndRemoveCapture(const std::string& path) {
     return out;
 }
 
-// #4504: print an `[ INFRA ]` marker naming the failure mode and mark the
-// CURRENT test failed directly, so a link/system() failure cannot be
-// misread as a sanitizer finding regardless of which assertion macro the
-// caller uses on the returned code. Mirrors `noteInfraFailure`
-// (tests/support/aot_support.hpp:713) / `sanitizerRuntimeMaster`'s
-// `[ INFRA ]` marker (tests/native_test_harness.hpp:284) -- same
-// "print inline with BEZEL_EXPECT_* output, fail unconditionally" shape,
-// extended here to the native-ASan-leg link/exec path those two don't cover.
-// #4504's marking is unconditional for every REAL caller. The one test that
-// must opt out is the #3676 ratchet, which INDUCES a link failure on purpose
-// to pin the -3 return contract -- for it, the marking is the mechanism under
-// test, not a verdict on the test. `ExpectAsanInfraFailure` suppresses the
-// marking for its scope and COUNTS the markers instead, so the ratchet asserts
-// both halves (the code is -3 AND the marker fired) rather than losing one.
-// Deliberately not a bare bool: a suppression that cannot be asserted against
-// is a suppression that can hide a missing marker.
-inline int& asanInfraFailureCount() {
-    static thread_local int n = 0;
-    return n;
-}
-
-inline bool& asanInfraFailureExpected() {
-    static thread_local bool v = false;
-    return v;
-}
-
-struct ExpectAsanInfraFailure {
-    int before;
-    ExpectAsanInfraFailure() : before(asanInfraFailureCount()) {
-        asanInfraFailureExpected() = true;
-    }
-    ~ExpectAsanInfraFailure() { asanInfraFailureExpected() = false; }
-    ExpectAsanInfraFailure(const ExpectAsanInfraFailure&) = delete;
-    ExpectAsanInfraFailure& operator=(const ExpectAsanInfraFailure&) = delete;
-    // How many `[ INFRA ]` markers fired inside this scope.
-    int count() const { return asanInfraFailureCount() - before; }
-};
-
-inline void noteAsanInfraFailure(const char* tag, const std::string& reason) {
-    std::cout << "    [ INFRA ] runUnderAsan(tag=\"" << (tag ? tag : "?")
-              << "\"): " << reason << "\n"
-              << "    [ INFRA ] this is an INFRASTRUCTURE failure "
-                 "(link/exec), NOT a sanitizer finding -- see #4504.\n";
-    std::cout.flush();
-    ++asanInfraFailureCount();
-    // Suppressed ONLY inside an ExpectAsanInfraFailure scope (the #3676
-    // ratchet). Every other caller still fails unconditionally.
-    if (!asanInfraFailureExpected()) {
-        ::bezel::test::currentTestFailed() = true;
-    }
-}
+// #4563 MOVED: `noteAsanInfraFailure` and `ExpectAsanInfraFailure` now live in
+// support/asan_infra_failure.hpp, in THIS namespace and with exactly this
+// behaviour, so every call site here and the #3676 ratchet are untouched. They
+// moved because the ~77 hand-rolled per-file copies of this helper need the
+// same one marker for their own build-failure path, and a second suppression
+// mechanism is the drift this header family exists to prevent. That header also
+// adds the three call-site spellings (`asanBuildFailure` / `asanLinkFailure` /
+// `asanExecFailure`) that return the canonical -2/-3/-4 while announcing.
 
 // Link `objPath` against the ASan runtime, run the resulting `exe` under
 // `asanOptions`, and hand back the raw `system()` status. Returns 0 when the

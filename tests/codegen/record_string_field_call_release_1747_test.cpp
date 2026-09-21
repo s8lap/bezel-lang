@@ -92,26 +92,30 @@ int runUnderLeakSanitizer(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
     auto cleanup = [&] { std::remove(objPath.c_str()); std::remove(exe.c_str());
                           std::remove(runErr.c_str()); };
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " 2>" + runErr;
     int status = std::system(runCmd.c_str());
@@ -129,7 +133,7 @@ int runUnderLeakSanitizer(const std::string& source) {
         report = ss.str();
     }
     cleanup();
-    if (status == -1) return -3;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     switch (bezel::test::sanitizerFindingInReport(report)) {
         case bezel::test::SanitizerFinding::kHardError:
             // Surface it: a redzone finding must never be observed silently.

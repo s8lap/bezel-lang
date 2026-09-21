@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "native_test_harness.hpp"
+#include "support/asan_infra_failure.hpp"  // asanInfraFailures() (#4563)
 #include "support/aot_support.hpp"
 #include "support/force_sanitize.hpp"
 #include "support/scratch_dir.hpp"
@@ -362,6 +363,30 @@ int main(int argc, char** argv) {
               << " check(s) skipped (ASan/TSan runtime unavailable — see"
                  " tests/native_test_harness.hpp sanitizerRuntimeMaster())\n";
 
+    // fix #4563: the SIBLING of the line above, for the other two outcomes the
+    // native-sanitizer leg used to collapse into the same -1. `NATIVE
+    // SANITIZER:` counts only "the runtime could not be built" — a genuine
+    // environment SKIP. A test program that failed to BUILD, or failed to
+    // LINK, is a failure of the leg's own setup, and before #4563 it returned
+    // the same -1 and every `if (rc == -1) return;` read it as that SKIP: the
+    // row printed [ OK ] having asserted nothing about memory safety, and no
+    // counter moved, so a suite-wide outage of either kind was invisible here.
+    //
+    // Each such failure now also fails its own test, so the gate cannot miss
+    // ONE of them; this tally is about the SHAPE of an outage, which otherwise
+    // reads as N unrelated test failures. Printed UNCONDITIONALLY for the same
+    // reason as its two neighbours — "0" is a positive confirmation the leg
+    // built and linked, not the absence of a signal. A separate line so the
+    // LOAD-BEARING legacy-line regex (scripts/gate/summary.py) is untouched,
+    // and deliberately not the word "failure(s)" so it cannot be confused with
+    // aot_support.hpp's `INFRA: N failure(s)` tally (a different subsystem,
+    // asserted on by tests/support/aot_infra_loud_3007_test.cpp).
+    const std::size_t nativeSanitizerInfra =
+        ::bezel::test::asanInfraFailures().load(std::memory_order_relaxed);
+    std::cout << "NATIVE SANITIZER INFRA: " << nativeSanitizerInfra
+              << " build/link/exec break(s) (the leg's own setup failed — see"
+                 " tests/support/asan_infra_failure.hpp)\n";
+
     // fix #3733: loud, not silent. runAotChecked's toolchain probe at
     // tests/support/aot_support.hpp takes a single early-return when
     // `clang --version` fails (or BEZEL_AOT_FORCE_NO_TOOLCHAIN=1 forces it).
@@ -431,6 +456,17 @@ int main(int argc, char** argv) {
         // is nonzero.
         json += ",\"native_sanitizer_unavailable_skips\":";
         json += std::to_string(nativeSanitizerSkips);
+        // fix #4563: additive field — same rationale as #3626/#3733 above; a
+        // reader that does not know this key ignores it (summary.py's
+        // check_agreement compares only passed/failed/total/selected/schema),
+        // so no schema-version bump. Deliberately NOT wired into
+        // run_parallel.sh's nonzero-fails-the-run check the way #3626's field
+        // is: unlike an unavailable toolchain, every one of these ALREADY
+        // failed its own test, so the shard fails on its own. The field is for
+        // triage — it tells a reader at a glance whether N failures are one
+        // infrastructure outage or N distinct defects.
+        json += ",\"native_sanitizer_infra_failures\":";
+        json += std::to_string(nativeSanitizerInfra);
         // fix #3733: additive field — same rationale as #3626 above; an older
         // reader that does not know this key ignores it (summary.py's
         // check_agreement only compares passed/failed/total/selected/schema),

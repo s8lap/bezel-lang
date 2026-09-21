@@ -35,6 +35,9 @@
 
 #include "support/force_sanitize.hpp"   // bezel::test::forceSanitizeAddress() (#3682)
 #include "support/scratch_dir.hpp"      // the ONE scratch-root policy
+#include "support/asan_infra_failure.hpp"  // #4563: asanBuildFailure/-Link/-Exec,
+                                        // the loud -2/-3/-4 every runner in this
+                                        // family returns instead of a silent -1.
 #include "test_harness.hpp"             // currentTestFailed() — the #3682 trip
 
 namespace bezel::native_test {
