@@ -338,6 +338,56 @@ public:
         auto it = inheritanceClauseBindings_.find(clauseArgs);
         return it == inheritanceClauseBindings_.end() ? nullptr : &it->second;
     }
+    // fix #4520 (§22.5 "Optional parameters and named arguments" / §22.8
+    // step 1 / §22.10, v0.306): the THIRD §22.5 site of the inheritance-clause
+    // family, and the reason it cannot share the table right above.
+    //
+    // That table holds a clause's binding to the base's PRIMARY parameter
+    // list. A clause may instead bind an EXPLICIT base constructor
+    // (`class D(v: int) : B(b := "e", a := v)` over
+    // `B.constructor(a: int, b: string)`), which codegen resolves with
+    // `Emitter::baseClauseExplicitCtor` and CALLS — a different formal list,
+    // a different resolution path, and a different lowering site
+    // (`emitImplicitBase`, not `prePopulateBasePositionalFields`). Both are
+    // keyed by the same clause, so publishing a PRIMARY-parameter binding for
+    // a call that binds a convenience constructor's list would be precisely
+    // the mispairing #3562 removed. Hence a table of its own, keyed the same
+    // way (the argument vector's address — see the rationale above for why
+    // that, and not the declaring `ast::TypeDecl*`).
+    //
+    // THE CONSTRUCTOR IS PART OF THE VALUE, not a comment. Sema picks the
+    // callee by ARITY (`formalParamCount`); codegen picks it with
+    // `ctorForArgs`, which also discriminates an overload set by argument
+    // type. The two agree on every shape reachable here, but they are two
+    // predicates, so the consumer checks POINTER IDENTITY against the
+    // constructor this binding was computed for and falls back to today's
+    // positional pairing if they ever disagree — a disagreement then costs
+    // the by-name fix, not a wrong-slot store.
+    struct InheritanceClauseCtorBinding {
+        // Non-const because codegen's `BaseClauseExplicitCtor::cs` is a
+        // non-const `ConstructorSymbol*` (it is handed to `ctorFns_` and to
+        // `unitValueForCtorParam`), and a `const_cast` at the consumer would
+        // be a worse record of the same fact.
+        ConstructorSymbol* ctor = nullptr;
+        // Entry `j` is the 0-based index into the clause's argument vector
+        // that supplies the constructor's parameter `j`, or -1 when unbound —
+        // the same shape `bindArgsToParams` returns for every other site.
+        std::vector<int> paramToArg;
+    };
+    void setInheritanceClauseCtorBinding(
+        const std::vector<ast::CallArgument>* clauseArgs,
+        ConstructorSymbol* ctor, std::vector<int> binding) {
+        if (!clauseArgs || !ctor) return;
+        inheritanceClauseCtorBindings_[clauseArgs] =
+            InheritanceClauseCtorBinding{ctor, std::move(binding)};
+    }
+    const InheritanceClauseCtorBinding* inheritanceClauseCtorBinding(
+        const std::vector<ast::CallArgument>* clauseArgs) const {
+        if (!clauseArgs) return nullptr;
+        auto it = inheritanceClauseCtorBindings_.find(clauseArgs);
+        return it == inheritanceClauseCtorBindings_.end() ? nullptr
+                                                          : &it->second;
+    }
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
     // for the rationale. Populated by the typecheck pass from
@@ -1047,6 +1097,21 @@ private:
     // the "record a reconstruction disposition" gate on a spelling.
     std::unordered_map<const std::vector<ast::CallArgument>*, std::vector<int>>
         inheritanceClauseBindings_;
+    // fix #4520 (§22.5 / §22.8 step 1 / §22.10, v0.306): the same clause's
+    // §22.5 binding when it binds an EXPLICIT base constructor rather than the
+    // base's primary parameter list — see the setter/getter above for why this
+    // is a second table on the same key type rather than a second entry in the
+    // one above, and why the resolved `ConstructorSymbol` travels with the
+    // binding. Published by `ExprTC::visitTopDecl`'s primary-base-ctor-args
+    // walk, read by codegen's `Emitter::emitImplicitBase`
+    // (`baseClauseExplicitCtor` arm).
+    //
+    // ⚠ AST-KEYED, and the snapshot test knows it — same second needle as its
+    // sibling above, same reconstruction judgement recorded beside it in
+    // tests/module/semacontext_ast_side_table_snapshot_test.cpp.
+    std::unordered_map<const std::vector<ast::CallArgument>*,
+                       InheritanceClauseCtorBinding>
+        inheritanceClauseCtorBindings_;
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs. Populated by the typecheck pass at the
     // SAME site it computes `substituteMemberType` for the §7

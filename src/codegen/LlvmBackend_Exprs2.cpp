@@ -4754,7 +4754,39 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
         const std::vector<ast::CallArgument>& args) {
     BaseClauseExplicitCtor r;
     if (!base || args.empty()) return r;
+    bool clauseAllPositional = true;
+    for (const auto& a : args)
+        if (!a.name.empty()) { clauseAllPositional = false; break; }
     r.cs = ctorForArgs(base, args);
+    // fix #4520 (§22.5 / §22.8 step 1 / §22.10, v0.306): a NAMED clause is
+    // resolved by SEMA, not by `ctorForArgs`.
+    //
+    // `ctorForArgs`'s `ctorTypeMatches` compares `args[i]`'s type class with
+    // parameter `i`'s — a POSITIONAL pairing, and therefore a second §22.5
+    // binding rule sitting beside the real one. It rejects every clause whose
+    // names are correct but whose order is not: measured on 6c05b4cf,
+    // `class D(v: int) : B(b := "e", a := v)` over
+    // `constructor(a: int, b: string)` compared the string `"e"` against
+    // `a: int`, returned null, and `emitImplicitBase` fell through to its
+    // arity-0 fallback — so the base constructor was NEVER CALLED and the
+    // clause's values were dropped entirely (the program printed `0` and a
+    // blank line where `4` / `e` is correct). Re-keying the argument loop
+    // alone would not have moved that program one byte.
+    //
+    // Sema published the §22.5 binding for this clause against this
+    // constructor's own formal list, through the ONE binder body every
+    // construction site runs; when `ctorForArgs` finds nothing for a NAMED
+    // clause, that answer is adopted. Deliberately only when it finds
+    // NOTHING, and only for a clause carrying a name: an all-positional
+    // clause keeps `ctorForArgs` as its sole authority (including its #3760
+    // type-class rejection, which is what stops a chain from binding a
+    // wrongly-typed same-arity sibling), so no program that resolves today
+    // can resolve differently here.
+    if (!r.cs && !clauseAllPositional) {
+        if (const sema::SemaContext::InheritanceClauseCtorBinding* pub =
+                ctx_.inheritanceClauseCtorBinding(&args))
+            r.cs = pub->ctor;
+    }
     if (!r.cs) return r;
     auto it = ctorFns_.find(r.cs);
     // Declaring an imported constructor on demand is idempotent and is what
@@ -4785,10 +4817,10 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
     // caller's fill loop pairs clause argument `i` with formal `i`
     // POSITIONALLY, so it can only complete a TRAILING omitted tail; declaring
     // a named short clause callable would make the evaluator skip it and the
-    // caller emit nothing.
-    bool clauseAllPositional = true;
-    for (const auto& a : args)
-        if (!a.name.empty()) { clauseAllPositional = false; break; }
+    // caller emit nothing. (fix #4520 re-keyed that fill loop by the §22.5
+    // binding, but sema publishes one only for a TOTAL binding over exactly
+    // these arguments — a named SHORT clause has none, so this exact-arity
+    // rule still stands for it. That shape's own silence is filed, not fixed.)
     const std::size_t nFormals = sema::formalParamCount(*r.cs);
     if (it == ctorFns_.end() ||
         it->second->arg_size() != nFormals + 1 ||

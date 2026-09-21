@@ -13557,10 +13557,88 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                     std::vector<llvm::Value*> args;
                     args.push_back(obj);
                     bool ok = true;
+                    // fix #4520 (§22.5 / §22.8 step 1 / §22.10, v0.306):
+                    // install the §22.5 binding sema published for THIS
+                    // clause against THIS constructor's formal list, before
+                    // anything below pairs an argument with a parameter.
+                    //
+                    // This loop paired `clsBaseArgs[i]` with formal `i` and
+                    // never read `arg.name`, so a named clause binding an
+                    // explicit base constructor lost its names entirely:
+                    // measured on 6c05b4cf, `class D(v: int) : B(b := "e",
+                    // a := v)` over `constructor(a: int, b: string)` compiled
+                    // clean and printed `0` and a blank line where `4` / `e`
+                    // is correct. It is the third and last site of the family
+                    // #4484 (the `base(...)` chain) and #4491 (the clause
+                    // bound to the base's PRIMARY list) fixed, and, like
+                    // those, the binding is computed by the ONE binder body —
+                    // here over `FormalsView::of(*ctor)`, this call's own
+                    // formal list — and merely READ here.
+                    //
+                    // The channel is its own (`inheritanceClauseCtorBinding`,
+                    // keyed on the clause's argument vector, which is exactly
+                    // the `clsBaseArgs` pointer `sema::primaryBaseCtorArgsOf`
+                    // just returned): the sibling table describes the base's
+                    // PRIMARY parameter list, and this call binds a different
+                    // one. An IMPORTED derived class's replayed vector is a
+                    // different address and finds no entry, so the
+                    // local/imported split stays pointer identity with no
+                    // #3152 seam read added.
+                    //
+                    // THE CONSTRUCTOR IDENTITY IS CHECKED, not assumed: sema
+                    // resolves the callee by arity, `baseClauseExplicitCtor`
+                    // by `ctorForArgs` (which also discriminates an overload
+                    // set by argument type). Where they could ever disagree
+                    // the binding is ignored and this loop keeps today's
+                    // positional pairing — a lost fix, never a wrong-slot
+                    // store. The size tests are the same discipline: only a
+                    // TOTAL binding over exactly these arguments re-keys the
+                    // loop, which is also the only shape
+                    // `baseClauseExplicitCtor` declares callable for a named
+                    // clause (it requires `nFormals == args.size()` there).
+                    const std::vector<int>* ctorParamToArg = nullptr;
+                    if (const sema::SemaContext::InheritanceClauseCtorBinding*
+                            pub = ctx_.inheritanceClauseCtorBinding(
+                                clsBaseArgs)) {
+                        if (pub->ctor == bce.cs &&
+                            pub->paramToArg.size() ==
+                                sema::formalParamCount(*bce.cs) &&
+                            pub->paramToArg.size() == clsBaseArgs->size())
+                            ctorParamToArg = &pub->paramToArg;
+                    }
+                    // The FORMAL a given SOURCE argument binds to, and its
+                    // inverse. Both degenerate to the identity when nothing
+                    // was published, which is exactly the textual-order
+                    // pairing this arm has always used and is the same answer
+                    // for an all-positional clause.
+                    auto formalForArg = [&](std::size_t ai) -> std::size_t {
+                        if (!ctorParamToArg) return ai;
+                        for (std::size_t pi = 0; pi < ctorParamToArg->size();
+                             ++pi)
+                            if ((*ctorParamToArg)[pi] == static_cast<int>(ai))
+                                return pi;
+                        return ai;  // unreachable for a total binding
+                    };
+                    auto argForFormal = [&](std::size_t pi) -> std::size_t {
+                        if (!ctorParamToArg || pi >= ctorParamToArg->size())
+                            return pi;
+                        const int ai = (*ctorParamToArg)[pi];
+                        return ai >= 0 ? static_cast<std::size_t>(ai) : pi;
+                    };
+                    // §22.5 "Evaluation order": the supplied arguments are
+                    // evaluated in call-site TEXTUAL order, "for positional
+                    // and named arguments alike; naming an argument changes
+                    // which parameter it binds to, never when it runs". So
+                    // this loop stays SOURCE-indexed and only the slot each
+                    // value lands in is re-keyed — the same split #4484 and
+                    // #4491 made on their own arms.
+                    std::vector<llvm::Value*> byFormal(clsBaseArgs->size(),
+                                                       nullptr);
                     for (std::size_t i = 0; i < clsBaseArgs->size(); ++i) {
                         const auto& a = (*clsBaseArgs)[i];
                         if (!a.value) { ok = false; break; }
                         llvm::Value* v = lowerExpr(*a.value);
+                        const std::size_t fi = formalForArg(i);
                         // fix #3433 (§4.7 / §22.8 / §11.1, v0.283): the
                         // inheritance-clause face of the same gap — see the
                         // `base(...)` site in emitChainCall above. §11.1's
@@ -13568,8 +13646,11 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         // through this loop, which owed the unit placeholder
                         // byte for a `()`-typed formal just as the explicit
                         // chain call does.
+                        // fix #4520: the formal whose TYPE the §4.7 rescue
+                        // must read is the one §22.5 BINDS this argument to,
+                        // not the one at its source position.
                         if (!v)
-                            v = unitValueForCtorParam(v, bt, i, a.value.get());
+                            v = unitValueForCtorParam(v, bt, fi, a.value.get());
                         if (!v) {
                             // #1386: ICE — lowerExpr returned null for a
                             // positional-base-ctor argument.
@@ -13583,10 +13664,20 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         // Coerce a numeric arg to the base ctor's param type
                         // (a no-op for pointer/struct args, per §5.1).
                         v = coerceNumericToType(
-                            v, bce.fn->getFunctionType()->getParamType(i + 1),
+                            v, bce.fn->getFunctionType()->getParamType(fi + 1),
                             /*srcUnsigned=*/false);
-                        args.push_back(v);
+                        if (fi < byFormal.size()) byFormal[fi] = v;
                     }
+                    // A total binding fills every slot; the check is here so
+                    // that a partial one can never push a null into `args`
+                    // (which LLVM would take as a malformed call) — it falls
+                    // through to the same "not callable" disposition an
+                    // abandoned argument already had.
+                    if (ok)
+                        for (llvm::Value* v : byFormal)
+                            if (!v) { ok = false; break; }
+                    if (ok)
+                        for (llvm::Value* v : byFormal) args.push_back(v);
                     // fix #3777 (§22.5 / §22.8 step 1 / §22.10, v0.286): the
                     // §22.10 inheritance-clause face of the chain-call fill.
                     // `baseClauseExplicitCtor` now resolves a base constructor
@@ -13655,8 +13746,14 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                 if (!pt ||
                                     pt->kind != sema::TypeRef::Kind::Function)
                                     continue;
-                                if (pi >= clsBaseArgs->size()) break;
-                                const auto& a = (*clsBaseArgs)[pi];
+                                // fix #4520: the clause argument supplying
+                                // formal `pi` is the one §22.5 BINDS there,
+                                // not the one at source position `pi`
+                                // (`argForFormal` is the identity when no
+                                // binding was published).
+                                const std::size_t sa = argForFormal(pi);
+                                if (sa >= clsBaseArgs->size()) break;
+                                const auto& a = (*clsBaseArgs)[sa];
                                 if (!a.value) continue;
                                 if (!isPlusOneClosureProducer(a.value.get()))
                                     continue;
@@ -13719,9 +13816,15 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                 // itself supplied no expression at this
                                 // position. Aligns with `lowerCall`'s
                                 // `ai < args.size()` bound.
-                                if (ai + 1 >= args.size()) break;
+                                // fix #4520: the value lowered from SOURCE
+                                // argument `ai` now sits at the slot §22.5
+                                // binds it to, so the release must read that
+                                // slot rather than `ai + 1` (the identity
+                                // when no binding was published).
+                                const std::size_t slot = formalForArg(ai) + 1;
+                                if (slot >= args.size()) break;
                                 if (a.value && isPlusOneStringProducer(a.value.get()))
-                                    emitStringRelease(args[ai + 1]);
+                                    emitStringRelease(args[slot]);
                             }
                         }
                         return;

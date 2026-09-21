@@ -11542,6 +11542,91 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     }
                 }
             }
+            // fix #4520 (§22.5 "Optional parameters and named arguments" /
+            // §22.8 step 1 / §22.10, v0.306): the THIRD §22.5 site of this
+            // family, and the last one still pairing by textual position.
+            //
+            // The block above binds a clause to the base's PRIMARY parameter
+            // list. A clause may instead bind an EXPLICIT base constructor,
+            // which codegen resolves with `Emitter::baseClauseExplicitCtor`
+            // and CALLS — `emitImplicitBase`, not
+            // `prePopulateBasePositionalFields`. That call's argument loop
+            // paired `clsBaseArgs[i]` with the constructor's parameter `i`
+            // and never read `arg.name`. §22.5 forbids exactly that twice:
+            // "naming an argument changes which parameter it binds to, never
+            // when it runs", and — naming the reach of the rule — "every
+            // construction site in the language reaches it through the same
+            // binding — a call, a `new` expression, and a record construction
+            // alike". §22.10 puts the clause among them: "When a class with a
+            // primary constructor has a base class, the base call appears in
+            // the inheritance clause … This replaces an explicit `base(...)`
+            // call."
+            //
+            // MEASURED ON 6c05b4cf: `class D(v: int) : B(b := "e", a := v)`
+            // over an explicit `constructor(a: int, b: string)` compiled at
+            // exit 0 with no diagnostic and printed `0` and a blank line,
+            // where `4` / `e` is correct — the clause values were DROPPED
+            // ENTIRELY rather than mispaired, because the callable test in
+            // `baseClauseExplicitCtor` never let a misordered pair through.
+            // The all-positional spelling of the same program prints `4` /
+            // `e`, so the plumbing works and it is the NAMES that were lost.
+            //
+            // THE BINDING IS NOT RESTATED IN CODEGEN, and it is not squeezed
+            // into the table above: that one describes the base's PRIMARY
+            // parameter list, and this call binds a DIFFERENT formal list, so
+            // reusing it would be precisely the mispairing #3562 removed. Same
+            // binder body (`bindArgsToParams`), a different `FormalsView` —
+            // `of(*ctor)` — and a channel of its own (see SemaContext.hpp).
+            //
+            // THE RESOLVED CONSTRUCTOR TRAVELS WITH THE BINDING. This picks
+            // the callee by ARITY; codegen's `ctorForArgs` also discriminates
+            // an overload set by argument type, so the two are two predicates
+            // even where they agree. Publishing the constructor lets the
+            // consumer check pointer identity and fall back to today's
+            // positional pairing if they ever disagree — the cost of a
+            // disagreement is then the by-name fix, never a wrong-slot store.
+            // An AMBIGUOUS arity match (two non-static constructors of the
+            // clause's arity) publishes nothing for the same reason.
+            //
+            // `emit=false`, matching what #4491 did for the primary arm and
+            // #4484 for the chain: §22.5 VALIDITY checking of a clause that
+            // binds an explicit base constructor is a separate, pre-existing
+            // gap (this arm has its own guards — `baseClauseExplicitCtor`'s
+            // callability test, the arity-0 fallback — and its own silent
+            // shapes, e.g. a NAMED clause omitting a defaulted trailing
+            // parameter, measured on 6c05b4cf to leave the base entirely
+            // unconstructed). Turning this binder loud is a new rejection
+            // belonging to that gap, filed rather than folded in; a clause
+            // the binder declines publishes nothing and lowers exactly as it
+            // does today.
+            if (baseTs && td->primaryBaseCtorArgs[0].value) {
+                ConstructorSymbol* clauseCtor = nullptr;
+                bool ambiguousArity = false;
+                for (Symbol* m : baseTs->members) {
+                    auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                    if (!other || other->isStatic) continue;
+                    if (formalParamCount(*other) !=
+                        td->primaryBaseCtorArgs.size())
+                        continue;
+                    if (clauseCtor) { ambiguousArity = true; break; }
+                    clauseCtor = other;
+                }
+                if (clauseCtor && !ambiguousArity) {
+                    const std::string desc =
+                        std::string("inheritance-clause base call to a "
+                                    "constructor of `") +
+                        std::string(baseTs->name) + "`";
+                    BindResult cb = bindArgsToParams(
+                        sema::FormalsView::of(*clauseCtor),
+                        td->primaryBaseCtorArgs,
+                        td->primaryBaseCtorArgs[0].value->span.begin, desc,
+                        /*emit=*/false);
+                    if (cb.ok)
+                        ctx_.setInheritanceClauseCtorBinding(
+                            &td->primaryBaseCtorArgs, clauseCtor,
+                            cb.paramToArg);
+                }
+            }
             // The base positional field clause argument `ai` binds to. Empty
             // binding (nothing published) degenerates to the textual-order
             // `argument i ↔ field i` pairing this loop has always used, which
