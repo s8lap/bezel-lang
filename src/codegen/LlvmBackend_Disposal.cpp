@@ -6499,6 +6499,70 @@ void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
 }
 
 
+// fix #4552 / §35.5 *The owning match* + §35.4 *Disposal is defined by the
+// active case* (v0.306): is `e` an UNBOUND owned temporary of owning-choice
+// type — the scrutinee shape §35.5 calls an "announcing scrutinee form"?
+//
+// §35.5: "The scrutinee temporary's full expression is the **whole `case`
+// construct** — K8.3, applied unchanged — so payloads not transferred into
+// bindings (discarded slots like `Fetched(_)`, and the payloads of the value
+// when a `_` or non-destructuring arm is selected) are disposed when the
+// construct completes, by the same unbound-temporary pass that disposes the
+// container."
+//
+// THE ADMITTED SHAPE IS A CALL, and only a call. §15.3 makes an owning choice
+// a move-only value type whose "return transfers", and §35.3's case
+// construction (`Outcome.Fetched(new Widget())`) is itself a CallExpr whose
+// callee resolves to a ChoiceCaseSymbol — so both mint. EXCLUDED, each because
+// something else already owns the value and a second disposal here would be a
+// double free:
+//   • a bare identifier (`case o of …`) — a named local, disposed by
+//     `registerOwningChoiceDisposal`'s scope-end active-case pass;
+//   • `case move o of …` — the §35.5 marked scrutinee transfer, which codegen
+//     does not yet implement (the source local's slot is left populated and
+//     its scope-end pass still disposes it; #4552's follow-up);
+//   • a field / property / indexer read — a borrow of its storage (K1.5).
+//
+// This gate is deliberately NOT the ownership pass's `disposeOwnedScrutinee`
+// flag: that flag's own predicate is `producerState == Owned` restricted to a
+// heap class/interface or an owning-collection head, and widening it would
+// change a pass whose verdicts feed diagnostics. The owning-choice family is
+// already classified codegen-side by `registerOwningChoiceDisposal` (which
+// likewise consults no ownership flag), so keeping this gate beside it keeps
+// the two owning-choice disposal sites reading one authority.
+bool Emitter::patternBindsAnySlot(const ast::Pattern* p) {
+    if (!p) return false;
+    if (dynamic_cast<const ast::BindingPattern*>(p)) return true;
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+        for (const auto& sp : dp->subPatterns) {
+            if (!sp.nakedBinding.empty()) return true;
+            if (patternBindsAnySlot(sp.pattern.get())) return true;
+        }
+        return false;
+    }
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+        for (const auto& m : ap->members)
+            if (patternBindsAnySlot(m.get())) return true;
+        return false;
+    }
+    return false;  // discard / null / constant / named / range / relop / type
+}
+
+
+bool Emitter::unboundOwningChoiceTemp(const ast::Expr* e,
+                                      const sema::TypeRef* rt) {
+    if (!e || !rt) return false;
+    if (!dynamic_cast<const ast::CallExpr*>(e)) return false;
+    if (rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) return false;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    return verdict && *verdict == common::ChoiceClassification::Owning;
+}
+
+
 void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // fix #2892 / §28.10 (v0.241): the UNWIND-EXCLUSIVE entries (`unwindOnly`,
     // `releaseOnUnwindOnly`) fire when the scope's owned locals never reached
@@ -7152,7 +7216,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // the same slot reads null on its own (later, in reverse-declaration-
         // order iteration) unwind path and skips. The unbox is load → null-
         // check → release → store null, identical shape to the class path.
-        if (it->unwindOnly) {
+        // fix #4552 / §35.5 (v0.306): `!it->owningChoice` — a case-scrutinee
+        // owning-CHOICE temporary registers an `unwindOnly` entry whose slot
+        // holds a choice STRUCT, not a pointer. This arm loads a `ptr` from
+        // the slot and dispatches a vtable Dispose on it, which for a choice
+        // struct would read the tag word as an object pointer. Let such an
+        // entry fall through to the `owningChoice` arm below, which carries
+        // its own `unwindOnly` gate.
+        if (it->unwindOnly && !it->owningChoice) {
             if (!dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -8343,6 +8414,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // slot value is whatever the active case holds at scope end, and
         // disposing it is the SOLE path for those payloads.
         if (it->owningChoice) {
+            // fix #4552 / §35.5 (v0.306): an `unwindOnly` owning-choice entry
+            // is a case-scrutinee temporary whose NORMAL-edge disposal is
+            // emitted at the construct's completion (lowerCaseStmt); this
+            // entry covers only the arm-body throw edge.
+            if (it->unwindOnly && !dropUndischarged) continue;
             // fix #4552 / §35.9 (v0.306): route through the LOCATION helper,
             // which unwraps a `C?` slot's `{ i8 hasValue, <choice> }` before
             // walking the active case. `owningChoiceRef` is the local's own

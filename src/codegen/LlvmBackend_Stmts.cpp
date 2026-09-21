@@ -10241,6 +10241,13 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // disposes the temp), and emit a normal-path disposal at endBB top.
     llvm::AllocaInst* scrutOwnedSlot = nullptr;
     bool scrutOwnIsOwningCollection = false;
+    // fix #4552 / §35.5 *The owning match* + §35.4 (v0.306): the owning-CHOICE
+    // spelling of the same K8.3 boundary. An owning choice is a VALUE type, so
+    // `scrut` is a struct in a register and every gate above (which requires a
+    // pointer) declines it — the scrutinee temporary was owned by nothing and
+    // its payloads leaked outright. See `unboundOwningChoiceTemp`.
+    llvm::AllocaInst* scrutChoiceSlot = nullptr;
+    const sema::TypeRef* scrutChoiceRef = nullptr;
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
@@ -10281,6 +10288,46 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                 d.collection = true;      // owning-collection free path
             if (!disposeStack_.empty())
                 disposeStack_.back().push_back(d);
+        }
+        // fix #4552 / §35.5 (v0.306): the owning-CHOICE scrutinee temporary.
+        // §35.5: "payloads not transferred into bindings (discarded slots like
+        // `Fetched(_)`, and the payloads of the value when a `_` or
+        // non-destructuring arm is selected) are disposed when the construct
+        // completes, by the same unbound-temporary pass that disposes the
+        // container."
+        //
+        // EXACTLY-ONCE — and the gate that buys it is `armsBind` below.
+        // §35.5's owning match TRANSFERS the selected case's owned payloads
+        // into the arm's bindings, and its own adoption spelling
+        // (`using var u := move r;` in a `do … end` arm) then disposes the
+        // payload at the arm's scope end. Disposing the container wholesale at
+        // construct completion would double-free exactly that shape — MEASURED
+        // as a SIGSEGV on rule-corpus case s35_5_0002, which is written from
+        // the spec and was passing before the gate was added. So this reclaim
+        // is confined to the constructs §35.5 describes as disposing at
+        // completion: the ones whose arms bind NOTHING — "discarded slots like
+        // `Fetched(_)`, and the payloads of the value when a `_` or
+        // non-destructuring arm is selected". For a construct that DOES bind,
+        // the payload keeps the pre-existing behaviour (the arm adopts it, or
+        // it leaks because arm-selection transfer is not implemented) — the
+        // sound direction, and #4552's own follow-up.
+        const bool armsBind = [&] {
+            for (const auto& arm : cs.arms)
+                if (patternBindsAnySlot(arm.pattern.get())) return true;
+            return false;
+        }();
+        if (!scrutOwnedSlot && scrut && !armsBind &&
+            unboundOwningChoiceTemp(cs.scrutinee.get(), scrutTy) &&
+            !scrut->getType()->isPointerTy() && !disposeStack_.empty()) {
+            scrutChoiceSlot = entryAlloca(scrut->getType());
+            builder_.CreateStore(scrut, scrutChoiceSlot);
+            scrutChoiceRef = scrutTy;
+            Disposal d{scrutChoiceSlot, nullptr};
+            d.unwindOnly = true;   // arm-body throw disposes the temp
+            d.owningChoice = true;
+            d.owningChoiceTy = scrutTy->declaration;
+            d.owningChoiceRef = scrutTy;
+            disposeStack_.back().push_back(d);
         }
     }
     auto* endBB =
@@ -10403,6 +10450,33 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             llvm_, "casescrut.end", currentFn_);
         builder_.CreateBr(scrutEndBB);
         builder_.SetInsertPoint(scrutEndBB);
+    }
+    // fix #4552 / §35.5 (v0.306): the owning-CHOICE scrutinee temporary's
+    // NORMAL-edge disposal, at the construct's completion — K8.3's boundary,
+    // which §35.5 applies "in statement position exactly as in expression
+    // position". Emitted at the top of endBB, after every arm body has
+    // finished, so a pattern binding (a borrow of the scrutinee, §19.3) is
+    // never read past it.
+    if (scrutChoiceSlot && scrutChoiceRef) {
+        emitOwningChoiceLocationDisposal(scrutChoiceSlot, scrutChoiceRef);
+        // Zero the slot so any later traversal of this Disposal entry is a
+        // no-op at RUNTIME as well as after the compile-time erasure below:
+        // a zeroed choice reads tag 0 with null payload pointers, and every
+        // payload disposal in the active-case walk is null-guarded. (The
+        // erasure alone is edge-order-dependent — #2816's lesson — so the
+        // runtime discharge is what actually makes the reclaim exactly-once.)
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(scrutChoiceSlot->getAllocatedType()),
+            scrutChoiceSlot);
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == scrutChoiceSlot) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
     }
     return false;
 }

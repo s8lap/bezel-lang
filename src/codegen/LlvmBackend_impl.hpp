@@ -16951,6 +16951,23 @@ private:
                                            llvm::Value* addr,
                                            const ast::Expr* rhsExpr);
 
+    // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
+    // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's
+    // "announcing scrutinee form"? See the definition for the admitted and
+    // excluded scrutinee shapes and why this gate is codegen-side.
+    bool unboundOwningChoiceTemp(const ast::Expr* e, const sema::TypeRef* rt);
+
+    // fix #4552 / §35.5 (v0.306): does `p` (or any pattern nested in it) bind
+    // a slot? An owning match's selected arm TRANSFERS the case's owned
+    // payloads into its bindings (§35.5), and `using var u := move r;` in a
+    // `do … end` arm is the spec's own adoption spelling — so a construct
+    // whose arms bind anything may not have its scrutinee temporary disposed
+    // wholesale at completion. Deliberately COARSE: a binding on a
+    // payload-free or value-payload case cannot take ownership of anything,
+    // but declining there only leaks (the sound direction), while getting it
+    // wrong the other way is a double free.
+    static bool patternBindsAnySlot(const ast::Pattern* p);
+
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
     bool lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body);
