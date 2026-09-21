@@ -7780,6 +7780,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     return ps2->resolvedDeclType;
             return nullptr;
         };
+        // fix #4510 (§2.8.2 clause 1 / §27.4 / §27.1, v0.306): the formal a
+        // call-argument lambda takes its inferred parameter types from — from
+        // BOTH sources, exactly as `formalOutParamType2` above (#2657/#3186)
+        // and `formalCtorOutParamType` on the `new` path (#3772) already do.
+        //
+        // The fix-#829 seeding below used to read `calleeMd2` alone, and an
+        // IMPORTED method has no `ast::MethodDecl` at all (ModuleLoader
+        // reconstructs a bare `sema::MethodSymbol`; the formal types survive
+        // only as `ParameterSymbol::resolvedDeclType`). So across a module
+        // boundary an unannotated lambda argument got NO target type —
+        // silently, because #3756's "no target type anywhere" diagnostic is
+        // suppressed for a call argument (`hadArgContext`), which is exactly
+        // the context this thread was supposed to supply. §2.8.2 clause 1
+        // makes that a defect: the artifact interface must be sufficient to
+        // type-check every well-formed use of the public surface with FULL
+        // signatures, and §27.4 admits the omitted annotation whenever the
+        // target type is known from context — the boundary does not change
+        // whether it is known.
+        //
+        // MEASURED (real `bezelc`, a `-c` library plus an importing exe, an
+        // imported `ApplyHof(f: ((int) -> int) -> int)` called with
+        // `lambda(g) => g(9)`): the single-module twin answers 10 and the
+        // imported call answered 0. A one-level `(int) -> int` formal masked
+        // it — with no type the parameter slot falls through `lowerLambda`'s
+        // `llvm::Type* ty = i32()` DEFAULT, which happens to be right for an
+        // `int` parameter — while the nested function-typed slot lowered `g`
+        // as `i32`, left `g(9)` un-typed, and the body was dropped to
+        // `ret i32 0` (read off `BEZEL_DUMP_IR=1`: the twin emits a second
+        // lambda `i32 (ptr, ptr)` whose body is an indirect call, the importer
+        // emits `i32 (ptr, i32)` whose body is a bare `ret i32 0`).
+        //
+        // A GENERIC callee is skipped on BOTH sides: there the function-param
+        // type may be an unresolved type parameter (`(T) -> int`) inferred
+        // from another argument, and the generic-inference path types the
+        // lambda parameter correctly (#505).
+        auto formalFnParamType2 =
+            [&](std::size_t pos) -> TypeRef* {
+            if (calleeMd2) {
+                if (!calleeMd2->genericParams.empty()) return nullptr;
+            } else if (!calleeMs2 || !calleeMs2->genericParams.empty()) {
+                return nullptr;
+            }
+            return formalOutParamType2(pos);
+        };
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
             // §22.4: `out var x` declares x in the current scope.
@@ -8303,11 +8347,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // another argument; the existing generic-inference path types
                     // the lambda param correctly, and threading the bare `T` here
                     // would override it with the unsubstituted parameter (#505).
-                    if (calleeMd2 && calleeMd2->genericParams.empty() &&
-                        pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        if (auto* pt = ctx_.resolvedType(
-                                *calleeMd2->params[pos2].type)) {
+                    // fix #4510: `formalFnParamType2` (both sources; see its
+                    // header) in place of the former `calleeMd2`-only lookup.
+                    // For a LOCAL callee it resolves through the very same
+                    // `ctx_.resolvedType(*calleeMd2->params[pos2].type)` under
+                    // the very same guards, so that path is unchanged; for an
+                    // IMPORTED one it reads the reconstructed symbol's
+                    // `resolvedDeclType`, which is where the formal's type
+                    // lives when there is no AST decl (§2.8.2 clause 1).
+                    if (calleeMs2) {
+                        if (auto* pt = formalFnParamType2(pos2)) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 !pt->funcParams.empty()) {
                                 // #1140 / §14: a function-typed param `(T)->R`
