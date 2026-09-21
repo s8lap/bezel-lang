@@ -12347,19 +12347,34 @@ int Emitter::ctorArityCount(const sema::TypeSymbol* cls, std::size_t n,
 // slot declares no default, or its default failed to lower (the imported arm
 // has already reported in that case) — the caller then abandons the call, which
 // is exactly what it did before #3777 for these shapes.
+namespace {
+// fix #4550 (§22.5 / §22.8 step 1 / §2.5, v0.306; #3152 seam): the ONE place
+// the constructor-default fill asks whether a constructor is LOCAL or
+// IMPORTED.
+//
+// A LOCAL constructor carries its source-written `ast::Param` list, whose
+// `defaultValue` is the real `ast::Expr` — strictly better than any rendered
+// text (it can read an earlier parameter, `default(T)`, …). An IMPORTED one
+// ships no `ast::ConstructorDecl` at all (the #2374 shape), so its defaults
+// ride `ParameterSymbol::defaultText` and fold through
+// `importedCtorDefaultArgValue` — the same helper the imported `new`-site fill
+// uses (LlvmBackend_Exprs2.cpp, fix #3082).
+//
+// Stated once because BOTH halves of the fill need it — the trailing-run
+// wrapper, to answer `outIsLocal`, and the per-slot body, to pick its arm —
+// and the #2374 seam must be crossed in one place, not per caller (#3152).
+const ast::ConstructorDecl* localCtorDeclOf(
+        const sema::ConstructorSymbol& target) {
+    return dynamic_cast<const ast::ConstructorDecl*>(target.decl);
+}
+}  // namespace
+
 bool Emitter::fillOmittedCtorArgs(const sema::ConstructorSymbol& target,
                                   llvm::FunctionType* fnTy,
                                   bool coerceNumericDefaults,
                                   std::vector<llvm::Value*>& args,
                                   bool* outIsLocal) {
-    // A LOCAL constructor carries its source-written `ast::Param` list, whose
-    // `defaultValue` is the real `ast::Expr` — strictly better than any
-    // rendered text (it can read an earlier parameter, `default(T)`, …). An
-    // IMPORTED one ships no `ast::ConstructorDecl` at all (the #2374 shape), so
-    // its defaults ride `ParameterSymbol::defaultText` and fold through
-    // `importedCtorDefaultArgValue` — the same helper the imported `new`-site
-    // fill uses (LlvmBackend_Exprs2.cpp, fix #3082).
-    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(target.decl);
+    const ast::ConstructorDecl* cd = localCtorDeclOf(target);
     if (outIsLocal) *outIsLocal = cd != nullptr;
     const std::size_t nFormals = target.params.size();
     if (args.empty() || args.size() >= nFormals + 1) return true;  // nothing omitted
@@ -12393,23 +12408,7 @@ bool Emitter::fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
                                    llvm::FunctionType* fnTy,
                                    bool coerceNumericDefaults,
                                    std::vector<llvm::Value*>& ordered) {
-    // A LOCAL constructor carries its source-written `ast::Param` list, whose
-    // `defaultValue` is the real `ast::Expr` — strictly better than any
-    // rendered text (it can read an earlier parameter, `default(T)`, …). An
-    // IMPORTED one ships no `ast::ConstructorDecl` at all (the #2374 shape), so
-    // its defaults ride `ParameterSymbol::defaultText` and fold through
-    // `importedCtorDefaultArgValue` — the same helper the imported `new`-site
-    // fill uses (LlvmBackend_Exprs2.cpp, fix #3082).
-    // The failure mode #3152 guards against is a read that answers WRONG for an
-    // imported symbol. Here the null answer IS the imported case and is handled:
-    // `cd` non-null walks the source-written `ast::Param` defaults, `cd` null
-    // takes the imported path through `importedCtorDefaultArgValue` (the #2374
-    // shape, where a ConstructorSymbol ships no `ast::ConstructorDecl` at all).
-    // The ratchet cannot tell "branches on decl presence and handles both arms"
-    // from "reads decl and assumes it exists", so this carries a marker.
-    // SEAM-DEBT: #4550 — class-3 read on `target.decl` used as the
-    // local-vs-imported discriminator; both arms implemented, see above.
-    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(target.decl);
+    const ast::ConstructorDecl* cd = localCtorDeclOf(target);
     const std::size_t nFormals = target.params.size();
     if (ordered.size() != nFormals) return false;
     // Which slots this call OMITS, captured before anything fills them: the
