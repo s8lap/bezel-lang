@@ -145,6 +145,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 loopBodyDeclaredSlots_.insert(lit->second);
         }
         if (diverged_) return true;  // CG40: diverging initializer
+        // fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from
+        // and null* (v0.306): `var c := b;` is the spec's OWN spelling of the
+        // move-only local-to-local move ("`var y := x;`: copies for an
+        // ordinary value type; moves for a move-only value type"), and it
+        // double-freed exactly as the `:=` form did — both slots kept the
+        // owned payload and both scope-end active-case passes disposed it.
+        // Runs after `lowerLocalDecl` has stored the initializer into the new
+        // binding's slot, and after the `diverged_` bail (a diverging
+        // initializer never reached the store, so there is no transfer to
+        // record). // per §15.3, §28.7, v0.306, #4566
+        markOwningChoiceLocalMovedFrom(ld, ld->initializer.get());
         // §15.3 (#747): a move-only owning inline-array local auto-disposes its
         // slots at scope end, independent of `using var` (§28.10 line 2025).
         // When handled, bypass the using/task/unwind chain (none applies to a
@@ -1644,6 +1655,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    // fix #4566 / §15.3 *Local-to-local assignment* + §28.7
+                    // *Moved-from and null* (v0.306): the MOVE half of the
+                    // drop-on-overwrite pass above. An owning choice is a
+                    // move-only value type, so `c := b;` TRANSFERS — "After
+                    // the move, `x` is in moved-from state" — and §15.3's
+                    // *Local lifetime* bullet says the source then "holds no
+                    // value", so "no pass walks it". Codegen only ever
+                    // plain-stored the struct, leaving BOTH slots holding the
+                    // same owned payload pointer for BOTH scope-end
+                    // active-case passes to dispatch `Dispose` through (a
+                    // measured SIGSEGV / ASan heap-use-after-free). Emitted
+                    // AFTER the store, so the value the store read out of the
+                    // source slot is already in the target's.
+                    // // per §15.3, §28.7, v0.306, #4566
+                    markOwningChoiceLocalMovedFrom(as->target.get(),
+                                                   as->value.get());
                     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): the
                     // path-sensitive walker change in `collectBorrowingArray
                     // FreeEligible` (LlvmBackend_Setup.cpp ~24423 / ~28134)

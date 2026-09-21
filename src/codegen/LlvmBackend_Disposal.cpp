@@ -6506,6 +6506,164 @@ void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
 }
 
 
+// fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from and null*
+// (v0.306). §15.3 makes an owning-classified choice a MOVE-ONLY value type:
+// "Assignment transfers the value from source to destination, leaving the
+// source in moved-from state", spelled out at the first *Rules* bullet as
+// "**Local-to-local assignment** `var y := x;`: copies for an ordinary value
+// type; moves for a move-only value type. After the move, `x` is in moved-from
+// state" — unmarked, because "a move-only value binding has no borrow reading
+// to disambiguate". §15.3's *Local lifetime* bullet then states the
+// consequence for the SOURCE: a whole-value move "leaves the local holding no
+// value rather than a hole, so no pass walks it (K1's moved-from state:
+// 'discharge machinery skips it')", which is §28.7's *Moved-from and null*
+// clause — "A moved-from or null location therefore stores without disposal".
+//
+// Codegen implemented only the STORE half. `c := b;` and `var c := b;`
+// plain-copied the choice struct, so both slots held the same owned payload
+// pointer and BOTH scope-end active-case passes dispatched `Dispose` through
+// it. MEASURED on §35.4's own shape (`var b := Bundle.Ready(new
+// Resource("b")); var c := Bundle.Ready(new Resource("c")); c := b;`):
+// `dispose c` / `moved` / `dispose b` / SIGSEGV, the second dispatch reading
+// a freed vtable, and `AddressSanitizer: heap-use-after-free` under
+// `--sanitize=address`.
+//
+// THE MARK IS A RUNTIME ZERO-STORE over the source slot — the choice analogue
+// of `nullTransferredOwnedLocalSlot`, which nulls an owned class local's slot
+// at a transfer so the null-guarded disposal downstream is a no-op. Zeroing
+// works for a choice for the same reason, one level in: the scope-end pass
+// reads tag 0, enters case 0's arm, and finds payload pointers its EXISTING
+// null-guard skips ("Null-guard: a never-bound arm ... could leave an `owned`-
+// payload slot null"); a case-0 payload that is itself an owning choice
+// recurses into the same all-zero state and terminates there. So no consumer
+// of the slot needs a new predicate:
+//   * the scope-end active-case pass disposes nothing;
+//   * `disposeDisplacedOwningChoiceLocal` at a later re-acquiring store
+//     (`c := b; b := Bundle.Ready(new Resource("b2"));` — measured as its own
+//     double free, `dispose c` / `dispose b` / SIGSEGV) reads the same zeros
+//     and disposes nothing, which is exactly §28.7's moved-from clause;
+//   * the next store into the source re-arms it with a live value, so a move
+//     inside a loop body is correct every iteration.
+// Being a runtime store it is EXACT on every control-flow path: a move under
+// an `if` suppresses the source's disposal on the taken path and leaves it on
+// the other. A static "transferred somewhere in this body" set — the move-only
+// inline array's `moveOnlyArrayTransferred_`, the other move-only kind's
+// answer to the same question — cannot make that distinction and pays for it
+// with a leak on the untaken path.
+//
+// WHY NOT A SENTINEL TAG instead of a zero-store: an out-of-range tag would
+// also make the disposal switch fall to its no-op default, but it puts the
+// slot in a state the CASE lowering's exhaustive switch has no arm for. Zero
+// is an in-range, constructible state, so a read of the moved-from source —
+// which §15.3 makes a compile error but which this compiler still ACCEPTS
+// (filed separately; not fixed here) — stays a defined read rather than
+// becoming undefined behaviour.
+//
+// SCOPE. #4566 is local-to-local, so both ends must be plain locals with an
+// `ast::LocalDecl`: that is exactly the set `registerOwningChoiceDisposal`
+// enrolls in the scope-end pass, which is what makes "the target has taken
+// over the disposal obligation" a fact rather than an assumption. A
+// field/index/static target, a parameter at either end, `_ := b;` (§35.10's
+// move-only discard) and §35.5 arm-selection payload transfer are declined
+// here and remain open.
+void Emitter::markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
+                                             const ast::Expr* srcExpr) {
+    // THE TARGET must be a plain local — the recipient has to be a location
+    // this backend actually enrolls in the scope-end active-case pass, or the
+    // suppression below would turn the double free into a leak. Same gate, in
+    // the same order, as `disposeDisplacedOwningChoiceLocal` above.
+    if (!targetExpr) return;
+    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(targetExpr);
+    if (!tid) return;
+    auto* tloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+    if (!tloc) return;
+    // This overload is reached only from the `:=` lowering, so `targetExpr` is
+    // an ASSIGNMENT target; the same marker, for the same reason, as
+    // `disposeDisplacedOwningChoiceLocal` above. // per §21.1
+    // LOCALDECL-ONLY: §21.1 makes a runtime `const` a single-assignment
+    // binding, so sema rejects a store into one before codegen runs and an
+    // `ast::LocalConstDecl` can never be an assignment target here.
+    auto* tld = dynamic_cast<const ast::LocalDecl*>(tloc->decl);
+    markOwningChoiceLocalMovedFrom(tld, srcExpr);
+}
+
+// The shared core, reached from the `:=` overload above and directly from the
+// `var c := b;` declaration site (a LocalDecl has no target EXPRESSION — the
+// binding itself is the target).
+void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
+                                             const ast::Expr* srcExpr) {
+    if (!targetLd || !srcExpr) return;
+    if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
+    // THE SOURCE must be a bare identifier naming a DIFFERENT local. A bare
+    // identifier is the only shape §15.3 bullet 1 moves; `b.f`, `b[i]` and
+    // `b.M()` are borrows of `b` (the same reading `MoveOnlyArrayTransfer
+    // Walker` gives those positions for the other move-only kind).
+    auto* sid = dynamic_cast<const ast::IdentifierExpr*>(srcExpr);
+    if (!sid) return;
+    auto* sloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*sid));
+    if (!sloc) return;
+    // `lowerStmt`'s own `LocalConstDecl` arm records why its sibling does not
+    // mirror the `registerOwningChoiceDisposal` chain: "A `const` cannot bind
+    // an OWNED production (an owning choice, a move-only inline array, a task
+    // frame — §21.1)". // per §21.1
+    // LOCALDECL-ONLY: a §21.1 runtime `const` cannot BIND an owning choice, so
+    // it is never enrolled in the scope-end active-case pass and has no
+    // disposal for a moved-from mark to suppress.
+    auto* sld = dynamic_cast<const ast::LocalDecl*>(sloc->decl);
+    if (!sld) return;  // a parameter / §21.1 `const` — neither is enrolled in
+                       // the scope-end pass, so neither has a disposal to
+                       // suppress (§21.1 does not admit an owned production
+                       // at a `const` binding at all).
+    if (sld == targetLd) return;  // `b := b;` — §15.3's *Whole-value
+                                  // reassignment* bullet makes self-assignment
+                                  // "a no-op"; zeroing here would destroy the
+                                  // value the store just wrote back.
+    // The declared type decides, resolved in the SAME order
+    // `registerOwningChoiceDisposal` uses — the store below and the scope-end
+    // pass must never disagree about which locals are owning choices.
+    const sema::TypeRef* rt =
+        sld->type ? ctx_.resolvedType(*sld->type)
+                  : (sld->initializer ? ctx_.exprType(*sld->initializer)
+                                      : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return;
+    // §3.6 rule 2 + §35.4: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    auto it = locals_.find(sld);
+    if (it == locals_.end() || !it->second) return;
+    llvm::AllocaInst* slot = it->second;
+    // The expected storage type, derived the way the DISPOSAL derives it:
+    // §35.9's `C?` is the ordinary nullable value type `{ i8 hasValue,
+    // <choice struct> }` (zeroing it clears `hasValue`, so
+    // `emitOwningChoiceLocationDisposal`'s guard skips the walk outright),
+    // and a bare `C` is the choice struct, laid out under its own
+    // instantiation's substitution (#2047).
+    llvm::Type* want = nullptr;
+    if (rt->nullable) {
+        want = nullableValueStructTy(rt);
+    } else {
+        RecordSubstGuard choiceSubst(this, rt);
+        want = choiceStruct(rt->declaration);
+    }
+    if (!want) return;
+    // Refuse anything whose alloca is not that exact storage. The one shape
+    // this excludes in practice is a §27.5 capture-boxed local, whose alloca
+    // has been rewritten to a pointer-sized cell holder — a zero-store there
+    // would null the cell pointer rather than the value. §15.3's consume-site
+    // freeze makes moving a move-only local while a closure capture of it is
+    // live a compile error, so the shape should not reach here; declining is
+    // the conservative answer if it ever does (the pre-fix double free, never
+    // a fresh corruption).
+    if (slot->getAllocatedType() != want) return;
+    builder_.CreateStore(llvm::Constant::getNullValue(want), slot);
+}
+
+
 // fix #4552 / §35.5 *The owning match* + §35.4 *Disposal is defined by the
 // active case* (v0.306): is `e` an UNBOUND owned temporary of owning-choice
 // type — the scrutinee shape §35.5 calls an "announcing scrutinee form"?

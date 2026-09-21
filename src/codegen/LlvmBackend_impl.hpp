@@ -17052,6 +17052,48 @@ private:
                                            llvm::Value* addr,
                                            const ast::Expr* rhsExpr);
 
+    // fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from and
+    // null* (v0.306): the MOVE half of an owning-choice local-to-local
+    // transfer. §15.3 makes an owning choice a move-only value type — "`var y
+    // := x;`: copies for an ordinary value type; moves for a move-only value
+    // type. After the move, `x` is in moved-from state" — and §15.3's *Local
+    // lifetime* bullet says what that costs the source: a whole-value move
+    // "leaves the local holding no value rather than a hole, so no pass walks
+    // it". Codegen implemented only the store: `c := b;` / `var c := b;`
+    // plain-copied the choice struct, so BOTH slots held the same owned
+    // payload pointer and BOTH scope-end active-case passes dispatched
+    // `Dispose` on it (measured: `dispose b` then a SIGSEGV reading the freed
+    // vtable, and an ASan heap-use-after-free).
+    //
+    // The mark is a RUNTIME one — a zero-store over the source slot, the
+    // choice analogue of `nullTransferredOwnedLocalSlot`'s null-store over an
+    // owned class local's slot. It makes every §28.7 consumer of that slot a
+    // no-op without any of them needing a new predicate: the scope-end
+    // active-case pass reads tag 0, takes case 0's arm, and finds null payload
+    // pointers its existing null-guard already skips (a nested owning-choice
+    // payload recurses into the same all-zero state); `disposeDisplacedOwning
+    // ChoiceLocal` at a later re-acquiring store (`c := b; b := C.Ready(…);`)
+    // reads the same zeros and disposes nothing; and the next store into the
+    // source re-arms it with a live value. Being a runtime store it is exact
+    // on every control-flow path — a move under an `if` suppresses the source
+    // disposal on the taken path only — which a static "this local is
+    // transferred somewhere" set (the move-only inline array's
+    // `moveOnlyArrayTransferred_`) cannot be.
+    //
+    // SCOPE (#4566 is local-to-local; the rest is filed, not silently
+    // widened): both ends must be plain locals with an `ast::LocalDecl` — the
+    // exact set `registerOwningChoiceDisposal` enrolls in the scope-end pass,
+    // so "the target takes over the disposal obligation" is a fact rather than
+    // a hope. A field/index/static target, a parameter at either end, `_ :=
+    // b;` (§35.10's move-only discard) and arm-selection payload transfer are
+    // all declined here.
+    void markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
+                                        const ast::Expr* srcExpr);
+    // The shared core. `var c := b;` has no target EXPRESSION — the binding is
+    // the target — so the declaration site calls this form directly.
+    void markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
+                                        const ast::Expr* srcExpr);
+
     // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
     // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's
     // "announcing scrutinee form"? See the definition for the admitted and
