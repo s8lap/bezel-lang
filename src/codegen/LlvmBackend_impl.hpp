@@ -16914,9 +16914,42 @@ private:
     // case holds at scope end, and disposing it is the SOLE path for those
     // payloads (no separate `using var` registration fires for choice
     // payloads — the choice value IS the owner).
-    void emitOwningChoiceActiveCaseDisposal(llvm::AllocaInst* slot,
+    // fix #4552 / §35.9 (v0.306): `slot` is a `llvm::Value*`, not an
+    // `AllocaInst*` — `emitOwningChoiceLocationDisposal` below GEPs INTO a
+    // nullable wrapper and hands the inner address here, and the #4132
+    // recursive arm already passes a fresh alloca. Nothing in the body needs
+    // alloca-ness (it only loads the choice struct from the address).
+    void emitOwningChoiceActiveCaseDisposal(llvm::Value* slot,
                                             const sema::TypeSymbol* choiceTy,
                                             const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.9 *Nullable `C?`* + §35.4 *Disposal is defined by the
+    // active case* (v0.306): dispose the owning-choice value held at `addr`,
+    // unwrapping §35.9's `C?` representation first. For a non-nullable
+    // location this is `emitOwningChoiceActiveCaseDisposal` verbatim; for a
+    // `C?` location the storage is `{ i8 hasValue, <choice struct> }`
+    // (nullableValueStructTy), so the active-case walk must run on field 1
+    // under a `hasValue` guard — reading the wrapper's first bytes AS the
+    // choice struct (what every caller did before this fix) reads `hasValue`
+    // as the tag and either silently disposes nothing or dispatches through a
+    // payload slot that holds another case's bytes.
+    void emitOwningChoiceLocationDisposal(llvm::Value* addr,
+                                          const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.4 *Drop-on-overwrite is defined and automatic* + §35.9
+    // (v0.306): the owning-CHOICE sibling of `disposeDisplacedOwnedClassLocal`.
+    // "Whole-value reassignment of an owning-choice local or field *disposes
+    // the displaced value* per §28.7" — and "`x := null;` on an owned `C?`
+    // location likewise disposes the displaced value's payloads". Before this,
+    // codegen had no drop-on-overwrite path for a choice at all: the class
+    // helper bails on a non-class local and the scope-end active-case pass only
+    // ever sees the FINAL value, so every displaced owning-choice value leaked.
+    // Emitted between the RHS's evaluation and the store, which is §28.7's
+    // stated order. FIELD targets are NOT covered here (the helper requires a
+    // plain local identifier, exactly as the class sibling does).
+    void disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
+                                           llvm::Value* addr,
+                                           const ast::Expr* rhsExpr);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).

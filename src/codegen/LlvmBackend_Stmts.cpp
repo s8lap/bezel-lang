@@ -1623,6 +1623,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (!as->lhsMovedFromAtStore)
                         disposeDisplacedOwnedClassLocal(as->target.get(), addr,
                                                         elemTy, rhs);
+                    // fix #4552 / §35.4 *Drop-on-overwrite is defined and
+                    // automatic* + §35.9 (v0.306): the owning-CHOICE sibling of
+                    // the class drop above. "Whole-value reassignment of an
+                    // owning-choice local or field disposes the displaced value
+                    // per §28.7"; `o := null` on an owned-state `C?` location
+                    // does the same. A choice is a VALUE type, so the class
+                    // helper's `unwindOwnedLocalClass` gate declines it and no
+                    // other path ever saw the displaced value — the scope-end
+                    // active-case pass only sees whatever the slot holds LAST.
+                    // Same §28.7 moved-from suppression as the class sibling,
+                    // and the same position in the sequence (RHS already
+                    // lowered into `rhs`; the store is emitted below).
+                    if (!as->lhsMovedFromAtStore)
+                        disposeDisplacedOwningChoiceLocal(as->target.get(), addr,
+                                                          as->value.get());
                     // #914: a narrowed value-nullable RHS (sema proved non-null)
                     // assigned to a non-nullable target — unwrap the {flag,value}
                     // struct to its value. No-op for a nullable target (elemTy is

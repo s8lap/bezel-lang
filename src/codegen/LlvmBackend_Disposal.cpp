@@ -3282,7 +3282,7 @@ void Emitter::disposeNewDiscardOwnedOutSlots(std::size_t base) {
 
 
 void Emitter::emitOwningChoiceActiveCaseDisposal(
-        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
+        llvm::Value* slot, const sema::TypeSymbol* choiceTy,
         const sema::TypeRef* choiceRef) {
     // §35.4 (v0.200, #2045 stage 3) "Disposal is defined by the active
     // case." Reads the runtime TAG (field 0 of the choice struct), switches
@@ -6373,6 +6373,132 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
 }
 
 
+// fix #4552 / §35.9 *Nullable `C?`* (v0.306): dispose the owning-choice value
+// held AT AN ADDRESS, unwrapping §35.9's `C?` representation first.
+//
+// §35.9 makes `C?` "the ordinary nullable value type (§7.2)", and §7.2's
+// representation for a nullable value type is the tagged wrapper
+// `{ i8 hasValue, <payload> }` (`nullableValueStructTy`, whose own
+// `isNullableChoiceTy` arm builds it with `choiceStruct` as the payload). So a
+// `C?` LOCATION does not hold a choice struct at offset 0 — it holds the
+// wrapper, with the choice struct at field 1.
+//
+// ⚠ EVERY pre-#4552 caller read it as though it did. `registerOwningChoiceDisposal`
+// registers a nullable owning-choice local exactly as it registers a
+// non-nullable one (its gate reads `rt->declaration->kind == Choice`, which a
+// `C?` TypeRef satisfies), and the scope-end pass then loaded `%choice.C` from
+// the wrapper's address — reading `hasValue` (plus padding) AS THE TAG.
+// MEASURED on `var o: Outcome? := Outcome.Fetched(new Widget());`: `hasValue`
+// is 1, `Fetched` is case 0 and `Failed` is case 1, so the tag read 1, the
+// switch took the payload-free `Failed` arm, and the widget was silently
+// leaked. The same misread is a CRASH rather than a leak whenever the
+// mis-decoded tag lands on a case that DOES carry an owned payload: the
+// extracted "payload pointer" is then another field's bytes.
+void Emitter::emitOwningChoiceLocationDisposal(llvm::Value* addr,
+                                               const sema::TypeRef* choiceRef) {
+    if (!addr || !choiceRef || !choiceRef->declaration) return;
+    if (!choiceRef->nullable) {
+        emitOwningChoiceActiveCaseDisposal(addr, choiceRef->declaration,
+                                           choiceRef);
+        return;
+    }
+    llvm::StructType* wrap = nullableValueStructTy(choiceRef);
+    if (!wrap || wrap->getNumElements() < 2) return;
+    // §35.9: "`null` assignment into an owned-state `C?` location is
+    // drop-on-overwrite — the displaced value's payloads are disposed". The
+    // converse is equally normative: a `C?` location that IS null holds no
+    // payloads, so the walk must be guarded rather than run on zeroed bytes.
+    llvm::Value* hvAddr =
+        builder_.CreateStructGEP(wrap, addr, 0, "ocd.opt.hv.addr");
+    llvm::Value* hv =
+        builder_.CreateLoad(nullablePrimHasValTy(), hvAddr, "ocd.opt.hv");
+    llvm::Value* live = builder_.CreateICmpNE(
+        hv, llvm::ConstantInt::get(nullablePrimHasValTy(), 0), "ocd.opt.live");
+    auto* dispBB =
+        llvm::BasicBlock::Create(llvm_, "ocd.opt.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ocd.opt.cont", currentFn_);
+    builder_.CreateCondBr(live, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    llvm::Value* inner =
+        builder_.CreateStructGEP(wrap, addr, 1, "ocd.opt.val.addr");
+    emitOwningChoiceActiveCaseDisposal(inner, choiceRef->declaration,
+                                       choiceRef);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
+// fix #4552 / §35.4 *Drop-on-overwrite is defined and automatic* + §35.9
+// (v0.306). §35.4: "Whole-value reassignment of an owning-choice local or field
+// *disposes the displaced value* per §28.7, like an owned class binding. A
+// choice has no partial states, so the single-value form of that rule applies
+// as written"; and "`x := null;` on an owned `C?` location likewise disposes
+// the displaced value's payloads (§35.9)".
+//
+// Codegen had NO drop-on-overwrite path for a choice before this: the class
+// sibling (`disposeDisplacedOwnedClassLocal`, above) returns at its
+// `unwindOwnedLocalClass` gate for a choice-typed local (a choice is a
+// value type, not a class reference), and the scope-end active-case pass
+// (`registerOwningChoiceDisposal` → `emitDisposals`' `owningChoice` arm) only
+// ever sees the FINAL value in the slot. So every displaced value leaked:
+// MEASURED on `var b := Bundle.Ready(new Resource("old")); b := Bundle.Ready(
+// new Resource("new"));` — spec output `dispose old / reassigned / dispose
+// new`, observed `reassigned / dispose new`.
+//
+// ORDER. Called from the `:=` lowering AFTER the RHS has been lowered and
+// BEFORE the store — §35.4's own sequencing ("the RHS is evaluated first, then
+// the displaced value is disposed, then the new value is stored").
+//
+// THE TWO SUPPRESSIONS, both §28.7's: the pass runs only "if the previous value
+// is live (**non-null and not moved-from**)".
+//   1. moved-from — supplied by the caller via `as->lhsMovedFromAtStore`, the
+//      ownership dataflow's converged state at this store (#3950). Without it
+//      `b := Pass(move b);` would dispose the value the callee just handed
+//      back through the same slot.
+//   2. self-assignment — `b := b;` is admitted today and lowers to a
+//      load-then-store of the same bytes, so disposing the displaced value
+//      would free the payload the store is about to write back. The class
+//      sibling catches this with a pointer IDENTITY guard on the loaded old
+//      value; a choice is a struct in an SSA register with no pointer to
+//      compare, so the equivalent test is syntactic: the RHS is a bare
+//      identifier naming the same local.
+// The NULL half of §28.7's conjunction needs no separate gate here: an owning
+// choice always holds a live case, and the `C?` spelling's `hasValue` guard is
+// inside `emitOwningChoiceLocationDisposal`.
+void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
+                                                llvm::Value* addr,
+                                                const ast::Expr* rhsExpr) {
+    if (!addr || !target) return;
+    if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return;  // field / index / static target — not a plain local
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc) return;  // a parameter (borrow or owned) — excluded
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld) return;
+    // Suppression 2 (see the header): `b := b;`.
+    if (auto* rhsId = dynamic_cast<const ast::IdentifierExpr*>(rhsExpr))
+        if (ctx_.exprSymbol(*rhsId) == static_cast<sema::Symbol*>(loc)) return;
+    // The declared type decides — the same resolution order
+    // `registerOwningChoiceDisposal` uses, so the store-site drop and the
+    // scope-end active-case pass can never disagree about which locals are
+    // owning choices.
+    const sema::TypeRef* rt =
+        ld->type ? ctx_.resolvedType(*ld->type)
+                 : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return;
+    // §3.6 rule 2 + §35.4: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    emitOwningChoiceLocationDisposal(addr, rt);
+}
+
+
 void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // fix #2892 / §28.10 (v0.241): the UNWIND-EXCLUSIVE entries (`unwindOnly`,
     // `releaseOnUnwindOnly`) fire when the scope's owned locals never reached
@@ -8217,8 +8343,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // slot value is whatever the active case holds at scope end, and
         // disposing it is the SOLE path for those payloads.
         if (it->owningChoice) {
-            emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
-                                               it->owningChoiceRef);
+            // fix #4552 / §35.9 (v0.306): route through the LOCATION helper,
+            // which unwraps a `C?` slot's `{ i8 hasValue, <choice> }` before
+            // walking the active case. `owningChoiceRef` is the local's own
+            // (instantiated) TypeRef, so it carries the `nullable` bit;
+            // `registerOwningChoiceDisposal` admits a `C?` local exactly as it
+            // admits a `C` one, and reading the wrapper's leading bytes as the
+            // tag is what made the nullable spelling leak (or, for a different
+            // case order, dispatch through the wrong payload slot).
+            if (it->owningChoiceRef)
+                emitOwningChoiceLocationDisposal(it->slot, it->owningChoiceRef);
+            else
+                emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
+                                                   it->owningChoiceRef);
             continue;
         }
         // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose

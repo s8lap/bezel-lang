@@ -1702,7 +1702,7 @@ s35_4_0001	pass
 s35_4_0002	fail	#4376
 s35_4_0003	fail	divergence
 s35_4_0004	pass	
-s35_4_0005	fail	divergence
+s35_4_0005	pass	
 s35_4_0006	fail	divergence
 s35_4_0007	fail	divergence
 s35_4_0008	pass	
@@ -1734,7 +1734,7 @@ s35_7_0006	pass
 s35_8_0001	pass	
 s35_8_0002	pass	
 s35_8_0003	fail	divergence
-s35_9_0001	fail	divergence
+s35_9_0001	pass	
 s35_9_0002	pass	
 s35_10_0001	pass	
 s35_10_0002	pass	
