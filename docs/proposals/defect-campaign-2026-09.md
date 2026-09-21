@@ -285,6 +285,65 @@ reviewer confirmed `applyGenericSubst` "genuinely cannot serve" one site), that 
 named parameter of the one function, not a second function. A second function surviving the
 lane is the family re-forming.
 
+---
+
+#### I1 — lane record (2026-09-22, integration HEAD `00e10c0e`)
+
+*Written by the I1 lane per §7 rule 6. Everything below is from a run, not a source read.*
+
+**Verify-first, all eight members.**
+
+| # | Status on HEAD | Evidence |
+|---|---|---|
+| #4212 | **Anchor already landed** before this lane opened — `1eadfaf4`, now in `origin/main`. | `sema::substituteGenericArgs(TypeRef*, const SubstArgs&)` in `src/sema/SubstArgs.{hpp,cpp}`; `Resolver::applyGenericSubst`, `Resolver::substituteAliasGenericArgs` and `ExprTC::substituteGenericFieldType` are thin delegators. |
+| #4172 | **Already fixed**, closed 2026-09-18. | Fixed by `ff9afb0c fix #4188` (alias under-substitution at the §27.8 reference site); closed with `eac864c4 test #4172`. Re-measured: the issue's repro compiles and prints `hi`. |
+| #3861 | **Already fixed.** | `e577e44c fix #4183` rewrote `unifyArgSubst`'s constructed-generic case onto `collectAncestorInstantiationsOf`. All three of #3861's consequences verified: `C<string>: I<int>` at `p: I<X>` binds `X := int` (not `string`); binding to `string` is rejected; `C<U>: I<int>, I<string>` makes the candidate inapplicable with the §14.5-quoting diagnostic. |
+| #2755 | **Reproduced, fixed this lane.** | Both repros exited 1 with "IR verification failed" pre-fix. |
+| #3566 | **Reproduced, fixed this lane.** | `first=3 last=2 count=3` (insertion order) pre-fix; `first=1 last=3 count=3` after. |
+| #2742 | **Reproduced, fixed this lane.** Direction MEASURED: **false reject** (the issue was filed "NOT reproduced" and asked for exactly this). | Plus an unreported sibling at `moveOnlyElementSites_`, same mechanism, same fix. |
+| #2736 | **Split.** (b)'s seven `IOwning*` interfaces are **already fixed** by `#4305`'s `kNullDeclClassConstraints` table; `OwningBuffer`/`Span`/`ReadOnlySpan` correctly still admitted. (a) and (b)'s `OwningTask<T>` half still reproduce. | `OwningTask<int>` compiles clean; the rule corpus already banks it as `s14_4_0005 fail`. #4305 declined `OwningTask` deliberately (no stdlib-doc `where` clause to register) while spec §14.4 v0.306 names it in the restriction list — that tension needs a ruling, and flipping it retypes ~6 existing async tests. Not taken. |
+| #2735 | **Reproduces, and has MOVED — worse than filed.** | The issue reports "exits 0, silently wrong; no ASan abort was observed". On HEAD, ASan aborts: `heap-use-after-free`, READ of size 8 in `bz$B2.C$Round`, freed in the same frame. It is a live memory-safety defect cross-module, not a wrong value. Closing it still needs the new module metadata #2735 declined to invent. Not taken. |
+
+**⚠ THE FAMILY IS DRAWN TOO WIDE — split, per §0's falsification rule.** A fix at the anchor's
+shared code path (the eager sema `TypeRef` walker) closes **#4212 and #4172 only** — fewer
+than half the listed members. Re-verification shows the eight sit at **four** shared sites,
+not one:
+
+| Site | Members | State |
+|---|---|---|
+| **S1 — the eager sema `TypeRef` walker** | #4212, #4172 | **Unified.** One authority; three delegators. |
+| **S2 — the deferred per-instantiation obligation recorders** (`hashContainerSites_`, `moveOnlyElementSites_`, `owningElementSites_`, `owningBufferSpanMoveOnlySites_`, `asTargetSites_`) and their Pass-2 "resolve this bare name against the enclosing type" loops | #2742, #2736(a), #2736(b), #2735 | Same *mechanism* (three hand-inlined copies of one guard, two recorders missing it), **different code path**. Unified this lane into `Resolver::nameBoundByCurrentMethod`. |
+| **S3 — the codegen substitution maps** `genericSubst_` / `genericSubstSemaTy_` and their composition through `substituteTypeRefLocal` | #2755, #3566 | Same *mechanism* (a substitution installed raw, or under the wrong parameter names), **different layer**. Both fixed this lane, each by delegating to the existing authority (`substituteTypeRefLocal`, `computeAncestorGenericSubst`). |
+| **S4 — `unifyArgSubst`** (unification) | #3861 | Closed independently by `#4183`. Was never at S1 — the anchor explicitly scopes unification out. |
+
+The clustering rule held at the level of *mechanism* ("one copy is later taught something the
+others are not") and failed at the level of *shared code path*, which is what §0 keys a family
+on. The honest reading: **I1 is one mechanism across four layers**, and each layer needs its
+own anchor. S1's is #4212 and is done; S2's and S3's were performed ad hoc this lane and are
+**not yet ratcheted** — nothing stops a sixth recorder omitting the guard, and nothing stops
+the next `newSema[...] = <raw>` site.
+
+**Residual duplication, still open (filed).** Two consolidations the anchor did not reach:
+- `common::substitutedChoicePayloadType` (`src/common/OwnershipFacts.cpp`) is the **fourth**
+  eager walker #4212's own table names, still **top-level only**, still not delegating. It
+  takes a `const SemaContext&` and returns `const TypeRef*`, so delegating needs an allocating
+  (non-`const`) context — a real design question, not an oversight. Filed as
+  [#4568](https://github.com/s8lap/bezel-lang/issues/4568).
+- The codegen layer carries S1's duplication verbatim: `Emitter::resolveTypeParamRef`
+  (top-level only) beside `Emitter::substituteTypeRefLocal` (recursive), with several
+  `newSema[...] = resolveTypeParamRef(...)` sites, plus three that store the argument raw.
+  That is the S3 anchor this lane did not write; filed as
+  [#4567](https://github.com/s8lap/bezel-lang/issues/4567).
+
+**Falsification: observed at S1, and handled exactly as prescribed.** The alias caller *does*
+need different semantics — the §15.1 nested-inline-array re-validation (fix #4280) only fires
+at substitution time. It is a **named parameter** of the one function
+(`SubstArgs::validateNestedInlineArrays`), not a second function. No second walker survived at
+S1.
+
+**Members closed by this lane:** #2755, #3566, #2742. **Already closed:** #4172, #3861.
+**Left open:** #4212 (umbrella — holds until #2735/#2736 close), #2735, #2736.
+
 ### J — Non-terminating and super-linear classification (§35.1, §35.4, §28.1)
 
 **Mechanism.** `payloadFieldTypeIsMoveOnly` recurses back into `classifyChoiceCore` with a
