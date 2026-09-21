@@ -132,3 +132,13 @@ plain_var_vtableless_builtin_discard_leak_4185.shared_uncovered_builtin_still_le
 # ── pattern (e): diagnosticMessageContains(r, "LSan/ASan at exit") — 2 rows, 2 files ──
 codegen_narrowed_value_op_arg_release_3116.unnarrowed_object_call_argument_still_leaks_as_expected  # #3892/#3895: an unnarrowed Object-typed call argument still leaks, as expected — not a compiler crash or unrelated signal. tests/codegen/narrowed_value_op_arg_release_3116_test.cpp:290
 dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_28_9  # spec §28.9: the dict VALUE-position argument is deliberately NOT claimed by the #3887/#3888 fix, so it must still trip LeakSanitizer on both sides of that commit — the inverse control of the rows above it in the same file. tests/codegen/dict_sorted_key_local_release_3887_3888_test.cpp:388
+
+# ── pattern (f): BEZEL_EXPECT_FALSE(r.ran) + an allocation-COUNT assertion — 1 row ──
+# Found by the first full cycle that actually enforced this file (#4537). The
+# population pass scanned shapes (a)–(e) and did not have this one: the row
+# does not call a leak helper and does not match on a headline string, it
+# asserts `r.ran == false` and then pins the residue's exact size, which is a
+# STRONGER oracle than any of the above — a crash lands in the same
+# `ran == false` shape but names no allocation count, so it fails rather than
+# passing. Worth keeping in mind if this file is ever repopulated by scan.
+async_iterator_lambda_param_capture_cell_3567.abandoned_async_iterator_leak_is_only_the_3541_residue_spec_29_7  # #3541/#3567, spec §29.7: an abandoned async iterator leaks exactly the §27.5 capture-cell residue — three allocations per abandoned round over 200 rounds. The row asserts the leak is PRESENT and is EXACTLY "in 600 allocation(s)", which is what distinguishes the residue from the over-release this arming could have become. tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp:157
