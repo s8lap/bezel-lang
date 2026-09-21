@@ -69,8 +69,22 @@
 // only emitted on the reconstruction path, so an in-module test cannot reach
 // it. The AOT harness compiles one module and cannot express a dependency, so
 // the rows hand-roll `Driver::compileObject` plus
-// `bezel::test::compileFileForTest`, the established two-module shape. No JIT
-// oracle is used.
+// `bezel::test::compileFileForTest`, the established two-module shape, and run
+// the product through `bezel::test::runProgramForTest` rather than
+// `std::system` (#4532). No JIT oracle is used.
+//
+// ORACLE NOTE — WHY THE RUN GOES THROUGH `runProgramForTest`. Every row's
+// library exports a record with a lambda-valued field initializer, and that
+// shape leaks its 48-byte closure (#4535) — in a SINGLE module just as well as
+// across the boundary, and identically on a `bezelc` built from this batch's
+// merge-base 7f29b8ce, so it is neither this fix's doing nor the boundary's.
+// Under `gate.sh --full` a hand-rolled `std::system(exe)` inherited
+// LeakSanitizer's defaults and its `exitcode` REPLACED the program's: all three
+// rows reported 1 instead of 42, and their `BEZEL_EXPECT_EQ(42, rc)` never saw
+// the program's answer at all. The sweep's own run options
+// (`detect_leaks=0:abort_on_error=0`, what every `runAot` test uses per #1822)
+// leave each row asserting the value it exists to assert, while a real redzone
+// error still fails the row loudly with its report.
 
 #include <cstdio>
 #include <cstdlib>
@@ -138,7 +152,13 @@ int buildImportAndRun4480(const std::string& libSrc, const std::string& mainSrc,
              .success)
         return -3;
 
-    int status = std::system(appExeF.path.c_str());
+    // runProgramForTest, not std::system: under `gate.sh --full` the
+    // ambient environment leaves LeakSanitizer ON, and its exit code
+    // then REPLACES this program's (#4532). The helper gives the run the
+    // sweep's own options (detect_leaks=0:abort_on_error=0, exactly what
+    // `runAot` uses per #1822) and fails the test loudly, with the report,
+    // if the sanitizer actually fires.
+    int status = bezel::test::runProgramForTest(appExeF.path);
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -4;
 }
 

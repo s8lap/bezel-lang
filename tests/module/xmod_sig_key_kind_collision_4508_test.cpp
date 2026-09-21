@@ -75,7 +75,22 @@
 // module as its own oracle, so "the boundary changed the answer" is executable
 // rather than asserted. The AOT harness cannot express a module dependency, so
 // the rows hand-roll `Driver::compileObject` plus
-// `bezel::test::compileFileForTest`. No JIT oracle is used.
+// `bezel::test::compileFileForTest`, and run the product through
+// `bezel::test::runProgramForTest` rather than `std::system` (#4532). No JIT
+// oracle is used.
+//
+// ORACLE NOTE — WHY THE RUN GOES THROUGH `runProgramForTest`. Rows 5-7 pass a
+// lambda to the constructor of a GENERIC class, and that leaks the 48-byte
+// closure (#4534) — in the single-module twin exactly as across the boundary,
+// and identically on a `bezelc` built from this batch's merge-base 7f29b8ce, so
+// it is neither this fix's doing nor the boundary's. Under `gate.sh --full` a
+// hand-rolled `std::system(exe)` inherited LeakSanitizer's defaults and its
+// `exitcode` REPLACED the program's: all six assertions below reported 1
+// instead of 105, on both sides of the boundary at once, which is precisely the
+// shape that reads as "the twin oracle disagrees" and is not. The sweep's own
+// run options (`detect_leaks=0:abort_on_error=0`, what every `runAot` test uses
+// per #1822) leave each row asserting the value it exists to assert, while a
+// real redzone error still fails the row loudly with its report.
 
 #include <cstdio>
 #include <cstdlib>
@@ -148,7 +163,13 @@ int buildImportAndRun4508(const std::string& libSrc, const std::string& mainSrc,
              .success)
         return kAppBuildFailed4508;
 
-    int status = std::system(appExeF.path.c_str());
+    // runProgramForTest, not std::system: under `gate.sh --full` the
+    // ambient environment leaves LeakSanitizer ON, and its exit code
+    // then REPLACES this program's (#4532). The helper gives the run the
+    // sweep's own options (detect_leaks=0:abort_on_error=0, exactly what
+    // `runAot` uses per #1822) and fails the test loudly, with the report,
+    // if the sanitizer actually fires.
+    int status = bezel::test::runProgramForTest(appExeF.path);
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status)
                                                : kAbnormalExit4508;
 }
@@ -169,7 +190,13 @@ int buildSingleAndRun4508(const std::string& src, const char* tag) {
              .success)
         return kAppBuildFailed4508;
 
-    int status = std::system(exeF.path.c_str());
+    // runProgramForTest, not std::system: under `gate.sh --full` the
+    // ambient environment leaves LeakSanitizer ON, and its exit code
+    // then REPLACES this program's (#4532). The helper gives the run the
+    // sweep's own options (detect_leaks=0:abort_on_error=0, exactly what
+    // `runAot` uses per #1822) and fails the test loudly, with the report,
+    // if the sanitizer actually fires.
+    int status = bezel::test::runProgramForTest(exeF.path);
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status)
                                                : kAbnormalExit4508;
 }

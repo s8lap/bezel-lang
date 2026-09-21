@@ -46,7 +46,27 @@
 // express a dependency, so these rows hand-roll `Driver::compileObject` for
 // the library plus `bezel::test::compileFileForTest` for the importer, the
 // established two-module shape (tests/module/xmod_3277_forin_userclass_dispose
-// _test.cpp, tests/module/cross_module_import_test.cpp). No JIT oracle is used.
+// _test.cpp, tests/module/cross_module_import_test.cpp), and run the product
+// through `bezel::test::runProgramForTest` rather than `std::system` (#4532).
+// No JIT oracle is used.
+//
+// ORACLE NOTE — WHY THE RUN GOES THROUGH `runProgramForTest`. A checked-
+// disposal program LEAKS BY DESIGN: §28.2 (v0.135, issues #621/#627)
+// quarantines a disposed object instead of freeing it, so the guard at a later
+// member access has something to read — `bz_array_mark_disposed` /
+// `bz_closure_mark_disposed` / `bz_shared_mark_disposed`, whose own comments
+// call it "a deliberate memory leak in checked builds". Under `gate.sh --full`
+// a hand-rolled `std::system(exe)` inherited LeakSanitizer's defaults, so that
+// designed quarantine forced the exit status to 1 and BOTH failure directions
+// showed up at once:
+//   * row 3's `checked` half reported 1 where the program returns 42 — an
+//     oracle asserting something §28.2 contradicts;
+//   * row 1 asserts exactly 1, so it passed VACUOUSLY, green whatever its
+//     program did.
+// The sweep's own run options (`detect_leaks=0:abort_on_error=0`, what every
+// `runAot` test uses per #1822) restore both rows to asserting the §28.2
+// behaviour they exist to pin, while a real redzone error still fails the row
+// loudly with its report (#4532).
 
 #include <cstdio>
 #include <cstdlib>
@@ -120,7 +140,13 @@ int buildImportAndRun4488(const std::string& libSrc, const std::string& mainSrc,
              .success)
         return -3;
 
-    int status = std::system(appExeF.path.c_str());
+    // runProgramForTest, not std::system: under `gate.sh --full` the
+    // ambient environment leaves LeakSanitizer ON, and its exit code
+    // then REPLACES this program's (#4532). The helper gives the run the
+    // sweep's own options (detect_leaks=0:abort_on_error=0, exactly what
+    // `runAot` uses per #1822) and fails the test loudly, with the report,
+    // if the sanitizer actually fires.
+    int status = bezel::test::runProgramForTest(appExeF.path);
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -4;
 }
 
