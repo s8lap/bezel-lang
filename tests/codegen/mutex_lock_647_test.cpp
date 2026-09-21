@@ -53,6 +53,7 @@
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/emit_object_support.hpp"  // #4569: emitObjectFileForTest
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -113,7 +114,15 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+        // #4569: repointed onto the ASan-sweep wrapper, the same rename the
+        // other 35 files in the #3917 burn-down took. #4569 listed this file
+        // among the "concurrency tail" that needed a per-call sanitizer
+        // decision because the *_647 family "carries sibling TSan rows in the
+        // same file" -- measured, it does not: this file has exactly ONE
+        // emitObjectFile call, no buildRuntimeSanitizerObject, and its link
+        // line below is a hardcoded `-fsanitize=address`, so there is no
+        // -fsanitize=thread path an instrumented object could reach.
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err))
             return bezel::test::asanBuildFailure("emitObjectFile");
     }
 

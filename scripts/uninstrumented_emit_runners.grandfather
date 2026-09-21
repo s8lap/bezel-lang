@@ -18,10 +18,7 @@
 
 1    tests/codegen/alias_owning_collection_disposal_1462_test.cpp
 1    tests/codegen/argpass_string_probe_test.cpp
-1    tests/codegen/async_618_domain_serial_test.cpp
 1    tests/codegen/async_lambda_488_test.cpp
-1    tests/codegen/async_test.cpp
-1    tests/codegen/atomic_647_test.cpp
 2    tests/codegen/buffer_545_test.cpp
 1    tests/codegen/bug_465_test.cpp
 1    tests/codegen/bug_474_string_slice_test.cpp
@@ -44,12 +41,10 @@
 1    tests/codegen/json_550_test.cpp
 1    tests/codegen/json_options_687_test.cpp
 1    tests/codegen/local_generic_class_method_monomorphization_3347_test.cpp
-1    tests/codegen/mutex_lock_647_test.cpp
 1    tests/codegen/objinit_usingvar_disposal_test.cpp
 1    tests/codegen/owned_collection_iface_619_test.cpp
 1    tests/codegen/owned_dict_drain_628_test.cpp
 1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
-1    tests/codegen/semaphore_647_test.cpp
 1    tests/codegen/serialization_668_669_test.cpp
 1    tests/codegen/serialization_tier2_classes_test.cpp
 1    tests/codegen/serialization_tier3_graph_test.cpp
@@ -60,7 +55,6 @@
 1    tests/codegen/shared_weak_nullable_620_test.cpp
 1    tests/codegen/static_class_enum_owned_field_1557_1564_test.cpp
 1    tests/codegen/stringbuilder_tostring_borrow_consume_leak_1637_test.cpp
-1    tests/codegen/task_combinators_test.cpp
 1    tests/codegen/tsan_704_bz_exc_threadlocal_test.cpp
 1    tests/codegen/xmod_imported_generic_indexer_property_3346_3348_test.cpp
 1    tests/module/xmod_owned_class_return_707_test.cpp
