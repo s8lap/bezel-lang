@@ -12104,7 +12104,42 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
 //     as outstanding for the `this(...)` arm, and it is unchanged here.
 // // per §22.5, fix #4484, fix #4496
 void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
-    if (chain.args.empty()) return;
+    // fix #4519 (§12.8 / §22.5 / §22.10, v0.306): a ZERO-ARGUMENT `base()`
+    // reaches the binder too. This used to `return` on `chain.args.empty()`
+    // above everything below, so #4496's `emit=true` never saw the one arity
+    // §22.5 can still reject for free: none supplied at all.
+    //
+    // MEASURED ON 6c05b4cf: `class D : B` with `constructor() base(); end`
+    // over `class B(n: int, s: string)` compiled at exit 0 with no
+    // diagnostic and RAN to exit 0, printing `0` and a blank line — both
+    // required primary parameters at their calloc zero, `s` a NULL string
+    // pointer that `Console.WriteLine` tolerates and an interpolating
+    // consumer dereferences.
+    //
+    // THE SPEC ALREADY RULES ON THIS, which is why it is a code change and
+    // not a question. §12.8 states the requirement in the same sentence that
+    // inserts the implicit chain: "If neither `base(...)` nor `this(...)` is
+    // written, the compiler inserts an implicit `base()` call (which requires
+    // the base class to have a parameterless constructor; otherwise the chain
+    // must be explicit)". §22.5 says what "parameterless" means for a primary
+    // constructor — "Every parameter that declares no default must be bound,
+    // positionally or by name" — so an all-defaulted primary list IS callable
+    // with no arguments and a required parameter is not. That is exactly what
+    // the binder below answers, with no new rule and no new diagnostic text.
+    //
+    // ⚠ THE IMPLICIT SPELLING IS NOT CLOSED HERE, and the asymmetry is
+    // recorded rather than hidden. #4496 deferred this shape on the ground
+    // that "rejecting the explicit spelling without settling what the
+    // implicit one means in the same shape would make two spellings of one
+    // call disagree" — the disagreement it feared was about the RULING, and
+    // §12.8 gives it: both spellings require a parameterless base
+    // constructor. What remains is an implementation gap, not a second
+    // reading: the implicit chain is not an `ast::CallExpr` this publisher
+    // ever sees, its predicate must also reach a base whose only
+    // constructors are EXPLICIT (which `!base->hasPositionalFields` below
+    // returns on), and it must settle accessibility and `abstract`. Filed
+    // with those three points rather than folded in.
+    //
     // Codegen's `Emitter::baseClassOf`: the first CLASS entry of `baseTypes`.
     TypeSymbol* base = nullptr;
     for (TypeSymbol* b : currentType_->baseTypes) {
@@ -12139,7 +12174,12 @@ void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
     // nothing and letting codegen store a mispaired object.
     BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain.args,
                                     chain.span.begin, desc, /*emit=*/true);
-    if (b.ok) ctx_.setPositionalBinding(&chain, b.paramToArg);
+    // fix #4519: nothing to publish for a zero-argument chain — codegen's
+    // case (b) is gated on `!chainCall->args.empty()` and never installs a
+    // binding there, so `base()` lowers exactly as it did (every slot takes
+    // its §22.5 default) on the shapes the binder now accepts.
+    if (b.ok && !chain.args.empty())
+        ctx_.setPositionalBinding(&chain, b.paramToArg);
 }
 
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.

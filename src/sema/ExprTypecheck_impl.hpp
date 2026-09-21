@@ -2586,7 +2586,10 @@ private:
     // `base(...)` arguments to the BASE class's primary-constructor parameter
     // list, read by codegen's `prePopulateBasePositionalFields`. Called only
     // from `publishPrimaryCtorChainBinding`, which owns the chain-call
-    // recognition both arms share. See the definition in
+    // recognition both arms share. Since #4496 the binder runs with
+    // `emit=true`, so this also CHECKS the call; since #4519 a ZERO-argument
+    // `base()` reaches it too (§12.8's "requires the base class to have a
+    // parameterless constructor"). See the definition in
     // ExprTypecheck_Calls.cpp.
     void publishBaseChainPrimaryBinding(const ast::CallExpr& chain);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
