@@ -41,6 +41,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
@@ -124,7 +125,7 @@ int runUnderAsanNoCorruption(const std::string& source) {
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return -2;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -2;
     }
 
     auto cleanup = [&] {
@@ -190,7 +191,7 @@ int runUnderLeakSanitizer(const std::string& source) {
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return -2;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -2;
     }
 
     auto cleanup = [&] {

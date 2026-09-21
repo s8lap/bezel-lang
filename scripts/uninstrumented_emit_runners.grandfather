@@ -36,15 +36,9 @@
 1    tests/codegen/dict_get_or_add_test.cpp
 1    tests/codegen/dict_getenumerator_string_key_release_2522_test.cpp
 1    tests/codegen/dict_linq_source_string_key_release_2544_test.cpp
-1    tests/codegen/dict_record_value_leak_test.cpp
-1    tests/codegen/discard_named_owned_binding_1651_codegen_test.cpp
 1    tests/codegen/domain_spawn_choice_valuearg_3181_test.cpp
-2    tests/codegen/env_disposer_672_test.cpp
 1    tests/codegen/event_leak_480_test.cpp
-2    tests/codegen/event_subscription_closure_841_test.cpp
 1    tests/codegen/exception_disposal_test.cpp
-1    tests/codegen/exception_message_disposal_1033_test.cpp
-1    tests/codegen/explicit_dispose_reclaim_test.cpp
 2    tests/codegen/for_var_capture_leak_793_test.cpp
 1    tests/codegen/free_on_dispose_test.cpp
 1    tests/codegen/fresh_owned_receiver_disposal_1039_test.cpp
@@ -56,7 +50,6 @@
 1    tests/codegen/iter_second_dispose_idempotent_1107_test.cpp
 1    tests/codegen/json_550_test.cpp
 1    tests/codegen/json_options_687_test.cpp
-1    tests/codegen/linq_refcount_test.cpp
 1    tests/codegen/local_generic_class_method_monomorphization_3347_test.cpp
 1    tests/codegen/mutex_lock_647_test.cpp
 1    tests/codegen/objinit_usingvar_disposal_test.cpp
@@ -66,7 +59,6 @@
 1    tests/codegen/owned_iter_field_disposal_1643_test.cpp
 1    tests/codegen/owned_local_reassign_disposal_913_1054_test.cpp
 1    tests/codegen/ownedarray_forin_using_var_1287_test.cpp
-2    tests/codegen/rawbytes_disposal_test.cpp
 1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
 1    tests/codegen/semaphore_647_test.cpp
 1    tests/codegen/serialization_668_669_test.cpp
@@ -79,13 +71,11 @@
 1    tests/codegen/shared_weak_nullable_620_test.cpp
 1    tests/codegen/static_class_enum_owned_field_1557_1564_test.cpp
 1    tests/codegen/static_owned_field_disposal_1212_test.cpp
-1    tests/codegen/string_accumulator_leak_1486_test.cpp
 1    tests/codegen/string_producer_leak_1481_1482_test.cpp
 1    tests/codegen/stringbuilder_append_producer_leak_1185_test.cpp
 1    tests/codegen/stringbuilder_tostring_borrow_consume_leak_1637_test.cpp
 1    tests/codegen/task_combinators_test.cpp
 1    tests/codegen/tsan_704_bz_exc_threadlocal_test.cpp
-1    tests/codegen/undisposed_leak_test.cpp
 1    tests/codegen/xmod_imported_generic_indexer_property_3346_3348_test.cpp
 2    tests/module/xmod_closure_return_712_test.cpp
 1    tests/module/xmod_owned_class_return_707_test.cpp
