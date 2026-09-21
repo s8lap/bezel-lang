@@ -1,0 +1,57 @@
+# sanitizer_exempt.txt — tests whose generated-code sanitizer CORRUPTION report
+# is the SPECIFIED outcome, not a defect (#4533).
+#
+# Read by scripts/gate/sanitizer.py. Format: one `suite.name` per line, with
+# the reason after a `#`. Blank lines and full-line comments are ignored; a
+# MISSING file is an empty set, so losing this file makes the gate stricter,
+# never looser.
+#
+# WHAT BELONGS HERE — and it is a short list by construction:
+#   a row that runs a program whose behaviour the SPEC LEAVES UNDEFINED, and
+#   whose oracle therefore asserts nothing about the crash. Generated-code
+#   AddressSanitizer exists to detect exactly that read, so its report is the
+#   CORRECT outcome there, not a false positive.
+#
+# WHAT DOES NOT — a report in a row that merely tolerates it. Every entry is a
+# claim that the spec defines no observable to assert; if a row could assert
+# one, fix the row instead. A corruption report in a FAILING test is never
+# exempt: the list is consulted only for tests that PASSED.
+#
+# PRECEDENT, and the reason this file is short. When the same question came up
+# for §31.1 (tests/codegen/throw_borrow_field_catch_dispose_1678_test.cpp), the
+# project's answer was to DELETE the cell, not to exempt it:
+#
+#   "Asserting that undefined behaviour 'runs to completion' under a sanitizer
+#    whose whole job is to detect it is a contradiction, and the ASan report is
+#    the CORRECT outcome, not a false positive."
+#
+# tests/codegen/checked_disposal_621_test.cpp made the same call by omitting
+# unchecked-mode use-after-dispose rows outright. Prefer those over an entry
+# here; an entry is for a row whose non-UB half is not already pinned elsewhere.
+
+# ── measured population (2026-09-21) ────────────────────────────────────────
+# Derived by reading every test whose comments admit unchecked-mode undefined
+# behaviour (17 files), discarding the ones that never RUN such a program in
+# default mode, then confirming the survivors empirically:
+#
+#   BEZEL_AOT_FORCE_SANITIZE=address BEZEL_TEST_FILTER=<f> bezel_tests_codegen
+#
+# Both rows print `[  OK  ]` and one `ERROR: AddressSanitizer` headline, and the
+# scan attributes each to its own `[san-scope]` bracket:
+#
+#   SANITIZER EVIDENCE (all shards): 4 report marker(s) in 2 of 2 shard log(s)
+#   scanned, 2 corruption headline(s); attributed 0 failing, 2 passing,
+#   0 unattributed
+#
+# With this file they are `allowed`; with an empty exemption file the same scan
+# is FATAL and names both — the guard is not decorative.
+#
+# The #4475 row's SEGV reproduced at `pc 0x0000004ea6ee`, address 0x8, which is
+# BYTE-IDENTICAL to one of the seven corruption headlines in the failed
+# e89577e4 --full cycle (shard.codegen.7). Two of the other seven are #1748's
+# row below and four are the open #3460 async double-free, whose own test
+# asserts `heap_uaf_count == 0` and therefore FAILED on them.
+
+ctor_this_observation_residual_1748.closure_invoked_during_construction_unchecked_is_ub_not_nre  # §22.7: an unchecked build observes the `this` watermark null, and any use requiring non-null is UNDEFINED — the row's whole point is that unchecked does NOT reach the checked build's NullReferenceException, and it asserts only `!= 1`. Matches the `bz$M.W$ctor` SEGV-at-0x8 in the failed e89577e4 cycle. tests/codegen/ctor_this_observation_residual_1748_test.cpp:269
+
+closure_dispose_then_invoke_4475.unchecked_disposal_silent_per_28_2_unchecked  # §28.2: use-after-dispose is UNDEFINED in unchecked mode; the row invokes a disposed closure and guards its only assertion with `if (r.ran)`. NOTE: that guard makes the row VACUOUS under the sweep — it asserts nothing at all once ASan fires. Exempted here so the channel can be armed today, but the row itself should follow the §31.1 precedent in throw_borrow_field_catch_dispose_1678_test.cpp (delete the incoherent cell; its compile half is already pinned by the sibling rows). Filed as #4538. tests/codegen/closure_dispose_then_invoke_4475_test.cpp:109

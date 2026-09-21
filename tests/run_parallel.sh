@@ -345,73 +345,24 @@ fi
 #
 # THE ACCOUNTING LINE IS UNCONDITIONAL, AND THAT IS THE POINT. `0 reports` and
 # `the channel is not wired` are indistinguishable to a grep that returns 0 —
-# which is precisely the defect #4533 reports. This line is printed on EVERY
-# run and carries the number of shard logs actually SCANNED, so gate.sh can
-# assert it READ something before believing a zero. Same shape as the #3626 /
-# #3733 oracle floors below, which print "0" as positive confirmation.
+# which is precisely the defect #4533 reports. The line is printed on EVERY run
+# and carries the number of shard logs actually SCANNED, so gate.sh can assert
+# it READ something before believing a zero. Same shape as the #3626 / #3733
+# oracle floors below, which print "0" as positive confirmation.
 #
 # OBSERVATION ONLY — this script never fails on a report, it only reports what
-# it saw; gate.sh decides what it means. Two reasons. (1) run_parallel is also a
-# lane's runner (scripts/agent_check.sh), and a lane probing a leak row must not
-# have its runner fail underneath it. (2) A report is NOT uniformly a defect:
-# 11 rows in 7 files ASSERT a leak deliberately (`leaksAtLeast`, e.g.
-# tests/codegen/record_factory_call_wide_release_suppression_scope_4342_test.cpp:160),
-# and under BEZEL_AOT_FORCE_SANITIZE runAotChecked re-emits their real LSan
-# report while the row PASSES. Separating a leak from memory corruption is the
-# gate's judgement to make, so both counts are reported separately here.
-#
-# The marker alternation is gate.sh's own, verbatim — this connects the
-# existing channel, it does not invent a wider one.
-san_scanned=0; san_files=0; san_hits=0; san_corrupt=0
-declare -a san_corrupt_logs=() san_leak_logs=()
-for _sf in "$logdir"/shard.*.log; do
-    [[ -e "$_sf" ]] || continue
-    san_scanned=$(( san_scanned + 1 ))
-    _n=$(grep -acE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$_sf" 2>/dev/null || true)
-    _n=${_n:-0}
-    [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
-    (( _n == 0 )) && continue
-    san_hits=$(( san_hits + _n ))
-    san_files=$(( san_files + 1 ))
-    # An `ERROR: AddressSanitizer` headline is memory CORRUPTION (UAF / OOB /
-    # double-free). A leak report's headline is `ERROR: LeakSanitizer` and its
-    # summary is `SUMMARY: AddressSanitizer: N byte(s) leaked`, so the two
-    # classes never collide on this pattern. Counted separately because no test
-    # in this tree deliberately asserts a corruption report through an
-    # uncaptured stderr, while 11 deliberately assert a leak.
-    _c=$(grep -acE 'ERROR: AddressSanitizer' "$_sf" 2>/dev/null || true)
-    _c=${_c:-0}
-    [[ "$_c" =~ ^[0-9]+$ ]] || _c=0
-    san_corrupt=$(( san_corrupt + _c ))
-    # Corruption-bearing logs are shown FIRST: the excerpt below is bounded, and
-    # a run whose leak reports outnumber its one double-free must not push the
-    # double-free out of the operator's view.
-    if (( _c > 0 )); then san_corrupt_logs+=("$_sf"); else san_leak_logs+=("$_sf"); fi
-done
-# LOAD-BEARING LITERAL: scripts/gate.sh's ASan phase parses this exact line and
-# hard-fails the cycle when it is ABSENT. Keep the wording and the field order
-# in step with it (and with scripts/gate/tests/test_sanitizer_evidence.py).
-echo "SANITIZER EVIDENCE (all shards): $san_hits report marker(s) in $san_files of $san_scanned shard log(s) scanned, $san_corrupt corruption headline(s)"
-if (( san_hits > 0 )); then
-    # Bounded on purpose: the harness already caps each re-emitted report at
-    # 32 KiB (aot_support.hpp), and a run with many reports must not bury the
-    # rest of the gate log. Three logs, one excerpt each; the accounting line
-    # above carries the true totals and the kept logdir carries the rest.
-    echo "--- sanitizer reports ---"
-    san_show=("${san_corrupt_logs[@]}" "${san_leak_logs[@]}")
-    for _sf in "${san_show[@]:0:3}"; do
-        echo "==> $(basename "$_sf") <=="
-        # In a log that carries BOTH, show the corruption report — a leak
-        # banner earlier in the same file must not be what the operator reads
-        # when a double-free is the reason the cycle is about to fail.
-        _pat='ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired'
-        grep -aqE 'ERROR: AddressSanitizer' "$_sf" 2>/dev/null &&
-            _pat='ERROR: AddressSanitizer'
-        grep -a -m1 -A18 -E "$_pat" "$_sf" 2>/dev/null | head -24
-    done
-    if (( san_files > 3 )); then
-        echo "... and $(( san_files - 3 )) further shard log(s) with report markers"
-    fi
+# it saw; gate.sh decides what it means. run_parallel is also a lane's runner
+# (scripts/agent_check.sh), and a report is not uniformly a defect: rows that
+# deliberately assert a leak, and rows that deliberately run a program the spec
+# leaves UNDEFINED, both emit one and PASS. The scan therefore ATTRIBUTES each
+# report to the test that produced it (test_main.cpp's `[san-scope]` markers,
+# on the same unbuffered fd as the report) and reports the split; the judgement
+# lives in scripts/gate/sanitizer.py, which is where it can be unit-tested.
+if ! PYTHONPATH="$repo_root/scripts" python3 -m gate.sanitizer scan "$logdir"; then
+    # NEVER silent. A scanner that failed leaves the gate with no accounting
+    # line, and gate.sh fails the cycle on its absence rather than reading the
+    # silence as clean.
+    echo "run_parallel: gate.sanitizer scan FAILED — no sanitizer accounting produced (#4533)" >&2
 fi
 
 # Phantom-name warning + GATE FAILURE banner (#2100, #1861) — the

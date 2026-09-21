@@ -586,40 +586,20 @@ gate_shard_logdir() { # $1 = sharded-run log, $2 = stamp file → echoes the kep
   return 0
 }
 
-# fix #4533: parse the SANITIZER EVIDENCE accounting line tests/run_parallel.sh
-# lifts out of the per-shard logs. ONE reader for BOTH sharded consumers (the
-# authoritative pass and the canary tier), because both launch run_parallel and
-# both used to grep its stdout for a headline that stream structurally cannot
-# carry — see the ASan phase below for the measurement.
+# fix #4533: the gate's side of the sanitizer-evidence channel. ONE reader for
+# BOTH sharded consumers (the authoritative pass and the canary tier), because
+# both launch tests/run_parallel.sh and both used to grep its stdout for a
+# headline that stream structurally cannot carry.
 #
-# Echoes `<hits> <files> <scanned> <corrupt>` and returns 0. Returns nonzero,
-# with a reason on stderr, when the line is ABSENT (1), unparseable (2), or
-# reports that it scanned no shard log at all (3) — each of which is the same
-# blind spot in a different shape, and none of which may be read as "clean".
-# Never fails the gate itself: the caller decides, because the canary tier must
-# record its dual-consume marker before it can fail, and is fail-open by design
-# where the authoritative pass is not.
-gate_sanitizer_evidence() { # $1 = sharded-run log → "<hits> <files> <scanned> <corrupt>"
-  local log="$1" line hits files scanned corrupt
-  line=$(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$log" 2>/dev/null || true)
-  if [ -z "$line" ]; then
-    echo "no SANITIZER EVIDENCE accounting line in $log (is tests/run_parallel.sh current, or did the run die before printing it?)" >&2
-    return 1
-  fi
-  hits=$(printf '%s\n' "$line" | sed -n 's/^SANITIZER EVIDENCE (all shards): \([0-9][0-9]*\) report marker.*/\1/p')
-  files=$(printf '%s\n' "$line" | sed -n 's/^.* report marker(s) in \([0-9][0-9]*\) of .*/\1/p')
-  scanned=$(printf '%s\n' "$line" | sed -n 's/^.* of \([0-9][0-9]*\) shard log(s) scanned.*/\1/p')
-  corrupt=$(printf '%s\n' "$line" | sed -n 's/^.* scanned, \([0-9][0-9]*\) corruption headline.*/\1/p')
-  if [ -z "$hits" ] || [ -z "$files" ] || [ -z "$scanned" ] || [ -z "$corrupt" ]; then
-    echo "unparseable sanitizer-evidence accounting line: $line" >&2
-    return 2
-  fi
-  if [ "$scanned" -eq 0 ]; then
-    echo "the sanitizer-evidence scan read 0 shard logs, so its zero means nothing: $line" >&2
-    return 3
-  fi
-  printf '%s %s %s %s\n' "$hits" "$files" "$scanned" "$corrupt"
-  return 0
+# The decision itself lives in scripts/gate/sanitizer.py — it is a real
+# decision (corruption in a FAILING test is deterministic evidence; corruption
+# in a PASSING test is a defect unless the row declares that its program's
+# crash is the specified outcome; an unattributable report is never excused;
+# a leak is counted, not fatal) and it belongs where it can be unit-tested,
+# not in a bash conditional. Exit codes: 0 clean, 1 FATAL, 2 the channel is not
+# wired — which must never read like a clean suite.
+gate_sanitizer_verdict() { # $1 = sharded-run log → prints findings; rc 0/1/2
+  PYTHONPATH=scripts python3 -m gate.sanitizer verdict --shard-log "$1" 2>&1
 }
 
 echo "== gate[1/5]: reconfigure (glob any new test files) =="
@@ -899,33 +879,40 @@ else
       grep -E 'TOTAL:|WARNING: only' "$S/gate_canary.log" || true
       # A fired generated-code sanitizer report in the canary is DETERMINISTIC
       # evidence, exactly as in the full pass — fail hard, no arbitration.
-      # fix #4533: the canary launches tests/run_parallel.sh too (just above),
-      # so this grep had the SAME defect as the authoritative pass — it read
+      # fix #4533: THE CANARY LAUNCHES tests/run_parallel.sh TOO (just above), so
+      # this grep had the SAME defect as the authoritative pass — it read
       # run_parallel's stdout, which a shard's program output never reaches.
-      # It now reads the lifted accounting line, and counts CORRUPTION as the
-      # evidence: `leaksAtLeast` rows re-emit a real LSan report and PASS, and a
-      # diff that touches one would otherwise hard-fail a healthy canary.
+      # (#4533 records the canary as unaffected "because it reads a direct
+      # binary run"; that is not what the line above does.) It now reads the
+      # same lifted channel, through the same reader, and the same judgement:
+      # a LEAK is not evidence (`leaksAtLeast` rows re-emit a real LSan report
+      # and PASS, and a diff that touches one would otherwise hard-fail a
+      # healthy canary), corruption in a passing row is evidence unless the row
+      # declares itself in sanitizer_exempt.txt.
+      #
       # gate.canary.decide's contract is `asan_hits > 0 -> FAIL_HARD`; WHICH
       # reports count as evidence is the bash side's job (canary.py: "what stays
-      # bash — the ASan check"), so feeding it the corruption count keeps the
-      # dual-run consistent without changing the module.
+      # bash — the ASan check"), so handing it the FATAL verdict as a 1 keeps
+      # the dual-run consistent without changing the module.
       if [ "$ASAN" -eq 1 ]; then
-        if _c_ev=$(gate_sanitizer_evidence "$S/gate_canary.log" 2>/dev/null); then
-          read -r _c_hits _c_files _c_scanned _c_corrupt <<< "$_c_ev"
-          _c_asan="$_c_corrupt"
-          if [ "$_c_corrupt" -gt 0 ]; then
-            echo "   -- generated-code ASan fired in the canary ($_c_hits report marker(s), $_c_corrupt corruption headline(s)) --"
-            sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_canary.log" | head -60
-            _canary_dual hard
-            fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
-          fi
-        else
+        _c_find=$(gate_sanitizer_verdict "$S/gate_canary.log"); _c_rc=$?
+        if [ "$_c_rc" -eq 1 ]; then
+          _c_asan=1
+          echo "   -- generated-code ASan fired in the canary --"
+          printf '%s\n' "$_c_find" | sed 's/^/   /'
+          sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_canary.log" | head -60
+          _canary_dual hard
+          fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
+        elif [ "$_c_rc" -ne 0 ]; then
           # The canary is FAIL-OPEN by design and is never the acceptance
           # authority. Degrade to "not evaluated here" and say so — the
           # authoritative pass below REFUSES an unwired channel, which is where
           # that refusal belongs.
-          echo "   canary: no usable sanitizer-evidence accounting line — the ASan leg is not evaluated here; the authoritative pass refuses an unwired channel (#4533)"
+          echo "   canary: sanitizer-evidence channel not readable — the ASan leg is not evaluated here; the authoritative pass refuses an unwired channel (#4533)"
           _c_asan=0
+        else
+          _c_asan=0
+          [ -n "$_c_find" ] && printf '%s\n' "$_c_find" | sed 's/^/   canary: /'
         fi
       fi
       if [ "$crc" -ne 0 ]; then
@@ -1072,30 +1059,29 @@ if [ "$ASAN" -eq 1 ]; then
   # PLAIN run and turn the detector into a tautology — the same trap the
   # repo-identity banner near the top of this file documents (it is deliberately
   # not echoed for exactly that reason).
-  if ! asan_ev=$(gate_sanitizer_evidence "$S/gate_shard.log" 2>"$S/gate_asan_ev.err"); then
-    ASAN_ERRS=0; ASAN_SHARDS=$SHARD_COUNT
-    echo "   -- sanitizer-evidence channel UNREADABLE: $(tr '\n' ' ' <"$S/gate_asan_ev.err" 2>/dev/null | cut -c1-240) --"
-    rec_ran shard_asan "1" "evidence channel unreadable"
-    fail "sharded ASan — no usable sanitizer-evidence accounting from the sharded run; a zero here cannot be told apart from an unwired channel (#4533)"
-  fi
-  echo "   $(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$S/gate_shard.log")"
-  read -r asan_hits asan_files asan_scanned asan_corrupt <<< "$asan_ev"
+  asan_ev=$(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$S/gate_shard.log" 2>/dev/null || true)
+  [ -n "$asan_ev" ] && echo "   $asan_ev"
+  asan_hits=$(printf '%s\n' "$asan_ev" | sed -n 's/^SANITIZER EVIDENCE (all shards): \([0-9][0-9]*\) report marker.*/\1/p')
   ASAN_ERRS=${asan_hits:-0}; ASAN_SHARDS=$SHARD_COUNT
-  if [ "$asan_corrupt" -gt 0 ]; then
-    echo "   -- generated-code ASan fired in the sharded pass ($asan_hits report marker(s) across $asan_files shard log(s), $asan_corrupt corruption headline(s)) --"
-    sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -60
-    rec_ran shard_asan "1" "$asan_corrupt corruption report(s)"
-    fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)"
-  fi
-  if [ "$asan_hits" -gt 0 ]; then
-    # Leak-only. Printed loudly and carried into telemetry (asan_errors) so a
-    # drift in the count is visible in the trend even though it does not fail.
-    echo "   -- $asan_hits leak-only sanitizer report marker(s) in $asan_files of $asan_scanned shard log(s); no corruption headline --"
-    sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -30
-    rec_ran shard_asan "0" "$asan_hits leak-only marker(s), no corruption"
-  else
-    rec_ran shard_asan "0" "no ASan report ($asan_scanned shard log(s) scanned)"
-  fi
+  asan_scanned=$(printf '%s\n' "$asan_ev" | sed -n 's/^.* of \([0-9][0-9]*\) shard log(s) scanned.*/\1/p')
+  asan_find=$(gate_sanitizer_verdict "$S/gate_shard.log"); asan_rc=$?
+  [ -n "$asan_find" ] && printf '%s\n' "$asan_find" | sed 's/^/   /'
+  case "$asan_rc" in
+    0) rec_ran shard_asan "0" "no fatal finding (${asan_hits:-0} marker(s), ${asan_scanned:-0} shard log(s) scanned)" ;;
+    1) # The verdict above NAMED the offending tests. Show the reports too: the
+       # excerpt is the lifted section, which the scan ordered corruption-first.
+       sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -60
+       rec_ran shard_asan "1" "corruption in the sharded pass"
+       fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)" ;;
+    2) rec_ran shard_asan "1" "evidence channel unwired"
+       fail "sharded ASan — the sanitizer-evidence channel is not wired; a zero from it is not a clean suite (#4533)" ;;
+    # ANY other status is the reader itself failing (no python3, an import
+    # error, a traceback). That must never fall through as "clean" — the whole
+    # defect being fixed is a verification leg that reads green while switched
+    # off.
+    *) rec_ran shard_asan "1" "evidence reader exited $asan_rc"
+       fail "sharded ASan — the sanitizer-evidence reader exited $asan_rc; its silence is not a clean suite (#4533)" ;;
+  esac
 fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase

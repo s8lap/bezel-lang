@@ -263,8 +263,51 @@ int main(int argc, char** argv) {
 
         ::bezel::test::currentTestFailed() = false;
         std::cout << "[ RUN  ] " << test.suite << "." << test.name << "\n";
+        // fix #4533: BRACKET THE BODY ON fd 2, NOT ON stdout.
+        //
+        // The gate hard-fails a cycle on a fired generated-code sanitizer
+        // report, and to do that soundly it has to know WHICH TEST produced
+        // one: a row that deliberately runs an undefined-behaviour program
+        // (§28.2 use-after-dispose unchecked) gets a report AND passes, while
+        // the same report in any other row is a memory-safety defect.
+        //
+        // That question cannot be answered from the `[ RUN  ]` lines above.
+        // They go to `std::cout`, which is FULLY BUFFERED when a shard is
+        // redirected into a file, while the sanitizer report is written to
+        // unbuffered fd 2 (aot_support.hpp's emitSanitizerReportToStderr) — so
+        // the two streams interleave in the log in an order that has nothing to
+        // do with the order of execution. Attribution by position is wrong, and
+        // wrong in a way that LOOKS right: it names a plausible neighbour.
+        //
+        // These markers are on the SAME unbuffered stream as the report, so
+        // their relative order is exactly the execution order and a report
+        // between `enter X` and `leave X` belongs to X. Only under the sweep,
+        // where reports can actually occur — a normal single-binary run's
+        // stderr stays byte-for-byte as it was. The spelling deliberately does
+        // not start with `[ RUN`: scripts/gate/summary.py's crashed-shard
+        // culprit extraction is anchored on that prefix (#1608).
+        const bool sanScope = ::bezel::test::forceSanitizeAddress();
+        if (sanScope) {
+            // Flush the buffered `[ RUN  ]` line first, so that UNDER THE SWEEP
+            // the two streams also read in order for a human — the gate prints
+            // excerpts of these logs to an operator. Deliberately only here: on
+            // the plain oracle the log stays byte-for-byte as it was, which
+            // keeps summary.py's documented #1608 last-[ RUN ]-line culprit
+            // behaviour (and its buffering quirks) exactly as consumers expect.
+            std::cout.flush();
+            std::fprintf(stderr, "[san-scope] enter %s.%s\n",
+                         test.suite.c_str(), test.name.c_str());
+            std::fflush(stderr);
+        }
         test.body();
-        if (::bezel::test::currentTestFailed()) {
+        const bool testFailed = ::bezel::test::currentTestFailed();
+        if (sanScope) {
+            std::fprintf(stderr, "[san-scope] leave %s.%s %s\n",
+                         test.suite.c_str(), test.name.c_str(),
+                         testFailed ? "fail" : "pass");
+            std::fflush(stderr);
+        }
+        if (testFailed) {
             ++failed;
             std::cout << "[ FAIL ] " << test.suite << "." << test.name << "\n";
         } else {
