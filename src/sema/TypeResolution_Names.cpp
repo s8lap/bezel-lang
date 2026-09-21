@@ -48,6 +48,34 @@ static std::string owningRenameHint(std::string_view name) {
     return std::string();
 }
 
+// stdlib §4.2 / spec §14.4 (v0.306): the index of the OWNED element slot in
+// one of the six owning collections' generic-argument lists, or npos when
+// `name` is not one of them. Slot 0 is `T` for the list/set/stack/queue
+// families; slot 1 is `V` for `OwningDictionary<K, V>` (the key K is
+// borrowed and value-like by design, §28.11, and is checked by
+// checkHashContainerKeys instead).
+//
+// fix #2735: hoisted out of the declaration-site `ownedSlot` block below so
+// the cross-module instantiation-site walk asks the SAME table. Two hand-typed
+// copies of a name list is precisely the skew #2742 was about (one recorder
+// taught something four siblings were not) — one definition, two call sites.
+//
+// `OwningBuffer<T>` / `Span<T>` / `ReadOnlySpan<T>` are DELIBERATELY absent:
+// §14.4 names them as explicit exceptions that admit value-typed T, and they
+// carry their own §28.11 move-only obligation via
+// owningBufferSpanMoveOnlySites_. `OwningTask<T>` and the `IOwning*`
+// interfaces are absent too — they are the #4305 kNullDeclClassConstraints
+// table's subject (and #2736(b)'s residual for the task form), a different
+// recorder with a different diagnostic.
+static std::size_t owningCollectionOwnedSlot(std::string_view name) {
+    if (name == "OwningArray" || name == "OwningSet" ||
+        name == "OwningStack" || name == "OwningQueue" ||
+        name == "OwningLinkedList")
+        return 0;
+    if (name == "OwningDictionary") return 1;
+    return static_cast<std::size_t>(-1);
+}
+
 // fix #3147 (§14.4 / §28.5 / §2.8.3 rule 4, v0.252; family F12 of the
 // imported-symbol seam #3152): the name of the BARE type parameter that is the
 // declared type of the `owned` field `fs` — `T` or `T?` — or "" when `fs` is
@@ -2002,6 +2030,143 @@ TypeRef* Resolver::substituteAliasGenericArgs(
                         /*validateNestedInlineArrays=*/true});
 }
 
+// stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
+// imported-symbol seam #3152) — the CROSS-MODULE half of #2713's
+// per-instantiation owning-element sweep.
+//
+// §14.4 "Class-only restriction on owning generics" (v0.306) restricts the
+// owning collections' element type to class and interface types, and §3.6
+// rule 2 requires the property to be evaluated "at each instantiation, after
+// substituting the type arguments ... rejected *at the instantiation site*".
+// #2713 satisfies that by recording an `OwningElementSite` while resolving
+// THIS compilation's own type bodies. An IMPORTED generic has no AST here at
+// all — `ModuleLoader` builds its TypeRefs directly and `Symbol::decl` stays
+// null for every imported symbol — so no site was ever recorded for it and
+// `checkOwningElementInstantiations()` had nothing to walk; the defining
+// module never instantiates the type, so it could not catch it either.
+//
+// MEASURED on 6f252b1d: a dependency's `public class Holder<T> where T: class`
+// carrying `private owned _l: OwningLinkedList<T>` admitted `Holder<string>`
+// in the importer with NO diagnostic at any severity, and the program was a
+// `heap-use-after-free` (ASan, READ of size 8 in the importing module's
+// method) — NOT the merely-wrong-value the issue reported. The mechanism is
+// #2713's: codegen's `elementPolicyFor()` falls back to the Value row for a
+// runtime-managed element in the owning family, so the collection stores the
+// pointer WITHOUT taking a reference while the `owned` argument transfer still
+// releases the caller's, leaving a dangling slot. The `OwningDictionary<K, V>`
+// value slot and a method RETURN type (`static Make(owned x: T): owned
+// OwningLinkedList<T>`, no field at all) reproduce the identical ASan report.
+//
+// NO NEW MODULE METADATA IS REQUIRED, and this is the point the issue got
+// wrong. #3147 closed the byte-identical cross-module gap in the §28.5
+// owned-field check by walking `tsym->members` at the instantiation site
+// instead of the declaring type's AST: FieldSymbols are populated on BOTH
+// sides, and `sema::storageComponentType` reads the local `ast::FieldDecl` and
+// the imported `SemaContext::importedMemberType` in ONE place. That same
+// channel already carries everything this rule needs — verified by direct
+// instrumentation on the repro: the imported `Holder`'s private `_l` is
+// present in `tsym->members` with a Named TypeRef whose `headName()` is
+// `OwningLinkedList` and whose slot-0 argument is a declaration-less Named
+// TypeRef with `importedName == "T"`, exactly the deferred shape the
+// declaration-site recorder records locally. Method return types ride the
+// sibling `SemaContext::importedReturnType` table, and parameter types the
+// named both-sources accessor `formalParamResolvedType` (#3189's family).
+//
+// Rather than re-decide the rule here, the walk RECORDS an `OwningElementSite`
+// keyed to the imported type, so `checkOwningElementInstantiations()` answers
+// it with the same `owningElementBadDesc` predicate, the same chained-binding
+// worklist, and the same diagnostic text the local path already emits — the
+// #2742 discipline (one predicate, many recorders) applied to a new recorder.
+//
+// RESIDUALS, deliberately left and recorded rather than guessed at:
+//   - A local variable inside an IMPORTED generic method's body. Its type is
+//     not part of the exported signature surface at all (the body rides
+//     `methodBodyText` and is re-parsed in a FRESH SemaContext, whose
+//     obligations never reach this Resolver). MEASURED: that shape compiles
+//     and runs CORRECTLY — it is a missing rejection, not a memory-safety
+//     hole — so closing it is the part that would genuinely need new
+//     metadata, and it stays on #2735.
+//   - An obligation reached through an imported INTERMEDIATE generic
+//     (`class Outer<U>` in the dependency holding an `Inner<U>` that holds the
+//     collection). Pass 2's chained-binding worklist re-keys through
+//     `instantiations_`, and no instantiation node exists for a member type
+//     the loader built rather than `resolveType`.
+//   - A field inherited from an imported BASE class: `tsym->members` is this
+//     type's own member list.
+void Resolver::recordImportedOwningElementObligations(TypeSymbol* tsym,
+                                                      const ast::Type& site) {
+    if (!tsym || tsym->genericParams.empty()) return;
+    // LOCAL types are already covered by the declaration-site recorder in
+    // resolveNamed(), which sees their bodies; running this walk for them too
+    // would be redundant (Pass 2's `reported` key would collapse the duplicate)
+    // but would also widen a well-tested path for no gain. Imported only.
+    if (!ctx_.isImported(tsym)) return;
+    if (!importedOwningElementScanned_.insert(tsym).second) return;
+
+    // Record `container<... paramName ...>` when `ft` names an owning
+    // collection whose OWNED slot is a bare type parameter of `tsym`.
+    auto recordIfOwningElementSlot = [&](const TypeRef* ft) {
+        if (!ft || ft->kind != TypeRef::Kind::Named) return;
+        std::string_view head = ft->headName();
+        std::size_t slot = owningCollectionOwnedSlot(head);
+        if (slot == static_cast<std::size_t>(-1)) return;
+        if (slot >= ft->genericArgs.size()) return;
+        const TypeRef* el = ft->genericArgs[slot];
+        // Only a DEFERRED element is recordable. A concrete or composite one
+        // was already decided at the exporter's own declaration site (and by
+        // `owningElementBadDesc` there), and carries no per-instantiation
+        // obligation here.
+        if (!el || el->kind != TypeRef::Kind::Named || el->declaration) return;
+        if (!el->genericArgs.empty()) return;
+        std::string_view elName = el->headName();
+        if (elName.empty()) return;
+        // The name must be one `tsym` itself binds; match against the type's
+        // own parameter list and record THAT view, so Pass 2's
+        // `genericParams[i]->name == s.paramName` comparison is over storage
+        // with the same (loader-owned) lifetime as the symbol it walks.
+        for (const Symbol* gp : tsym->genericParams) {
+            if (!gp || gp->name != elName) continue;
+            owningElementSites_.push_back({head, gp->name, &site, tsym});
+            return;
+        }
+    };
+
+    for (const Symbol* mem : tsym->members) {
+        // Fields and properties (including auto-property storage): the
+        // #3147 channel, via the ONE accessor that consults both sources.
+        if (dynamic_cast<const FieldSymbol*>(mem) ||
+            dynamic_cast<const PropertySymbol*>(mem)) {
+            recordIfOwningElementSlot(storageComponentType(mem, ctx_));
+            continue;
+        }
+        auto* ms = dynamic_cast<const MethodSymbol*>(mem);
+        if (!ms) continue;
+        // A generic METHOD's own type parameter is NOT this check's subject:
+        // its bindings are calls, which `instantiations_` does not record, and
+        // a method parameter may legally SHADOW the type's (fix #2742). The
+        // per-parameter name match below is against `tsym->genericParams`
+        // only, so a shadowing method parameter is rejected by that test for
+        // the same reason `nameBoundByCurrentMethod` rejects it locally — but
+        // a NON-shadowing method parameter of the same name would not be
+        // distinguishable, so skip a generic method's signature outright.
+        // That residual is #2736(a), unchanged by this fix.
+        if (!ms->genericParams.empty()) continue;
+        recordIfOwningElementSlot(ctx_.importedReturnType(ms));
+        // §2.8.2 (#2373 / #3194): an IMPORTED member's parameter carries no
+        // syntactic `declType` at all — there is no `ast::Type` to attach —
+        // and `ModuleLoader::convertParams` stashes the already-resolved
+        // TypeRef on `resolvedDeclType` instead. Reading `declType` alone was
+        // MEASURED here to make this arm DEAD for every import: an imported
+        // `method Take(l: OwningLinkedList<T>)` still admitted `Taker<string>`
+        // with the arm present. That is the exact false ACCEPT #2373 and #3194
+        // each had to fix at their own site, so ask the named both-sources
+        // accessor (`formalParamResolvedType`, sema/Symbol.hpp) rather than
+        // hand-inlining the fallback a fourth time.
+        for (std::size_t pi = 0; pi < formalParamCount(*ms); ++pi)
+            recordIfOwningElementSlot(formalParamResolvedType(*ms, pi));
+    }
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -2183,13 +2348,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // for the list/set/stack/queue families and `V` (slot 1, the
                 // value) for `OwningDictionary<K, V>` (the key K is value-like
                 // by design, §28.11).
-                std::size_t ownedSlot = static_cast<std::size_t>(-1);
-                if (first == "OwningArray" || first == "OwningSet" ||
-                    first == "OwningStack" || first == "OwningQueue" ||
-                    first == "OwningLinkedList")
-                    ownedSlot = 0;
-                else if (first == "OwningDictionary")
-                    ownedSlot = 1;
+                // fix #2735: the slot table lives in ONE place
+                // (owningCollectionOwnedSlot above), shared with the
+                // cross-module instantiation-site walk.
+                std::size_t ownedSlot = owningCollectionOwnedSlot(first);
                 if (ownedSlot != static_cast<std::size_t>(-1) &&
                     ownedSlot < ref.genericArgs.size()) {
                     const TypeRef* el = ref.genericArgs[ownedSlot];
@@ -3386,6 +3548,15 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 }
             }
         }
+        // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
+        // imported-symbol seam #3152): the same cross-module gap #3147 closed
+        // for the §28.5 owned-field check, at the §14.4 owning-collection
+        // ELEMENT check. An imported generic's obligations are not in
+        // `owningElementSites_` because nothing in this compilation ever
+        // resolved its body; synthesize them from its reconstructed member
+        // surface before the instantiation is recorded just below, so Pass 2
+        // sees both halves.
+        recordImportedOwningElementObligations(tsym, t);
         // §14.2: record this concrete instantiation so a deferred inner
         // obligation owned by `tsym` (recorded while resolving tsym's body)
         // can be re-checked against the binding it supplies here. Recording

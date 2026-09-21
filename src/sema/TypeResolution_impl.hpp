@@ -643,6 +643,17 @@ private:
     // at the instantiation site per §3.6 rule 2.
     void checkOwningElementInstantiations();
 
+    // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735) — the CROSS-MODULE
+    // half of the recorder above. `owningElementSites_` is populated while
+    // resolving THIS compilation's own type bodies, so an IMPORTED generic
+    // (which has no AST here at all) never got a site and Pass 2 had nothing
+    // to walk. This synthesizes the missing sites from `tsym`'s reconstructed
+    // member surface — the #3147 channel, no new module metadata — so Pass 2
+    // answers the cross-module case with the SAME predicate and diagnostic.
+    // Scanned once per imported TypeSymbol (importedOwningElementScanned_).
+    void recordImportedOwningElementObligations(TypeSymbol* tsym,
+                                                const ast::Type& site);
+
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
     // degenerate-`as`-target rule at a TYPE-level generic parameter. The
     // declaration-site check in ExprTypecheck admits `o as T` inside the
@@ -1434,6 +1445,14 @@ private:
         TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
     };
     std::vector<OwningElementSite> owningElementSites_;
+
+    // fix #2735: imported generic TypeSymbols whose member surface has already
+    // been swept by recordImportedOwningElementObligations(). The sweep is a
+    // property of the TYPE, not of the instantiation site, so a dependency
+    // instantiated at twenty sites must not push twenty identical obligations
+    // (Pass 2 would collapse them via its `reported` key, but the quadratic
+    // site x instantiation walk would not).
+    std::set<TypeSymbol*> importedOwningElementScanned_;
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): one `x as T` in a
     // generic body whose target is a bare type parameter OF THE ENCLOSING TYPE.
