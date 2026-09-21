@@ -123,6 +123,38 @@ bool holeCutInsideGenericArgList(std::string_view exprText,
     return false;
 }
 
+// §18.5 (v0.306, #4517): compute the SourceLocation of `text[uptoOffset]`
+// given that `text[0]` sits at `base` in the enclosing file. A hole's
+// expression text is re-lexed from a standalone copy (see splitInterpolation
+// below), so its own Lexer's locations start fresh at {1, 1, 0} unless
+// rebased — before this, a diagnostic anywhere inside a hole (e.g. "expected
+// expression" on `{if cmp < 0 then ... }` missing its mandatory outer parens)
+// printed as the file's `1:1` instead of pointing at the hole. Mirrors
+// Lexer::locationAt's walk (CR/CRLF/LF each advance the line once and reset
+// the column; every other byte advances the column), just parameterized over
+// an arbitrary starting location instead of always the file origin.
+SourceLocation advanceLocation(SourceLocation base, std::string_view text,
+                                std::size_t uptoOffset) {
+    std::uint32_t line = base.line;
+    std::uint32_t column = base.column;
+    const std::size_t limit = uptoOffset < text.size() ? uptoOffset : text.size();
+    for (std::size_t i = 0; i < limit; ++i) {
+        char c = text[i];
+        if (c == '\r') {
+            ++line;
+            column = 1;
+            if (i + 1 < limit && text[i + 1] == '\n') ++i; // CRLF is one line break
+        } else if (c == '\n') {
+            ++line;
+            column = 1;
+        } else {
+            ++column;
+        }
+    }
+    return SourceLocation{line, column,
+                          static_cast<std::uint32_t>(base.offset + uptoOffset)};
+}
+
 } // namespace
 
 Parser::Parser(Lexer& lexer, DiagnosticEngine& diagnostics)
@@ -314,7 +346,15 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                 // (avoids SSO invalidation when the InterpPart is moved).
                 auto srcOwned =
                     std::make_unique<std::string>(std::string(actualExpr));
-                Lexer subLex(*srcOwned, diagnostics_);
+                // §18.5 (v0.306, #4517): rebase the sub-lexer onto the hole's
+                // real position in the file (raw[exprStart] is the first
+                // character of the expression, right after the opening `{`),
+                // so a diagnostic from inside the hole (e.g. a missing
+                // mandatory-parenthesization "expected expression") points at
+                // the hole instead of the file's 1:1.
+                SourceLocation holeExprBase =
+                    advanceLocation(e.span.begin, raw, exprStart);
+                Lexer subLex(*srcOwned, diagnostics_, holeExprBase);
                 Parser subPar(subLex, diagnostics_);
                 auto expr = subPar.parseExpression();
                 if (expr) {

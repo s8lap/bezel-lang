@@ -139,9 +139,15 @@ bool isReservedKeyword(std::string_view text) {
 Lexer::Lexer(std::string_view source, DiagnosticEngine& diagnostics)
     : source_(source), diagnostics_(diagnostics) {}
 
+// §18.5 (v0.306, #4517): rebase every produced location onto `base` instead
+// of the default {1, 1, 0} origin — see Lexer.hpp for why.
+Lexer::Lexer(std::string_view source, DiagnosticEngine& diagnostics,
+             SourceLocation base)
+    : source_(source), diagnostics_(diagnostics), base_(base) {}
+
 SourceLocation Lexer::locationAt(std::size_t offset) const {
-    std::uint32_t line = 1;
-    std::uint32_t column = 1;
+    std::uint32_t line = base_.line;
+    std::uint32_t column = base_.column;
     const std::size_t limit = offset < source_.size() ? offset : source_.size();
     for (std::size_t i = 0; i < limit; ++i) {
         const char c = source_[i];
@@ -158,7 +164,8 @@ SourceLocation Lexer::locationAt(std::size_t offset) const {
             ++column;
         }
     }
-    return SourceLocation{line, column, static_cast<std::uint32_t>(offset)};
+    return SourceLocation{line, column,
+                          static_cast<std::uint32_t>(base_.offset + offset)};
 }
 
 Token Lexer::next() {
