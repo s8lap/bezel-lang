@@ -52,6 +52,30 @@
 // here are LOOP-AMPLIFIED. The `this`-bounded row is deliberately one-shot and
 // still fails pre-fix on its own (4 B / 1), because its captured cell has no
 // reclaim site at all rather than a racy one; amplifying it would add nothing.
+//
+// ON `Button`'s SPELLING (#1727). `public event Clicked: Ev;` is spec §24
+// (v0.306)'s RETIRED member kind — the migration spelling is stdlib §6.5's
+// `private owned readonly _clicked: EventSource<Ev> := new();` +
+// `public property Clicked: IEvent<Ev> => _clicked;` pattern, but issue #1727
+// (the compiler half of the retirement) is still open, so `event` still
+// compiles. `Button` here was rewritten to the §6.5 pattern and measured
+// AGAINST THIS FIX'S OWN CLAIM: rewritten, the 200-/50-iteration
+// `using var sub := b.Clicked.Subscribe(...)` shape (rows 1 and 2) no longer
+// leaks AT ALL, pre-fix or post — measured clean (exit 7) under
+// `--sanitize=address` / `ASAN_OPTIONS=detect_leaks=1:use_stacks=0` on a
+// `bezelc` built at a2f3becb (before #4509's fix existed), versus the
+// unrewritten `event` spelling's exact 1592 B / 199 allocations on the same
+// binary. A user-authored property getter is evidently visible to the
+// compiler's escape classification in a way the retired member kind's
+// synthetic accessor is not, so rows 1/2 would no longer be pinning anything
+// if rewritten. Per this repo's discipline (never weaken what a regression
+// test pins), `Button` STAYS on the retired `event` spelling — it joins the
+// #1727 migration pile rather than being fixed here. `Widget` below (used
+// only by the `this`-bounded row) WAS converted to the §6.5 pattern: that
+// row's defect was reconfirmed to still reproduce post-rewrite (pre-fix at
+// a2f3becb: `r.ran` false, wrong `T`; clean and `T == 5` post-fix), so the two
+// classes are not interchangeable for this purpose and are handled
+// differently on that measured basis, not by assumption.
 
 #include <string>
 
@@ -172,7 +196,8 @@ BEZEL_TEST(escaping_capture_cell_refcount_4509,
         "module M; "
         "record Ev(N: int); "
         "class Widget "
-        "  public event Clicked: Ev; "
+        "  private owned readonly _clicked: EventSource<Ev> := new(); "
+        "  public property Clicked: IEvent<Ev> => _clicked; "
         "  public owned sub: Subscription?; "
         "  public T: int := 0; "
         "  public method Tally(x: int) T := T + x; end Tally; "
@@ -180,7 +205,7 @@ BEZEL_TEST(escaping_capture_cell_refcount_4509,
         "    var k := 3; "
         "    this.sub := this.Clicked.Subscribe(lambda(e) => do this.Tally(e.N + k); end); "
         "  end Hook; "
-        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "  public method Fire(n: int) _clicked.Raise(new Ev(n)); end Fire; "
         "end Widget; "
         "class C public static method Main(): int "
         "  using var w := new Widget(); "

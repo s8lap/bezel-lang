@@ -79,6 +79,25 @@
 // observable there without instrumentation, and per #2633 an ASan build can
 // land a wild access in mapped memory and pass, so the plain build is the
 // oracle that reproduces what a user sees.
+//
+// ON `Button`'s SPELLING (#1727). `public event Clicked: Ev;` is spec §24
+// (v0.306)'s RETIRED member kind; stdlib §6.5's migration spelling is
+// `private owned readonly _clicked: EventSource<Ev> := new();` +
+// `public property Clicked: IEvent<Ev> => _clicked;` (#1727 — the compiler
+// half of the retirement — is still open, so `event` still compiles).
+// `nestedHandler`'s `Button` was rewritten to that pattern and measured: with
+// `src/codegen/` at 2151b15a (#4509's fix present, #4523's absent — the exact
+// FAIL-WITHOUT baseline above), the rewritten program no longer reproduces
+// ANY of rows 1, 2, or 5's defect — both crash repros run to their correct
+// exit code with no SIGSEGV, and row 5's 200-iteration loop is clean (exit 7,
+// no leak) under `--sanitize=address` / `ASAN_OPTIONS=detect_leaks=1:
+// use_stacks=0`, versus the unrewritten spelling's exact SIGSEGV / SIGSEGV /
+// 1592 B in 199 allocations on the identical binary — the same divergence
+// `escaping_capture_cell_refcount_4509_test.cpp`'s header documents for its
+// own `Button`. Since `nestedHandler` is one shared helper feeding every row
+// here, and three of its five rows would stop pinning anything if rewritten,
+// `Button` stays on the retired `event` spelling for the whole file — it
+// joins the #1727 migration pile rather than being fixed here.
 
 #include <string>
 
