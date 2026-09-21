@@ -5536,6 +5536,49 @@ private:
         return v;
     }
 
+    // fix #455 / §4.5, extracted for fix #4579 (§4.6 / §7.2, v0.306): lift a
+    // lowered element value `v` into the tagged `{i8 hasValue, T value}` struct
+    // an element of nullable-VALUE type `elemTyRef` occupies, so the alloca the
+    // caller spills it into MATCHES the stride `collectionElemSize` computed and
+    // the runtime memcpy's. Returns `v` unchanged for every other element type.
+    //
+    // This was the body of the `ensureNullableElem` lambda #455 put inside
+    // `tryLowerCollectionInstanceCall` (LlvmBackend_Calls.cpp) — see that call
+    // site's comment for the full rationale, which is unchanged. It is a member
+    // now because the NODE-backed `LinkedList<T>` family lives in a different
+    // function in a different file (`tryLowerLinkedListInstanceCall`,
+    // LlvmBackend_Calls3.cpp) and so never got the rule: its `AddLast(1)` on a
+    // `LinkedList<int?>` spilled a bare `i32` into a 4-byte alloca and handed
+    // `bz_llist_add_last` an 8-byte stride, which memcpy'd 4 bytes PAST the slot
+    // (ASan stack-buffer-overflow) and left the node holding the payload's low
+    // byte as its hasValue tag. One helper, both families — rather than the
+    // second spelling of one rule that narrow #4553 and fix #4571 each declined
+    // to introduce in `emitRemoveElementEquality`.
+    llvm::Value* ensureNullableElementValue(const sema::TypeRef* elemTyRef,
+                                            llvm::Value* v) {
+        if (!elemTyRef || !v) return v;
+        sema::TypeRef nvBuf;
+        const sema::TypeRef* nvTy = nullptr;
+        if (isNullableValueTy(elemTyRef)) {
+            nvTy = elemTyRef;
+        } else if (elemTyRef->nullable &&
+                   elemTyRef->kind == sema::TypeRef::Kind::Named &&
+                   !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
+            // fix #569 / §14.1: a BARE nullable type parameter (`T?`) inside a
+            // monomorphized body — resolve it through the active substitution.
+            if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
+                isNullableValueTy(&nvBuf))
+                nvTy = &nvBuf;
+        }
+        if (!nvTy) return v;
+        llvm::StructType* expected = nullableValueStructTy(nvTy);
+        if (!expected || v->getType() == expected) return v;
+        // (b) null pointer → the null tagged struct.
+        if (v->getType()->isPointerTy()) return nullableValueNull(nvTy);
+        // (a) inner scalar/struct value → {hasValue=1, v}.
+        return wrapNullableValue(nvTy, v);
+    }
+
     // v0.171 (#1336) — the Try-convention writeback. Every extraction
     // `TryX(out item: T?)` builtin must assign the out slot on BOTH exit paths
     // (§22.3): `null` on the false path, the extracted value on the true path.

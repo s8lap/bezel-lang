@@ -5464,30 +5464,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // bare T value into the SAME tagged {i8, T} struct the (now 8-byte) esz
         // and the caller-side `arr[i]` decode expect. Without this the bare value
         // was stored at the nullable element's stride → garbage tag/value on read.
+        // fix #4579: the body moved verbatim to `ensureNullableElementValue`
+        // (LlvmBackend_impl.hpp) so the node-backed `LinkedList<T>` family —
+        // a different function in a different file, which never got this rule
+        // and stored bare inner bytes at the tagged stride — applies the SAME
+        // rule rather than a second spelling of it. Behaviour here is unchanged.
         auto ensureNullableElem = [&](llvm::Value* v) -> llvm::Value* {
-            const sema::TypeRef* elemTyRef =
-                (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
-            if (!elemTyRef) return v;
-            sema::TypeRef nvBuf;
-            const sema::TypeRef* nvTy = nullptr;
-            if (isNullableValueTy(elemTyRef)) {
-                nvTy = elemTyRef;
-            } else if (elemTyRef->nullable &&
-                       elemTyRef->kind == sema::TypeRef::Kind::Named &&
-                       !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
-                if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
-                    isNullableValueTy(&nvBuf))
-                    nvTy = &nvBuf;
-            }
-            if (!nvTy) return v;
-            llvm::StructType* expected = nullableValueStructTy(nvTy);
-            if (!expected || v->getType() == expected) return v;
-            // (b) null pointer → null tagged struct.
-            if (v->getType()->isPointerTy())
-                return nullableValueNull(nvTy);
-            // (a) inner scalar/struct value → {hasValue=1, v}.
-            return wrapNullableValue(nvTy, v);
+            return ensureNullableElementValue(
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr,
+                v);
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)

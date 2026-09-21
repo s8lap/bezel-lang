@@ -3343,14 +3343,47 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
                           : llvm::cast<llvm::Value>(
                                 llvm::ConstantPointerNull::get(ptrTy()));
     };
+    // fix #4579 (§4.6 / §4.7 / §7.2, v0.306): every `bz_llist_add_*` below hands
+    // the runtime a POINTER to this slot plus `esz`, and `llist_node_alloc`
+    // memcpy's exactly `esz` bytes out of it. `esz` is `collectionElemSize`, the
+    // ALLOCATION size of the element's LLVM type — for a nullable VALUE element
+    // (`LinkedList<int?>`) that is the tagged `{i8 hasValue, T value}` struct, 8
+    // bytes for `int?`. But the arms lowered the argument with a bare
+    // `lowerExpr`, which for `ll.AddLast(1)` yields the inner `i32` (the
+    // IntLiteral arm lowers from `rt->primitive` and ignores `rt->nullable`), so
+    // the slot was a 4-byte `alloca i32` and the memcpy read 4 bytes PAST it.
+    //
+    // MEASURED on 75ae6094 (gate `--full`, shard codegen/5): "AddressSanitizer:
+    // stack-buffer-overflow … READ of size 8 … in memcpy / llist_node_alloc /
+    // bz_llist_add_last", with the frame report naming the two slots the repro
+    // creates — `[64, 68)` (the 4-byte `AddLast(1)` slot, overflowed) beside
+    // `[32, 40)` (the correctly-sized 8-byte `AddLast(null)` slot, because the
+    // NullLiteral arm DOES consult `isNullableValueTy`).
+    //
+    // It is a wrong ANSWER before it is a memory error: `{i8, T}` puts the tag at
+    // offset 0, so the stored node's hasValue byte became the payload's LOW BYTE
+    // and the payload came from the uninitialized 4 bytes past the slot. Any
+    // value whose low byte is zero read back as `null` — `ll.AddLast(256)` then
+    // `256 in ll` answered FALSE on the plain build (§17.5's membership test over
+    // §8.4 equality), which is why the plain oracle passed the ASan-failing row.
+    //
+    // The array-backed family has had the rule since fix #455 (§4.5); this is the
+    // same helper, now shared (`ensureNullableElementValue`). Spill through one
+    // place so the "slot type == element type" invariant cannot be restated
+    // wrongly in a fifth arm.
+    auto llElemSlot = [&](llvm::Value* v) -> llvm::AllocaInst* {
+        v = ensureNullableElementValue(llElemRef, v);
+        llvm::AllocaInst* s = entryAlloca(v->getType());
+        builder_.CreateStore(v, s);
+        return s;
+    };
 
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3374,8 +3407,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3395,8 +3427,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3416,8 +3447,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,

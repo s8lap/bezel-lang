@@ -146,3 +146,82 @@ BEZEL_TEST(in_nullable_value_element_4553, linkedlist_nullable_element_spec_17_5
         "  return 0; "
         "end Main; end C;"), 1);
 }
+
+// ── #4579: the node-backed insert arms store the element at the TAGGED stride ──
+//
+// THE BUG (§4.6 / §7.2 / §17.5, v0.306). The row above found it under ASan:
+// `LinkedList<int?>.AddLast(1)` spilled the bare inner `i32` into a 4-byte
+// alloca and handed `bz_llist_add_last` the 8-byte stride `collectionElemSize`
+// computes for `{i8 hasValue, i32 value}`, so `llist_node_alloc`'s memcpy read
+// 4 bytes PAST the slot ("stack-buffer-overflow … READ of size 8 … in memcpy /
+// llist_node_alloc / bz_llist_add_last", gate 75ae6094 shard codegen/5).
+//
+// But the over-read is the SECOND symptom. §7.2's tagged layout puts hasValue at
+// offset 0, so the node's tag became the payload's LOW BYTE and the payload came
+// from uninitialized stack. The rows below use 256 (low byte 0x00) so the stored
+// element reads back as `null` — a WRONG ANSWER the plain oracle sees, which is
+// why the row above passed plain and failed only under ASan (the #2633
+// asymmetry). §17.5: "`x in collection` evaluates to `true` if
+// `collection.Contains(x)` is true"; §8.4's present-vs-present case reduces to
+// the inner type's equality, so each of these is `true`.
+//
+// FAIL-WITHOUT: all three return 0 on the pre-fix compiler (measured by probe on
+// 75ae6094 and by restoring the two src files from HEAD); 1 with the fix.
+
+// §4.6/§7.2/§17.5: AddLast stores a tagged element, not the bare inner bytes.
+BEZEL_TEST(in_nullable_value_element_4553, linkedlist_addlast_tagged_stride_spec_4_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var ll := new LinkedList<int?>(); "
+        "  ll.AddLast(256); "
+        "  var k: int? := 256; "
+        "  if k in ll then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §4.6/§7.2/§17.5: the AddFirst arm carried the identical defect.
+BEZEL_TEST(in_nullable_value_element_4553, linkedlist_addfirst_tagged_stride_spec_4_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var ll := new LinkedList<int?>(); "
+        "  ll.AddFirst(256); "
+        "  var k: int? := 256; "
+        "  if k in ll then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §4.6/§7.2/§17.5: and the two anchored arms — all four insert paths, so a fix
+// that armed only the one the gate caught would fail here.
+BEZEL_TEST(in_nullable_value_element_4553, linkedlist_addafter_addbefore_tagged_stride_spec_4_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var ll := new LinkedList<int?>(); "
+        "  var n1 := ll.AddLast(1); "
+        "  ll.AddAfter(n1, 512); "
+        "  ll.AddBefore(n1, 1024); "
+        "  var a: int? := 512; "
+        "  var b: int? := 1024; "
+        "  if (a in ll) and (b in ll) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §8.4: the inverse control — a value the list does NOT hold is not a member, so
+// a "fix" that made the tagged comparison constant-true fails here. `2 in ll`
+// after storing 256 must be false.
+BEZEL_TEST(in_nullable_value_element_4553, linkedlist_absent_value_is_not_member_spec_8_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var ll := new LinkedList<int?>(); "
+        "  ll.AddLast(256); "
+        "  var k: int? := 2; "
+        "  if k in ll then return 0; end; "
+        "  return 1; "
+        "end Main; end C;"), 1);
+}
