@@ -4886,11 +4886,14 @@ void Emitter::prePopulateBasePositionalFields(
     // the textual-order pairing `argument i ↔ field i` this function has
     // always used, which is bit-identical for an all-positional call and is
     // the pre-fix behaviour for every shape sema declines to bind. Since fix
-    // #4496 the CHAIN arm's binder runs with `emit=true`, so an over- or
-    // under-supplied or doubly-bound `base(...)` is a §22.5 compile error and
-    // never reaches this fallback; the CLAUSE arm's is still `emit=false`
-    // (#4496's clause twin — measured in the sema publisher's comment), so a
-    // malformed clause still lowers by textual order exactly as before.
+    // #4496 the CHAIN arm's binder runs with `emit=true`, and since fix #4518
+    // the CLAUSE arm's does too, so an over- or under-supplied, doubly-bound
+    // or misnamed `base(...)` OR §22.10 inheritance clause is a §22.5 compile
+    // error and never reaches this fallback. What still reaches it is the
+    // shapes sema DECLINES TO BIND AT ALL rather than rejects: an imported
+    // clause (no entry under the replayed vector's address), a call binding an
+    // explicit base constructor (neither publisher runs there), and an
+    // all-positional call, for which the fallback is the same answer.
     std::vector<int> baseFieldToArg;
     // The base positional field a given SOURCE argument index binds to, and
     // its inverse. Stated once because three places below need them: the §4.7

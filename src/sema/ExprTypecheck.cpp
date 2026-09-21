@@ -11465,26 +11465,51 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             // channel is a table of its own only because the clause has no
             // `ast::Expr` node to key on (see SemaContext.hpp).
             //
-            // `emit=false`, matching #4484's `base(...)` half: §22.5 ARITY
-            // checking of an inheritance clause is a pre-existing and
-            // separate gap — measured on e9239ab4, each of `: B(n := v)`
-            // (under-supplied), `: B(v, "a", 3)` (over-supplied),
-            // `: B(v, n := 2, s := "a")` (doubly bound) and
-            // `: B(zz := v, s := "a")` (no such parameter) compiles with ZERO
-            // diagnostics against `class B(n: int, s: string)`. Making the
-            // binder loud here is a NEW rejection belonging to that gap (the
-            // clause twin of #4496), not to this binding-order defect, so a
-            // clause the binder declines publishes nothing and keeps exactly
-            // today's textual-order lowering.
+            // fix #4518 (§22.5 / §22.10, v0.306): `emit=true`. #4491 ran
+            // this binder with `emit=false` and recorded WHY — its subject
+            // was binding ORDER, so making the binder loud would have been a
+            // new rejection belonging to a different gap. This is that
+            // deferral closed, and it is the CLAUSE twin of #4496, which
+            // closed the same gap on the `base(...)` chain arm by the same
+            // one-word move.
             //
-            // Published only when the clause binds the base's PRIMARY
-            // parameter list — no explicit non-static base constructor of the
-            // clause's arity — which is the arity arm of codegen's own
-            // `baseClauseExplicitCtor` guard (the predicate that decides
-            // whether case (a) stores these slots at all). A clause that
-            // binds an explicit base constructor publishes nothing and keeps
-            // whichever disposition it has today.
-            // // per §22.5, fix #4491; SEAM-DEBT: the clause twin of #4496
+            // §22.10 is what makes the two arms one question: "When a class
+            // with a primary constructor has a base class, the base call
+            // appears in the inheritance clause … This replaces an explicit
+            // `base(...)` call" (v0.306). The clause IS the base call, so
+            // §22.5's two REJECTIONS reach it exactly as they reach the
+            // chain: "naming a parameter already bound positionally …, or
+            // naming the same parameter twice, is a compile error at the call
+            // naming that parameter", and "Every parameter that declares no
+            // default must be bound, positionally or by name".
+            //
+            // MEASURED ON 6c05b4cf, against `class B(n: int, s: string)`:
+            // `: B(n := v)` compiled at exit 0 and ran to exit 0 printing `4`
+            // and a blank line (the `s` slot kept its calloc zero — a
+            // half-constructed object, and an interpolating consumer
+            // dereferences the NULL); `: B(v, n := 2, s := "a")` compiled at
+            // exit 0 and SIGSEGV'd at run (exit 139) after printing `4`;
+            // `: B(v, "a", 3)` and `: B(zz := v, s := "a")` compiled at exit
+            // 0 and silently DROPPED the argument the rule rejects. The first
+            // two are silent MISCOMPILES, not merely missing diagnostics.
+            //
+            // The diagnostics are not new text: they are the five strings
+            // `bindArgsToParams` already emits for a `new T(...)`, a method
+            // call, a `this(...)` chain and (since #4496) a `base(...)`
+            // chain — the point of #3178's `FormalsView` being that one
+            // binder body serves every formal source.
+            //
+            // Checked (and published) only when the clause binds the base's
+            // PRIMARY parameter list — no explicit non-static base
+            // constructor of the clause's arity — which is the arity arm of
+            // codegen's own `baseClauseExplicitCtor` guard (the predicate
+            // that decides whether case (a) stores these slots at all). A
+            // clause that binds an explicit base constructor is neither
+            // checked nor published here and keeps whichever disposition it
+            // has today; its own §22.5 VALIDITY is the third site's question
+            // (#4520 binds it by name; its arity checking is filed, not
+            // folded in).
+            // // per §22.5, fix #4491
             std::vector<int> clauseFieldToArg;
             if (baseTs && baseTs->hasPositionalFields) {
                 bool explicitCtorOfThisArity = false;
@@ -11509,7 +11534,7 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         sema::FormalsView::of(fields),
                         td->primaryBaseCtorArgs,
                         td->primaryBaseCtorArgs[0].value->span.begin, desc,
-                        /*emit=*/false);
+                        /*emit=*/true);  // fix #4518 (§22.5, v0.306)
                     if (b.ok) {
                         clauseFieldToArg = b.paramToArg;
                         ctx_.setInheritanceClauseBinding(
