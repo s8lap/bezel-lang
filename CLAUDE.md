@@ -456,6 +456,21 @@ dispose-count/ASan-clean for a double-free.
   diagnostic carries a real location, so the helper returns true on both sides.
   When the pre-fix behaviour is a crash/IR-verifier failure/signal, assert the
   *specific* diagnostic. (Caught because FAIL-WITHOUT showed 2 of 4 rows failing.)
+- ⚠ **Generated-code ASan is a GATE-ONLY oracle, so a lane's green does not
+  cover it.** `BEZEL_AOT_FORCE_SANITIZE=address` is exported by `gate.sh` and
+  `gate_full_cycle.sh` and by **nothing else** — `agent_check.sh` does not set
+  it (verified 2026-09-22). So `runAot`/`runAotChecked` rows a lane runs are
+  NOT instrumented, and a defect that only faults under ASan is invisible until
+  the gate. That is not a silent skip and not a vacuous oracle — the lane's run
+  is honest about what it measured; it simply measured the plain build.
+  Measured cost: #4579 shipped into a gate this way. Its authoring lane ran 8/8
+  green (truthfully), and the row stack-buffer-overflowed on the gate's `--full`
+  leg, because a LinkedList insert allocated a 4-byte slot and told the runtime
+  the stride was 8. **If your change touches allocation, element layout,
+  release/retain, or anything a sanitizer could catch, re-run your own filter
+  with the env var set** before handing back:
+  `BEZEL_AOT_FORCE_SANITIZE=address scripts/agent_check.sh --area codegen <filter>`
+  and confirm the run prints `NATIVE SANITIZER: 0 check(s) skipped`.
 - **The `-1` sentinel silently deletes the ASan leg — but NOT for the reason
   this file used to give.** ⚠ The old wording here said "the native ASan leg is
   vacuous in lane worktrees, `asanRuntimeObject()` is empty there" and told you
