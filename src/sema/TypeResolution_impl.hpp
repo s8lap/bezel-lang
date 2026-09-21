@@ -613,6 +613,29 @@ private:
     // this predicate is precisely the skew #1463 was about.
     static bool isBareGenericParamBinding(const TypeRef* bound,
                                           const ast::Type* boundAst);
+    // fix #2742 (§3.6 rule 2 / §14.1, v0.306) — the #2713 MISATTRIBUTION
+    // guard, as ONE predicate instead of three hand-inlined copies.
+    //
+    // Every deferred per-instantiation obligation is recorded as a bare
+    // parameter NAME plus `currentOuterType_`, and re-read in a Pass 2 that
+    // resolves that name against the ENCLOSING TYPE's `genericParams` and
+    // walks `instantiations_`. A generic METHOD may declare a type parameter
+    // that SHADOWS one of the enclosing type's — `class Box<T>` with
+    // `method M<T>()` — and nothing forbids it: Appendix A.3's
+    // `GenericParam ::= Variance? Identifier` imposes no uniqueness, and
+    // there is no shadowing diagnostic in sema or the parser. Inside such a
+    // method the name denotes the METHOD's parameter, whose bindings
+    // `instantiations_` knows nothing about, so recording the site validates
+    // the method's `T` against the TYPE's — a different binding entirely.
+    //
+    // A method parameter that does NOT shadow is skipped by the same test,
+    // which is correct for the same reason (generic-method bindings are not
+    // in `instantiations_` at all); that residual is #2736(a).
+    //
+    // Returns true when `name` is bound by the generic method currently being
+    // resolved, i.e. "do NOT record this site". False outside a method
+    // signature/body, and false for a method that declares no type parameters.
+    bool nameBoundByCurrentMethod(std::string_view name) const;
     // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): Pass 2 for the owning-
     // collection element check.  The declaration-site check in resolveType()
     // admits a bare generic parameter; this walks the recorded instantiations of
