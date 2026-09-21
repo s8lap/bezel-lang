@@ -1710,6 +1710,36 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
                 "supported on the cross-module per-instantiation path (#1386)");
             continue;
         }
+        // fix #4544 (§7.2 / §7.8 / §22.13, v0.306): mirror
+        // emitStaticConstructorBody's #2903 coercion (this file, the "fix
+        // #2903" comment ahead of its own field-init loop) here. For a
+        // LOCALLY-declared generic class this loop is the ONLY runtime store
+        // that ever reaches a per-instantiation static global: per the block
+        // comment above genericInstSfinitFn, the template-level #709 loop
+        // runs BEFORE any per-instantiation global exists (those are created
+        // lazily on first touch, during method-body emission), so its own
+        // genericInstStaticGlobals_ walk finds nothing to store into — this
+        // lazily-built per-instantiation sfinit is what actually populates
+        // `PK<int>.SF`. Without the §7.2 tagged-slot wrap, a nullable-VALUE-
+        // typed field (`int?`, the two-field `{i8 hasValue; T}` aggregate)
+        // receives a bare `lowerExpr` result (a plain `i32` for the literal
+        // `105`) whose LLVM type never equals instGV's aggregate type, so the
+        // #1116 guard just below silently skipped the store and the field
+        // read back as the zero-initialized `{0, 0}` — `null` — exactly
+        // issue #4544's `NullReferenceException` on `SF!`. Measured: fails
+        // identically whether `SF` is mutable or `static readonly` with a
+        // non-constant initializer (both take this same runtime-store path);
+        // a non-nullable `int` sibling was unaffected (`i32` already equals
+        // the slot type, so the pre-fix bare store was already correct).
+        {
+            const sema::TypeRef* fRt2 =
+                fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+            val = coerceInitializerToSlot(val, instGV->getValueType(),
+                                          isUnsignedTargetExpr(*initExpr));
+            if (fRt2 && isNullableValueTy(fRt2))
+                val = coerceReturnToNullableValue(
+                    val, fRt2, isUnsignedTargetExpr(*initExpr));
+        }
         // #1116 guard, mirrors the #709 loop's getValueType() check: a
         // T-DEPENDENT initializer whose value type doesn't match this
         // instantiation's field type is skipped rather than mis-stored.
