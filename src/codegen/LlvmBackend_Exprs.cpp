@@ -8268,6 +8268,87 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 r = builder_.CreateLoad(st, r, "this.val");
         }
     }
+    // fix #4511 (§8.4 / §8.6 / §5.1, v0.306): `Object = value` / `value =
+    // Object`, either order. §5.1's reference conversions include "any type to
+    // `Object`", a VALUE type reaching it by boxing (§8.6); §8.4 then defines
+    // `a = b` as `a.Equals(b)` with the null-safe wrapper, and §8.1 fixes
+    // `Object`'s member surface to include `Equals(Object?)`. The pair is
+    // therefore well-formed, and sema admits it on exactly that authority —
+    // #4501's §5.1 operand-pair gate deliberately exempts `Object` on either
+    // side (pinned by
+    // `sema_binary_operand_pair_4501.t5_object_operand_not_rejected_by_this_rule_spec_5_1`).
+    //
+    // Codegen had NO arm for the pair: the value operand was never boxed, so it
+    // arrived at the scalar fall-through as `icmp eq ptr %o, i32 %i` and the
+    // compile died in IR verification. A RECORD value operand was worse than
+    // malformed — `Point = (Object)p` reached the §8.3 struct-equality dispatch
+    // with a POINTER on the other side and SEGFAULTED the compiler.
+    //
+    // Box the value operand exactly as an assignment to an `Object` location
+    // would (`boxValue` — the mint `boxForTarget` makes, keyed by the same
+    // `isObjectOrInterfaceTarget` predicate) and dispatch through
+    // `lowerObjectEquals`: the vtable `kEqualsSlot` route, null-safe on the
+    // receiver and on `other`. §8.4 makes the LEFT operand the receiver, so the
+    // box takes whichever position its operand held. The box is minted here and
+    // only READ by the equals thunk, so it is released immediately after the
+    // comparison — fix #3480's reasoning, and the exact shape
+    // `lowerValueSemUniversalEquals` already uses for `5.Equals(o)`.
+    //
+    // Placed HERE, before every shape-keyed arm below, because those arms
+    // classify by LLVM operand shape and each mis-claims one spelling of this
+    // pair: the decimal block would feed an `Object` pointer to `bz_decimal_cmp`
+    // for `Object = decimal`, and the struct arm is the record segfault above.
+    if (bin.op == "=" || bin.op == "<>") {
+        auto objectOperand = [&](const ast::Expr* e, llvm::Value* v) -> bool {
+            if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
+                return false;
+            if (!v->getType()->isPointerTy()) return false;
+            return isObjectOrInterfaceTarget(ctx_.exprType(*e));
+        };
+        // The boxable side: a value-typed operand that did NOT lower to a
+        // pointer. The pointer test is what keeps `Object = string` and
+        // `Object = someClass` on their existing reference paths — `string` is
+        // a reference type (§4.6) that keeps its bare `bz_string*` in an
+        // `Object` slot, and a class pointer coerced to `Object` never boxes.
+        auto boxableOperand =
+            [&](const ast::Expr* e, llvm::Value* v) -> const sema::TypeRef* {
+            if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
+                return nullptr;
+            if (v->getType()->isPointerTy()) return nullptr;
+            const sema::TypeRef* t = ctx_.exprType(*e);
+            if (!t || isObjectOrInterfaceTarget(t)) return nullptr;
+            return (isBoxableValueType(t) || isNullableValueTy(t)) ? t : nullptr;
+        };
+        const sema::TypeRef* boxTy = nullptr;
+        bool boxIsLeft = false;
+        if (objectOperand(bin.left.get(), l)) {
+            boxTy = boxableOperand(bin.right.get(), r);
+        } else if (objectOperand(bin.right.get(), r)) {
+            boxTy = boxableOperand(bin.left.get(), l);
+            boxIsLeft = boxTy != nullptr;
+        }
+        if (boxTy) {
+            llvm::Value* raw = boxIsLeft ? l : r;
+            // `boxValue` publishes its mint in `lastBoxMint_` for #2865's
+            // reader; this box is claimed HERE, so restore the caller's view.
+            llvm::Value* savedMint = lastBoxMint_;
+            llvm::Value* boxed = boxValue(raw, boxTy);
+            lastBoxMint_ = savedMint;
+            // A value kind with no box descriptor returns its input unchanged;
+            // fail closed to the existing paths rather than emit a bad call.
+            if (boxed && boxed != raw && boxed->getType()->isPointerTy()) {
+                llvm::Value* recv  = boxIsLeft ? boxed : l;
+                llvm::Value* other = boxIsLeft ? r : boxed;
+                if (llvm::Value* eq = lowerObjectEquals(recv, other)) {
+                    auto* relFn = declareC("bz_box_release",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()});
+                    builder_.CreateCall(relFn, {boxed});  // null-safe (§28.9)
+                    return bin.op == "=" ? eq : builder_.CreateNot(eq);
+                }
+            }
+        }
+    }
     bool lUnwrapped_ = false;
     bool rUnwrapped_ = false;
     // §7.11 / #914 / #1117 (proposal 0114, v0.267): the §7.11 lifted-operator
