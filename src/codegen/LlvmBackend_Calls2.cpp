@@ -11487,14 +11487,50 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             std::unordered_map<std::string_view,
                                                const sema::TypeRef*>
                                 newSema;
+                            // fix #2755 (§14.1 *Instantiation and its site*,
+                            // §2.8.3 rule 4, v0.306): compose the SEMA
+                            // argument through the still-active OUTER
+                            // substitution before storing it, exactly as the
+                            // INSTANCE arm of this same function does
+                            // (`newSema[pname] = argSema;` above). The two
+                            // halves used to disagree: `lowerTypeRef` reads
+                            // `genericSubst_`, which is still the outer map
+                            // at this point, so the LLVM half COMPOSED
+                            // (`T → i64` for `Inner<U>.Head()` inside a live
+                            // `OuterU<long>`), while the sema half stored the
+                            // still-open `U` RAW. Every consumer of the sema
+                            // half then saw an unbound type parameter: the
+                            // specialization NAME loop skips a `declaration`-
+                            // less ref, so the callee was emitted as
+                            // `Inner$Head$spec` with no `$Long` suffix —
+                            // indistinguishable from the dead-template
+                            // pseudo-specialization; the specialization CACHE
+                            // KEY keyed on `typeRefIdentityKey(U)` so distinct
+                            // instantiations collided; and `lowerTypeRef`'s
+                            // nullable bare-parameter branch fell back to the
+                            // `{i8, i32}` placeholder. A live, concrete caller
+                            // (`OuterU$Head$spec$long`, returning `{i8,i64}`)
+                            // therefore called a body built under a
+                            // NON-concrete substitution, returning `{i8,i32}`
+                            // — malformed IR, caught by `verifyModule` as
+                            // "Function return type does not match operand
+                            // type of return inst!" on a legal program.
+                            // `substituteTypeRefLocal` is the RECURSIVE
+                            // superset of `resolveTypeParamRef`, needed here
+                            // because a nested `Inner<Wrap<U>>` argument is
+                            // not a top-level bare parameter. An empty outer
+                            // map makes it the identity, so the direct
+                            // `Inner<long>.Head()` path is unchanged.
                             for (std::size_t gi = 0; gi < nGP; ++gi) {
-                                llvm::Type* concrTy =
-                                    lowerTypeRef(recvTy->genericArgs[gi]);
+                                const sema::TypeRef* argSema =
+                                    substituteTypeRefLocal(
+                                        recvTy->genericArgs[gi],
+                                        genericSubstSemaTy_);
                                 // Local generic: name comes from ast::TypeDecl;
                                 // imported: name comes from sema::Symbol.
                                 std::string_view pname = gpNames[gi];
-                                newSubst[pname] = concrTy;
-                                newSema[pname] = recvTy->genericArgs[gi];
+                                newSubst[pname] = lowerTypeRef(argSema);
+                                newSema[pname] = argSema;
                             }
                             genericSubst_ = std::move(newSubst);
                             genericSubstSemaTy_ = std::move(newSema);
