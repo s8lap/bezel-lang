@@ -14582,7 +14582,26 @@ void ExprTC::checkImportedNewExprArgs(
         const ast::CallArgument& a =
             ne.args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value) continue;
-        checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
+        // fix #4543 (§14.1 / §5.1 / §2.8.3 rule 4, v0.306): substitute the
+        // formal through THIS construction's concrete type arguments before
+        // comparing, exactly as the LOCAL `new` path does
+        // (`substituteMemberType(…, &ne, t)` in the overload-ranking block
+        // above). Without it an imported generic constructor whose parameter
+        // EMBEDS the class's own type parameter — `constructor(x: Sc<T>?)` on
+        // `class Sc<T>` — was compared bare: `Sc<int>?` (the argument) against
+        // `Sc<T>?` (the formal), which is a genericArgs mismatch, so
+        // `new Sc<int>(q)` was refused with the §5.1 "not implicitly
+        // convertible" message while the single-module twin compiled and
+        // answered 105 (MEASURED, real two-module `bezelc`). A bare `x: T` /
+        // `x: T?` formal escaped because `checkAssignable` treats a
+        // declaration-less Named as opaque; a CONSTRUCTED `Sc<T>` does not, so
+        // this was the one shape left unsubstituted. `substituteMemberType`
+        // already handles the imported side (its `importedName` arm, #428
+        // phase B) and returns its input unchanged when nothing applies, so a
+        // non-generic imported ctor is untouched. §2.8.3 rule 4: the same
+        // program must type the same way whichever artifact declared the type.
+        TypeRef* formal = substituteMemberType(p->resolvedDeclType, &ne, t);
+        checkAssignable(ctx_.exprType(*a.value), formal,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(j + 1),
                         a.value.get());  // per §7.4 / §27.6 (#1191)
