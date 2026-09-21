@@ -38,6 +38,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
@@ -141,7 +142,7 @@ int runUnderASan(const std::string& source) {
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return -1;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -1;
     }
 
     auto cleanup = [&] {

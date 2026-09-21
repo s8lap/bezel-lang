@@ -39,6 +39,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
@@ -119,7 +120,7 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return -1;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -1;
     }
 
     auto cleanup = [&] {
