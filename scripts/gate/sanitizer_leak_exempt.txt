@@ -142,3 +142,22 @@ dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_2
 # `ran == false` shape but names no allocation count, so it fails rather than
 # passing. Worth keeping in mind if this file is ever repopulated by scan.
 async_iterator_lambda_param_capture_cell_3567.abandoned_async_iterator_leak_is_only_the_3541_residue_spec_29_7  # #3541/#3567, spec §29.7: an abandoned async iterator leaks exactly the §27.5 capture-cell residue — three allocations per abandoned round over 200 rounds. The row asserts the leak is PRESENT and is EXACTLY "in 600 allocation(s)", which is what distinguishes the residue from the over-release this arming could have become. tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp:157
+
+# ── pattern (g): expectValueAndOnlyThe3541Residue(r, out, kResidue3541) — 5 rows ──
+# A per-file helper that asserts BOTH the program's stdout AND that the leak is
+# exactly the #3541 residue. Same family as pattern (f)'s single row and the
+# same underlying open issue: #3500's filter in LlvmBackend_Stmts.cpp keeps
+# closureRelease / boxedCellFree / boxedCellFreeDeferred / inlineOwnedArrayCell
+# out of the §29.7 abandonment snapshot, so an abandoned iterator holding a
+# lambda leaks exactly three allocations per round (closure 40 B, env 16 B,
+# §27.5 cell 8 B). The file's header records that removing the filter on top of
+# #3539's repair was MEASURED and is still an ASan SEGV in CloneDispose, so the
+# filter stays and #3541 remains open. These rows pin the residue at
+# `in 600 allocation(s)`; their `fully_drained` siblings use expectRanCleanly
+# and are leak-FREE, which is what makes this a scoped residue and not a
+# blanket tolerance.
+iter_lambda_captured_iter_format_local_unbox_3603.var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: abandoned captured `var seq` leaks exactly the three-allocation-per-round §27.5 residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:367
+iter_lambda_captured_iter_format_local_unbox_3603.using_var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: the `using var` spelling of the same abandoned-iterator residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:385
+iter_lambda_captured_iter_format_local_unbox_3603.using_var_class_local_captured_by_lambda_abandoned_3539  # #3541/#3539, spec §27.5: a captured `using var` over a plain class, abandoned — same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:400
+iter_lambda_captured_iter_format_local_unbox_3603.async_var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: the ASYNC iterator half of the same defect, same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:415
+iter_lambda_captured_iter_format_local_unbox_3603.issue_3539_repro_disposes_captured_using_var_exactly_once_27_5  # #3541/#3539, spec §27.5: the #3539 repro. The name refers to the CELL destructor count (the "0" in its expected stdout — every Cell destructed, i.e. disposed exactly once on all 200 abandoned rounds); the leak it still carries is the separate #3541 residue, which is why it is here and not a contradiction. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:435
