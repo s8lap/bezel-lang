@@ -1119,6 +1119,25 @@ say "gate-smart-push-selftest phase: GREEN ($_sps_ran tests, $_sps_skipped skipp
 # Self-test first, as every other ratchet here does: the checker reads ALL the
 # documents' headings, and a checker that read only the spec's would call every
 # rationale citation dangling — which is exactly what the first measurement did.
+say "commit-trailer phase: scripts/check_commit_trailers.py"
+_ct_log="$LOGDIR/${TAG}_commit_trailers.log"
+if ! python3 scripts/check_commit_trailers.py --self-test > "$_ct_log" 2>&1; then
+  say "CYCLE FAILURE: check_commit_trailers SELF-TEST failed — the checker"
+  say "  cannot be trusted to report on the batch. See $_ct_log"
+  tail -20 "$_ct_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_commit_trailers.py --range origin/main..HEAD >> "$_ct_log" 2>&1; then
+  say "CYCLE FAILURE: a commit in this batch does not end with exactly the one"
+  say "  trailer CLAUDE.md mandates. Five lanes in cycle 17 emitted a Sonnet"
+  say "  trailer plus a Claude-Session line because a host reminder told them"
+  say "  to; CLAUDE.md overrides it. Rewrite with git filter-branch --msg-filter."
+  say "  See $_ct_log"
+  tail -40 "$_ct_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "commit-trailer phase: GREEN (every commit carries exactly one mandated trailer)"
+
 say "src-citation phase: scripts/check_src_citations.py"
 _sc_log="$LOGDIR/${TAG}_src_citations.log"
 if ! python3 scripts/check_src_citations.py --self-test > "$_sc_log" 2>&1; then
