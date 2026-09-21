@@ -68,6 +68,31 @@ systemctl --user set-property "$SLICE" \
   ManagedOOMMemoryPressure=auto \
   >/dev/null 2>&1 || true
 
+# fix #4536: the suite crashes ON PURPOSE — SIGSEGV repro programs, ASan aborts,
+# the crash-isolation rows, and every `--full` shard that trips a sanitizer. Each
+# such crash was paying a core-dump write plus compression through
+# `kernel.core_pattern = |/usr/lib/systemd/systemd-coredump`, and on a KDE box
+# also spawning a `drkonqi-coredump` handler that never exits. Measured on
+# 2026-09-21: **335 dumps / 1.9 GB in one day**, and 16 resident handlers holding
+# 698 MB that had been alive 14 hours.
+#
+# RLIMIT_CORE is inherited, and `systemd-run --scope` EXECS the command as a child
+# of this shell (the manager does not fork it), so setting it here reaches the test
+# binary and every program it forks. Verified: `( ulimit -c 0; systemd-run --user
+# --scope -q -- sh -c 'ulimit -c' )` prints 0.
+#
+# NOT set for `build`: a compiler ICE is the one crash here whose core might be
+# worth having. And this only binds ops routed through THIS script — running a
+# test binary directly in your shell still dumps, which is what you want while
+# debugging. `BEZEL_KEEP_CORES=1` restores dumping without editing anything.
+#
+# systemd-run's `-p LimitCORE=0` does NOT work here: scopes reject exec-related
+# properties ("Unknown assignment: LimitCORE=0"), because the caller execs the
+# process rather than the manager. The ulimit is the mechanism that applies.
+if [ "$kind" != build ] && [ "${BEZEL_KEEP_CORES:-0}" != 1 ]; then
+  ulimit -c 0 2>/dev/null || true
+fi
+
 case "$kind" in
   build)
     # Gate build (bezel_tests) is heavy + on the critical path -> priority.
