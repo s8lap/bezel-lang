@@ -1,0 +1,134 @@
+# sanitizer_leak_exempt.txt — tests whose generated-code sanitizer LEAK
+# report is a DELIBERATE assertion, not a defect (#4537).
+#
+# Read by scripts/gate/sanitizer.py. Format: one `suite.name` per line, with
+# the reason after a `#`. Blank lines and full-line comments are ignored; a
+# MISSING file is an empty set, so losing this file makes the gate stricter,
+# never looser.
+#
+# THIS IS THE LEAK SIBLING OF sanitizer_exempt.txt, WITH A DIFFERENT
+# RATIONALE — read that file first. sanitizer_exempt.txt declares rows whose
+# CORRUPTION is undefined behaviour the spec itself allows; that reasoning
+# does not apply here. Every row below deliberately ASSERTS that a real
+# allocation escapes the compiler's release path — the test is checking for
+# the ABSENCE of a fix, on purpose, because the underlying defect (e.g. a
+# missing release site for a nested record/string field) is tracked by its
+# own issue and not yet fixed. Under `--full` the deliberately-leaked
+# allocation makes LeakSanitizer report at process exit, and the row PASSES
+# because passing is exactly what "the leak is still there" looks like.
+#
+# WHAT BELONGS HERE — a row that POSITIVELY asserts a leak occurred (checks
+# for the PRESENCE of "detected memory leaks" / `ERROR: LeakSanitizer` in the
+# diagnostic text, or an `r.ran == false` outcome it explicitly attributes to
+# a leak headline rather than a crash). If a row's leak is incidental (it
+# would pass whether or not LSan happened to see the allocation) it does not
+# belong here — fix the row instead, or drop it to sanitizer_exempt.txt if
+# what it actually pins is a UB corruption crash.
+#
+# WHAT DOES NOT — a row asserting leak-FREEDOM (`find(...) == npos`,
+# `ASSERT_FALSE(leaksAtLeast(...))`, `expectLeakFree`, `hasSanitizerReport`/
+# `hasMemoryError` used with `EXPECT_FALSE`) never produces a report while
+# passing, so it needs no declaration; and a row whose own runner redirects
+# its subprocess output away entirely (`> /dev/null`, outside the standard
+# aot_support.hpp harness) is structurally invisible to this channel and also
+# needs none.
+#
+# A leak report in a FAILING test is never exempt (this file is consulted
+# only for tests that PASSED), and a report from a test not listed here fails
+# the cycle by name — same rule as sanitizer_exempt.txt, applied to leaks by
+# scripts/gate/sanitizer.py's verdict().
+#
+# ── measured population (2026-09-21) ────────────────────────────────────────
+# FIVE distinct deliberate-leak patterns were found, by (1) `grep -rlnE
+# '"detected memory leaks"|"LSan/ASan at exit"|leak.*[Ss]anitizer|expectLeak|
+# leaksAtLeast' tests/ --include=*.cpp` (71 candidate files), (2) reading each
+# candidate's actual assertions to discard every NEGATIVE (leak-freedom) row,
+# (3) confirming every survivor empirically against the already-built
+# `bezel_tests_codegen` binary with `BEZEL_AOT_FORCE_SANITIZE=address
+# BEZEL_TEST_FILTER=<suite>`, checking for `[san-scope] leave <name> pass`
+# bracketing an `ERROR: LeakSanitizer` headline (not `ERROR: AddressSanitizer`
+# — that is corruption, sanitizer_exempt.txt's list, not this one). All 37
+# rows below were so confirmed. The four non-codegen candidate files
+# (tests/module/xmod_auto_property_setter_arc_2490_test.cpp,
+# tests/module/xmod_named_local_setter_arc_2505_test.cpp,
+# tests/ownership/out_owned_discard_leak_1467_test.cpp,
+# tests/sema/serialization_typedriven_703_test.cpp) were read and contain only
+# leak-FREEDOM assertions or hand-rolled runners that redirect to /dev/null —
+# no additions needed there.
+#
+# RESIDUAL RISK: this is a bounded, pattern-driven search, not a full `--full`
+# sweep of the whole suite (a lane must not run that — CLAUDE.md). A row using
+# a positive-leak-tolerance pattern not covered by the five below, or added
+# after 2026-09-21, will not be caught by this file and will legitimately FAIL
+# the next `--full` cycle by name; that failure IS the mechanism working
+# (fail closed), and the fix is to add the row here with its reason, not to
+# weaken the gate.
+#
+# (a) `leaksAtLeast(program, minBytes)` — 11 rows, 7 files. The floor-bytes
+#     helper defined per-file; asserts `leaksAtLeast(...) == true`.
+# (b) `expectLeakButNoMemoryError(r)` — 19 rows, 5 files. A shared-shape local
+#     helper (defined once per file) that asserts `t.find("detected memory
+#     leaks") != npos` AND excludes UAF/double-free/SEGV text.
+# (c) `expectLeakNotCrash(prog)` — 4 rows, 1 file
+#     (using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp). Asserts
+#     `r.ran == false`, a `sawLeakReport` flag set from a leak headline, and
+#     the absence of every crash-signature string (SEGV/DEADLYSIGNAL/wild
+#     jump/heap-buffer-overflow) — mirrors (d)'s inline shape as a helper.
+# (d) An inline instance of (c)'s exact shape — 1 row
+#     (plain_var_vtableless_builtin_discard_leak_4185_test.cpp), the control
+#     row (c)'s file's own header comment says round 1's review asked for.
+# (e) `diagnosticMessageContains(r, "LSan/ASan at exit")` — 2 rows, 2 files.
+#
+# scripts/gate/tests/test_sanitizer_evidence.py's
+# test_the_shipped_leak_exempt_file_names_only_real_tests confirms every
+# declared key below resolves to a real `BEZEL_TEST(suite, name)` (catches a
+# STALE entry whose row was deleted or renamed); it does NOT re-derive the
+# full population from source patterns, because a single mechanical pattern
+# (unlike sanitizer_exempt.txt's UB rows) does not cover this file — see the
+# RESIDUAL RISK note above.
+
+class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed  # #4253: a non-sealed class's readonly record-typed property still leaks the record's owned string field on scope-end disposal. tests/codegen/class_field_record_string_release_4253_test.cpp:235
+class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor  # #4253: presence of an unrelated user constructor does not change the leak. tests/codegen/class_field_record_string_release_4253_test.cpp:273
+class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly  # #4253: a non-readonly record-typed property still leaks. tests/codegen/class_field_record_string_release_4253_test.cpp:296
+inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_factory_control_still_leaks_not_uaf  # #4265: the safe (no-UAF) control case still leaks rather than releasing cleanly. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:310
+record_declare_then_assign_call_result_release_4266.multi_assignment_site_stays_safe_no_uaf  # #4266: the multi-assignment site is safe from use-after-free but still leaks. tests/codegen/record_declare_then_assign_call_result_release_4266_test.cpp:455
+record_factory_unbound_temporary_argument_uaf_4322.unrelated_second_argument_no_longer_uaf_but_leaks_call_wide  # #4322: fixing the UAF on the unrelated second argument left a call-wide leak. tests/codegen/record_factory_unbound_temporary_argument_uaf_4322_test.cpp:245
+nested_record_string_field_leak_4237.nested_field_is_borrowed_identifier_not_admitted_no_uaf  # #4237: a borrowed-identifier nested field is not UAF-admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:298
+nested_record_string_field_leak_4237.nested_construction_borrowed_string_arg_not_admitted_no_uaf  # #4237: a borrowed string argument to nested construction is not admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:337
+record_factory_call_wide_release_suppression_scope_4342.bound_call_result_unrelated_arg_still_leaks_call_wide  # #4342: a bound call result's unrelated argument still leaks call-wide. tests/codegen/record_factory_call_wide_release_suppression_scope_4342_test.cpp:160
+record_factory_param_passthrough_admitted_4295.double_embed_same_parameter_stays_rejected_no_uaf  # #4295: double-embedding the same parameter stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:402
+record_factory_param_passthrough_admitted_4295.ref_parameter_passthrough_stays_rejected_no_uaf  # #4295: ref-parameter passthrough stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:408
+
+# ── pattern (b): expectLeakButNoMemoryError(r) — 19 rows, 5 files ──────────
+codegen_async_generic_string_local_release_2807.async_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: an async-assigned string param deliberately does not free the caller's copy; expectLeakButNoMemoryError pins leak-not-corruption. tests/codegen/async_generic_string_local_release_2807_test.cpp:604
+codegen_async_generic_string_local_release_2807.generic_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: same for the generic-assigned case. tests/codegen/async_generic_string_local_release_2807_test.cpp:618
+codegen_iterator_lambda_ctor_string_local_release_2817.lambda_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: a lambda-assigned string param does not free the caller's copy. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:986
+codegen_iterator_lambda_ctor_string_local_release_2817.async_lambda_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: async-lambda variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1000
+codegen_iterator_lambda_ctor_string_local_release_2817.sync_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: sync-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1014
+codegen_iterator_lambda_ctor_string_local_release_2817.async_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: async-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1028
+codegen_iterator_lambda_ctor_string_local_release_2817.constructor_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: constructor variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1042
+codegen_string_index_arg_release_2717.record_receiver_index_is_deliberately_not_released_spec_9_7  # spec §9.7: a record receiver's string-index argument is deliberately not released. tests/codegen/string_index_arg_release_2717_test.cpp:960
+codegen_string_index_arg_release_2717.interface_receiver_index_is_deliberately_not_released_spec_11  # spec §11: interface-receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:976
+codegen_string_index_arg_release_2717.string_element_getter_index_is_deliberately_not_released_spec_23_4  # spec §23.4: string-element getter index variant. tests/codegen/string_index_arg_release_2717_test.cpp:992
+codegen_string_index_arg_release_2717.object_element_index_is_not_released_spec_23_4  # spec §23.4: object-element index variant. tests/codegen/string_index_arg_release_2717_test.cpp:1040
+codegen_string_index_arg_release_2717.bare_generic_element_via_this_receiver_is_not_released_spec_14_1  # spec §14.1: bare generic element via `this` receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:1060
+codegen_string_index_arg_release_2717.named_local_index_with_string_element_is_not_armed_spec_4_6  # spec §4.6: named-local index, string element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1081
+codegen_string_index_arg_release_2717.named_local_index_with_object_element_is_not_armed_spec_4_6  # spec §4.6: named-local index, object element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1095
+codegen_string_local_copy_release_2764.alias_stored_into_class_field_still_leaks_spec_28_9  # spec §28.9: an alias stored into a class field still leaks. tests/codegen/string_local_copy_release_2764_test.cpp:692
+codegen_string_local_copy_release_2764.nullable_copy_target_is_deliberately_excluded_spec_7  # spec §7: a nullable copy target is deliberately excluded from the release fix. tests/codegen/string_local_copy_release_2764_test.cpp:726
+codegen_string_local_copy_release_2764.using_var_copy_target_is_deliberately_excluded_spec_28_10  # spec §28.10: a `using var` copy target is deliberately excluded. tests/codegen/string_local_copy_release_2764_test.cpp:740
+dict_shadow_class_string_key_guard_3897.shadow_dict_indexer_aliasing_getter_not_armed_spec_23_4  # spec §23.4: a shadowed-dict indexer aliasing getter is not armed by the guard. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:235
+dict_shadow_class_string_key_guard_3897.shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9  # spec §28.9: a shadowed-dict generic method aliasing its return is not armed. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:253
+
+# ── pattern (c): expectLeakNotCrash(prog) — 4 rows, 1 file ─────────────────
+using_var_discard_vtableless_builtin_4224.shared_using_var_discard_looped_leaks_not_crashes  # #4224: a discarded `using var Shared<T>` builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes) under repetition. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:180
+using_var_discard_vtableless_builtin_4224.weak_using_var_discard_looped_leaks_not_crashes  # #4224: Weak<T> variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:213
+using_var_discard_vtableless_builtin_4224.jsonserializer_using_var_discard_looped_leaks_not_crashes  # #4224: JsonSerializer variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:239
+using_var_discard_vtableless_builtin_4224.sharedeventsource_using_var_discard_looped_leaks_not_crashes  # #4224: SharedEventSource variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:265
+
+# ── pattern (d): inline sawLeakReport shape (same as (c)) — 1 row ─────────
+plain_var_vtableless_builtin_discard_leak_4185.shared_uncovered_builtin_still_leaks_not_crashes  # #4185: a discarded plain-var Shared<Widget> builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes); the control row #4224's review round 1 asked for. tests/codegen/plain_var_vtableless_builtin_discard_leak_4185_test.cpp:244
+
+# ── pattern (e): diagnosticMessageContains(r, "LSan/ASan at exit") — 2 rows, 2 files ──
+codegen_narrowed_value_op_arg_release_3116.unnarrowed_object_call_argument_still_leaks_as_expected  # #3892/#3895: an unnarrowed Object-typed call argument still leaks, as expected — not a compiler crash or unrelated signal. tests/codegen/narrowed_value_op_arg_release_3116_test.cpp:290
+dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_28_9  # spec §28.9: the dict VALUE-position argument is deliberately NOT claimed by the #3887/#3888 fix, so it must still trip LeakSanitizer on both sides of that commit — the inverse control of the rows above it in the same file. tests/codegen/dict_sorted_key_local_release_3887_3888_test.cpp:388

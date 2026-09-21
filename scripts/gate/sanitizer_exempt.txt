@@ -1,6 +1,11 @@
 # sanitizer_exempt.txt — tests whose generated-code sanitizer CORRUPTION report
 # is the SPECIFIED outcome, not a defect (#4533).
 #
+# This file is CORRUPTION only. For a deliberate LEAK assertion
+# (`leaksAtLeast`), see the sibling file sanitizer_leak_exempt.txt (#4537) —
+# a different rationale (an on-purpose assertion, not a UB allowance), so a
+# separate list rather than one file conflating the two.
+#
 # Read by scripts/gate/sanitizer.py. Format: one `suite.name` per line, with
 # the reason after a `#`. Blank lines and full-line comments are ignored; a
 # MISSING file is an empty set, so losing this file makes the gate stricter,

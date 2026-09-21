@@ -13,8 +13,12 @@ life of the sharded gate.
 Lifting the headlines is not enough on its own, because A REPORT IS NOT
 UNIFORMLY A DEFECT:
 
-  * ~11 rows in 7 files ASSERT a leak (`leaksAtLeast`) and re-emit a real
-    LeakSanitizer report while PASSING;
+  * 37 rows across 5 distinct helper/assertion shapes (`leaksAtLeast`,
+    `expectLeakButNoMemoryError`, `expectLeakNotCrash`, an inline equivalent,
+    and `diagnosticMessageContains(r, "LSan/ASan at exit")` — see
+    scripts/gate/sanitizer_leak_exempt.txt) ASSERT a leak and re-emit a real
+    LeakSanitizer report while PASSING; a naive grep for `leaksAtLeast` alone
+    finds only 11 of them (fix #4537's own investigation);
   * rows that exercise §28.2 use-after-dispose in UNCHECKED mode are running a
     program whose behaviour the spec leaves UNDEFINED — generated-code ASan
     reports it, and the row passes because it deliberately asserts nothing
@@ -45,11 +49,21 @@ THE RULE IT IMPLEMENTS
                                     SPECIFIED outcome says so out loud, in a
                                     tracked file, and every other one reds the
                                     cycle by name.
-  * a LEAK headline              -> counted, named and reported; never fatal.
-                                    The deliberate `leaksAtLeast` population is
-                                    large and the class is not memory
-                                    corruption. Tightening this leg needs a
-                                    banked clean-run baseline — issue #4537.
+  * a LEAK headline (`ERROR: LeakSanitizer`) in a test that FAILED, or that is
+    UNATTRIBUTED, or in a test that PASSED but is not declared in
+    scripts/gate/sanitizer_leak_exempt.txt
+                                 -> FATAL, by the identical rule as corruption
+                                    above (#4537). The 37 rows (5 distinct
+                                    assertion shapes) that deliberately assert
+                                    a leak declare themselves there, exactly as
+                                    sanitizer_exempt.txt's corruption row
+                                    declares itself; the file is separate
+                                    because the rationale is different (a
+                                    deliberate assertion, not a UB allowance).
+                                    An undeclared leak — a real leak the row's
+                                    own oracle does not see — now reds the
+                                    cycle by name instead of only being
+                                    counted.
 
 `scan` runs inside tests/run_parallel.sh, over the per-shard logs, WHILE THEY
 STILL EXIST (the runner reaps them on a clean exit). `verdict` runs inside
@@ -70,6 +84,15 @@ REPORT_RE = re.compile(
 # headline is `ERROR: LeakSanitizer` and its only AddressSanitizer mention is
 # `SUMMARY: AddressSanitizer: N byte(s) leaked`, so the two never collide here.
 CORRUPTION_RE = re.compile(r"ERROR: AddressSanitizer")
+# fix #4537: the LEAK-specific headline, symmetric with CORRUPTION_RE. NOT the
+# same set as "REPORT_RE minus CORRUPTION_RE" — the `aot-asan #1822] sanitizer
+# fired` banner line matches REPORT_RE's second alternative on EVERY report
+# (leak or corruption alike) but is neither headline itself, so deriving
+# "leak" as markers-corruption double-counts the banner as a leak on a
+# corruption-only report. Measured: a bare CORRUPTION fixture scans as
+# markers=2 (banner + headline), corruption=1 — markers-corruption=1 would
+# read as one undeclared leak on a report that has none.
+LEAK_RE = re.compile(r"ERROR: LeakSanitizer")
 
 ENTER_RE = re.compile(r"^\[san-scope\] enter (\S+)$")
 LEAVE_RE = re.compile(r"^\[san-scope\] leave (\S+) (pass|fail)$")
@@ -85,11 +108,12 @@ EVIDENCE_RE = re.compile(
     r" (?P<hits>\d+) report marker\(s\) in (?P<files>\d+) of "
     r"(?P<scanned>\d+) shard log\(s\) scanned, (?P<corrupt>\d+) corruption "
     r"headline\(s\); attributed (?P<failing>\d+) failing, (?P<passing>\d+) "
-    r"passing, (?P<unattributed>\d+) unattributed$")
+    r"passing, (?P<unattributed>\d+) unattributed; "
+    r"(?P<leak_unattributed>\d+) leak report\(s\) unattributed$")
 SCOPE_LINE_RE = re.compile(
     r"^" + re.escape(SCOPE_PREFIX) +
     r" (?P<test>\S+) (?P<outcome>pass|fail) markers=(?P<markers>\d+) "
-    r"corruption=(?P<corruption>\d+)$")
+    r"corruption=(?P<corruption>\d+) leak=(?P<leak>\d+)$")
 
 
 class Scan(object):
@@ -100,8 +124,14 @@ class Scan(object):
         self.files = 0            # shard logs holding >= 1 report marker
         self.hits = 0             # report-marker lines
         self.corrupt = 0          # corruption headline lines
-        self.by_test = {}         # "suite.name" -> {outcome, markers, corruption}
+        self.leak = 0             # leak headline lines (parallels self.corrupt)
+        self.by_test = {}         # "suite.name" -> {outcome, markers, corruption, leak}
         self.unattributed = 0     # corruption lines with no enclosing scope
+        # fix #4537: LEAK_RE headline lines with no enclosing scope. A
+        # SEPARATE counter from `unattributed`, not folded into it — the
+        # ScannerTest invariant `sum(attributed()) == corrupt` would otherwise
+        # break the moment a leak line landed here too.
+        self.unattributed_leaks = 0
         self.excerpts = []        # (basename, [lines]) — bounded, for the reader
 
     # Counts of CORRUPTION by attribution; the three sum to self.corrupt.
@@ -113,17 +143,29 @@ class Scan(object):
         return failing, passing, self.unattributed
 
 
-def _record(scan, test, outcome, markers, corruption):
-    if not markers and not corruption:
+def _record(scan, test, outcome, markers, corruption, leak):
+    if not markers and not corruption and not leak:
         return
     row = scan.by_test.setdefault(
-        test, {"outcome": outcome, "markers": 0, "corruption": 0})
+        test, {"outcome": outcome, "markers": 0, "corruption": 0, "leak": 0})
     # A test that failed anywhere is reported as failed: the FATAL rule must not
     # be dodged by a second, passing occurrence of the same name in another shard.
     if outcome == "fail":
         row["outcome"] = "fail"
     row["markers"] += markers
     row["corruption"] += corruption
+    row["leak"] += leak
+
+
+def _flush_unattributed(scan, pending):
+    """`pending` is [markers, corruption, leak] for a scope that never reached
+    a matching `leave` (crashed shard, or a `leave` with a mismatched name).
+    Both the corruption remainder AND the leak remainder become unattributed
+    — losing either is the one outcome not allowed (#4533, #4537)."""
+    if pending[1]:
+        scan.unattributed += pending[1]
+    if pending[2]:
+        scan.unattributed_leaks += pending[2]
 
 
 def scan_log(scan, path):
@@ -133,8 +175,8 @@ def scan_log(scan, path):
     them. `errors="replace"` because a test program's stderr is arbitrary
     bytes. Returns True if the log held at least one report marker.
     """
-    cur = None          # the test currently open, or None
-    pending = [0, 0]    # [markers, corruption] seen since `enter`
+    cur = None             # the test currently open, or None
+    pending = [0, 0, 0]    # [markers, corruption, leak] seen since `enter`
     hits_here = 0
     try:
         fh = open(path, "r", errors="replace")
@@ -147,38 +189,45 @@ def scan_log(scan, path):
             if m:
                 # An UNCLOSED scope (the previous test never reached `leave` —
                 # it crashed the shard) keeps its reports rather than silently
-                # dropping them: they become unattributed, which is FATAL for
-                # corruption. Losing evidence is the one outcome not allowed.
-                if cur is not None and pending[1]:
-                    scan.unattributed += pending[1]
-                cur, pending = m.group(1), [0, 0]
+                # dropping them: they become unattributed, which is FATAL.
+                if cur is not None:
+                    _flush_unattributed(scan, pending)
+                cur, pending = m.group(1), [0, 0, 0]
                 continue
             m = LEAVE_RE.match(line)
             if m:
                 name, outcome = m.group(1), m.group(2)
                 if cur is not None and name == cur:
-                    _record(scan, name, outcome, pending[0], pending[1])
-                elif pending[1]:
-                    scan.unattributed += pending[1]
-                cur, pending = None, [0, 0]
+                    _record(scan, name, outcome, pending[0], pending[1], pending[2])
+                elif cur is not None:
+                    _flush_unattributed(scan, pending)
+                cur, pending = None, [0, 0, 0]
                 continue
             if not REPORT_RE.search(line):
                 continue
             hits_here += 1
             scan.hits += 1
             is_corrupt = bool(CORRUPTION_RE.search(line))
+            is_leak = bool(LEAK_RE.search(line))
             if is_corrupt:
                 scan.corrupt += 1
+            if is_leak:
+                scan.leak += 1
             if cur is None:
                 # No enclosing scope: the markers are off (the plain oracle), or
-                # a worker thread reported after the body returned.
+                # a worker thread reported after the body returned. The banner
+                # line alone (neither corrupt nor leak) carries no evidence to
+                # lose, so only a real headline needs to become unattributed.
                 if is_corrupt:
                     scan.unattributed += 1
+                elif is_leak:
+                    scan.unattributed_leaks += 1
             else:
                 pending[0] += 1
                 pending[1] += 1 if is_corrupt else 0
-        if cur is not None and pending[1]:
-            scan.unattributed += pending[1]
+                pending[2] += 1 if is_leak else 0
+        if cur is not None:
+            _flush_unattributed(scan, pending)
     return hits_here > 0
 
 
@@ -245,14 +294,15 @@ def format_scan(scan):
     failing, passing, unattributed = scan.attributed()
     out = ["%s %d report marker(s) in %d of %d shard log(s) scanned, "
            "%d corruption headline(s); attributed %d failing, %d passing, "
-           "%d unattributed"
+           "%d unattributed; %d leak report(s) unattributed"
            % (EVIDENCE_PREFIX, scan.hits, scan.files, scan.scanned,
-              scan.corrupt, failing, passing, unattributed)]
+              scan.corrupt, failing, passing, unattributed,
+              scan.unattributed_leaks)]
     for test in sorted(scan.by_test):
         row = scan.by_test[test]
-        out.append("%s %s %s markers=%d corruption=%d"
+        out.append("%s %s %s markers=%d corruption=%d leak=%d"
                    % (SCOPE_PREFIX, test, row["outcome"], row["markers"],
-                      row["corruption"]))
+                      row["corruption"], row["leak"]))
     if scan.hits:
         out.append(EXCERPT_HEADER)
         for name, lines in scan.excerpts:
@@ -306,7 +356,8 @@ def parse_lifted(text):
             d = m.groupdict()
             rows.append({"test": d["test"], "outcome": d["outcome"],
                          "markers": int(d["markers"]),
-                         "corruption": int(d["corruption"])})
+                         "corruption": int(d["corruption"]),
+                         "leak": int(d["leak"])})
     return ev, rows
 
 
@@ -315,8 +366,18 @@ FATAL = 1
 OK = 0
 
 
-def verdict(ev, rows, exempt):
-    """(rc, lines) — the gate's decision over one lifted scan."""
+def verdict(ev, rows, exempt, leak_exempt=None):
+    """(rc, lines) — the gate's decision over one lifted scan.
+
+    `exempt` declares CORRUPTION rows whose crash is the spec's SPECIFIED
+    outcome (scripts/gate/sanitizer_exempt.txt). `leak_exempt` declares LEAK
+    rows that deliberately ASSERT a leak (scripts/gate/sanitizer_leak_exempt.txt,
+    #4537) — a different rationale, so a separate list; a test can appear in
+    both, one, or neither. Both are applied by the identical rule: fatal in a
+    failing test regardless of declaration, fatal in a passing test unless
+    declared, allowed when declared.
+    """
+    leak_exempt = leak_exempt or {}
     if ev is None:
         return UNWIRED, ["no %s accounting line — the sanitizer-evidence "
                          "channel is not wired, and a zero from an unwired "
@@ -327,36 +388,63 @@ def verdict(ev, rows, exempt):
                          "its zero means nothing (#4533)"]
     lines, fatal = [], False
     for row in sorted(rows, key=lambda r: r["test"]):
-        if not row["corruption"]:
-            continue
-        if row["outcome"] == "fail":
-            fatal = True
-            lines.append("FATAL  %s — %d corruption headline(s) in a FAILING "
-                         "test: deterministic evidence, not arbitrable"
-                         % (row["test"], row["corruption"]))
-        elif row["test"] in exempt:
-            lines.append("allowed %s — %d corruption headline(s) in a passing "
-                         "test, declared in sanitizer_exempt.txt: %s"
-                         % (row["test"], row["corruption"],
-                            exempt[row["test"]] or "(no reason recorded)"))
-        else:
-            fatal = True
-            lines.append("FATAL  %s — %d corruption headline(s) in a PASSING "
-                         "test, not declared in sanitizer_exempt.txt. Either "
-                         "it is a memory-safety defect the row's oracle does "
-                         "not see, or the row deliberately runs an undefined "
-                         "program and must say so in that file."
-                         % (row["test"], row["corruption"]))
+        if row["corruption"]:
+            if row["outcome"] == "fail":
+                fatal = True
+                lines.append("FATAL  %s — %d corruption headline(s) in a "
+                             "FAILING test: deterministic evidence, not "
+                             "arbitrable" % (row["test"], row["corruption"]))
+            elif row["test"] in exempt:
+                lines.append("allowed %s — %d corruption headline(s) in a "
+                             "passing test, declared in sanitizer_exempt.txt: %s"
+                             % (row["test"], row["corruption"],
+                                exempt[row["test"]] or "(no reason recorded)"))
+            else:
+                fatal = True
+                lines.append("FATAL  %s — %d corruption headline(s) in a "
+                             "PASSING test, not declared in "
+                             "sanitizer_exempt.txt. Either it is a "
+                             "memory-safety defect the row's oracle does not "
+                             "see, or the row deliberately runs an undefined "
+                             "program and must say so in that file."
+                             % (row["test"], row["corruption"]))
+        # fix #4537: a LEAK headline on this row (LEAK_RE, not merely
+        # "markers minus corruption" — the banner line matches REPORT_RE on
+        # every report and is neither headline) is fatal by the identical
+        # rule, against the SEPARATE leak_exempt list.
+        leaks_here = row["leak"]
+        if leaks_here:
+            if row["outcome"] == "fail":
+                fatal = True
+                lines.append("FATAL  %s — %d leak report(s) in a FAILING "
+                             "test: deterministic evidence, not arbitrable "
+                             "(#4537)" % (row["test"], leaks_here))
+            elif row["test"] in leak_exempt:
+                lines.append("allowed %s — %d leak report(s) in a passing "
+                             "test, declared in sanitizer_leak_exempt.txt: %s"
+                             % (row["test"], leaks_here,
+                                leak_exempt[row["test"]] or
+                                "(no reason recorded)"))
+            else:
+                fatal = True
+                lines.append("FATAL  %s — %d leak report(s) in a PASSING "
+                             "test, not declared in "
+                             "sanitizer_leak_exempt.txt. Either it is a real "
+                             "leak the row's oracle does not see, or the row "
+                             "deliberately asserts one and must say so in "
+                             "that file (#4537)." % (row["test"], leaks_here))
     if ev["unattributed"]:
         fatal = True
         lines.append("FATAL  %d corruption headline(s) could not be attributed "
                      "to any test (no enclosing [san-scope] marker). An "
                      "unprovable report is not an excused one."
                      % ev["unattributed"])
-    leaks = ev["hits"] - ev["corrupt"]
-    if leaks > 0:
-        lines.append("note   %d leak report marker(s): counted and recorded, "
-                     "not fatal (#4537)" % leaks)
+    if ev.get("leak_unattributed"):
+        fatal = True
+        lines.append("FATAL  %d leak report(s) could not be attributed to "
+                     "any test (no enclosing [san-scope] marker). An "
+                     "unprovable report is not an excused one (#4537)."
+                     % ev["leak_unattributed"])
     return (FATAL if fatal else OK), lines
 
 
@@ -371,6 +459,15 @@ def main(argv=None):
     v.add_argument("--shard-log", required=True)
     v.add_argument("--exempt", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "sanitizer_exempt.txt"))
+    # fix #4537: a SEPARATE declared-exemption list for deliberate LEAK
+    # assertions (leaksAtLeast rows) — a different rationale from the
+    # UB-corruption list above, so a different file. gate.sh's
+    # gate_sanitizer_verdict() never passes either --exempt flag, so both
+    # defaults (computed here, next to this script) are what the gate
+    # actually consults.
+    v.add_argument("--leak-exempt", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "sanitizer_leak_exempt.txt"))
 
     args = ap.parse_args(argv)
     if args.cmd == "scan":
@@ -384,7 +481,8 @@ def main(argv=None):
         print("cannot read %s: %s" % (args.shard_log, exc), file=sys.stderr)
         return UNWIRED
     ev, rows = parse_lifted(text)
-    rc, lines = verdict(ev, rows, read_exempt(args.exempt))
+    rc, lines = verdict(ev, rows, read_exempt(args.exempt),
+                        read_exempt(args.leak_exempt))
     for line in lines:
         print(line)
     return rc

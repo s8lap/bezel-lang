@@ -885,10 +885,11 @@ else
       # (#4533 records the canary as unaffected "because it reads a direct
       # binary run"; that is not what the line above does.) It now reads the
       # same lifted channel, through the same reader, and the same judgement:
-      # a LEAK is not evidence (`leaksAtLeast` rows re-emit a real LSan report
-      # and PASS, and a diff that touches one would otherwise hard-fail a
-      # healthy canary), corruption in a passing row is evidence unless the row
-      # declares itself in sanitizer_exempt.txt.
+      # corruption in a passing row is evidence unless the row declares itself
+      # in sanitizer_exempt.txt; a LEAK in a passing row is evidence unless the
+      # row declares itself in sanitizer_leak_exempt.txt (fix #4537 — the 11
+      # `leaksAtLeast` rows do, so a diff that touches only those does not
+      # hard-fail a healthy canary).
       #
       # gate.canary.decide's contract is `asan_hits > 0 -> FAIL_HARD`; WHICH
       # reports count as evidence is the bash side's job (canary.py: "what stays
@@ -1039,16 +1040,21 @@ grep -E 'TOTAL:|## GATE FAILURE|died on|actual FAIL|--- failing' "$S/gate_shard.
 #   * LIVENESS IS ASSERTED. A missing accounting line fails the phase instead of
 #     reading as "clean" — a guard that cannot fire is the defect being fixed,
 #     so the gate must refuse a zero it did not actually measure.
-#   * THE HARD-FAIL KEYS ON CORRUPTION. `ERROR: AddressSanitizer` (UAF / OOB /
-#     double-free) is never deliberate in this tree and fails the cycle on the
-#     spot, independent of rc and of arbitration. A LEAK headline
-#     (`ERROR: LeakSanitizer`) is counted, printed and recorded but does NOT
-#     fail, because 11 rows in 7 files deliberately ASSERT a leak
-#     (`leaksAtLeast`) and re-emit a real LSan report while PASSING — hard-
-#     failing on those would red every --full cycle, and on a ceiling-killed
-#     run would also convert the #3667 RETRY into a FAIL. Tightening that leg
-#     needs a banked clean-run baseline (a lane cannot measure one) — #4533's
-#     follow-up.
+#   * THE HARD-FAIL KEYS ON CORRUPTION AND ON UNDECLARED LEAKS. `ERROR:
+#     AddressSanitizer` (UAF / OOB / double-free) is never deliberate in this
+#     tree and fails the cycle on the spot, independent of rc and of
+#     arbitration, UNLESS the test declares itself in
+#     scripts/gate/sanitizer_exempt.txt (its crash is the spec's SPECIFIED
+#     outcome). A LEAK headline (`ERROR: LeakSanitizer`) is fatal by the
+#     identical rule against a SEPARATE list, sanitizer_leak_exempt.txt
+#     (fix #4537): 37 rows across 5 distinct deliberate-leak-assertion shapes
+#     (not just `leaksAtLeast` — the naive grep for that alone finds only 11;
+#     see the file's own header for the other four) re-emit a real LSan report
+#     while PASSING, and declare themselves there — every other leak now reds
+#     the cycle by name, same as undeclared corruption. Both lists are read by
+#     scripts/gate/sanitizer.py's verdict(); gate_sanitizer_verdict() below
+#     never passes --exempt/--leak-exempt, so the DEFAULT paths (computed next
+#     to sanitizer.py) are what the gate actually consults.
 if [ "$ASAN" -eq 1 ]; then
   PHASE_T0=$(now)  # shard_asan is only the harvest; the ASan compile+run time is
                    # already attributed to the 'shard' phase above (no double-count).

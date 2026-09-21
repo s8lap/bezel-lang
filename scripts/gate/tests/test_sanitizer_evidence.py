@@ -1,5 +1,16 @@
-"""#4533 — the sharded sanitizer-report hard-fail must be able to FIRE, and it
-must fire on the right thing.
+"""#4533 (+ #4537) — the sharded sanitizer-report hard-fail must be able to
+FIRE, and it must fire on the right thing.
+
+#4537 closes the residual gap #4533 deliberately left open: a LEAK report
+(`ERROR: LeakSanitizer`) in a test that PASSED was counted and printed but
+never fatal, because 37 rows across 5 distinct assertion shapes deliberately
+assert one (a naive grep for `leaksAtLeast` alone finds only 11 of them — see
+scripts/gate/sanitizer_leak_exempt.txt for the other four). Since #4533's
+`[san-scope]` markers already attribute every report to its test, the fix is
+the identical rule corruption already gets — fatal in a failing test, fatal in
+a passing test unless declared, allowed when declared — against a SEPARATE
+list (scripts/gate/sanitizer_leak_exempt.txt) because the rationale is
+different: a leak row is a deliberate ASSERTION, not a UB allowance.
 
 THE DEFECT. `scripts/gate.sh` treats a fired generated-code sanitizer report as
 DETERMINISTIC evidence of a memory error and hard-fails on it, independent of
@@ -267,13 +278,50 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(sc.by_test["s.x"]["outcome"], "fail")
             self.assertEqual(sc.attributed(), (2, 0, 0))
 
+    # ── fix #4537: leaks get the SAME fail-closed attribution as corruption,
+    # tracked in a SEPARATE counter (unattributed_leaks) so the pre-existing
+    # `sum(attributed()) == corrupt` invariant above cannot be diluted by a
+    # leak line landing in the corruption bucket.
+
+    def test_a_leak_outside_every_scope_is_unattributed_not_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sc = S.scan_logdir(_logdir(tmp, **{"a.0": LEAK}))
+            self.assertGreater(sc.hits, 0)
+            self.assertEqual(sc.corrupt, 0)
+            self.assertEqual(sc.unattributed_leaks, 1)
+            self.assertEqual(sc.by_test, {})
+
+    def test_an_unclosed_scope_keeps_its_leak_evidence(self):
+        """A shard that died mid-test never writes `leave`. Its leak report
+        must become unattributed — which #4537 makes FATAL — not vanish."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = ("[san-scope] enter s.crashed\n" + LEAK)
+            sc = S.scan_logdir(_logdir(tmp, **{"a.0": body}))
+            self.assertEqual(sc.unattributed_leaks, 1)
+            self.assertEqual(sc.by_test, {})
+
+    def test_every_leak_line_lands_in_exactly_one_bucket(self):
+        """The leak sibling of test_every_corruption_line_lands_in_exactly_one_
+        bucket: attributed (via by_test rows) + unattributed_leaks must equal
+        every leak line seen, or one could silently evade #4537."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _logdir(tmp, **{
+                "a.0": _scope("s.p", "pass", LEAK) + LEAK,
+                "a.1": _scope("s.f", "fail", LEAK + CORRUPTION),
+                "a.2": "[san-scope] enter s.crashed\n" + LEAK,
+                "a.3": _scope("s.clean", "pass", CORRUPTION)})
+            sc = S.scan_logdir(d)
+            attributed_leaks = sum(r["leak"] for r in sc.by_test.values())
+            self.assertEqual(sc.leak, attributed_leaks + sc.unattributed_leaks)
+            self.assertEqual((attributed_leaks, sc.unattributed_leaks), (2, 2))
+
 
 class VerdictTest(unittest.TestCase):
     """The decision, over the shapes the gate must tell apart."""
 
-    def _v(self, scan, exempt=None):
+    def _v(self, scan, exempt=None, leak_exempt=None):
         ev, rows = S.parse_lifted("\n".join(S.format_scan(scan)))
-        return S.verdict(ev, rows, exempt or {})
+        return S.verdict(ev, rows, exempt or {}, leak_exempt or {})
 
     def _scan(self, **logs):
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,14 +376,53 @@ class VerdictTest(unittest.TestCase):
         self.assertIn("could not be attributed", "\n".join(lines))
         self.assertIn("not an excused one", "\n".join(lines))
 
-    def test_a_leak_is_noted_not_fatal(self):
+    # ── fix #4537: a leak is now fatal by the IDENTICAL rule as corruption,
+    # against the separate leak_exempt list.
+
+    def test_leak_in_an_undeclared_passing_test_is_FATAL_and_names_it(self):
         rc, lines = self._v(self._scan(**{"a.0": _scope("s.leak", "pass", LEAK)}))
-        self.assertEqual(rc, S.OK)
-        self.assertIn("leak report marker(s)", "\n".join(lines))
+        self.assertEqual(rc, S.FATAL)
+        self.assertIn("FATAL  s.leak", "\n".join(lines))
+        self.assertIn("sanitizer_leak_exempt.txt", "\n".join(lines),
+                      "the cycle must say how to declare a deliberate leak row")
         self.assertIn("#4537", "\n".join(lines))
+
+    def test_leak_in_a_declared_passing_test_is_allowed_and_says_why(self):
+        rc, lines = self._v(
+            self._scan(**{"a.0": _scope("s.leak", "pass", LEAK)}),
+            leak_exempt={"s.leak": "leaksAtLeast — deliberate assertion"})
+        self.assertEqual(rc, S.OK)
+        self.assertIn("allowed s.leak", "\n".join(lines))
+        self.assertIn("leaksAtLeast", "\n".join(lines))
+
+    def test_leak_in_a_failing_test_is_FATAL_even_when_leak_declared(self):
+        """Same rule as corruption: the list is consulted only for tests that
+        PASSED — a leak declaration is not a licence in a failing test."""
+        rc, _ = self._v(
+            self._scan(**{"a.0": _scope("s.leak", "fail", LEAK)}),
+            leak_exempt={"s.leak": "deliberate"})
+        self.assertEqual(rc, S.FATAL)
+
+    def test_a_corruption_exemption_does_not_excuse_a_leak_in_the_same_row(self):
+        """The two lists are independent — declaring a row in
+        sanitizer_exempt.txt (corruption) says nothing about a leak the same
+        row also produced."""
+        body = CORRUPTION + LEAK
+        rc, lines = self._v(self._scan(**{"a.0": _scope("s.both", "pass", body)}),
+                            exempt={"s.both": "the corruption is UB"})
+        self.assertEqual(rc, S.FATAL)
+        self.assertIn("allowed s.both", "\n".join(lines))   # the corruption half
+        self.assertIn("FATAL  s.both", "\n".join(lines))    # the undeclared leak
+
+    def test_unattributed_leak_is_FATAL(self):
+        rc, lines = self._v(self._scan(**{"a.0": LEAK}))
+        self.assertEqual(rc, S.FATAL)
+        self.assertIn("leak report(s) could not be attributed", "\n".join(lines))
+        self.assertIn("not an excused one", "\n".join(lines))
 
     def test_a_missing_exempt_file_makes_the_gate_stricter_never_looser(self):
         self.assertEqual(S.read_exempt("/nonexistent/sanitizer_exempt.txt"), {})
+        self.assertEqual(S.read_exempt("/nonexistent/sanitizer_leak_exempt.txt"), {})
 
     def test_the_shipped_exempt_file_parses_and_every_entry_has_a_reason(self):
         path = SCRIPTS / "gate" / "sanitizer_exempt.txt"
@@ -345,6 +432,86 @@ class VerdictTest(unittest.TestCase):
                 reason,
                 "%s is exempted with no reason — an undocumented exemption is "
                 "indistinguishable from a silenced defect" % name)
+
+    def test_the_shipped_leak_exempt_file_parses_and_every_entry_has_a_reason(self):
+        path = SCRIPTS / "gate" / "sanitizer_leak_exempt.txt"
+        self.assertTrue(path.exists(), "the leak-exemption file must be tracked")
+        for name, reason in S.read_exempt(str(path)).items():
+            self.assertTrue(
+                reason,
+                "%s is exempted with no reason — an undocumented exemption is "
+                "indistinguishable from a silenced defect" % name)
+
+    @staticmethod
+    def _all_bezel_tests():
+        """Every "suite.name" declared anywhere under tests/**/*.cpp via
+        BEZEL_TEST(suite, name). Used to catch a STALE leak-exempt entry (row
+        deleted or renamed) without assuming any one source pattern."""
+        import re
+        test_re = re.compile(
+            r"BEZEL_TEST\(\s*([A-Za-z0-9_]+)\s*,\s*\n?\s*([A-Za-z0-9_]+)\s*\)")
+        found = set()
+        for path in (REPO / "tests").rglob("*.cpp"):
+            for m in test_re.finditer(path.read_text()):
+                found.add("%s.%s" % (m.group(1), m.group(2)))
+        return found
+
+    def test_the_shipped_leak_exempt_file_names_only_real_tests(self):
+        """Every declared key must resolve to a REAL BEZEL_TEST(suite, name)
+        somewhere in tests/ — catches a row that was deleted or renamed out
+        from under its declaration, which would otherwise be silent dead
+        cover (masking a real future leak in whatever replaced it).
+
+        This does NOT try to re-derive the full population from a single
+        source pattern: #4537's own investigation found FIVE distinct
+        deliberate-leak-assertion shapes (leaksAtLeast, expectLeakButNo-
+        MemoryError, expectLeakNotCrash, an inline equivalent, and
+        diagnosticMessageContains(..., "LSan/ASan at exit")) across the 37
+        rows this file declares — a single mechanical derivation would not
+        generalize the way sanitizer_exempt.txt's UB-corruption population
+        does, and pinning it to one pattern here almost shipped an
+        undercount (see sanitizer_leak_exempt.txt's RESIDUAL RISK note)."""
+        declared = set(S.read_exempt(
+            str(SCRIPTS / "gate" / "sanitizer_leak_exempt.txt")))
+        self.assertTrue(declared, "guard: the file must not be empty")
+        real = self._all_bezel_tests()
+        stale = declared - real
+        self.assertEqual(
+            stale, set(),
+            "sanitizer_leak_exempt.txt declares %r, which no longer names a "
+            "real BEZEL_TEST(suite, name) — remove the stale entry" % stale)
+
+    def test_the_leaksAtLeast_population_is_a_subset_of_the_declared_leak_exempt(self):
+        """The one sub-population that DOES have a single reliable mechanical
+        signature: every BEZEL_TEST calling EXPECT_TRUE(leaksAtLeast(...))
+        must be declared. A SUBSET check (not equality, unlike the corruption
+        file's analogous check) because #4537 found four OTHER deliberate-leak
+        shapes that also belong in this file but share no common regex with
+        this one."""
+        import re
+        test_re = re.compile(
+            r"BEZEL_TEST\(\s*([A-Za-z0-9_]+)\s*,\s*\n?\s*([A-Za-z0-9_]+)\s*\)")
+        derived = set()
+        for path in (REPO / "tests").rglob("*.cpp"):
+            text = path.read_text()
+            if "EXPECT_TRUE(leaksAtLeast" not in text:
+                continue
+            starts = [(m.start(), m.group(1), m.group(2))
+                     for m in test_re.finditer(text)]
+            starts.sort()
+            for lm in re.finditer(r"EXPECT_TRUE\(leaksAtLeast", text):
+                cand = [s for s in starts if s[0] <= lm.start()]
+                self.assertTrue(cand, "%s: leaksAtLeast with no enclosing "
+                                      "BEZEL_TEST" % path)
+                _, suite, name = cand[-1]
+                derived.add("%s.%s" % (suite, name))
+        declared = set(S.read_exempt(
+            str(SCRIPTS / "gate" / "sanitizer_leak_exempt.txt")))
+        missing = derived - declared
+        self.assertEqual(
+            missing, set(),
+            "a BEZEL_TEST calling leaksAtLeast(...) is not declared in "
+            "sanitizer_leak_exempt.txt: %r" % missing)
 
 
 def _env(tmp):
@@ -491,14 +658,32 @@ class GateBlockTest(unittest.TestCase):
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("FATAL  s.ub", r.stdout)
 
-    def test_a_leak_only_run_passes_and_is_recorded(self):
+    def test_an_undeclared_leak_only_run_FAILS_the_cycle(self):
+        """fix #4537: the residual gap #4533 left open. gate_sanitizer_verdict
+        never passes --leak-exempt, so this run consults the REAL shipped
+        sanitizer_leak_exempt.txt — "s.leak" is not in it."""
         with tempfile.TemporaryDirectory() as tmp:
             r = self._run(tmp, self._log(**{"a.0": _scope("s.leak", "pass", LEAK)}))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("GATE_FAIL: sharded ASan — memory error", r.stdout)
+            self.assertIn("FATAL  s.leak", r.stdout, "the cycle must NAME the test")
+            self.assertIn("sanitizer_leak_exempt.txt", r.stdout)
+            self.assertNotIn("AFTER_ASAN_BLOCK", r.stdout,
+                             "fail() exits before this echo is reached")
+
+    def test_a_declared_leak_only_run_passes_the_cycle(self):
+        """The 11 real leaksAtLeast rows are declared in the SHIPPED
+        sanitizer_leak_exempt.txt — exercise one end to end through the real
+        gate.sh block, not just the unit-level verdict()."""
+        declared = ("class_field_record_string_release_4253."
+                   "non_sealed_class_still_leaks_axis_sealed")
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run(tmp, self._log(**{"a.0": _scope(declared, "pass", LEAK)}))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("leak report marker(s)", r.stdout)
+            self.assertIn("allowed %s" % declared, r.stdout)
             self.assertIn("AFTER_ASAN_BLOCK ASAN_ERRS=2", r.stdout,
-                          "the marker count must reach telemetry even though it "
-                          "does not fail — a drift is then visible in the trend")
+                          "the marker count must reach telemetry even for an "
+                          "allowed leak — a drift is then visible in the trend")
 
 
 class CanaryBlockTest(unittest.TestCase):
@@ -528,13 +713,28 @@ class CanaryBlockTest(unittest.TestCase):
                           "the dual-consume marker must be recorded BEFORE the fail")
             self.assertIn("GATE_FAIL: canary ASan", r.stdout)
 
-    def test_a_leak_only_canary_does_not_brick_the_gate(self):
+    def test_an_undeclared_leak_in_the_canary_fails_hard(self):
+        """fix #4537: the canary consults the same gate_sanitizer_verdict as
+        the authoritative pass, so an undeclared leak is evidence there too —
+        the pre-#4537 "a leak never bricks the canary" behaviour is gone for
+        the undeclared case; only a DECLARED leak stays inert (see below)."""
         with tempfile.TemporaryDirectory() as tmp:
             r = self._run(tmp, GateBlockTest._log(**{"a.0": _scope("s.l", "pass", LEAK)}))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("CANARY_DUAL hard", r.stdout)
+            self.assertIn("GATE_FAIL: canary ASan", r.stdout)
+            self.assertIn("sanitizer_leak_exempt.txt", r.stdout)
+
+    def test_a_declared_leak_in_the_canary_does_not_brick_the_gate(self):
+        declared = ("class_field_record_string_release_4253."
+                   "non_sealed_class_still_leaks_axis_sealed")
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run(tmp, GateBlockTest._log(**{"a.0": _scope(declared, "pass", LEAK)}))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("AFTER_CANARY_BLOCK _c_asan=0", r.stdout,
-                          "a leak must not be handed to gate.canary.decide as "
-                          "deterministic evidence — it would FAIL_HARD")
+                          "a DECLARED leak must not be handed to "
+                          "gate.canary.decide as deterministic evidence — it "
+                          "would FAIL_HARD")
             self.assertNotIn("CANARY_DUAL", r.stdout)
 
     def test_an_unreadable_canary_channel_degrades_open_and_says_so(self):
