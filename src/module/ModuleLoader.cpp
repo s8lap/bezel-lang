@@ -1356,24 +1356,39 @@ static std::string metaNamedSimpleName(const MetaType& mt) {
 // Render a MetaType as Bezel source text for use in a synthetic class source.
 static std::string metaTypeToSourceText(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
+        std::string s;
         switch (mt.primitive) {
-            case PrimitiveKind::Bool:    return "bool";
-            case PrimitiveKind::Char:    return "char";
-            case PrimitiveKind::String:  return "string";
-            case PrimitiveKind::Byte:    return "byte";
-            case PrimitiveKind::SByte:   return "sbyte";
-            case PrimitiveKind::Short:   return "short";
-            case PrimitiveKind::UShort:  return "ushort";
-            case PrimitiveKind::Int:     return "int";
-            case PrimitiveKind::UInt:    return "uint";
-            case PrimitiveKind::Long:    return "long";
-            case PrimitiveKind::ULong:   return "ulong";
-            case PrimitiveKind::Float:   return "float";
-            case PrimitiveKind::Double:  return "double";
-            case PrimitiveKind::Decimal: return "decimal";
-            case PrimitiveKind::Object:  return "Object";
-            default: return "int";
+            case PrimitiveKind::Bool:    s = "bool";    break;
+            case PrimitiveKind::Char:    s = "char";    break;
+            case PrimitiveKind::String:  s = "string";  break;
+            case PrimitiveKind::Byte:    s = "byte";    break;
+            case PrimitiveKind::SByte:   s = "sbyte";   break;
+            case PrimitiveKind::Short:   s = "short";   break;
+            case PrimitiveKind::UShort:  s = "ushort";  break;
+            case PrimitiveKind::Int:     s = "int";     break;
+            case PrimitiveKind::UInt:    s = "uint";    break;
+            case PrimitiveKind::Long:    s = "long";    break;
+            case PrimitiveKind::ULong:   s = "ulong";   break;
+            case PrimitiveKind::Float:   s = "float";   break;
+            case PrimitiveKind::Double:  s = "double";  break;
+            case PrimitiveKind::Decimal: s = "decimal"; break;
+            case PrimitiveKind::Object:  s = "Object";  break;
+            default:                     s = "int";     break;
         }
+        // fix #4516 (§7.1 / §7.2 / §22.6, v0.306): render the nullable `?` on a
+        // PRIMITIVE, as the Named arm below has always done. Dropping it here
+        // replayed `x: int?` as `x: int` — a declared type the exporter never
+        // wrote — and, because this text is the source the §14/#705 AST-side
+        // key is re-parsed from, it also made nullability UNRENDERABLE in the
+        // key: `Pick(a: int)` beside `Pick(b: int?)` emitted two IDENTICAL
+        // stubs, which is a duplicate-member error that takes the whole
+        // reconstruction down (MEASURED: §14/#662 rejection of a program the
+        // exporter compiled). `string` and `string?` are distinct types (§7.1)
+        // and `int?` is a distinct type from `int` (§7.2), so §22.6's
+        // "overloads differing in ... types are distinguishable" covers the
+        // pair and the stub must spell the two apart.
+        if (mt.nullable) s += "?";
+        return s;
     }
     if (mt.kind == TypeKind::Named) {
         std::string s = metaNamedSimpleName(mt);  // fix #3540 — see the helper
@@ -1403,7 +1418,10 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
     // §3.1 / A.5 `TypeNoNullable ::= … | "(" ")"`: the unit type. Reached
     // mainly as a function type's return (`(string) -> ()`); a method's own
     // unit return is already omitted by buildMethodStub before it gets here.
-    if (mt.kind == TypeKind::Unit) return "()";
+    // fix #4516: `Type ::= TypeNoNullable "?"?` (A.5) admits `()?` and the
+    // parser accepts it, so the nullable form is rendered here for the same
+    // reason it is on every other spellable kind.
+    if (mt.kind == TypeKind::Unit) return mt.nullable ? "()?" : "()";
 
     // §15.1 / A.5 `InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type`.
     // The size is textual on the wire and already a folded decimal (#3183).
@@ -1460,10 +1478,44 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
 
 // §14/#705: canonical type text for a MetaType, used as a signature key for
 // overload-safe matching (not for source-code generation — that is
-// metaTypeToSourceText).  Uses ',' without space for generic args, and omits
-// the nullable '?' suffix: stubs do not reliably preserve nullability for
-// primitive types, and nullable-vs-non-nullable overloads are rare; the key's
-// purpose is to distinguish base types, not nullability.
+// metaTypeToSourceText).  Uses ',' without space for generic args, and renders
+// the nullable '?' suffix (fix #4516).
+//
+// NULLABILITY IS PART OF THE KEY (fix #4516, §7.1 / §7.2 / §22.6, v0.306).
+// This comment used to read "omits the nullable '?' suffix: stubs do not
+// reliably preserve nullability for primitive types, and nullable-vs-non-
+// nullable overloads are rare". Both halves were defects rather than reasons.
+// §7.1: "`string` and `string?` are distinct types"; §7.2 says the same of a
+// nullable value type, and §14.2 leans on it ("a nullable value type is a
+// distinct type from its non-nullable form (§7.1)"). §22.6 opens "Overload
+// resolution considers number, TYPES, the `ref`/`out` modifiers, and the
+// presence of `owned` on an ordinary parameter — overloads differing in any of
+// these are distinguishable", and closes with the same list — so a pair
+// differing only in nullability is legal, and the compiler accepts it
+// (MEASURED: a single module resolves `Pick(a: T)` beside `Pick(b: T?)` to the
+// non-nullable member and answers 105). The "stubs do not preserve it" half
+// was true of `metaTypeToSourceText`'s PRIMITIVE arm only, and that arm is the
+// other half of this fix: it now renders the `?` the Named and Function arms
+// always did, so all three sides can see it.
+//
+// MEASURED pre-fix, real `bezelc`, a `-c` library plus an importing executable:
+//   * `Pick(a: SC<T>)` beside `Pick(b: SC<T>?)` — single module 105, imported
+//     205, the OTHER overload's body. The collision of facet (a): a silent
+//     wrong value across a module boundary.
+//   * `Pick(a: int)` beside `Pick(b: int?)` — single module 105, imported
+//     REJECTED with §14/#662, because both stubs rendered `int` and the
+//     synthetic source declared the same method twice. Facet (b).
+//
+// An InlineArray is excluded: A.5 gives it no nullable form (`([2]int)?` does
+// not parse — MEASURED), so `nullable` cannot be true for one and rendering it
+// would be a spelling no side could produce.
+//
+// THE PARTICIPATING SET IS FOUR FUNCTIONS, not the three below. For obligation
+// (b) `metaTypeToSourceText` is a participant too: the AST side re-parses ITS
+// output, so a facet it cannot spell is a facet the AST key can never carry,
+// whatever these three do. That is why #4508 could not render parameter names
+// and why nullability could not be rendered before this fix — and why all four
+// move in one commit.
 //
 // THE KEY HAS TWO OBLIGATIONS, and this function is one of THREE renderers that
 // must discharge both together (fix #4508):
@@ -1490,7 +1542,20 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
 // ()` and `(owned T) -> ()` are distinct function types", and the modifier
 // string round-trips verbatim through the wire, the stub source and
 // Loader::convert).
+static std::string metaTypeSigTextCore(const MetaType& mt);
+
+// The nullability-appending wrapper (fix #4516). Every recursive use below —
+// generic arguments, function parameters and returns, an inline array's
+// element — goes through THIS function, so a nested `Box<int?>` and a nested
+// `((int) -> int)?` render their `?` exactly as a top-level one does, on all
+// three sides.
 static std::string metaTypeSigText(const MetaType& mt) {
+    std::string s = metaTypeSigTextCore(mt);
+    if (mt.nullable && mt.kind != TypeKind::InlineArray) s += '?';
+    return s;
+}
+
+static std::string metaTypeSigTextCore(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
         switch (mt.primitive) {
             case PrimitiveKind::Bool:    return "bool";
@@ -1521,7 +1586,7 @@ static std::string metaTypeSigText(const MetaType& mt) {
             }
             s += '>';
         }
-        // Nullable omitted intentionally (see comment above).
+        // The nullable `?` is appended by the `metaTypeSigText` wrapper.
         return s;
     }
 
@@ -1601,7 +1666,20 @@ static std::string metaMemberSigKey(std::string_view name,
 // param type produces the same key as the MetaParam it was generated from —
 // see metaTypeSigText's header for the two obligations both sides discharge.
 // A shape with no canonical spelling returns "?" (a no-match sentinel).
+static std::string astTypeToSigTextCore(const ast::Type* t);
+
+// The nullability-appending wrapper (fix #4516) — the AST mirror of
+// `metaTypeSigText`'s. `ast::Type::nullable` is the `?` suffix the parser read
+// back out of `metaTypeToSourceText`'s output, which now spells it on every
+// kind that has a nullable form (its PRIMITIVE arm was the gap this fix
+// closes). A `null` node has no flag to read and stays the no-match sentinel.
 static std::string astTypeToSigText(const ast::Type* t) {
+    std::string s = astTypeToSigTextCore(t);
+    if (t && t->nullable && t->kind != ast::TypeKind::InlineArray) s += '?';
+    return s;
+}
+
+static std::string astTypeToSigTextCore(const ast::Type* t) {
     if (!t) return "?";
     if (t->kind == ast::TypeKind::Unit) return "()";
 
@@ -1659,7 +1737,7 @@ static std::string astTypeToSigText(const ast::Type* t) {
             }
             s += '>';
         }
-        // Nullable omitted (mirrors metaTypeSigText).
+        // The nullable `?` is appended by the `astTypeToSigText` wrapper.
         return s;
     }
     return "?";
@@ -1689,7 +1767,20 @@ static std::string freshMethodSigKey(const sema::MethodSymbol* ms) {
 // input is `Loader::convert(MetaType)`, a field-for-field structural copy of
 // the very MetaType the other side renders, so the two stay in lockstep by
 // construction (fix #4508).
+static std::string typeRefSigTextCore(const sema::TypeRef* tr);
+
+// The nullability-appending wrapper (fix #4516) — the TypeRef mirror.
+// `Loader::convert` copies `nullable` field-for-field off the very MetaType
+// `metaTypeSigText` renders (`ref->nullable = mt.nullable;`), so the two sides
+// read ONE flag and cannot drift.
 static std::string typeRefSigText(const sema::TypeRef* tr) {
+    std::string s = typeRefSigTextCore(tr);
+    if (tr && tr->nullable && tr->kind != sema::TypeRef::Kind::InlineArray)
+        s += '?';
+    return s;
+}
+
+static std::string typeRefSigTextCore(const sema::TypeRef* tr) {
     if (!tr) return "?";
     switch (tr->kind) {
         case sema::TypeRef::Kind::Unit:
@@ -1731,7 +1822,7 @@ static std::string typeRefSigText(const sema::TypeRef* tr) {
                 }
                 s += '>';
             }
-            // Nullable omitted (mirrors metaTypeSigText).
+            // The nullable `?` is appended by the `typeRefSigText` wrapper.
             return s;
         }
         // fix #4508 (§27.1 / §15.1, v0.306): the third mirror. `funcParams`,
