@@ -5500,8 +5500,27 @@ bool Emitter::isObjectMemberMethodRef(const ast::Expr* e) const {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
     if (!ma || !ma->target) return false;
     if (ctx_.exprSymbol(*e)) return false;          // a real MethodSymbol ref
+    // fix #4578 (§8.1 / §27.6 / §28.9, v0.306): do NOT require the reference's
+    // own exprType to be Function. Unlike every sibling arm of
+    // `isPlusOneClosureProducer`, the Function type on THIS shape is written by
+    // CG60 ITSELF (LlvmBackend_Exprs.cpp — `ctx_.setExprType(&e, fnTy)`), at
+    // lowering time: sema deliberately leaves the bare reference untyped so the
+    // §27.7 "cannot call a value of type `string`" reject cannot fire on it
+    // (ExprTypecheck_Calls.cpp, the CG27c Object carve-out). So the predicate
+    // answered FALSE for the entire pre-lowering pass and TRUE afterwards — and
+    // `collectClosureReleaseEligible` (LlvmBackend_Setup.cpp), which runs at
+    // function ENTRY, is a pre-lowering consumer. `var f := o.GetHashCode;`
+    // therefore never entered `closureReleaseEligible_`, no scope-end
+    // `bz_closure_release` was armed, and the cell minted by
+    // `makeObjectMemberThunk` leaked on every reference (measured: 48 B cell +
+    // 8 B env per reference; the IR carried zero `bz_closure_release`). A null
+    // type is now admitted; a type that is PRESENT but not Function is still
+    // declined, which keeps the call-position spelling `o.ToString()` out (sema
+    // types that MA `string` via the `&ma == calleeOfCallCtx_` arm). The
+    // remaining three checks are exactly CG60's own gate, so eligibility still
+    // tracks the producer that minted the cell.
     const sema::TypeRef* t = ctx_.exprType(*e);      // sema/CG60 typed it
-    if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
+    if (t && t->kind != sema::TypeRef::Kind::Function) return false;
     // CG60 patches the receiver's type checks (Object primitive); we do the
     // same check on the side that asks whether the producer ran.
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);

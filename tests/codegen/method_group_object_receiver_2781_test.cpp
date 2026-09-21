@@ -63,7 +63,6 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -86,17 +85,22 @@ int runChecked(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
-// ASan on, LeakSanitizer off. Used only where the program carries a
-// PRE-EXISTING leak unrelated to this fix (the Equals thunk's receiver
-// env_ptr is a borrow that LSan cannot prove live; the GetHashCode
-// variant happens to be allocated in a shape LSan accepts, so it uses
-// runChecked directly). LSan overrides the process exit code, so leaving
-// it on would mask the value.
-int runCheckedNoLeaks(const std::string& src) {
-    JitResult r = runAotCheckedLenient(src);
-    if (wasSkipped(r)) return -1000;
-    return r.ran ? r.exitCode : -999;
-}
+// fix #4578 (§8.1 / §27.6 / §28.9, v0.306) RETIRED the leak-tolerant helper
+// this file used to carry. Its comment claimed the Equals/ToString thunks'
+// receiver env_ptr was "a borrow that LSan cannot prove live" — a conservative
+// false positive — and that "the GetHashCode variant happens to be allocated
+// in a shape LSan accepts, so it uses runChecked directly".
+//
+// BOTH halves of that were wrong. The leak was REAL: `makeObjectMemberThunk`
+// mints a +1 closure cell (48 B + an 8 B env) and the emitted IR carried ZERO
+// `bz_closure_release`, because the #2781 arm of `isPlusOneClosureProducer`
+// gated on an `exprType` that CG60 itself writes at LOWERING time, so the
+// function-entry `collectClosureReleaseEligible` scan never admitted the
+// local. All THREE members leaked identically; LSan merely happened to still
+// find a stale pointer to the GetHashCode cell at leak-check time. That luck
+// is not an oracle, and it ran out. With the cell now released on every edge,
+// every ASan row below uses the STRICT `runChecked` — ASan and LeakSanitizer
+// both on.
 
 // §8.3 — Object.GetHashCode on a string receiver must equal the direct
 // call's hash (the issue's headline case: it returned 0 instead of the
@@ -153,6 +157,36 @@ constexpr const char* kDirectCalls =
     "  return n; "
     "end Main; end C;";
 
+// fix #4578 (§8.1 / §27.6 / §28.9, v0.306) — LOOP-AMPLIFIED leak pin for all
+// THREE universal members. A one-shot leak repro of this shape is a VACUOUS
+// oracle: LSan reports only *unreachable* allocations, and a single never-
+// released cell can still be found from a dead stack slot or a register at
+// leak-check time — which is exactly how the GetHashCode row above passed the
+// strict oracle for revisions while the cell was never released at all.
+// 500 iterations x 3 members removes the luck: pre-fix this leaks 83,944 B in
+// 2,998 allocations, post-fix it is clean. `ok` counts 3 successes per
+// iteration (1500) and the exit code stays under runAot's WEXITSTATUS byte.
+constexpr const char* kMethodGroupLoop =
+    "module M; "
+    "class C public static method Main(): int "
+    "  var s := \"objloop\"; "
+    "  var o: Object := s; "
+    "  var d := s.GetHashCode(); "
+    "  var ok := 0; "
+    "  var i := 0; "
+    "  while i < 500 do "
+    "    var f := o.GetHashCode; "
+    "    var g := o.Equals; "
+    "    var t := o.ToString; "
+    "    if f() = d then ok := ok + 1; end; "
+    "    if g(\"objloop\") then ok := ok + 1; end; "
+    "    if t() = \"objloop\" then ok := ok + 1; end; "
+    "    i := i + 1; "
+    "  end; "
+    "  if ok = 1500 then return 29; end; "
+    "  return 3; "
+    "end Main; end C;";
+
 }  // namespace
 
 // §8.3 — GetHashCode method group on an Object-typed receiver, plain
@@ -175,14 +209,14 @@ BEZEL_TEST(method_group_object_receiver_2781, equals_method_group_string) {
     BEZEL_EXPECT_EQ(runPlain(kEqualsString), 23);
 }
 
-// §8.3 — same under ASan. The closure cell's env_ptr captures the
-// receiver by borrow — LSan conservatively flags this as a leak because
-// the closure outlives the explicit `var f` slot it came from (the
-// `f(o)` call hands it to a CallExpr whose release happens at the
-// call-site boundary, and LSan does not follow that). runCheckedNoLeaks
-// catches the value while skipping the leak report.
+// §8.3 / §28.9 — same under ASan, STRENGTHENED by fix #4578 (v0.306). This
+// row used to run on the leak-tolerant oracle, on the premise that the
+// closure cell's env_ptr is "a borrow LSan cannot prove live". That premise
+// was wrong: the cell itself was never released at all (zero
+// `bz_closure_release` in the emitted IR), so LSan's report was a TRUE
+// positive. With the scope-end release armed, the strict oracle holds.
 BEZEL_TEST(method_group_object_receiver_2781, equals_method_group_string_asan) {
-    BEZEL_EXPECT_EQ(runCheckedNoLeaks(kEqualsString), 23);
+    BEZEL_EXPECT_EQ(runChecked(kEqualsString), 23);
 }
 
 // §8.5 — ToString method group on an Object-typed receiver. Pre-fix this
@@ -192,9 +226,10 @@ BEZEL_TEST(method_group_object_receiver_2781, to_string_method_group_string) {
     BEZEL_EXPECT_EQ(runPlain(kToStringString), 19);
 }
 
-// §8.5 — same under ASan. Same env_ptr-leak shape as Equals above.
+// §8.5 / §28.9 — same under ASan, STRENGTHENED by fix #4578 (v0.306) for the
+// reason spelled out on the Equals row above.
 BEZEL_TEST(method_group_object_receiver_2781, to_string_method_group_string_asan) {
-    BEZEL_EXPECT_EQ(runCheckedNoLeaks(kToStringString), 19);
+    BEZEL_EXPECT_EQ(runChecked(kToStringString), 19);
 }
 
 // CONTROL — direct calls on the same three universal members must keep
@@ -203,4 +238,19 @@ BEZEL_TEST(method_group_object_receiver_2781, to_string_method_group_string_asan
 // relies on. 1 + 2 + 4 = 7.
 BEZEL_TEST(method_group_object_receiver_2781, direct_calls_on_object_still_work) {
     BEZEL_EXPECT_EQ(runPlain(kDirectCalls), 7);
+}
+
+// fix #4578 (§8.1 / §27.6 / §28.9, v0.306) — the DETERMINISTIC pin for the
+// missing scope-end `bz_closure_release` on the cell `makeObjectMemberThunk`
+// mints. `isObjectMemberMethodRef` gated on an `exprType` that CG60 itself
+// writes at lowering time, so the function-entry `collectClosureReleaseEligible`
+// scan never admitted the local and no release was ever armed. FAIL-WITHOUT
+// measured on the pre-fix compiler: exit 1, "83944 byte(s) leaked in 2998
+// allocation(s)"; with the fix, exit 29 and LSan-clean. The plain-oracle
+// value (1500 successful agreements) also pins that releasing the cell does
+// NOT disturb the receiver borrow the env holds — a double-release would
+// fault under ASan here rather than leak.
+BEZEL_TEST(method_group_object_receiver_2781,
+           method_group_loop_releases_every_cell_spec_8_1) {
+    BEZEL_EXPECT_EQ(runChecked(kMethodGroupLoop), 29);
 }
