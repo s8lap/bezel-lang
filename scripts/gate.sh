@@ -586,6 +586,42 @@ gate_shard_logdir() { # $1 = sharded-run log, $2 = stamp file → echoes the kep
   return 0
 }
 
+# fix #4533: parse the SANITIZER EVIDENCE accounting line tests/run_parallel.sh
+# lifts out of the per-shard logs. ONE reader for BOTH sharded consumers (the
+# authoritative pass and the canary tier), because both launch run_parallel and
+# both used to grep its stdout for a headline that stream structurally cannot
+# carry — see the ASan phase below for the measurement.
+#
+# Echoes `<hits> <files> <scanned> <corrupt>` and returns 0. Returns nonzero,
+# with a reason on stderr, when the line is ABSENT (1), unparseable (2), or
+# reports that it scanned no shard log at all (3) — each of which is the same
+# blind spot in a different shape, and none of which may be read as "clean".
+# Never fails the gate itself: the caller decides, because the canary tier must
+# record its dual-consume marker before it can fail, and is fail-open by design
+# where the authoritative pass is not.
+gate_sanitizer_evidence() { # $1 = sharded-run log → "<hits> <files> <scanned> <corrupt>"
+  local log="$1" line hits files scanned corrupt
+  line=$(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$log" 2>/dev/null || true)
+  if [ -z "$line" ]; then
+    echo "no SANITIZER EVIDENCE accounting line in $log (is tests/run_parallel.sh current, or did the run die before printing it?)" >&2
+    return 1
+  fi
+  hits=$(printf '%s\n' "$line" | sed -n 's/^SANITIZER EVIDENCE (all shards): \([0-9][0-9]*\) report marker.*/\1/p')
+  files=$(printf '%s\n' "$line" | sed -n 's/^.* report marker(s) in \([0-9][0-9]*\) of .*/\1/p')
+  scanned=$(printf '%s\n' "$line" | sed -n 's/^.* of \([0-9][0-9]*\) shard log(s) scanned.*/\1/p')
+  corrupt=$(printf '%s\n' "$line" | sed -n 's/^.* scanned, \([0-9][0-9]*\) corruption headline.*/\1/p')
+  if [ -z "$hits" ] || [ -z "$files" ] || [ -z "$scanned" ] || [ -z "$corrupt" ]; then
+    echo "unparseable sanitizer-evidence accounting line: $line" >&2
+    return 2
+  fi
+  if [ "$scanned" -eq 0 ]; then
+    echo "the sanitizer-evidence scan read 0 shard logs, so its zero means nothing: $line" >&2
+    return 3
+  fi
+  printf '%s %s %s %s\n' "$hits" "$files" "$scanned" "$corrupt"
+  return 0
+}
+
 echo "== gate[1/5]: reconfigure (glob any new test files) =="
 # Snapshot the compiler-archive mtime BEFORE any build work: comparing after
 # the build phase tells us whether the k2 cache identity changed this gate
@@ -863,14 +899,33 @@ else
       grep -E 'TOTAL:|WARNING: only' "$S/gate_canary.log" || true
       # A fired generated-code sanitizer report in the canary is DETERMINISTIC
       # evidence, exactly as in the full pass — fail hard, no arbitration.
+      # fix #4533: the canary launches tests/run_parallel.sh too (just above),
+      # so this grep had the SAME defect as the authoritative pass — it read
+      # run_parallel's stdout, which a shard's program output never reaches.
+      # It now reads the lifted accounting line, and counts CORRUPTION as the
+      # evidence: `leaksAtLeast` rows re-emit a real LSan report and PASS, and a
+      # diff that touches one would otherwise hard-fail a healthy canary.
+      # gate.canary.decide's contract is `asan_hits > 0 -> FAIL_HARD`; WHICH
+      # reports count as evidence is the bash side's job (canary.py: "what stays
+      # bash — the ASan check"), so feeding it the corruption count keeps the
+      # dual-run consistent without changing the module.
       if [ "$ASAN" -eq 1 ]; then
-        c_asan=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_canary.log" 2>/dev/null)
-        _c_asan="${c_asan:-0}"
-        if [ "${c_asan:-0}" -gt 0 ]; then
-          echo "   -- generated-code ASan fired in the canary ($c_asan report marker(s)) --"
-          grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_canary.log" | head -60
-          _canary_dual hard
-          fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
+        if _c_ev=$(gate_sanitizer_evidence "$S/gate_canary.log" 2>/dev/null); then
+          read -r _c_hits _c_files _c_scanned _c_corrupt <<< "$_c_ev"
+          _c_asan="$_c_corrupt"
+          if [ "$_c_corrupt" -gt 0 ]; then
+            echo "   -- generated-code ASan fired in the canary ($_c_hits report marker(s), $_c_corrupt corruption headline(s)) --"
+            sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_canary.log" | head -60
+            _canary_dual hard
+            fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
+          fi
+        else
+          # The canary is FAIL-OPEN by design and is never the acceptance
+          # authority. Degrade to "not evaluated here" and say so — the
+          # authoritative pass below REFUSES an unwired channel, which is where
+          # that refusal belongs.
+          echo "   canary: no usable sanitizer-evidence accounting line — the ASan leg is not evaluated here; the authoritative pass refuses an unwired channel (#4533)"
+          _c_asan=0
         fi
       fi
       if [ "$crc" -ne 0 ]; then
@@ -979,18 +1034,68 @@ grep -E 'TOTAL:|## GATE FAILURE|died on|actual FAIL|--- failing' "$S/gate_shard.
 # an ASan-only failure). The harness re-emits any report with the '[aot-asan
 # #1822]' banner; also catch the raw sanitizer headline. Skipped entirely in the
 # plain default (a clean suite never matches anyway).
+#
+# fix #4533: THIS PHASE READ THE WRONG FILE AND SO COULD NEVER FIRE.
+# `$S/gate_shard.log` is tests/run_parallel.sh's OWN STDOUT; a shard's PROGRAM
+# output goes to a per-shard file under run_parallel's mktemp logdir, and only
+# `^[ FAIL ]` lines were lifted back into the parent stream. The grep below was
+# therefore over a file that STRUCTURALLY CANNOT hold the pattern, and a grep
+# that returns 0 for that reason is indistinguishable from a clean suite.
+# Measured on the failed 2026-09-21 --full cycle at e89577e4: seven programs
+# printed `ERROR: LeakSanitizer` and
+# `grep -cE 'ERROR: (Address|Leak)Sanitizer' e89577e4_full.log` → 0, while this
+# phase recorded `rc=0 (no ASan report)`.
+#
+# run_parallel.sh now LIFTS the evidence out of the per-shard logs while they
+# still exist (it reaps them on a clean run) and prints one unconditional
+# accounting line. Two things changed here:
+#   * LIVENESS IS ASSERTED. A missing accounting line fails the phase instead of
+#     reading as "clean" — a guard that cannot fire is the defect being fixed,
+#     so the gate must refuse a zero it did not actually measure.
+#   * THE HARD-FAIL KEYS ON CORRUPTION. `ERROR: AddressSanitizer` (UAF / OOB /
+#     double-free) is never deliberate in this tree and fails the cycle on the
+#     spot, independent of rc and of arbitration. A LEAK headline
+#     (`ERROR: LeakSanitizer`) is counted, printed and recorded but does NOT
+#     fail, because 11 rows in 7 files deliberately ASSERT a leak
+#     (`leaksAtLeast`) and re-emit a real LSan report while PASSING — hard-
+#     failing on those would red every --full cycle, and on a ceiling-killed
+#     run would also convert the #3667 RETRY into a FAIL. Tightening that leg
+#     needs a banked clean-run baseline (a lane cannot measure one) — #4533's
+#     follow-up.
 if [ "$ASAN" -eq 1 ]; then
-  PHASE_T0=$(now)  # shard_asan is only the grep; the ASan compile+run time is
+  PHASE_T0=$(now)  # shard_asan is only the harvest; the ASan compile+run time is
                    # already attributed to the 'shard' phase above (no double-count).
-  asan_hits=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_shard.log" 2>/dev/null)
+  # The evidence line is echoed INSIDE this block on purpose: it carries the
+  # substring `SANITIZER`, and gate_full_cycle.sh's silent-degradation detector
+  # is `grep -qi 'asan\|sanitize'` over gate.sh's STDOUT for the --full pass.
+  # Printing it unconditionally (in both oracles) would satisfy that grep from a
+  # PLAIN run and turn the detector into a tautology — the same trap the
+  # repo-identity banner near the top of this file documents (it is deliberately
+  # not echoed for exactly that reason).
+  if ! asan_ev=$(gate_sanitizer_evidence "$S/gate_shard.log" 2>"$S/gate_asan_ev.err"); then
+    ASAN_ERRS=0; ASAN_SHARDS=$SHARD_COUNT
+    echo "   -- sanitizer-evidence channel UNREADABLE: $(tr '\n' ' ' <"$S/gate_asan_ev.err" 2>/dev/null | cut -c1-240) --"
+    rec_ran shard_asan "1" "evidence channel unreadable"
+    fail "sharded ASan — no usable sanitizer-evidence accounting from the sharded run; a zero here cannot be told apart from an unwired channel (#4533)"
+  fi
+  echo "   $(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$S/gate_shard.log")"
+  read -r asan_hits asan_files asan_scanned asan_corrupt <<< "$asan_ev"
   ASAN_ERRS=${asan_hits:-0}; ASAN_SHARDS=$SHARD_COUNT
-  if [ "${asan_hits:-0}" -gt 0 ]; then
-    echo "   -- generated-code ASan fired in the sharded pass ($asan_hits report marker(s)) --"
-    grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_shard.log" | head -60
-    rec_ran shard_asan "1" "$asan_hits ASan report(s)"
+  if [ "$asan_corrupt" -gt 0 ]; then
+    echo "   -- generated-code ASan fired in the sharded pass ($asan_hits report marker(s) across $asan_files shard log(s), $asan_corrupt corruption headline(s)) --"
+    sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -60
+    rec_ran shard_asan "1" "$asan_corrupt corruption report(s)"
     fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)"
   fi
-  rec_ran shard_asan "0" "no ASan report"
+  if [ "$asan_hits" -gt 0 ]; then
+    # Leak-only. Printed loudly and carried into telemetry (asan_errors) so a
+    # drift in the count is visible in the trend even though it does not fail.
+    echo "   -- $asan_hits leak-only sanitizer report marker(s) in $asan_files of $asan_scanned shard log(s); no corruption headline --"
+    sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -30
+    rec_ran shard_asan "0" "$asan_hits leak-only marker(s), no corruption"
+  else
+    rec_ran shard_asan "0" "no ASan report ($asan_scanned shard log(s) scanned)"
+  fi
 fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase
