@@ -876,21 +876,43 @@ llvm::Function* Emitter::specializedClassCompareToFn(
         const std::vector<std::string_view>& gpNames,
         const std::vector<const sema::TypeRef*>& instArgs,
         llvm::Function* templateFn) {
-    // ⚠ DECLINE AN INHERITED `CompareTo` (issue 3566). `findMethodByName` walks
-    // the base chain, so `ms` can belong to a BASE class whose body reads the
-    // BASE's type-parameter names — and `gpNames` are the DERIVED class's.
-    // For `class Base<U>` / `class Derived<T>: Base<T>`, installing
-    // {"T" -> long} leaves Base's `U` unbound, so the "specialization" lowers
-    // Base's `U`-typed fields at the i32 placeholder and comes out
-    // INSTRUCTION-IDENTICAL to the template — while `buildSpecializedMethodFn`
-    // clears `emittingGenericTemplateBody_`, disabling the template-only return
-    // backstop for a body that is still effectively a template. Declining here
-    // restores the pre-#3530 template call byte-for-byte for that shape, which
-    // is the honest answer until the fix issue 3566 proposes lands: compose the
-    // derived arguments through `TypeSymbol::baseTypeRefs` to the declaring
-    // base, the walk `instanceDescriptorFor` already performs.
-    if (!ms->parent || !ty->declaration || ms->parent != ty->declaration)
-        return nullptr;
+    // fix #3566 (stdlib §4.17 / spec §2.8.3 rule 4 / §14.1, v0.306) — AN
+    // INHERITED `CompareTo` IS NOW SPECIALIZED, not declined.
+    //
+    // `findMethodByName` walks the base chain, so `ms` can belong to a BASE
+    // class whose body reads the BASE's type-parameter names — while `gpNames`
+    // are the DERIVED class's. For `class GBase<T>` / `class Derived<U>:
+    // GBase<U>`, installing {"U" -> long} leaves `GBase`'s `T` unbound, so the
+    // "specialization" lowered `GBase`'s `T`-typed fields at the i32
+    // placeholder and came out INSTRUCTION-IDENTICAL to the template. #3530
+    // therefore silently did nothing for that shape, and #3566 declined it
+    // outright rather than emit a body that was still effectively a template.
+    //
+    // MEASURED consequence of the decline (on integration HEAD 00e10c0e, the
+    // issue's own repro): `SortedDictionary<Derived<long>, int>` with keys
+    // inserted 3, 1, 2 printed `first=3 last=2 count=3` — insertion order, i.e.
+    // the comparator answered garbage for every pair. stdlib §4.17 makes
+    // `K`'s `IComparable<K>.CompareTo` the ordering authority AND the key
+    // identity ("two keys are the same key exactly when `CompareTo` returns
+    // 0"), so a comparator reading the wrong field offsets decides both
+    // ITERATION ORDER and MAP MEMBERSHIP. Silent wrong answer, rc=0.
+    //
+    // THE FIX is the one #3566 proposes, and it reuses the walk that already
+    // exists rather than adding a second spelling of it (LANE_RULES §6):
+    // `computeAncestorGenericSubst` walks `ty->declaration`'s base chain up to
+    // `ms->parent`, composing each level's `baseTypeRefs[i]->genericArgs`
+    // through the substitution built so far, and fills both maps keyed by the
+    // ANCESTOR's parameter names. It is the same authority `fieldAddr`'s
+    // inherited-field branch uses (#2840/#585), so the body is lowered against
+    // exactly the offsets the field reads use. It is called BEFORE the new maps
+    // are installed, so its own seed composes through the still-active outer
+    // substitution (the transitive `Outer<X>` case, #2202).
+    //
+    // The thunk NAME and CACHE KEY keep using the DERIVED class's `instArgs`
+    // — correct, because the thunk is per derived instantiation; only the
+    // substitution the BODY is built under moves to the base's names.
+    if (!ms->parent || !ty->declaration) return nullptr;
+    const bool inheritedCompareTo = (ms->parent != ty->declaration);
     // The thunk loads two `ptr`s and calls `i32 (ptr, ptr)`. Require the
     // TEMPLATE to already have that signature before specializing: it is the
     // signature `CompareTo(other: Self): int` produces for every instantiation
@@ -917,13 +939,29 @@ llvm::Function* Emitter::specializedClassCompareToFn(
     auto savedSemaTy = genericSubstSemaTy_;
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-    // Both halves come from the caller's composed `instArgs`, in the lockstep
-    // order the sibling site uses (`newSubst[p] = lowerTypeRef(argSema);
-    // newSema[p] = argSema;`), so the LLVM and sema maps cannot desync — the
-    // desync #3020 records as corrupting the buildSpecializedMethodFn cache key.
-    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
-        newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
-        newSema[gpNames[gi]] = instArgs[gi];
+    if (inheritedCompareTo) {
+        // fix #3566: the body reads the DECLARING BASE's parameter names.
+        // `computeAncestorGenericSubst` re-derives them POSITIONALLY from each
+        // base clause, so a renamed parameter (`Derived<U>: GBase<U>`, body
+        // reading `T`) resolves exactly as an identically-spelled one does; a
+        // shared spelling never reaches it by name. It returns false when the
+        // ancestor is non-generic or the chain could not pin every parameter —
+        // and in both cases declining is still the honest answer: the template
+        // is then either already correct (nothing to substitute) or we cannot
+        // prove what to substitute, which is #3530's own "no worse than the
+        // behaviour it replaces" fallback.
+        if (!computeAncestorGenericSubst(ty, ms->parent, newSubst, newSema))
+            return nullptr;
+    } else {
+        // Both halves come from the caller's composed `instArgs`, in the
+        // lockstep order the sibling site uses (`newSubst[p] =
+        // lowerTypeRef(argSema); newSema[p] = argSema;`), so the LLVM and sema
+        // maps cannot desync — the desync #3020 records as corrupting the
+        // buildSpecializedMethodFn cache key.
+        for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+            newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
+            newSema[gpNames[gi]] = instArgs[gi];
+        }
     }
     genericSubst_ = std::move(newSubst);
     genericSubstSemaTy_ = std::move(newSema);
