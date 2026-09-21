@@ -2563,14 +2563,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // Params are absent from `declScopeDepth_` by construction (#3403), so
         // a captured parameter never reaches (2) and is never armed.
         const void* dkey = static_cast<const void*>(decl);
-        auto        ddit = declScopeDepth_.find(dkey);
-        auto        ddfn = declScopeDepthFn_.find(dkey);
         // Is THIS body the one that declared the local, so that its recorded
         // depth indexes the `disposeStack_` we are holding right now?
-        const bool inDeclaringFrame =
-            ddit != declScopeDepth_.end() && ddfn != declScopeDepthFn_.end() &&
-            ddfn->second == currentFn_ && ddit->second >= 1 &&
-            ddit->second <= disposeStack_.size();
+        // fix #4526: this was #4523's own inline spelling of that test, kept
+        // beside a separate `ddit->second - 1` read below. It is now the
+        // single accessor both halves go through, so the check and the index
+        // are one operation and no site can take the index without the proof.
+        std::size_t ownerIdx = 0;
+        const bool inDeclaringFrame = declScopeDisposeIndex(dkey, ownerIdx);
         bool armed = refcountedCellDecls_.count(dkey) != 0;
         if (!armed && inDeclaringFrame && !cellRefcountDeclined_.count(dkey)) {
             // The #4509 classification, unchanged except that
@@ -2604,7 +2604,6 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // method re-lowered per specialization re-registers in each
                 // specialization's own frame, which is why this is keyed on the
                 // holder and not on `refcountedCellDecls_`.
-                const std::size_t ownerIdx = ddit->second - 1;
                 bool alreadyRegistered = false;
                 for (const auto& existing : disposeStack_[ownerIdx])
                     if (existing.slot == newSlot && existing.cellRelease) {

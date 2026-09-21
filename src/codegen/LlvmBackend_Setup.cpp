@@ -17203,8 +17203,24 @@ void Emitter::consumeLastLambdaCapturedCells() {
             // already completed before the deferred cell free fires, so no
             // UAF is possible.
             (void)patternBinding;
-            {
-                std::size_t ownerScopeIdx = dd->second - 1;
+            // fix #4526 (§27.5 / §28.3 / §28.9, v0.306): the enclosing `if`'s
+            // `dd->second < disposeStack_.size()` is #969's declared-SHALLOWER
+            // COMPARISON, documented safe across bodies at
+            // `declScopeDepthFn_`'s declaration, and stays exactly as it is.
+            // The INDEX is a different question: a depth recorded while
+            // lowering the DECLARING body names a scope of THAT body's
+            // `disposeStack_`, and this one has been cleared and refilled
+            // since (`lowerLambda`, every async resume / iterator moveNext).
+            // Take it through the single accessor, which hands back an index
+            // only for a depth THIS body recorded.
+            //
+            // When it declines, register nothing and still `continue`: the
+            // point of this branch is that the cell must OUTLIVE the inner
+            // scope, which the `continue` already secures, and the owner frame
+            // keeps whatever reclaim it registered for itself. Fail-closed —
+            // a bounded leak, never a free into the wrong frame's scope.
+            std::size_t ownerScopeIdx = 0;
+            if (declScopeDisposeIndex(ce.key, ownerScopeIdx)) {
                 bool alreadyDeferred = false;
                 for (const auto& existing : disposeStack_[ownerScopeIdx])
                     if (existing.slot == ce.newSlot &&
@@ -37482,19 +37498,48 @@ llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
     //   scope depth — register in the scope where the local was declared
     //             (declScopeDepth_), not necessarily the innermost scope; this is
     //             correct whether the call is in the same or a nested scope.
+    //   owning frame — fix #4526, below: only when the local is THIS frame's.
     if (!disposeStack_.empty()) {
         if (sema::Symbol* rawSym = ctx_.exprSymbol(argExpr)) {
             if (auto* loc = dynamic_cast<sema::LocalSymbol*>(rawSym)) {
+                // fix #4526 (§27.5 / §28.3 / §28.9, v0.306): and only when the
+                // local belongs to the frame being lowered. `locals_.find`
+                // below LOOKS like that check and is not: inside a lambda body
+                // `locals_` also holds the CAPTURED decls (the restored
+                // cell-backed slots), so a captured `Array<byte>` passed to
+                // this factory took the depth `declScopeDepth_` recorded for
+                // the DECLARING method and indexed the lambda's own,
+                // freshly-cleared `disposeStack_` with it — registering the
+                // CALLER's array for disposal at the LAMBDA's scope end.
+                // Measured on origin/main (6c05b4cf): after one call to
+                // `f` in `var b := new Array<byte>(4, byte(7)); var f :=
+                // lambda(): int => do using var rb := RawBytes.From(b); …`,
+                // `b.Count` reads 0, a second `RawBytes.From(b)` copies
+                // nothing, and `b[0]` raises IndexOutOfRangeException.
+                //
+                // Falling back to this body's innermost scope would be no
+                // better — the array is not this frame's to dispose at ANY of
+                // its scopes — so the right answer is to register nothing and
+                // leave the local to its own frame. `declScopeDepthFromOtherFn`
+                // asks exactly that and nothing more: a local with NO recorded
+                // depth keeps the pre-existing innermost-scope fallback, which
+                // #998's own shape relies on.
+                if (loc->decl && declScopeDepthFromOtherFn(loc->decl))
+                    return lowerExpr(argExpr);
                 if (!loc->isUsing && loc->decl) {
                     auto slotIt = locals_.find(loc->decl);
                     if (slotIt != locals_.end()) {
                         llvm::AllocaInst* argSlot = slotIt->second;
                         // Determine the scope in which this local was declared.
+                        // fix #4526: through the single accessor, which returns
+                        // an index only for a depth THIS body recorded — the
+                        // cross-frame case already returned above, so the only
+                        // remaining decline is "never recorded", whose
+                        // innermost-scope fallback is the pre-existing one.
                         std::size_t depth = disposeStack_.size() - 1;
-                        auto dd = declScopeDepth_.find(loc->decl);
-                        if (dd != declScopeDepth_.end() && dd->second >= 1 &&
-                                dd->second - 1 < disposeStack_.size())
-                            depth = dd->second - 1;
+                        std::size_t declIdx = 0;
+                        if (declScopeDisposeIndex(loc->decl, declIdx))
+                            depth = declIdx;
                         // Check if already registered (guard against double-registration).
                         bool alreadyReg = false;
                         for (const auto& d : disposeStack_[depth])

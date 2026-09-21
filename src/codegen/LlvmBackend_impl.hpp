@@ -1315,6 +1315,47 @@ private:
         declScopeDepth_[declNode]   = disposeStack_.size();
         declScopeDepthFn_[declNode] = currentFn_;
     }
+    // fix #4526 (§27.5 / §28.3 / §28.9, v0.306): the ONE sanctioned way to
+    // turn a recorded declaration depth into a `disposeStack_` INDEX. #4523
+    // proved the hazard is reachable rather than theoretical and closed the
+    // single site it was filed for with an inline conjunct; two siblings
+    // still indexed by a bare depth. Making the check and the index ONE
+    // operation is what stops the next site from forgetting it — the index is
+    // simply not obtainable without the proof.
+    //
+    // Returns false, leaving `idxOut` untouched, when no depth was recorded,
+    // when it was recorded while lowering a DIFFERENT body, or when it is out
+    // of range for the stack being held right now. Every caller's false
+    // branch must be the conservative one (register nothing), which costs a
+    // bounded leak; the alternative reading is a use-after-free.
+    //
+    // NOT for depth COMPARISONS. #969's `declaredShallower` test — "does this
+    // capture's local live in an ENCLOSING scope?" — only compares two
+    // depths, which `declScopeDepthFn_`'s declaration above documents as safe
+    // as it stands; routing it through here would change its meaning rather
+    // than tighten it.
+    bool declScopeDisposeIndex(const void* declNode,
+                               std::size_t& idxOut) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        if (fnIt == declScopeDepthFn_.end() || fnIt->second != currentFn_)
+            return false;
+        auto it = declScopeDepth_.find(declNode);
+        if (it == declScopeDepth_.end()) return false;
+        if (it->second < 1 || it->second > disposeStack_.size()) return false;
+        idxOut = it->second - 1;
+        return true;
+    }
+    // fix #4526: was this local's depth recorded while lowering a DIFFERENT
+    // body? Deliberately distinct from `!declScopeDisposeIndex(...)`, which is
+    // also true for "never recorded" and "out of range": a consumer whose
+    // pre-existing fallback for an UNRECORDED local is sound must keep it and
+    // refuse only when the recorded depth positively belongs to another
+    // frame — because for such a local no scope of THIS body is a correct
+    // place to dispose it, not even the innermost one.
+    bool declScopeDepthFromOtherFn(const void* declNode) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        return fnIt != declScopeDepthFn_.end() && fnIt->second != currentFn_;
+    }
     // fix #4523 (§27.5 / §28.9, v0.306): #4509's per-DECL decision, made once
     // and obeyed everywhere.
     //
