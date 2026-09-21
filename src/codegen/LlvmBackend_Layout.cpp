@@ -4218,6 +4218,27 @@ struct CaptureWalker {
                 for (auto& s : arm.stmts) stmt(s.get());
             }
             return; }
+        // fix #4527 / §17.15 (v0.216): the BINDING ATOM `(var y := E; body)`.
+        // Its clauses are embedded plain-`var` LocalDecl nodes and its body is
+        // one full Expression, so an enclosing local it references can sit in
+        // either — and without this arm a BindExpr fell through to the leaf
+        // tail below, taking BOTH with it. A symbol invisible here never
+        // reaches `capturedSyms`, so the closure gets no env field for it and
+        // the reference does not lower at all: measured on origin/main
+        // (6c05b4cf) as "internal: lowerLocalDecl's initializer expression
+        // failed to lower to a value for this local's slot (degraded to a
+        // zero-initialized value) — #2434" on
+        // `var x := 7; var f := lambda(): int => (var y := x; y + 1);`.
+        //
+        // The same atom compiles today when it captures nothing, and when it
+        // names the lambda's OWN parameter (bound by the lambda, never routed
+        // through this walker) — so the gap is precisely the capture path.
+        // Clauses go through `stmt`, whose LocalDecl arm already walks an
+        // initializer; nothing about a clause differs from any other `var`.
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& c : bx->clauses) stmt(c.get());
+            expr(bx->body.get());
+            return; }
         // Literals and other leaf expressions: nothing to do.
     }
 

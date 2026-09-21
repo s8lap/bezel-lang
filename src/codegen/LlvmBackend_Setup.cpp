@@ -34555,6 +34555,23 @@ void Emitter::collectCellFreeEligible(
                     walkExpr(ctx, arm.guard.get(), out);
                     walkExpr(ctx, arm.exprBody.get(), out); }
                 return; }
+            // fix #4527 / §17.15 (v0.216): the BINDING ATOM
+            // `(var y := E; body)`, the exact twin of the #3591 arm below and
+            // fixed for the same reason. `CaptureWalker` (LlvmBackend_Layout.cpp)
+            // decides that an outer local referenced only inside an atom IS
+            // captured, so `boxLocalSlot` allocates its cell; this walk decides
+            // whether any lambda captures it at all, and with no arm here the
+            // answer was "none" — so `collectLambdaCaptures` never classified
+            // it, `cellFreeEligible_` never armed, and the cell leaked.
+            // Measured: 4 B / 1 allocation per call for
+            // `var x := 7; var f := lambda(): int => (var y := x; y + 1);`
+            // with only `CaptureWalker`'s arm added, against a clean run for
+            // the same program written `lambda(): int => x + 1`. Clauses go
+            // through `walkStmt`, whose LocalDecl arm walks an initializer.
+            if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+                for (auto& c : bx->clauses) walkStmt(ctx, c.get(), out);
+                walkExpr(ctx, bx->body.get(), out);
+                return; }
         }
         static void walkStmt(const sema::SemaContext& ctx,
                              const ast::Stmt* s,
