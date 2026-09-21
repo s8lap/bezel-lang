@@ -4938,8 +4938,33 @@ void Emitter::prePopulateBasePositionalFields(
     // `.fn`, not `.cs`: a resolved-but-not-callable constructor makes
     // `emitImplicitBase` fall through WITHOUT lowering anything, so the
     // pre-population still owes the arguments there.
-    if (t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty() &&
-        !baseClauseExplicitCtor(baseTs, *baseArgs).fn) {
+    //
+    // fix #4485 (§22.5 "Evaluation timing" / §22.8 step 0 / §22.10, v0.306):
+    // computed ONCE, and its `.fn` truth also sets `chainedPrimaryOwnsSlots` —
+    // this arm suppressed the ARGUMENT stores on the #3742 predicate but never
+    // told the #3777 default-fill loop below, which is unconditional. A base
+    // clause `: B(v)` binding a §22.10 convenience constructor of `B` (arity
+    // matching the clause, chaining via `this(...)` into `B`'s primary) left
+    // `baseArgVals` empty exactly as intended, but the fill loop then read
+    // "every slot unsupplied" and materialized EVERY one of `B`'s primary
+    // positional defaults here — a second evaluation of the one §22.8 step 0
+    // already ran inside the call `emitImplicitBase` makes to that convenience
+    // constructor. Same defect, same predicate, same repair as fix #3562 made
+    // for case (b)'s `base(...)`-chain arm on these very lines — this is that
+    // arm's case-(a) twin the #3562 commit deliberately left unfixed (scope
+    // note). Measured on a tree with fix #3562 but not this one, `class
+    // B(n: int, k: int := Counter.Next())` with `constructor(a: int)
+    // this(a);` reached from `class D(v: int) : B(v)`: `k=2 cnt=2` where
+    // §22.8 step 1 admits one evaluation (`k=1 cnt=1`); the `owned`-factory
+    // form of the same default left the first instance's destructor never
+    // run — LeakSanitizer reported the leaked allocation.
+    const bool baseClauseHasArgs =
+        t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty();
+    const BaseClauseExplicitCtor baseClauseBce =
+        baseClauseHasArgs ? baseClauseExplicitCtor(baseTs, *baseArgs)
+                           : BaseClauseExplicitCtor{};
+    if (baseClauseHasArgs && baseClauseBce.fn) chainedPrimaryOwnsSlots = true;
+    if (baseClauseHasArgs && !baseClauseBce.fn) {
         // fix #4491 (§22.5 / §22.8 step 0 / §22.10, v0.306): install the
         // §22.5 binding sema published for THIS inheritance clause, before
         // anything below reads `fieldForArg` / `argForField`. This is case
