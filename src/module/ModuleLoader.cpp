@@ -2073,6 +2073,59 @@ static bool methodSignatureIsStubSafe(const MetaMember& mm,
 // header comments there). `td` provides the enclosing-class name AND the
 // class's own generic-parameter names (both are bound by the synthetic
 // class header) so the per-stub check recognizes `T` and friends as in scope.
+// fix #4514 (§22.12 / §15.1 / §14.1/#783 / §2.8.3 rule 3, v0.306): emit the
+// class-level `const` members of `td` into a synthetic reconstruction source.
+//
+// WHY THIS WAS MISSING AND WHAT IT COST. Every synthetic source below declares
+// the class's FIELDS, PROPERTIES and METHOD STUBS so that a body (or signature)
+// carried across the wire VERBATIM can resolve the names it mentions. A
+// class-level `const` was never among them — and a `const` is nameable from
+// exactly the same verbatim texts. The measured shape (#4514) is a `const` used
+// as an INLINE-ARRAY EXTENT on a constructor parameter:
+//
+//     public class MxC<T>
+//       public const MAX: int := 2;
+//       public constructor(a: [MAX]int) … end constructor;
+//
+// `ctorBodyText` carries that declaration verbatim, `MAX` resolved to nothing in
+// the fresh context, and — because §15.1's extent expression is NOT visited by
+// ExprTC (see the `findConstShiftDomainFaultInScope` comment in
+// TypeResolution_Names.cpp) — the failure was SILENT: no diagnostic, no
+// `semaDiag->hasErrors()`, so the §14.1/#783 soundness gate saw a clean body and
+// ATTACHED a constructor decl whose parameter's `arraySizeValue` stayed at -1.
+// Codegen's `lowerTypeRef` then answered the bare `i32` placeholder for that
+// parameter and `buildOrderedArgs`' §15.4 inline-array arm declined without
+// producing a value — a SIGSEGV in the importing compile (the other half of
+// #4514). §2.8.3 rule 3 requires the artifact interface to carry enough to
+// reconstruct every public signature; `[MAX]int` is part of one.
+//
+// NARROWED to a PRIMITIVE-typed const with a non-empty, non-`default(...)`
+// `valueText`, deliberately. `valueText` is `renderConstExpr`'s output, which is
+// a re-parsable source lexeme for every literal arm (the lexer keeps the quotes
+// on a string/char literal, so the text round-trips) and the empty string for
+// anything it cannot render. `default(T)` is the one arm that renders a NAME —
+// `de->type->name->parts.back()`, unqualified — and a name this synthetic source
+// does not declare would fail to resolve and take the WHOLE reconstruction down,
+// turning a gap into a regression. A primitive const is also the only kind
+// §15.1 admits as an extent. Anything outside that set keeps exactly its
+// pre-fix behaviour: no stub, and the same silent non-resolution.
+static std::string buildConstStubs(const MetaTypeDecl& td) {
+    std::string s;
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Const) continue;
+        if (mm.name.empty() || mm.valueText.empty()) continue;
+        if (mm.type.kind != TypeKind::Primitive) continue;
+        if (mm.valueText.rfind("default(", 0) == 0) continue;
+        // §22.12: a class-level `const` is implicitly static, and the parser
+        // requires explicit visibility on one. `ConstMemberSymbol` carries no
+        // modifiers (SymbolCollection sets none), so there are none to render.
+        s += "  " + metaVisibilityToKeyword(mm.visibility) + " const " +
+             mm.name + " : " + metaTypeToSourceText(mm.type) + " := " +
+             mm.valueText + ";\n";
+    }
+    return s;
+}
+
 static std::string buildMethodStub(const MetaMember& mm,
                                    const MetaTypeDecl& td,
                                    bool importsModule) {
@@ -2242,6 +2295,10 @@ static std::string buildSyntheticClassSource(
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -2481,7 +2538,34 @@ static bool parseAndAttachCtorBody(
     // Walk fresh context's exprSymbols and remap into mainCtx.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             // Field reference: find same-named field in importedType.
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
@@ -2743,7 +2827,34 @@ static bool parseAndAttachDtorBody(
     // Remap exprSymbols.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -3090,7 +3201,34 @@ static bool parseAndAttachBaseCtorArgs(
     // same predicate across the two paths.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             // A base-clause argument that names a positional primary-ctor
             // parameter is the typical case (`Base(mp)` reads the fresh
             // FieldSymbol for `mp`); a non-positional field reference also
@@ -3331,6 +3469,10 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
             src += "\n";
         }
     }
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -3676,7 +3818,34 @@ static bool parseAndAttachMethodBody(
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -3883,6 +4052,10 @@ static std::string buildSyntheticPropertySource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references inside the body resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -4037,7 +4210,34 @@ static bool parseAndAttachPropertyBody(
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -4401,6 +4601,10 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields: any field carrying its own fieldInitText gets its real
     // initializer; every other field is a bare type re-declaration (name
     // resolution only — see comment above).
@@ -4760,6 +4964,18 @@ static bool parseAndAttachFieldInit(
         // sibling type's auto-property reference) remaps through the SAME
         // `importedFields` storage map exactly as a field does; see that
         // map's #3736 widening comment above.
+        // fix #4514 (§22.12 / §14.1 / §2.8.3 rule 3, v0.306): a class-level
+        // `const` named by a re-parsed field initializer. Registered by
+        // identity — see the long note on the identical arm in
+        // `parseAndAttachCtorBody` for why identity rather than a name remap,
+        // and why the stub and this arm are one change. Placed BEFORE the
+        // storage arm because the `importedFields` map below holds only
+        // FieldSymbols and auto-property storage, so a const falling into it
+        // would take the #2375 sibling branch and resolve to nothing.
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+            continue;
+        }
         auto* propSym = dynamic_cast<sema::PropertySymbol*>(freshSym);
         if (dynamic_cast<sema::FieldSymbol*>(freshSym) ||
             (propSym && !propSym->isIndexer)) {

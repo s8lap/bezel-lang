@@ -13464,7 +13464,24 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // lvalue; an ordinary parameter receives the argument's value.
         // §22.4: `out var x` — ensureOutVarSlots already allocated the
         // slot; lvalueAddr will find it via locals_ lookup.
-        llvm::Value* v;
+        //
+        // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): INITIALIZED. This was a
+        // bare `llvm::Value* v;`, and not every arm below assigns it — the
+        // §15.4 inline-array arm assigns only when `lowerTypeRef` of the
+        // formal yields an `llvm::ArrayType`, and falls straight through when
+        // it yields the i32 placeholder instead (an inline-array formal whose
+        // extent did not fold — see `lowerTypeRef`'s `arraySizeValue < 0`
+        // fallback). Every subsequent read of `v` in this loop then touched an
+        // indeterminate value: MEASURED as `v = 0xffffffff` and a SIGSEGV at
+        // `v->getType()` about 200 lines down, on the issue's repro (a
+        // `const`-named extent `[MAX]int` on an IMPORTED GENERIC constructor's
+        // parameter, whose importer-side reconstruction left the extent
+        // unfolded). A null here routes that same shape into the `#1386`
+        // internal-error diagnostic below — a clean compile-time failure with
+        // a real location — instead of a crash. This is the general guard: any
+        // future arm that declines without assigning now fails loudly rather
+        // than reading garbage. // per §15.1
+        llvm::Value* v = nullptr;
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
@@ -13563,6 +13580,32 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                  builder_.getInt32(static_cast<unsigned>(k))}));
                     }
                     v = builder_.CreateLoad(aty, aslot);
+                } else {
+                    // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): sema says the
+                    // formal IS an inline array, but `lowerTypeRef` answered
+                    // something other than an `llvm::ArrayType` — which it does
+                    // for exactly one shape, an extent that is neither an AST
+                    // literal nor a folded `arraySizeValue >= 0`, where it
+                    // returns the bare `i32` placeholder ("what keeps an
+                    // unfoldable size failing loudly", LlvmBackend_Layout.cpp).
+                    // Say so HERE rather than letting the null `v` fall through
+                    // to the generic `#1386` "lowerExpr returned null" line: the
+                    // argument expression is fine, the PARAMETER's type is what
+                    // could not be lowered, and naming the extent is what points
+                    // a reader at the real defect (cross-module, this is a
+                    // §2.8.3 rule 3 reconstruction gap — see #4514's other
+                    // half). Returning false declines the call cleanly.
+                    ctx_.diagnostics().report(
+                        Severity::Error, a.value->span.begin,
+                        "the inline-array parameter `" +
+                            std::string(params[idx].name) +
+                            "` has an extent that is not a compile-time "
+                            "constant at this call site, so the argument "
+                            "cannot be laid out (§15.1); for an IMPORTED "
+                            "declaration this means the dependency's metadata "
+                            "did not carry the folded extent (§2.8.3 rule 3, "
+                            "#4514)");
+                    return false;
                 }
             } else {
                 llvm::Value* coll =
