@@ -79,9 +79,13 @@
 //       unchanged byte-for-byte (several lit rows pin it) and the equality/
 //       relational arm, which carried its own near-copy ending
 //       "(§6.2/§5.1)", now emits that same text — nothing pinned the old
-//       spelling. Plus: the arithmetic arm still has NO constant-narrowing
-//       escape (`uint * 3` stays rejected), the one asymmetry this
-//       unification deliberately preserved rather than smoothing over.
+//       spelling. fix #4512 (§5.1, v0.306, a later commit on this same
+//       call) closed the one remaining asymmetry this unification had
+//       deliberately preserved: the arithmetic arm now has the SAME §5.1
+//       constant-narrowing escape as the relational/equality arm
+//       (`uint * 3`, `ulong + 1000` now admit, matching `uint > 1000`); a
+//       non-literal operand of the same value still has no §5.1 relation
+//       and stays rejected.
 
 #include <string>
 #include <string_view>
@@ -346,10 +350,8 @@ BEZEL_TEST(sema_binary_operand_pair_4501,
 // unchanged byte-for-byte (several lit rows pin it); the equality/relational
 // arm, which had its own near-copy ending "(§6.2/§5.1)", now emits that same
 // text — nothing pinned the old spelling (the #1204 gtest rows assert
-// `hasErrors()` only), and two wordings for one rule was half the defect. The
-// arithmetic arm still has NO constant-narrowing escape: preserved, not
-// smoothed over. Without these rows a later tidy-up could change either
-// silently.
+// `hasErrors()` only), and two wordings for one rule was half the defect.
+// Without this row a later tidy-up could change the wording silently.
 // ===========================================================================
 BEZEL_TEST(sema_binary_operand_pair_4501,
            t6_mixed_numeric_wording_unchanged_spec_6_2) {
@@ -367,15 +369,41 @@ BEZEL_TEST(sema_binary_operand_pair_4501,
     }
 }
 
+// fix #4512 (§5.1, v0.306): supersedes
+// `t6_arithmetic_arm_has_no_literal_escape_spec_6_2` (this exact name),
+// which pinned the OLD asymmetry as deliberate — "the arithmetic arm has
+// never had #1204's escape" — and is now the wrong verdict: §5.1's
+// constant-narrowing paragraph "applies at every position where this
+// section's implicit conversions apply — there is no position carve-out",
+// and §6.2 explicitly promotes "using §5.1", so `ulong + 1000` has the same
+// authority as `ulong > 1000` (#1204). Runs and asserts the VALUE, not just
+// acceptance: the escape adopts the literal into the OTHER operand's type
+// (§5.1), so `u * 3` computes in `uint` and `v + 100` in `ulong` — neither
+// widens to/from `int` (§5.1's signed/unsigned "never implicit" pairs), so
+// only the escape admits them.
 BEZEL_TEST(sema_binary_operand_pair_4501,
-           t6_arithmetic_arm_has_no_literal_escape_spec_6_2) {
-    // `uint * 3` and `ulong + 1000` are rejected today (the arithmetic arm has
-    // never had #1204's escape) while `uint > 1000` is admitted. The asymmetry
-    // is pre-existing and out of this fix's scope; pinning it means a future
-    // change to it is a deliberate one.
+           t6_arithmetic_arm_literal_escape_admitted_spec_5_1) {
+    auto r = runAotChecked(prog4501(
+        " var u: uint := 5; var x := u * 3; "
+        " var v: ulong := 5; var y := v + 100; "
+        " return int(x) + int(y); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15 + 105);
+}
+
+// The escape is keyed on the operand being literal-DERIVED (§5.1's
+// "compile-time constant"); a typed VARIABLE of the same value has no §5.1
+// relation to a mismatched-signedness or narrower-width operand and stays
+// rejected — the escape widens acceptance for CONSTANTS only, exactly as
+// #1204 already established for the relational arm (`uint > n` where `n` is
+// a variable stays rejected too).
+BEZEL_TEST(sema_binary_operand_pair_4501,
+           t6_arithmetic_arm_non_literal_pair_still_rejected_spec_5_1) {
     for (const char* body :
-         {" var u: uint := 5; var x := u * 3; return 0; ",
-          " var u: ulong := 5; var x := u + 1000; return 0; "}) {
+         {" var u: uint := 5; var n: int := 3; "
+          " var x := u * n; return 0; ",
+          " var v: ulong := 5; var m: int := 100; "
+          " var y := v + m; return 0; "}) {
         auto r = semaAll4501(prog4501(body));
         BEZEL_EXPECT_TRUE(hasDiag4501(r, kHead));
         BEZEL_EXPECT_TRUE(hasDiag4501(r, kNumericTail));

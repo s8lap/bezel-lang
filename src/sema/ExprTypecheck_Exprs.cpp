@@ -318,16 +318,32 @@ const char* primitiveSpelling(PrimitiveType p) {
     return "<unknown>";
 }
 
-// §6.2/#1204: returns true when `e` is a "literal-derived expression" — built
-// entirely from integer or float literals via unary/binary operators.  Such
-// expressions have no declared signed/unsigned type of their own and are
-// compatible with any numeric operand in a comparison (e.g. `ulong > 1000`,
-// `ulong > 0 - 5`).  Only named variable references or non-literal sub-exprs
-// cause this to return false, triggering the signed↔unsigned rejection below.
+// §5.1/#1204: returns true when `e` is an "integer-literal-derived
+// expression" — built entirely from INTEGER literals via unary/binary
+// operators.  Such expressions have no declared signed/unsigned type of
+// their own and are the §5.1 "constant narrowing" source: "AN EXPRESSION OF
+// INTEGER TYPE that is a compile-time constant implicitly converts to any
+// integer type whose range contains its value" (e.g. `ulong > 1000`,
+// `ulong > 0 - 5`).  Only named variable references or non-integer-literal
+// sub-exprs cause this to return false, triggering the signed↔unsigned
+// rejection below.
+//
+// fix #4512 (§5.1, v0.306): narrowed from also matching `FloatLiteralExpr` —
+// this predicate is the ONE gate for §5.1's constant-narrowing escape
+// (reportNoImplicitConversionBetweenOperands, below), and that paragraph's
+// own text is exact about its domain: an INTEGER-typed constant into an
+// integer-typed target, never a float/decimal one. The old (over-broad)
+// match let a FLOAT literal "adopt" a `decimal` operand it has no §5.1
+// relation to (`decimal` and binary floats are on §5.1's "never implicit"
+// list, and neither is an integer type, so nothing else in this rule would
+// have caught it): measured on 67b79744 (docs v0.306), `var d: decimal :=
+// 1m; if d > 5.0 then …` reached codegen and failed IR verification
+// (`sext double 5.0 to i32`, "SExt only operates on integer"). No caller
+// outside `reportNoImplicitConversionBetweenOperands` uses this predicate,
+// so narrowing it is invisible everywhere else.
 static bool isLiteralDerivedExpr(const ast::Expr* e) {
     if (!e) return false;
     if (dynamic_cast<const ast::IntLiteralExpr*>(e))   return true;
-    if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return true;
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e))
         return isLiteralDerivedExpr(ue->operand.get());
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
@@ -5273,15 +5289,25 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
 //     own wording.
 //
 // THE LITERAL ESCAPE IS NOW KEYED ON THE OTHER OPERAND. §5.1's constant
-// narrowing lets an untyped integer constant adopt the other operand's type,
-// which is why `uint > 1000` must keep compiling (#1204). But a numeric
-// constant can only adopt a type a numeric constant can HAVE: §5.1's rule is
-// written over "any integer type whose range contains its value", and §4.3/
-// §4.4 give the float and decimal forms. It cannot adopt `bool` or `string`.
-// The old spelling asked only "is either side literal-derived?", so the `0` in
-// `string = 0` and in `bool = 0` exempted the pair all by itself — a second,
-// independent reason those two rows were admitted, and the reason fixing the
-// `isPromotablePrimitive` precondition alone would not have closed them.
+// narrowing lets an untyped INTEGER constant adopt the other operand's
+// INTEGER type, which is why `uint > 1000` must keep compiling (#1204). The
+// escape is exactly as narrow as the paragraph's own text — "an expression
+// of integer type … converts to any integer type whose range contains its
+// value" — never a float/decimal constant, never a float/decimal/`bool`/
+// `string` target (fix #4512, §5.1, v0.306: an earlier spelling here matched
+// a FLOAT literal too and accepted any `isPromotablePrimitive` target
+// including `decimal`/`float`/`double`, which let a float constant "adopt"
+// `decimal` — a pair §5.1 never relates — and reach codegen; see
+// `isLiteralDerivedExpr`'s header comment for the measured crash).
+// `isTrueIntegerType` below is the same 8-type "any integer type" set §4.2
+// enumerates (`isTrueInt` in the compound-assignment §6.6 check,
+// ExprTypecheck.cpp, is the identical set under a local name — `char` is a
+// distinct §4.5 kind and is excluded from both). The old spelling asked only
+// "is either side literal-derived?" with no target-type gate at all, so the
+// `0` in `string = 0` and in `bool = 0` exempted the pair all by itself — a
+// second, independent reason those two rows were admitted, and the reason
+// fixing the `isPromotablePrimitive` precondition alone would not have
+// closed them.
 bool ExprTC::reportNoImplicitConversionBetweenOperands(
     const ast::BinaryExpr& be, std::string_view op, const TypeRef* lt,
     const TypeRef* rt, bool allowLiteralAdoption) {
@@ -5303,14 +5329,30 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         primitiveWidens(rt->primitive, lt->primitive))
         return false;
     if (allowLiteralAdoption) {
-        // §5.1 constant narrowing — see the header comment: the constant adopts
-        // the OTHER operand's type, so the escape requires that type to be one
-        // a numeric constant can have.
+        // §5.1 constant narrowing — see the header comment: the constant
+        // adopts the OTHER operand's type, so the escape requires that type
+        // to be one an INTEGER constant can have — the 8 sized integer
+        // types, per §4.2/§5.1's own "any integer type" wording (fix #4512:
+        // narrower than `isPromotablePrimitive`, which also admits
+        // `float`/`double`/`decimal`/`char` — types a §5.1 constant can be
+        // ASSIGNED to via ordinary widening, but not "adopt" via this
+        // constant-only escape).
+        auto isTrueIntegerType = [](PrimitiveType p) {
+            switch (p) {
+                case PrimitiveType::Byte:  case PrimitiveType::SByte:
+                case PrimitiveType::Short: case PrimitiveType::UShort:
+                case PrimitiveType::Int:   case PrimitiveType::UInt:
+                case PrimitiveType::Long:  case PrimitiveType::ULong:
+                    return true;
+                default:
+                    return false;
+            }
+        };
         if (isLiteralDerivedExpr(be.left.get()) &&
-            isPromotablePrimitive(rt->primitive))
+            isTrueIntegerType(rt->primitive))
             return false;
         if (isLiteralDerivedExpr(be.right.get()) &&
-            isPromotablePrimitive(lt->primitive))
+            isTrueIntegerType(lt->primitive))
             return false;
     }
     const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
@@ -6756,11 +6798,28 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 // the SAME call the equality/relational arm above makes; the
                 // two copies that used to answer it independently shared one
                 // hole, which is what made both #4500's and #4501's rows
-                // invisible. `allowLiteralAdoption` is false here because this
-                // arm has never had the #1204 escape — preserved exactly, not
-                // unified, since adding it would newly ADMIT `ulong + 1000`.
+                // invisible.
+                //
+                // fix #4512 (§5.1/§6.2, v0.306): `allowLiteralAdoption` is now
+                // `true` here too. §5.1's constant-narrowing paragraph states
+                // it "applies at every position where this section's implicit
+                // conversions apply — there is no position carve-out", and
+                // arithmetic is exactly such a position (§6.2 explicitly
+                // promotes "using §5.1"); the old asymmetry (relational
+                // admitted `ulong > 1000`, arithmetic rejected `ulong + 1000`)
+                // had no textual authority — it was `reportNoImplicitConversion
+                // BetweenOperands`'s ORIGINAL literal escape's own asymmetry
+                // (#1204 was written for the relational/equality arm only,
+                // arithmetic was never visited), pinned only by this arm's own
+                // test (`t6_arithmetic_arm_has_no_literal_escape_spec_6_2`,
+                // now renamed/flipped). Safe to enable now that the escape
+                // itself is exact to §5.1's own domain (fix #4512's other
+                // half, `isLiteralDerivedExpr`/`isTrueIntegerType` above): it
+                // can no longer let a float/decimal constant slip through a
+                // pair §5.1 never relates, which is what made a naive flip of
+                // this flag alone unsafe before that narrowing.
                 if (reportNoImplicitConversionBetweenOperands(
-                        be, op, lt, rt, /*allowLiteralAdoption=*/false))
+                        be, op, lt, rt, /*allowLiteralAdoption=*/true))
                     return;
             }
         }
