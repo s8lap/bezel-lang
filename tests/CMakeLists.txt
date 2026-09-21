@@ -79,13 +79,44 @@ foreach(g IN LISTS BEZEL_TEST_GROUPS)
     list(APPEND BEZEL_TEST_CLAIMED_DIRS ${BEZEL_TEST_GROUP_${g}_DIRS})
 endforeach()
 
+# fix #4530: glob each CLAIMED directory's `*.cpp` pattern EXACTLY ONCE at
+# CONFIGURE time and reuse the result everywhere below, instead of the THREE
+# separate `file(GLOB ... CONFIGURE_DEPENDS ...)` calls this used to make per
+# directory (once here to populate `_d_srcs` for the truthy check below, once
+# more inside the flat "everything" builder, and a third time inside the
+# per-group builder). `VerifyGlobs.cmake_force` (a zero-input phony) forces
+# ninja to re-run `cmake -P VerifyGlobs.cmake` on EVERY invocation regardless
+# — that check-time triplication was already free there, because CMake's own
+# glob-verification manager merges identical glob EXPRESSIONS into one watched
+# entry (confirmed by inspecting a configured build's generated
+# VerifyGlobs.cmake: each entry is annotated with every consuming variable/
+# line, e.g. `_d_srcs`, `BEZEL_TEST_ALL_SOURCES` and `BEZEL_TEST_SOURCES_codegen`
+# all cite the SAME single `tests/codegen/*.cpp` block). What the triplication
+# actually tripled was CONFIGURE-TIME work: every full reconfigure (the
+# `RERUN_CMAKE` this same force-check can trigger, per #4530's title) re-listed
+# and re-processed each claimed directory's files three times over instead of
+# once. Discovery semantics are unchanged — every claimed dir is still globbed,
+# both FATAL_ERROR invariants below are unchanged, and a new file is picked up
+# exactly as before (see the commit body for the before/after proof).
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    file(GLOB _bezel_claimed_srcs_${_d} CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+endforeach()
+
 # Invariant (2): no unclaimed area.
 file(GLOB _bezel_test_entries RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
      CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*)
 foreach(_d IN LISTS _bezel_test_entries)
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${_d})
-        file(GLOB _d_srcs CONFIGURE_DEPENDS
-             ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        if(_d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
+            # Already globbed above; reuse it instead of re-globbing (#4530).
+            set(_d_srcs ${_bezel_claimed_srcs_${_d}})
+        else()
+            # An unclaimed dir (e.g. tests/lit/) — this IS the only place that
+            # glob is needed, so it stays a fresh call.
+            file(GLOB _d_srcs CONFIGURE_DEPENDS
+                 ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        endif()
         if(_d_srcs AND NOT _d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
             message(FATAL_ERROR
                 "Bezel: tests/${_d}/ contains test sources but no group in "
@@ -96,26 +127,27 @@ foreach(_d IN LISTS _bezel_test_entries)
     endif()
 endforeach()
 
-# The flat "everything" list invariant (1) is checked against.
-set(_bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
-foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
-    list(APPEND _bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
-endforeach()
-file(GLOB BEZEL_TEST_ALL_SOURCES CONFIGURE_DEPENDS ${_bezel_all_globs})
-
-# Root-level tests (everything but the shared entry point).
-file(GLOB BEZEL_TEST_ROOT_SOURCES CONFIGURE_DEPENDS
+# Root-level tests (everything but the shared entry point) — also the "root
+# pattern" contribution to the flat "everything" list below, globbed once.
+file(GLOB _bezel_root_srcs CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+set(BEZEL_TEST_ROOT_SOURCES ${_bezel_root_srcs})
 list(REMOVE_ITEM BEZEL_TEST_ROOT_SOURCES ${BEZEL_TEST_ENTRY})
 
-# Per-group source lists.
+# The flat "everything" list invariant (1) is checked against — built from the
+# already-globbed per-dir results above instead of re-globbing them (#4530).
+set(BEZEL_TEST_ALL_SOURCES ${_bezel_root_srcs})
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    list(APPEND BEZEL_TEST_ALL_SOURCES ${_bezel_claimed_srcs_${_d}})
+endforeach()
+
+# Per-group source lists — reuse the already-globbed per-dir results (#4530).
 set(_bezel_assigned "")
 foreach(g IN LISTS BEZEL_TEST_GROUPS)
-    set(_g_globs "")
+    set(BEZEL_TEST_SOURCES_${g} "")
     foreach(_d IN LISTS BEZEL_TEST_GROUP_${g}_DIRS)
-        list(APPEND _g_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        list(APPEND BEZEL_TEST_SOURCES_${g} ${_bezel_claimed_srcs_${_d}})
     endforeach()
-    file(GLOB BEZEL_TEST_SOURCES_${g} CONFIGURE_DEPENDS ${_g_globs})
     if(g STREQUAL BEZEL_TEST_ROOT_GROUP)
         list(APPEND BEZEL_TEST_SOURCES_${g} ${BEZEL_TEST_ROOT_SOURCES})
     endif()
