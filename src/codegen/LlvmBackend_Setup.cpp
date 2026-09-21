@@ -22992,6 +22992,78 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #4546 / stdlib §4.17 / §28.6 / §28.9 (v0.306): `SortedDictionary<K,
+    // V>.FirstKey` / `.LastKey`, K = string, are +1 string producers. BOTH
+    // codegen sites for these two ordering properties — the PROPERTY-syntax
+    // bare MemberAccessExpr (LlvmBackend_Exprs.cpp's `isSortedDictMember` arm)
+    // and the CALL-syntax CallExpr (LlvmBackend_Calls.cpp's
+    // `tryLowerCollectionInstanceCall` `isDict` block, the `bz_dict_min_key_str`
+    // / `bz_dict_max_key_str` arm) — build a fresh heap `bz_string` from the
+    // runtime's malloc'd key-copy bytes and call `initStringRc(strObj)`,
+    // minting rc := 1 exactly like every other +1 producer this function
+    // recognizes (interpolation/range-slice/ToString/string.Join/…). Neither
+    // site discharges that +1: before this recognition, every read of either
+    // property was classified as a BORROW, so a consumer (a bound `var`, a
+    // `Console.WriteLine` argument, a concatenation operand) retained on top
+    // of the mint (rc 1→2) and released only its own retain at scope end
+    // (rc 2→1) — the producer's original +1, and the malloc'd key buffer it
+    // wraps, never freed. Loop-amplified (the issue's own repro, 50
+    // iterations reading both properties): 3500 B / 200 allocations, LSan-
+    // confirmed unbounded in a loop.
+    //
+    // §28.6 (*Leak prevention*) holds an accessor read face to lend-only — "a
+    // getter may not return a fresh owned value" — so a property getter that
+    // mints must have its mint discharged by the caller side, not silently
+    // dropped; stdlib §4.17 types both properties as `K`, and for `K = string`
+    // — a runtime-managed type, §28.9 — the caller-side discharge IS this
+    // function's ordinary +1-producer contract (transfer into a bound local,
+    // release at the escape-walked scope end / consuming-expression's end —
+    // the same #3703 / #429 mechanism every other producer here uses).
+    // Recognizing the read here, rather than patching each consumer site
+    // individually, routes both codegen sites through that single existing
+    // discipline: `armStringLocalRefcount`/`collectStringReleaseEligible`
+    // (a bound local transfers instead of double-retaining) and every other
+    // `isPlusOneStringProducer`-gated consumer (WriteLine argument, `+`
+    // operand, call argument, …) pick the recognition up for free.
+    //
+    // Gated on the receiver being `SortedDictionary<K, V>` with K a
+    // non-nullable `string` (`genericArgs[0]`) — the ONLY key type these two
+    // runtime entry points are used for (`bz_dict_min_key_gen` /
+    // `bz_dict_max_key_gen` return the key value directly for a non-string,
+    // §4.17-eligible key — no heap string is minted there, so there is
+    // nothing for this recognizer to catch, and it must not fire: recognizing
+    // a non-string-producing shape as a string +1 producer would misclassify
+    // an unrelated value as owning a string reference it never had).
+    auto isSortedDictStringKeyOrdering = [this](const ast::Expr* target,
+                                                std::string_view member) -> bool {
+        if (!target || (member != "FirstKey" && member != "LastKey"))
+            return false;
+        const sema::TypeRef* tt = ctx_.exprType(*target);
+        if (!tt || tt->kind != sema::TypeRef::Kind::Named || !tt->astNode ||
+            !tt->astNode->name || tt->astNode->name->parts.empty() ||
+            tt->headName() != "SortedDictionary")
+            return false;
+        if (tt->genericArgs.empty() || !tt->genericArgs[0]) return false;
+        const sema::TypeRef* keyTy = tt->genericArgs[0];
+        return keyTy->kind == sema::TypeRef::Kind::Primitive &&
+               keyTy->primitive == sema::PrimitiveType::String &&
+               !keyTy->nullable;
+    };
+    // PROPERTY syntax: `d.FirstKey` / `d.LastKey` (LlvmBackend_Exprs.cpp).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        if (isSortedDictStringKeyOrdering(ma->target.get(), ma->member))
+            return true;
+    }
+    // CALL syntax: `d.FirstKey()` / `d.LastKey()` (LlvmBackend_Calls.cpp).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (isSortedDictStringKeyOrdering(ma->target.get(), ma->member))
+                    return true;
+            }
+        }
+    }
     return false;
 }
 
