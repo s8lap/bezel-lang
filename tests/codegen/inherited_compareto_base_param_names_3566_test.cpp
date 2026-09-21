@@ -210,6 +210,37 @@ BEZEL_TEST(inherited_compareto_3566, matching_param_name_also_declined_spec_4_17
 }
 
 // ===========================================================================
+// THE SECOND SHAPE — a NON-generic class over a generic base. The caller's
+// gate (`genericInst`) asks whether the ELEMENT type is a constructed generic,
+// which is the right question only while the `CompareTo` is declared by that
+// element type. `class DPlain: GBase<long>` has no parameters of its own, so
+// the gate was false and the placeholder template was called — the layout that
+// matters belongs to `GBase<long>`, not to `DPlain`. Found by adversarial
+// review of the first fix, not by the issue; measured `first=3 last=2 count=3`
+// before the gate was widened.
+// ===========================================================================
+BEZEL_TEST(inherited_compareto_3566, non_generic_derived_over_generic_base_spec_4_17) {
+    auto out = runAotOut(
+        std::string("module M; ") + kGBase +
+        "class DPlain: GBase<long> "
+        "  public constructor(p: long, k: int) base(p, k); end constructor; "
+        "end DPlain; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var a := new DPlain(10L, 3); "
+        "    using var b := new DPlain(20L, 1); "
+        "    using var c := new DPlain(30L, 2); "
+        "    var d := new SortedDictionary<DPlain, int>(); "
+        "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
+        "    Console.WriteLine($\"first={d.FirstKey().Key} "
+        "last={d.LastKey().Key} count={d.Count} pay={d.FirstKey().Payload}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_EQ(out, std::string("first=1 last=3 count=3 pay=20"));
+}
+
+// ===========================================================================
 // ACCEPT CONTROLS — measured correct on the REVERT as well as with the fix, so
 // they pin that it narrowed nothing.
 // ===========================================================================
