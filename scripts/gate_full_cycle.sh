@@ -1199,6 +1199,73 @@ if ! python3 tests/conformance/rules/corpus.py check >> "$_rc_log" 2>&1; then
 fi
 say "rule-corpus phase: GREEN ($_rc_ran harness tests, manifest current)"
 
+# Conformance-harness self-test phase (tests/conformance, #4506). Build-free
+# and fast, so it sits beside the gate self-tests and the rule-corpus harness
+# tests above rather than in the conformance phase below, which needs a built
+# bezelc. This directory holds the DOC-EXTRACTED conformance harness's own
+# unit tests — the code that decides which spec examples are wrapped,
+# chained, `env`-bound and classified (classify_wrap, needs_async_main, the
+# `env` anchor regex, the chaining provider, `_snippet`, etc.) — as distinct
+# from the spec-example sweep run later in this script
+# (tests/conformance/run_conformance.sh), which actually needs a built
+# bezelc. Until now nothing ran these: a regression here could flip
+# conformance rows silently and the sweep would just report a different
+# PASS/SKIP split with exit 0 (#4506). (tests/conformance/rules is a
+# SEPARATE, hand-authored corpus with its own harness/self-tests, already
+# covered by the rule-corpus phase above; this phase does not touch it.)
+#
+# Same ratchet shape as gate-selftest (#3415) and rule-corpus above: COUNT
+# RATCHETS, NOT JUST THE EXIT STATUS. `unittest` exits 0 for "Ran 0 tests"
+# and for "OK (skipped=N)" alike, so a bare exit-status check would accept
+# precisely the outcome this phase exists to prevent — the directory
+# unenforced with a green tick on top. So this phase asserts a FLOOR on
+# tests run and a CAP on tests skipped.
+say "conformance-harness-selftest phase: tests/conformance/test_conformance.py (#4506)"
+_ch_log="$LOGDIR/${TAG}_conformance_harness_selftest.log"
+# Exact-not-a-ceiling, as the deprecated-JIT-oracle and rule-corpus baselines
+# are: this is the harness's current test count (95 at #4506's filing,
+# raised to 101 by fix #4556's runner.py/_snippet changes — re-measure with
+# `python3 -m unittest discover -s tests/conformance -p 'test_conformance.py'`
+# rather than trusting either number) — it only ever moves up; a lane that
+# deletes a test lowers it deliberately in the same commit.
+_ch_floor=101
+_ch_skip_cap=0
+# `-p 'test_conformance.py'` (not a bare `-s tests/conformance`) so this phase
+# can never silently absorb tests/conformance/rules/test_rules.py (already
+# run, with its own floor, by the rule-corpus phase above) even if discovery
+# behavior around subdirectories without __init__.py changes across Python
+# versions — confirmed empirically that a bare `-s tests/conformance` does
+# NOT currently descend into rules/, but the explicit pattern removes the
+# dependency on that behavior entirely.
+if ! python3 -m unittest discover -s tests/conformance -p 'test_conformance.py' -v \
+      > "$_ch_log" 2>&1; then
+  say "CYCLE FAILURE: the conformance harness's own self-tests failed — the"
+  say "  code that decides which spec examples are wrapped, chained, env-bound"
+  say "  and classified is broken, so the conformance sweep's PASS/SKIP split"
+  say "  cannot be trusted (#4506). See $_ch_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_ch_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_ch_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_ch_log" | tail -1)"
+_ch_skipped="$(sed -n 's/^OK (.*skipped=\([0-9]*\).*/\1/p' "$_ch_log" | tail -1)"
+[ -n "$_ch_skipped" ] || _ch_skipped=0
+if [ -z "$_ch_ran" ] || [ "$_ch_ran" -lt "$_ch_floor" ]; then
+  say "CYCLE FAILURE: the conformance harness self-tests reported OK but ran"
+  say "  only ${_ch_ran:-0} tests (floor $_ch_floor) — discovery collected"
+  say "  almost nothing, so the OK certifies nothing (#4506). See $_ch_log"
+  exit 1
+fi
+if [ "$_ch_skipped" -gt "$_ch_skip_cap" ]; then
+  say "CYCLE FAILURE: the conformance harness self-tests skipped $_ch_skipped"
+  say "  tests (cap $_ch_skip_cap) — an unenforced guard with a green tick is"
+  say "  worse than an honest gap (#4506). See $_ch_log"
+  sed -n '/skipped/p' "$_ch_log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "conformance-harness-selftest phase: GREEN ($_ch_ran tests, $_ch_skipped skipped)"
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded
@@ -1304,11 +1371,54 @@ if ! "$REPO/tests/conformance/run_conformance.sh" "$REPO/build/bezelc" \
     | tee -a "$CYCLE_LOG" >/dev/null
   exit 1
 fi
-# Surface the PASS/FAIL/SKIP tally in the cycle log. The healthy green over the
-# current manifest is 100/0 (16 error + 83 fragment + 1 program, 337 skip).
-grep -E '^(PASS|FAIL|SKIP):' "$LOGDIR/${TAG}_conformance.log" \
+# Surface the PASS/FAIL/SKIP tally in the cycle log, and ratchet it (#4506
+# item 3). This comment used to just NAME the healthy green ("100/0, 16 error
+# + 83 fragment + 1 program, 337 skip") without checking it — that is the
+# v0.138-era 437-row corpus, and the comment had been silently wrong (the
+# committed corpus's actual PASS/SKIP split moved on) for over a year with
+# nothing noticing, because a comment is not a check. `run_conformance.sh`'s
+# own Plan-A 5.1 guard only asserts PASS>0, so a corpus regression that drops
+# PASS from 254 to, say, 60 (every doc-example case in one section starts
+# erroring) would still exit 0 here.
+#
+# Floor on PASS (can only rise — a drop below the last-measured count is a
+# regression), ceiling on SKIP (can only fall — a rise means something that
+# used to run now doesn't, e.g. a case flipping from `fragment` to
+# `skip:*`). Measured against $REPO/build/bezelc at this cycle's HEAD:
+# PASS=254 (40 error + 211 fragment + 3 program), SKIP=414, FAIL=0 — exactly
+# the 2026-09-21 coverage-pass numbers recorded in
+# tests/conformance/README.md. Update both in the SAME commit that changes
+# the corpus (a regeneration per #4505, or a coverage pass per the README's
+# precedent), exactly as the rule-corpus floor above is updated when that
+# harness's own test count changes.
+_cf_log="$LOGDIR/${TAG}_conformance.log"
+_cf_pass_floor=254
+_cf_skip_cap=414
+_cf_pass="$(sed -n 's/^PASS: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+_cf_fail="$(sed -n 's/^FAIL: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+_cf_skip="$(sed -n 's/^SKIP: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+grep -E '^(PASS|FAIL|SKIP):' "$_cf_log" \
   | sed 's/^/  conformance /' | tee -a "$CYCLE_LOG" >/dev/null
+if [ -z "$_cf_pass" ] || [ -z "$_cf_skip" ]; then
+  say "CYCLE FAILURE: could not parse PASS:/SKIP: tallies out of $_cf_log —"
+  say "  the conformance sweep's own output format changed underneath this"
+  say "  check (#4506 item 3)."
+  exit 1
+fi
+if [ "$_cf_pass" -lt "$_cf_pass_floor" ]; then
+  say "CYCLE FAILURE: conformance sweep PASS=$_cf_pass, below the floor of"
+  say "  $_cf_pass_floor (FAIL=${_cf_fail:-?}, SKIP=${_cf_skip:-?}) — a case"
+  say "  that used to compile/run no longer does (#4506 item 3). See $_cf_log"
+  exit 1
+fi
+if [ "$_cf_skip" -gt "$_cf_skip_cap" ]; then
+  say "CYCLE FAILURE: conformance sweep SKIP=$_cf_skip, above the cap of"
+  say "  $_cf_skip_cap (PASS=${_cf_pass:-?}, FAIL=${_cf_fail:-?}) — a case that"
+  say "  used to run has fallen back to skip (#4506 item 3). See $_cf_log"
+  exit 1
+fi
 say "conformance phase: GREEN"
+say "  PASS=$_cf_pass (floor $_cf_pass_floor), SKIP=$_cf_skip (cap $_cf_skip_cap), FAIL=${_cf_fail:-0}"
 
 # ── CLANG-TIDY PHASE (fix #3666) — ADVISORY, ONCE PER CYCLE ────────────────
 # The clang-tidy tier (scripts/check_tidy.sh, changed TUs only) used to be a
