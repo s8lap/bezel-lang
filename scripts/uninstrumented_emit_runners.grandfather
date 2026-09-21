@@ -10,11 +10,6 @@
 # spellings.grandfather / scripts/imported_symbol_reads.grandfather,
 # #3590).
 #
-# Seeded on first --update from the measured count (the family
-# already had 99 bypassing call(s) in 87 file(s) at the moment this
-# ratchet shipped). All future --update calls tighten the ceiling to
-# min(existing, measured), never raise it.
-#
 # One row per file: the number of codegen::emitObjectFile( calls with
 # FEWER THAN FOUR arguments (so sanitizeAddress defaults to false at
 # src/codegen/LlvmBackend.hpp:102) in a file that nowhere reads the
@@ -81,7 +76,6 @@
 1    tests/codegen/owned_local_reassign_disposal_913_1054_test.cpp
 1    tests/codegen/ownedarray_forin_using_var_1287_test.cpp
 2    tests/codegen/rawbytes_disposal_test.cpp
-1    tests/codegen/record_string_field_call_release_1747_test.cpp
 1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
 1    tests/codegen/semaphore_647_test.cpp
 1    tests/codegen/serialization_668_669_test.cpp

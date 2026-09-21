@@ -81,7 +81,6 @@
 1    tests/codegen/owned_local_reassign_disposal_913_1054_test.cpp
 1    tests/codegen/ownedarray_forin_using_var_1287_test.cpp
 2    tests/codegen/rawbytes_disposal_test.cpp
-1    tests/codegen/record_string_field_call_release_1747_test.cpp
 1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
 1    tests/codegen/semaphore_647_test.cpp
 1    tests/codegen/serialization_668_669_test.cpp
@@ -142,7 +141,6 @@
 1    tests/codegen/owned_local_reassign_disposal_913_1054_test.cpp
 1    tests/codegen/ownedarray_forin_using_var_1287_test.cpp
 2    tests/codegen/rawbytes_disposal_test.cpp
-2    tests/codegen/record_string_field_call_release_1747_test.cpp
 2    tests/codegen/semaphore_647_test.cpp
 1    tests/codegen/static_owned_field_disposal_1212_test.cpp
 3    tests/codegen/string_accumulator_leak_1486_test.cpp
