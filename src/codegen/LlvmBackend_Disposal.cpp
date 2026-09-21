@@ -6474,6 +6474,13 @@ void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
     if (!id) return;  // field / index / static target — not a plain local
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc) return;  // a parameter (borrow or owned) — excluded
+    // LOCALDECL-ONLY: `target` is an ASSIGNMENT target — this helper is reached
+    // only from the `:=` lowering — and §21.1 makes a `const` local a
+    // single-assignment binding, so sema rejects the store before codegen ever
+    // runs ("cannot assign to const local `b` — a const local is a
+    // single-assignment binding (§21.1)", verified by probe). A LocalConstDecl
+    // therefore cannot reach here, and there is no `const` binding form for the
+    // #3591 family to silently skip. // per §21.1
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
     if (!ld) return;
     // Suppression 2 (see the header): `b := b;`.
