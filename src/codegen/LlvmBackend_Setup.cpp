@@ -34392,7 +34392,8 @@ void Emitter::collectDefinitelyEscapingLambdas(
 // This is a whole-body pre-pass; it runs after collectClosureReleaseEligible
 // so closureReleaseEligible_ is fully populated.
 void Emitter::collectCellFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LambdaExpr* ownLambda) {
     cellFreeEligible_.clear();
     unwindUnsafeCellFree_.clear();  // fix #2334
     sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
@@ -34455,6 +34456,21 @@ void Emitter::collectCellFreeEligible(
         // soundness argument (calledAtMostOnce is the multiplicity guard).
         const std::unordered_map<const void*, Emitter::TransparentForwardTarget3804>&
             transparentForwardTargets3804;
+        // fix #4524 (§27.5 / §28.9, v0.306): every `ast::LocalDecl` /
+        // `ast::LocalConstDecl` node this walk reaches — i.e. every local the
+        // WALKED BODY'S OWN FRAME allocates. The walk stops at every
+        // `LambdaExpr` boundary (a nested lambda's captures are handed to
+        // `collectLambdaCaptures`, which uses its own `walkStmt`/`walkExpr`
+        // and never touches this set), so a local declared inside a nested
+        // lambda is correctly ABSENT: its cell belongs to that lambda's
+        // frame, not to this one. Used only to gate the #3426 election; see
+        // `collectCellFreeEligible`'s `ownLambda` parameter. Over-collecting
+        // WITHIN this region would be harmless (a foreign key is, by
+        // construction, a node outside it) and under-collecting is
+        // fail-closed (one fewer envdtor free — a bounded leak, never an
+        // over-free), which is why a node kind this walk does not descend
+        // into needs no special handling here.
+        std::unordered_set<const void*>& ownFrameBindings;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -35404,6 +35420,7 @@ void Emitter::collectCellFreeEligible(
             // A `var f := lambda` where f is in closureReleaseEligible_:
             // the lambda is in "non-escaping" top-level position.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+                ownFrameBindings.insert(static_cast<const void*>(ld));  // #4524
                 bool nonEsc = !ld->isUsing &&
                     closureNonEscaping.count(static_cast<const void*>(ld));
                 // fix #2334: anchor `using var` initializers that are CallExpr
@@ -35439,6 +35456,7 @@ void Emitter::collectCellFreeEligible(
             // structurally false for a `const` (§21.1 — a `const` is never a
             // `using var`, by grammar), so no `usingInitOf` anchoring applies.
             if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+                ownFrameBindings.insert(static_cast<const void*>(lc));  // #4524
                 bool nonEsc =
                     closureNonEscaping.count(static_cast<const void*>(lc));
                 if (lc->value) expr(lc->value.get(), nonEsc);
@@ -35536,12 +35554,25 @@ void Emitter::collectCellFreeEligible(
                 static_cast<const void*>(it->second.target));
     }
 
+    // fix #4524 (§27.5 / §28.9, v0.306): the bindings THIS frame allocates —
+    // filled by the finder's own LocalDecl / LocalConstDecl arms as it walks
+    // `body`, plus (for a nested lambda's re-scan) that lambda's own formals.
+    // Consulted ONLY by the #3426 election below, and only when `ownLambda`
+    // says this walk is a nested lambda's. See the parameter's own comment at
+    // the declaration for the soundness argument.
+    std::unordered_set<const void*> ownFrameBindings;
+    if (ownLambda) {
+        if (const std::vector<sema::Symbol*>* ps = ctx_.lambdaParams(ownLambda))
+            for (const sema::Symbol* s : *ps)
+                ownFrameBindings.insert(static_cast<const void*>(s));
+    }
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
                         capturedByNonEscaping, capturedByEscaping,
                         capturedByNonEscapingUnwindUnsafe,
                         escapingCapturersOf, nestedWidenedKeys,
                         transparentTailNonEscaping3805,
-                        forwardTargets3804};
+                        forwardTargets3804,
+                        ownFrameBindings};
     for (auto& s : body) finder.stmt(s.get());
 
     // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
@@ -35556,6 +35587,27 @@ void Emitter::collectCellFreeEligible(
         if (!capturedByNonEscaping.count(key)) continue;    // (c)
         if (nestedWidenedKeys.count(key)) continue;         // (d)
         if (capturedByNonEscapingUnwindUnsafe.count(key)) continue;  // (e)
+        // fix #4524 (§27.5 / §28.9, v0.306): (f) ONLY THE ALLOCATING FRAME MAY
+        // ELECT. Conditions (a)-(e) are all proven from THIS body alone, and
+        // that is enough only while THIS body is the frame whose invocation
+        // allocates the cell. A nested lambda's re-scan cannot see its own
+        // call sites, so it happily elects a "sole out-of-frame holder" for an
+        // ANCESTOR's local: `Run` declares `x`, `l1` → `l2` → `l3` capture it,
+        // and `l1()` is called twice — `Run`'s own walk correctly declines
+        // (#3804's `calledAtMostOnce` reads false for `l1`), but `l1`'s
+        // re-scan then re-elects, because inside `l1`'s body `l2` really is
+        // called once. Two `l3` envs over ONE cell, each envdtor freeing it:
+        // measured as `heap-use-after-free ... freed by bz$lam$2$envdtor`, and
+        // as `attempting double-free` once the intervening read is removed.
+        // Exactly the multiplicity hazard `loopStack_.empty()` rules out at
+        // the ARM sites, reached through repeated CALLS instead of a backward
+        // edge — which no proof about one body's interior can see.
+        //
+        // The declaring frame's own verdict still reaches this body: it is
+        // merged in by #3804's `ancestorSharedCellOwner3804` loop in
+        // lowerLambda, which is precisely what that merge exists for. So this
+        // conjunct removes a WRONG answer without removing the right one.
+        if (ownLambda && !ownFrameBindings.count(key)) continue;      // (f)
         const void* owner = *lams.begin();
         if (!definitelyEscapingLambdas_.count(owner)) continue;      // (b)
         sharedCellEnvdtorFreeOwner_[key] = owner;

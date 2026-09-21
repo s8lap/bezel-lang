@@ -3330,7 +3330,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         collectBoxCaptureLocals(lam.stmts);
         collectDefinitelyEscapingLambdas(lam.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses its result).
-        collectCellFreeEligible(lam.stmts);
+        // fix #4524 (§27.5 / §28.9, v0.306): `&lam` marks this as a NESTED
+        // LAMBDA's own re-scan, which may not elect a #3426 shared-cell owner
+        // for a key it does not itself bind — see the parameter's comment.
+        collectCellFreeEligible(lam.stmts, &lam);
     } else {
         closureReleaseEligible_.clear();
         // fix #3757 follow-up: closureLocalCandidates_ must clear alongside

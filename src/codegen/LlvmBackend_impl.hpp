@@ -16165,8 +16165,29 @@ private:
                it->second == static_cast<const void*>(lam);
     }
     // Compute cellFreeEligible_ for a block body (see the .cpp).
+    //
+    // fix #4524 (§27.5 / §28.9, v0.306): `ownLambda` is non-null exactly when
+    // `body` is a NESTED LAMBDA's own body being re-scanned (lowerLambda /
+    // emitAsyncLambda), and null for a true function frame (method, ctor,
+    // destructor, async resume, iterator moveNext). It gates the #3426
+    // sole-out-of-frame-holder ELECTION, whose soundness argument is an
+    // argument about ONE FRAME: "every non-escaping co-capturer's env is
+    // released at a scope end inside THIS frame; the escaping holder's env
+    // dies strictly after THIS frame is gone; therefore its envdtor is the
+    // cell's last reader." That reasoning only speaks about the cell's
+    // lifetime when THIS frame is the frame that ALLOCATES the cell — i.e.
+    // the frame that declares the local / binds the parameter. A nested
+    // lambda's rescan sees only its own body, so it cannot know how many
+    // times the ANCESTOR frame that owns the cell invokes it: each
+    // invocation mints its own "sole" holder over the SAME cell, and each
+    // holder's envdtor frees it (#4524's measured heap-use-after-free, and
+    // a double-free once the read is removed). A key the walked body does
+    // not itself bind therefore gets NO election here — the declaring
+    // frame's own answer reaches this body through the #3804 ancestor merge,
+    // which is exactly what that merge exists for.
     void collectCellFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LambdaExpr* ownLambda = nullptr);
     // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): the SINGLE authority
     // answering "does calling local L (bound `var/const L := lambda() =>
     // …`) transparently and exclusively produce one specific nested

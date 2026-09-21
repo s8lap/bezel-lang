@@ -2290,7 +2290,10 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             collectBoxCaptureLocals(lam.stmts);
             collectDefinitelyEscapingLambdas(lam.stmts);
             // Must run AFTER collectClosureReleaseEligible (uses its result).
-            collectCellFreeEligible(lam.stmts);
+            // fix #4524 (§27.5 / §28.9, v0.306): the async twin of the sync
+            // lambda's own re-scan — `&lam` gates the #3426 election exactly
+            // as it does there.
+            collectCellFreeEligible(lam.stmts, &lam);
         } else {
             closureReleaseEligible_.clear();
             // fix #3773 (§27.5 / §28.9, v0.286): closureLocalCandidates_ must
