@@ -290,6 +290,31 @@ function(bezel_add_test_binary group)
     # the option produces no dependency edge of its own, so make the build
     # edge explicit.
     add_dependencies(${tgt} bezelc)
+    # fix #4529 (follow-up to #2877): state the link's provenance instead of
+    # leaving the harness to infer it from mtimes. The AOT bincache keys on
+    # SHA-256(libbezel_core.a) for a binary that was linked from that archive,
+    # and it decided "was it?" by comparing mtimes — which a no-op re-archive
+    # (identical bytes, new timestamp; llvm-ar is deterministic here) inverts,
+    # cooling the whole shared store and failing aot_cache_key's safety pin.
+    # This step records the digest the link actually consumed, so the harness
+    # can compare CONTENT. It runs on every link, so the record can never be
+    # stale with respect to its binary. See aot_support.hpp's LINK-TIME
+    # PROVENANCE comment.
+    #
+    # No BYPRODUCTS: `$<TARGET_FILE:${tgt}>` is rejected there ("No target
+    # bezel_tests_<g>") because BYPRODUCTS of a POST_BUILD command is evaluated
+    # without the owning target in scope, and the record is a 65-byte file that
+    # is rewritten on every link — nothing downstream consumes it as a build
+    # input, so ninja does not need to know about it.
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DBEZEL_CORE_LIB=$<TARGET_FILE:bezel_core>
+                -DBEZEL_OUT=$<TARGET_FILE:${tgt}>.coreid
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/record_core_identity.cmake
+        COMMENT "Recording libbezel_core.a identity for ${tgt} (#4529)"
+        VERBATIM)
+    set_property(TARGET ${tgt} APPEND PROPERTY
+        ADDITIONAL_CLEAN_FILES $<TARGET_FILE:${tgt}>.coreid)
     add_test(NAME ${tgt} COMMAND ${tgt})
     set(BEZEL_TEST_TARGETS ${BEZEL_TEST_TARGETS} ${tgt} PARENT_SCOPE)
 endfunction()

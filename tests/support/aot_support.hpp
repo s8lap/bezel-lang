@@ -1302,12 +1302,18 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 //       regardless of which TEST objects were relinked into bezel_tests. So a
 //       test-only edit (every "fix + regression test" iteration) keeps the
 //       cache WARM, where the old /proc/self/exe key went cold on ANY relink.
-//       STALE-CORE GUARD: if core.a on disk is NEWER than the running binary,
-//       the in-process compiler may predate it (e.g. `--target bezelc` rebuilt
-//       core.a without relinking bezel_tests, or a relink replaced the binary
-//       mid-run) — keying THIS process's products under the new archive's hash
-//       could hand a future, really-rebuilt bezel_tests a stale hit. The
-//       identity then falls back to /proc/self/exe (the k1 behaviour):
+//       STALE-CORE GUARD: the archive's hash is trusted only for a binary that
+//       was really linked from these bytes — e.g. `--target bezelc` can rebuild
+//       core.a without relinking bezel_tests, and keying THIS process's
+//       products under the new archive's hash would hand a future,
+//       really-rebuilt bezel_tests a stale hit. Since #4529 that question is
+//       answered by CONTENT: the link records SHA-256(core.a) in
+//       `<binary>.coreid` and the guard compares it with the archive on disk.
+//       A binary with no such record (a tree built before #4529) falls back to
+//       the older mtime ordering `coreTime <= exeTime`, which approximates the
+//       same question and, being a timestamp, gets a no-op re-archive wrong in
+//       the cooling direction. Either way the identity falls back to
+//       /proc/self/exe (the k1 behaviour) when the answer is no:
 //       conservative, never stale. Same fallback when the macro is undefined
 //       or the archive unreadable. Known gaps: the external clang/ld toolchain
 //       and the dynamically-linked libLLVM.so are now folded in via the
@@ -1643,6 +1649,132 @@ inline bool runningExeIsADeclaredTestBinary() {
     return manifestDeclaresExe(text, "/proc/self/exe");
 }
 
+// ── per #4529: LINK-TIME PROVENANCE, stated by the build instead of inferred ──
+//
+// The guard above answers "did the build system link this binary?". It does not
+// answer "was it linked from THESE archive bytes" — that was left to the
+// STALE-CORE mtime ordering (`coreTime <= exeTime`), and AN ORDERING IS NOT A
+// CONTENT COMPARISON IN EITHER DIRECTION. #2877 measured it over-accepting (the
+// shadowing link, which runningExeIsADeclaredTestBinary now covers). It also
+// OVER-REJECTS, and that is what failed the 87313e75 gate:
+//
+//   13:35:32.055  libbezel_core.a archived                  (gate[2/5])
+//   13:35:35.41   the six test binaries linked              <- ordering HOLDS
+//   13:35:58.73   libbezel_core.a RE-archived by gate[3/5]'s `--target bezelc
+//                 check-lit`, from 50 ccache-hit objects (84-180 ms each — a
+//                 real compile of LlvmBackend.cpp is tens of seconds) with no
+//                 file under src/ or tests/ touched since 13:30
+//
+// llvm-ar is deterministic here — members are stored uid/gid 0/0 with an
+// epoch-0 timestamp, and re-archiving the same 50 objects reproduces the
+// archive byte for byte (measured on that tree: sha256 b38429a4…). So that
+// re-archive moved the MTIME and not one byte of CONTENT. The ordering
+// nonetheless inverted, every shard fell to the per-binary exe fallback, the
+// shared store split six ways for the whole run, and this file's own safety pin
+// (the_running_test_binary_is_declared_and_keys_on_the_archive_2877) failed on
+// `id.compiler == core` — doing exactly the job its comment claims.
+//
+// The fix is to stop inferring provenance from a timestamp when the build
+// system can simply STATE it. tests/CMakeLists.txt now writes SHA-256(core.a)
+// to `<binary>.coreid` as a POST_BUILD step of every test binary's link, so the
+// record is produced by the same rule that does the link and says precisely
+// "this binary was linked while core.a held these bytes". Comparing it against
+// the archive's CURRENT hash is a content comparison, not a heuristic:
+//
+//   * no-op re-archive (identical bytes, new mtime)   -> matches -> TRUSTED
+//   * core.a genuinely rebuilt without relinking this
+//     binary — the real stale-core hazard             -> differs -> REJECTED,
+//     and rejected even when the mtimes are in the "safe" order, which the
+//     ordering alone cannot do
+//   * content changed and later reverted              -> matches -> TRUSTED,
+//     correctly: the archive on disk IS what this binary was linked from
+//
+// FALLBACK, and why it is not a weakening. A binary linked before this record
+// existed (any build tree from before this fix) has no `.coreid` and keeps
+// EXACTLY the previous rule — manifest + mtime ordering. Nothing trusted
+// yesterday becomes untrusted today, so no store is cooled by the change
+// itself; and nothing rejected yesterday becomes trusted, because #2877's
+// hand-linked probe is UNDECLARED and never reaches this code at all.
+inline std::string linkTimeCoreDigestPath() {
+    std::error_code ec;
+    // The RESOLVED path, not "/proc/self/exe" itself: the sidecar sits beside
+    // the real file, which is where CMake's $<TARGET_FILE:...> POST_BUILD wrote
+    // it. A binary relinked out from under a running process resolves to
+    // "<path> (deleted)", whose sidecar does not exist — the read fails and the
+    // legacy rule applies. That is the right answer: the deleted inode's
+    // provenance is exactly what cannot be established from the new file.
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec || exe.empty()) return {};
+    return exe.string() + ".coreid";
+}
+
+// PURE: read the 64 lowercase-or-uppercase-hex digest `text` begins with (after
+// leading whitespace), ignoring whatever follows the digest — so a bare digest,
+// a digest plus newline, and the `<digest>  <path>` shape `sha256sum` prints
+// all parse the same. A 65th hex character is REJECTED rather than truncated: a
+// longer run of hex is not a SHA-256, and silently taking its prefix would
+// accept a corrupt record as a valid one.
+inline bool parseHexDigest(std::string_view text,
+                           std::array<uint8_t, 32>& out) {
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::size_t i = 0;
+    while (i < text.size() &&
+           (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' ||
+            text[i] == '\r'))
+        ++i;
+    if (text.size() - i < 64) return false;
+    std::array<uint8_t, 32> digest{};
+    for (std::size_t b = 0; b < digest.size(); ++b) {
+        const int hi = nibble(text[i + 2 * b]);
+        const int lo = nibble(text[i + 2 * b + 1]);
+        if (hi < 0 || lo < 0) return false;
+        digest[b] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    const std::size_t after = i + 64;
+    if (after < text.size() && nibble(text[after]) >= 0) return false;
+    out = digest;
+    return true;
+}
+
+// Read the link-time record written beside the running binary. FALSE means "NO
+// RECORD" — absent, unreadable, or not a digest — and NEVER "mismatch"; the two
+// take different branches at the call site, so they must not be conflated. The
+// read is bounded: the record is 65 bytes and a build dir is not a place to
+// stream an arbitrary file from.
+inline bool readLinkTimeCoreDigest(const std::string& path,
+                                   std::array<uint8_t, 32>& out) {
+    if (path.empty()) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char buf[256];
+    in.read(buf, sizeof(buf));
+    if (in.bad()) return false;
+    return parseHexDigest(
+        std::string_view(buf, static_cast<std::size_t>(in.gcount())), out);
+}
+
+// PURE: the STALENESS half of the k2 decision. (The provenance half is
+// runningExeIsADeclaredTestBinary, ANDed by the caller — a binary the build
+// system never declared has no business keying on the archive whatever the
+// timestamps say.)
+//
+// A link-time record is AUTHORITATIVE when present: it is the build system's
+// own statement about this exact binary, so it accepts a no-op re-archive and
+// rejects a genuine rebuild, both of which the ordering gets wrong. Only in its
+// absence does the mtime ordering decide.
+inline bool archiveIdentityIsTrusted(bool haveLinkTimeRecord,
+                                     const std::array<uint8_t, 32>& recorded,
+                                     const std::array<uint8_t, 32>& coreHash,
+                                     bool mtimeOrderingOk) {
+    if (haveLinkTimeRecord) return recorded == coreHash;
+    return mtimeOrderingOk;
+}
+
 // The per-process build identity, computed ONCE (hashing the ~100 MB core
 // archive or the test binary is a few hundred ms; amortized over the whole
 // shard it is negligible).
@@ -1696,12 +1828,14 @@ inline const BuildIdentity& buildIdentity() {
 #endif
         bool haveCoreIdentity = false;
 #if defined(BEZEL_CORE_LIB_PATH) && defined(BEZEL_RUNTIME_LIB_PATH)
-        // (a) k2: the compiler archive, guarded — only trusted when the
-        // running binary is at least as new as the archive, i.e. it was linked
-        // FROM these bytes (see the STALE-CORE GUARD note in the KEY comment).
+        // (a) k2: the compiler archive, guarded — only trusted when this binary
+        // really was linked FROM these bytes, which since #4529 is decided by
+        // the link-time digest the build recorded and only otherwise by the
+        // mtime ordering (see the STALE-CORE GUARD note in the KEY comment).
         // /proc/self/exe resolves to the on-disk binary's inode even after a
         // mid-run relink replaced the path (the magic link pins the deleted
-        // inode, whose old mtime then correctly trips this guard). The branch
+        // inode, whose old mtime then correctly trips this guard, and whose
+        // `.coreid` sidecar no longer exists). The branch
         // requires BOTH archive macros: with the runtime path unknown a
         // core-only identity would leave the runtime entirely unkeyed, so the
         // exe fallback (which contains the whole-archived runtime) is used
@@ -1717,15 +1851,38 @@ inline const BuildIdentity& buildIdentity() {
             // per #2877: the mtime ordering is necessary but NOT sufficient —
             // it does not establish that THIS binary was linked from these
             // bytes. Require additionally that the build system declared this
-            // binary (see the LINK-PROVENANCE comment above). Evaluated LAST so
-            // the manifest read is short-circuited away on the stale-core path.
-            if (!ecCore && !ecExe && coreTime <= exeTime &&
-                runningExeIsADeclaredTestBinary()) {
-                std::array<uint8_t, 32> coreHash;
-                if (sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
+            // binary (see the LINK-PROVENANCE comment above).
+            //
+            // per #4529: nor is the ordering NECESSARY. When the build system
+            // recorded the archive digest at link time, that record decides and
+            // the ordering is not consulted — a no-op re-archive moves the
+            // mtime without moving a byte, and the ordering alone reads that as
+            // staleness and cools the whole shared store. The ordering remains
+            // the rule for a binary with no record. The archive is hashed only
+            // when one of the two can still say yes, so a stale-core process
+            // pays for the exe hash and not for both.
+            //
+            // The manifest read is consequently no longer short-circuited away
+            // on the stale-core path, because the ordering no longer decides on
+            // its own. It costs one ~600-byte read and six stats, once per
+            // process, against the 50 MB hash it gates.
+            if (!ecCore && !ecExe && runningExeIsADeclaredTestBinary()) {
+                std::array<uint8_t, 32> recorded{};
+                const bool haveRecord =
+                    readLinkTimeCoreDigest(linkTimeCoreDigestPath(), recorded);
+                const bool mtimeOrderingOk = coreTime <= exeTime;
+                std::array<uint8_t, 32> coreHash{};
+                // TOCTOU hardening (unchanged): core.a is re-stat'ed AFTER
+                // hashing, so a rebuild that began mid-hash changes the mtime
+                // and drops us to the exe fallback rather than keying a
+                // torn/new archive under a passed guard.
+                if ((haveRecord || mtimeOrderingOk) &&
+                    sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
                     fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore2) ==
                         coreTime &&
-                    !ecCore2) {
+                    !ecCore2 &&
+                    archiveIdentityIsTrusted(haveRecord, recorded, coreHash,
+                                             mtimeOrderingOk)) {
                     out->compiler = coreHash;
                     haveCoreIdentity = true;
                 }

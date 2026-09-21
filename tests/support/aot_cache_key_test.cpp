@@ -816,6 +816,138 @@ BEZEL_TEST(aot_cache_key, manifest_rows_for_absent_binaries_never_match_2877) {
 }
 
 // ---------------------------------------------------------------------------
+// LINK-TIME PROVENANCE (#4529): the archive identity survives a no-op
+// re-archive, and does not survive a real one.
+//
+// #2877 closed the over-ACCEPTING direction of the stale-core mtime ordering.
+// The over-REJECTING direction failed the 87313e75 gate and is what these rows
+// pin. Measured on that tree:
+//
+//   13:35:32.055  libbezel_core.a archived              (gate[2/5])
+//   13:35:35.41   the six test binaries linked          <- ordering HOLDS
+//   13:35:58.73   libbezel_core.a RE-archived by gate[3/5]'s `--target bezelc
+//                 check-lit`, from 50 ccache-hit objects (84-180 ms each) with
+//                 no file under src/ or tests/ touched since 13:30
+//
+// llvm-ar stores members uid/gid 0/0 at an epoch-0 timestamp, so re-archiving
+// the same 50 objects reproduces the archive byte for byte (verified on that
+// tree: sha256 b38429a4…). The re-archive moved the MTIME and not one byte of
+// CONTENT — yet `coreTime <= exeTime` inverted, every shard fell to the
+// per-binary exe identity, the shared store split six ways for the whole run,
+// and the safety pin above failed on `id.compiler == core`.
+//
+// The build now records SHA-256(core.a) at link time in `<binary>.coreid`
+// (tests/CMakeLists.txt), and that record decides.
+// ---------------------------------------------------------------------------
+
+// THE WIRING PIN, and the row that fails if the POST_BUILD step is ever
+// dropped: the record must EXIST beside this binary, and must equal the digest
+// of the archive on disk. The last assertion is the 87313e75 scenario stated
+// against REAL data — a hostile mtime ordering (as if core.a had just been
+// re-archived) with the real record and the real archive must still be trusted.
+BEZEL_TEST(aot_cache_key, the_build_records_the_link_time_core_digest_beside_this_binary_4529) {
+    const std::string p = bezel::test::aot_detail::linkTimeCoreDigestPath();
+    BEZEL_EXPECT_TRUE(!p.empty());
+    Digest recorded{};
+    BEZEL_EXPECT_TRUE(bezel::test::aot_detail::readLinkTimeCoreDigest(p, recorded));
+#ifdef BEZEL_CORE_LIB_PATH
+    Digest core{};
+    BEZEL_EXPECT_TRUE(sha256File(BEZEL_CORE_LIB_PATH, core));
+    BEZEL_EXPECT_TRUE(recorded == core);
+    // mtimeOrderingOk=false is the gate's state: core.a re-archived AFTER this
+    // binary was linked, identical bytes. The record must carry the decision.
+    BEZEL_EXPECT_TRUE(bezel::test::aot_detail::archiveIdentityIsTrusted(
+        true, recorded, core, /*mtimeOrderingOk=*/false));
+#endif
+}
+
+// THE DECISION, at the level the fix operates on. Both directions matter and
+// they are not symmetric:
+//   * a record that MATCHES overrides a hostile mtime ordering (the cooling
+//     defect) — without this the whole shared store re-splits on every build
+//     that re-archives core.a after linking the tests;
+//   * a record that DIFFERS overrides a friendly one (the soundness half) —
+//     a binary whose archive has been rebuilt under it must NOT key on that
+//     archive however the timestamps happen to fall, and the ordering alone
+//     cannot see that case at all.
+BEZEL_TEST(aot_cache_key, a_link_time_record_decides_over_the_mtime_ordering_4529) {
+    using bezel::test::aot_detail::archiveIdentityIsTrusted;
+    const Digest linked = ident(11);
+    const Digest other = ident(12);
+
+    // Record present.
+    BEZEL_EXPECT_TRUE(archiveIdentityIsTrusted(true, linked, linked, false));
+    BEZEL_EXPECT_TRUE(archiveIdentityIsTrusted(true, linked, linked, true));
+    BEZEL_EXPECT_TRUE(!archiveIdentityIsTrusted(true, linked, other, true));
+    BEZEL_EXPECT_TRUE(!archiveIdentityIsTrusted(true, linked, other, false));
+
+    // No record (a tree built before #4529, or a hand-linked binary): EXACTLY
+    // the previous rule, so nothing trusted before this fix becomes untrusted
+    // and nothing rejected before it becomes trusted.
+    BEZEL_EXPECT_TRUE(archiveIdentityIsTrusted(false, linked, other, true));
+    BEZEL_EXPECT_TRUE(!archiveIdentityIsTrusted(false, linked, linked, false));
+}
+
+// A record that cannot be parsed must read as NO RECORD — which falls back to
+// the mtime ordering — and never as a match. Conflating the two would turn a
+// truncated file (a half-written POST_BUILD, a full disk) into a blanket
+// "trust the archive", i.e. the #2877 defect arriving through the fix for it.
+BEZEL_TEST(aot_cache_key, a_corrupt_link_time_record_reads_as_no_record_4529) {
+    using bezel::test::aot_detail::parseHexDigest;
+    using bezel::test::aot_detail::readLinkTimeCoreDigest;
+    Digest d{};
+
+    // The shapes the writer can legitimately produce.
+    const std::string hex(64, 'a');
+    BEZEL_EXPECT_TRUE(parseHexDigest(hex, d));
+    BEZEL_EXPECT_TRUE(parseHexDigest(hex + "\n", d));
+    BEZEL_EXPECT_TRUE(parseHexDigest("  " + hex + "\n", d));
+    BEZEL_EXPECT_TRUE(parseHexDigest(hex + "  /path/to/libbezel_core.a\n", d));
+    BEZEL_EXPECT_TRUE(parseHexDigest(std::string(64, 'A'), d));  // upper case
+    // …and the VALUE is the bytes, not merely "it parsed" — a parser that
+    // returned true while leaving `out` untouched would make every comparison
+    // in this file compare one zero digest with another.
+    Digest all_ff{};
+    for (auto& b : all_ff) b = 0xFF;
+    Digest v{};
+    BEZEL_EXPECT_TRUE(parseHexDigest(std::string(64, 'f'), v));
+    BEZEL_EXPECT_TRUE(v == all_ff);
+    BEZEL_EXPECT_TRUE(parseHexDigest(std::string(64, 'F'), v));
+    BEZEL_EXPECT_TRUE(v == all_ff);
+
+    // The shapes that must NOT parse.
+    BEZEL_EXPECT_TRUE(!parseHexDigest("", d));
+    BEZEL_EXPECT_TRUE(!parseHexDigest(std::string(63, 'a'), d));   // truncated
+    BEZEL_EXPECT_TRUE(!parseHexDigest(std::string(65, 'a'), d));   // not SHA-256
+    BEZEL_EXPECT_TRUE(!parseHexDigest(std::string(63, 'a') + "z", d));
+    BEZEL_EXPECT_TRUE(!parseHexDigest("   \n", d));
+
+    // A file that is not there is "no record", and so is a directory.
+    const std::string dir = bezel::test::aot_detail::makeWorkDir();
+    BEZEL_EXPECT_TRUE(!dir.empty());
+    if (dir.empty()) return;
+    bezel::test::aot_detail::WorkDir cleanup{dir};
+    BEZEL_EXPECT_TRUE(!readLinkTimeCoreDigest(dir + "/absent.coreid", d));
+    BEZEL_EXPECT_TRUE(!readLinkTimeCoreDigest("", d));
+    BEZEL_EXPECT_TRUE(!readLinkTimeCoreDigest(dir, d));  // a directory
+    { std::ofstream os(dir + "/torn.coreid", std::ios::binary); os << "deadbeef"; }
+    BEZEL_EXPECT_TRUE(!readLinkTimeCoreDigest(dir + "/torn.coreid", d));
+    // …and a well-formed one is read back EXACTLY, byte for byte. The pattern
+    // is deliberately non-zero so a reader that returned true without writing
+    // `out` would be caught rather than matching a default-constructed Digest.
+    const std::string pattern = "0123456789abcdef0123456789abcdef"
+                                "0123456789abcdef0123456789abcdef";
+    { std::ofstream os(dir + "/good.coreid", std::ios::binary);
+      os << pattern << "\n"; }
+    Digest got{};
+    BEZEL_EXPECT_TRUE(readLinkTimeCoreDigest(dir + "/good.coreid", got));
+    Digest expected{};
+    BEZEL_EXPECT_TRUE(parseHexDigest(pattern, expected));
+    BEZEL_EXPECT_TRUE(got == expected);
+    BEZEL_EXPECT_TRUE(got[0] == 0x01 && got[1] == 0x23 && got[31] == 0xef);
+}
+
+// ---------------------------------------------------------------------------
 // BEHAVIOUR-CHANGING ENVIRONMENT (#2877, key component (e)).
 //
 // BEZEL_OWNERSHIP_LAMBDA_DATAFLOW and BEZEL_VERIFY_IR change what the
