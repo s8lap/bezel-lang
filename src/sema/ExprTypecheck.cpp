@@ -6404,6 +6404,37 @@ static std::string_view namedTypeSimpleName(const TypeRef* ref) {
     if (!ref || ref->kind != TypeRef::Kind::Named) return {};
     if (ref->declaration) return ref->declaration->name;
     if (!ref->importedName.empty()) return ref->importedName;
+    // fix #4570 (§27.8, v0.306): a type alias resolves TRANSPARENTLY by
+    // copying the underlying TypeRef and then RESTORING astNode to the USE
+    // SITE (the alias name `Al`), so the astNode read below answers `Al`
+    // rather than the underlying builtin head. TypeRef.hpp names
+    // `aliasResolvedHead` as the compensating field carried for exactly this
+    // reason and `headName()` as "the ONE read every builtin-collection/
+    // wrapper identity check should use instead of astNode->name->parts[0]";
+    // this function is such a check and was missing the leg.
+    //
+    // Measured consequence: `type Al := Array<int>; var x: Al := src;`
+    // reached `variantGenericAssignable` with toName="Al" against
+    // fromName="Array", matched no ancestor of `Array<int>` under that name,
+    // and — because `Array` IS in `builtinBorrowingCollectionFullyModeled` —
+    // took that predicate's proof-of-non-conformance REJECT. That
+    // contradicts §27.8's "each instantiation of the alias is
+    // interchangeable with the corresponding instantiation of the aliased
+    // type". Every arity-1 builtin head in the modeled family (`Array`,
+    // `Set`, `Stack`, `Queue`, `LinkedList`, `SortedSet`, and the collection
+    // interfaces) was unusable through an alias; the arity-2 maps
+    // (`Dictionary`, `SortedDictionary`) only APPEARED to work because they
+    // sit outside that family and fell through to the conservative accept —
+    // they were never alias-transparent either, merely un-rejected.
+    //
+    // Placed AFTER `declaration` and `importedName` — through an alias copy
+    // both already carry the UNDERLYING type's own name, so those legs are
+    // already alias-transparent — and BEFORE the astNode read, the only leg
+    // the alias restore corrupts. Non-alias refs leave `aliasResolvedHead`
+    // empty and are unaffected, and the qualified-name `parts.back()`
+    // (last-component) behaviour this function deliberately keeps, unlike
+    // `headName()`'s `parts[0]`, is preserved for them.
+    if (!ref->aliasResolvedHead.empty()) return ref->aliasResolvedHead;
     if (ref->astNode && ref->astNode->name &&
         !ref->astNode->name->parts.empty())
         return ref->astNode->name->parts.back();

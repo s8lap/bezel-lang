@@ -363,6 +363,14 @@ static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
     if (!ref || ref->kind != TypeRef::Kind::Named) return {};
     if (ref->declaration) return ref->declaration->name;
     if (!ref->importedName.empty()) return ref->importedName;
+    // fix #4570 (§27.8, v0.306): the alias-transparency leg, identical to
+    // the one on ExprTypecheck.cpp's `namedTypeSimpleName` this is a copy of
+    // (see the full rationale there). A type alias restores `astNode` to the
+    // USE SITE, so without this the read below answers the ALIAS name. Here
+    // that mis-spelled `type Al := IEnumerable<int>` as the non-existent type
+    // `Al<int>` in the §15.4 collection-literal diagnostic and hid the
+    // builtin interface head from `isCollectionLiteralInterfaceTarget`.
+    if (!ref->aliasResolvedHead.empty()) return ref->aliasResolvedHead;
     if (ref->astNode && ref->astNode->name &&
         !ref->astNode->name->parts.empty())
         return ref->astNode->name->parts.back();
