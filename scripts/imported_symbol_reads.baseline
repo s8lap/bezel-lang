@@ -40,7 +40,7 @@
 11   src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-13   src/codegen/LlvmBackend_Setup.cpp
+12   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 23   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
