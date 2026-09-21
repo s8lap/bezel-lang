@@ -316,7 +316,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (!part.literal.empty()) {
                 // Literal part: process escape sequences (e.g. \n → newline,
                 // \t → tab) that were stored as raw chars by splitInterpolation.
-                // Wrap in quotes so processStringText's strip-quotes logic works.
+                // Wrap in quotes so the shared literal lowering's strip-quotes
+                // logic works.
                 // R36/#733: for a VERBATIM interpolated string (`$@"..."`, §18.7)
                 // the literal parts must NOT have escapes decoded — the splitter
                 // already kept the raw backslash. Thread isVerbatim through AND
@@ -326,31 +327,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 std::string wrapped =
                     (is->isVerbatim ? std::string("@\"") : std::string("\"")) +
                     part.literal + "\"";
-                std::string content =
-                    processStringText(wrapped, is->isVerbatim);
-                llvm::Constant* dataArr = llvm::ConstantDataArray::getString(
-                    llvm_, content, /*AddNull=*/true);
-                unsigned id = stringLiteralIdx_++;
-                auto* dataGV = new llvm::GlobalVariable(
-                    *module_, dataArr->getType(), true,
-                    llvm::GlobalValue::PrivateLinkage, dataArr,
-                    ".bz.istr.data." + std::to_string(id));
-                dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                dataGV->setAlignment(llvm::Align(1));
-                llvm::Constant* lenC = llvm::ConstantInt::get(
-                    i64(), content.size());
-                // The literal part is built from a byte string → width 1.
-                // #422: constant global literal — SENTINEL rc (never freed). The
-                // struct now has 4 fields {data, len, width, rc}; supply all.
-                llvm::Constant* widC = llvm::ConstantInt::get(
-                    llvm::Type::getInt8Ty(llvm_), 1);
-                llvm::Constant* strVal = llvm::ConstantStruct::get(
-                    stringType(), {dataGV, lenC, widC, stringRcSentinel()});
-                auto* strGV = new llvm::GlobalVariable(
-                    *module_, stringType(), true,
-                    llvm::GlobalValue::PrivateLinkage, strVal,
-                    ".bz.istr." + std::to_string(id));
-                pv = strGV;
+                // fix #4545 (§4.6/§18.5/§18.8, v0.306): this used to hand-roll the
+                // global via `processStringText`, which decodes UTF-8 to code
+                // points and then TRUNCATES each one to its low byte (always
+                // width 1) — the exact "code-point count used as a byte/width
+                // decision" defect #4499 fixed on the dict-key path, on the one
+                // path that fix did not touch. A non-ASCII literal segment (e.g.
+                // U+65E5 U+672C) came out as its low storage bytes ("å,").
+                // `lowerStringLiteral` is the shared, correct construction — the
+                // same `processStringCodePoints` → `codePointsWidth` →
+                // `makeCodePointArray` pipeline plain `"…"` literals already use
+                // (LlvmBackend_String.cpp:384) — so the literal segment gets the
+                // narrowest width that actually fits its code points instead of a
+                // hard-coded 1, and a hole substituting the identical text (which
+                // already went through this pipeline) and the literal segment now
+                // agree.
+                pv = lowerStringLiteral(wrapped, is->isVerbatim);
             } else if (part.expr) {
                 // Expression part: lower the expression, then convert to
                 // string. If a format spec is present (§18.5), apply it.
