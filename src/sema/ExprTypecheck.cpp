@@ -16551,6 +16551,71 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // block, ExprTypecheck_Exprs.cpp): identical primitives
                     // keep that type; otherwise the narrower operand
                     // promotes to whichever of the two admits it.
+                    auto isTrueInt = [](P p) {
+                        switch (p) {
+                            case P::Byte: case P::SByte: case P::Short:
+                            case P::UShort: case P::Int: case P::UInt:
+                            case P::Long: case P::ULong:
+                                return true;
+                            default:
+                                return false;
+                        }
+                    };
+                    std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    // fix #4513 (§3.5/§5.1/§6.2/§6.6, v0.306): ask the SAME
+                    // two admissibility questions the binary `x op e` asks —
+                    // §3.5's bool exclusion (fix #4500) and §5.1's pairwise-
+                    // conversion rule (fix #4501/#4512) — through the SAME
+                    // shared calls `typeBinary` uses, BEFORE computing R.
+                    // Previously this branch computed R from tTy/rTy's
+                    // WIDENING relationship alone, with no bool/§5.1 gate:
+                    // for a pair the binary form outright REJECTS
+                    // (`int + bool`, `decimal * bool`, `int * string`), the
+                    // "no conversion either way" fallback below (`rPrim =
+                    // rTy->primitive`) manufactured a fictitious R and
+                    // reported "computes `bool`"/"computes `string`" — a
+                    // binary result type the binary path no longer computes
+                    // since fix #4500/#4501. Gating first means a pair the
+                    // binary form rejects is reported with the SAME wording
+                    // as the binary rejection, and the R computation below
+                    // only ever runs on a pair `x op e` actually has a
+                    // result for.
+                    //
+                    // Scoped to skip the ALREADY-handled integer/integer (or
+                    // char/integer) "no conversion either way" pair — e.g.
+                    // `int += ulong`, pinned by the #2155 lit rows with
+                    // `reportInadmissiblePair`'s own wording below. Both
+                    // gates would ALSO reject that exact pair (it is
+                    // §5.1-inadmissible either way), so running them
+                    // unconditionally would silently flip that pinned
+                    // wording — a second, out-of-scope unification #4513
+                    // does not attempt (narrowed in the issue tracker).
+                    // `integerKindPair` is exactly `reportInadmissiblePair`'s
+                    // own eligibility test, evaluated up front instead of via
+                    // the (now redundant) `rPrim`/`integerWriteBack`
+                    // fallback — a pair with ANY widening relation never
+                    // reaches this branch's "no conversion either way" case
+                    // regardless, so scoping on it changes nothing else.
+                    const bool integerKindPair =
+                        (isTrueInt(tTy->primitive) ||
+                         tTy->primitive == P::Char) &&
+                        isTrueInt(rTy->primitive);
+                    bool pairRejectedAsBinary =
+                        reportBoolOperandExcludedFromArithmeticOrOrdering(
+                            as->value->span.begin, binOp, tTy, rTy);
+                    if (!pairRejectedAsBinary && !integerKindPair) {
+                        pairRejectedAsBinary =
+                            reportNoImplicitConversionBetweenOperands(
+                                as->value->span.begin, binOp, tTy, rTy,
+                                /*allowLiteralAdoption=*/true,
+                                as->target.get(), as->value.get());
+                    }
+                    if (pairRejectedAsBinary) {
+                        // Reported above (either gate); nothing further to
+                        // check — computing a write-back R for a pair the
+                        // binary form itself rejects is exactly the bug this
+                        // fix removes.
+                    } else {
                     P rPrim = tTy->primitive;
                     if (tTy->primitive != rTy->primitive) {
                         if (primitiveWidens(tTy->primitive, rTy->primitive))
@@ -16564,16 +16629,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     bool rEqualsT = rPrim == tTy->primitive;
                     bool rConvertsToT =
                         !rEqualsT && primitiveWidens(rPrim, tTy->primitive);
-                    auto isTrueInt = [](P p) {
-                        switch (p) {
-                            case P::Byte: case P::SByte: case P::Short:
-                            case P::UShort: case P::Int: case P::UInt:
-                            case P::Long: case P::ULong:
-                                return true;
-                            default:
-                                return false;
-                        }
-                    };
                     bool integerWriteBack =
                         !rEqualsT && !rConvertsToT &&
                         (isTrueInt(tTy->primitive) ||
@@ -16603,7 +16658,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !isLitDerived(as->value.get()))
                         reportInadmissiblePair();
                     if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
-                        std::string binOp(as->op.substr(0, as->op.size() - 1));
                         // §7.11 (#2153): with a nullable operand the computed
                         // R lifts to `R?`; spell it so (`int? + double?`
                         // computes `double?`). The `T?(x op e)` remedy stays
@@ -16627,6 +16681,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "the right-hand operand explicitly, or write "
                             "`x := " + spellN(tTy) + "(x " + binOp +
                             " e);` if the loss is intended (§6.6)");
+                    }
                     }
                 }
             } else if (tTy && rTy &&

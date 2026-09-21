@@ -5311,6 +5311,22 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
 bool ExprTC::reportNoImplicitConversionBetweenOperands(
     const ast::BinaryExpr& be, std::string_view op, const TypeRef* lt,
     const TypeRef* rt, bool allowLiteralAdoption) {
+    return reportNoImplicitConversionBetweenOperands(
+        be.span.begin, op, lt, rt, allowLiteralAdoption, be.left.get(),
+        be.right.get());
+}
+
+// fix #4513 (§5.1/§6.2/§6.6, v0.306): the location-and-expr-pointer core the
+// BinaryExpr overload above delegates to, so the §6.6 compound-assignment
+// family check (ExprTypecheck.cpp) — which has an AssignmentStmt's
+// `target`/`value`, not a `BinaryExpr` — can ask this SAME question instead
+// of computing its own, independent (and, for a `bool`/`string` right-hand
+// operand, WRONG) answer. See the class-declaration comment (impl.hpp) for
+// why `leftExpr`/`rightExpr` may be null.
+bool ExprTC::reportNoImplicitConversionBetweenOperands(
+    SourceLocation loc, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt, bool allowLiteralAdoption, const ast::Expr* leftExpr,
+    const ast::Expr* rightExpr) {
     if (!lt || !rt) return false;
     if (lt->kind != TypeRef::Kind::Primitive ||
         rt->kind != TypeRef::Kind::Primitive)
@@ -5348,10 +5364,10 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                     return false;
             }
         };
-        if (isLiteralDerivedExpr(be.left.get()) &&
+        if (isLiteralDerivedExpr(leftExpr) &&
             isTrueIntegerType(rt->primitive))
             return false;
-        if (isLiteralDerivedExpr(be.right.get()) &&
+        if (isLiteralDerivedExpr(rightExpr) &&
             isTrueIntegerType(lt->primitive))
             return false;
     }
@@ -5366,12 +5382,12 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         // The pre-existing §6.2 mixed-numeric wording, byte-for-byte: several
         // lit rows pin it (`sema_mixed_numeric__*`, `sema_521_incompatible__*`).
         ctx_.diagnostics().report(
-            Severity::Error, be.span.begin,
+            Severity::Error, loc,
             head + " (§6.2); add an explicit cast (§5.2) to convert"
                    " one operand to the other's type.");
     } else if (op == "=" || op == "<>") {
         ctx_.diagnostics().report(
-            Severity::Error, be.span.begin,
+            Severity::Error, loc,
             head + " (§5.1) — `=`/`<>` invoke `Equals` "
                    "(§17.3/§8.4) and §5.1 admits no conversion "
                    "between these operand types, so there is no applicable "
@@ -5380,12 +5396,62 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                    "`int(b)`; for a rendering, `.ToString()` (§8.5).");
     } else {
         ctx_.diagnostics().report(
-            Severity::Error, be.span.begin,
+            Severity::Error, loc,
             head + " (§5.1) — §5.1's table has no row between "
                    "them, so the operation is a compile error (§6.2); "
                    "convert one operand explicitly (§5.2).");
     }
     return true;
+}
+
+// fix #4513 (§3.5/§6.6, v0.306): extracted from fix #4500's inline gate in
+// `typeBinary` (below) so the §6.6 compound-assignment family check
+// (ExprTypecheck.cpp) can ask the IDENTICAL §3.5 question instead of
+// computing its own — see the impl.hpp declaration for the full rationale.
+// `+` defers to string concatenation (§4.6) when either operand is `string`;
+// every other reader of this predicate (ordering, and every other arithmetic
+// op) has no such deferral.
+bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
+    SourceLocation loc, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt) {
+    auto isBool = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::Bool;
+    };
+    auto isStringPrim = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::String;
+    };
+    const bool ordering =
+        (op == "<" || op == ">" || op == "<=" || op == ">=");
+    // §4.6 is the MORE SPECIFIC authority for `string + <anything>`: `+` on a
+    // string operand is concatenation (a declared `String.operator +`,
+    // §3.5), not §3.5's numeric-arithmetic bullet, and its remedy is
+    // interpolation or `.ToString()` — not `int(b)`. The caller's own
+    // string-mismatch check already covers every non-string right operand,
+    // `bool` included, so this gate stands aside for exactly that pair
+    // rather than answering it with advice that does not fit.
+    const bool deferToStringConcat =
+        (op == "+") && (isStringPrim(lt) || isStringPrim(rt));
+    if ((isBool(lt) || isBool(rt)) && !deferToStringConcat) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "operator `" + std::string(op) + "` is not defined for `bool` "
+            "operands (\xC2\xA7""3.5) \xE2\x80\x94 " +
+            (ordering
+                 ? std::string(
+                       "no ordering of `false`/`true` is "
+                       "defined; only `=`/`<>` are valid on bool. To order "
+                       "by a flag, convert explicitly (`int(b)`).")
+                 : std::string(
+                       "\xC2\xA7""3.5 defines arithmetic (`+`, `-`, `*`, `/`) "
+                       "on the numeric types only, and \xC2\xA7""5.1 admits no "
+                       "implicit conversion out of `bool`, so the operation "
+                       "is a compile error (\xC2\xA7""6.2). To compute with a "
+                       "flag, convert explicitly (`int(b)`).")));
+        return true;
+    }
+    return false;
 }
 
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
@@ -5952,39 +6018,19 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return t && t->kind == TypeRef::Kind::Primitive &&
                    t->primitive == PrimitiveType::Bool;
         };
-        auto isStringPrim = [](const TypeRef* t) {
-            return t && t->kind == TypeRef::Kind::Primitive &&
-                   t->primitive == PrimitiveType::String;
-        };
         TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
         TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
         const bool ordering =
             (op == "<" || op == ">" || op == "<=" || op == ">=");
-        // §4.6 is the MORE SPECIFIC authority for `string + <anything>`:
-        // `+` on a string operand is concatenation (a declared `String.operator
-        // +`, §3.5), not §3.5's numeric-arithmetic bullet, and its remedy is
-        // interpolation or `.ToString()` — not `int(b)`. That check lives
-        // below and already covers every non-string right operand, `bool`
-        // included, so this gate stands aside for exactly that pair rather
-        // than answering it with advice that does not fit.
-        const bool deferToStringConcat =
-            (op == "+") && (isStringPrim(lt) || isStringPrim(rt));
-        if ((isBool(lt) || isBool(rt)) && !deferToStringConcat) {
-            ctx_.diagnostics().report(
-                Severity::Error, be.span.begin,
-                "operator `" + std::string(op) + "` is not defined for `bool` "
-                "operands (\xC2\xA7""3.5) \xE2\x80\x94 " +
-                (ordering
-                     ? std::string(
-                           "no ordering of `false`/`true` is "
-                           "defined; only `=`/`<>` are valid on bool. To order "
-                           "by a flag, convert explicitly (`int(b)`).")
-                     : std::string(
-                           "\xC2\xA7""3.5 defines arithmetic (`+`, `-`, `*`, `/`) "
-                           "on the numeric types only, and \xC2\xA7""5.1 admits no "
-                           "implicit conversion out of `bool`, so the operation "
-                           "is a compile error (\xC2\xA7""6.2). To compute with a "
-                           "flag, convert explicitly (`int(b)`).")));
+        // fix #4513 (§3.5/§6.6, v0.306): the gate itself — the diagnostic
+        // and the string-concat deferral — is now the ONE call
+        // `reportBoolOperandExcludedFromArithmeticOrOrdering` (impl.hpp),
+        // shared with the §6.6 compound-assignment family check
+        // (ExprTypecheck.cpp), which asks this exact question about the same
+        // (target, right-hand-operand) pair. Only the error-RECOVERY typing
+        // below is specific to this expression-typing caller.
+        if (reportBoolOperandExcludedFromArithmeticOrOrdering(
+                be.span.begin, op, lt, rt)) {
             // Error recovery, mirroring the unit-operand gate above: an
             // ordering yields `bool`; an arithmetic yields the OTHER
             // (non-bool) operand's type when there is one, else `int`.

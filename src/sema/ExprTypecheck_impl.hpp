@@ -1504,6 +1504,37 @@ private:
                                                    const TypeRef* rt,
                                                    bool allowLiteralAdoption);
 
+    // fix #4513 (§5.1/§6.2/§6.6, v0.306): the SAME question as above, asked
+    // from a position with no `ast::BinaryExpr` to hand — the §6.6 compound-
+    // assignment family check (ExprTypecheck.cpp), whose "operands" are an
+    // AssignmentStmt's `target`/`value`. The BinaryExpr overload delegates
+    // here; `leftExpr`/`rightExpr` are only consulted for the §5.1 constant-
+    // narrowing escape's literal-derived test (`isLiteralDerivedExpr`) and may
+    // be null (then the escape never applies from that side).
+    bool reportNoImplicitConversionBetweenOperands(SourceLocation loc,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption,
+                                                   const ast::Expr* leftExpr,
+                                                   const ast::Expr* rightExpr);
+
+    // fix #4513 (§3.5/§6.6, v0.306): the §3.5 per-operand-type table's `bool`
+    // exclusion from the arithmetic (`+ - * /`) and ordering (`< <= > >=`)
+    // families — fix #4500's typeBinary gate, extracted so the §6.6 compound-
+    // assignment family check can ask the IDENTICAL question about the SAME
+    // (target, right-hand-operand) pair instead of falling through to the
+    // §6.6 write-back diagnostic, which names a binary result type (`bool`)
+    // the binary path no longer computes for that pair. `+` defers to string
+    // concatenation when either operand is `string` (§4.6 is the more
+    // specific authority there), exactly as the typeBinary gate does. Reports
+    // and returns true iff the pair is excluded; unlike the BinaryExpr call
+    // site, the caller here does its own consequence (typeBinary does
+    // error-recovery typing; the compound-assignment check just stops).
+    bool reportBoolOperandExcludedFromArithmeticOrOrdering(
+        SourceLocation loc, std::string_view op, const TypeRef* lt,
+        const TypeRef* rt);
+
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
     // interface)? BFS, cycle-guarded.
