@@ -1737,12 +1737,31 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
     // already implements (issue #364), so route to it rather than re-deriving
     // it here and risking a second spelling of one rule.
     //
+    // fix #4580 (§17.5/§8.4/§5.1, v0.306): the arm above only fired when BOTH
+    // operands already arrived as the tagged struct. `el` (the stored element,
+    // loaded at the element stride) always does — but `target`, the QUERY
+    // operand, may instead be a NON-nullable value: `3 in xs` over
+    // `Array<int?>` lowers the literal `3` straight from its `int` type
+    // (`lowerExpr`'s IntLiteralExpr arm reads `rt->primitive` and ignores
+    // `rt->nullable`), so it arrives as a bare `i32`. §5.1 admits this — `T`
+    // converts to `T?` implicitly (the "present-value wrapping" of §7.2) —
+    // before §17.5's own admissibility rule even engages. Coerce EACH operand
+    // up to the tagged struct with `ensureNullableElementValue` (the same
+    // helper fix #4579 uses to spill a bare value into a nullable-value slot)
+    // before dispatching, so a bare inner value on either side is admitted
+    // rather than declined into the invalid-IR fallback below.
+    // `ensureNullableElementValue` is a no-op on a value that is already the
+    // tagged struct, so the pre-existing both-tagged case is unaffected.
+    //
     // Every caller of this helper gets the fix at once: `x in coll` (the §17.5
     // lowering), `.Contains`, `.Remove`, `.IndexOf`, and the array-backed
     // `Set<T>` dedup insert all compare elements through here.
-    if (isNullableValueTy(elemTy) && el->getType()->isStructTy() &&
-        target->getType()->isStructTy())
-        return emitValueEquality(el, target, elemTy);
+    if (isNullableValueTy(elemTy)) {
+        llvm::Value* l = ensureNullableElementValue(elemTy, el);
+        llvm::Value* r = ensureNullableElementValue(elemTy, target);
+        if (l->getType()->isStructTy() && r->getType()->isStructTy())
+            return emitValueEquality(l, r, elemTy);
+    }
 
     // fix #4571 (§4.4/§8.3, v0.306): a non-nullable DECIMAL element —
     // `Array<decimal>`, `LinkedList<decimal>`, the array-backed `Set<decimal>`
