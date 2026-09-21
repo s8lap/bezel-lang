@@ -38074,9 +38074,10 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
             // String key: extract data/len from the bz_string struct.
             llvm::Value* kd = loadStringData(k);
             llvm::Value* kl = loadStringLen(k);
+            llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3)
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {dict, kd, kl, vPtr});
+                                {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+            builder_.CreateCall(fn, {dict, kd, kl, kw, vPtr});
             // fix #3703 / §28.9: same escaping-value story as .Add(k,v) and
             // the indexer-set — bz_dict_set_str copies kd/kl's BYTES
             // (strndup), never retaining `k` (the bz_string*) itself. A

@@ -7099,11 +7099,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // and Interface correctly per §28.11 v0.135 fix #619.
         llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
 
-        // Helper: extract string data/len from bz.string ptr
-        auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+        // Helper: extract the (data, code-point length, storage width) TRIPLE
+        // every string-key runtime entry point takes. fix #4499 (spec §4.6 /
+        // §8.3, v0.306): the width is not optional — a string's byte size is
+        // `len * width`, so a table given only (data, len) treats a code-point
+        // count as a byte count and truncates every width>1 key.
+        auto strDataLen = [&](llvm::Value* s)
+                -> std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> {
             llvm::Value* data = loadStringData(s);
             llvm::Value* len  = loadStringLen(s);
-            return {data, len};
+            llvm::Value* w    = loadStringWidth(s);   // i8, fix #4499
+            return {data, len, w};
         };
         // issues #343 / D3: spill a generic key value to a stack slot and return
         // the byte pointer the generic runtime entry points expect. A record key
@@ -7493,14 +7499,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (non-string) key keeps the pre-existing `bz_dict_keys_gen`
             // path unchanged.
             llvm::Value* dtLensArr = nullptr;
+            llvm::Value* dtWidthsArr = nullptr;   // fix #4499
             if (dtIsStringKey) {
                 auto* dtLensOutSlot = entryAlloca(ptrTy());
+                // fix #4499: the snapshot's third parallel spine — the per-key
+                // §4.6 storage width `decodeDictStringKeyAt` needs to rebuild
+                // the key at its true byte size (`len * width`).
+                auto* dtWidthsOutSlot = entryAlloca(ptrTy());
                 auto* kfnStr = declareC("bz_dict_keys_str",
                     llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(kfnStr,
-                    {recv, dtKeysOutSlot, dtLensOutSlot, dtCntSlot});
-                dtLensArr = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                    {recv, dtKeysOutSlot, dtLensOutSlot, dtWidthsOutSlot,
+                     dtCntSlot});
+                dtLensArr   = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                dtWidthsArr = builder_.CreateLoad(ptrTy(), dtWidthsOutSlot);
             } else {
                 auto* kfn = declareC("bz_dict_keys_gen",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
@@ -7535,9 +7548,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (dtIsStringKey) {
                     auto* sortStrFn = declareC("bz_sort_kv_str",
                         llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #4499: the width spine is permuted with keys/lens/
+                    // values — otherwise a sorted key's bytes and its width
+                    // come from different entries.
                     builder_.CreateCall(sortStrFn,
-                        {dtKeysArr, dtLensArr, dtValsArr, dtCnt});
+                        {dtKeysArr, dtLensArr, dtWidthsArr, dtValsArr, dtCnt});
                 } else if (llvm::Function* cmpFn =
                                buildSortedKeyComparator(keyTy)) {
                     auto* sortFn = declareC("bz_sort_kv_gen",
@@ -7562,7 +7578,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (see this arm's opening comment), or safely leaked otherwise.
             llvm::Value* dtKeyDecoded =
                 dtIsStringKey
-                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtIdx).first
+                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtWidthsArr,
+                                            dtIdx).first
                     : decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
                                              "dictterm.kgen").first;
 
@@ -7613,8 +7630,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // spine from `dtKeysArr`, freed by the for-in path's own endBB
             // (`lensArr`) the same way — a generic key never allocates one
             // (`dtLensArr` stays null).
-            if (dtIsStringKey)
+            if (dtIsStringKey) {
                 builder_.CreateCall(dtFreeFn, {dtLensArr});
+                builder_.CreateCall(dtFreeFn, {dtWidthsArr});   // fix #4499
+            }
             builder_.CreateCall(dtFreeFn, {dtValsArr});
 
             // #1013-style reclaim: a fresh unbound Dictionary/SortedDictionary
@@ -7694,9 +7713,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
             }
-            auto [kd, kl] = strDataLen(k);
-            auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
-            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            auto [kd, kl, kw] = strDataLen(k);
+            auto* fn = declareC("bz_dict_contains_str", i1(),
+                                {ptrTy(), ptrTy(), i64(), i8()});
+            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.contains");
             // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into
             // the table BY VALUE (bz_dict_contains_str reads kd/kl, never the
             // bz_string* itself — unlike the VALUE slot, which is retained
@@ -7728,10 +7748,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy()});
                 isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "tryadd.dup");
             } else {
-                auto [kd0, kl0] = strDataLen(k);
+                auto [kd0, kl0, kw0] = strDataLen(k);
                 auto* cf = declareC("bz_dict_contains_str", i1(),
-                                    {ptrTy(), ptrTy(), i64()});
-                isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "tryadd.dup");
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "tryadd.dup");
             }
             auto* dupBB = llvm::BasicBlock::Create(llvm_, "tryadd.dup.disp",
                                                    currentFn_);
@@ -7762,11 +7782,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_set_str",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             }
             llvm::BasicBlock* insEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
@@ -7833,11 +7853,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "add.dup"),
                         "ArgumentException");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
                     llvm::Value* isDup =
-                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                        builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                     // fix #3703 / §28.9: the real insert below re-derives
                     // kd/kl from `k` a SECOND time and releases a fresh +1 KEY
                     // producer only after that insert — which never runs on
@@ -7874,10 +7894,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)},
                                                 "add.dup");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
-                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
+                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                 }
                 auto* dupBB  = llvm::BasicBlock::Create(
                     llvm_, "add.dup.disp", currentFn_);
@@ -7927,10 +7947,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     nullTransferredOwnedLocalSlot(call.args[1].value.get());
                 return llvm::ConstantInt::get(i32(), 0);
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+            builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for
             // OwningDictionary<K,V> with a string key, the value (arg 1) has
             // just been transferred. Null the caller's bare owned local/param
@@ -7994,18 +8014,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             llvm::Value* removeResult;
             if (valDisp) {
                 // OwningDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
                 removeResult = builder_.CreateCall(
-                    fn, {recv, kd, kl, llvm::cast<llvm::Value>(valDisp)},
+                    fn, {recv, kd, kl, kw, llvm::cast<llvm::Value>(valDisp)},
                     "dict.remove");
             } else {
-                auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
-                removeResult = builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+                auto* fn = declareC("bz_dict_remove_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                removeResult = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.remove");
             }
             // fix #3703 / §28.9: Remove never throws (absent key just returns
             // false), so `k`'s single use above (kd/kl) is unconditionally
@@ -8035,10 +8056,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "pv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "pv.found");
                 // fix #3703 / §28.9: this call is the sole use of `k`'s
                 // buffer (kd2/kl2 alias it); release a fresh +1 KEY producer
@@ -8105,10 +8126,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "tpv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "tpv.found");
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryPopValue
                 // never throws, so release a fresh +1 KEY producer now.
@@ -8203,10 +8224,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryGetValue
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8296,10 +8317,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; GetOrNull
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8430,8 +8451,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             llvm::Value* genKey = keyTy ? genKeyPtr(k) : nullptr;
-            llvm::Value* strKd = nullptr, *strKl = nullptr;
-            if (!keyTy) { auto p = strDataLen(k); strKd = p.first; strKl = p.second; }
+            llvm::Value* strKd = nullptr, *strKl = nullptr, *strKw = nullptr;
+            if (!keyTy) {
+                auto p = strDataLen(k);
+                strKd = std::get<0>(p); strKl = std::get<1>(p);
+                strKw = std::get<2>(p);   // fix #4499
+            }
 
             // Lower the factory closure (K) -> V. Build a synthetic Function
             // TypeRef so an unannotated lambda param/return picks up the right
@@ -8517,8 +8542,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKey, tmpSlot});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot});
             }
 
             auto* missBB = llvm::BasicBlock::Create(llvm_, "goa.miss", currentFn_);
@@ -8552,8 +8577,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, encoded});
             } else {
                 auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, encoded});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, encoded});
             }
             // Re-read the now-stored slot so the returned value is the BORROW of the
             // stored slot (mirrors the indexer-get-borrow; for a record value this
@@ -8565,8 +8590,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, tmpSlot2});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot2});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot2});
             }
             llvm::Value* missSlot = builder_.CreateLoad(ptrTy(), tmpSlot2, "goa.mslot");
             llvm::Value* missVal = decodeSlot(missSlot);
@@ -8673,22 +8698,29 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                               : "bz_dict_min_key_str";
                 auto* dataSlot = entryAlloca(ptrTy());
                 auto* lenSlot  = entryAlloca(i64());
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                // fix #4499: the key's §4.6 storage width is a third out-slot.
+                // Pre-fix this site stamped width 1 on every returned key, so a
+                // width>1 MinKey/MaxKey was reinterpreted as `len` Latin-1 code
+                // points over a buffer that actually held `len * width` bytes.
+                auto* wSlot    = entryAlloca(i8Ty);
                 builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), dataSlot);
                 builder_.CreateStore(builder_.getInt64(0), lenSlot);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), wSlot);
                 auto* mmStrFn = declareC(rtNameStr, i1(),
-                                         {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot});
-                // data and len are now filled; build a heap bz_string object.
+                                         {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot, wSlot});
+                // data, len and width are now filled; build a heap bz_string.
                 llvm::Value* kdata = builder_.CreateLoad(ptrTy(), dataSlot, "sd.kd");
                 llvm::Value* klen  = builder_.CreateLoad(i64(), lenSlot, "sd.kl");
-                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* kwid  = builder_.CreateLoad(i8Ty, wSlot, "sd.kw");
                 uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
                 auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
                 llvm::Value* strObj = builder_.CreateCall(callocFn,
                     {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
                 builder_.CreateStore(kdata, builder_.CreateStructGEP(stringType(), strObj, 0));
                 builder_.CreateStore(klen,  builder_.CreateStructGEP(stringType(), strObj, 1));
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStore(kwid,
                     builder_.CreateStructGEP(stringType(), strObj, 2));
                 initStringRc(strObj);
                 return strObj;

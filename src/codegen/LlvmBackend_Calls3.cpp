@@ -2027,6 +2027,7 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             // --- snapshot keys + values ---
             auto* keysOutSlot = entryAlloca(ptrTy());
             auto* lensOutSlot = entryAlloca(ptrTy());
+            auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: §4.6 widths
             auto* cntSlot     = entryAlloca(i64());
             auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -2040,9 +2041,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             } else {
                 auto* kfn = declareC("bz_dict_keys_str",
                     llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(kfn,
-                    {recv, keysOutSlot, lensOutSlot, cntSlot});
+                    {recv, keysOutSlot, lensOutSlot, widsOutSlot, cntSlot});
                 auto* vfn = declareC("bz_dict_values_str",
                     llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), ptrTy(), ptrTy()});
@@ -2052,6 +2053,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
             llvm::Value* lensArr = isStringKey
                                        ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                                       : nullptr;
+            llvm::Value* widsArr = isStringKey            // fix #4499
+                                       ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                        : nullptr;
             llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
             llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -2087,8 +2091,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 if (!useGen && lensArr) {
                     auto* sortFn = declareC(
                         "bz_sort_kv_str", llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), ptrTy(), i64()});
-                    builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #4499: the width spine permutes with the others.
+                    builder_.CreateCall(sortFn,
+                        {keysArr, lensArr, widsArr, valsArr, cnt});
                 } else if (useGen) {
                     // A key type `buildSortedKeyComparator` cannot rank returns
                     // null; leaving the snapshot unsorted then matches what the
@@ -2149,7 +2155,8 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 // "should not happen" null fallback verbatim.) ---
                 llvm::Value* keyDecoded;
                 if (isStringKey) {
-                    auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+                    auto strPr =
+                        decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
                     keyDecoded = strPr.first;
                     builder_.CreateCall(freeFn, {strPr.second});
                 } else if (useGen) {
@@ -2185,8 +2192,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
 
             builder_.SetInsertPoint(endBB);
             builder_.CreateCall(freeFn, {keysArr});
-            if (isStringKey)
+            if (isStringKey) {
                 builder_.CreateCall(freeFn, {lensArr});
+                builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+            }
             builder_.CreateCall(freeFn, {valsArr});
 
             // #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): for string-keyed

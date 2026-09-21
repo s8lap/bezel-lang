@@ -631,9 +631,10 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     } else {
         llvm::Value* kd = loadStringData(k);
         llvm::Value* kl = loadStringLen(k);
+        llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
         // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into the
         // table BY VALUE (bz_dict_try_get_str reads kd/kl and never retains
         // the bz_string* itself — unlike the VALUE slot, which stores the
@@ -857,6 +858,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     llvm::Value* keyPtr = nullptr;     // generic-key path needs it again to null
     llvm::Value* kd = nullptr;         // string-key path needs it again to null
     llvm::Value* kl = nullptr;
+    llvm::Value* kw = nullptr;         // fix #4499: storage width rides along
     if (keyTy) {
         keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
@@ -870,9 +872,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     } else {
         kd = loadStringData(k);
         kl = loadStringLen(k);
+        kw = loadStringWidth(k);        // fix #4499
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
     }
     // §4.8/§4.9: a `move` of an absent key raises, same as the indexer get.
     // fix #3703 / §28.9: unlike lowerCollectionIndexerGet (a SINGLE read of
@@ -911,8 +914,8 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         builder_.CreateCall(fn, {recv, keyPtr, nullV});
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, nullV});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, nullV});
         // fix #3703 / §28.9: kd/kl alias k's own buffer and are read TWICE in
         // this function (the try_get probe above and this null-store); only
         // now, after the last read, is it safe to discharge a fresh +1 KEY
@@ -1521,11 +1524,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     }
     llvm::Value* kd = loadStringData(k);
     llvm::Value* kl = loadStringLen(k);
+    llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
     if (valDisp) {
         auto* fn = declareC("bz_dict_set_str_disposing",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr, valDisp});
+            {ptrTy(), ptrTy(), i64(), i8(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr, valDisp});
         // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for an
         // OwningDictionary<K,V> with string key the value has just been
         // transferred; null the caller's slot for a bare owned local/param RHS.
@@ -1533,8 +1537,8 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             nullTransferredOwnedLocalSlot(valueExpr);
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
         // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
         // borrow": the borrowing Dictionary<K,V> string-key branch of the
         // indexer-set `d[k] := rhs` — identical to the gen-key branch above
@@ -11674,6 +11678,7 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // --- snapshot keys + values ---
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -11687,8 +11692,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy(), ptrTy()});
@@ -11698,6 +11704,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -11736,7 +11745,8 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
         // #3576's arm — see LlvmBackend_impl.hpp for the helpers) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto [strObj, kp] = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto [strObj, kp] =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             // Free the raw key bytes from bz_dict_keys_str.
             builder_.CreateCall(freeFn, {kp});
             keyDecoded = strObj;
@@ -11768,7 +11778,10 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
 
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // Wrap the materialised entries as an OWNING vtable-backed IEnumerable

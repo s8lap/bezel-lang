@@ -16115,6 +16115,7 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
 
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -16128,8 +16129,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
@@ -16137,6 +16139,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -16151,8 +16156,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         }
     } else {
         auto* sortFn = declareC("bz_sort_kv_str",
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(), i64()});
-        builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+        // fix #4499: the width spine permutes with keys/lens/values.
+        builder_.CreateCall(sortFn, {keysArr, lensArr, widsArr, valsArr, cnt});
     }
 
     // Allocate a fresh bz_array_t of {K, V} entries.
@@ -16194,7 +16201,8 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         // lowerToLazyEnumerator's dict arm.) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto strPr =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             keyDecoded = strPr.first;
             builder_.CreateCall(freeFn, {strPr.second});
         } else {
@@ -16224,7 +16232,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     }
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // String keys: use the #2522 string-key Dispose-walker so the rebuilt

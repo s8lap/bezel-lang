@@ -2312,6 +2312,10 @@ private:
         bool dictEntryForSnapshot = false;
         llvm::AllocaInst* dictEntryForKeysOutSlot = nullptr;  // ptr* (char**/void**)
         llvm::AllocaInst* dictEntryForLensOutSlot = nullptr;  // ptr* (i64*); null unless string key
+        // fix #4499: the snapshot's THIRD spine (int8_t* of per-key §4.6
+        // storage widths), malloc'd by bz_dict_keys_str beside keys and lens
+        // and freed on exactly the same paths. Null unless string key.
+        llvm::AllocaInst* dictEntryForWidsOutSlot = nullptr;  // ptr* (i8*)
         llvm::AllocaInst* dictEntryForValsOutSlot = nullptr;  // ptr* (void**)
         llvm::AllocaInst* dictEntryForCntSlot     = nullptr;  // i64* — snapshot count
         llvm::AllocaInst* dictEntryForIdxSlot     = nullptr;  // i64* — current cursor
@@ -18567,8 +18571,13 @@ private:
     // materializer/GetEnumerator sites do, or deferred to a loop's increment
     // block, as the for-in site does) is the CALLER's job, unchanged from
     // before this fix.
+    // fix #4499: `widthsArr` is `bz_dict_keys_str`'s THIRD out-array (int8_t*
+    // per key, the §4.6 storage width). Without it the rebuilt key is a
+    // width-1 string of `lens[idx]` BYTES, which is a code-point count used as
+    // a byte count — the #4499 defect on the read side.
     std::pair<llvm::Value*, llvm::Value*> decodeDictStringKeyAt(
-        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx);
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* widthsArr,
+        llvm::Value* idx);
 
     // decodeDictGenericKeyAt loads a generic (non-string) key BY VALUE out of
     // the malloc'd raw-bytes copy `bz_dict_keys_gen` wrote at `idx`. Returns

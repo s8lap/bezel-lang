@@ -6562,6 +6562,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::Value* lensArrD = builder_.CreateLoad(
                     ptrTy(), it->dictEntryForLensOutSlot, "def.lens");
                 builder_.CreateCall(freeFnD, {lensArrD});
+                if (it->dictEntryForWidsOutSlot) {   // fix #4499
+                    llvm::Value* widsArrD = builder_.CreateLoad(
+                        ptrTy(), it->dictEntryForWidsOutSlot, "def.wids");
+                    builder_.CreateCall(freeFnD, {widsArrD});
+                }
             }
             builder_.CreateCall(freeFnD, {valsArrD});
             continue;

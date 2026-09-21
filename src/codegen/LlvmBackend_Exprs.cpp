@@ -4798,19 +4798,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     // tryLowerCollectionInstanceCall / #1426).
                                     const char* rn = isMax ? "bz_dict_max_key_str"
                                                            : "bz_dict_min_key_str";
+                                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
                                     auto* skFn = declareC(rn, i1(),
-                                        {ptrTy(), ptrTy(), ptrTy()});
+                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                                     llvm::AllocaInst* dSlot = entryAlloca(ptrTy());
                                     llvm::AllocaInst* lSlot = entryAlloca(i64());
+                                    // fix #4499: the key's §4.6 storage width.
+                                    llvm::AllocaInst* wSlot = entryAlloca(i8Ty2);
                                     builder_.CreateStore(
                                         llvm::ConstantPointerNull::get(ptrTy()), dSlot);
                                     builder_.CreateStore(builder_.getInt64(0), lSlot);
-                                    builder_.CreateCall(skFn, {obj, dSlot, lSlot});
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty2, 1), wSlot);
+                                    builder_.CreateCall(skFn,
+                                        {obj, dSlot, lSlot, wSlot});
                                     llvm::Value* kdata =
                                         builder_.CreateLoad(ptrTy(), dSlot, "sp.kd");
                                     llvm::Value* klen =
                                         builder_.CreateLoad(i64(), lSlot, "sp.kl");
-                                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                                    llvm::Value* kwid =
+                                        builder_.CreateLoad(i8Ty2, wSlot, "sp.kw");
                                     uint64_t strSz2 = module_->getDataLayout()
                                         .getTypeAllocSize(stringType());
                                     auto* callocFn2 = declareC("calloc", ptrTy(),
@@ -4822,8 +4829,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         builder_.CreateStructGEP(stringType(),sObj,0));
                                     builder_.CreateStore(klen,
                                         builder_.CreateStructGEP(stringType(),sObj,1));
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty2, 1),
+                                    builder_.CreateStore(kwid,
                                         builder_.CreateStructGEP(stringType(),sObj,2));
                                     initStringRc(sObj);
                                     return sObj;
@@ -5157,23 +5163,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // String keys: existing bz_dict_keys_str path (unchanged).
                 auto* keysOutSlot = entryAlloca(ptrTy());
                 auto* lensOutSlot = entryAlloca(ptrTy());
+                auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499
                 auto* cntSlot2 = entryAlloca(i64());
                 auto* keysFn2 = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(keysFn2, {dictObj, keysOutSlot, lensOutSlot, cntSlot2});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(keysFn2, {dictObj, keysOutSlot, lensOutSlot,
+                                              widsOutSlot, cntSlot2});
                 llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
                 llvm::Value* lensArr = builder_.CreateLoad(ptrTy(), lensOutSlot);
+                llvm::Value* widsArr = builder_.CreateLoad(ptrTy(), widsOutSlot);
                 llvm::Value* cnt2 = builder_.CreateLoad(i64(), cntSlot2);
                 auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 llvm::Value* result2 = builder_.CreateCall(allocFn2,
                     {builder_.getInt64(8), cnt2});
                 auto* addFn2 = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                         {ptrTy(), ptrTy(), i64()});
-                auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
-                auto* memcpyFn2 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-                auto* callocFn3 = declareC("calloc", ptrTy(), {i64(), i64()});
-                auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
-                uint64_t strSz2 = module_->getDataLayout().getTypeAllocSize(stringType());
                 auto* idxSlot3 = entryAlloca(i64());
                 builder_.CreateStore(builder_.getInt64(0), idxSlot3);
                 auto* condBB2b = llvm::BasicBlock::Create(llvm_, "ks2.c", currentFn_);
@@ -5184,22 +5188,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* idx3 = builder_.CreateLoad(i64(), idxSlot3);
                 builder_.CreateCondBr(builder_.CreateICmpSLT(idx3, cnt2), bodyBB2b, endBB2b);
                 builder_.SetInsertPoint(bodyBB2b);
-                llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idx3);
-                llvm::Value* kp2 = builder_.CreateLoad(ptrTy(), kpPtr2);
-                llvm::Value* lpPtr2 = builder_.CreateGEP(i64(), lensArr, idx3);
-                llvm::Value* kl3 = builder_.CreateLoad(i64(), lpPtr2);
-                llvm::Value* dataSz3 = builder_.CreateAdd(kl3, builder_.getInt64(1));
-                llvm::Value* dataCopy3 = builder_.CreateCall(mallocFn2, {dataSz3});
-                builder_.CreateCall(memcpyFn2, {dataCopy3, kp2, kl3});
-                llvm::Value* nulPtr3 = builder_.CreateGEP(i8Ty2, dataCopy3, kl3);
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 0), nulPtr3);
-                llvm::Value* strObj3 = builder_.CreateCall(callocFn3,
-                    {builder_.getInt64(1), builder_.getInt64(strSz2)});
-                builder_.CreateStore(dataCopy3, builder_.CreateStructGEP(stringType(), strObj3, 0));
-                builder_.CreateStore(kl3, builder_.CreateStructGEP(stringType(), strObj3, 1));
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 1),
-                    builder_.CreateStructGEP(stringType(), strObj3, 2));
-                    initStringRc(strObj3);  // #422: producer's reference, rc := 1
+                // fix #4499: this arm carried a FOURTH hand-written copy of the
+                // raw-bytes → bz_string decode, and it was the copy that
+                // hard-coded width 1 and `lens[i]` BYTES. Route it through the
+                // one shared decoder (narrow #3717's helper) so the width rule
+                // is stated once. Ownership is unchanged: the decode produces a
+                // fresh +1 string and does NOT free the snapshot's own blob,
+                // exactly as the inline copy did.
+                llvm::Value* strObj3 =
+                    decodeDictStringKeyAt(keysArr, lensArr, widsArr, idx3).first;
                 auto* slotK2 = entryAlloca(ptrTy());
                 builder_.CreateStore(strObj3, slotK2);
                 builder_.CreateCall(addFn2, {result2, slotK2, builder_.getInt64(8)});
@@ -7993,10 +7990,11 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 // String key fast path.
                 llvm::Value* kdata = loadStringData(key);
                 llvm::Value* klen  = loadStringLen(key);
+                llvm::Value* kwid  = loadStringWidth(key);   // fix #4499
                 auto* fn = declareC("bz_dict_contains_str", i1(),
-                                    {ptrTy(), ptrTy(), i64()});
+                                    {ptrTy(), ptrTy(), i64(), i8()});
                 llvm::Value* r =
-                    builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
+                    builder_.CreateCall(fn, {dict, kdata, klen, kwid}, "dict.in");
                 // fix #3703 / §28.9: `key in dict` never stores the key — the
                 // table copies kdata/klen's bytes, never retaining `key`
                 // itself (unlike a VALUE slot, per #429). Release a fresh +1

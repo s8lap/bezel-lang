@@ -266,21 +266,29 @@ void    bz_dict_mark_disposed(void* d, void (*dispose_val)(void*));
 // via bz_dict_mark_disposed (checked mode only).
 int8_t  bz_dict_is_disposed(void* d);
 
-bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, void** out);
-void    bz_dict_set_str(void* d, const char* k, int64_t k_len, void* val);
+// fix #4499 (spec §4.6 / §8.3, v0.306): every string-key entry point takes the
+// key as (raw data, CODE-POINT count, storage width). The width is load-bearing
+// — a string's byte size is `len * width`, and the pre-fix ABI carried only
+// (data, len) and used `len` as a byte count, truncating every width>1 key to
+// its first `len/width` code points so distinct keys collided into one entry.
+bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                            void** out);
+void    bz_dict_set_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                        void* val);
 
 // issue #388 / stdlib §4.9: the OwningDictionary<string,V> indexer setter —
 // if the key is already present, dispose the value currently stored under it via
 // `dispose_val` (null-safe) before storing the new (owned) value; on a fresh key
 // it just inserts. Used by OwningDictionary<K,V>'s `set(owned)` indexer.
 void    bz_dict_set_str_disposing(void* d, const char* k, int64_t k_len,
-                                  void* val, void (*dispose_val)(void*));
-bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len);
+                                  int8_t k_w, void* val,
+                                  void (*dispose_val)(void*));
+bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len, int8_t k_w);
 // issue M1 / stdlib §4.9: OwningDictionary<string,V>.Remove — disposes the
 // removed value via dispose_val before unlinking (null-safe: skip if null).
 bool    bz_dict_remove_str_disposing(void* d, const char* k, int64_t k_len,
-                                     void (*dispose_val)(void*));
-bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len);
+                                     int8_t k_w, void (*dispose_val)(void*));
+bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len, int8_t k_w);
 int64_t bz_dict_count(void* d);
 
 // §29.12 / issue #1232: return the current modification epoch of the dict/set.
@@ -304,10 +312,13 @@ void     bz_runtime_dispose(void* p, void (*dispose_elem)(void*));
 // code.
 int64_t  bz_runtime_kind(void* p);
 
-// Enumerate all keys as (char*, int64_t len) pairs. The caller must free the
-// returned arrays with free(). `*keys_out` and `*lens_out` are malloc'd arrays.
+// Enumerate all keys as (char* data, int64_t code-point len, int8_t width)
+// triples. The caller must free the returned arrays with free(). `*keys_out`,
+// `*lens_out` and `*widths_out` are malloc'd parallel arrays; each `keys[i]` is
+// its own malloc'd `lens[i] * widths[i]`-byte copy (fix #4499 — the width is
+// what lets a caller rebuild the key at its true storage width).
 void bz_dict_keys_str(void* d, char*** keys_out, int64_t** lens_out,
-                      int64_t* n_out);
+                      int8_t** widths_out, int64_t* n_out);
 
 // Generic-key variant: key_size bytes per key; hash and eq work on raw bytes.
 void* bz_dict_alloc_generic(int64_t key_size,
@@ -331,7 +342,8 @@ bool  bz_dict_contains_gen(void* d, const void* key);
 // fix #643 / stdlib §4.9: PopValue(key) — retrieve the stored value pointer
 // (written into *out) then remove the entry WITHOUT disposing the value
 // (ownership transfers to the caller).  Returns false when key is absent.
-bool  bz_dict_pop_value_str(void* d, const char* k, int64_t k_len, void** out);
+bool  bz_dict_pop_value_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                            void** out);
 bool  bz_dict_pop_value_gen(void* d, const void* key, void** out);
 
 // stdlib §4.10 / §4.8: empty a hash table in place (keeps it allocated). Frees
@@ -373,9 +385,12 @@ void* bz_dict_min_key_gen(void* d, int (*cmp)(const void* a, const void* b));
 void* bz_dict_max_key_gen(void* d, int (*cmp)(const void* a, const void* b));
 //
 // bz_dict_min_key_str / bz_dict_max_key_str — least/greatest key in a string-key
-// dict.  Fills *out_data (strndup'd) and *out_len.  Returns false if empty.
-bool bz_dict_min_key_str(void* d, char** out_data, int64_t* out_len);
-bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len);
+// dict.  Fills *out_data (a malloc'd `*out_len * *out_w`-byte copy), *out_len
+// (code points) and *out_w (storage width, fix #4499).  False if empty.
+bool bz_dict_min_key_str(void* d, char** out_data, int64_t* out_len,
+                         int8_t* out_w);
+bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len,
+                         int8_t* out_w);
 //
 // Sorted-snapshot helpers: reorder snapshot arrays in ascending key order.
 // O(n log n); used for SortedDictionary/SortedSet iteration (§4.17/§4.18).
@@ -385,16 +400,19 @@ bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len);
 void bz_sort_kv_gen(void** keys, void** values, int64_t n,
                     int (*cmp)(const void* a, const void* b));
 //
-// bz_sort_kv_str: sort char** keys + int64_t* lens + void** values together
-// by lexicographic string comparison (§9.6).
-void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n);
+// bz_sort_kv_str: sort char** keys + int64_t* lens + int8_t* widths +
+// void** values together by lexicographic string comparison (§9.6). The width
+// spine is permuted with the others (fix #4499); the COMPARISON itself is still
+// byte-wise strcmp and is #4493's to make code-point-aware.
+void bz_sort_kv_str(char** keys, int64_t* lens, int8_t* widths, void** values,
+                    int64_t n);
 //
 // bz_sort_keys_gen: sort a void** key-bytes-pointer array in ascending order.
 void bz_sort_keys_gen(void** keys, int64_t n,
                       int (*cmp)(const void* a, const void* b));
 //
-// bz_sort_keys_str: sort char** + int64_t* arrays in ascending string order.
-void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n);
+// bz_sort_keys_str: sort char** + int64_t* + int8_t* arrays in ascending order.
+void bz_sort_keys_str(char** keys, int64_t* lens, int8_t* widths, int64_t n);
 
 //
 // #628 / stdlib §4.9 v0.135: ownership-transferring drain iteration.
@@ -407,7 +425,7 @@ void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n);
 // `cursor` is a caller-supplied int64_t scan position (start at 0).
 bool bz_dict_drain_next_str(void* d, int64_t* cursor,
                              char** key_out, int64_t* key_len_out,
-                             void** val_out);
+                             int8_t* key_w_out, void** val_out);
 //
 // bz_dict_drain_next_gen — generic-keyed dict (key_size > 0).
 // Same as bz_dict_drain_next_str but the key is returned as a malloc'd copy

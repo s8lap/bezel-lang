@@ -7209,26 +7209,24 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
 
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* keysFn = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-    builder_.CreateCall(keysFn, {dictObj, keysOutSlot, lensOutSlot, cntSlot});
+                            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(keysFn, {dictObj, keysOutSlot, lensOutSlot, widsOutSlot,
+                                 cntSlot});
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // char**
     llvm::Value* lensArr = builder_.CreateLoad(ptrTy(), lensOutSlot);  // i64*
+    llvm::Value* widsArr = builder_.CreateLoad(ptrTy(), widsOutSlot);  // i8*
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
-    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
     auto* freeFn   = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-    uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
 
     auto* idxSlot = entryAlloca(i64());
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
     auto* varSlot = entryAlloca(ptrTy());  // loop var is a string-object pointer
     locals_[&fs] = varSlot;
     registerForLoopSpillSlots(fs, {dkEpochSlot, keysOutSlot, lensOutSlot,
-                                   cntSlot, idxSlot, varSlot});
+                                   widsOutSlot, cntSlot, idxSlot, varSlot});
     // #1058 / §28/§4.8: initialise to null so the endBB break-path release is
     // null-safe when the loop body is never entered (cnt == 0).
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
@@ -7252,22 +7250,14 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
 
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-    llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-    llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);     // char*
-    llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-    llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);       // i64 len
-    llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-    llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-    llvm::Value* strObj = builder_.CreateCall(callocFn,
-        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-    builder_.CreateStore(dataCpy, builder_.CreateStructGEP(stringType(), strObj, 0));
-    builder_.CreateStore(kl, builder_.CreateStructGEP(stringType(), strObj, 1));
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-        builder_.CreateStructGEP(stringType(), strObj, 2));
-    initStringRc(strObj);  // #422: producer's reference, rc := 1
+    // fix #4499: this loop carried its own copy of the raw-bytes → bz_string
+    // decode, hard-coding width 1 and copying `lens[i]` BYTES (a code-point
+    // count read as a byte count). Route it through the one shared decoder so
+    // the §4.6 width rule is stated in exactly one place. Ownership is
+    // unchanged: a fresh +1 string per iteration, released in incBB/endBB, and
+    // the snapshot's own blob still freed by incBB below.
+    llvm::Value* strObj =
+        decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB).first;
     builder_.CreateStore(strObj, varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
@@ -7301,6 +7291,7 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     }
     builder_.CreateCall(freeFn, {keysArr});
     builder_.CreateCall(freeFn, {lensArr});
+    builder_.CreateCall(freeFn, {widsArr});   // fix #4499: third snapshot spine
     return true;
 }
 
@@ -7456,8 +7447,8 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
 // See the declarations in LlvmBackend_impl.hpp for the full rationale;
 // snapshotting, sorting and freeing stay copy-specific at each call site.
 std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
-        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx) {
-    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* widthsArr,
+        llvm::Value* idx) {
     auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
     auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
@@ -7466,18 +7457,31 @@ std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
     llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
     llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idx);
     llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-    llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-    llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+    // fix #4499 (spec §4.6, v0.306): the snapshot's third parallel spine is the
+    // key's storage WIDTH. Pre-fix this decode hard-coded width 1 and copied
+    // `kl` BYTES — i.e. it read a code-point count as a byte count, the same
+    // confusion the storage layer had, so every width>1 key came back as a
+    // truncated, mis-widthed string. The byte size is `len * width`, and the
+    // rebuilt string carries the source key's own width so `=` against a
+    // literal (emitStringEquals' equal-width memcmp path) still answers §4.6's
+    // code-point-sequence question.
+    llvm::Value* wpPtr = builder_.CreateGEP(i8Ty, widthsArr, idx);
+    llvm::Value* kwB   = builder_.CreateLoad(i8Ty, wpPtr, "dk.width");
+    llvm::Value* kw64  = builder_.CreateZExt(kwB, i64(), "dk.w64");
+    llvm::Value* kbytes = builder_.CreateMul(kl, kw64, "dk.bytes");
+    // One extra width-sized zero slot, matching how bz_string data buffers are
+    // terminated (and what bz_key_dup writes on the runtime side).
+    llvm::Value* dataSz  = builder_.CreateAdd(kbytes, kw64);
+    llvm::Value* dataCpy = builder_.CreateCall(callocFn,
+        {dataSz, builder_.getInt64(1)});
+    builder_.CreateCall(memcpyFn, {dataCpy, kp, kbytes});
     llvm::Value* strObj = builder_.CreateCall(callocFn,
         {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
     builder_.CreateStore(dataCpy,
         builder_.CreateStructGEP(stringType(), strObj, 0));
     builder_.CreateStore(kl,
         builder_.CreateStructGEP(stringType(), strObj, 1));
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+    builder_.CreateStore(kwB,
         builder_.CreateStructGEP(stringType(), strObj, 2));
     initStringRc(strObj);
     return {strObj, kp};
@@ -7595,6 +7599,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // --- key snapshot ---
     auto* keysOutSlot = entryAlloca(ptrTy()); // char** (string) or void** (gen)
     auto* lensOutSlot = entryAlloca(ptrTy()); // i64*   (string only; unused gen)
+    auto* widsOutSlot = entryAlloca(ptrTy()); // i8*    (string only; fix #4499)
     auto* cntSlot     = entryAlloca(i64());
 
     // --- value snapshot ---
@@ -7615,9 +7620,9 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     } else {
         // String-key dict: bz_dict_keys_str + bz_dict_values_str
         auto* kfn = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                             {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn,
-                            {dictObj, keysOutSlot, lensOutSlot, cntSlot});
+                             {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dictObj, keysOutSlot, lensOutSlot,
+                                  widsOutSlot, cntSlot});
         auto* vfn = declareC("bz_dict_values_str", llvm::Type::getVoidTy(llvm_),
                              {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(vfn, {dictObj, valsOutSlot, entryAlloca(i64())});
@@ -7625,6 +7630,9 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -7649,12 +7657,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             // String-key: sort keys (char**), lens (i64*), and values together.
             auto* sortKvStrFn = declareC("bz_sort_kv_str",
                 llvm::Type::getVoidTy(llvm_),
-                {ptrTy(), ptrTy(), ptrTy(), i64()});
+                {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
             llvm::Value* lensForSort = lensArr
                 ? lensArr
                 : llvm::ConstantPointerNull::get(ptrTy());
+            // fix #4499: the width spine is permuted with the others.
+            llvm::Value* widsForSort = widsArr
+                ? widsArr
+                : llvm::ConstantPointerNull::get(ptrTy());
             builder_.CreateCall(sortKvStrFn,
-                {keysArr, lensForSort, valsArr, cnt});
+                {keysArr, lensForSort, widsForSort, valsArr, cnt});
         }
     }
 
@@ -7705,7 +7717,8 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         // in LlvmBackend_impl.hpp) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            keyDecoded = decodeDictStringKeyAt(keysArr, lensArr, idxB).first;
+            keyDecoded =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB).first;
         } else if (useGen) {
             // bz_dict_keys_gen returns void** where each element is a malloc'd
             // copy of the key's raw bytes (NOT inttoptr-encoded — the raw bytes
@@ -7793,6 +7806,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         d.dictEntryForSnapshot = true;
         d.dictEntryForKeysOutSlot = keysOutSlot;
         d.dictEntryForLensOutSlot = isStringKey ? lensOutSlot : nullptr;
+        d.dictEntryForWidsOutSlot = isStringKey ? widsOutSlot : nullptr;  // #4499
         d.dictEntryForValsOutSlot = valsOutSlot;
         d.dictEntryForCntSlot = cntSlot;
         d.dictEntryForIdxSlot = idxSlot;
@@ -7895,8 +7909,10 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         builder_.SetInsertPoint(clEndBB);
     }
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey)
+    if (isStringKey) {
         builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
     // fix #4129: the manual frees just above did EXACTLY what the
     // dictEntryForSnapshot scope pushed before loopStack_ would do — pop it
@@ -8380,6 +8396,8 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     // Alloca for temp key/val outputs from the runtime pop function.
     auto* keyOutSlot = entryAlloca(ptrTy());   // char** (str) or void** (gen)
     auto* keyLenSlot = entryAlloca(i64());     // int64_t (str key_len only)
+    // fix #4499: the popped key's §4.6 storage width (string mode only).
+    auto* keyWidSlot = entryAlloca(llvm::Type::getInt8Ty(llvm_));
     auto* valOutSlot = entryAlloca(ptrTy());   // void** for value
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "dd.cond", currentFn_);
@@ -8399,9 +8417,11 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
         //                        char** key_out, int64_t* key_len_out,
         //                        void** val_out) → bool
         auto* drainFn = declareC("bz_dict_drain_next_str", i1(),
-                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy(),
+                                  ptrTy()});
         popped = builder_.CreateCall(drainFn,
-            {dictObj, cursorSlot, keyOutSlot, keyLenSlot, valOutSlot},
+            {dictObj, cursorSlot, keyOutSlot, keyLenSlot, keyWidSlot,
+             valOutSlot},
             "dd.popped");
     } else {
         // bz_dict_drain_next_gen(dict, int64_t* cursor,
@@ -8429,19 +8449,21 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
             // rawKeyPtr is a malloc'd char* (the key bytes; null-terminated).
             // Build a bz_string_t object from it — same pattern as
             // lowerDictEntryFor's string-key decode.
-            auto* mallocFn  = declareC("malloc", ptrTy(), {i64()});
             auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
             auto* i8Ty      = llvm::Type::getInt8Ty(llvm_);
             uint64_t strSz  = module_->getDataLayout().getTypeAllocSize(stringType());
-            // rawKeyPtr is char*; key_len_out holds the byte length.
+            // rawKeyPtr is char*; key_len_out holds the CODE-POINT count and
+            // key_w_out the storage width (fix #4499). The comment here used to
+            // read "the byte length" — that was the #4499 defect stated in a
+            // comment: the buffer is `len * width` bytes.
             llvm::Value* kl = builder_.CreateLoad(i64(), keyLenSlot);
-            // Allocate and null-terminate the data buffer.
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            // The char* from bz_dict_drain_next_str is already a malloc'd copy;
-            // use it directly as the string data buffer (no extra malloc+memcpy).
-            // Null-terminate: write '\0' at offset kl.
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, rawKeyPtr, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* kw = builder_.CreateLoad(i8Ty, keyWidSlot, "dd.kw");
+            // The char* from bz_dict_drain_next_str is already a malloc'd copy
+            // (bz_key_dup, which allocates `len * width` bytes PLUS a
+            // width-sized zero terminator); use it directly as the string data
+            // buffer. Pre-fix this site wrote a NUL at byte offset `kl` into
+            // that buffer, which strndup had sized to strnlen(key)+1 — past
+            // the allocation whenever the key held an embedded U+0000.
             // Allocate the bz_string_t header.
             llvm::Value* strObj = builder_.CreateCall(callocFn,
                 {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
@@ -8449,11 +8471,10 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
                 builder_.CreateStructGEP(stringType(), strObj, 0));
             builder_.CreateStore(kl,
                 builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+            builder_.CreateStore(kw,
                 builder_.CreateStructGEP(stringType(), strObj, 2));
             initStringRc(strObj);
             keyDecoded = strObj;
-            (void)dataSz;
         } else if (useGen) {
             // Generic key: rawKeyPtr is a malloc'd copy of the key bytes.
             // Load the key value out of the raw bytes.
