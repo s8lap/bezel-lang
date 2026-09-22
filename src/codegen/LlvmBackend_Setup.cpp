@@ -14173,6 +14173,113 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                 builder_.CreateCall(it->second, args);
             }
         }
+    } else if (b->hasPositionalFields && hasAnyConstructor(b) &&
+               cls != mostDerived) {
+        // fix #4574 (§22.5 "Optional parameters and named arguments" /
+        // §22.8 step 0-1 / §22.10 "Primary constructors" / §12.8
+        // "Constructor chaining", v0.306): the "route to the primary" arm
+        // the §22.10 inheritance-clause block above already has
+        // (`b->hasPositionalFields && hasAnyConstructor(b)`, a few lines
+        // up), given to THIS arity-0 fallback too — for a base `b` reached
+        // by an IMPLICIT `base()` call, with no clause and no explicit
+        // `base(...)`/`this(...)` written anywhere in the chain reaching
+        // it.
+        //
+        // §12.8/§22.5 (fix #4549) already require every parameter of such
+        // a `b` to carry a default before an implicit `base()` into it is
+        // ACCEPTED at all — so by the time this line runs, sema has
+        // already confirmed `b` is parameterless-callable. What was
+        // missing is codegen actually MATERIALIZING those defaults:
+        // `ctorForArgs(b, {})` above returned null because a §22.10
+        // PRIMARY constructor has no `ConstructorSymbol` (the same reason
+        // a direct `new` site routes to the primary, #3625/#3713) — so
+        // this arm, unlike the one immediately below it, is reached
+        // whenever `b` ALSO declares an explicit constructor
+        // (`hasAnyConstructor(b)`): the field-init fallback below is gated
+        // on `!hasAnyConstructor(b)` and so never fires for this shape,
+        // and nothing else in the chain ever writes `b`'s positional
+        // fields either — they stay at their calloc zero, with no
+        // diagnostic at any severity.
+        //
+        // `cls != mostDerived` is the guard against DOUBLE materialization,
+        // not an incidental narrowing. Whenever THIS `emitImplicitBase`
+        // call is the construction ENTRY POINT for the class whose
+        // implicit `base()` reaches `b` DIRECTLY (`cls == mostDerived`),
+        // the `new` site — or, for a `this(...)`-hop target, fix #4575's
+        // own call — has already run `prePopulateBasePositionalFields` for
+        // THIS SAME `cls`, and that function's trailing §22.5 default-fill
+        // loop (LlvmBackend_Exprs2.cpp) has ALREADY materialized every one
+        // of `b`'s defaults: its top gate tests `baseClassOf(cls)`'s own
+        // `hasPositionalFields`, which — when `b` is `cls`'s DIRECT base —
+        // is exactly `b`'s. Filling them again here too would evaluate a
+        // non-constant default (`Counter.Next()`, an `owned`-factory) a
+        // SECOND time, the exact defect class fix #3562/#4485 exist to
+        // prevent. `cls != mostDerived` is false only when this recursion
+        // was reached through `emitImplicitBase`'s OWN "no-ctor
+        // pass-through ancestor" recursion below (`b` becomes the NEXT
+        // `cls`) — an intermediate class with NO primary parameter list of
+        // its own sitting between the construction entry and `b`. That
+        // intermediate class has no positional fields of ITS OWN, so
+        // `prePopulateBasePositionalFields`'s top gate — keyed on the
+        // ENTRY's DIRECT base, not on `b` — returns before ever examining
+        // `b`, and this arm is the only place left to do it.
+        //
+        // MEASURED on cafdfc52 (origin/main, this commit's parent):
+        //
+        //   class B(n: int := 1, s: string := "d")
+        //     public constructor(a: int) Console.WriteLine(a.ToString()); end;
+        //   end B;
+        //   class D : B end D;
+        //   class E : D end E;
+        //
+        // `new E()` compiles clean with `bezelc` (exit 0, no diagnostic)
+        // and reading `n`/`s` off the constructed `E` prints `0` and a
+        // blank line where `1` / `d` is correct — `D` (E's direct base)
+        // declares no primary list of its own, so
+        // `prePopulateBasePositionalFields(E, ...)`'s top gate never
+        // reaches `B`, and this recursive `emitImplicitBase(D, obj,
+        // mostDerived=E)` call's arity-0 fallback for `B` is the only
+        // remaining place that could have written `B`'s fields — until
+        // this fix, it silently did not. The ONE-LEVEL spelling
+        // (`class D : B end D;`, `new D()`) was already correct, because
+        // there `B` IS the entry's direct base and
+        // `prePopulateBasePositionalFields` already reaches it.
+        //
+        // Neither `emitLocalBaseFieldInit`/`emitOwnFieldInit` NOR the
+        // IMPORTED `primaryInitFn` entry point below materialize a §22.10
+        // POSITIONAL parameter's default themselves (`emitOwnFieldInit`
+        // reads `dynamic_cast<ast::FieldDecl>(m->decl)`, which is null for
+        // a posParam field — its `decl` is the owning `TypeDecl`, per
+        // `FieldSymbol::posParam`'s own declaration comment, Symbol.hpp).
+        // So this loop, mirroring `prePopulateBasePositionalFields`'s own
+        // trailing default-fill loop and sharing its ONE materialization
+        // (`positionalParamDefaultValue`, fix #3777), must run before
+        // either of those two "run `b`'s own construction sequence" calls,
+        // exactly as case (a)'s clause arm above documents for its own
+        // (externally pre-filled) slots.
+        llvm::StructType* bst = classStruct(b);
+        for (const sema::Symbol* m : sema::recordPositionalFieldSymbols(b)) {
+            auto* fs = const_cast<sema::FieldSymbol*>(
+                static_cast<const sema::FieldSymbol*>(m));
+            auto idxIt = fieldIndex_.find(fs);
+            if (idxIt == fieldIndex_.end()) continue;
+            llvm::Value* v = positionalParamDefaultValue(
+                *fs, obj, genericSubst_, genericSubstSemaTy_);
+            if (!v) continue;  // no default declared — unreachable per fix
+                                // #4549's own §12.8 check, kept as the same
+                                // defensive no-op every other caller of this
+                                // helper uses.
+            llvm::Type* fieldTy = bst->getElementType(idxIt->second);
+            v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(bst, obj, idxIt->second));
+        }
+        if (ctx_.isImported(b) && b->genericParams.empty()) {
+            builder_.CreateCall(primaryInitFn(b), {obj});
+        } else {
+            emitImplicitBase(b, obj, mostDerived);
+            emitLocalBaseFieldInit(b, obj, mostDerived);
+        }
     } else if (!emitImportedBaseFieldInit(b, obj, mostDerived)) {
         // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): `b` may be an IMPORTED
         // no-explicit-ctor class — emitImportedBaseFieldInit (above) handles
