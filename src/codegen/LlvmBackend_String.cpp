@@ -4338,11 +4338,41 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         RecordSubstGuard fieldSubst(this, fieldTy);
         return emitChoiceHashCode(val, fieldTy->declaration, fieldTy);
     }
-    if (val->getType()->isDoubleTy())
+    // fix #4586 / §4.3.1 / §8.3 (v0.306): the hash half of the §8.3
+    // `a.Equals(b) ⇒ a.GetHashCode() = b.GetHashCode()` invariant. §4.3.1
+    // makes `=`/`Equals` reflexive for floats — "NaN = NaN is true", and
+    // `-0.0 = +0.0` is true — so every NaN bit pattern (signaling or quiet,
+    // any payload) MUST hash to the same value, and so must the two zeros,
+    // or a `Set<double>`/`Dictionary<double, V>` lookup with a NaN/negative-
+    // zero key that hashes to a different bucket than the one it was
+    // inserted under silently misses even though `Equals` says it matches.
+    // Canonicalize BEFORE taking the bits: a NaN operand (isNaN via `fcmp
+    // uno x, x`, mirroring emitValueEquality's fix #1165 arm) becomes the
+    // canonical quiet NaN; a zero operand (oeq against +0.0, true for both
+    // signs) becomes +0.0. A canonicalized double still needs the same
+    // low-32-bits-only fold as before it went through the raw bitcast/trunc
+    // pair, so ordinary (non-NaN, non-zero) values hash exactly as they did.
+    if (val->getType()->isDoubleTy()) {
+        llvm::Value* isNan  = builder_.CreateFCmpUNO(val, val, "h.dnan");
+        llvm::Value* isZero = builder_.CreateFCmpOEQ(
+            val, llvm::ConstantFP::get(val->getType(), 0.0), "h.dzero");
+        llvm::Value* norm = builder_.CreateSelect(
+            isZero, llvm::ConstantFP::get(val->getType(), 0.0), val, "h.dnz");
+        norm = builder_.CreateSelect(
+            isNan, llvm::ConstantFP::getNaN(val->getType()), norm, "h.dnn");
         return builder_.CreateTrunc(
-            builder_.CreateBitCast(val, i64()), i32());
-    if (val->getType()->isFloatTy())
-        return builder_.CreateBitCast(val, i32());
+            builder_.CreateBitCast(norm, i64()), i32());
+    }
+    if (val->getType()->isFloatTy()) {
+        llvm::Value* isNan  = builder_.CreateFCmpUNO(val, val, "h.fnan");
+        llvm::Value* isZero = builder_.CreateFCmpOEQ(
+            val, llvm::ConstantFP::get(val->getType(), 0.0), "h.fzero");
+        llvm::Value* norm = builder_.CreateSelect(
+            isZero, llvm::ConstantFP::get(val->getType(), 0.0), val, "h.fnz");
+        norm = builder_.CreateSelect(
+            isNan, llvm::ConstantFP::getNaN(val->getType()), norm, "h.fnn");
+        return builder_.CreateBitCast(norm, i32());
+    }
     // per §9.6 / stdlib §2.6 (#1464): a STRUCT-shaped value with no declared
     // record type — a value-builtin like `Guid` ({i64,i64}) whose declaration
     // is a builtin Class, not a Record, so the record branch above did not

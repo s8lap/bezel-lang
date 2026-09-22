@@ -622,9 +622,26 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
         // (dispatched above)
     } else if (isString)
         eq = emitStringEq(a, b);                           // §4.6 content compare
-    else if (lt->isFloatingPointTy())
-        eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare
-    else if (lt->isStructTy() || lt->isArrayTy())
+    else if (lt->isFloatingPointTy()) {
+        // fix #4586 / §4.3.1 (v0.306): a `double`/`float` DICT/SET KEY must
+        // compare by the SAME reflexive `=` the language gives floats —
+        // "NaN = NaN is true" — not raw IEEE `oeq`, which is false for
+        // NaN-vs-NaN and would make `Set<double>.Contains`/
+        // `Dictionary<double, V>.ContainsKey` answer false for a key the
+        // scalar `=` operator (and §4.3.1's own rationale) say is present.
+        // Mirrors the scalar `=` lowering (LlvmBackend_Exprs.cpp, `op == "="`)
+        // and emitValueEquality's float arm (fix #1165, LlvmBackend_Layout.cpp):
+        // oeq(a,b) OR (isNaN(a) AND isNaN(b)); ±0.0 stay equal because oeq is
+        // already true for them. This trampoline previously used raw
+        // `FCmpOEQ`, unlike the struct/array arm below which already routes
+        // through emitValueEquality — so a `Guid` key got the reflexive rule
+        // for free while a bare `double`/`float` key did not.
+        llvm::Value* ieee_eq  = builder_.CreateFCmpOEQ(a, b, "feq");
+        llvm::Value* a_is_nan = builder_.CreateFCmpUNO(a, a, "anan");
+        llvm::Value* b_is_nan = builder_.CreateFCmpUNO(b, b, "bnan");
+        llvm::Value* both_nan = builder_.CreateAnd(a_is_nan, b_is_nan, "abnan");
+        eq = builder_.CreateOr(ieee_eq, both_nan, "feq_ref");
+    } else if (lt->isStructTy() || lt->isArrayTy())
         // per §9.6 / stdlib §2.6 (#1464): a STRUCT- or ARRAY-shaped key — a
         // value-builtin like `Guid` ({i64,i64}), or an inline-array key —
         // compares STRUCTURALLY (field/bytewise), not via a raw ICmp on a
