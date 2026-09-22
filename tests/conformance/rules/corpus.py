@@ -46,7 +46,8 @@ KNOWN = REQUIRED + ("cites", "diagnostic", "stdout", "output", "issue", "notes",
 
 # Compiler switches a case may ask for. An allowlist, not a passthrough: a case
 # is data in a repository, and the runner executes what it says.
-ALLOWED_FLAGS = ("--checked-disposal", "--experimental-scoped-await-bind")
+ALLOWED_FLAGS = ("--checked-disposal", "--unchecked-disposal",
+                 "--report-trust-admissions", "--experimental-scoped-await-bind")
 EXPECTS = ("accept", "quiet", "reject", "warn", "run")
 DOCS = ("spec", "stdlib")
 

@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.306. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.307. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.306 and `Bezel_Standard_Library.md` v0.306 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.307 and `Bezel_Standard_Library.md` v0.307 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -411,6 +411,8 @@ Records, enums, primitives and inline arrays are **value types**: no disposal, n
 
 **Trivial-dispose classes** are exempt from ceremony, not from tracking (§28.9): a class with no destructor, no `owned` field of non-trivial type, no owning-inline-array field, on a trivial-dispose base. `Array<T>`, `Set<T>`, `Dictionary<K,V>`, `StringBuilder`, `Random` qualify — no must-use warning anywhere the warning would otherwise attach: a plain `var`, an undischarged `owned` parameter (a method's, an iterator's, an async method's), an owning iteration variable. An **interface**-typed binding is never exempt — unless its initializer is a producer of a trivial-dispose **class** (`var t: IThing := new TrivialThing();`), the exemption being keyed on the value, not the annotation. `OwningArray<T>` and anything holding a resource do not. **Every borrow rule still applies to trivial-dispose references.**
 
+**The default build is checked disposal mode** (§28.2): any member access through a reference to a logically-disposed instance raises `DisposedAccessException` (§31.4). The release relaxation — the same access undefined — is selected explicitly per build (`--unchecked-disposal`); never write a program that depends on it. Every "faults in checked mode" below is therefore the default behaviour.
+
 The one question to ask of every class-typed value: *am I responsible for disposing this?* Owned = yes. Borrowed = no.
 
 ### 4.2 The six markers
@@ -481,7 +483,7 @@ Disposing an **owned field** from code of its declaring type (`_resource.Dispose
 **`scoped`** (§28.14) declares **storage-bounded retention** — the callee may store the thing, bounded by the storing object's life.
 
 - On a **function-typed** parameter (`method Subscribe(scoped h: () -> ())`): the callee may store the callback in a `scoped` field of the bounding object, forward it to a same-bound `scoped` parameter, or invoke it. Function-typed arguments carry **no call-site marker**. Without `scoped` such a parameter is **call-bounded** — invocable during the call, never retained — and callers may pass any closure.
-- On a **class- or interface-typed** parameter: the callee may store the borrow in a direct non-owned field of the bounding object. The call site writes `M(scoped x)` — an argument *modifier*, not an expression; a fresh producer is rejected there.
+- On a **class- or interface-typed** parameter: the callee may store the borrow in a direct non-owned field of the bounding object. The call site writes `M(scoped x)` — an argument *modifier*, not an expression; a fresh producer is rejected there. A **primary-constructor** parameter may be `scoped` at these types — `class Box(scoped src: Source)`, used from a body as `src` — and its compiler-generated capture field is that direct non-owned field; the holder must still be a `using var` local (or `this`) with the source declared before it. A function-typed `scoped` primary parameter is rejected (§22.10).
 - **The price: captured local sources are frozen** while the bounding object lives — no move, no reassign, and **no `Dispose()`**. `scoped` on a **static** method is admitted only when that method's return is `owned`.
 
 ### 4.3 The announcement table, as a decision procedure
@@ -549,7 +551,7 @@ Records also cannot have destructors, `owned` fields, owning-inline-array fields
 
 | | Borrowing family | Owning family |
 |---|---|---|
-| Types | `Array<T>`, `LinkedList<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `SortedDictionary<K,V>`, `SortedSet<T>` | `OwningArray<T>`, `OwningLinkedList<T>`, `OwningDictionary<K,V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>` |
+| Types | `Array<T>`, `LinkedList<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `SortedDictionary<K,V>`, `SortedSet<T>` | `OwningArray<T>`, `OwningLinkedList<T>`, `OwningDictionary<K,V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningSlotMap<T>` (handle-keyed; no borrowing twin) |
 | Element slots at class T | **borrows** — the caller keeps ownership | **owned** |
 | `Add`/`Insert`/indexer-set | stores the borrow | `Add(owned item: T)`; indexer-set disposes the previous value |
 | `Remove`/`RemoveAt`/`Clear` | removes the borrow | **disposes** the element(s) |
@@ -587,6 +589,8 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 **Escaping an element borrow.** Over a **concrete** collection type the chain is slot → collection → binding, and keeping the reference past the loop is fine while the collection lives. Over an **interface-typed** source the compiler cannot see the backing, so the variable's source is conservatively the loop's own enumerator — a scope-bound local — and any escape is **rejected** (§29.2). Remedy: take the parameter at a concrete collection type, or give the elements an owner that outlives the loop.
 
+**Mutating what you iterate, and using what you removed** (§29.12, §28.11). `for var x in xs do … xs.Remove(x); … end;` compiles and **warns**: the next advance raises `InvalidOperationException`. Silent and correct: collect the matches into a second collection and remove after the loop; `xs.Remove(x); break;` (no advance follows); an indexer-set `xs[i] := v` (element-level, not structural); or `while xs.Count > 0 do using var x := xs.PopLast(); … end;` on an owning collection. On an **owning** collection `var w := xs[0]; xs.RemoveAt(0); w.Ping();` compiles and **warns**: `RemoveAt` disposed the element `w` borrows (checked mode faults there). Re-take the borrow after the mutation, take the element out first with `PopAt(0)`, or mutate after the last use. Neither warning fires through a different binding (`var ys := xs;`), and neither is suppressible per site.
+
 **Materializing is not a liveness remedy at class element types** (v0.265). `ToArray()`/`ToSet()`/`ToDictionary(…)` there build **borrowing** collections, so the materialized slots dangle exactly as the original borrow did; materialize-first is the **re-enumeration** remedy over a *live* backing, nothing more. What does remedy a dead-on-arrival element borrow: consume each element inside the loop body that borrows it, or give the elements an owner (an `IOwningEnumerable<T>` producer, consumed by owning iteration into an owning collection, with the accessor applied to *that* collection). Where the producer is a borrowing minting iterator you cannot change, **no retention remedy exists** (§29.11).
 
 **Lazy queries are single-consumption** (§29.11): enumerated at most once. The right is spent by enumeration or a terminal operator, by applying a further deferred operator (`var q2 := q.Select(f);`), or by passing the query as an `IEnumerable<T>` argument. It is orthogonal to ownership.
@@ -597,13 +601,13 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 ### 4.6 The diagnostics you will actually hit
 
-Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; and `_ := someTask;` / `using var _ := someTask;`.
+Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** and the **element-borrow use-after-removal warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode, v0.307) and every borrow you store in a plain field, a borrowing collection, or an abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
 
 ---
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.306 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.307 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1055,6 +1059,22 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
   pure readonly property Count: int;             // distinct keys
   pure readonly property Total: int;             // sum of counts; may be negative
 end
+public record SlotHandle                         // compiler-intrinsic value; sendable, hashable; NO public constructor — default(SlotHandle) denotes no map and FAULTS like a foreign handle
+  readonly property Index: int;   readonly property Generation: int;   // =, <>, Equals, GetHashCode, ToString provided
+end
+public class OwningSlotMap<T>: IEnumerable<T>, IOwningEnumerable<T> where T: class   // v0.307: the handle-and-table type
+  constructor();  constructor(capacity: int);
+  pure readonly property Count: int;
+  method Insert(owned value: T): SlotHandle;     // takes ownership; mints the handle — a VALUE you may store anywhere
+  method Contains(handle: SlotHandle): bool;     // `h in map`
+  method Get(handle: SlotHandle): T;             // borrow; KeyNotFoundException if absent
+  method GetOrNull(handle: SlotHandle): T?;      // borrow or null — a stale handle reads null, never a later occupant
+  method TryGetValue(handle: SlotHandle, out value: T?): bool;         // the out is a BORROW
+  method Remove(handle: SlotHandle): bool;       // DISPOSES; false if absent
+  method PopValue(handle: SlotHandle): owned T;  TryPopValue(handle: SlotHandle, out owned value: T?): bool;
+  method Handles(): owned Array<SlotHandle>;     // a SNAPSHOT (ascending Index) — safe to Remove while walking it
+  method Drain(): IOwningEnumerable<T>;   method Clear();   // Clear/Dispose dispose in DESCENDING Index
+end
 ```
 
 The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable` (the hash family's `IEqualityComparer` ctors are a recorded different case — rationale §17.14). `SortedDictionary` has `Add`/`TryAdd` (v0.282) but no `Keys`/`Values` (recorded: iterate entries). **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
@@ -1371,7 +1391,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index, and an instance `ForEach(action)` on any sequence (`Array<T>` and `string` included — write the `for` loop). Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `ArraySpan<T>`/`ReadOnlyArraySpan<T>` have no concrete cross-mode `SequenceEqual` (the `IReadOnlySpan<T>` overload takes the other family's span directly, v0.290).
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `SlotMap`/`Arena`/`GenerationalArena`/`Pool` as plain names and any borrowing slot map (→ `OwningSlotMap<T>` with `SlotHandle` keys, v0.307 — the only form; a handle from another map faults), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `ArraySpan<T>`/`ReadOnlyArraySpan<T>` have no concrete cross-mode `SequenceEqual` (the `IReadOnlySpan<T>` overload takes the other family's span directly, v0.290).
 
 **Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting, `string.IsNullOrEmpty` (→ `s = null or s.IsEmpty`, v0.290), the static `string.Compare(a, b[, ignoreCase])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`, v0.290).
 

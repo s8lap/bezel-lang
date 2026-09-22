@@ -6,9 +6,13 @@
 //!   enumerator. Standard collections detect this and throw
 //!   `InvalidOperationException` on the next `MoveNext()`. Structural
 //!   modification invalidates: any operation that adds, removes, or
-//!   repositions entries or reallocates storage — `Add` among them.
+//!   repositions entries or reallocates storage — `Add` among them. The
+//!   in-loop structural call on the iterated binding, from which the loop's
+//!   next advance is reachable, also draws the mutation-during-iteration
+//!   warning; the program stays accepted.
 //! cites: 29.12
 //! expect: run
+//! warns: yes
 //! stdout: caught
 module Conf;
 
