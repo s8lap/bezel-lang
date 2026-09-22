@@ -626,60 +626,35 @@ void Resolver::checkEqualitySkipInert() {
 
 void Resolver::checkTypeEqualitySkipInert(TypeSymbol* t) {
     for (Symbol* m : t->members) {
-        // The grammar admits `equality skip` on the four storage-bearing
-        // sites per §9.2 line 1385; the static-member arm is the inert-
-        // annotation case from §9.2 line 1419. We walk every FieldDecl
-        // (regular + imported) and every auto-property with an
-        // `equality` slot. The PropertySymbol-side slot is filled by
-        // SymbolCollection only on the LOCAL side; imported members ride
-        // MetaProperty::equalitySkip — out of scope for this fix, which is
-        // the local-static-only arm of the rule.
-        auto* mem = dynamic_cast<MemberSymbol*>(m);
-        if (!mem) continue;
+        // The grammar admits `equality skip` on the storage-bearing sites per
+        // §9.2 line 1385; the static-member arm is the inert-annotation case
+        // from §9.2 line 1419.
         //
-        // First arm: an explicit FieldDecl with `equality skip`.
-        auto* fs = dynamic_cast<FieldSymbol*>(m);
-        if (fs && fs->decl) {
-            const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (fd && fd->equality) {
-                const bool isStatic = hasMod(mem, "static");
-                if (isStatic) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("static field `") +
-                        std::string(m->name) +
-                        "` may not carry the `equality skip` clause — "
-                        "static members never participate in equality "
-                        "(§9.2 inert-annotation rule, mirroring §9.8; "
-                        "the clause is meaningless on a static and is "
-                        "rejected to avoid an inert-looking-but-load-"
-                        "bearing annotation, §18)");
-                }
-            }
-            continue;
-        }
-        // Second arm: an auto-property (PropertySymbol) with `equality
-        // skip`. A static PROPERTY is similarly inert.
-        auto* ps = dynamic_cast<PropertySymbol*>(m);
-        if (ps && ps->decl) {
-            const auto* pd =
-                dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-            if (pd && pd->equality) {
-                const bool isStatic = hasMod(mem, "static");
-                if (isStatic) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("static property `") +
-                        std::string(m->name) +
-                        "` may not carry the `equality skip` clause — "
-                        "static members never participate in equality "
-                        "(§9.2 inert-annotation rule, mirroring §9.8; "
-                        "the clause is meaningless on a static and is "
-                        "rejected to avoid an inert-looking-but-load-"
-                        "bearing annotation, §18)");
-                }
-            }
-        }
+        // Asked of the SYMBOL, not of `Symbol::decl` (umbrella #3152): the
+        // clause now rides `MemberSymbol::equalitySkip`, which SymbolCollection
+        // fills from the three AST hosts and ModuleLoader fills from
+        // `MetaMember::equalitySkip`. The previous spelling cast `fs->decl` /
+        // `ps->decl` to a FieldDecl/PropertyDecl, which also meant a POSITIONAL
+        // field (whose `decl` is the owning TypeDecl) was never examined at
+        // all. The walk itself is local-only by construction —
+        // `forEachTypeAndNested` iterates `ctx_.module()->children`, which
+        // holds only the types THIS compilation declares — so no diagnostic is
+        // re-reported against a dependency's declarations.
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem || !memberEqualitySkip(mem)) continue;
+        if (!hasMod(mem, "static")) continue;
+        const char* kindWord =
+            dynamic_cast<PropertySymbol*>(m) ? "property" : "field";
+        ctx_.diagnostics().report(
+            Severity::Error, m->declLoc,
+            std::string("static ") + kindWord + " `" +
+            std::string(m->name) +
+            "` may not carry the `equality skip` clause — "
+            "static members never participate in equality "
+            "(§9.2 inert-annotation rule, mirroring §9.8; "
+            "the clause is meaningless on a static and is "
+            "rejected to avoid an inert-looking-but-load-"
+            "bearing annotation, §18)");
     }
 }
 

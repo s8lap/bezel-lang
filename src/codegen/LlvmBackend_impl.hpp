@@ -3892,63 +3892,26 @@ private:
         return false;
     }
 
-    // §9.2 (v0.307) / fix #4643: true when the record-storage member carries
-    // an `equality skip` clause on its AST declaration. Covers the three
-    // host-AST shapes that admit the clause: explicit field (FieldDecl),
-    // auto-property (PropertyDecl), and positional field (Param, via the
-    // record's `positionalFields`). Used by collectRecordStorage to drop the
-    // member from the auto-equality / auto-hash synthesis while leaving it
-    // laid out (so ToString, serialization, and explicit field reads still
-    // see it).
+    // §9.2 "The `equality skip` clause" (v0.307) / fix #4643, cross-module
+    // follow-up: true when the record-storage member is removed from the
+    // auto-equality membership computation. Used by
+    // `collectRecordStorageForEquality` (and by `emitStructEquality` /
+    // `emitRecordHashCode`, which walk the FULL layout and need to know which
+    // physical slots to step over) to drop the member from the synthesized
+    // `=`/`<>`/`GetHashCode` while leaving it laid out — so reads, `with`,
+    // ToString and serialization still see it.
+    //
+    // Delegates to the ONE sema predicate (umbrella #3152). The first spelling
+    // of this helper recovered the clause by casting `Symbol::decl` to a
+    // PropertyDecl / FieldDecl, and for a positional field by index arithmetic
+    // back through `parent->decl`'s `positionalFields` — all three null for an
+    // IMPORTED member, so an imported record's skipped component was compared
+    // and hashed at the import while the exporter's own module excluded it
+    // (measured: `True` in-module, `False` across the boundary, on both `=`
+    // and `GetHashCode`). `sema::memberEqualitySkip` reads the symbol bit both
+    // collectors fill, so the two sides answer from one source.
     static bool memberHasEqualitySkip(const sema::Symbol* m) {
-        if (!m) return false;
-        if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m)) {
-            // Auto-property: equality skip lives on PropertyDecl.
-            if (ps->decl) {
-                if (auto* pd =
-                        dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                    return pd->equality && pd->equality->isSkip;
-                }
-            }
-            return false;
-        }
-        if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
-            // Positional records: the field symbol's `decl` is the OWNING
-            // TypeDecl (not a FieldDecl) and the equality clause lives on
-            // the Param at `fs->posParam` — set by SymbolCollection to
-            // `&td.positionalFields[i]` (line 488). Pointer arithmetic
-            // against the vector's data() recovers the layout index.
-            if (fs->posParam) {
-                const sema::TypeSymbol* parent = fs->parent;
-                if (parent && parent->decl) {
-                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                            parent->decl)) {
-                        auto* tdMut = const_cast<ast::TypeDecl*>(td);
-                        if (!tdMut->positionalFields.empty()) {
-                            const size_t idx = static_cast<size_t>(
-                                fs->posParam - tdMut->positionalFields.data());
-                            if (idx < tdMut->positionalFields.size()) {
-                                const auto& pf =
-                                    tdMut->positionalFields[idx];
-                                return pf.equality && pf.equality->isSkip;
-                            }
-                        }
-                    }
-                }
-                return false;
-            }
-            // Body field: equality skip lives on FieldDecl. (A positional
-            // field's `decl` is the parent TypeDecl, so this arm is only
-            // reached when `posParam` is null above.)
-            if (fs->decl) {
-                if (auto* fd =
-                        dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                    return fd->equality && fd->equality->isSkip;
-                }
-            }
-            return false;
-        }
-        return false;
+        return sema::memberEqualitySkip(m);
     }
 
     // CG17: a method participates in virtual dispatch if it is `virtual`,
@@ -8811,7 +8774,8 @@ private:
     // `this`-receiver reentrancy exemption). See the definition in
     // LlvmBackend_Assign.cpp for why the exemption is decided here.
     const sema::TypeSymbol* instrumentedSetterClass(
-        const ast::Expr& target, const sema::PropertySymbol* ps) const;
+        const ast::Expr& target, const sema::PropertySymbol* ps,
+        const ast::PropertyDecl* pd) const;
 
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to

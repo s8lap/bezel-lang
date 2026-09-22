@@ -1078,6 +1078,31 @@ struct MetaMember {
     bool serializedOptional = false;
     std::string serializedWireName;   // empty => the DECLARED name
 
+    // §9.2 "The `equality skip` clause" (v0.307; additive within v7,
+    // follow-up to fix #4643): this storage member's `equality skip` clause.
+    //
+    // §9.2 states the obligation directly: "the artifact interface ([§2.8.2])
+    // carries the clause exactly as it carries `serialized` clauses", and
+    // "Adding or removing `equality skip` on a public type's member is a
+    // breaking change ([§3.6] rule 3)" — so it is interface content the
+    // semantic hash must track, not a local decoration. #4643 landed the
+    // clause with no wire carriage at all; MEASURED consequence, on a record
+    // exported by one module and used by another: `new Pt(1,10) = new
+    // Pt(1,20)` (where `Cache` is `equality skip`) answered `True` in the
+    // declaring module and `False` at the import, with the same split on
+    // `GetHashCode`, and the body-record shape turned a locally-accepted `=`
+    // into a compile error at the import.
+    //
+    // Emitted under its OWN record code (REC_EQ_CLAUSE) and only when TRUE, so
+    // a module using no `equality skip` is byte-identical to a pre-#4643 build
+    // — the REC_SER_CLAUSE / REC_POSPARAM_DEFAULT discipline, with `hashMember`
+    // guarded by the SAME predicate as the emission (the half c97a49f had to
+    // correct on the F4 slice). Absent (a pre-#4643 blob) reads as `false`,
+    // i.e. "participates in equality": the pre-fix reading, so a stale
+    // dependency degrades to exactly what it did before and no new silent
+    // answer appears in the dependency direction.
+    bool equalitySkip = false;
+
     // NestedType (§11.3, issue #502): when kind == NestedType, this holds
     // the complete MetaTypeDecl for the nested type. Heap-allocated via
     // unique_ptr to break the cyclic MetaMember → MetaTypeDecl → MetaMember

@@ -6890,7 +6890,8 @@ bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) 
 // applies (#4597): `this.P := v`, `base.P := v`, a bare `P := v` inside an
 // instance member, and the indexer spellings of each.
 const sema::TypeSymbol* Emitter::instrumentedSetterClass(
-    const ast::Expr& target, const sema::PropertySymbol* ps) const {
+    const ast::Expr& target, const sema::PropertySymbol* ps,
+    const ast::PropertyDecl* pd) const {
     // §22.16 / #4386: nothing is instrumented in release mode.
     if (!checkedContracts_ || !ps) return nullptr;
     // §22.16 "Never instrumented: non-public methods and setters, static
@@ -6902,9 +6903,20 @@ const sema::TypeSymbol* Emitter::instrumentedSetterClass(
     if (ps->visibility != ast::Visibility::Public) return nullptr;
     // §13.6 accessor visibility: `public property Id: int private set;` is a
     // public property with a NON-public setter, and §22.16's row is about the
-    // setter. An IMPORTED property carries no `ast::PropertyDecl` (#2414), so
-    // this refinement simply does not apply there.
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+    // setter.
+    //
+    // `pd` is the declaration the SOLE caller (`lowerPropertySetValue`) has
+    // already resolved — it is on this path only because `computedSetterOf`
+    // returned a `pd->accessors` element, which requires `ps->decl` to be a
+    // block-form `ast::PropertyDecl`. Taking it as a parameter rather than
+    // re-deriving it with a second `dynamic_cast<…>(ps->decl)` keeps this
+    // predicate off the imported-symbol classification seam (umbrella #3152):
+    // there is no null-`decl` arm here to answer "no visibility refinement"
+    // for an imported property, because an imported property never reaches
+    // this function at all. Null-tolerant so a future caller that has no
+    // declaration degrades to "no accessor-level refinement" explicitly
+    // rather than by a silent cast failure.
+    if (pd) {
         if (pd->hasAutoAccessorVis && pd->autoAccessorIsSet &&
             pd->autoAccessorVis != ast::Visibility::Public)
             return nullptr;
@@ -7110,7 +7122,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     // before the inlined setter body so the instance is observed in the
     // state the caller handed over, exactly as the public-method entry
     // check is emitted before the method body (`emitFunctionBody`).
-    const sema::TypeSymbol* invCls4614 = instrumentedSetterClass(target, ps);
+    const sema::TypeSymbol* invCls4614 = instrumentedSetterClass(target, ps, pd);
     if (invCls4614) emitInvariantCheck(recv, invCls4614);
     // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
     llvm::AllocaInst* slot = entryAlloca(v->getType());

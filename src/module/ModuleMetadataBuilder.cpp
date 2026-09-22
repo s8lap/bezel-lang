@@ -1099,6 +1099,15 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     out.serializedSkip     = m.serializedSkip;
     out.serializedOptional = m.serializedOptional;
     out.serializedWireName = std::string(m.serializedWireName);
+    // §9.2 "The `equality skip` clause" (v0.307; follow-up to fix #4643):
+    // §9.2 says "the artifact interface ([§2.8.2]) carries the clause exactly
+    // as it carries `serialized` clauses", so it is exported the same way and
+    // from the same place — the SYMBOL, which SymbolCollection filled from
+    // whichever of the three storage-bearing AST hosts this member has
+    // (positional field, auto-property, explicit field). Re-deriving it from
+    // `m.decl` here would miss the positional case outright, whose `decl` is
+    // the owning TypeDecl.
+    out.equalitySkip = m.equalitySkip;
 
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.decl)) {
         out.kind = MetaMemberKind::Field;

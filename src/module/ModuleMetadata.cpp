@@ -171,7 +171,19 @@ enum RecordCode : unsigned {
     // `parseAndAttachInvariants` closes, so a stale dependency degrades to
     // exactly what it did before rather than to anything new.
     REC_INVARIANT_TEXT = 16,
-    // 17.. additive; unknown codes are skipRecord()'d by the reader
+    // §9.2 "The `equality skip` clause" (v0.307, additive within v7; follow-up
+    // to fix #4643): MEMBER_BLOCK — a storage member's `equality skip` clause
+    // as a single scalar under its OWN code. Emitted only when TRUE, so a
+    // module whose members carry no `equality skip` is byte-identical to a
+    // pre-#4643 build. A distinct code rather than a third scalar appended to
+    // REC_SER_CLAUSE because the two clauses are independent: §9.2's table
+    // ("The two-package skip model") makes participation per-package, so a
+    // member may carry either, both, or neither, and folding them would make
+    // one clause's presence decide the other's encoding. Absent (a pre-#4643
+    // blob) reads as `false` = "participates in equality", which is exactly
+    // what that dependency's own compiler produced.
+    REC_EQ_CLAUSE = 17,
+    // 18.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -350,6 +362,13 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
         hashBool(h, m.serializedOptional);
         hashStr(h, m.serializedWireName);
     }
+    // §9.2 (v0.307): `equality skip` flips comparison results and hash values
+    // for clients and can flip the §3.6 auto-hashable/hashable derived
+    // properties, so §9.2 names adding or removing it a BREAKING change
+    // (§3.6 rule 3) — it must fold into the semantic hash or a consumer's
+    // staleness check cannot see it. GUARDED BY THE SAME PREDICATE AS THE
+    // EMISSION, for the reason the `serialized` fold directly above states.
+    if (m.equalitySkip) hashBool(h, m.equalitySkip);
     // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 3, v0.254): a positional
     // primary-ctor parameter's default-value text is part of the cross-module
     // contract — a library adding or removing (or changing) a `:= Expr`
@@ -644,7 +663,9 @@ MetaMember::MetaMember(const MetaMember& o)
       enumWireName(o.enumWireName),
       serializedSkip(o.serializedSkip),
       serializedOptional(o.serializedOptional),
-      serializedWireName(o.serializedWireName) {
+      serializedWireName(o.serializedWireName),
+      // §9.2 (v0.307): same shape as the `serialized` trio above.
+      equalitySkip(o.equalitySkip) {
     if (o.nestedType)
         nestedType = std::make_unique<MetaTypeDecl>(*o.nestedType);
 }
@@ -676,6 +697,8 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         serializedSkip = o.serializedSkip;
         serializedOptional = o.serializedOptional;
         serializedWireName = o.serializedWireName;
+        // §9.2 (v0.307): same shape as the `serialized` trio above.
+        equalitySkip = o.equalitySkip;
         nestedType = o.nestedType
             ? std::make_unique<MetaTypeDecl>(*o.nestedType)
             : nullptr;
@@ -740,6 +763,10 @@ bool MetaMember::operator==(const MetaMember& o) const {
            serializedSkip == o.serializedSkip &&
            serializedOptional == o.serializedOptional &&
            serializedWireName == o.serializedWireName &&
+           // §9.2 (v0.307): the `equality skip` clause is part of a storage
+           // member's identity — see hashMember; §9.2 names adding or removing
+           // it a breaking change (§3.6 rule 3).
+           equalitySkip == o.equalitySkip &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
            fieldInitText == o.fieldInitText &&
@@ -1102,6 +1129,14 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         for (char c : m.serializedWireName)
             sv.push_back(static_cast<std::uint8_t>(c));
         w.EmitRecord(REC_SER_CLAUSE, sv);
+    }
+    // §9.2 "The `equality skip` clause" (v0.307; schema v7 additive): emitted
+    // ONLY when the member carries the clause, so a module using none is
+    // byte-identical to before — and `hashMember` is guarded by the SAME
+    // predicate, the half c97a49f had to correct for REC_SER_CLAUSE.
+    if (m.equalitySkip) {
+        llvm::SmallVector<std::uint64_t, 1> ev{1u};
+        w.EmitRecord(REC_EQ_CLAUSE, ev);
     }
     // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): a positional
     // primary-ctor parameter's default-value expression text, under its
@@ -2097,6 +2132,17 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                     for (std::size_t vi = 2; vi < vals.size(); ++vi)
                         m.serializedWireName.push_back(
                             static_cast<char>(vals[vi] & 0xFF));
+                    continue;
+                }
+                // §9.2 "The `equality skip` clause" (v0.307): captured BY CODE
+                // for the same reason REC_SER_CLAUSE above is — a coded record
+                // is self-describing and `skipRecord()`'d by every reader this
+                // format has had, so a pre-#4643 reader never sees it and a
+                // pre-#4643 BLOB simply leaves `equalitySkip` false, which is
+                // the "participates in equality" reading that dependency's own
+                // compiler produced.
+                if (got.get() == REC_EQ_CLAUSE && vals.size() >= 1) {
+                    m.equalitySkip = vals[0] != 0;
                     continue;
                 }
                 // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): the

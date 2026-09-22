@@ -766,6 +766,18 @@ struct Loader {
             if (!mm.serializedWireName.empty())
                 member->serializedWireName =
                     ctx.internString(mm.serializedWireName);
+            // §9.2 "The `equality skip` clause" (v0.307; follow-up to fix
+            // #4643): the same one-place carriage, for the same reason. It had
+            // NO channel at all, so every consumer recovered it by casting
+            // `Symbol::decl` — null for every imported member — and answered
+            // "participates in equality". MEASURED: an imported
+            // `record Pt(X: int, Cache: int equality skip)` compared and hashed
+            // `Cache` at the import while its own module excluded it, and the
+            // body-record shape turned a locally-accepted `=` into a compile
+            // error at the import. `applyBehavior` runs for every reconstructed
+            // member kind, so field, positional field and auto-property all
+            // pick it up here.
+            member->equalitySkip = mm.equalitySkip;
             if (mm.isPure && std::find(member->modifiers.begin(),
                                       member->modifiers.end(), "pure") ==
                                   member->modifiers.end())

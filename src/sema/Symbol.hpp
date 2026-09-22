@@ -757,6 +757,38 @@ struct MemberSymbol : Symbol {
     bool serializedSkip = false;
     bool serializedOptional = false;
     std::string_view serializedWireName;  // empty => the DECLARED name
+    // §9.2 "The `equality skip` clause" (v0.307; umbrella #3152, follow-up to
+    // fix #4643): this storage member's `equality skip` clause.
+    //
+    // §9.2 is explicit that the clause is INTERFACE, not local decoration:
+    // "the artifact interface ([§2.8.2]) carries the clause exactly as it
+    // carries `serialized` clauses". #4643 landed the clause riding
+    // `ast::FieldDecl::equality` / `ast::PropertyDecl::equality` /
+    // `ast::Param::equality` and NOTHING else, so every consumer recovered it
+    // by casting `Symbol::decl` — null for every IMPORTED member — and
+    // answered "no clause" for all of them. MEASURED on the commit that
+    // introduced it:
+    //
+    //   * `public record Pt(X: int, Cache: int equality skip)` exported from
+    //     one module: `new Pt(1,10) = new Pt(1,20)` is `True` inside the
+    //     declaring module and `False` across the import, with the same split
+    //     on `GetHashCode` — a silent wrong ANSWER, and a §8.3 hashing-
+    //     coherence split between the two sides of the boundary;
+    //   * the body-record shape (`private equality skip _count: int;`) goes
+    //     further: the skip is the clause's rescue path, so with it invisible
+    //     the importer classifies the record as not auto-hashable and `=`
+    //     becomes a COMPILE ERROR the identical same-module program accepts.
+    //
+    // Populated on BOTH sides — SymbolCollection from the three AST hosts the
+    // A.3/A.4 grammar admits the clause on (positional field, auto-property,
+    // explicit field), ModuleLoader from `MetaMember::equalitySkip` — so the
+    // predicate below needs no source switch. The `builtinExceptionBase`
+    // (#2950) / `serializedSkip` (#3140) template. Ask `memberEqualitySkip`
+    // below rather than reading this field directly: not every MemberSymbol is
+    // built by SymbolCollection/ModuleLoader (the builtin-interface shims in
+    // SemaContext.hpp are not), and the accessor is the one place that
+    // documents what `false` means for those.
+    bool equalitySkip = false;
 };
 
 struct FieldSymbol : MemberSymbol {
@@ -1226,6 +1258,22 @@ struct SerializedComponentClause {
 // `enumConstantWireName` instead. Nothing populates both, so a member is
 // carried by exactly one of the two channels.
 SerializedComponentClause serializedComponentClause(const Symbol* m);
+
+// §9.2 "The `equality skip` clause" (v0.307; umbrella #3152, follow-up to fix
+// #4643): the ONE way to ask whether a storage member is removed from the
+// auto-equality membership computation.
+//
+// Reads `MemberSymbol::equalitySkip`, which SymbolCollection fills from the
+// AST and ModuleLoader fills from the dependency's metadata — so it answers
+// for a LOCAL and an IMPORTED member alike and never touches `Symbol::decl`.
+// Every consumer of the clause goes through here: sema's two auto-equality
+// membership predicates (`isAutoEqualityBearingBodyRecord` /
+// `isPositionalRecordEqualityBearing`), §9.2's inert-annotation check, and
+// codegen's `=`/`GetHashCode` synthesis. `false` for a null symbol, for a
+// non-member symbol, and for a member no collector filled — the pre-#4643
+// reading, i.e. "participates", which is the direction that keeps a member in
+// equality rather than silently dropping it.
+bool memberEqualitySkip(const Symbol* m);
 
 // §9.8 (#3140, family F2): the §9.8 wire SHAPE of a class's synthesized
 // serialization surface — "tree", "graph", "cyclic", or "" for a class that has

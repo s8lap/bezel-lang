@@ -186,6 +186,15 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
         // FieldSymbol::declLoc reported 0:0.
         sym->declLoc = fd->span.begin;
         sym->scope = parent.memberScope;  // field lives in type's member scope
+        // §9.2 "The `equality skip` clause" (v0.307): an explicit field's
+        // clause, onto the SYMBOL. A.4 places it BEFORE the identifier on a
+        // FieldDecl; this is the third of the three storage-bearing AST hosts
+        // (the other two are the positional field in collectTypeDecl and the
+        // auto-property below). Copied unconditionally — including onto a
+        // `static` field, which §9.2's inert-annotation rule then REJECTS in
+        // `Resolver::checkTypeEqualitySkipInert`; that check reads the symbol
+        // bit, so dropping it here for statics would silently disarm the rule.
+        if (fd->equality) sym->equalitySkip = fd->equality->isSkip;
         return sym;
     }
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
@@ -292,6 +301,11 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
             sym->serializedOptional = pd->serialized->isOptional;
             sym->serializedWireName = pd->serialized->name;
         }
+        // §9.2 "The `equality skip` clause" (v0.307): an auto-property's
+        // clause, onto the SYMBOL, for the same reason the `serialized` copy
+        // directly above gives — §9.2 states the artifact interface carries
+        // it "exactly as it carries `serialized` clauses".
+        if (pd->equality) sym->equalitySkip = pd->equality->isSkip;
         return sym;
     }
     if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
@@ -498,6 +512,13 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
                 fs->serializedOptional = pf.serialized->isOptional;
                 fs->serializedWireName = pf.serialized->name;
             }
+            // §9.2 "The `equality skip` clause" (v0.307): the positional
+            // field's clause, onto the SYMBOL. A positional FieldSymbol's
+            // `decl` is the owning TypeDecl (not a FieldDecl), so before this
+            // even the LOCAL consumers had to recover the clause by index
+            // arithmetic back into `td.positionalFields`; the symbol bit
+            // retires that walk as well as the imported-side blind spot.
+            if (pf.equality) fs->equalitySkip = pf.equality->isSkip;
             sym->members.push_back(fs);
         }
     }
@@ -1411,6 +1432,16 @@ SerializedComponentClause serializedComponentClause(const Symbol* m) {
     return info;
 }
 
+// §9.2 "The `equality skip` clause" (v0.307; follow-up to fix #4643): see the
+// declaration comment in Symbol.hpp for the measured cross-module divergence
+// this closes — a positional record comparing `True` in its own module and
+// `False` across the import, and a body record whose `=` is accepted locally
+// and rejected at the import.
+bool memberEqualitySkip(const Symbol* m) {
+    const auto* ms = dynamic_cast<const MemberSymbol*>(m);
+    return ms && ms->equalitySkip;
+}
+
 // fix #3140 (§9.8, family F2): see the declaration comment in Symbol.hpp for
 // why an imported class answers "" and what was measured when it did not.
 std::string_view serializedClassShape(const TypeSymbol* t) {
@@ -1745,11 +1776,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         // otherwise-inadmissible auto-property storage (e.g. a class-typed
         // cache field whose address identity must not enter auto-`=`).
         if (isAutoPropertyStorageSymbol(m, ctx)) {
-            if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
-                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                    if (pd->equality && pd->equality->isSkip) continue;
-                }
-            }
+            if (memberEqualitySkip(m)) continue;
             if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
                 return false;
             continue;
@@ -1773,9 +1800,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
             for (auto mod : fs->modifiers)
                 if (mod == "static") { isStatic = true; break; }
             if (isStatic) continue;
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                if (fd->equality && fd->equality->isSkip) continue;
-            }
+            if (memberEqualitySkip(m)) continue;
             return false;
         }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
@@ -1848,9 +1873,7 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                 // otherwise reject as a class-typed / move-only / reference
                 // component. Checked BEFORE the admissibility test below so
                 // the field's declared type is not consulted.
-                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                    if (fd->equality && fd->equality->isSkip) continue;
-                }
+                if (memberEqualitySkip(m)) continue;
                 // Positional field: type must be admissible (§9.3 → §9.2 rule).
                 if (!isAdmissibleComponentType(
                         storageComponentType(m, ctx), ctx, 0))
