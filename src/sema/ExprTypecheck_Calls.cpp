@@ -3845,7 +3845,121 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // loader keyed on the symbol. Use it so the call expression types
             // correctly against the imported signature.
             if (TypeRef* rt = ctx_.importedReturnType(ms)) {
-                ctx_.setExprType(&ce, rt);
+                // fix #4611 (§14.5 phase 1 "Argument-driven unification" /
+                // §2.8.3 rule 2, v0.307): run phase-1 argument-driven
+                // inference for an IMPORTED generic method. The local path
+                // (the `md && md->returnType` arm ~1100 lines above) infers
+                // the method's own type parameters from the call's arguments
+                // and substitutes them into the declared return type; this
+                // arm did NOT, so `U.Echo(41)` against an imported
+                // `Echo<T>(x: T): T` was typed as the still-unbound `T` —
+                // rendered `?`. The failure surfaced at the first USE of the
+                // value ("operator `+` is not defined for type `?`") rather
+                // than at the inference site, while the byte-identical
+                // single-module program compiled and ran. Measured on a real
+                // two-module build for both a one- and a two-type-parameter
+                // imported method.
+                //
+                // This is the third instance of the same AST-only gate as
+                // #4590 (phase 3) and #4589 (the explicit-list arity check):
+                // `ModuleLoader` never assigns `MethodSymbol::decl` for an
+                // imported method, so every step written against `md` is a
+                // silent no-op across a module boundary. Nothing new has to
+                // cross the wire — the method's own type parameters ride
+                // `MethodSymbol::genericParams` (from
+                // `MetaMember::genericParams`) and its formal types are
+                // reached through the both-sources accessor
+                // `formalParamResolvedType`; phase 1 needs BOTH, where #4589
+                // needed only the parameter COUNT.
+                //
+                // The unifier is `unifyReturnAgainstTarget`, the TypeRef-side
+                // twin of `unifyArgSubst` that #4590 already uses for phase 3
+                // — reused rather than grown into a second, drifting
+                // structural unifier. It resolves a bare type-parameter
+                // reference through BOTH spellings (`bareTypeParamRef`: an
+                // AST-backed name, or the loader's `importedName`) and
+                // carries §14.5's `X?` nullable-peeling rule, which is what
+                // phase 1 needs at a parameter position. It does not perform
+                // §14.5's "unique instantiation the argument implements or
+                // extends" ancestor walk that `unifyArgSubst` grew in #4183;
+                // that shape simply solves nothing here (the helper's final
+                // `return true`), leaving the pre-fix `?` rather than binding
+                // wrongly — a residual, not a regression.
+                TypeRef* callTy = rt;
+                if (!ms->genericParams.empty()) {
+                    // §14.5: "When a full explicit list is supplied, no
+                    // inference runs." Phase 1 is the no-explicit-list case,
+                    // so stand down whenever the call spelled one (the
+                    // arity of such a list is #4589's check, just above).
+                    // The explicit list's own BINDING is likewise absent on
+                    // this imported arm — filed as #4622 rather than folded
+                    // in here, since §14.5 puts it outside phase 1 and no
+                    // row of #4611's repro spells a list.
+                    const std::vector<std::unique_ptr<ast::Type>>*
+                        callTypeArgs = nullptr;
+                    if (auto* iMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce.callee.get()))
+                        callTypeArgs = &iMa->typeArgs;
+                    else if (auto* iNcm =
+                                 dynamic_cast<const ast::NullCondMemberExpr*>(
+                                     ce.callee.get()))
+                        callTypeArgs = &iNcm->typeArgs;
+                    else if (auto* iId =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     ce.callee.get()))
+                        callTypeArgs = &iId->typeArgs;
+                    if (!callTypeArgs || callTypeArgs->empty()) {
+                        std::unordered_set<std::string_view> mParamNames;
+                        for (const Symbol* gp : ms->genericParams)
+                            if (gp && !gp->name.empty())
+                                mParamNames.insert(gp->name);
+                        std::unordered_map<std::string_view, TypeRef*> argSubst;
+                        bool consistent = true;
+                        for (std::size_t pi = 0;
+                             pi < ce.args.size() && consistent; ++pi) {
+                            if (!ce.args[pi].value) continue;
+                            // §14.1 / §22.4 / #1164: an inline out-var
+                            // argument has no type of its own — the parameter
+                            // binds it, not the other way round. Same skip the
+                            // local phase-1 loop performs.
+                            std::string_view amod = ce.args[pi].modifier;
+                            if (amod == "out var" || amod == "out using var" ||
+                                amod == "out owned var")
+                                continue;
+                            const TypeRef* pt =
+                                formalParamResolvedType(*ms, pi);
+                            if (!pt) continue;
+                            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                            if (!argTy) continue;
+                            // §14.5: "a bare `null` literal argument is not
+                            // self-determined and contributes no binding" —
+                            // sema types an uncontexted null as nullable
+                            // Object. Same skip as the local loop (#885/#886).
+                            if (argTy->kind == TypeRef::Kind::Primitive &&
+                                argTy->primitive == PrimitiveType::Object &&
+                                argTy->nullable)
+                                continue;
+                            // A disagreeing second binding (§14.5 *Agreement*)
+                            // returns false. Abandon the whole substitution
+                            // rather than install a half-solved type: the call
+                            // then keeps the unresolved return type it had
+                            // before this fix, which is the pre-existing
+                            // behaviour and never a wrong binding.
+                            if (!unifyReturnAgainstTarget(pt, argTy,
+                                                          mParamNames,
+                                                          argSubst))
+                                consistent = false;
+                        }
+                        if (consistent && !argSubst.empty())
+                            callTy = substituteReturnType(rt, argSubst);
+                    }
+                }
+                // The #783 and #1937 declines below deliberately read the
+                // UNSUBSTITUTED `rt`: each classifies the DECLARED return
+                // shape (a class type parameter / a generic record
+                // parameterized by a method type parameter), and both would
+                // stop firing on a substituted type.
+                ctx_.setExprType(&ce, callTy);
                 // #783 / §14.1 (decline-with-reasons): an IMPORTED generic CLASS's
                 // method whose return type references a class type parameter is NOT
                 // monomorphized importer-side — its body was compiled in the
