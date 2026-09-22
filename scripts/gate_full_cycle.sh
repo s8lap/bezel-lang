@@ -1016,6 +1016,49 @@ if ! python3 scripts/check_leak_exempt_status.py --strict \
 fi
 say "leak-exempt-status phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_leakexempt.log"))"
 
+# ── SEAM-ACCESSOR CONFORMANCE PHASE (#4539) ────────────────────────────────
+# check_imported_symbol_reads.py ratchets the READS of the AST-vs-symbol-table
+# import seam; #4539 named the class it is blind to: a read that is correct
+# and necessary for the local path, consumed by code with no imported-side
+# fallback on its failure branch. Three such consumers shipped silently in one
+# cycle (#4480, #4508, #4510) before anyone wrote a cross-module test for the
+# shape. #4510's own fix gave its consumer a BOTH-SOURCES ACCESSOR — resolves
+# through the AST when present, through the symbol table when not — joining
+# two pre-existing ones (formalOutParamType2 #2657/#3186/#3188/#3206,
+# formalCtorOutParamType #2668/#3772). This phase ratchets that every
+# registered accessor keeps at least one tests/module/ (cross-module) test
+# citing one of its issues — #4539's own "cheapest, already demonstrated
+# twice" candidate (a conformance obligation), not the harder "detect a
+# missing fallback automatically" one (investigated and declined for this
+# script — see its own module docstring for why a text-pattern scanner over
+# src/ cannot reliably tell a real gap from an ALREADY-CORRECT or
+# structurally-unreachable site without the same judgement a human lane
+# applied to find #4589/#4590/#4591/#4592).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above.
+say "seam-accessor-conformance phase: detector self-test + coverage ratchet (#4539)"
+if ! python3 scripts/check_seam_accessor_conformance.py --self-test \
+      > "$LOGDIR/${TAG}_seamaccessor.log" 2>&1; then
+  say "CYCLE FAILURE: check_seam_accessor_conformance SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_seamaccessor.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_seamaccessor.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_seam_accessor_conformance.py --strict \
+      >> "$LOGDIR/${TAG}_seamaccessor.log" 2>&1; then
+  say "CYCLE FAILURE: a registered both-sources accessor (#4539) has lost its"
+  say "  tests/module/ cross-module conformance coverage — an accessor with"
+  say "  no test proving the imported path still matches the local twin is"
+  say "  the exact regression #4480/#4508/#4510 shipped silently. See"
+  say "  $LOGDIR/${TAG}_seamaccessor.log"
+  sed -n '/check_seam_accessor_conformance:/,$p' "$LOGDIR/${TAG}_seamaccessor.log" \
+    2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamaccessor.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
