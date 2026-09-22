@@ -4581,7 +4581,8 @@ static bool parseAndAttachExtensionPropertyBody(
 // source byte-for-byte for every existing caller.
 static std::string buildSyntheticFieldInitSource(
     const MetaTypeDecl& td, const std::string& moduleName,
-    const std::string& extraMembers = {}) {
+    const std::string& extraMembers = {},
+    const sema::TypeSymbol* baseSym = nullptr) {
     std::string src = "module _2351_reparsed_field_;\n";
     // §2.8.2 / #2375: `import` the exporting module so its PUBLIC sibling
     // types — already loaded into the importer's mainCtx — are visible to
@@ -4597,6 +4598,16 @@ static std::string buildSyntheticFieldInitSource(
     // the import still correctly rejects — the #2351 self-pass (a)
     // guarantee is preserved.
     if (!moduleName.empty()) src += "import " + moduleName + ";\n";
+    // fix #4599 residual 1 (§22.16 / §11.1 / §2.8.2, v0.306): when a base
+    // clause is requested and the base class declares in a DIFFERENT module
+    // than `td` itself (a base reached transitively, not a same-module
+    // sibling), the `import moduleName;` line above does not expose it —
+    // import its own declaring module too. `baseSym` is only ever non-null
+    // from `parseAndAttachInvariants` (see its header for why the base is a
+    // REAL, already-loaded symbol here rather than a re-declared stub).
+    if (baseSym && !baseSym->moduleName.empty() &&
+        baseSym->moduleName != moduleName)
+        src += "import " + baseSym->moduleName + ";\n";
     src += metaVisibilityToKeyword(td.visibility);
     src += " class ";
     src += td.name;
@@ -4611,6 +4622,24 @@ static std::string buildSyntheticFieldInitSource(
         }
         src += ">";
     }
+    // fix #4599 residual 1: ` : Base` — a bare name, no generic argument
+    // list and no constructor of its own. `baseSym` is the REAL (already
+    // fully-loaded, already fully base-resolved) TypeSymbol, not text
+    // reconstructed from `td.baseTypes[0]`, so there is no MetaType here to
+    // render generic arguments from; a GENERIC base therefore needs its own
+    // type argument the bare name cannot supply. Separately — MEASURED, not
+    // merely inferred — the synthetic class declares no explicit constructor
+    // (this function never has, for any caller), so §12.8 requires its
+    // IMPLICIT default constructor's IMPLICIT `base()` chain to resolve: a
+    // base whose every constructor takes a parameter fails that check with
+    // "the chain must be explicit", even though nothing here ever
+    // instantiates anything. Both gaps route through the SAME soundness
+    // gate below (a resolveTypes/typecheck error) and decline exactly as any
+    // other unresolvable shape does — see parseAndAttachInvariants's header
+    // for why this is a silent decline, not a hard reject, and for the
+    // measured scope this leaves closed vs. open.
+    if (baseSym && !baseSym->name.empty())
+        src += " : " + std::string(baseSym->name);
     src += "\n";
     // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
     // declarations, so a VERBATIM text this source carries can name one — see
@@ -5156,25 +5185,88 @@ static bool parseAndAttachFieldInit(
 // hard reject, and the reason is the direction of the harm: a hard reject
 // would turn programs that build today into programs that do not build, to
 // buy a check that is off by default (§22.16 makes clause evaluation a
-// checked-contracts-mode behaviour, and the loader cannot see the mode). The
-// known shape that lands here is a clause naming an INHERITED member: the
-// synthetic source re-declares only the class's OWN members (the #710/#2290
-// limitation shared by every reconstruction path in this file), so
-// `invariant(BaseField > 0);` on a derived exported class does not resolve.
-// That residual is narrower than the defect it sits inside and is tracked as
-// issue #4599 (with the §11.6 nested-imported-class one) rather than hidden.
+// checked-contracts-mode behaviour, and the loader cannot see the mode).
+//
+// fix #4599 residual 1 (§22.16 / §11.1 / §2.8.2, v0.306): a clause naming an
+// INHERITED member now ALSO reconstructs, for a NON-GENERIC immediate base
+// THAT HAS AN ACCESSIBLE PARAMETERLESS CONSTRUCTOR (see "NOT covered" below
+// for why that second condition exists — it was not part of the original
+// filing and was found only by driving a real build). The synthetic source
+// re-declares only the class's OWN members — the #710/#2290 limitation
+// every OTHER reconstruction path in this file shares, because those paths
+// need the base's METHOD BODIES / CTOR ARGUMENTS (executable code, requiring
+// a full textual re-declaration of the base chain to re-parse against) —
+// but an invariant clause only needs to LOOK UP the base's storage, not
+// execute anything over it. `importedType.baseTypes` (populated by pass 2's
+// `reconstructTypeSymbol`, itself already resolved — codegen's
+// `baseClassOf` reads the same field) already gives a REAL, already-fully-
+// loaded base `TypeSymbol*`, whichever module it declares in and however
+// many ancestors above THAT are already resolved on IT. So rather than
+// re-declaring the base's storage as a textual stub (#710's approach,
+// needed only when the reconstruction must execute code), this function
+// instead points the synthetic `Derived`'s base clause AT the real symbol
+// (`registerForFreshCtx` below) — member lookup then walks the REAL,
+// pre-existing base chain, and an inherited field's `exprSymbol` already IS
+// the real `FieldSymbol`, needing no remap (see the loop below's "#2375
+// sibling member" arm, which this shape also falls into, unmodified).
+//
+// NOT covered, and both routed through the SAME resolveTypes/typecheck
+// soundness gate below (a silent decline, same policy as any other
+// unresolvable shape):
+//
+//   * a GENERIC base (`buildSyntheticFieldInitSource`'s ` : Base` emits a
+//     bare name — see its own comment) — resolveTypes reports the arity
+//     mismatch it cannot supply;
+//   * a base whose EVERY constructor takes a parameter. MEASURED, not
+//     inferred: this function's synthetic class declares no constructor of
+//     its own (it never has, for any caller of `buildSyntheticFieldInitSource`),
+//     so §12.8 requires its IMPLICIT default constructor's IMPLICIT `base()`
+//     chain to resolve — "implicit `base()` chain: base class `X` has no
+//     parameterless constructor; the chain must be explicit (§12.8)" — even
+//     though the synthetic module never instantiates anything. Closing THIS
+//     narrower gap needs a forwarding constructor whose parameter list
+//     type-matches one of the base's, which for anything beyond primitive
+//     parameter types needs those types' own declarations reconstructed in
+//     the fresh context too — the SAME cross-type textual-reconstruction
+//     surface #710/#2290 already tracks, reached through a different door
+//     (the implicit-chain check) than #710's filed repro (an explicit
+//     cross-type call in a ctor body). Filed as #710's narrower residual
+//     rather than solved here, per CLAUDE.md §4 (decline-with-reasons, not
+//     a silent partial fix): supplying literal placeholder argument values
+//     would be unsound name-shopping (which literal is "right" for an
+//     arbitrary parameter type is not this function's decision to make),
+//     and a generalized "reconstruct the base's declaration too" is
+//     #710/#2290's stated direction, not a narrow addition here.
 //
 // Verified to reconstruct, by two-module probe: a clause over the class's own
 // `private` field (those cross for layout, #2456), a clause naming a
-// class-level `const` (#4514's stubs), and a clause on a GENERIC imported
-// class instantiated in the importer.
+// class-level `const` (#4514's stubs), a clause on a GENERIC imported class
+// instantiated in the importer, and (residual 1's own probe) a clause on a
+// class naming a `public` field declared on its NON-GENERIC, parameterless-
+// constructor immediate base, the base declared in the SAME module and —
+// separately — in a DIFFERENT, transitively-imported module. Also verified,
+// by the SAME probe technique, that a base whose only constructor takes an
+// argument reproduces the exact §12.8 diagnostic above and the reconstruction
+// declines (pre-fix behaviour preserved, not a regression).
 static bool parseAndAttachInvariants(const MetaTypeDecl& td,
                                      const std::string& moduleName,
                                      sema::TypeSymbol& importedType,
                                      sema::SemaContext& mainCtx) {
     if (td.ownInvariantText.empty()) return false;
-    std::string source =
-        buildSyntheticFieldInitSource(td, moduleName, td.ownInvariantText);
+
+    // fix #4599 residual 1: the first CLASS entry of `importedType.baseTypes`
+    // — mirrors `Emitter::baseClassOf`'s exact filter (LlvmBackend_Setup.cpp)
+    // so this function and codegen's own base-chain walk agree on which base
+    // is "the" class base when an interface base sits ahead of it in the
+    // list (`reconstructTypeSymbol` pushes every resolved Named base,
+    // interfaces included, in `td.baseTypes` order).
+    sema::TypeSymbol* baseSym = nullptr;
+    for (sema::TypeSymbol* b : importedType.baseTypes) {
+        if (b && b->kind == ast::TypeDeclKind::Class) { baseSym = b; break; }
+    }
+
+    std::string source = buildSyntheticFieldInitSource(
+        td, moduleName, td.ownInvariantText, baseSym);
 
     DiagnosticEngine freshDiag;
     Lexer freshLex(source, freshDiag);
@@ -5195,28 +5287,38 @@ static bool parseAndAttachInvariants(const MetaTypeDecl& td,
     // to the `import <moduleName>;` line the synthetic source emits, so a
     // clause naming one resolves to the REAL imported symbol. Same registration
     // (and same #3748 per-symbol type-channel carry) as the field-init path.
+    //
+    // fix #4599 residual 1: register the REAL base symbol the same way, under
+    // ITS OWN declaring module (which may differ from `moduleName` — see
+    // `buildSyntheticFieldInitSource`'s matching `import` line) — so the
+    // ` : Base` clause in the synthetic header binds to the real, already
+    // fully-resolved symbol rather than failing to resolve at all.
+    auto registerForFreshCtx = [&](sema::TypeSymbol* sym) {
+        if (!sym || sym->name.empty()) return;
+        freshCtx.registerImportedType(sym->moduleName, sym);
+        for (sema::Symbol* mem : sym->members) {
+            if (!mem) continue;
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem)) {
+                if (sema::TypeRef* rt = mainCtx.importedReturnType(ms))
+                    freshCtx.setImportedReturnType(
+                        ms, rt, mainCtx.importedReturnOwned(ms));
+            } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem)) {
+                if (sema::TypeRef* ty = mainCtx.importedMemberType(fs))
+                    freshCtx.setImportedMemberType(fs, ty);
+            } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(mem)) {
+                if (sema::TypeRef* ty = mainCtx.importedMemberType(ps))
+                    freshCtx.setImportedMemberType(ps, ty);
+            }
+            freshCtx.markImported(mem);
+        }
+    };
+    if (baseSym) registerForFreshCtx(baseSym);
     if (const std::vector<sema::TypeSymbol*>* siblings =
             mainCtx.importedTypesOf(moduleName)) {
         for (sema::TypeSymbol* sib : *siblings) {
             if (!sib || sib->name.empty()) continue;
             if (sib->name == td.name) continue;
-            freshCtx.registerImportedType(moduleName, sib);
-            for (sema::Symbol* mem : sib->members) {
-                if (!mem) continue;
-                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem)) {
-                    if (sema::TypeRef* rt = mainCtx.importedReturnType(ms))
-                        freshCtx.setImportedReturnType(
-                            ms, rt, mainCtx.importedReturnOwned(ms));
-                } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem)) {
-                    if (sema::TypeRef* ty = mainCtx.importedMemberType(fs))
-                        freshCtx.setImportedMemberType(fs, ty);
-                } else if (auto* ps =
-                               dynamic_cast<sema::PropertySymbol*>(mem)) {
-                    if (sema::TypeRef* ty = mainCtx.importedMemberType(ps))
-                        freshCtx.setImportedMemberType(ps, ty);
-                }
-                freshCtx.markImported(mem);
-            }
+            registerForFreshCtx(sib);
         }
     }
     sema::resolveTypes(*sf, freshCtx);
@@ -5337,6 +5439,51 @@ static bool parseAndAttachInvariants(const MetaTypeDecl& td,
     mainCtx.ownImportedAuxiliary(semaDiag);
     mainCtx.ownImportedAuxiliary(freshCtxPtr);
     return true;
+}
+
+// fix #4599 residual 2 (§22.16 / §11.6 / §2.8.2, v0.306): recurse into a
+// §11.6 NESTED imported class's OWN `invariant(E);` clauses. `convertTypeDecl`
+// populates `ownInvariantText` uniformly for every class it visits — nested
+// included, since it rides each member's `nestedType` block — but the pass-3b
+// caller below only walked `md.types`, i.e. TOP-LEVEL types, so a nested
+// class's clauses rode the wire and were never re-parsed: `emitInvariantCheck`
+// silently skipped them, the pre-#4592 behaviour for that shape.
+//
+// Sync-walks `td.members` against `t.members` using `metaMemberProducesSymbol`
+// — the same discipline `parseAndAttachInvariants`'s own importedMethods remap
+// above uses — rather than a `localTypes` qualified-name lookup: pass 2's
+// `reconstructTypeSymbol` (called recursively for every nested type, see its
+// `MetaMemberKind::NestedType` arm) has already populated each
+// `NestedTypeSymbol::type` by the time pass 3b runs, so the sync-walk finds
+// the fully-reconstructed inner TypeSymbol directly, with no second lookup
+// that could resolve a different type on a same-simple-name collision across
+// sibling parents.
+//
+// Container kind is NOT gated here (unlike the Class-only check below): §11.6
+// permits a nested type inside a class OR a record body, and this function's
+// job is only to find the nested class — the Class-kind gate that decides
+// whether §22.16 applies at all is applied per nested type, exactly as the
+// top-level loop applies it per top-level type. Recurses so a doubly-nested
+// class's clauses are reached too.
+static void parseAndAttachInvariantsNested(const MetaTypeDecl& td,
+                                           const std::string& moduleName,
+                                           sema::TypeSymbol& t,
+                                           sema::SemaContext& ctx) {
+    std::size_t idx = 0;
+    for (const MetaMember& mm : td.members) {
+        if (!metaMemberProducesSymbol(mm)) continue;
+        if (idx >= t.members.size()) break;
+        sema::Symbol* sym = t.members[idx++];
+        if (mm.kind != MetaMemberKind::NestedType || !mm.nestedType) continue;
+        auto* nts = dynamic_cast<sema::NestedTypeSymbol*>(sym);
+        if (!nts || !nts->type) continue;
+        const MetaTypeDecl& ntd = *mm.nestedType;
+        if (nts->type->kind == ast::TypeDeclKind::Class &&
+            !ntd.ownInvariantText.empty()) {
+            parseAndAttachInvariants(ntd, moduleName, *nts->type, ctx);
+        }
+        parseAndAttachInvariantsNested(ntd, moduleName, *nts->type, ctx);
+    }
 }
 
 }  // namespace
@@ -5903,14 +6050,17 @@ static void loadMetadataPass2(
     // context's own symbols — which codegen would then lower against a
     // different struct identity (the #3207 failure shape).
     //
-    // Top-level types only; a §11.6 NESTED imported class's clauses are not
-    // reached (issue #4599).
+    // fix #4599 residual 2 (§22.16 / §11.6, v0.306): the loop attaches a
+    // TOP-LEVEL class's own clauses; `parseAndAttachInvariantsNested` below
+    // additionally recurses through `td.members[].nestedType` so a §11.6
+    // nested imported class's clauses are reached too (see that function's
+    // header for why it is unconditional on `t->kind`).
     for (std::size_t i = 0; i < md.types.size(); ++i) {
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
-        if (t->kind != ast::TypeDeclKind::Class) continue;
-        if (td.ownInvariantText.empty()) continue;  // none, or a pre-#4592 blob
-        parseAndAttachInvariants(td, md.moduleName, *t, ctx);
+        if (t->kind == ast::TypeDeclKind::Class && !td.ownInvariantText.empty())
+            parseAndAttachInvariants(td, md.moduleName, *t, ctx);
+        parseAndAttachInvariantsNested(td, md.moduleName, *t, ctx);
     }
 
     // §26 / §2.5 (#735) — Pass 4: reconstruct exported EXTENSION blocks. An
