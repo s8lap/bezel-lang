@@ -930,6 +930,35 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // field/local reference — `move _slot!` is a move of `_slot`.
             const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                // §28.3 / §28.8.1 (s28_3_0020): `move` is not admitted on a
+                // borrow — the marker asserts an ownership transfer, but a
+                // PLAIN PARAMETER (one declared without the `owned` modifier
+                // — `w: T`, not `owned w: T`) carries no obligation to
+                // transfer. Reject before markMovedByName so the marker
+                // doesn't silently "consume" a borrow and produce a new owned
+                // binding with no source obligation (the pre-fix bug:
+                // `var b := move w;` on a borrow parameter `w` left `b` as a
+                // fresh owned value with no backing obligation, drawing the
+                // downstream "owned value in `b` is implicitly disposed" lint
+                // — wrong shape, wrong site, wrong wording).
+                if (auto* sym = ctx_.exprSymbol(*id)) {
+                    if (auto* ps =
+                            dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                        if (ps->modifier != "owned") {
+                            report(
+                                Severity::Error, un->span.begin,
+                                std::string("`move` is not admitted on a "
+                                            "borrow: `") +
+                                    std::string(id->name) +
+                                    "` is a plain parameter and carries no "
+                                    "obligation to transfer; write `var y := " +
+                                    std::string(id->name) +
+                                    "` (a plain borrow) or transfer from an "
+                                    "`owned` source (§28.3 / §28.8.1)");
+                            return;
+                        }
+                    }
+                }
                 // §28.8.1 / #825: a bare `move _field` is syntactically
                 // identical to `move this._field` — both leave the field in
                 // moved-from state and must be restored before the method exits.
