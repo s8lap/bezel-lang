@@ -3121,7 +3121,7 @@ BEZEL_TEST(cross_module_import,
         "  public owned Label: string; "
         "  public static disposed: int := 0; "
         "  public constructor(owned label: string) "
-        "    Label := move label; "
+        "    Label := label; "
         "  end constructor; "
         // The destructor body accesses the generic static field — this is
         // the path that crashed: staticFieldGlobal looked up genericSubst_
