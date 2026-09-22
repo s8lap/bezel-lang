@@ -1542,6 +1542,15 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
 // ()` and `(owned T) -> ()` are distinct function types", and the modifier
 // string round-trips verbatim through the wire, the stub source and
 // Loader::convert).
+//
+// #4521 (§14/#705, INVESTIGATED, no code change): the "typeRefSigText renders
+// declaration->name — the simple name" claim two lines up is only true when
+// `tr->declaration` is non-null. Its Named arm ALSO has an `importedName`
+// fallback for an UNRESOLVED reference, and that fallback can be the
+// QUALIFIED §11.6 name (`Loader::convert` sets it from `mt.namedName`
+// verbatim) where this function's Named arm always reduces to the SIMPLE
+// name via `metaNamedSimpleName`. See typeRefSigTextCore's Named case for the
+// full analysis of why this asymmetry cannot be observed today.
 static std::string metaTypeSigTextCore(const MetaType& mt);
 
 // The nullability-appending wrapper (fix #4516). Every recursive use below —
@@ -1807,6 +1816,35 @@ static std::string typeRefSigTextCore(const sema::TypeRef* tr) {
             }
         }
         case sema::TypeRef::Kind::Named: {
+            // #4521 (§14/#705, INVESTIGATED, no code change — see the issue's
+            // own review comment for the full write-up): the two arms below
+            // spell a §11.6 NESTED type DIFFERENTLY. `tr->declaration` resolved
+            // renders the SIMPLE name (`declaration->name`), matching
+            // metaTypeSigTextCore's `metaNamedSimpleName` reduction — the two
+            // sides agree whenever resolution succeeds, by construction. The
+            // `importedName` fallback below is reached only when `tr` is
+            // UNRESOLVED, and `Loader::convert`'s Named arm sets it to
+            // `mt.namedName` VERBATIM — the QUALIFIED wire name — whenever
+            // `ModuleMetadataBuilder::convertType` could not resolve the type
+            // at the EXPORTER (its Named arm's `else` branch: the reference's
+            // first AST name part, never dotted, is what reaches an
+            // unresolved case there instead — so a dotted `importedName` can
+            // ONLY originate from an exporter-side resolution, contradicting
+            // "this side is unresolved"). That contradiction is exactly why
+            // the drift cannot be observed today: reaching it needs a §11.6
+            // type the EXPORTER resolved and the IMPORTER cannot (the type's
+            // declaring module outside the consumer's import closure) — and
+            // that state is refused at codegen with a diagnostic naming
+            // #3577 (§2.8.3 rule 3) before any key built from this fallback
+            // is ever compared. Reducing this fallback to a simple name (to
+            // match the resolved arm unconditionally) would not fix anything
+            // observable and would turn a harmless MISMATCH into a possible
+            // COLLISION in that same unreachable state — see the issue's
+            // measured §4 for why that trade was declined. If EITHER
+            // precondition changes (the #3577 refusal softens, or an
+            // unresolved dotted name becomes reachable some other way), this
+            // pair must be revisited together — never one side alone,
+            // exactly as #4508 moved all three renderers in one commit.
             std::string s;
             if (tr->declaration)
                 s = std::string(tr->declaration->name);
