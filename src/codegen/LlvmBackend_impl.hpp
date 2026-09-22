@@ -1166,13 +1166,17 @@ private:
     // was never minted is a double-free — strictly worse than the leak this
     // closes. CLAIM = MINT by construction, per #3384's shape.
     std::unordered_set<const ast::Node*> propReadIterWrappedExprs_;
-    // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
-    // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
-    // (the variable's original storage slot).  After boxing, the original
-    // slot is kept in sync on every write so that pre-emitted code (e.g.
-    // a while-loop condition lowered before the body) that loads from the
-    // original alloca sees the updated value.  NOT populated for for-var
-    // loop variables (their incBB manages the original slot directly).
+    // §27.5 / #673: for boxed NON-FOR-VAR locals, maps each cell-holder alloca
+    // (newSlot) to the ORIGINAL pre-boxing alloca (the variable's original
+    // storage slot).  After boxing, the original slot is kept in sync on every
+    // write so that pre-emitted code (e.g. a while-loop condition lowered
+    // before the body) that loads from the original alloca sees the updated
+    // value.  NOT populated for for-var loop variables (their incBB manages
+    // the original slot directly — see boxLocalSlot's fresh-path note).
+    // Populated on BOTH of boxLocalSlot's strategies: the guarded one since
+    // #673, the fresh-each-iteration one since `fix #4612`, which needs the
+    // entry so #3484's exposed-read repair covers a local declared inside a
+    // loop body.
     // Part of the saved/restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::AllocaInst*> cellVarSyncSlot_;
 
@@ -17503,8 +17507,8 @@ private:
                               bool forLoopVar = false,
                               bool* wasGuardedBoxing = nullptr);
 
-    // §27.5 / #673: after writing `val` to the cell of a guarded-boxed
-    // local (whose cell-holder alloca is `newSlot`), also store `val` to
+    // §27.5 / #673: after writing `val` to the cell of a boxed local (whose
+    // cell-holder alloca is `newSlot`), also store `val` to
     // the original pre-boxing alloca if `cellVarSyncSlot_` has an entry.
     // This keeps pre-emitted code that reads the original alloca (e.g. a
     // while-loop condition lowered before the lambda was encountered) in

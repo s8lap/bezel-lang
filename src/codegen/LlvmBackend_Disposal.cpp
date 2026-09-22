@@ -7311,13 +7311,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // `dyn_cast<StructType>(...->getAllocatedType())` returned null
             // and the key release was a no-op (17500 B / 1000 allocs leak
             // unchanged from the pre-fix HEAD). The original struct alloca
-            // is no longer recoverable from locals_[key]; cellVarSyncSlot_
-            // is only populated on the GUARDED boxing path (boxLocalSlot
-            // line 4071), not the FRESH path the inline non-escaping closure
-            // capture takes. cellVars_ (keyed by the cell holder, i.e.
-            // it->slot itself) is populated by BOTH paths in boxLocalSlot
-            // — look up the cell's struct type there for the GEP field 0
-            // load.
+            // is no longer recoverable from locals_[key]. `fix #4612` since
+            // populates cellVarSyncSlot_ on the FRESH boxing path too (it was
+            // GUARDED-only when this was written), so that map is no longer a
+            // reason to avoid — but cellVars_ (keyed by the cell holder, i.e.
+            // it->slot itself) is populated by BOTH paths and records the
+            // cell's TYPE, which is what the GEP below actually needs — look
+            // up the struct type there for the field 0 load.
             if (it->dictEntryKeyReleaseDeferred) {
                 if (auto cvIt = cellVars_.find(it->slot);
                     cvIt != cellVars_.end()) {
@@ -8850,10 +8850,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // d.slot, set on both boxing paths in boxLocalSlot). The original
             // struct alloca is no longer recoverable from locals_[key] (it is
             // rebound to the cell holder by lowerLambda before this consumer
-            // runs), and cellVarSyncSlot_ is only set on the GUARDED boxing
-            // path — so neither maps to the right struct alloca here. The
-            // cell itself holds the DictionaryEntry struct by value, and
-            // cellVars_ records its type.
+            // runs). (cellVarSyncSlot_ was GUARDED-only when this was written;
+            // `fix #4612` populates it on the non-for-var FRESH path too. It
+            // still is not what this needs: the cell itself holds the
+            // DictionaryEntry struct by value, and cellVars_ records its type.)
             if (auto cvIt = cellVars_.find(d.slot);
                 cvIt != cellVars_.end()) {
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(cvIt->second)) {

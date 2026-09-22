@@ -3724,6 +3724,16 @@ llvm::AllocaInst* Emitter::localSlot(const ast::Expr& e) {
 // them here, at the single funnel every boxed read and write already goes
 // through, rather than growing a second null-discipline at ~40 call sites.
 //
+// fix #4612 (§27.5, v0.306) extends the repair to boxLocalSlot's OTHER
+// strategy. The fresh-each-iteration path stores the holder unconditionally,
+// which reads as "not this defect's shape" and is why it recorded no
+// `cellVarSyncSlot_` entry and so enrolled no read below — but that store is
+// itself AT THE CAPTURE SITE, and the reclaim sites (`boxedCellFree`, #1017's
+// deferred free, #4509's `cellRelease`) NULL the holder afterwards so the next
+// capture re-allocates. A loop iteration that does not reach the capture site
+// again therefore reads exactly the same null. Same defect, same repair; the
+// fresh path now null-initialises its holder and records its fall-back slot.
+//
 // The repair is NOT emitted inline, because whether a given read is exposed
 // depends on the FINISHED CFG — a read the capture site's join block dominates
 // can never see the null — and at the moment a read is emitted the blocks and
@@ -3876,6 +3886,9 @@ void Emitter::fixupCapturedCellHolderReads() {
     for (auto& [fn, reads] : byFn) {
         if (!fn || fn->isDeclaration()) continue;
         llvm::DominatorTree dt(*fn);
+        // fix #4612: holders this pass has already null-initialised, so a
+        // second repaired read of the same holder does not emit a second store.
+        std::unordered_set<llvm::AllocaInst*> nulledHolders;
         for (const PendingHolderRead* p : reads) {
             auto* ld = llvm::cast<llvm::Instruction>(
                 static_cast<llvm::Value*>(p->load));
@@ -3895,6 +3908,57 @@ void Emitter::fixupCapturedCellHolderReads() {
                 if (dt.dominates(b, ld->getParent())) { ready = true; break; }
             }
             if (ready) continue;
+            // fix #4612 (§27.5, v0.306): the discriminator below is `== null`,
+            // so it is only as good as the holder's initial value. The GUARDED
+            // strategy null-initialises its holder in the entry block; the
+            // FRESH one leaves a bare `entryAlloca`, whose content on a path
+            // that never reached the capture site is UNDEF — measured as a
+            // SEGV reading a holder back as 0x01f86bab63189069 (stack residue)
+            // on the issue's program with the guard flipped so iteration 0
+            // skips the capture. Supply the missing init HERE, for exactly the
+            // holders that are getting a guard, rather than at the boxing site
+            // for all of them.
+            //
+            // WHY HERE AND NOT THERE, measured: an entry-block `store null` is
+            // not inert. It clears a stack slot that LeakSanitizer's
+            // conservative scan may have been treating as a live reference, so
+            // emitting it unconditionally turned
+            // `codegen_const_narrowing_capture_2597.loop_declared_const_captures_per_iteration_spec_27_5`
+            // red — a row whose 64 B/iteration capture-cell leak is
+            // PRE-EXISTING (#2640 family; amplified 500x it is 32000 B / 1500
+            // allocations on `cafdfc52` and 31936 B / 1497 with this fix, i.e.
+            // the same leak either way) and whose one-shot green was the scan
+            // accident #3484's own note warns about. Restricting the store to
+            // the holders that actually receive a guard keeps every
+            // unconditional-capture program bit-identical, which is the same
+            // discipline that already keeps the guard off dominated reads.
+            auto* ldInst = llvm::dyn_cast<llvm::LoadInst>(ld);
+            if (auto* holder =
+                    ldInst ? llvm::dyn_cast<llvm::AllocaInst>(
+                                 ldInst->getPointerOperand())
+                           : nullptr;
+                holder && holder->getParent() == &fn->getEntryBlock() &&
+                nulledHolders.insert(holder).second) {
+                bool alreadyNulled = false;
+                for (llvm::Instruction& i : fn->getEntryBlock()) {
+                    auto* st = llvm::dyn_cast<llvm::StoreInst>(&i);
+                    if (!st || st->getPointerOperand() != holder) continue;
+                    if (llvm::isa<llvm::ConstantPointerNull>(
+                            st->getValueOperand()))
+                        alreadyNulled = true;
+                    // Either way the FIRST store to the holder settles it: a
+                    // non-null one means the slot is written before any read
+                    // this pass would reach, and prepending a null ahead of it
+                    // would be dead.
+                    break;
+                }
+                if (!alreadyNulled) {
+                    llvm::IRBuilder<> eb(&fn->getEntryBlock(),
+                                         std::next(holder->getIterator()));
+                    eb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                   holder);
+                }
+            }
             llvm::IRBuilder<> b(ld->getParent(), std::next(ld->getIterator()));
             llvm::Value* isNull = b.CreateICmpEQ(
                 ld, llvm::ConstantPointerNull::get(ptrTy()), "cell.unset");
@@ -4058,15 +4122,54 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                                 {builder_.getInt64(1), cellSize});
         llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
         builder_.CreateStore(cur2, cell);
+        // Deliberately a BARE `entryAlloca`: this path's holder is NOT
+        // null-initialised here. On a path that never reaches this capture site
+        // its content is undef, which `fix #4612` repairs — but only for the
+        // holders whose reads that fix actually guards, from
+        // `fixupCapturedCellHolderReads`, so an unconditional capture keeps the
+        // IR it had. An entry-block `store null` is not inert: see the measured
+        // LeakSanitizer row quoted at that site.
         newSlot = entryAlloca(ptrTy());
         builder_.CreateStore(cell, newSlot);
         cellVars_[newSlot] = valTy;
         // fix #3484: the fresh path stores unconditionally, so the holder is
-        // non-null from here on through this block. (No cellVarSyncSlot_ entry
-        // is recorded on this path, so boxedStorage records no read for it
-        // either; the block is recorded for symmetry and for a slot that later
-        // reaches the already-boxed re-guard above.)
+        // non-null from here on through this block. The block is recorded so
+        // every read this capture site DOMINATES stays bit-identical to what it
+        // was before #3484 — an unconditional capture never reaches the fixup.
         cellHolderReadyBlocks_[newSlot].push_back(builder_.GetInsertBlock());
+        // fix #4612 (§27.5, v0.306): record the fall-back slot for the fresh
+        // path too. #3484 gave every EXPOSED holder read a null fallback, but
+        // `boxedStorage` enrols a read only when the holder has a
+        // `cellVarSyncSlot_` entry — and this path recorded none, so the whole
+        // fresh family (a local DECLARED IN A LOOP BODY, per #823's
+        // `loopBodyDeclaredSlots_` arm, or one re-initialised each pass) was
+        // outside the repair. That is precisely the shape the reclaim sites
+        // rely on the repair for: `boxedCellFree`, #1017's deferred free and
+        // #4509's `cellRelease` each NULL the holder after reclaiming, by
+        // design, "leaving boxLocalSlot's guard to allocate a fresh cell on the
+        // next capture" — which never happens on an iteration that does not
+        // reach the capture site. The next iteration's scope-end disposal then
+        // loaded the null holder and dereferenced it (`SEGV on unknown address
+        // 0x0`, the issue's repro: a `using var` local declared in a `for` body
+        // and captured by a lambda inside an `if`).
+        //
+        // The fall-back is sound for exactly the reason it is on the guarded
+        // path: `slot` is the variable's pre-boxing storage, it is what this
+        // path's own `preboxed` load seeds the cell from, and on this family it
+        // is re-initialised by the declaration on every pass (the declaration
+        // was lowered BEFORE the boxing, so its store still targets `slot`).
+        // Holder null ⇒ no cell exists for this pass, nothing else can observe
+        // the variable, and `slot` IS its storage. Holder set ⇒ the select folds
+        // to the cell and §27.5 sharing is unchanged.
+        //
+        // NOT for a for-var loop variable. The entry doubles as the write-back
+        // registration `syncCellToOrigSlot` consults, and a for-var's original
+        // slot is the loop's own induction storage, which its `incBB` manages
+        // directly — mirroring a body write into it would perturb the iteration
+        // count. The for-var's conditional-capture shape is measured NOT to
+        // crash (its stale holder still addresses a live cell, since nothing
+        // reclaims it) and is left alone here.
+        if (!forLoopVar) cellVarSyncSlot_[newSlot] = slot;
         return cell;
     }
 
