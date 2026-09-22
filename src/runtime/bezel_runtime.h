@@ -1385,6 +1385,17 @@ void bz_closure_release(void* c);
 // The FIRST retain records 2, not 1: the frame's own reference is implicit (it
 // exists from `calloc` and is never announced), so the first env to arrive is
 // the second holder. null is a no-op for both.
+//
+// fix #4564 (§27.5 / §28.9, v0.306): the last drop leaves a TOMBSTONE in the
+// table rather than erasing the entry, so a release PAST the last drop — an
+// over-release, always a defect at the call site — is reported by
+// `bz_refcount_overrelease_fail` instead of taking the "never tracked, so the
+// frame is the sole holder" arm and free()ing the block a second time (#4547's
+// defect, reached here by a different route). The cell itself is still freed on
+// the same call as before; a retain re-arms a tombstoned entry (calloc recycles
+// a dead cell's address constantly), and a bounded ring evicts old tombstones
+// so a correct program's table does not grow. See the block comment above
+// `g_cell_rc` in bezel_runtime_refcounting.cpp for the full argument.
 void bz_cell_retain(void* cell);
 void bz_cell_release(void* cell);
 // #4475 (§28.2): closure-as-object use-after-dispose guard. Set/read the

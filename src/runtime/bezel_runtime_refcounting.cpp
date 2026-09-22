@@ -685,18 +685,115 @@ static void bz_drain_borrow_table(void) {
 // (a leaked closure) leaves the cell alive — the leak direction, which is the
 // PRIME DIRECTIVE's safe side.
 //
-// ADDRESS REUSE is not a hazard: the entry is erased under the lock in the same
-// critical section that decides to free, so a later `calloc` handing back the
-// same address finds no stale entry.
+// ADDRESS REUSE happens constantly and is handled explicitly, not avoided: a
+// cell's `calloc` block is freed here and the very next iteration's cell
+// typically lands on the same address (measured 197 of 200 iterations on
+// #4509's own event-subscription loop). Before #4564 the entry was ERASED at
+// the last drop, so a recycled address simply found no entry — correct, but
+// only by throwing away the fact that the cell had died, which is exactly what
+// #4564 needed back. See the TOMBSTONE note below for how both are now had at
+// once.
+//
+// ---------------------------------------------------------------------------
+// fix #4564 (§27.5 / §28.9, v0.306): TOMBSTONES — detecting an over-release
+// instead of double-freeing on it.
+//
+// THE DEFECT. `bz_cell_release` has two arms: a tracked cell decrements and
+// frees at zero, and an UNTRACKED cell (no env ever retained it) is freed
+// outright, because the frame is then the sole holder. Erasing the entry at
+// the last drop collapsed those two states into one. A release PAST the last
+// drop — an over-release, always a defect at the call site — found no entry
+// and took the untracked arm, so it called `free()` on a block this function
+// had already freed. That is the same double free #4547 fixed for
+// string/closure/box, reached by a different route: there the post-decrement
+// count went to -1 and fell through a `> 0` guard, here there is no count
+// left to go negative. #4547's three-way rewrite therefore does not transfer.
+//
+// THE FIX. The last drop now leaves a TOMBSTONE — the entry stays, with the
+// count at `BZ_CELL_TOMBSTONE` — instead of erasing. A release that finds a
+// tombstone is an over-release and is reported by the same
+// `bz_refcount_overrelease_fail` #4547 introduced, before any free.
+//
+// A TOMBSTONE IS NOT A LEAK OF THE CELL: the block is still freed at the last
+// drop, on the same instruction as before. What survives is the 1 map entry,
+// and only until one of the two reclaim routes takes it:
+//
+//   (1) RETAIN CLEARS IT. A retain is only ever emitted at a live cell's
+//       capture-store, so a retain landing on a tombstone means `calloc` has
+//       recycled the address into a NEW cell — the entry must be re-armed at 2
+//       (frame + this env), exactly as the not-present arm does, NOT
+//       incremented off the tombstone. This arm is load-bearing, not
+//       defensive: it fires on 197 of the 200 iterations of #4509's repro, and
+//       without it that loop would count `0 + 1 == 1` for a cell with two
+//       holders and free it at the FIRST release — turning #4564's latent
+//       double free into an immediate use-after-free on every iteration.
+//
+//   (2) A BOUNDED RING EVICTS IT. `g_cell_dead_ring` holds the last
+//       BZ_CELL_TOMBSTONE_RING tombstoned addresses; tombstoning a cell evicts
+//       the oldest and erases its entry. Without this the table would grow by
+//       one node per dead cell for the process lifetime — unbounded growth on
+//       every CORRECT program, which is a worse trade than the latent double
+//       free it is buying (#4509 exists because 8 B per capture was already
+//       too much). The eviction re-checks that the evicted entry is still a
+//       tombstone, so it can never drop a live cell's count.
+//
+// So the detection window is the last BZ_CELL_TOMBSTONE_RING cell deaths, and
+// past that the behaviour degrades to exactly what it was before this fix.
+// That is deliberate: an over-release is emitted by the SAME frame/envdtor
+// pair that issued the legitimate releases, so it arrives within a handful of
+// cell deaths, while the memory cost of a wider window is paid by every
+// correct program forever.
+//
+// WHY ABORT AND NOT "skip the free and carry on". A tombstone hit could in
+// principle also be a NEW, never-retained cell at a recycled address taking
+// the untracked arm — which would make the abort a false positive on a correct
+// program. It cannot be, because codegen emits `bz_cell_release` at exactly
+// two sites (the declaring scope's `Disposal::cellRelease` and the env's
+// envdtor), both gated on the same `CaptureEntry::retainCellInEnv` that gates
+// the retain, and `boxLocalSlot` allocates the cell AT the capture site that
+// retains it — so a non-null cell reaching either release site has been
+// retained. Measured on five programs covering all three armed shapes
+// (per-iteration cell, one cell shared by N envs, env outliving its frame):
+// 504 releases, of which 0 took the untracked arm. The untracked arm is kept
+// exactly as it was for the cells that legitimately never enter the table.
 // ---------------------------------------------------------------------------
 static std::unordered_map<void*, int64_t> g_cell_rc;
 static std::mutex                         g_cell_rc_mtx;
+
+// A count a live entry can never hold: the first retain records 2 and a
+// decrement that reaches 0 tombstones instead of returning.
+static const int64_t     BZ_CELL_TOMBSTONE      = 0;
+static const std::size_t BZ_CELL_TOMBSTONE_RING = 1024;
+static void*             g_cell_dead_ring[BZ_CELL_TOMBSTONE_RING];
+static std::size_t       g_cell_dead_head = 0;
+
+// Tombstone `cell` (whose entry the caller has just driven to
+// BZ_CELL_TOMBSTONE) and evict the oldest tombstone, so the table holds at
+// most BZ_CELL_TOMBSTONE_RING of them. Caller holds g_cell_rc_mtx.
+static void bz_cell_tombstone_record(void* cell) {
+    void* evicted = g_cell_dead_ring[g_cell_dead_head];
+    // `evicted == cell` is the ring having wrapped onto an earlier life of
+    // this same address; erasing then would drop the tombstone we are in the
+    // middle of installing.
+    if (evicted && evicted != cell) {
+        auto e = g_cell_rc.find(evicted);
+        // Only if it is STILL a tombstone: the address may have been recycled
+        // into a live cell since, and erasing that would lose a real count.
+        if (e != g_cell_rc.end() && e->second == BZ_CELL_TOMBSTONE)
+            g_cell_rc.erase(e);
+    }
+    g_cell_dead_ring[g_cell_dead_head] = cell;
+    g_cell_dead_head = (g_cell_dead_head + 1) % BZ_CELL_TOMBSTONE_RING;
+}
 
 extern "C" void bz_cell_retain(void* cell) {
     if (!cell) return;
     std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
     auto it = g_cell_rc.find(cell);
     if (it == g_cell_rc.end()) g_cell_rc.emplace(cell, 2);  // frame + this env
+    // fix #4564 route (1): a tombstone at a retained address is a RECYCLED
+    // address, not a dead cell coming back — re-arm at frame + this env.
+    else if (it->second == BZ_CELL_TOMBSTONE) it->second = 2;
     else ++it->second;
 }
 
@@ -706,8 +803,17 @@ extern "C" void bz_cell_release(void* cell) {
         std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
         auto it = g_cell_rc.find(cell);
         if (it != g_cell_rc.end()) {
+            // fix #4564: a tombstone is a cell this function already drove to
+            // zero and freed. Reaching it again is an over-release — two
+            // releases for one reference — so report it HERE, before the free
+            // below turns it into a double free that names the allocator
+            // instead of the bug (#4547's argument, same §28.9 invariant).
+            if (it->second == BZ_CELL_TOMBSTONE)
+                bz_refcount_overrelease_fail("capture cell");
             if (--it->second > 0) return;
-            g_cell_rc.erase(it);
+            // Last drop. The free below still happens on this call; what the
+            // tombstone keeps is the knowledge that it did.
+            bz_cell_tombstone_record(cell);
         }
         // Not in the table: no env ever retained it, so the frame is the only
         // holder and this release is the cell's one and only free.
