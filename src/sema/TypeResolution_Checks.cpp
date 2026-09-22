@@ -4128,9 +4128,9 @@ static std::string describeStaticValueType(const TypeRef* rt);
 // helpers; their definitions live later in this TU alongside the other
 // §22.12 predicates.
 static bool isHoldsBorrowsChoice(const TypeRef* rt,
-                                 const sema::SemaContext& ctx);
+                                 sema::SemaContext& ctx);
 static bool isPlainInlineArrayCarryingBorrows(
-    const TypeRef* rt, const sema::SemaContext& ctx);
+    const TypeRef* rt, sema::SemaContext& ctx);
 static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
                                                    SemaContext& ctx);
 // §22.12 rule 4 residual + §9.7 strict reference-type quantifier
@@ -4139,7 +4139,7 @@ static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
 // declared classes/interfaces. Forward-declared so the value-site pass
 // can consult it; defined alongside the other §22.12 predicates.
 static bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
-                                                const SemaContext& ctx);
+                                                SemaContext& ctx);
 static bool isStaticallyNullExpr(const ast::Expr* e);
 static bool isStaticallyDefaultExpr(const ast::Expr* e);
 // fix #3973 (§9.7, v0.295): returns true iff a diagnostic was reported (the
@@ -10216,7 +10216,7 @@ static bool typeRiskingUnreleasedStringInInlineArray(const TypeRef* tr) {
 static bool isSerializationEligibleType(
         const TypeRef* tr,
         std::unordered_set<const TypeSymbol*>& visited,
-        const SemaContext& ctx,
+        SemaContext& ctx,
         bool forRecordComponent = false) {
     if (!tr) return false;
     using K = TypeRef::Kind;
@@ -12101,7 +12101,7 @@ static bool isChoiceTypeRef(const TypeRef* rt) {
 // choice never reaches this predicate; what reaches here is a
 // `BorrowBearing`-classified choice (§35.4).
 static bool isHoldsBorrowsChoice(const TypeRef* rt,
-                                 const sema::SemaContext& ctx) {
+                                 sema::SemaContext& ctx) {
     if (!isChoiceTypeRef(rt)) return false;
     auto verdict = common::classifyChoiceType(rt, ctx);
     return verdict && *verdict == common::ChoiceClassification::BorrowBearing;
@@ -12116,7 +12116,7 @@ static bool isHoldsBorrowsChoice(const TypeRef* rt,
 // warning with disposal-at-exit note) — they are NOT plain and NOT
 // borrow-bearing under §9.7's element-resolved reading.
 static bool isPlainInlineArrayCarryingBorrows(
-    const TypeRef* rt, const sema::SemaContext& ctx) {
+    const TypeRef* rt, sema::SemaContext& ctx) {
     if (!rt || rt->kind != TypeRef::Kind::InlineArray) return false;
     if (rt->arrayOwned) return false;  // owning inline arrays handled above
     if (!rt->arrayElement) return false;
@@ -12962,7 +12962,7 @@ void Resolver::recordStaticReadonlyBareTSite(std::string_view paramName,
 // them in the stricter quantifier because a null-source value references
 // nothing — runtime-managed or not).
 bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
-                                        const sema::SemaContext& ctx) {
+                                        sema::SemaContext& ctx) {
     if (!rt) return false;
     switch (rt->kind) {
         case TypeRef::Kind::Primitive:

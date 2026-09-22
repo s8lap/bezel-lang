@@ -1216,7 +1216,7 @@ static bool isHomogeneousEqualityOperatorOverload(const MethodSymbol* meth,
 // to check whether a nested positional record is itself hashable.
 // Definition follows isAutoEqualityBearingBodyRecord below.
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx);
+                                        SemaContext& ctx);
 
 // §35.7 (v0.210, #2083): declared in Symbol.hpp (with the #2047 `inst`
 // instantiation parameter). Body is below — after the admissibility predicate
@@ -1579,7 +1579,7 @@ std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts) {
 //
 // (v0.158 removed the former "sealed reference type with content equality"
 // clause; its only instance, `string`, is admitted explicitly above.)
-static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
+static bool isAdmissibleComponentType(const TypeRef* ty, SemaContext& ctx,
                                       int depth) {
     using K = TypeRef::Kind;
     if (!ty || depth > 32) return true;  // unresolved / recursion guard: conservative
@@ -1720,7 +1720,7 @@ bool recordIsPositional(const TypeSymbol* rec) {
 // and was wrongly disqualifying a record for exactly the "Origin-style
 // constant" pattern §9.2 gives as the motivating example — fixed here.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
-                                     const SemaContext& ctx) {
+                                     SemaContext& ctx) {
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
     // §9.3: a record with positional fields is positional / combined form; it
     // gets the §9.1 positional synthesis, not this body-record path.
@@ -1813,7 +1813,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // false-accepted `=`/`<>` on imported combined-form records whose exporter
 // already rejects them).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx) {
+                                        SemaContext& ctx) {
     if (!rec) return false;
     for (const Symbol* m : rec->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
@@ -1947,7 +1947,7 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
 // "non-issue in practice" note from the previous revision. v0.276 widens the
 // ruling to choices; this is that widening.
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx,
+                                 SemaContext& ctx,
                                  const TypeRef* inst) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §35.4: compute the classification. classifyChoiceType returns nullopt
@@ -2052,7 +2052,7 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 // defect class (#3144/#3152 family F9's cousin — empty-source predicate
 // silently mis-answers).
 bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
-                                   const SemaContext& ctx,
+                                   SemaContext& ctx,
                                    const TypeRef* inst) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §3.6 hashable row: gate on ValueLike. Same type-ref setup as
@@ -2104,7 +2104,7 @@ bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
 // §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is hashable unless
 // it is a record that neither synthesizes equality nor declares user equality,
 // or a choice that is not value-like auto-hashable (§35.7, v0.214).
-bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
+bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
     if (!ty) return true;                              // unresolved: conservative
     // The underlying type carries the equality contract; a nullable key `K?`
     // is hashable iff `K` is (the null-safe `=` of §8.4 handles null).
@@ -2170,7 +2170,7 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
 // detail level §3.6 supports for this property. Returns empty (the caller keeps
 // the flat message) when the type is not the record/choice failure shape.
 std::string hashableFailureComponentPath(const TypeRef* ty,
-                                         const SemaContext& ctx) {
+                                         SemaContext& ctx) {
     if (!ty || ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
     const TypeSymbol* ts = ty->declaration;
     // Fragment prefix — reads naturally after the parent §14.2 citation:

@@ -3689,7 +3689,7 @@ static bool isBoxingTargetType(const TypeRef* to) {
 // owning-classified choice — "Move-only membership follows from *structure*,
 // never from a declaration form". `kindOut` receives the spec's own name for
 // whichever kind matched, so the diagnostic can say which one it is.
-static bool isMoveOnlyValueType(const TypeRef* t, const SemaContext& ctx,
+static bool isMoveOnlyValueType(const TypeRef* t, SemaContext& ctx,
                                 const char*& kindOut) {
     return common::isMoveOnlyValueType(t, ctx, kindOut);
 }

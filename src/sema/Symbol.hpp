@@ -1548,7 +1548,7 @@ bool recordIsPositional(const TypeSymbol* rec);
 // Called from isAdmissibleComponentType (nested record check), isEqualityBearing
 // (hash-container key check), and ExprTypecheck (use-site equality error).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx);
+                                        SemaContext& ctx);
 
 // §9.2 (v0.158) auto-equality eligibility for a *body record* (a record with
 // no positional fields). Returns true iff the record is "auto-hashable":
@@ -1579,7 +1579,7 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // Returns false for positional / combined-form records (they get the §9.1
 // positional synthesis instead) and for non-record types.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
-                                     const SemaContext& ctx);
+                                     SemaContext& ctx);
 
 // §9.2 v0.210 (#2083) auto-equality eligibility for a *value-like choice*
 // (a choice whose §35.4 classification is ValueLike — every payload is a
@@ -1616,7 +1616,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // conservatively classifies borrow-bearing, so `Pair` read as inadmissible no
 // matter the argument).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx,
+                                 SemaContext& ctx,
                                  const TypeRef* inst = nullptr);
 
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
@@ -1646,7 +1646,7 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 // — the §28.1 per-instantiation erasure of `owned` payload markers applies
 // to the classification check, exactly as in isAutoEqualityBearingChoice.
 bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
-                                   const SemaContext& ctx,
+                                   SemaContext& ctx,
                                    const TypeRef* inst = nullptr);
 
 // §3.6 / §8.3 (v0.158, #1338): the **hashable** derived type property —
@@ -1663,7 +1663,7 @@ bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
 // v0.214 (#2087): a **choice** is hashable iff it is value-like
 // auto-hashable (§35.7); owning and borrow-bearing choices are not,
 // decided by the same §35.4 classifier the use-site `=`/`<>` error consults.
-bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
+bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx);
 
 // §14.2 (v0.214, #2087): given a type that has just FAILED isEqualityBearing,
 // return a component-path fragment naming the offending type + the §3.6/§9.2/
@@ -1678,7 +1678,7 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 // detail level §3.6 supports for this property. Returns empty (caller keeps the
 // flat message) for any type outside that record/choice failure shape.
 std::string hashableFailureComponentPath(const TypeRef* ty,
-                                         const SemaContext& ctx);
+                                         SemaContext& ctx);
 
 // §22.3 "Parameter modifiers" / §2.5 "Dependency resolution" (v0.237, #2659,
 // #2374): the declared modifier of constructor formal `pos` — one of "", "ref",

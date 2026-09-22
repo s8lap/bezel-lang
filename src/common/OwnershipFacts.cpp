@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "ast/Node.hpp"
 #include "sema/FieldSymbolAccessors.hpp"
 #include "sema/SemaContext.hpp"
+#include "sema/SubstArgs.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
@@ -1275,7 +1277,7 @@ bool isReferenceTypeForRecordField(const sema::TypeRef* rt) {
 // (independently rejected by §35.1/§9's no-self-containment rule; this guard
 // only defends against it) still terminates.
 bool isBorrowBearingRecordCommon(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>* choiceSeen = nullptr);
 
@@ -1300,7 +1302,7 @@ bool isBorrowBearingRecordCommon(
 // in-progress case the cache cannot, because the cache only stores FINAL
 // verdicts, never the cycle guard's `ValueLike`.  // per §35.1, §35.4, §28.1
 std::optional<ChoiceClassification> classifyChoiceCore(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
@@ -1315,7 +1317,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // and passes a null `memo` (its queries are isolated, not nested inside
 // a `classifyChoiceType` call).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
-    const sema::TypeRef* ft, const sema::SemaContext& ctx,
+    const sema::TypeRef* ft, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
         nullptr);
@@ -1326,7 +1328,7 @@ bool ownedMarkerActiveOnInstantiatedTypeImpl(
 // substituted field type must be re-classified in the environment carried by
 // its substitution entry, not the visiting record's. // per §9.7, #2145
 bool recordFieldTypeIsBorrowCarryingCommon(
-    const sema::TypeRef* ft, const sema::SemaContext& ctx,
+    const sema::TypeRef* ft, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>* choiceSeen = nullptr) {
     if (!ft) return false;
@@ -1403,7 +1405,7 @@ bool recordFieldTypeIsBorrowCarryingCommon(
 }
 
 bool isBorrowBearingRecordCommon(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>* choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
@@ -1586,7 +1588,7 @@ RecordSubstEnv::Entry resolveRecordFieldSubst(const sema::TypeRef* ft,
 }
 
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
-                                 const sema::SemaContext& ctx) {
+                                 sema::SemaContext& ctx) {
     if (!rt) return false;
     // Builtin span VIEWS carry a borrow of their backing Array/OwningBuffer
     // but have no user Record TypeDecl, so the record walk below misses them.
@@ -1661,7 +1663,7 @@ namespace {
 // pre-#4125 exponential #4145. // per §35.1, §35.4, §28.1, v0.298
 bool payloadFieldTypeIsMoveOnly(
     const sema::TypeRef* ft,
-    const sema::SemaContext& ctx,
+    sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
@@ -1714,7 +1716,7 @@ bool payloadFieldTypeIsMoveOnly(
 // at every distinct enclosing site.
 bool payloadFieldTypeIsBorrowCarrying(
     const sema::TypeRef* ft,
-    const sema::SemaContext& ctx,
+    sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     const RecordSubstEnv* env,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
@@ -1798,7 +1800,7 @@ bool payloadFieldTypeIsBorrowCarrying(
 // 200 `owned` payloads of an imported owning choice were never disposed, while
 // the identical program in one module leaked nothing.
 std::optional<ChoiceClassification> classifyChoiceCore(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
@@ -1961,7 +1963,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // entry, erase on exit — match classifyChoiceCore, so sibling payload
 // frames re-classify under their own env (the #2145 diamond).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
-    const sema::TypeRef* ft, const sema::SemaContext& ctx,
+    const sema::TypeRef* ft, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
     if (!ft) return true;  // unknown → conservative (owning)
@@ -2019,7 +2021,7 @@ bool ownedMarkerActiveOnInstantiatedTypeImpl(
 }  // namespace
 
 bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
-                                         const sema::SemaContext& ctx) {
+                                         sema::SemaContext& ctx) {
     // Public entry: an isolated per-instantiation query with no in-flight
     // classification path, so seed a fresh cycle guard. The choice-side
     // recursion (an `owned` payload whose type is a choice) consults the
@@ -2039,17 +2041,10 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
 
 const sema::TypeRef* substitutedChoicePayloadType(
     const ast::Param& pf, const sema::TypeSymbol* decl, const sema::TypeRef* rt,
-    const sema::SemaContext& ctx) {
+    sema::SemaContext& ctx) {
     if (!pf.type) return nullptr;
-    const sema::TypeRef* ftTemplate = ctx.resolvedType(*pf.type);
+    sema::TypeRef* ftTemplate = ctx.resolvedType(*pf.type);
     if (!ftTemplate) return nullptr;
-    // Substitute a BARE type-parameter payload (`T`) through the instantiation:
-    // a bare parameter resolves to a Named TypeRef with a null declaration whose
-    // head names one of the choice's generic params. Concrete or nested-generic
-    // payloads are returned as resolved (their own kind decides owning/value —
-    // an `owned Array<T>` field is owning by Array being a class, no inner-arg
-    // substitution needed for the classification).
-    //
     // fix #3144 (family F9 of #3152): `decl` is the choice's `TypeSymbol`, not
     // its `ast::TypeDecl`. Every caller reached the TypeDecl by
     // `dynamic_cast<...>(choiceTy->decl)`, null for every imported choice, so
@@ -2058,20 +2053,59 @@ const sema::TypeRef* substitutedChoicePayloadType(
     // `TypeSymbol::genericParams` carries the same names on both sides (#3145's
     // `seedRecordSubstEnv` overload rests on the same fact), so the substitution
     // is now decidable cross-module.
-    if (decl && rt && !decl->genericParams.empty() &&
-        rt->genericArgs.size() == decl->genericParams.size() &&
-        ftTemplate->kind == sema::TypeRef::Kind::Named &&
+    if (!decl || !rt || decl->genericParams.empty() ||
+        rt->genericArgs.size() != decl->genericParams.size())
+        return ftTemplate;  // uninstantiated template / arity mismatch —
+                            // the conservative declaration-site reading.
+
+    // The `name -> concrete` map the shared walker takes. Built per call from
+    // (genericParams, genericArgs) rather than threaded, because this entry
+    // point's callers hold the INSTANTIATION, never a substitution map.
+    std::unordered_map<std::string_view, sema::TypeRef*> subst;
+    subst.reserve(decl->genericParams.size());
+    for (std::size_t i = 0; i < decl->genericParams.size(); ++i)
+        if (decl->genericParams[i])
+            subst.emplace(decl->genericParams[i]->name, rt->genericArgs[i]);
+
+    // TOP-LEVEL arm, kept local ON PURPOSE — the one place this walker must
+    // NOT delegate (fix #4568). It reads `headName()`, which is
+    // ALIAS-TRANSPARENT (#1462: `aliasResolvedHead` carries the underlying
+    // head after `type Id<T> := T;` restores `astNode` to the use site),
+    // whereas `sema::substituteGenericArgs`'s `paramHead` deliberately reads
+    // only the use-site single-part head. The difference is load-bearing and
+    // measured: a payload declared `owned v: Id<T>` resolves to the bare
+    // parameter with `astNode` pointing at `Id`, so the shared walker's leaf
+    // test misses it and `Flat<int>` would regress from value-like to owning.
+    // Nullable is preserved here exactly as the shared walker preserves it
+    // (`T?` -> `int?`); the pre-#4568 body dropped the `?`.
+    if (ftTemplate->kind == sema::TypeRef::Kind::Named &&
         !ftTemplate->declaration) {
-        const std::string_view h = ftTemplate->headName();
-        for (std::size_t i = 0; i < decl->genericParams.size(); ++i)
-            if (decl->genericParams[i] && decl->genericParams[i]->name == h)
-                return rt->genericArgs[i];
+        auto it = subst.find(ftTemplate->headName());
+        if (it != subst.end()) {
+            sema::TypeRef* substituted = it->second;
+            if (ftTemplate->nullable && substituted && !substituted->nullable) {
+                sema::TypeRef* nn = ctx.makeTypeRef(*substituted);
+                nn->nullable = true;
+                return nn;
+            }
+            return substituted;
+        }
     }
-    return ftTemplate;
+
+    // Everything BELOW the top level. Pre-#4568 this returned `ftTemplate`
+    // unchanged, so `owned inner: Inner<T>` at `Outer<int>` handed the §28.1
+    // erasure oracle a still-generic `Inner<T>`, which classifies
+    // conservatively OWNING — `Outer<int>` came out move-only instead of
+    // value-like and a second read of the local was rejected as a use after
+    // move. The shared walker recurses into `genericArgs`, an InlineArray
+    // element and Function parameter/return slots, and returns `ftTemplate`
+    // itself (no allocation) when nothing beneath needed substituting, so a
+    // concrete payload costs exactly the map build. // per §14.1, §35.4, v0.306
+    return sema::substituteGenericArgs(ftTemplate, sema::SubstArgs{ctx, subst});
 }
 
 std::optional<ChoiceClassification> classifyChoiceType(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env) {
     // Public entry point: seed a fresh CHOICE PATH guard AND a fresh
     // per-call classification memo, then delegate to the shared core.
@@ -2097,7 +2131,7 @@ std::optional<ChoiceClassification> classifyChoiceType(
 // `kindOut` spellings — so the §8.6 boxing check and the new §28.11
 // collection-element check share one decision instead of two drifting
 // copies (CLAUDE.md §6 / LANE_RULES §6).
-bool isMoveOnlyValueType(const sema::TypeRef* t, const sema::SemaContext& ctx,
+bool isMoveOnlyValueType(const sema::TypeRef* t, sema::SemaContext& ctx,
                          const char*& kindOut) {
     if (!t) return false;
     if (t->kind == sema::TypeRef::Kind::InlineArray && t->arrayOwned) {
