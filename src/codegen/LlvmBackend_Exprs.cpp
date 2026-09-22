@@ -9371,27 +9371,59 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         }
     }
     } // end eitherNull2 guard
-    // §8.4 (#1106): `=`/`<>` on USER-CLASS-typed operands invokes the class's
-    // `Equals` (null-safe), never a raw pointer compare. Classes cannot overload
-    // `=`/`<>` (§25.2); they customize equality via an `Equals` override, and `=`
-    // must dispatch it. Route both operands through lowerObjectEquals (vtable
-    // kEqualsSlot dispatch — the override, or the default reference-identity
-    // thunk for a class with none, so a non-overriding class keeps ptr-compare
-    // semantics; null-safe on the receiver). Excludes a null-literal operand
-    // (`a = null` is the reference-equality-to-null form, handled by the scalar
-    // path below) and fires only when BOTH operands are user-class pointers
-    // (Object/interface/record/builtin handled elsewhere). Without this, `a = b`
-    // on a class with an overridden Equals did a raw ICmp ptr-compare and
-    // bypassed the override (defect 2).
+    // §8.4 (#1106, widened by fix #4560): `=`/`<>` on USER-CLASS-typed operands
+    // invokes the class's `Equals` (null-safe), never a raw pointer compare.
+    // Classes cannot overload `=`/`<>` (§25.2); they customize equality via an
+    // `Equals` override, and `=` must dispatch it. Route both operands through
+    // lowerObjectEquals (vtable kEqualsSlot dispatch — the override, or the
+    // default reference-identity thunk for a class with none, so a non-
+    // overriding class keeps ptr-compare semantics; null-safe on the receiver).
+    // Excludes a null-literal operand (`a = null` is the reference-equality-to-
+    // null form, handled by the scalar path below).
+    //
+    // fix #4560 (§8.1/§8.3/§8.4, v0.306): the original #1106 predicate required
+    // BOTH operands to be `Kind::Named && TypeDeclKind::Class` — which a
+    // statically-`Object`-typed operand never is (`Object` lowers to
+    // `Kind::Primitive`/`PrimitiveType::Object`, isObjectOrInterfaceTarget's own
+    // test). So a pair with an `Object`-typed operand fell all the way through
+    // to CG4's raw `ICmpEQ`/`ICmpNE` below — reference identity — while
+    // `.Equals()` on the identical pair already dispatched virtually through
+    // this same `lowerObjectEquals` helper (§9.6). `Object` is itself
+    // `public class Object` (§8.1) with a **virtual** `Equals` (§8.1's
+    // declaration), and §8.4/§25.2 make `=` invoke `Equals` UNCONDITIONALLY for
+    // classes — there is no carve-out keyed on the operand's *static* type, only
+    // on its *kind* (class vs. record/enum/etc.). The fix widens the per-operand
+    // predicate to also accept `Object`, which — because it is applied to each
+    // operand independently and then ANDed — naturally covers `Object = Object`
+    // (the issue's own repro: two distinct boxes of `5` answered `False` via
+    // identity while `.Equals` answered `True` via the box's value-comparison
+    // override) and the mixed `Object = someClass` / `someClass = Object` pair
+    // (measured equally broken pre-fix: an `Object`-typed local holding a class
+    // WITH an `Equals` override answered `False` against a same-typed local of
+    // the concrete class, in both operand orders, while `.Equals` answered
+    // `True` both ways — the identical root cause, not a separate defect).
+    // Interfaces are deliberately NOT widened here (`TypeDeclKind::Interface`
+    // is untouched) — measured to have the analogous bug via a different arm of
+    // this same predicate, but that is a distinct code path and out of #4560's
+    // scope; tracked separately as #4615.
     if ((op == "=" || op == "<>") &&
         l->getType()->isPointerTy() && r->getType()->isPointerTy()) {
-        auto isUserClassExpr = [&](const ast::Expr* e) -> bool {
+        auto isUserClassOrObjectExpr = [&](const ast::Expr* e) -> bool {
             if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
             const sema::TypeRef* t = ctx_.exprType(*e);
-            return t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
-                   t->declaration->kind == ast::TypeDeclKind::Class;
+            if (!t) return false;
+            if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                t->declaration->kind == ast::TypeDeclKind::Class)
+                return true;
+            // §8.1: `Object` is itself a class, but its TypeRef is minted as
+            // Kind::Primitive/PrimitiveType::Object (see
+            // isObjectOrInterfaceTarget), not Kind::Named — so it needs its own
+            // arm rather than falling out of the Named/Class check above.
+            return t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::Object;
         };
-        if (isUserClassExpr(bin.left.get()) && isUserClassExpr(bin.right.get())) {
+        if (isUserClassOrObjectExpr(bin.left.get()) &&
+            isUserClassOrObjectExpr(bin.right.get())) {
             if (llvm::Value* eq = lowerObjectEquals(l, r))
                 return op == "=" ? eq : builder_.CreateNot(eq);
         }
