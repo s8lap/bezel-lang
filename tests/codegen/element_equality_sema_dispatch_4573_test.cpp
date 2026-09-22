@@ -542,6 +542,89 @@ BEZEL_TEST(element_equality_sema_dispatch_4573, control_array_interface_identity
         "end Main; end C;"), 1);
 }
 
+// fix #4594 (§8.4/§25.2, v0.306): an INTERFACE element whose implementing
+// class overrides `Equals` must dispatch through the override (§8.4: "`a = b`
+// invokes `a.Equals(b)`"; §25.2: collections "use `Equals` rather than `=`"),
+// not fall to reference identity. Exact repro from the issue: `probe` is a
+// DIFFERENT `K` instance with the same `V`, reached only through the
+// interface-typed local/array — pre-fix this answered `Contains` false
+// (identity), measured on cafdfc52.
+BEZEL_TEST(element_equality_sema_dispatch_4573, array_interface_equals_override_dispatch_spec_8_4_4594) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; interface I method Get(): int; end I; "
+        "class K: I public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public method Get(): int return V; end Get; "
+        "  public override method Equals(o: Object?): bool "
+        "    var other: K? := o as K; "
+        "    if other = null then return false; end; "
+        "    return other.V = this.V; "
+        "  end Equals; "
+        "  public override method GetHashCode(): int return V; end GetHashCode; "
+        "end K; "
+        "class C public static method Main(): int "
+        "  var k1: I := new K(1); "
+        "  var a: Array<I> := [k1]; "
+        "  var probe: I := new K(1); "
+        "  if a.Contains(probe) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// The absent control for #4594: a value-UNEQUAL probe, reached the same way,
+// must still answer false — a fix that dispatched the override but ignored
+// its result (or answered `true` unconditionally) would pass the row above
+// and fail this one.
+BEZEL_TEST(element_equality_sema_dispatch_4573, array_interface_equals_override_absent_spec_8_4_4594) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; interface I method Get(): int; end I; "
+        "class K: I public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public method Get(): int return V; end Get; "
+        "  public override method Equals(o: Object?): bool "
+        "    var other: K? := o as K; "
+        "    if other = null then return false; end; "
+        "    return other.V = this.V; "
+        "  end Equals; "
+        "  public override method GetHashCode(): int return V; end GetHashCode; "
+        "end K; "
+        "class C public static method Main(): int "
+        "  var k1: I := new K(1); "
+        "  var a: Array<I> := [k1]; "
+        "  var probe: I := new K(99); "
+        "  if a.Contains(probe) then return 0; end; "
+        "  return 1; "
+        "end Main; end C;"), 1);
+}
+
+// `.IndexOf` through the interface, pinning the POSITION rather than mere
+// membership — a fix that answered `Contains` right by accident (e.g. an
+// unconditional identity fallback that happens to alias) would not
+// necessarily get the index right too.
+BEZEL_TEST(element_equality_sema_dispatch_4573, array_interface_equals_override_indexof_spec_8_4_4594) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; interface I method Get(): int; end I; "
+        "class K: I public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public method Get(): int return V; end Get; "
+        "  public override method Equals(o: Object?): bool "
+        "    var other: K? := o as K; "
+        "    if other = null then return false; end; "
+        "    return other.V = this.V; "
+        "  end Equals; "
+        "  public override method GetHashCode(): int return V; end GetHashCode; "
+        "end K; "
+        "class C public static method Main(): int "
+        "  var k1: I := new K(1); "
+        "  var k2: I := new K(2); "
+        "  var a: Array<I> := [k1, k2]; "
+        "  var probe: I := new K(2); "
+        "  if (a.IndexOf(probe) = 1) and (a.IndexOf(new K(1)) = 0) "
+        "     then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
 // §10: an enum element compares its underlying integer.
 BEZEL_TEST(element_equality_sema_dispatch_4573, control_array_enum_spec_8_3) {
     BEZEL_EXPECT_EQ(run(

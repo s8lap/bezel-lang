@@ -1725,6 +1725,36 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
     if (elemIsClass && bothPtr) {
         const sema::TypeSymbol* cls =
             (ty && ty->kind == K::Named) ? ty->declaration : nullptr;
+        // fix #4594 (§8.4/§25.2, v0.306): an INTERFACE-typed element's
+        // `Equals` override lives on the RUNTIME implementing class, which is
+        // not statically knowable at the element type — `classEqualsOverride`
+        // walks a class's OWN base chain and (correctly, for the class case)
+        // answers "no override" for an interface declaration, so this arm used
+        // to fall straight to the reference-identity default below even when
+        // the implementing class overrides `Equals`. §8.4 ("`a = b` invokes
+        // `a.Equals(b)`") and §25.2 (collections "use `Equals` rather than
+        // `=`") require the override to be dispatched regardless of whether it
+        // is reached through the class or the interface. `lowerObjectEquals`
+        // (LlvmBackend_String.cpp, #946/#947) already performs exactly that
+        // dispatch — virtually, through `vtable[kEqualsSlot]` on the runtime
+        // object — for an `Object`/interface receiver, and step 4 below routes
+        // `Object` through it for the identical reason. Every class's slot 4 is
+        // unconditionally filled (`classEqualsThunk`: the override if one
+        // exists, else the §8.3 reference-identity default), so this is total,
+        // not merely a fast path for the override case — an interface element
+        // with no override still answers identity, unchanged from before.
+        //
+        // Deliberately NOT widening `classEqualsOverride`'s own Class guard:
+        // that would require walking from the STATIC interface type, which
+        // cannot name the implementing class's override at all; routing
+        // through the vtable instead reads the RIGHT (runtime) class. Scoped
+        // to `cls->kind == Interface` only, so a CLASS-typed element (the
+        // shared blast radius `emitRemoveElementEquality` serves — every
+        // `Array<SomeClass>.Contains`/`.IndexOf`/`.Remove`/`Set` dedup) takes
+        // the unchanged `classEqualsOverride` path immediately below.
+        if (cls && cls->kind == ast::TypeDeclKind::Interface) {
+            if (llvm::Value* eq = lowerObjectEquals(el, target)) return eq;
+        }
         if (sema::MethodSymbol* eqm = classEqualsOverride(cls)) {
             // §8.4: `el.Equals(target)`. Guard against a null element slot or a
             // null query: dispatching through a null `el` would load a null
