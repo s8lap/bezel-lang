@@ -16,7 +16,7 @@ public interface IRetryable
 end IRetryable;
 
 public class RetryableException: Exception, IRetryable
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 
   public method ShouldRetry(): bool => true;

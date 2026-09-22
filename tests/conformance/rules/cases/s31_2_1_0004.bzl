@@ -11,12 +11,12 @@
 module Conf;
 
 public class SiblingA: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end SiblingA;
 
 public class SiblingB: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end SiblingB;
 

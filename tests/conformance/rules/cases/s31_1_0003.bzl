@@ -11,7 +11,7 @@
 module Conf;
 
 public class BadException: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end BadException;
 

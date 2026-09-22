@@ -12,12 +12,12 @@
 module Conf;
 
 public class ExA: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end ExA;
 
 public class ExB: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end ExB;
 

@@ -11,12 +11,12 @@
 module Conf;
 
 public class BroadException: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end BroadException;
 
 public class NarrowException: BroadException
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end NarrowException;
 
