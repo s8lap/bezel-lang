@@ -6,6 +6,7 @@
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
+#include <algorithm>  // std::find — for static-method detection via modifiers
 #include <unordered_set>
 
 // §4.3/§4.4 (v0.190, #1781): decimal literal range-check at formation reuses the
@@ -1407,7 +1408,39 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
     }
 }
 
+// §22.16 contract-clause static-requires state guard. Detects the top-level
+// visit of a clause expression by pointer-matching `&e` against the current
+// method's `contractClauses[i].expr.get()`; sets `currentClauseIsStatic_` to
+// the clause's `isStatic` bit so the IdentifierExpr handler (and any future
+// walker) can read it. Sub-expression visits never match (different AST
+// nodes), so the flag persists correctly through the recursive walk and
+// is restored on return. RAII so every return path through visitExpr
+// restores the flag.
+ExprTC::ClauseStaticGuard::ClauseStaticGuard(ExprTC* t, const ast::Expr& e)
+    : tc(t), saved(t->currentClauseIsStatic_), entered(false) {
+    if (t->currentMethodDecl_) {
+        for (const auto& c : t->currentMethodDecl_->contractClauses) {
+            if (c.expr.get() == &e) {
+                t->currentClauseIsStatic_ = c.isStatic;
+                entered = true;
+                break;
+            }
+        }
+    }
+}
+
+ExprTC::ClauseStaticGuard::~ClauseStaticGuard() {
+    if (entered) tc->currentClauseIsStatic_ = saved;
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
+    // §22.16: detect top-level visit of a clause expression (sub-expression
+    // recursive visits never match the clause expression's pointer, so the
+    // flag is set once at entry and persists across the recursive walk).
+    // RAII restores it on every return path — including the IdentifierExpr
+    // branch's many early returns on a bare-name identifier that is itself
+    // a clause expression (e.g. `static requires(myConst)`).
+    ClauseStaticGuard clauseStaticGuard(this, e);
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
     // typed verbatim by visitStmt's LocalDecl arm inside a child Scope, so
@@ -1582,6 +1615,146 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // Slice S29 (§22.8): a field initializer may not observe
             // an instance member (implicit-`this` reference).
             if (inFieldInitializer_) checkNotInstanceMember(*id, sym);
+            // §22.16 contract-clause gates. Two clauses here:
+            //
+            //   (1) Static `requires` — a `static requires` clause may
+            //   mention only state its call sites can see (the member's
+            //   parameters, and members visible to every caller); a
+            //   `static requires` over non-public state is a compile
+            //   error at the declaration (§22.16). And a `static`
+            //   clause that the implementation cannot discharge
+            //   statically is a compile error — the prover floor
+            //   (constants only) means any identifier resolving to a
+            //   non-constant symbol (parameter, field, local) is
+            //   undischargeable.
+            //
+            //   (2) Constructor's `requires` — a constructor's
+            //   `requires` may not observe `this` in any of §22.7's
+            //   senses (no field of the declaring type is assigned at
+            //   clause time) — it reads parameters and statics only
+            //   (§22.16). An instance-method reference here is an
+            //   implicit-`this` access and is rejected. (A bare `this`
+            //   identifier in a ctor's `requires` is rejected by the
+            //   static-member / field-initializer gates above.)
+            //
+            // Both run only when the IdentifierExpr resolved to a
+            // symbol — the contextual-keyword path (`old` / `result`)
+            // handles its own rejection a few hundred lines below.
+            if (sym) {
+                if (currentClauseIsStatic_ &&
+                    currentClauseKind_ == ContractClauseKind::Requires) {
+                    // (1) Static requires: every identifier must be a
+                    // parameter (always visible to call sites) or a
+                    // public member; everything else is the rejected
+                    // case. The diagnostic chosen matches the rule's
+                    // wording — "non-public" for visibility, "proven"
+                    // for undischargeable.
+                    if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
+                        // a method reference inside a `static requires`
+                        // would mean calling the method — the prover
+                        // floor is constants, so an external call is
+                        // undischargeable regardless of visibility.
+                        // Treat it as `proven`-tier undischargeable.
+                        (void)ms;
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            "a `static requires` clause is undischargeable "
+                            "at the proven tier when it calls a member "
+                            "(\xc2\xa7""22.16 \xe2\x80\x94 the prover floor "
+                            "is constant expressions folding to `true`)");
+                    } else if (auto* ps = dynamic_cast<ParameterSymbol*>(sym)) {
+                        // parameters are visible to every call site, but
+                        // the prover floor (constants only) cannot
+                        // discharge over a parameter — the call site has
+                        // no constant to substitute. Reject as `proven`.
+                        (void)ps;
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            "a `static requires` clause is undischargeable "
+                            "at the proven tier when its expression names "
+                            "a parameter (\xc2\xa7""22.16 \xe2\x80\x94 the "
+                            "prover floor is constant expressions folding "
+                            "to `true`)");
+                    } else if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
+                        // locals are never visible to call sites, and the
+                        // prover floor cannot discharge over them.
+                        (void)ls;
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            "a `static requires` clause over non-public "
+                            "state (\xc2\xa7""22.16 \xe2\x80\x94 a `static "
+                            "requires` clause may mention only state its "
+                            "call sites can see, and a local is visible "
+                            "only inside the declaring member)");
+                    } else if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+                        // a field reference is non-public (its enclosing
+                        // type's other code aside) and the prover floor
+                        // cannot discharge over it.
+                        (void)fs;
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            "a `static requires` clause over non-public "
+                            "state (\xc2\xa7""22.16 \xe2\x80\x94 a field is "
+                            "not visible to every call site)");
+                    } else if (auto* cs =
+                                   dynamic_cast<ConstMemberSymbol*>(sym)) {
+                        // a const member reference inside a `static
+                        // requires` is dischargeable when the const
+                        // value folds (constant expression, §17.14).
+                        // Anything else is rejected.
+                        if (!cs->isStatic) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, id->span.begin,
+                                "a `static requires` clause over "
+                                "non-public state (\xc2\xa7""22.16 \xe2\x80\x94"
+                                " an instance const is not visible to every "
+                                "call site)");
+                        }
+                        // a static const with a constant-foldable value
+                        // is allowed by the prover floor — no diagnostic.
+                    } else {
+                        // Unknown symbol class (PropertySymbol, EventSymbol,
+                        // TypeSymbol-as-value, imported cross-module …):
+                        // the safe default is to reject, since the prover
+                        // cannot discharge over any non-constant symbol.
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            "a `static requires` clause is undischargeable "
+                            "at the proven tier over a non-constant "
+                            "expression (\xc2\xa7""22.16 \xe2\x80\x94 the "
+                            "prover floor is constant expressions folding "
+                            "to `true`)");
+                    }
+                } else if (inConstructor_ &&
+                           currentClauseKind_ == ContractClauseKind::Requires) {
+                    // (2) Constructor's requires: an instance-method
+                    // reference is an implicit-`this` access (§22.7,
+                    // §22.16). Parameters, statics, type-level names,
+                    // local-scope helpers, and pure value-returning
+                    // statics are allowed.
+                    if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
+                        // an instance method reads `this`; a static method
+                        // doesn't. `MethodSymbol` doesn't carry an
+                        // `isStatic` flag — the static modifier lives in
+                        // the parsed-modifiers list, exactly the source
+                        // ExprTypecheck.cpp's local `isStaticMember` lambda
+                        // walks. Mirror that check here.
+                        const bool isStatic =
+                            std::find(ms->modifiers.begin(),
+                                      ms->modifiers.end(),
+                                      "static") != ms->modifiers.end();
+                        if (!isStatic) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, id->span.begin,
+                                "a constructor's `requires` clause may not "
+                                "observe `this` (\xc2\xa7""22.16, "
+                                "\xc2\xa7""22.7) \xe2\x80\x94 the call to "
+                                "an instance member reads `this`, which "
+                                "has not been initialized at this point");
+                        }
+                    }
+                }
+            }
             // per §22.10 (v0.180): record where a CLASS primary-constructor
             // parameter is referenced. A parameter resolves to a FieldSymbol
             // whose `posParam` is non-null and whose parent is a class. Its
@@ -2091,22 +2264,40 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                     "or a constructor"));
                 }
             } else if (id->name == "old") {
+                // §22.16: `old` is a contextual keyword reserved for
+                // `ensures` clauses — and is rejected in constructor
+                // clauses even when the clause is itself an `ensures`
+                // (constructor fields sit at §22.7's null watermark; no
+                // prestate exists for `old` to capture, per the rule
+                // "old is a compile error in `requires` clauses, in
+                // `invariant` members, in constructor clauses, and
+                // outside clauses entirely").
                 if (currentClauseKind_ == ContractClauseKind::Ensures &&
-                    &e == calleeOfCallCtx_) {
+                    &e == calleeOfCallCtx_ &&
+                    !inConstructor_) {
                     // `old(E)` — the CallExpr handler (typeCall) takes
                     // over from here: it visits the operand, enforces
                     // the §22.16 ownership restriction, and sets the
                     // CallExpr's exprType. Suppress the contextual-
                     // keyword diagnostic so the handler runs cleanly.
                 } else {
+                    // §22.16: the constructor clause case names the same
+                    // rule (`old` is rejected in constructor clauses) —
+                    // surface it explicitly so the diagnostic names the
+                    // rule that fired rather than the generic "outside
+                    // `ensures`" wording.
+                    const char* why = inConstructor_
+                        ? "`old` is rejected in a constructor's clauses "
+                          "(\xc2\xa7""22.16 \xe2\x80\x94 fields sit at "
+                          "\xc2\xa7""22.7's null watermark, no prestate "
+                          "exists for `old` to capture)"
+                        : "`old` is a contextual keyword reserved for "
+                          "`ensures` clauses (\xc2\xa7""22.16); it is "
+                          "not an identifier and cannot be referenced "
+                          "from a method body, a `requires` clause, or "
+                          "an `invariant` member";
                     ctx_.diagnostics().report(
-                        Severity::Error, id->span.begin,
-                        std::string("`old` is a contextual keyword "
-                                    "reserved for `ensures` clauses "
-                                    "(\xc2\xa7""22.16); it is not an "
-                                    "identifier and cannot be referenced "
-                                    "from a method body, a `requires` "
-                                    "clause, or an `invariant` member"));
+                        Severity::Error, id->span.begin, why);
                 }
             } else {
                 ctx_.diagnostics().report(
@@ -2377,6 +2568,43 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     }
     visitChildren(e);
     literalUnderUnaryMinus_ = savedNegLit;
+    // §22.16: `old(old(E))` is a compile error — the contextual keyword
+    // `old` does not nest, by the "every old operand is captured by copy"
+    // capture-taxonomy rule. Detect the outer `old(...)` whose argument is
+    // itself an `old(...)` CallExpr and reject at this visit. The inner
+    // call's own `old` handling in typeCall (ExprTypecheck_Calls.cpp) has
+    // already admitted the inner identifier by the time we get here; the
+    // rule fires at the OUTER `old`'s surface. (A nested `old` inside an
+    // expression that is not an `old` call — e.g. `old(x) + old(y)` — is
+    // fine; only the *argument* of an outer `old(...)` being itself an
+    // `old(...)` is rejected.)
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee &&
+            currentClauseKind_ == ContractClauseKind::Ensures) {
+            if (auto* outerId = dynamic_cast<const ast::IdentifierExpr*>(
+                    ce->callee.get())) {
+                if (outerId->name == "old" && ce->args.size() == 1 &&
+                    ce->args[0].value) {
+                    if (auto* innerCe = dynamic_cast<const ast::CallExpr*>(
+                            ce->args[0].value.get())) {
+                        if (innerCe->callee) {
+                            if (auto* innerId = dynamic_cast<
+                                    const ast::IdentifierExpr*>(
+                                    innerCe->callee.get())) {
+                                if (innerId->name == "old") {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce->span.begin,
+                                        "`old` does not nest \xe2\x80\x94 "
+                                        "`old(old(\xe2\x80\xa6))` is a "
+                                        "compile error (\xc2\xa7""22.16)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // per §7.4 (v0.182, #1566): a call, a function-value invocation (`f?(…)`), or
     // a constructor can transfer control to user code, which may run a closure
     // that nulls a mutably-captured local — so after visiting one (its arguments

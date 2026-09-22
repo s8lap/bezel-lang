@@ -140,6 +140,24 @@ public:
     void run(const ast::SourceFile& src);
 
 private:
+    // §22.16 contract-clause static-requires state. The `static` qualifier
+    // on a clause demands the proven tier; sema's enforcement fires from
+    // the IdentifierExpr handler and from the per-clause walker. The bit
+    // is detected by pointer-matching `&e` against
+    // `currentMethodDecl_->clauses[i].expr.get()` — only the TOP-LEVEL
+    // visitExpr of a clause expression matches, never a recursive visit,
+    // so a single guard at the top of visitExpr is sufficient. RAII so the
+    // flag is restored on every return path through visitExpr (including
+    // the IdentifierExpr branch's many early returns on a bare-name
+    // identifier that is itself a clause expression, e.g. the
+    // `static requires(myConst)` shape).
+    struct ClauseStaticGuard {
+        ExprTC* tc;
+        bool saved;
+        bool entered;
+        ClauseStaticGuard(ExprTC* t, const ast::Expr& e);
+        ~ClauseStaticGuard();
+    };
     // Per-walker scope for identifier lookups inside method bodies (slice 3b).
     struct Scope {
         std::unordered_map<std::string_view, Symbol*> names;
@@ -551,6 +569,18 @@ private:
     // sema layer does not pull in the AST header for a 3-valued flag.
     enum class ContractClauseKind { None, Requires, Ensures };
     ContractClauseKind currentClauseKind_ = ContractClauseKind::None;
+    // §22.16: a `static` clause qualifier demands the proven tier. The
+    // clause loop in ExprTypecheck.cpp's runMethodBody sets the kind and
+    // `inContractClause_` flags before calling visitExpr(*c.expr); this
+    // third flag carries the `static` bit (the AST node has it; the
+    // sema layer keeps a mirrored bool to avoid an AST header include).
+    // Set / restored inside visitExpr via a clause-entry guard that
+    // matches the clause expression by pointer (the only AST node whose
+    // pointer matches `currentMethodDecl_->clauses[i].expr.get()` is the
+    // top-level clause visit — sub-expression visits never match, so
+    // the flag stays set throughout the recursive walk and restores
+    // cleanly on return).
+    bool currentClauseIsStatic_ = false;
 
     // per §24: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
