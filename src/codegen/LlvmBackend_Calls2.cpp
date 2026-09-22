@@ -5982,11 +5982,39 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             // Build the case's payload struct value.
             auto* payloadTy = st->getElementType(1 + tag);
+            // fix #4610 / §35.3 + §7.5 (v0.306): a payload field declared with
+            // a NULLABLE VALUE type (`S(v: int?)`) occupies the §15.1 tagged
+            // struct `{ i8 hasValue, T value }` in the case's payload slot —
+            // `choiceStruct` lays it out that way — but the ARGUMENT lowers to
+            // the bare inner value (`i32 7`). The InsertValue below was handed
+            // that bare value against a `{ i8, i32 }` element, which LLVM's
+            // constant folder accepts and turns into a malformed constant
+            // aggregate: `{ { i8, i32 } } { i32 7 }`. Nothing on the codegen
+            // path rejects it (`verifyModule` is opt-in here), so it survived
+            // to the backend, where the DAG builder measured the mistyped
+            // element and aborted the whole compiler with
+            // `LLVM ERROR: Invalid size request on a scalable vector.` (six
+            // lines of Bezel, no generics, no `owned` — §35.4 rule 3 makes
+            // `Opt` value-like, an ordinary copyable value).
+            //
+            // `coerceToNullableSlot` is the same #813/§15.1 wrap every other
+            // store into a nullable-value slot goes through (assignment,
+            // inline-array element stores, `out` recipients); it tags the value
+            // `hasValue = 1`, maps a `null` literal to the all-zero struct, and
+            // is a NO-OP when the element is not a nullable-value struct or the
+            // argument already IS one — so every other payload shape (a plain
+            // value, an `owned` class pointer, a `string?`, a nested choice)
+            // lowers byte-for-byte as before. // per §35.3, §7.5, §15.1
+            auto* payloadStructTy = llvm::dyn_cast<llvm::StructType>(payloadTy);
             llvm::Value* payload = llvm::UndefValue::get(payloadTy);
             for (std::size_t i = 0; i < payloadFields.size(); ++i) {
-                if (payloadFields[i])
-                    payload = builder_.CreateInsertValue(
-                        payload, payloadFields[i], {(unsigned)i});
+                if (!payloadFields[i]) continue;
+                llvm::Value* fv = payloadFields[i];
+                if (payloadStructTy && i < payloadStructTy->getNumElements())
+                    fv = coerceToNullableSlot(
+                        payloadStructTy->getElementType((unsigned)i), fv);
+                payload = builder_.CreateInsertValue(payload, fv,
+                                                     {(unsigned)i});
             }
             // Build the full choice struct value: tag + payload slots.
             llvm::Value* whole = llvm::UndefValue::get(st);
