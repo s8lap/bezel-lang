@@ -285,7 +285,7 @@ s9_2_0005	pass
 s9_2_0006	pass	
 s9_2_0007	pass	
 s9_2_0008	pass	
-s9_2_0009	fail	divergence
+s9_2_0009	pass	
 s9_2_0010	pass	
 s9_2_0011	pass	
 s9_2_0012	pass	
@@ -301,7 +301,7 @@ s9_3_0001	pass
 s9_3_0002	fail	divergence
 s9_3_0003	pass	
 s9_3_0004	fail	divergence
-s9_3_0005	fail	divergence
+s9_3_0005	pass	
 s9_4_0001	pass	
 s9_4_0002	fail	divergence
 s9_4_0003	fail	divergence
