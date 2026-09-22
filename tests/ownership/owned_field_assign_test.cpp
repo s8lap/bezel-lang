@@ -208,26 +208,29 @@ BEZEL_TEST(owned_field_assign, ctor_owned_param_into_owned_field_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.8 / §28.8.1: `move c` of an `owned` parameter is also an owned value;
-// storing it into the owned field is a legal transfer. ACCEPTED.
+// §28.8 / §28.8.1: an `owned` parameter is an owned value; storing it into the
+// owned field is a legal transfer. ACCEPTED. Spelled marker-free per §28.3
+// K3.13 (v0.307): the declared field slot announces the consume, so the bare
+// `resource` IS the transfer and a `move` marker here is redundant (K3.1).
 BEZEL_TEST(owned_field_assign, move_owned_param_into_owned_field_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public method TakeOwnership(owned resource: Inner) "
         "  this._c.Dispose(); "
-        "  this._c := move resource; "
+        "  this._c := resource; "
         "end TakeOwnership;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3: `move ownedLocal` is an Owned producer (the local moves out and is
-// left moved-from). Storing it into the owned field is a legal transfer.
-// ACCEPTED.
+// §28.3: an owned local read in an owned-field store is an Owned producer (the
+// local moves out and is left moved-from). Storing it into the owned field is a
+// legal transfer. ACCEPTED. Spelled marker-free per §28.3 K3.13 (v0.307) — the
+// declared field slot announces the consume, so `move` here is redundant (K3.1).
 BEZEL_TEST(owned_field_assign, move_owned_local_into_owned_field_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public method Replace() "
         "  var fresh := new Inner(); "
         "  this._c.Dispose(); "
-        "  this._c := move fresh; "
+        "  this._c := fresh; "
         "end Replace;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
