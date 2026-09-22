@@ -13245,12 +13245,60 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         // these are VALUES, matching every other non-top-level caller of
         // this function (the declaration comment, LlvmBackend_impl.hpp).
         //
-        // Scoped to `isThis`: an explicit `base(...)` chain that resolves to
-        // an EXPLICIT base constructor (`!isThis`, `target` found) is a
-        // materially different shape — a cross-class hop, not a same-class
-        // sibling — not exercised by issue #4575's repro or by this fix's
-        // regression tests, and left as today's behavior.
-        if (isThis) {
+        // fix #4584 (§22.8 step 0-2 / §22.10 / §12.8 / §22.5 "Evaluation
+        // timing", v0.306): the `!isThis` half, which #4575 named above and
+        // deliberately left alone ("a cross-class hop, not a same-class
+        // sibling ... left as today's behavior"). It has the identical gap,
+        // one class over. An explicit `base(...)` that resolves to an
+        // EXPLICIT base constructor calls `target`'s compiled body — and if
+        // `target`'s OWN leading statement is a `base(...)` binding ITS base's
+        // §22.10 PRIMARY parameter list, nothing writes those slots: the
+        // `!target` cascade above declines to lower the call's arguments for
+        // that shape, on the documented assumption that
+        // `prePopulateBasePositionalFields` already ran at the `new` site,
+        // and for a THREE-level chain it did not.
+        //
+        // MEASURED on 97718f8a, issue #4584's own repro:
+        //
+        //   class B(n: int := 3, s: string := "dflt")
+        //     public constructor(a: int) this(a, "ctor"); end constructor;
+        //   end B;
+        //   class D : B    public constructor(a: int) base(a, "d"); end; end D;
+        //   class E : D    public constructor(a: int) base(a);      end; end E;
+        //   new E(9)   // printed `0` and a blank line; `9` / `d` is correct
+        //
+        // `prePopulateBasePositionalFields(E, ...)` at the `new` site returns
+        // at its top gate (`baseClassOf(E)` is `D`, which declares no primary
+        // list of its own) and so never examines `B`; `E`'s `base(a)` then
+        // lands HERE with `target` = `D`'s explicit constructor; and inside
+        // `D`'s compiled body, `base(a, "d")` finds no `ConstructorSymbol` of
+        // `B` for two arguments (`B`'s explicit constructor has arity 1 — the
+        // call binds `B`'s PRIMARY list) and none of the three `!target` arms
+        // above matches `!isThis` with two arguments and
+        // `hasAnyConstructor(B)` true, so it does nothing at all. The
+        // TWO-level twin (`new D(9)`, skipping `E`) was already correct —
+        // there `D` IS the entry and its own `base(a, "d")` is exactly what
+        // `prePopulateBasePositionalFields` inspects — and is pinned as a
+        // control.
+        //
+        // `!targetCls->hasPositionalFields` is what keeps this exactly ONE
+        // evaluation of `target`'s chain arguments, and it is the same
+        // question `entryWalkFilledBase` asks in `emitImplicitBase`:
+        // `prePopulateBasePositionalFields` recurses into
+        // `prePopulateBasePositionalFields(targetCls, ...)` only through its
+        // own `baseClassOf(t)->hasPositionalFields` top gate, so when
+        // `targetCls` declares NO primary parameter list of its own, NO such
+        // call was made anywhere for this construction and this one cannot
+        // duplicate it. When `targetCls` DOES declare one, the entry walk may
+        // have reached it and already lowered these very expressions — a
+        // second lowering would evaluate a side-effecting chain argument
+        // (`base(Counter.Next(), "d")`) twice, the #3562/#4485 defect class —
+        // so that shape keeps today's behaviour. It is also unreachable from
+        // the shape this fix is about: §22.10 lets only a primary chain to
+        // `base(...)`, so a class with a primary parameter list cannot be the
+        // `cs->parent` of an explicit `base(...)` at all; what varies here is
+        // `targetCls`, the class one level DOWN.
+        if (isThis || !targetCls->hasPositionalFields) {
             std::vector<llvm::Value*> targetArgVals(args.begin() + 1,
                                                      args.end());
             prePopulateBasePositionalFields(targetCls, currentThis_,
