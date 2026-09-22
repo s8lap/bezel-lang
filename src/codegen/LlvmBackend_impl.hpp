@@ -612,7 +612,19 @@ public:
           builder_(llvmCtx),
           checkedDisposal_(opts.checkedDisposal),
           checkedContracts_(opts.checkedContracts),
-          isMainModule_(opts.isMainModule) {}
+          isMainModule_(opts.isMainModule) {
+        // fix #4593 (spec §7.2, stdlib §2.6 / §4.4 / §9.8, v0.306): stamp the host
+        // DataLayout BEFORE a single type is lowered. A fresh llvm::Module
+        // carries the EMPTY DataLayout, in which `i64` has a 4-byte ABI
+        // alignment; x86-64 gives it 8. Every `module_->getDataLayout()
+        // .getTypeAllocSize(T)` below — `collectionElemSize`, `lazyElemSize`,
+        // the dictionary entry stride, the async/iterator frame size, the box
+        // payload size — is handed to the runtime as a memcpy byte count for
+        // storage the BACKEND lays out with the host layout, so any aggregate
+        // whose padding depends on an i64 member was measured short. See
+        // setHostTargetLayout's comment in LlvmBackend.hpp for the full story.
+        setHostTargetLayout(*module_);
+    }
 
     std::unique_ptr<llvm::Module> run() {
         // CG8: build every class's instance layout first (so field

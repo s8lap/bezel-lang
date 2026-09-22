@@ -21,6 +21,35 @@ namespace bezel::codegen {
 // definitions live in the sibling LlvmBackend_*.cpp translation units. This
 // file holds the public entry points.
 
+// fix #4593 (spec §7.2, v0.306): the ONE host TargetMachine both the emitter's
+// layout queries and the object emitter derive from. Created once, on first
+// use; null when the host target is unavailable (in which case the module keeps
+// the empty DataLayout and emitObjectFile reports the lookup failure, exactly
+// as before this fix).
+static llvm::TargetMachine* hostTargetMachine() {
+    static std::unique_ptr<llvm::TargetMachine> tm = [] {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+        std::string err;
+        const llvm::Target* target =
+            llvm::TargetRegistry::lookupTarget(triple.str(), err);
+        if (!target) return std::unique_ptr<llvm::TargetMachine>{};
+        llvm::TargetOptions opts;
+        return std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(triple, "generic", "", opts,
+                                        llvm::Reloc::PIC_));
+    }();
+    return tm.get();
+}
+
+void setHostTargetLayout(llvm::Module& module) {
+    llvm::TargetMachine* tm = hostTargetMachine();
+    if (!tm) return;
+    module.setTargetTriple(tm->getTargetTriple());
+    module.setDataLayout(tm->createDataLayout());
+}
+
 std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,
                                          llvm::LLVMContext& llvmCtx,
@@ -48,28 +77,18 @@ bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
         return false;
     }
 
-    static const bool inited = [] {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        return true;
-    }();
-    (void)inited;
-
-    llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
-    const llvm::Target* target =
-        llvm::TargetRegistry::lookupTarget(triple.str(), error);
-    if (!target) return false;
-
-    llvm::TargetOptions opts;
-    std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
-        triple, "generic", "", opts, llvm::Reloc::PIC_));
+    // fix #4593 (spec §7.2, v0.306): one shared host TargetMachine, so the layout
+    // the emitter measured its byte counts against IS the layout this pass
+    // lowers `alloca`/GEP with. Re-stamping is idempotent for an Emitter-built
+    // module (which stamps itself at construction) and is still required for a
+    // module that came from anywhere else.
+    llvm::TargetMachine* tm = hostTargetMachine();
     if (!tm) {
-        error = "could not create target machine";
+        error = "could not create a target machine for the host triple '" +
+                llvm::sys::getDefaultTargetTriple() + "'";
         return false;
     }
-
-    module.setTargetTriple(triple);
-    module.setDataLayout(tm->createDataLayout());
+    setHostTargetLayout(module);
 
     // JIT→AOT test-harness migration §2 (memory net): when requested, run LLVM's
     // AddressSanitizerPass over the generated module so the emitted machine code
@@ -102,7 +121,7 @@ bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
         llvm::FunctionAnalysisManager fam;
         llvm::CGSCCAnalysisManager cgam;
         llvm::ModuleAnalysisManager mam;
-        llvm::PassBuilder pb(tm.get());
+        llvm::PassBuilder pb(tm);
         pb.registerModuleAnalyses(mam);
         pb.registerCGSCCAnalyses(cgam);
         pb.registerFunctionAnalyses(fam);

@@ -104,6 +104,25 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          llvm::LLVMContext& llvmCtx,
                                          const CodegenOptions& opts = {});
 
+// fix #4593 (spec §7.2, stdlib §2.6 / §4.4 / §9.8, v0.306): stamp `module` with the HOST
+// target triple and DataLayout.
+//
+// Why this is not cosmetic. An `llvm::Module` starts life with the EMPTY
+// DataLayout, whose default integer alignments are not the host's — most
+// importantly `i64` gets an ABI alignment of 4 bytes ("i64:32:64"), where
+// x86-64 gives it 8. Every `module_->getDataLayout().getTypeAllocSize(T)` the
+// emitter performs therefore answered a DIFFERENT question from the one the
+// object emitter answers when it lays `alloca T` out, for every aggregate whose
+// padding depends on an i64 member. The emitter uses those byte counts as
+// memcpy/stride arguments to the runtime (`bz_array_add`, `bz_array_get`,
+// `bz_llist_add_last`, the dictionary entry stride, the async/iterator frame
+// size, …) against storage the BACKEND sized — so the two disagreed and the
+// tail of every such value was dropped on the way in and read back
+// uninitialized. Stamping the module at construction makes the emitter and the
+// backend answer with one layout; `emitObjectFile` re-stamps idempotently for
+// any module it did not build.
+void setHostTargetLayout(llvm::Module& module);
+
 // Emit `module` as a native object file at `objectPath` (host target).
 // Returns true on success; on failure returns false and sets `error`.
 // Initializes the native target on first use.
