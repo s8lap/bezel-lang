@@ -343,3 +343,48 @@ BEZEL_TEST(collection_concurrent_mod_1232,
         "  return caught * 100 + R._n; "
         "end Main; end C;"), 1);
 }
+
+// ===========================================================================
+// fix #4623 / §29.12, v0.307 — Set<string>.Remove()/.Clear() never bump
+// mod_count at all: unlike every sibling structural-mutation path in this
+// file (Array Add/Remove/InsertAt/RemoveAt, Dictionary set/remove/pop/clear,
+// LinkedList Add*/Remove*/Pop*, generic-key Set<T> via bz_dict_remove_gen /
+// bz_dict_clear), bz_dict_remove_set_string and bz_dict_clear_set_strings —
+// the runtime behind Set<string>.Remove()/.Clear() — read/write the table
+// but skip d->mod_count++ entirely. This is the FALSE-NEGATIVE direction,
+// the opposite of #4606 (which over-reported): a `for` over a Set<string>
+// that removes or clears mid-iteration does not raise
+// InvalidOperationException where §29.12 requires it to (Remove/Clear are
+// listed structural operations; the element-level-write carve-out #4606 was
+// about does not apply — there is no element-level write here, both remove
+// storage). Confirmed pre-fix: both rows below return 0 (no exception
+// caught) instead of the expected 42.
+// ===========================================================================
+
+// §29.12 / #4623 — Set<string>: Remove() during for-in must throw.
+BEZEL_TEST(collection_concurrent_mod_1232, set_string_remove_during_for_throws_4623) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := new Set<string>(); "
+        "  s.Add(\"a\"); s.Add(\"b\"); "
+        "  try "
+        "    for var item in s do s.Remove(\"a\"); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #4623 — Set<string>: Clear() during for-in must throw.
+BEZEL_TEST(collection_concurrent_mod_1232, set_string_clear_during_for_throws_4623) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := new Set<string>(); "
+        "  s.Add(\"a\"); s.Add(\"b\"); "
+        "  try "
+        "    for var item in s do s.Clear(); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}

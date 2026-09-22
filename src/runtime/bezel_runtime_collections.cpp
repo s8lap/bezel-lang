@@ -1615,6 +1615,13 @@ void bz_dict_clear_set_strings(void* dp) {
     memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
     d->count = 0;
     d->order_count = 0;  // issue #622: reset insertion-order tracking on Clear
+    // fix #4623 / §29.12, v0.307: Clear() is a listed structural operation
+    // ("Add, ..., Clear, ...") — this string-releasing twin of bz_dict_clear
+    // must bump mod_count exactly as bz_dict_clear does, else a `for` over a
+    // Set<string> that Clear()s the same set mid-iteration never raises
+    // InvalidOperationException (a false negative — the enumerator keeps
+    // walking a table that was just emptied underneath it).
+    d->mod_count++;  // §29.12 / #4623: structural mutation
 }
 
 // issue #429 / §28.9 / §4.10: like bz_dict_remove_gen but releases the
@@ -1639,6 +1646,13 @@ bool bz_dict_remove_set_string(void* dp, const void* key) {
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    // fix #4623 / §29.12, v0.307: Remove() is a listed structural operation
+    // ("Add, ..., Remove, ..."), same as bz_dict_remove_gen (the non-string
+    // twin this function otherwise mirrors) and bz_dict_remove_str — this
+    // string-releasing Set<string> path was the one sibling that skipped the
+    // bump, so a `for` over a Set<string> that Remove()s the same set
+    // mid-iteration never raised InvalidOperationException (false negative).
+    d->mod_count++;  // §29.12 / #4623: structural mutation
     return true;
 }
 
