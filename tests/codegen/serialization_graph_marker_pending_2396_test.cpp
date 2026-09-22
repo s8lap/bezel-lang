@@ -123,7 +123,7 @@ const char* kHubSlot =
     "  public owned Target: Slot; "
     "  public Alias: Slot?; "
     "  public constructor(owned target: Slot, alias: Slot?) "
-    "    Target := move target; Alias := alias; "
+    "    Target := target; Alias := alias; "
     "  end constructor; "
     "end Hub; ";
 
@@ -230,10 +230,10 @@ BEZEL_TEST(codegen_serialization_graph_marker_pending_2396,
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
-        "    Target := move target; Alias := alias; "
+        "    Target := target; Alias := alias; "
         "  end constructor; "
         "  public constructor(owned target: Slot) "
-        "    Target := move target; Alias := Target; "
+        "    Target := target; Alias := Target; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "

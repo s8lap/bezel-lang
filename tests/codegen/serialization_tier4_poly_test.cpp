@@ -186,7 +186,7 @@ const char* kHierarchy =
 const char* kContainer =
     "class Container : ISerializable, IDeserializable "
     "  public owned S: Shape; "
-    "  public constructor(owned s: Shape) S := move s; end constructor; "
+    "  public constructor(owned s: Shape) S := s; end constructor; "
     "end Container; ";
 
 // §9.8 tier 4: Circle binary round-trip through polymorphic base field.
@@ -285,7 +285,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  public owned S: Shape; "
         "  public Tag: int; "
         "  public constructor(owned s: Shape, tag: int) "
-        "    S := move s; Tag := tag; "
+        "    S := s; Tag := tag; "
         "  end constructor; "
         "end Container; "
         "class C public static method Main(): int "
@@ -424,11 +424,11 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  public owned Primary: Shape; "
         "  public Alias: Shape?; "  // nullable back-edge
         "  public constructor(owned primary: Shape, alias: Shape?) "
-        "    Primary := move primary; Alias := alias; "
+        "    Primary := primary; Alias := alias; "
         "  end constructor; "
         // Serialize-side convenience ctor: wire the self-alias from the receiver.
         "  public constructor(owned primary: Shape) "
-        "    Primary := move primary; Alias := Primary; "
+        "    Primary := primary; Alias := Primary; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "

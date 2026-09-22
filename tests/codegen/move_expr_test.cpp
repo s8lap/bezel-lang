@@ -48,7 +48,7 @@ BEZEL_TEST(codegen_move, move_as_constructor_argument) {
 BEZEL_TEST(codegen_move, move_as_field_assignment_rhs) {
     BEZEL_EXPECT_EQ(runProg(std::string(kR) +
         "class Box public owned item: R; "
-        "  public constructor(owned r: R) item := move r; end constructor; "
+        "  public constructor(owned r: R) item := r; end constructor; "
         "  public method Val(): int => item.V; end Box; "
         "class C public static method Main(): int "
         "  var r := new R(); r.V := 6; using var b := new Box(owned r); "

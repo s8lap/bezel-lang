@@ -592,7 +592,7 @@ BEZEL_TEST(undisposed_leak, discard_move_local_disposed_once_1009) {
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
         "  var x := new R(); "
-        "  _ := move x; "
+        "  _ := x; "
         "  return R._n; "            // 1 — disposed once, x not double-freed
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runOwn(src), 1);
