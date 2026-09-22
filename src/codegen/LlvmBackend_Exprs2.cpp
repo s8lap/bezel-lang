@@ -8348,10 +8348,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // invariant of the constructed type AFTER the ctor call returns
         // normally and BEFORE the `obj` reference is exposed to the caller
         // (§22.16 "Every fresh instance satisfies its full dynamic class
-        // invariant before it is observable"). Imported types' invariant
-        // records are declaration facts, so emitInvariantCheck is a no-op
-        // for them — their invariants were already checked at construction
-        // time in the exporter. Skipped when the ctor threw (the
+        // invariant before it is observable").
+        //
+        // fix #4592 (§22.16 / §2.8.2, v0.306): this comment used to say that
+        // emitInvariantCheck is "a no-op for imported types — their invariants
+        // were already checked at construction time in the exporter". Both
+        // halves were false. §22.16 puts the construction-exit check at the
+        // most-derived constructor's completion, which codegen emits HERE, at
+        // the `new` site — so a `new` in this module is a point the exporter
+        // never compiled, and the imported chain link was simply dropped.
+        // `emitInvariantCheck` now reads the loader's re-parsed clause
+        // expressions for an imported class. Skipped when the ctor threw (the
         // emitNewPendingCheck above branched to the unwind edge). The
         // `disposeAndFreeOnThrow = true` flag wires the construction-exit
         // unwind (§22.16 "the partially-constructed instance unwinds under
@@ -9020,10 +9027,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // here, the allocating site, exactly once on the unwind edge.
         emitNewPendingCheck(obj);  // CG20: an imported constructor may throw
         // §22.16 (v0.240, #2941): construction exit on the imported-ctor
-        // path — evaluate the class invariant of the constructed type
-        // (a no-op for the imported type itself, since the exporter
-        // already evaluated it; but fires for any same-module-derived
-        // invariant chain). Skipped on the throw edge. The
+        // path — evaluate the class invariant of the constructed type.
+        //
+        // fix #4592 (§22.16 / §2.8.2, v0.306): this used to read "a no-op for
+        // the imported type itself, since the exporter already evaluated it;
+        // but fires for any same-module-derived invariant chain". Neither
+        // clause held — §22.16's construction-exit point is this `new` site,
+        // which no exporter compiled, and the walk dropped the imported link
+        // whether or not a local subclass sat above it. The imported type's
+        // own clauses now evaluate here from the loader's re-parse.
+        // Skipped on the throw edge. The
         // `disposeAndFreeOnThrow = true` flag wires the §22.9 unwind
         // shape: a violated invariant disposes + frees `obj` before
         // ContractViolationException propagates.

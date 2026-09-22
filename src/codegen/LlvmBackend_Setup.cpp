@@ -6533,18 +6533,51 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
     if (!classType || insideInvariantCheck_) return;
     // Find source-defined invariants across the base chain. A class with no
     // invariants at any level is a no-op (the common case).
-    struct Inv { const sema::TypeSymbol* cls; const ast::InvariantDecl* decl; };
+    struct Inv { const sema::TypeSymbol* cls; const ast::Expr* expr; };
     std::vector<Inv> chain;
     for (const sema::TypeSymbol* c = classType; c; c = baseClassOf(c)) {
         const auto* td = dynamic_cast<const ast::TypeDecl*>(c->decl);
-        if (!td) continue;  // imported: invariant records, no AST
-        for (const auto& m : td->members) {
-            if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(m.get())) {
-                if (inv->expr && !inv->isStatic) {
-                    chain.push_back({c, inv});
+        if (td) {
+            for (const auto& m : td->members) {
+                if (auto* inv =
+                        dynamic_cast<const ast::InvariantDecl*>(m.get())) {
+                    if (inv->expr && !inv->isStatic) {
+                        chain.push_back({c, inv->expr.get()});
+                    }
                 }
             }
+            continue;
         }
+        // fix #4592 (§22.16 / §2.8.2, v0.306): an IMPORTED class in the chain
+        // has no `ast::TypeDecl` (`TypeSymbol::decl` is never assigned for an
+        // import), and this arm used to `continue` — so every invariant
+        // declared on an imported base was dropped from the conjunction
+        // outright. Not "checked elsewhere": the construction-exit check is
+        // emitted at the `new` SITE (§22.16 makes it the most-derived
+        // constructor's completion, wired at `new`, not in the ctor body), and
+        // the site is in THIS module, so nothing in the exporter stood in for
+        // it. MEASURED across a real `--import` boundary with
+        // `--checked-contracts` on both halves, a base carrying
+        // `invariant(v > 0);` constructed at `v = -1`: pre-fix the program ran
+        // to completion (exit 42), post-fix it raised
+        // ContractViolationException (exit 99); the same program in ONE module
+        // raised on both, so the boundary was the whole difference.
+        //
+        // `importedInvariantExprs` is the loader's re-parse of the exporter's
+        // verbatim clause text (`ModuleLoader::parseAndAttachInvariants`),
+        // with every name already remapped onto this compilation's imported
+        // member symbols — so `lowerExpr` below GEPs through the same storage
+        // the exporter compiled. `invariantContracts` is NOT usable here: its
+        // §2.8.2 `canonicalText` is an identity artifact (`M.C.v > 0`), not an
+        // expression. Empty — a pre-#4592 artifact, or a clause that did not
+        // reconstruct — leaves exactly the pre-fix behaviour for that class.
+        //
+        // Only the class's OWN clauses live in the vector, so the walk keeps
+        // going into an imported BASE of an imported class and §22.16's
+        // base-first conjunction composes across any mix of local and
+        // imported links.
+        for (const ast::Expr* e : c->importedInvariantExprs)
+            if (e) chain.push_back({c, e});
     }
     // §22.16 base-first → base at the END of the vector, most-derived at
     // the FRONT (we built the chain most-derived-first above). Reverse so
@@ -6568,7 +6601,7 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
     // path; nothing else here mutates the per-function scope.
 
     for (const auto& iv : chain) {
-        llvm::Value* condV = lowerExpr(*iv.decl->expr);
+        llvm::Value* condV = lowerExpr(*iv.expr);
         if (!condV) continue;  // purity/type-error already diagnosed upstream
         llvm::Value* failed = builder_.CreateNot(condV, "inv.fail");
         auto* throwBB =

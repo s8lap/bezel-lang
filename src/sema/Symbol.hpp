@@ -117,6 +117,28 @@ struct TypeSymbol : Symbol {
     // base-first order. Local classes derive these from their AST; imported
     // classes have no AST, so the loader publishes this side-table vector.
     std::vector<ContractRecord> invariantContracts;
+    // §22.16 / §2.8.2 (fix #4592): the RE-PARSED expressions of an imported
+    // class's OWN `invariant(E);` members, in declaration order — the
+    // executable half of the vector above.
+    //
+    // `invariantContracts` is an IDENTITY channel: §2.8.2 defines a record's
+    // `canonicalText` with every name replaced by its declaration-resolved,
+    // module-qualified spelling (`invariant(v > 0)` on module `M`'s class `C`
+    // records as `M.C.v > 0`), so nothing can be lowered from it. Codegen's
+    // §22.16 instrumentation needs an `ast::Expr` bound to THIS compilation's
+    // symbols; `ModuleLoader::parseAndAttachInvariants` re-parses the
+    // exporter's verbatim clause text (`MetaTypeDecl::ownInvariantText`) in a
+    // synthetic re-declaration of the class and remaps the result onto the
+    // imported members, exactly as the ctor/method/property/field-init
+    // reconstruction paths do, and publishes the expressions here.
+    //
+    // Empty for a LOCAL class (whose `decl` carries the real AST) and for an
+    // imported class from a pre-#4592 artifact or whose clause text could not
+    // be reconstructed — in both of those the pre-fix behaviour stands: the
+    // clause is not evaluated on this side of the boundary. The two shapes
+    // that still land in the second case (a clause naming an INHERITED member,
+    // and a §11.6 nested imported class) are tracked as issue #4599.
+    std::vector<const ast::Expr*> importedInvariantExprs;
     // Scope inside which members and generic params live. Always greater
     // than `scope` (which is the type's own enclosing scope).
     ScopeId memberScope = kModuleScope;

@@ -2236,24 +2236,79 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // base clause argument list is BYTE-IDENTICAL to a pre-#3916 build (the
     // field is left empty, `emitTypeDecl`'s guard skips the record, and the
     // module's header hash is unchanged).
-    if (t.hasPositionalFields && !source.empty()) {
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
-            if (!td->primaryBaseCtorArgs.empty()) {
-                std::string joined;
-                for (std::size_t i = 0; i < td->primaryBaseCtorArgs.size(); ++i) {
-                    const auto& a = td->primaryBaseCtorArgs[i];
-                    if (!a.value) continue;
-                    const std::size_t begin = a.value->span.begin.offset;
-                    const std::size_t end = a.value->span.end.offset;
-                    if (begin >= end || end > source.size() ||
-                        a.value->span.begin.line == 0)
-                        continue;
-                    if (i > 0) joined += ", ";
-                    joined.append(source.substr(begin, end - begin));
-                }
-                out.baseCtorArgsText = std::move(joined);
-            }
+    //
+    // SEAM-DEBT: #3911 — and reused by the §22.16 invariant-text block below.
+    // This is the EXPORTER: `t` is the local module's freshly-parsed type, so
+    // the AST half is present by construction and the read is safe (same
+    // argument `collectInvariants` records at its own identical read). The
+    // cast is hoisted here rather than repeated so the #3152 seam ratchet's
+    // per-file class-1 count does not rise for a second consumer of the very
+    // same local-only fact.
+    const auto* selfTd = !source.empty()
+                             ? dynamic_cast<const ast::TypeDecl*>(t.decl)
+                             : nullptr;
+    if (t.hasPositionalFields && selfTd != nullptr &&
+        !selfTd->primaryBaseCtorArgs.empty()) {
+        std::string joined;
+        for (std::size_t i = 0; i < selfTd->primaryBaseCtorArgs.size(); ++i) {
+            const auto& a = selfTd->primaryBaseCtorArgs[i];
+            if (!a.value) continue;
+            const std::size_t begin = a.value->span.begin.offset;
+            const std::size_t end = a.value->span.end.offset;
+            if (begin >= end || end > source.size() ||
+                a.value->span.begin.line == 0)
+                continue;
+            if (i > 0) joined += ", ";
+            joined.append(source.substr(begin, end - begin));
         }
+        out.baseCtorArgsText = std::move(joined);
+    }
+
+    // §22.16 / §2.8.2 (fix #4592): this class's OWN `invariant(E);` members,
+    // re-rendered as source text so the importer can RE-PARSE them into live
+    // expressions and evaluate them at §22.16's instrumentation points.
+    //
+    // WHY THE EXISTING CARRIAGE IS NOT ENOUGH. `out.invariants` (the §2.8.2
+    // contract records, built by `typeInvariants` above) already crosses, and
+    // `ModuleLoader` already publishes it as `TypeSymbol::invariantContracts`
+    // — but a record's payload is `canonicalText`, whose §2.8.2 definition
+    // replaces every name with its declaration-resolved, module-qualified
+    // spelling. MEASURED: an exported `invariant(v > 0);` over the field `v`
+    // canonicalizes to `InvLibA.BaseA.v > 0`, which does not re-parse into an
+    // expression evaluable against `this`. §2.8.2 anticipates the split ("An
+    // implementation may additionally carry each clause's display text
+    // (original names) for diagnostics; display text never participates in
+    // identity") — `ownInvariantText` is that second, identity-free channel.
+    //
+    // The exporter does NOT canonicalize or rewrite: the expression's span is
+    // sliced out of `source` verbatim and wrapped back into an `invariant(…);`
+    // member, exactly as #662c's `dtorBodyText` and #3916's `baseCtorArgsText`
+    // slice their fragments. `static` invariants are skipped: §22.16 makes one
+    // INERT in this revision ("`static invariant(false);` compiles and does
+    // nothing"), and codegen's `emitInvariantCheck` excludes them on the local
+    // side too, so carrying one would create a check across the boundary that
+    // the same program does not get in-module.
+    //
+    // Conditional on the class declaring at least one, so a module whose
+    // classes declare none produces BYTE-IDENTICAL metadata to a pre-#4592
+    // build (`emitTypeDecl`'s guard skips the record and `hashTypeDecl`'s
+    // fold is guarded on the same predicate).
+    if (t.kind == ast::TypeDeclKind::Class && selfTd != nullptr) {
+        std::string joined;
+        for (const auto& member : selfTd->members) {
+            const auto* inv =
+                dynamic_cast<const ast::InvariantDecl*>(member.get());
+            if (!inv || !inv->expr || inv->isStatic) continue;
+            const std::size_t begin = inv->expr->span.begin.offset;
+            const std::size_t end = inv->expr->span.end.offset;
+            if (begin >= end || end > source.size() ||
+                inv->expr->span.begin.line == 0)
+                continue;
+            joined += "invariant(";
+            joined.append(source.substr(begin, end - begin));
+            joined += ");\n";
+        }
+        out.ownInvariantText = std::move(joined);
     }
 
     // §9.8 / §2.8.3 rule 4 (#3179, family F10 of umbrella #3152): the

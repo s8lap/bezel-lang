@@ -158,7 +158,20 @@ enum RecordCode : unsigned {
     // MetaTypeDecl::baseCtorArgsText for the byte-identical-serialization
     // rationale and the dependency-direction staleness contract.
     REC_BASE_CTOR_ARGS = 15,
-    // 16.. additive; unknown codes are skipRecord()'d by the reader
+    // §22.16 / §2.8.2 (#4592, additive within v7): TYPE_BLOCK — this class's
+    // OWN `invariant(E);` members re-rendered as source text, as a string
+    // payload under its OWN code. Emitted only when non-empty, so a module
+    // whose classes declare no invariant is byte-identical to a pre-#4592
+    // build. A distinct code rather than a further positional REC_STRING for
+    // the same reason REC_BASE_CTOR_ARGS / REC_EXC_BASE are coded: TYPE_BLOCK
+    // already carries three independent optional strings, and a fourth
+    // positional one would make every reader's capture ordering load-bearing.
+    // Absent (an OLD artifact) reads as "" — the pre-fix behaviour, which IS
+    // the #4592 silent-no-check defect the importer-side
+    // `parseAndAttachInvariants` closes, so a stale dependency degrades to
+    // exactly what it did before rather than to anything new.
+    REC_INVARIANT_TEXT = 16,
+    // 17.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -398,6 +411,14 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     // a fold the writer never wrote moves the VBR-encoded header hash of
     // every artifact for a change that wrote nothing.
     if (!ty.baseCtorArgsText.empty()) hashStr(h, ty.baseCtorArgsText);
+    // §22.16 / §2.8.6 (#4592): this class's own invariant source text.
+    // §2.8.6's delta table classifies "`invariant` removed or text changed" as
+    // BREAKING, so it is public-interface content §2.8.3 rule 3's staleness
+    // check must track. GUARDED ON EXACTLY THE EMISSION'S CONDITION, the same
+    // rule every conditional field above states: a fold the writer never wrote
+    // moves the VBR-encoded header hash of every artifact for a change that
+    // wrote nothing.
+    if (!ty.ownInvariantText.empty()) hashStr(h, ty.ownInvariantText);
     // §12 / §31.4 (#2950): the built-in exception base. It decides the class's
     // LAYOUT on both sides of the boundary, so it is public-interface content
     // that staleness detection must track — a dependency that gains or loses
@@ -744,6 +765,11 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            // staleness must track it), so two metadata values differing only
            // in it are NOT equal.
            baseCtorArgsText == o.baseCtorArgsText &&
+           // §22.16 / §2.8.6 (#4592): an `invariant` removed or re-worded is
+           // a BREAKING delta in §2.8.6's own table, so two metadata values
+           // differing only in this text are NOT equal — this operator backs
+           // the round-trip tests.
+           ownInvariantText == o.ownInvariantText &&
            builtinExceptionBase == o.builtinExceptionBase &&
            builtinInterfaceBases == o.builtinInterfaceBases &&
            // §35.1 (#3144): the case list is part of a choice's identity.
@@ -1201,6 +1227,17 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // mirrors the order hashTypeDecl folds them in.
     if (!ty.baseCtorArgsText.empty())
         emitStringAs(w, REC_BASE_CTOR_ARGS, ty.baseCtorArgsText);
+    // §22.16 / §2.8.2 (#4592): this class's OWN `invariant(E);` members as
+    // source text, under its own record code so it is independent of the
+    // trailing `dtorBodyText` REC_STRING and of the two other coded strings
+    // TYPE_BLOCK already carries. Emitted only when non-empty, so a module
+    // whose classes declare no invariant is BYTE-IDENTICAL to a pre-#4592
+    // build. Position among the trailing records is immaterial — the code is
+    // self-describing and every reader this format has had `skipRecord()`s an
+    // unknown one — so it goes after `baseCtorArgsText`, mirroring the order
+    // `hashTypeDecl` folds them in.
+    if (!ty.ownInvariantText.empty())
+        emitStringAs(w, REC_INVARIANT_TEXT, ty.ownInvariantText);
     // §12 / §31.4 (#2950): the built-in exception base, under its own record
     // code so it is independent of the trailing dtorBodyText string above.
     // Emitted only when non-empty, so a module with no exception subclass
@@ -1600,7 +1637,19 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                      // this new slot so an absent record is still `skipRecord()`'d
                      // for a reader predating the field — the pre-fix reading.
                      unsigned thirdCapturedCode = 0,
-                     std::string* thirdCodedCapture = nullptr) {
+                     std::string* thirdCodedCapture = nullptr,
+                     // §22.16 / §2.8.2 (#4592): a FOURTH coded string capture,
+                     // for REC_INVARIANT_TEXT. Same independent, self-
+                     // describing shape as the second and third slots; a
+                     // fourth slot rather than a shared one for the reason
+                     // `thirdCodedCapture`'s comment states — TYPE_BLOCK now
+                     // holds FOUR independent optional strings, and conflating
+                     // any two of them via one slot would be exactly the
+                     // silent misparse `emitTypeDecl`'s 8th-scalar ⚠ block
+                     // warns about. nullptrable, so this stays a strict
+                     // extension of the previous API.
+                     unsigned fourthCapturedCode = 0,
+                     std::string* fourthCodedCapture = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1611,7 +1660,8 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
         }
         if (n == Next::Record) {
             if (captureString != nullptr || codedCapture != nullptr ||
-                disposeVerdict != nullptr || thirdCodedCapture != nullptr) {
+                disposeVerdict != nullptr || thirdCodedCapture != nullptr ||
+                fourthCodedCapture != nullptr) {
                 // Read this record; capture it if it is one we are waiting for.
                 llvm::SmallVector<std::uint64_t, 32> vals;
                 auto got = r.cursor.readRecord(id, vals);
@@ -1657,6 +1707,17 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                     // Absent leaves the field empty, the pre-fix reading.
                     dst = thirdCodedCapture;
                     thirdCodedCapture = nullptr;
+                } else if (fourthCodedCapture != nullptr &&
+                           code == fourthCapturedCode) {
+                    // §22.16 / §2.8.2 (#4592): the fourth coded-capture slot.
+                    // Same shape and semantics as the second and third arms
+                    // above (decode bytes; clear the pointer so a second
+                    // REC_INVARIANT_TEXT cannot silently overwrite the first
+                    // — at most one exists per type, so that is unreachable
+                    // in practice). Absent leaves the field empty, the
+                    // pre-fix reading.
+                    dst = fourthCodedCapture;
+                    fourthCodedCapture = nullptr;
                 }
                 if (dst != nullptr) {
                     dst->clear();
@@ -2177,7 +2238,14 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
         REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases,
         &ty.nonTrivialDispose,
         REC_SER_TYPE_SHAPE, &ty.serializedShape, &ty.serializedPolyCases,
-        REC_BASE_CTOR_ARGS, &ty.baseCtorArgsText);
+        REC_BASE_CTOR_ARGS, &ty.baseCtorArgsText,
+        // §22.16 / §2.8.2 (#4592): this class's own `invariant(E);` source
+        // text, through the new `fourthCodedCapture` slot. Same independent,
+        // self-describing record-code shape as the three captures above —
+        // absent leaves the field empty, the pre-fix reading, which is
+        // exactly the #4592 silent-no-check defect the importer-side
+        // `parseAndAttachInvariants` closes.
+        REC_INVARIANT_TEXT, &ty.ownInvariantText);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

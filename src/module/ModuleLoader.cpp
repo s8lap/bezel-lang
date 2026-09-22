@@ -4569,8 +4569,19 @@ static bool parseAndAttachExtensionPropertyBody(
 // extra since the text is already on hand) — the `:=` initializer text is
 // appended too. Every method is a signature-only stub (self-call
 // resolution, e.g. `Hits: int := ComputeInitial();`).
-static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
-                                                 const std::string& moduleName) {
+//
+// fix #4592 (§22.16 / §2.8.2, v0.306): `extraMembers` is spliced in verbatim
+// just before `end <Type>;`. It exists so the §22.16 invariant reconstruction
+// (`parseAndAttachInvariants`) can re-parse a class's `invariant(E);` members
+// in the SAME synthetic context this function already builds for a field
+// initializer — the two shapes have identical needs (a single expression, no
+// parameters, no locals, reading the type's own storage, `const` members and
+// pure self-methods), so duplicating ~90 lines of source-builder would have
+// been the only alternative. Empty (the default) reproduces the pre-#4592
+// source byte-for-byte for every existing caller.
+static std::string buildSyntheticFieldInitSource(
+    const MetaTypeDecl& td, const std::string& moduleName,
+    const std::string& extraMembers = {}) {
     std::string src = "module _2351_reparsed_field_;\n";
     // §2.8.2 / #2375: `import` the exporting module so its PUBLIC sibling
     // types — already loaded into the importer's mainCtx — are visible to
@@ -4646,6 +4657,12 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
         // and the per-stub skip on sibling-type signatures does NOT apply.
         std::string stub = buildMethodStub(mm, td, /*importsModule=*/true);
         if (!stub.empty()) src += stub + "\n";
+    }
+    // fix #4592: caller-supplied members (the §22.16 `invariant(E);` clauses),
+    // spliced after every stub so a clause may name any of them.
+    if (!extraMembers.empty()) {
+        src += extraMembers;
+        if (extraMembers.back() != '\n') src += "\n";
     }
     src += "end " + td.name + ";\n";
     return src;
@@ -5099,6 +5116,229 @@ static bool parseAndAttachFieldInit(
     return true;
 }
 
+// fix #4592 (§22.16 / §2.8.2, v0.306): re-parse an imported class's OWN
+// `invariant(E);` members and publish the resulting expressions on the
+// imported TypeSymbol, so `Emitter::emitInvariantCheck` can evaluate them at
+// §22.16's construction-exit / public-method-entry / public-method-exit
+// points on THIS side of the module boundary.
+//
+// THE DEFECT THIS CLOSES. `emitInvariantCheck` builds its base-first chain by
+// walking `dynamic_cast<const ast::TypeDecl*>(c->decl)` for each class in the
+// hierarchy and `continue`s when the cast is null — which is EVERY imported
+// class (`TypeSymbol::decl` is never assigned for an import). So a class whose
+// base lives in another module had that base's invariants silently dropped
+// from the conjunction: not "re-checked elsewhere", never emitted at all.
+// MEASURED across a real `--import` boundary, `--checked-contracts` on both
+// halves, a base with `invariant(v > 0);` constructed with `v = -1`:
+//   pre-fix   exit 42 — construction completed, no ContractViolationException
+//   post-fix  exit 99 — the catch arm caught the violation
+// The byte-identical same-module program answers 99 on both, which is exactly
+// why the gap was invisible.
+//
+// WHY A RE-PARSE AND NOT AN ACCESSOR SWAP. Unlike the sibling imported-symbol
+// gaps whose symbol side already holds the answer, the fact this needs is an
+// `ast::Expr` to lower. `TypeSymbol::invariantContracts` carries only
+// §2.8.2 `canonicalText`, which is an identity artifact (measured: `v > 0` on
+// module `InvLibA`'s class `BaseA` records as `InvLibA.BaseA.v > 0`). The
+// exporter therefore now also carries the clause's verbatim source text
+// (`MetaTypeDecl::ownInvariantText`, the §2.8.2 display-text channel), and
+// this function turns it back into live, symbol-bound expressions by exactly
+// the reconstruction discipline the ctor / dtor / method / property /
+// field-init paths above already use: parse a synthetic re-declaration of the
+// class, run the three sema passes in a FRESH context, remap every expression
+// symbol onto the REAL imported member, copy the four AST-keyed side tables,
+// and keep the fresh source/AST/context alive for the compilation's lifetime.
+//
+// FAILURE POLICY — RECORDED CHOICE (CLAUDE.md §4). A reconstruction that does
+// not type-check silently declines to publish, leaving the pre-fix behaviour
+// (the clause is not evaluated in the importer). This matches
+// `parseAndAttachMethodBody`'s policy rather than `parseAndAttachFieldInit`'s
+// hard reject, and the reason is the direction of the harm: a hard reject
+// would turn programs that build today into programs that do not build, to
+// buy a check that is off by default (§22.16 makes clause evaluation a
+// checked-contracts-mode behaviour, and the loader cannot see the mode). The
+// known shape that lands here is a clause naming an INHERITED member: the
+// synthetic source re-declares only the class's OWN members (the #710/#2290
+// limitation shared by every reconstruction path in this file), so
+// `invariant(BaseField > 0);` on a derived exported class does not resolve.
+// That residual is narrower than the defect it sits inside and is tracked as
+// issue #4599 (with the §11.6 nested-imported-class one) rather than hidden.
+//
+// Verified to reconstruct, by two-module probe: a clause over the class's own
+// `private` field (those cross for layout, #2456), a clause naming a
+// class-level `const` (#4514's stubs), and a clause on a GENERIC imported
+// class instantiated in the importer.
+static bool parseAndAttachInvariants(const MetaTypeDecl& td,
+                                     const std::string& moduleName,
+                                     sema::TypeSymbol& importedType,
+                                     sema::SemaContext& mainCtx) {
+    if (td.ownInvariantText.empty()) return false;
+    std::string source =
+        buildSyntheticFieldInitSource(td, moduleName, td.ownInvariantText);
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    // The fresh context and its diagnostics must OUTLIVE this function: the
+    // published Expr* nodes live in `sf` and their symbols/types live in the
+    // fresh context's arena. Engine first (destroyed last), context second —
+    // the same ordering discipline every sibling path documents.
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    // §2.8.2 / #2375: make the exporting module's PUBLIC sibling types visible
+    // to the `import <moduleName>;` line the synthetic source emits, so a
+    // clause naming one resolves to the REAL imported symbol. Same registration
+    // (and same #3748 per-symbol type-channel carry) as the field-init path.
+    if (const std::vector<sema::TypeSymbol*>* siblings =
+            mainCtx.importedTypesOf(moduleName)) {
+        for (sema::TypeSymbol* sib : *siblings) {
+            if (!sib || sib->name.empty()) continue;
+            if (sib->name == td.name) continue;
+            freshCtx.registerImportedType(moduleName, sib);
+            for (sema::Symbol* mem : sib->members) {
+                if (!mem) continue;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem)) {
+                    if (sema::TypeRef* rt = mainCtx.importedReturnType(ms))
+                        freshCtx.setImportedReturnType(
+                            ms, rt, mainCtx.importedReturnOwned(ms));
+                } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem)) {
+                    if (sema::TypeRef* ty = mainCtx.importedMemberType(fs))
+                        freshCtx.setImportedMemberType(fs, ty);
+                } else if (auto* ps =
+                               dynamic_cast<sema::PropertySymbol*>(mem)) {
+                    if (sema::TypeRef* ty = mainCtx.importedMemberType(ps))
+                        freshCtx.setImportedMemberType(ps, ty);
+                }
+                freshCtx.markImported(mem);
+            }
+        }
+    }
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    // §14.1/#783 soundness gate: a clause that does not type-check cleanly
+    // would lower to a silently-wrong predicate (or to nothing), which is the
+    // very failure mode this fix exists to remove — decline instead.
+    if (semaDiag->hasErrors()) return false;
+
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) return false;
+
+    // Locate the re-parsed `invariant` members by walking the freshly-PARSED
+    // AST directly. `InvariantDecl` is not modelled as a `Symbol` at all
+    // (SymbolCollection creates none — see TypeResolution_Checks.cpp's #4115
+    // note), so the AST is the only route; walking `sf` also keeps this
+    // function off the #3152 seam ratchet's `<sym>->decl` cast count, for the
+    // reason parseAndAttachFieldInit's #3736 Property arm records.
+    const ast::TypeDecl* freshTd = nullptr;
+    for (const auto& top : sf->topDecls) {
+        auto* cand = dynamic_cast<const ast::TypeDecl*>(top.get());
+        if (cand && cand->name == td.name) { freshTd = cand; break; }
+    }
+    if (!freshTd) return false;
+    std::vector<const ast::Expr*> exprs;
+    for (const auto& member : freshTd->members) {
+        auto* inv = dynamic_cast<const ast::InvariantDecl*>(member.get());
+        if (!inv || !inv->expr || inv->isStatic) continue;
+        exprs.push_back(inv->expr.get());
+    }
+    if (exprs.empty()) return false;
+
+    // Storage remap: every FIELD and non-indexer PROPERTY of the imported
+    // class, so a clause's bare `v` binds to the REAL imported symbol —
+    // `fieldIndex_` / `storageMemberOf` are keyed on it, and a fresh symbol
+    // would make codegen build a separate struct identity for the same
+    // storage (the #3207 measurement).
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        bool isStorage = dynamic_cast<sema::FieldSymbol*>(m) != nullptr;
+        if (!isStorage) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            isStorage = ps && !ps->isIndexer;
+        }
+        if (isStorage && !m->name.empty()) importedFields[m->name] = m;
+    }
+    // Self-method remap, signature-keyed — §22.16 admits a clause calling a
+    // `pure` public method of the same instance.
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator)
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+        }
+    }
+
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        // fix #4514's arm, for the same reason: a class-level `const` named by
+        // a clause is registered BY IDENTITY (it has no storage and no runtime
+        // identity to unify) and must not fall into the storage map below.
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+            continue;
+        }
+        auto* propSym = dynamic_cast<sema::PropertySymbol*>(freshSym);
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym) ||
+            (propSym && !propSym->isIndexer)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end()) {
+                mainCtx.setExprSymbol(expr, it->second);
+                continue;
+            }
+            mainCtx.setExprSymbol(expr, freshSym);  // #2375 sibling member
+        } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            auto it = importedMethods.find(freshMethodSigKey(fms));
+            if (it != importedMethods.end()) {
+                mainCtx.setExprSymbol(expr, it->second);
+                continue;
+            }
+            mainCtx.setExprSymbol(expr, freshSym);  // #2375 sibling method
+        } else {
+            mainCtx.setExprSymbol(expr, freshSym);
+        }
+    }
+
+    // The four AST-keyed side tables, copied exactly as the sibling paths do —
+    // a clause sub-expression with no `exprType` lowers as a null and the
+    // predicate silently answers the wrong thing (#3748's measurement on the
+    // field-init path). Self-TypeRefs are rebound to the imported symbol first
+    // (#2954), so a `typeof`/`is` over the class itself does not name the
+    // synthetic shadow.
+    rebindSelfTypeRefsIn(freshCtx, freshType, &importedType);
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
+
+    importedType.importedInvariantExprs = std::move(exprs);
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 }  // namespace
 
 void stripContractFacts(MetaMember& member) {
@@ -5111,11 +5351,24 @@ void stripContractFacts(MetaMember& member) {
         for (MetaMember& nested : member.nestedType->members)
             stripContractFacts(nested);
         member.nestedType->invariants.clear();
+        // fix #4592 (§22.16 / §2.8.3 rule 3, v0.306): the invariant SOURCE
+        // text is a contract fact of exactly the kind this walk exists to
+        // drop. See the sibling clear below for why leaving it would make an
+        // opaque pre-carriage artifact disagree with a carrying one.
+        member.nestedType->ownInvariantText.clear();
     }
 }
 
 void stripContractFacts(MetaTypeDecl& type) {
     type.invariants.clear();
+    // fix #4592 (§22.16 / §2.8.3 rule 3, v0.306): `ownInvariantText` rides
+    // beside `invariants` and must be dropped with them. `metadataDescriptions
+    // Agree` uses this walk when EITHER duplicate description is opaque (a
+    // pre-carriage artifact "makes no behavioral claim"); clearing the records
+    // but keeping the text would leave `operator==` comparing "" against
+    // `invariant(v > 0);` and report a §2.8.3 rule 3 staleness disagreement
+    // for two descriptions the rule says agree.
+    type.ownInvariantText.clear();
     for (MetaMember& member : type.members) stripContractFacts(member);
 }
 
@@ -5631,6 +5884,33 @@ static void loadMetadataPass2(
         if (t->hasPositionalFields && !td.baseCtorArgsText.empty()) {
             parseAndAttachBaseCtorArgs(td, *t, ctx);
         }
+    }
+
+    // §22.16 / §2.8.2 (fix #4592): Pass 3b — the class's OWN `invariant(E);`
+    // clauses. `ownInvariantText` is on the MetaTypeDecl itself, like
+    // `dtorBodyText` and `baseCtorArgsText`, but this walk is DELIBERATELY its
+    // own loop rather than a step inside pass 3 above: pass 3's gate `continue`s
+    // for every non-generic class that carries no exported method body, and a
+    // class with an invariant is under no obligation to be generic or to export
+    // a body — the two-module repro in #4592 (`public class BaseA … invariant(v
+    // > 0);`) is exactly that shape, and attaching inside pass 3 left it
+    // silently unreconstructed, i.e. the defect unchanged.
+    //
+    // Position after pass 3 matters for the same reason pass 3 runs after
+    // pass 2: every member symbol a clause binds to (fields, auto-property
+    // storage, `const`s, pure self-methods) must already exist on `*t`, or the
+    // remap inside would find an empty member list and register the throwaway
+    // context's own symbols — which codegen would then lower against a
+    // different struct identity (the #3207 failure shape).
+    //
+    // Top-level types only; a §11.6 NESTED imported class's clauses are not
+    // reached (issue #4599).
+    for (std::size_t i = 0; i < md.types.size(); ++i) {
+        const MetaTypeDecl& td = md.types[i];
+        sema::TypeSymbol* t = created[i];
+        if (t->kind != ast::TypeDeclKind::Class) continue;
+        if (td.ownInvariantText.empty()) continue;  // none, or a pre-#4592 blob
+        parseAndAttachInvariants(td, md.moduleName, *t, ctx);
     }
 
     // §26 / §2.5 (#735) — Pass 4: reconstruct exported EXTENSION blocks. An
