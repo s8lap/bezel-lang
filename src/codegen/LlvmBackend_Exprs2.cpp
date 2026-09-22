@@ -11262,6 +11262,19 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     // dispose-exactly-once pair as the CaseStmt arm.
     llvm::AllocaInst* scrutOwnedSlot = nullptr;
     bool scrutOwnIsOwningCollection = false;
+    // fix #4625 / §28.3 *`case` scrutinees extend the boundary* (v0.307): the
+    // owning-CHOICE spelling of the same K8.3 boundary, which §28.3 applies "in
+    // statement position exactly as in expression position". `lowerCaseStmt`
+    // captured such a scrutinee (#4552/#4609/#4617); this function did not
+    // capture it at ALL — no slot, no dispose-stack entry, no
+    // construct-completion reclaim — so an owning match in expression position
+    // leaked its payloads outright. MEASURED on
+    // `var r := (case Outer.W(new Widget("a"), new Widget("b")) of
+    //            W(_, _) => 1, X => 2);` over
+    // `choice Outer W(owned a: Widget, owned b: Widget), X;`: neither
+    // destructor ran, `LeakSanitizer: 48 byte(s) leaked in 2 allocation(s)`.
+    llvm::AllocaInst* scrutChoiceSlot = nullptr;
+    const sema::TypeRef* scrutChoiceRef = nullptr;
     if (ce.scrutinee) {
         scrut = lowerExpr(*ce.scrutinee);
         if (!scrut) return nullptr;
@@ -11308,10 +11321,78 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             if (!disposeStack_.empty())
                 disposeStack_.back().push_back(d);
         }
+        // fix #4625 / §35.5 *The owning match* + §28.3 (v0.307): capture the
+        // owning-CHOICE scrutinee, byte-for-byte the capture `lowerCaseStmt`
+        // performs. An owning choice is a VALUE type, so `scrut` is a struct in
+        // a register and the `scrutOwnedSlot` gate above (which requires a
+        // pointer) declines it — in statement position #4552 added this arm;
+        // here it was simply absent, and §28.3 requires the K8.3 boundary "in
+        // statement position exactly as in expression position".
+        //
+        // Both of §35.5's announcing scrutinee forms are admitted, exactly as
+        // in statement position: an unbound owned temporary
+        // (`unboundOwningChoiceTemp`) and a named owned binding under the
+        // explicit transfer marker (`case move o of …`,
+        // `markedOwningChoiceScrutineeSlot`), the latter additionally CONSUMING
+        // its source — "the consumed binding is left moved-from when the
+        // construct completes". The Disposal entry is NOT `unwindOnly`, for
+        // #4609's reason: a `throw` out of an arm body takes the unwind edge,
+        // but the construct can also be left by an exception raised in a LATER
+        // operand of the enclosing full expression, and `emitDisposals` skips an
+        // `unwindOnly` entry when `dropUndischarged` is false.
+        llvm::AllocaInst* markedSrcSlot =
+            markedOwningChoiceScrutineeSlot(ce.scrutinee.get(), scrutTy);
+        if (!scrutOwnedSlot && scrut &&
+            (unboundOwningChoiceTemp(ce.scrutinee.get(), scrutTy) ||
+             markedSrcSlot) &&
+            !scrut->getType()->isPointerTy() && !disposeStack_.empty()) {
+            scrutChoiceSlot = entryAlloca(scrut->getType());
+            builder_.CreateStore(scrut, scrutChoiceSlot);
+            scrutChoiceRef = scrutTy;
+            Disposal d{scrutChoiceSlot, nullptr};
+            d.unwindOnly = false;
+            d.owningChoice = true;
+            d.owningChoiceTy = scrutTy->declaration;
+            d.owningChoiceRef = scrutTy;
+            disposeStack_.back().push_back(d);
+            if (markedSrcSlot)
+                builder_.CreateStore(
+                    llvm::Constant::getNullValue(
+                        markedSrcSlot->getAllocatedType()),
+                    markedSrcSlot);
+        }
     }
     const sema::TypeRef* resultSemaTy = ctx_.exprType(ce);
     llvm::Type* resultTy = i32();
     if (resultSemaTy) resultTy = lowerTypeRef(resultSemaTy);
+
+    // fix #4625 / §35.5 + §28.3 (v0.307): the captured owning-choice
+    // scrutinee's NORMAL-edge reclaim at the construct's completion — K8.3's
+    // boundary, the exact counterpart of the one `lowerCaseStmt` emits at the
+    // top of its `casestmt.end`. Every payload the selected arm did NOT
+    // transfer (the per-slot marks above decide which) is disposed here, after
+    // every arm body has run, so §19.3's pattern bindings stay alive through
+    // the arm body. The zero-store after it makes the reclaim exactly-once at
+    // RUNTIME too: the dispose-stack entry covering a `throw` out of an arm, or
+    // out of a later operand of the enclosing full expression, then walks a
+    // zeroed choice (tag 0, null payload pointers) and disposes nothing. The
+    // compile-time erasure alone is edge-order-dependent — #2816's lesson.
+    auto emitOwningChoiceScrutReclaim = [&]() {
+        if (!scrutChoiceSlot || !scrutChoiceRef) return;
+        emitOwningChoiceLocationDisposal(scrutChoiceSlot, scrutChoiceRef);
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(scrutChoiceSlot->getAllocatedType()),
+            scrutChoiceSlot);
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == scrutChoiceSlot) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
+    };
 
     auto* endBB = llvm::BasicBlock::Create(llvm_, "case.end", currentFn_);
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incomings;
@@ -11452,6 +11533,35 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             builder_.CreateCondBr(pm, bodyBB, nextBB);
         }
         builder_.SetInsertPoint(bodyBB);
+        // fix #4625 / §35.5 (v0.307): the PER-SLOT discharge of the
+        // construct-completion reclaim, the same call `lowerCaseStmt` makes at
+        // the top of a selected arm's body (#4609's per-arm gate, narrowed to
+        // per-slot by #4617). `bodyBB` is reached only on selection — a
+        // guard-declined arm branches to `nextBB` and "transfers nothing"
+        // (§35.5 *Guards*) — so this is exactly §35.5's boundary. The arm's
+        // bindings were filled from the scrutinee VALUE, never re-read from
+        // this slot, so the arm body below cannot observe the marks.
+        //
+        // THIS IS NOT OPTIONAL PRECISION IN EXPRESSION POSITION — it is what
+        // makes the reclaim below safe. §28.3's boundary "is what keeps
+        // §19.3's pattern bindings — borrows whose source is the scrutinee —
+        // alive through the arm body", and in expression position such a borrow
+        // can be the ARM'S RESULT and outlive the construct. MEASURED, admitted
+        // by the checker today:
+        //
+        //   var got := (case move o of W(var w, _) => w, X => other);
+        //   Console.WriteLine($"got={got.Ping()}");
+        //
+        // `got` is a borrow of payload `a`. Reclaiming the whole value at
+        // completion — a reclaim with no discharge — disposes `a` before that
+        // read: a use-after-free. Marking the slot the arm bound leaves `a` out
+        // of the reclaim, which is §35.5's own answer ("transfers the case's
+        // `owned` … payloads into its bindings") and #4617's sound direction:
+        // failing to mark a slot the arm took is a double free, marking one it
+        // did not is a leak.
+        if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
+            dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
+                                          arm.pattern.get());
         llvm::Value* v = lowerExpr(*arm.exprBody);
         // CG40 (§17.12 / §19): an arm body that diverges (`throw E`, or a
         // body that branches to the unwind/propagate target) has already
@@ -11831,6 +11941,10 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             builder_.CreateBr(scrutEndBB);
             builder_.SetInsertPoint(scrutEndBB);
         }
+        // fix #4625: a unit/void-result case expression forms no PHI, so the
+        // reclaim has no ordering constraint here — emit it at the top of
+        // `case.end`, exactly where `lowerCaseStmt` emits its own.
+        emitOwningChoiceScrutReclaim();
         return nullptr;
     }
     // K8 full-expression boundary (#1795): dispose the case-scrutinee owned
@@ -11843,7 +11957,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     // the PHI predecessors stay correct and IR verification passes.
     llvm::BasicBlock* scrutEndBB = nullptr;
     llvm::AllocaInst* resultSlot = nullptr;
-    if (ce.scrutinee && scrutOwnedSlot) {
+    if (ce.scrutinee && (scrutOwnedSlot || scrutChoiceSlot)) {
         // Allocate a slot for the case's result value BEFORE endBB has any
         // instructions, so the dispose call below can run without first having
         // to thread the result through a PHI (the PHI in endBB would otherwise
@@ -11877,6 +11991,28 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             llvm_, "casescrut.end", currentFn_);
         builder_.CreateBr(scrutEndBB);
         builder_.SetInsertPoint(scrutEndBB);
+        return builder_.CreateLoad(
+            incomings[0].first->getType(), resultSlot, "case.result");
+    }
+    // fix #4625 / §35.5 + §28.3 (v0.307): THE ORDERING CONSTRAINT expression
+    // position adds over statement position. The reclaim must run AFTER the
+    // selected arm's result value exists — otherwise it frees a payload the
+    // result still borrows (§28.3: the boundary "is what keeps §19.3's pattern
+    // bindings … alive through the arm body") — and it CANNOT be emitted
+    // before the PHI, because a PHI must be the first instruction of its block
+    // and `emitOwningChoiceLocationDisposal` emits a tag switch that TERMINATES
+    // the current block and leaves the insert point in a fresh join block.
+    //
+    // Both are satisfied by: build the PHI at the top of `case.end` (each arm's
+    // value was already computed and coerced in the arm's OWN block, so every
+    // incoming edge dominates), spill it to an entry-block slot, emit the
+    // reclaim, and reload in whatever block the reclaim left us in. That is the
+    // same spill/reload the #1795 owned-POINTER scrutinee above performs, and
+    // it keeps the returned value defined in the post-reclaim block without
+    // disturbing the PHI's predecessor edges.
+    if (ce.scrutinee && scrutChoiceSlot && scrutChoiceRef) {
+        builder_.CreateStore(phi, resultSlot);
+        emitOwningChoiceScrutReclaim();
         return builder_.CreateLoad(
             incomings[0].first->getType(), resultSlot, "case.result");
     }
