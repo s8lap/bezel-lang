@@ -13157,6 +13157,73 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         }
     }
     if (args.size() == it->second->arg_size()) {
+        // fix #4575 (§22.8 step 1 "The base or chained constructor call" /
+        // §12.8 "Constructor chaining" / §22.10 "Primary constructors",
+        // v0.306): pre-populate the base's §22.10 primary positional fields
+        // for `target` — the constructor a `this(...)` hop is ABOUT TO CALL
+        // FOR REAL, right below — before making that call.
+        //
+        // §22.8 step 1: "For a `this(...)` chain, the chained-to constructor
+        // runs to completion (its own steps of this sequence) before control
+        // returns here" — so when `target`'s OWN step 1 is an explicit
+        // `base(...)` into a base with NO ConstructorSymbol (a bare §22.10
+        // primary parameter list and no explicit constructor —
+        // `hasAnyConstructor(base) == false`), that step must actually WRITE
+        // the base's positional fields. It does not: the `!target` arm of
+        // THIS function (above, "base() with no matching base CONSTRUCTOR
+        // symbol") declines to evaluate `call->args` for that shape, on the
+        // documented assumption that "the base's positional-param fields
+        // were already stored by prePopulateBasePositionalFields at the
+        // `new` site" — true only when `target` IS the construction entry
+        // point. Fix #3583 already added the parallel call for a
+        // `this(...)` chain that resolves DIRECTLY to the enclosing class's
+        // own PRIMARY constructor (`isThis && currentThis_` below, the
+        // #1087 shape); this is its twin for a `this(...)` hop that instead
+        // resolves to an EXPLICIT sibling constructor (`target`, non-null
+        // here) whose own leading statement is the `base(...)` that needs
+        // the values — a shape #3583 never reached.
+        //
+        // MEASURED on cafdfc52 (origin/main, this commit's parent), issue
+        // #4575's own repro: `class B(n: int, s: string)` (no explicit
+        // constructor) with `class D : B` declaring `constructor() this(1);
+        // end` and `constructor(k: int) base(k, "x"); end`. `new D()`
+        // selects `constructor()`; the `new` site itself skips
+        // `prePopulateBasePositionalFields` entirely for an entry whose own
+        // body chains via `this(...)` (`boundCtorChainsThis`,
+        // LlvmBackend_Exprs2.cpp) — correct, since "the chain arm now runs
+        // it" (per that call's own comment) — but the only chain arm that
+        // ever did was the primary-landing one; this `target`-found arm
+        // never did. Result: `bezelc` exits 0 with no diagnostic and the
+        // program prints `0` and a blank line where `1` / `x` is correct.
+        // The single-hop spelling — `new D(1)`, selecting `constructor(k:
+        // int)` directly — was already correct, because THAT entry point's
+        // own `base(...)` is what `prePopulateBasePositionalFields`
+        // inspects.
+        //
+        // `args[0]` is the receiver; `args[1..]` are `target`'s own
+        // parameters, in declaration order, ALREADY fully lowered and
+        // defaulted (the `fillOmittedCtorArgs` call above, and this `if`'s
+        // own arity guard). Reusing them here — rather than re-lowering
+        // `call->args` a second time — is what keeps this exactly ONE
+        // evaluation of each argument expression, per §22.5 "Evaluation
+        // timing": `target`'s formal `k` is bound to the VALUE `this(1)`'s
+        // own (single, real) evaluation of `1` already produced, not to a
+        // second lowering of that expression. `ctorArgsByRefAbi=false`:
+        // these are VALUES, matching every other non-top-level caller of
+        // this function (the declaration comment, LlvmBackend_impl.hpp).
+        //
+        // Scoped to `isThis`: an explicit `base(...)` chain that resolves to
+        // an EXPLICIT base constructor (`!isThis`, `target` found) is a
+        // materially different shape — a cross-class hop, not a same-class
+        // sibling — not exercised by issue #4575's repro or by this fix's
+        // regression tests, and left as today's behavior.
+        if (isThis) {
+            std::vector<llvm::Value*> targetArgVals(args.begin() + 1,
+                                                     args.end());
+            prePopulateBasePositionalFields(targetCls, currentThis_,
+                                            targetArgVals, target,
+                                            /*ctorArgsByRefAbi=*/false);
+        }
         // fix #4077: install the unwind edge for the throw / propagate path.
         // Mirrors lowerCall's `closureArgUnwindCleanup` half (mutually
         // exclusive with the post-call release on every concrete edge).
