@@ -37660,22 +37660,53 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                 // D installs the compiler-generated `bz$T$Dispose` for EVERY local
                 // class (including those with no user destructor), so slot 2 is
                 // always non-null for a class that's in disposerFns_.
-                if (isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
+                // fix #4616 (§28.3 / §14.1 / §14.4, v0.307): resolve the
+                // result type through the ACTIVE MONOMORPHIZATION before
+                // classifying it. `OwningStack<T>.Pop()` declares `owned T`
+                // (stdlib §4.11), so inside a generic body the call's sema
+                // type is the placeholder `T` — a `Named` TypeRef with a null
+                // `declaration` — which `isClassOrInterfaceRef` rejects and
+                // whose `->declaration` is null for the disposer lookup two
+                // lines down. This arm was the ONLY one in this classifier
+                // that tested the raw `exprType` with no
+                // `|| isClassOrInterfaceRef(resolveTypeParamRef(...))`
+                // companion (every other arm — (a1), (a1u), (a2), (b0),
+                // (b0b), (b0c), (b0d), (b1), (b1f) — already carries one), so
+                // a `using var top := l.Pop();` in a generic body registered
+                // NO disposal at all and the popped object leaked: measured
+                // 0/100 destructor runs against 100/100 for the non-generic
+                // `OwningStack<Res>` twin. §3.6 makes the element category a
+                // DERIVED property of the type and §14.4 fixes the owning
+                // family's class/interface restriction at the INSTANTIATION,
+                // so the classification that governs here is the one at the
+                // substitution, not at the generic declaration; §14.1's
+                // monomorphization is what makes it concrete at the point
+                // this disposal is registered. `resolveTypeParamRef` returns
+                // its argument unchanged when there is no active substitution
+                // (or the head is not a bound parameter), so the concrete
+                // path is byte-identical. Same root cause and same shape as
+                // fix #4596 in `elementPolicyFor`, a different path: that one
+                // governs a collection's ELEMENT slots, this one the
+                // `using var` local's own scope-end disposal.
+                const sema::TypeRef* eTy =
+                    resolveTypeParamRef(ctx_.exprType(*ld->initializer));
+                if (isClassOrInterfaceRef(eTy)) {
                     // §2.14 / §4.5 / §4.11 / §29.1 (#550/#642/#746/#1349): the
                     // builtin owned-TRANSFER calls (Pop/Dequeue on owning
                     // stacks/queues, PopLast/PopFirst/PopAt/PopValue,
                     // T.Deserialize, TakeCurrent on owning enumerators) —
                     // recognized by name + owning receiver in the shared
                     // isBuiltinOwnedTransferCall (also used by
-                    // unwindOwnedLocalClass for the plain-var forms).
+                    // unwindOwnedLocalClass for the plain-var forms). A
+                    // BORROWING receiver (`Stack<T>.Pop(): T`, stdlib §4.11)
+                    // fails this predicate, so resolving the parameter above
+                    // cannot widen a borrow into an owned slot.
                     if (isBuiltinOwnedTransferCall(*call)) {
                         // Only register if the element class has a disposer
                         // (vtable slot 2 non-null).  Interface-typed results
                         // always dispatch dynamically and always have a vtable,
                         // so treat them as having a disposer too.
-                        const sema::TypeRef* eTy =
-                            ctx_.exprType(*ld->initializer);
-                        if (eTy && eTy->declaration) {
+                        if (eTy->declaration) {
                             bool hasDisposer =
                                 disposerFns_.find(eTy->declaration) !=
                                 disposerFns_.end();
