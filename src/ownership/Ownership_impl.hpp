@@ -560,6 +560,37 @@ public:
         const ast::Expr& e,
         const std::function<void(const ast::CallExpr&)>& fn) const;
 
+    // fix #4628 (§28.9 / §15.3): "Capturing a move-only local follows the
+    // same rule [as capturing an owned class-typed local] — the closure
+    // captures a borrow whose source is the local's enclosing scope; reads
+    // of slots through the captured borrow are admitted, `move arr[i]`
+    // through it is not, because the closure does not own the array."
+    // (§28.9). The general move-only-array leak scan
+    // (`moveOnlyArrayLeakScan`/`moveOnlyArrayLive_`, driven from the
+    // METHOD's own scope) deliberately stops at the `LambdaExpr` boundary —
+    // its own comment records the assumption that nothing reachable only
+    // through a lambda body can slot-move an outer array, which this rule
+    // shows is false. This is the dedicated lambda-body check for exactly
+    // that shape, run from `checkOneLambdaBodyEscapes` alongside its
+    // siblings above. Mirrors `scanLambdaBodyBorrowStores` /
+    // `forEachBorrowStoreCallInStmt` / `forEachBorrowStoreCallInExpr`
+    // shape-for-shape (never crosses into a nested lambda; a nested
+    // lambda's own moves are walked when the flat lambda list in
+    // `checkOneLambdaBodyEscapes` reaches it).
+    void scanLambdaBodyMoveOnlyArraySlotMoves(const ast::LambdaExpr& lam);
+    void checkMoveOnlyArraySlotMovesInStmt(const ast::Stmt& s,
+                                            const ast::LambdaExpr& lam);
+    void checkMoveOnlyArraySlotMovesInExpr(const ast::Expr& e,
+                                            const ast::LambdaExpr& lam);
+    // The check point: `move X[i]` where the IndexExpr `ix` is the operand.
+    // Reports iff `X` resolves to a move-only inline-array LOCAL declared
+    // OUTSIDE `lam` (a capture, by the same span-containment
+    // `declaredInLambda` test `checkClosureEscapesOnReturn`'s §28.8 leg
+    // uses above) — a same-lambda-declared array is an ordinary local, not
+    // a capture, and stays governed by the regular §15.3 rules.
+    void reportIfCapturedMoveOnlyArraySlotMove(const ast::IndexExpr& ix,
+                                                const ast::LambdaExpr& lam);
+
     // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
     // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
     // derivation above) is set by the dataflow's `visitStmt` walk for every

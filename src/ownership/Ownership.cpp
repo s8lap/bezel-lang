@@ -9813,6 +9813,10 @@ void MethodOwnership::checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam) {
     // cannot decide (issue 3702) and which was accepted before.
     if (lam.exprBody) {
         checkClosureEscapesOnReturn(*lam.exprBody, EscapeScope::LambdaBody);
+        // fix #4628 (§28.9 / §15.3): needs no `states_` / flow input (a pure
+        // span-containment + type check), so it runs independent of the
+        // save/clear/restore window above — same reason it is safe below too.
+        checkMoveOnlyArraySlotMovesInExpr(*lam.exprBody, lam);
         states_ = std::move(savedStates);
         localDepth_ = std::move(savedDepths);
         return;
@@ -9826,6 +9830,10 @@ void MethodOwnership::checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam) {
         if (s) scanCatchBorrowClosureReturns(*s);
     for (const auto& s : lam.stmts)
         if (s) scanLambdaBodyBorrowStores(*s);
+    // fix #4628 (§28.9 / §15.3): reject `move X[i]` through a captured
+    // borrow of a move-only inline-array local — see the declaration
+    // comment in Ownership_impl.hpp.
+    scanLambdaBodyMoveOnlyArraySlotMoves(lam);
     states_ = std::move(savedStates);
     localDepth_ = std::move(savedDepths);
 }
@@ -10111,6 +10119,230 @@ void MethodOwnership::forEachBorrowStoreCallInExpr(
     // range: no child expressions that can hold a storing-method CallExpr.
     // (Bind / range do have child expressions, but those children never carry
     // a storing-method call either; consistent with `collectBodyLambdasExpr`.)
+}
+
+// fix #4628 (§28.9 / §15.3, v0.300): see the declaration comment in
+// Ownership_impl.hpp. Driven per-statement over `lam.stmts` via
+// `forEachNestedStmt` (the #3656 single statement grammar), exactly like
+// `scanLambdaBodyBorrowStores` above — statement-LIST recursion is
+// `forEachNestedStmt`'s job, so `checkMoveOnlyArraySlotMovesInStmt` below
+// only extracts each statement's own direct expression children.
+void MethodOwnership::scanLambdaBodyMoveOnlyArraySlotMoves(
+        const ast::LambdaExpr& lam) {
+    for (const auto& top : lam.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [this, &lam](const ast::Stmt& cur) {
+            checkMoveOnlyArraySlotMovesInStmt(cur, lam);
+        });
+    }
+}
+
+// Mirrors `forEachBorrowStoreCallInStmt`'s expression-position dispatch
+// (same statement grammar, same never-recurse-into-nested-statement-lists
+// contract — that recursion is `forEachNestedStmt`'s, done by the caller
+// above), reused here because a `move` expression can appear at any of the
+// same positions a storing call can.
+void MethodOwnership::checkMoveOnlyArraySlotMovesInStmt(
+        const ast::Stmt& s, const ast::LambdaExpr& lam) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) checkMoveOnlyArraySlotMovesInExpr(*ld->initializer, lam);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) checkMoveOnlyArraySlotMovesInExpr(*lc->value, lam);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) checkMoveOnlyArraySlotMovesInExpr(*rs->value, lam);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) checkMoveOnlyArraySlotMovesInExpr(*es->expr, lam);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) checkMoveOnlyArraySlotMovesInExpr(*as->target, lam);
+        if (as->value) checkMoveOnlyArraySlotMovesInExpr(*as->value, lam);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) checkMoveOnlyArraySlotMovesInExpr(*ts->value, lam);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) checkMoveOnlyArraySlotMovesInExpr(*is->target, lam);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) checkMoveOnlyArraySlotMovesInExpr(*ds->value, lam);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) checkMoveOnlyArraySlotMovesInExpr(*ys->value, lam);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            checkMoveOnlyArraySlotMovesInExpr(*ifs->ifBranch.condition, lam);
+        for (const auto& el : ifs->elifBranches)
+            if (el.condition) checkMoveOnlyArraySlotMovesInExpr(*el.condition, lam);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) checkMoveOnlyArraySlotMovesInExpr(*ws->condition, lam);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) checkMoveOnlyArraySlotMovesInExpr(*fs->iterable, lam);
+        if (fs->withExpr) checkMoveOnlyArraySlotMovesInExpr(*fs->withExpr, lam);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) checkMoveOnlyArraySlotMovesInExpr(*cs->scrutinee, lam);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) checkMoveOnlyArraySlotMovesInExpr(*arm.guard, lam);
+            if (arm.exprBody) checkMoveOnlyArraySlotMovesInExpr(*arm.exprBody, lam);
+        }
+        return;
+    }
+    // Break / Continue / DoEndBlock / TryStmt / block-form CaseStmt arms:
+    // no direct expr child of their own here — `forEachNestedStmt` (the
+    // caller) already recurses into their nested STATEMENT lists, which
+    // reach this dispatch per visited statement.
+}
+
+// The expression-side recursion. Mirrors `forEachBorrowStoreCallInExpr`
+// node-for-node, but instead of firing a callback on every `CallExpr`, it
+// checks every `move` (`UnaryExpr` with `op == "move"`) directly: a `move`
+// is a primary-level prefix (grammar A.7), so its only reachable position is
+// as *some* subexpression's child, exactly where a storing `CallExpr` can
+// appear.
+void MethodOwnership::checkMoveOnlyArraySlotMovesInExpr(
+        const ast::Expr& e, const ast::LambdaExpr& lam) {
+    if (dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Nested-lambda boundary: do NOT descend. The flat lambda list in
+        // `checkOneLambdaBodyEscapes` walks this nested lambda separately,
+        // testing `declaredInLambda` against ITS OWN span.
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->op == "move" && un->operand) {
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(un->operand.get()))
+                reportIfCapturedMoveOnlyArraySlotMove(*ix, lam);
+        }
+        if (un->operand) checkMoveOnlyArraySlotMovesInExpr(*un->operand, lam);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) checkMoveOnlyArraySlotMovesInExpr(*ce->callee, lam);
+        for (const auto& a : ce->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) checkMoveOnlyArraySlotMovesInExpr(*nc->callee, lam);
+        for (const auto& a : nc->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) checkMoveOnlyArraySlotMovesInExpr(*ma->target, lam);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) checkMoveOnlyArraySlotMovesInExpr(*nm->target, lam);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) checkMoveOnlyArraySlotMovesInExpr(*ix->target, lam);
+        for (const auto& a : ix->indices)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) checkMoveOnlyArraySlotMovesInExpr(*be->left, lam);
+        if (be->right) checkMoveOnlyArraySlotMovesInExpr(*be->right, lam);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) checkMoveOnlyArraySlotMovesInExpr(*pb->operand, lam);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) checkMoveOnlyArraySlotMovesInExpr(*tt->operand, lam);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) checkMoveOnlyArraySlotMovesInExpr(*cd->condition, lam);
+        if (cd->thenValue) checkMoveOnlyArraySlotMovesInExpr(*cd->thenValue, lam);
+        if (cd->elseValue) checkMoveOnlyArraySlotMovesInExpr(*cd->elseValue, lam);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) checkMoveOnlyArraySlotMovesInExpr(*th->operand, lam);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) checkMoveOnlyArraySlotMovesInExpr(*we->source, lam);
+        for (const auto& ia : we->assigns)
+            if (ia.value) checkMoveOnlyArraySlotMovesInExpr(*ia.value, lam);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) checkMoveOnlyArraySlotMovesInExpr(*k, lam);
+        for (const auto& el : cl->elements)
+            if (el) checkMoveOnlyArraySlotMovesInExpr(*el, lam);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) checkMoveOnlyArraySlotMovesInExpr(*part.expr, lam);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) checkMoveOnlyArraySlotMovesInExpr(*cx->scrutinee, lam);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) checkMoveOnlyArraySlotMovesInExpr(*arm.guard, lam);
+            if (arm.exprBody) checkMoveOnlyArraySlotMovesInExpr(*arm.exprBody, lam);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit / bind /
+    // range: no child expressions that can hold a `move` of an indexed slot.
+}
+
+// The check point: `move X[i]` — `ix` is the IndexExpr operand of a `move`
+// found by the walker above. Reports iff `X` is a bare identifier resolving
+// to a move-only inline-array LOCAL declared OUTSIDE `lam` (a capture).
+void MethodOwnership::reportIfCapturedMoveOnlyArraySlotMove(
+        const ast::IndexExpr& ix, const ast::LambdaExpr& lam) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix.target.get());
+    if (!id) return;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls || !ls->decl) return;
+    long long size = 0;
+    if (!isMoveOnlyInlineArrayType(ls->declType, size)) return;
+    // Same `declaredInLambda` span-containment test `checkClosureEscapesOnReturn`'s
+    // §28.8 leg uses above (Ownership.cpp, the isBorrow classifier): a local
+    // whose OWN declaration lies inside `lam`'s span is this lambda's own
+    // production, not a capture from the enclosing scope.
+    const bool declaredInLambda =
+        ls->decl->span.begin.offset >= lam.span.begin.offset &&
+        ls->decl->span.end.offset <= lam.span.end.offset;
+    if (declaredInLambda) return;
+    report(Severity::Error, ix.span.begin,
+           std::string("cannot `move` slot `") + std::string(id->name) +
+           "[...]` through the closure's captured borrow of `" +
+           std::string(id->name) +
+           "`: the closure does not own the array (§28.9); read the slot "
+           "instead, or have the caller `move` the needed slots in as an "
+           "`owned` argument before constructing the closure");
 }
 
 // fix #3571: a thin `scanReturnsIn` leaf, firing `checkClosureEscapesOnReturn`
