@@ -1270,13 +1270,68 @@ private:
     // false; returns true when compatible. The check is shape-driven on the
     // AST so it recognizes the FFI-boundary named types
     // (CString/WString/RawBytes/IntPtr/UIntPtr), which have no user TypeSymbol.
+    // `paramModifier` is the extern parameter's `ref`/`out` marker (empty for a
+    // plain parameter and for the return slot). §32.13 clause 3 admits a
+    // C-compatible record "by address only: as `ref`/`out` extern parameters",
+    // so the modifier is part of the admissibility question, not decoration.
     bool checkExternType(const ast::Type& t, bool returnPosition,
-                         const std::string& declSpelling);
+                         const std::string& declSpelling, Scope* scope,
+                         std::string_view paramModifier = {});
 
     // §32.5: the FFI-compatibility predicate without diagnostics. Used by
     // checkExternType and, recursively, for inline-array element types and
     // function-type parameter/return types. `returnPosition` permits unit.
-    static bool isFfiCompatibleType(const ast::Type& t, bool returnPosition);
+    //
+    // No longer `static` (v0.306): §32.5 admits `Ptr<T>` and §32.13's
+    // single-field handle records, and neither can be decided from the AST
+    // shape alone — the pointee gate and the C-compatible property both need
+    // the record's declaration, which is reached through `scope`.
+    bool isFfiCompatibleType(const ast::Type& t, bool returnPosition,
+                             Scope* scope);
+
+    // §32.13 clause 1 (v0.306), the derived property: "a record is
+    // C-compatible iff every field's type is an FFI-compatible scalar (integer
+    // types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, `Ptr<T>`), an
+    // inline array `[N]T` of such a scalar …, or another C-compatible record
+    // (nesting; recursion is impossible — records are value types)". `depth`
+    // bounds the nesting walk so a malformed (cyclic) declaration terminates
+    // rather than recursing forever.
+    bool isCCompatibleRecord(const ast::Type& t, Scope* scope, int depth = 0);
+
+    // §32.13 clause 4 (v0.306), the typed-handle form: "A C-compatible record
+    // with exactly one field, of *integer or pointer* scalar type (integer
+    // types, `IntPtr`, `UIntPtr`, `Ptr<T>` — not `float`/`double`, not `bool`),
+    // is FFI-compatible **directly** — parameter, return, `ref`/`out`, and
+    // callback positions — marshalling exactly as its field."
+    bool isSingleFieldHandleRecord(const ast::Type& t, Scope* scope);
+
+    // §32.12 clause 1 (v0.306), the pointee gate: "`T` is drawn from the
+    // **FFI-pointee set** — integer types, `float`, `double`, `bool`,
+    // `IntPtr`, `UIntPtr`, and C-compatible records". Deliberately NOT §32.5's
+    // scalar set: `Ptr<U>` is an FFI-compatible scalar but is not a member
+    // here, "which is exactly what makes `Ptr<Ptr<U>>` inadmissible".
+    bool isFfiPointeeType(const ast::Type& t, Scope* scope, int depth = 0);
+
+    // The `sema::TypeSymbol` a single-part named type resolves to through the
+    // lexical scope chain, or null. A scope walk rather than
+    // `ctx_.resolvedType` so the answer does not depend on whether the record
+    // happens to be declared textually before the `extern` block that names
+    // it — `run()` walks `topDecls` in declaration order. Deliberately the
+    // SYMBOL, not its `ast::TypeDecl`: an imported record has no declaration
+    // at all (the #3152 seam), and every fact these predicates need — the
+    // declaration kind, the generic-parameter list, the field members and
+    // their types — the symbol carries on both sides of a module boundary.
+    const TypeSymbol* namedTypeSymbolInScope(const ast::Type& t,
+                                             Scope* scope) const;
+
+    // The symbol-side core of §32.13 clause 1, and the TypeRef predicates it
+    // is built from. Split this way so there is ONE classification, reached
+    // either from an `ast::Type` written in an extern signature or from a
+    // field's resolved type — not two spellings that can drift.
+    bool isCCompatibleRecordSym(const TypeSymbol* ts, int depth);
+    bool isCCompatibleFieldTypeRef(const TypeRef* rt, int depth);
+    bool isFfiScalarTypeRef(const TypeRef* rt, int depth);
+    bool isFfiPointeeTypeRef(const TypeRef* rt, int depth);
 
     // ---- §14.2: nested-generic constraint propagation -------------------
     //

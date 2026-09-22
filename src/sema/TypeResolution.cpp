@@ -273,8 +273,25 @@ void Resolver::run(const ast::SourceFile& src) {
                 "unreachable — choose a different alias (\xC2\xA7""2.2)");
         }
     }
+    // per §32.13 clause 1 / §32.5 (v0.306): an `extern` signature's
+    // admissibility depends on DERIVED properties of the types it names — is
+    // this record C-compatible? is this `Ptr<T>`'s pointee in the FFI-pointee
+    // set? — and those are computed from the record's own resolved field
+    // types. This loop walks `topDecls` in DECLARATION ORDER, so an extern
+    // block written above the record it names would see unresolved fields and
+    // reject a declaration the spec admits. §32.1 puts extern declarations at
+    // module level with no ordering rule, so resolve every other top-level
+    // declaration first and the extern blocks afterwards. (Only signatures are
+    // involved — no body is resolved here — so nothing else observes the
+    // deferral.)
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
+        if (dynamic_cast<const ast::ExternBlock*>(decl.get())) continue;
+        resolveTopDecl(*decl, &moduleScope);
+    }
+    for (const auto& decl : src.topDecls) {
+        if (!decl) continue;
+        if (!dynamic_cast<const ast::ExternBlock*>(decl.get())) continue;
         resolveTopDecl(*decl, &moduleScope);
     }
     // fix #4047 (§27.8, v0.294): the forward pass above walks

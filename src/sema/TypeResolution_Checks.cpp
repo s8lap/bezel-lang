@@ -9655,6 +9655,18 @@ static std::string spellExternType(const ast::Type& t) {
             } else {
                 out = "<type>";
             }
+            // §32.5 (v0.306): `Ptr<T>` is admitted per-instantiation, so a
+            // diagnostic that prints the bare head `Ptr` names neither the
+            // offending instantiation nor the rule. Render the arguments.
+            if (!t.genericArgs.empty()) {
+                out += "<";
+                for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+                    if (i) out += ", ";
+                    out += t.genericArgs[i] ? spellExternType(*t.genericArgs[i])
+                                            : "?";
+                }
+                out += ">";
+            }
             break;
         case ast::TypeKind::InlineArray:
             out = t.arrayOwned ? "[N owned]" : "[N]";
@@ -9669,7 +9681,171 @@ static std::string spellExternType(const ast::Type& t) {
     return out;
 }
 
-bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
+// per §32.13 clause 1 / §32.12 clause 1 (v0.306): the FFI scalar names that
+// can be recognised without a declaration. The record/`Ptr<T>` arms need one,
+// and go through the symbol side below.
+static bool isFfiScalarPrimitiveName(std::string_view n) {
+    PrimitiveType p = primitiveFromName(n);
+    return p != PrimitiveType::None && isFfiPrimitive(p);
+}
+
+const TypeSymbol* Resolver::namedTypeSymbolInScope(const ast::Type& t,
+                                                   Scope* scope) const {
+    if (t.kind != ast::TypeKind::Named || !t.name ||
+        t.name->parts.size() != 1)
+        return nullptr;
+    for (Scope* s = scope; s; s = s->parent) {
+        auto it = s->names.find(t.name->parts.front());
+        if (it == s->names.end()) continue;
+        return dynamic_cast<const TypeSymbol*>(it->second);
+    }
+    return nullptr;
+}
+
+// per §32.5 (v0.306): "FFI-compatible scalar (integer types, `float`,
+// `double`, `bool`, `IntPtr`, `UIntPtr`, `Ptr<T>`)" — §32.13 clause 1's field
+// set. Reads the resolved TypeRef, never an `ast::TypeDecl`, so an IMPORTED
+// record (whose TypeSymbol has no declaration at all) classifies identically
+// to a local one — the #3152 seam.
+bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
+    if (!rt || rt->nullable) return false;
+    if (rt->kind == TypeRef::Kind::Primitive)
+        return isFfiPrimitive(rt->primitive);
+    if (rt->kind != TypeRef::Kind::Named) return false;
+    std::string_view h = rt->headName();
+    if (h == "IntPtr" || h == "UIntPtr") return true;
+    if (h == "Ptr")
+        return rt->genericArgs.size() == 1 &&
+               isFfiPointeeTypeRef(rt->genericArgs[0], depth + 1);
+    return false;
+}
+
+// per §32.12 clause 1 (v0.306): the FFI-POINTEE set — "integer types,
+// `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records".
+// One member short of the scalar set above, deliberately: `Ptr<U>` "is an
+// FFI-compatible scalar … but is **not** a member here, which is exactly what
+// makes `Ptr<Ptr<U>>` inadmissible".
+bool Resolver::isFfiPointeeTypeRef(const TypeRef* rt, int depth) {
+    if (!rt || rt->nullable) return false;
+    if (rt->kind == TypeRef::Kind::Primitive)
+        return isFfiPrimitive(rt->primitive);
+    if (rt->kind != TypeRef::Kind::Named) return false;
+    std::string_view h = rt->headName();
+    if (h == "IntPtr" || h == "UIntPtr") return true;
+    if (h == "Ptr") return false;  // the §32.12 v1 decline
+    return isCCompatibleRecordSym(rt->declaration, depth + 1);
+}
+
+// per §32.13 clause 1: a field's type is "an FFI-compatible scalar …, an
+// inline array `[N]T` of such a scalar (§32.5's element set …), or another
+// C-compatible record (nesting)".
+bool Resolver::isCCompatibleFieldTypeRef(const TypeRef* rt, int depth) {
+    if (!rt || rt->nullable) return false;
+    if (isFfiScalarTypeRef(rt, depth)) return true;
+    if (rt->kind == TypeRef::Kind::InlineArray)
+        return !rt->arrayOwned && isFfiScalarTypeRef(rt->arrayElement, depth);
+    if (rt->kind == TypeRef::Kind::Named)
+        return isCCompatibleRecordSym(rt->declaration, depth + 1);
+    return false;
+}
+
+bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts, int depth) {
+    // §32.13 clause 1 says recursion is impossible ("records are value
+    // types"), which holds of a WELL-FORMED program; a malformed one must
+    // still terminate, and §9's own cycle check owns that diagnostic.
+    if (depth > 8 || !ts) return false;
+    if (ts->kind != ast::TypeDeclKind::Record) return false;
+    // §3.6's common rules make the property "evaluated per-instantiation for
+    // generic records". That evaluation is not wired here, so a generic record
+    // is conservatively NOT classified — the direction that rejects a boundary
+    // declaration rather than mis-admitting one.
+    if (!ts->genericParams.empty()) return false;
+    bool any = false;
+    for (const Symbol* m : ts->members) {
+        auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        if (!fs) continue;
+        bool isStatic = false;
+        for (auto mod : fs->modifiers)
+            if (mod == "static") isStatic = true;
+        if (isStatic) continue;  // §22.12: static storage is not a field slot
+        any = true;
+        // `storageComponentType` is the #3152 both-sources accessor: the
+        // §9.1 positional `Param`, the body `FieldDecl`, or — for an imported
+        // record with neither — `ctx.importedMemberType`.
+        if (!isCCompatibleFieldTypeRef(sema::storageComponentType(m, ctx_),
+                                       depth))
+            return false;
+    }
+    // A record with no storage has no C struct to correspond to, so clause 2's
+    // layout promise would have nothing to promise.
+    return any;
+}
+
+bool Resolver::isCCompatibleRecord(const ast::Type& t, Scope* scope,
+                                   int depth) {
+    if (t.nullable) return false;
+    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), depth);
+}
+
+bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope, int depth) {
+    // per §32.12 clause 1 (v0.306). A nullable pointee has no C
+    // representation (§32.5's nullable-value-type rule).
+    if (t.nullable) return false;
+    if (t.kind != ast::TypeKind::Named || !t.name ||
+        t.name->parts.size() != 1)
+        return false;
+    std::string_view n = t.name->parts.front();
+    if (isFfiScalarPrimitiveName(n)) return true;
+    if (n == "IntPtr" || n == "UIntPtr") return true;
+    if (n == "Ptr") return false;  // the §32.12 v1 decline
+    return isCCompatibleRecord(t, scope, depth);
+}
+
+bool Resolver::isSingleFieldHandleRecord(const ast::Type& t, Scope* scope) {
+    const TypeSymbol* ts = namedTypeSymbolInScope(t, scope);
+    if (t.nullable || !isCCompatibleRecordSym(ts, 0)) return false;
+    const TypeRef* only = nullptr;
+    int count = 0;
+    for (const Symbol* m : ts->members) {
+        auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        if (!fs) continue;
+        bool isStatic = false;
+        for (auto mod : fs->modifiers)
+            if (mod == "static") isStatic = true;
+        if (isStatic) continue;
+        ++count;
+        only = sema::storageComponentType(m, ctx_);
+    }
+    if (count != 1 || !only || only->nullable) return false;
+    // per §32.13 clause 4: "of *integer or pointer* scalar type (integer
+    // types, `IntPtr`, `UIntPtr`, `Ptr<T>` — not `float`/`double`, not
+    // `bool`)". The restriction is ABI-driven: `struct { double }` classes
+    // SSE on SysV but rides an integer slot on Win64, so admitting it "would
+    // mandate a wrong-register miscompile on a vouched target".
+    if (only->kind == TypeRef::Kind::Named) {
+        std::string_view h = only->headName();
+        if (h == "IntPtr" || h == "UIntPtr") return true;
+        return h == "Ptr" && only->genericArgs.size() == 1 &&
+               isFfiPointeeTypeRef(only->genericArgs[0], 1);
+    }
+    if (only->kind != TypeRef::Kind::Primitive) return false;
+    switch (only->primitive) {
+        case PrimitiveType::Byte:
+        case PrimitiveType::SByte:
+        case PrimitiveType::Short:
+        case PrimitiveType::UShort:
+        case PrimitiveType::Int:
+        case PrimitiveType::UInt:
+        case PrimitiveType::Long:
+        case PrimitiveType::ULong:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition,
+                                   Scope* scope) {
     switch (t.kind) {
         case ast::TypeKind::Unit:
             // §32.5: the unit type `()` is valid as a return type only.
@@ -9705,6 +9881,26 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
                     return n == "CString" || n == "WString" || n == "RawBytes";
                 return true;
             }
+            // per §32.5 (v0.306): "**`Ptr<T>`** — a typed foreign address
+            // (§32.12); admitted as a parameter, as a return type, and inside
+            // FFI function types, marshalling as the pointer it is. The null
+            // pointer is `Ptr<T>.Zero`; `Ptr<T>?` is **not** admitted
+            // (nullable value types below)." `T` carries §32.12's pointee
+            // gate, so `Ptr<Ptr<U>>` and `Ptr<SomeClass>` stay out.
+            if (n == "Ptr") {
+                if (t.nullable) return false;
+                return t.genericArgs.size() == 1 && t.genericArgs[0] &&
+                       isFfiPointeeType(*t.genericArgs[0], scope);
+            }
+            // per §32.5 / §32.13 clause 4: the typed-handle exception to
+            // "C-compatible records — by address only". A single-field record
+            // over an integer or pointer scalar "is admitted **directly** —
+            // parameter, return, `ref`/`out`, and callback positions —
+            // marshalling exactly as its field." A C-compatible record that is
+            // NOT of that form is admitted only at a `ref`/`out` parameter,
+            // which is `checkExternType`'s business (the modifier is not
+            // visible here).
+            if (isSingleFieldHandleRecord(t, scope)) return true;
             // Anything else with a name — user classes/records/interfaces,
             // `Array<T>`, generic params, etc. — is not FFI-compatible (§32.5
             // "Not allowed: ... classes, records, interfaces, generic type
@@ -9748,21 +9944,108 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
             // themselves FFI-compatible.
             for (const auto& fp : t.funcParams) {
                 if (!fp.type ||
-                    !isFfiCompatibleType(*fp.type, /*returnPosition=*/false))
+                    !isFfiCompatibleType(*fp.type, /*returnPosition=*/false,
+                                         scope))
                     return false;
             }
             // The function's return slot is a return position (unit allowed).
             if (!t.funcReturn) return true;  // `-> ()` parsed as null return
             return isFfiCompatibleType(*t.funcReturn,
-                                       /*returnPosition=*/true);
+                                       /*returnPosition=*/true, scope);
         }
     }
     return false;
 }
 
 bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
-                               const std::string& declSpelling) {
-    if (isFfiCompatibleType(t, returnPosition)) return true;
+                               const std::string& declSpelling, Scope* scope,
+                               std::string_view paramModifier) {
+    if (isFfiCompatibleType(t, returnPosition, scope)) return true;
+    // per §32.13 clause 3 (v0.306): "Admission — by address (§32.5): as
+    // `ref`/`out` extern parameters (C sees `R*`; §32.5's rules) and as
+    // `Ptr<R>` pointees. **By value is not admitted**, except the single-field
+    // form" — which `isFfiCompatibleType` already admitted above. The plain
+    // `ref`/`out` spellings only: `out owned` is separately not admitted
+    // (§32.5 "Not admitted, with reasons").
+    bool byAddress = (paramModifier == "ref" || paramModifier == "out" ||
+                      paramModifier == "out var");
+    if (byAddress && !returnPosition && isCCompatibleRecord(t, scope))
+        return true;
+    // per §32.12 clause 1 (v0.306): `Ptr<T>`'s pointee gate is
+    // "per-instantiation, §3.6-style diagnostics" and "any other instantiation
+    // is rejected at the instantiation site with a diagnostic naming the set"
+    // (stdlib §10.5). Say which set, and say why `Ptr<Ptr<U>>` is the one
+    // deliberate absence from it.
+    if (t.kind == ast::TypeKind::Named && t.name &&
+        t.name->parts.size() == 1 && t.name->parts.front() == "Ptr" &&
+        !t.nullable && t.genericArgs.size() == 1 && t.genericArgs[0]) {
+        const ast::Type& arg = *t.genericArgs[0];
+        bool nested = arg.kind == ast::TypeKind::Named && arg.name &&
+                      arg.name->parts.size() == 1 &&
+                      arg.name->parts.front() == "Ptr";
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            "extern method " + declSpelling + " has type `" +
+                spellExternType(t) +
+                "`, whose pointee is not in the FFI-pointee set — the integer "
+                "types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and "
+                "C-compatible records (\xC2\xA7""32.13)" +
+                (nested ? std::string(
+                              ". `Ptr<Ptr<U>>` is not admitted: use "
+                              "`Ptr<IntPtr>` plus an explicit "
+                              "`Ptr<U>.FromIntPtr` re-typing, one visible step "
+                              "per indirection")
+                        : std::string()) +
+                " (\xC2\xA7""32.12)");
+        return false;
+    }
+    // per §32.13: a record that reached here is either not C-compatible at
+    // all, or is C-compatible but written by value. Naming WHICH is the
+    // difference between an actionable diagnostic and "not permitted".
+    if (t.kind == ast::TypeKind::Named && t.name &&
+        t.name->parts.size() == 1 && !t.nullable) {
+        if (const TypeSymbol* ts = namedTypeSymbolInScope(t, scope)) {
+            if (ts->kind == ast::TypeDeclKind::Record) {
+                std::string name(t.name->parts.front());
+                if (!isCCompatibleRecord(t, scope)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "extern method " + declSpelling + " has record type `" +
+                            name +
+                            "`, which is not C-compatible: every field's type "
+                            "must be an FFI-compatible scalar (an integer "
+                            "type, `float`, `double`, `bool`, `IntPtr`, "
+                            "`UIntPtr`, `Ptr<T>`), an inline array of such a "
+                            "scalar, or another C-compatible record "
+                            "(\xC2\xA7""32.13)");
+                } else if (returnPosition) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "extern method " + declSpelling + " has record type `" +
+                            name +
+                            "`, which is C-compatible but admitted by address "
+                            "only — a return slot has no address to pass. Only "
+                            "the single-field form (exactly one field of "
+                            "integer or pointer scalar type) is admitted "
+                            "directly; by-value structs are deferred "
+                            "(\xC2\xA7""32.13, \xC2\xA7""32.14)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "extern method " + declSpelling + " has record type `" +
+                            name +
+                            "`, which is C-compatible but admitted by address "
+                            "only — declare the parameter `ref` or `out`, or "
+                            "take a `Ptr<" + name +
+                            ">`. Only the single-field form (exactly one field "
+                            "of integer or pointer scalar type — not `float`, "
+                            "`double` or `bool`) is admitted directly by value "
+                            "(\xC2\xA7""32.13)");
+                }
+                return false;
+            }
+        }
+    }
     // §32.5 (v0.186, #1720): a `RawBytes` (or `RawBytes?`) extern RETURN is
     // specifically rejected — the two-slot (pointer, length) marshalling shape
     // has no C return convention. Give an actionable diagnostic naming the

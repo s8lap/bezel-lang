@@ -864,7 +864,8 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                     // position, so the unit type `()` is not admitted here.
                     checkExternType(*p.type, /*returnPosition=*/false,
                                     std::string("parameter `") +
-                                        std::string(p.name) + "`");
+                                        std::string(p.name) + "`",
+                                    parent, p.modifier);
                 }
             }
             if (d.returnType) {
@@ -873,7 +874,7 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                 // type `()`. (An omitted `: T` clause leaves returnType null
                 // and is already a unit-returning method — §32.5.)
                 checkExternType(*d.returnType, /*returnPosition=*/true,
-                                "return type");
+                                "return type", parent);
             }
         }
     }
