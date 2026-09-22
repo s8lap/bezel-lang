@@ -218,3 +218,87 @@ BEZEL_TEST(collection_concurrent_mod_1232, array_indexer_set_no_throw) {
         "  return s; "
         "end Main; end C;"), 6);
 }
+
+// ===========================================================================
+// fix #4606 / §29.12, v0.307 — a dictionary indexer-set on a PRESENT key is
+// an element-level write, not a structural one: "`dict[existingKey] := v`
+// updating a present key ... leaves the enumerator valid." Pre-fix,
+// bz_dict_set_str / bz_dict_set_str_disposing / bz_dict_set_gen /
+// bz_dict_set_gen_disposing all bumped mod_count on the present-key branch
+// ("value update = modification"), so a `for` over the dictionary that
+// updates a present key's value falsely raised InvalidOperationException at
+// the next MoveNext(). These three rows each pin a distinct one of the four
+// runtime set entry points (string-key / generic-key / disposing).
+// ===========================================================================
+
+// bz_dict_set_str: string-key Dictionary, entry ("for var e in d") iteration
+// — the exact shape #4606 was filed against. Pre-fix: uncaught
+// InvalidOperationException (never reaches the return). Post-fix: completes
+// the pass and returns the sum of the (snapshot) values, 30 + 25 = 55 — the
+// runtime's dict entry-for loop reads a key/value snapshot taken at loop
+// entry (LlvmBackend_Stmts.cpp's lowerDictEntryFor), so the in-loop update is
+// exercised here for its non-invalidation only, matching the rule-corpus
+// case s29_12_0010.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           dict_str_key_indexer_set_existing_key_no_throw_4606) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := new Dictionary<string,int>(); "
+        "  d[\"alice\"] := 30; d[\"bob\"] := 25; "
+        "  var total := 0; "
+        "  for var e in d do "
+        "    d[e.Key] := e.Value + 1; "
+        "    total := total + e.Value; "
+        "  end; "
+        "  return total; "
+        "end Main; end C;"), 55);
+}
+
+// bz_dict_set_gen: generic-key (int) Dictionary, entry iteration. Same shape
+// as above, routed through the generic-key runtime instead of the
+// string-key one. Pre-fix: uncaught InvalidOperationException.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           dict_gen_key_indexer_set_existing_key_no_throw_4606) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := new Dictionary<int,int>(); "
+        "  d[1] := 10; d[2] := 20; "
+        "  var s := 0; "
+        "  for var e in d do "
+        "    d[e.Key] := e.Value + 1; "
+        "    s := s + e.Value; "
+        "  end; "
+        "  return s; "
+        "end Main; end C;"), 30);
+}
+
+// bz_dict_set_str_disposing: OwningDictionary<string, R>'s owned-taking
+// indexer-set on a PRESENT key. §4.9's default entry-for is not provided on
+// OwningDictionary, so iteration uses the key-iteration pattern (`.Keys`,
+// which shares the same dict's mod_count epoch). Pre-fix: the update on
+// "bob" (not yet visited) bumped mod_count, and the loop's next advance threw
+// InvalidOperationException, which the catch converts to `caught := 1` — so
+// the pre-fix result is 100 + R._n. Post-fix: no throw (caught stays 0), and
+// the disposing indexer-set disposes the value it displaced under "bob"
+// exactly once (R._n == 1) — so the expected result is 1.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           owning_dict_indexer_set_existing_key_no_throw_4606) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class R "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  using var d := new OwningDictionary<string, R>(); "
+        "  d.Add(\"a\", move (new R())); "
+        "  d.Add(\"b\", move (new R())); "
+        "  var caught := 0; "
+        "  try "
+        "    for var k in d.Keys do "
+        "      if k = \"a\" then d[\"b\"] := move (new R()); end; "
+        "    end; "
+        "  catch InvalidOperationException => caught := 1; "
+        "  end; "
+        "  return caught * 100 + R._n; "
+        "end Main; end C;"), 1);
+}

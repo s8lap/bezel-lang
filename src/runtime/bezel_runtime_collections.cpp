@@ -744,8 +744,10 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
     int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
+        // fix #4606 / §29.12, v0.307: an element-level write to a present key
+        // is NOT structural ("dict[existingKey] := v updating a present key
+        // ... leaves the enumerator valid") — do not bump mod_count here.
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
@@ -772,9 +774,10 @@ void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
     uint32_t h = fnv1a_cp(k, k_len, k_w);
     int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx >= 0) {
+        // fix #4606 / §29.12, v0.307: value update of a present key is not
+        // structural — no mod_count bump (see bz_dict_set_str above).
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     bz_dict_set_str(dp, k, k_len, k_w, val);  // fresh key: bz_dict_set_str bumps mod_count
@@ -923,8 +926,9 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     int64_t idx = dict_find_gen(d, key, h);
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
+        // fix #4606 / §29.12, v0.307: element-level write to a present key is
+        // not structural — do not bump mod_count here.
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
@@ -951,9 +955,10 @@ void bz_dict_set_gen_disposing(void* dp, const void* key, void* val,
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx >= 0) {
+        // fix #4606 / §29.12, v0.307: value update of a present key is not
+        // structural — no mod_count bump (see bz_dict_set_gen above).
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     bz_dict_set_gen(dp, key, val);        // fresh key: bz_dict_set_gen bumps mod_count
