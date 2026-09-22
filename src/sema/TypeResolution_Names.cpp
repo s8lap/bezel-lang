@@ -3736,7 +3736,28 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         if (fs->varType) resolveType(*fs->varType, scope);
-        if (fs->iterable) resolveTypesInExpr(*fs->iterable, scope);
+        if (fs->iterable) {
+            // fix #4554 (§16.5, v0.307): an open-ended range literal directly
+            // in a `for` iterable position cannot be iterated — the spec
+            // requires the compiler to emit a warning at the literal site.
+            // Defer the runtime check (a `Range<T>` variable of an open-ended
+            // shape raises InvalidOperationException at GetEnumerator) to
+            // codegen; only the literal-position case is the compile-time
+            // warning §16.5 mandates.
+            if (!fs->isAwait) {
+                if (auto* re = dynamic_cast<const ast::RangeExpr*>(
+                        fs->iterable.get())) {
+                    if (!re->lo || !re->hi) {
+                        ctx_.diagnostics().report(
+                            Severity::Warning, re->span.begin,
+                            std::string(
+                                "warning: open-ended range literal cannot be "
+                                "iterated (\xC2\xA7""16.5)"));
+                    }
+                }
+            }
+            resolveTypesInExpr(*fs->iterable, scope);
+        }
         if (fs->withExpr) resolveTypesInExpr(*fs->withExpr, scope);
         resolveTypesInBody(fs->body, scope);
         return;
@@ -3824,6 +3845,32 @@ void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
     if (auto* ap = dynamic_cast<const ast::AltPattern*>(&p)) {
         for (const auto& m : ap->members)
             if (m) resolveTypesInPattern(*m, scope);
+        return;
+    }
+    // fix #4554 (§16.6, v0.307): a constant stepless range pattern whose bounds
+    // are reversed (lo > hi on a `lo..hi`, lo >= hi on a `lo..<hi`) can never
+    // match — §16.6 mirrors the §16.4 step-sign check, same constant-fold
+    // discipline. Recurse into the range expression first so its bounds are
+    // type-resolved, then constant-fold and emit the spec's "never matches"
+    // warning if the bound comparison reverses the default ascending order.
+    auto checkReversedRangePattern =
+        [this, scope](const ast::RangePattern& rp) {
+            auto* re = dynamic_cast<const ast::RangeExpr*>(rp.rangeExpr.get());
+            if (!re || !re->lo || !re->hi || re->step) return;
+            auto loV = foldIntConstExpr(*re->lo, scope, 0);
+            auto hiV = foldIntConstExpr(*re->hi, scope, 0);
+            if (!loV || !hiV) return;
+            bool neverMatches = re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
+            if (neverMatches) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, rp.span.begin,
+                    "warning: this pattern never matches — bounds are "
+                    "reversed (\xC2\xA7""16.6)");
+            }
+        };
+    if (auto* rp = dynamic_cast<const ast::RangePattern*>(&p)) {
+        if (rp->rangeExpr) resolveTypesInExpr(*rp->rangeExpr, scope);
+        checkReversedRangePattern(*rp);
         return;
     }
 }
@@ -3919,6 +3966,57 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
 }
 
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
+    // fix #4554 (§16.4, v0.307): when a `RangeExpr` carries a `step` and all
+    // three of `lo`, `hi`, `step` are compile-time-constant integer expressions,
+    // the iteration's direction can be proven at compile time. A range whose
+    // direction (ascending when lo <= hi, descending when lo >= hi) disagrees
+    // with its step's sign produces an empty iteration — emit the §16.4
+    // "empty iteration" warning. Only fires on provably-constant ranges;
+    // runtime-computed steps are intentionally left alone because a sign
+    // mismatch there may be intentional (the value depends on input).
+    //
+    // §16.4 has an explicit equal-bounds exception: `lo..hi` with lo == hi
+    // yields exactly one value regardless of step sign (§16.6, inclusive
+    // equal-bounds); `lo..<hi` with lo == hi is empty regardless of step
+    // sign (§16.6, half-open equal-bounds). Encode that here so neither
+    // shape produces a false-positive warning.
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (re->lo && re->hi && re->step) {
+            auto loV = foldIntConstExpr(*re->lo, scope, 0);
+            auto hiV = foldIntConstExpr(*re->hi, scope, 0);
+            auto stV = foldIntConstExpr(*re->step, scope, 0);
+            if (loV && hiV && stV && *stV != 0) {
+                bool empty;
+                if (re->inclusive) {
+                    // `lo..hi` ascending with step<0, OR descending with step>0.
+                    // Equal bounds (lo == hi): one value, NOT empty.
+                    empty = (*loV < *hiV && *stV < 0) ||
+                            (*loV > *hiV && *stV > 0);
+                } else {
+                    // `lo..<hi` ascending (lo >= hi) with step>0, OR
+                    // descending (lo < hi) with step<0. Equal bounds
+                    // (lo == hi): empty for any step (hi excluded).
+                    empty = (*loV < *hiV && *stV < 0) ||
+                            (*loV >= *hiV && *stV > 0);
+                }
+                if (empty) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, re->span.begin,
+                        "warning: this range produces an empty iteration — "
+                        "the range's direction (lo " +
+                            std::string(*loV <= *hiV ? "<=" : ">=") +
+                            " hi) disagrees with the step's sign "
+                            "(\xC2\xA7""16.4)");
+                }
+            }
+        }
+        // Recurse into the children so the bounds / step are themselves
+        // type-resolved.
+        if (re->lo) resolveTypesInExpr(*re->lo, scope);
+        if (re->hi) resolveTypesInExpr(*re->hi, scope);
+        if (re->step) resolveTypesInExpr(*re->step, scope);
+        return;
+    }
     // First handle expressions that own a Type node directly.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         if (ne->type) resolveType(*ne->type, scope);
