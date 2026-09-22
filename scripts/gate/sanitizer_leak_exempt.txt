@@ -96,6 +96,21 @@
 # leak-FREEDOM assertions or hand-rolled runners that redirect to /dev/null —
 # no additions needed there.
 #
+# ── 2026-09-22, fix #4277 ────────────────────────────────────────
+# THREE rows REMOVED because the leak each one asserted is FIXED (this file's
+# own contract: a row whose leak is fixed is removed, with evidence):
+#   class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed
+#   class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor
+#   class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly
+# Evidence: each asserted `leaksAtLeast(prog, 6000)` on the 200-iteration
+# program it carried, measured on origin/main cafdfc52 at 7490 B / 400
+# allocations, 8600 B / 400 and 7490 B / 400 respectively; all three are
+# sanitizer-clean with fix #4277 and their rows now assert the exact
+# accumulated value through `runChecked`, which fails on ANY sanitizer
+# finding. The rows were RENAMED at the same time (`..._still_leaks_axis_*`
+# → `..._no_leak_spec_9_7_issue_4277`), so leaving the keys here would also
+# have tripped test_sanitizer_evidence.py's stale-key check.
+#
 # RESIDUAL RISK: this is a bounded, pattern-driven search, not a full `--full`
 # sweep of the whole suite (a lane must not run that — CLAUDE.md). A row using
 # a positive-leak-tolerance pattern not covered by the five below, or added
@@ -127,9 +142,6 @@
 # (unlike sanitizer_exempt.txt's UB rows) does not cover this file — see the
 # RESIDUAL RISK note above.
 
-class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed  # status:residue issue:4277 #4253: a non-sealed class's readonly record-typed property still leaks the record's owned string field on scope-end disposal. tests/codegen/class_field_record_string_release_4253_test.cpp:235
-class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor  # status:residue issue:4277 #4253: presence of an unrelated user constructor does not change the leak. tests/codegen/class_field_record_string_release_4253_test.cpp:273
-class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly  # status:residue issue:4277 #4253: a non-readonly record-typed property still leaks. tests/codegen/class_field_record_string_release_4253_test.cpp:296
 inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_factory_control_still_leaks_not_uaf  # status:trade #4265: the safe (no-UAF) control case still leaks rather than releasing cleanly. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:310
 record_declare_then_assign_call_result_release_4266.multi_assignment_site_stays_safe_no_uaf  # status:trade #4266: the multi-assignment site is safe from use-after-free but still leaks. tests/codegen/record_declare_then_assign_call_result_release_4266_test.cpp:455
 record_factory_unbound_temporary_argument_uaf_4322.unrelated_second_argument_no_longer_uaf_but_leaks_call_wide  # status:trade #4322: fixing the UAF on the unrelated second argument left a call-wide leak. tests/codegen/record_factory_unbound_temporary_argument_uaf_4322_test.cpp:245

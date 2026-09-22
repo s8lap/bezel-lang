@@ -16616,6 +16616,47 @@ private:
     // the method-body emission loop.
     void collectBoxStorageFields();
 
+    // fix #4277 (§9.7 "Records and disposal" / §28.9 "Runtime-managed types" /
+    // §13.2 "Top-level types" / §23.1 "Auto-properties", v0.306): the ONE
+    // question the #4253 class-field record-string release walk has to answer
+    // — "is this field's OWN declaration initializer the SOLE store its slot
+    // ever receives, for every instance, for the whole program?".
+    //
+    // #4253 answered it with THREE structural PROXIES — `sealed` on the
+    // declaring class, `!hasAnyConstructor(ts)`, `readonly` on the member —
+    // each a coarse stand-in for "nothing else can write here", and each
+    // over-rejecting on its own axis (#4277). This pair replaces all three
+    // with the question itself: a module-wide WRITE-SITE scan (the same shape
+    // `collectBoxStorageFields` above already uses to prove "every store to
+    // this field is boxable", reused rather than re-derived) plus the
+    // cross-module reachability argument that makes that scan COMPLETE.
+    //
+    // `recordFieldWritten_` holds, for every write site the scan found, BOTH
+    // the written `sema::Symbol*` and that symbol's `ast::Node* decl` — the
+    // decl key is what makes the answer instantiation-independent, since a
+    // monomorphized generic's member symbol is a different object from the
+    // one a write site resolved against but shares the declaration node.
+    std::unordered_set<const void*> recordFieldWritten_;
+    bool recordFieldWriteScanDone_ = false;
+    // FAIL-CLOSED. Set when the scan meets an `ast::Expr`/`ast::Stmt`/
+    // `ast::Member` kind it does not know, because such a node could hide a
+    // store the scan would then miss. While it is set NO field is admitted —
+    // the pre-#4253 safe leak, never an over-release. A node kind added to the
+    // AST without an arm here therefore disables the optimization loudly (rows
+    // 1-3 of class_field_record_string_release_4253 go red) instead of
+    // silently arming a use-after-free.
+    bool recordFieldWriteScanIncomplete_ = false;
+    // Populate recordFieldWritten_ / recordFieldWriteScanIncomplete_ by
+    // walking every local declaration body in this module. Memoized: the AST
+    // is immutable by the time any disposer is emitted, so the first caller
+    // pays for the walk and the rest read the cache.
+    void collectRecordFieldWriteSites();
+    // The predicate itself — see the definition (LlvmBackend_Setup.cpp) for
+    // the two-part proof (no write site OUTSIDE this module can exist; no
+    // write site INSIDE it does exist).
+    bool declarationInitializerIsSoleStore(const sema::TypeSymbol* ts,
+                                           const sema::Symbol* m);
+
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position
     // (a `move`, an owned argument / any call argument conservatively, an

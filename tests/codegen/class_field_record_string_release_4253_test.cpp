@@ -14,62 +14,61 @@
 //
 // THE FIX adds a fourth field-release walk (alongside the pre-existing
 // string / closure / box FIELD-STORE walks in the same function), gated on
-// THREE conditions that together prove the field is assigned EXACTLY ONCE,
-// by a provably fresh/alias-free construction, for the entire lifetime of
-// every instance:
-//   1. `readonly` on the field/auto-property (MEASURED: an ordinary method
-//      assigning it is rejected, "§23.1").
-//   2. `sealed` on the declaring class, and no explicit constructor on it
-//      (`!hasAnyConstructor`) — closing TWO independently-measured sema
-//      gaps found while investigating this issue and filed separately
-//      (NOT fixed here — out of scope for this codegen change):
-//        - #4275: a readonly field WITH a declaration initializer can
-//          currently be reassigned AGAIN inside an explicit constructor
-//          body, no diagnostic.
-//        - #4276: a DERIVED class's constructor can currently reassign a
-//          readonly property INHERITED from its base, no diagnostic.
-//      Rows 9 and 10 below exercise exactly these two shapes. Investigating
-//      them found #4275's own premise wrong ("this should be rejected") —
-//      §22.8's own scope statement and DECLINED.md ("Extending §22.8's
-//      single-assignment rule to readonly auto-properties", v0.271) record
-//      that the once-ness rule deliberately does NOT extend to auto-
-//      properties; #3207's own test pins the override taking effect at
-//      runtime. So #4275 stays UNFIXED by design and row 9 keeps proving
-//      this fix's guard is safe against it (still leaking, never a UAF,
-//      because `hasAnyConstructor(ts)` alone already excludes it). #4276
-//      WAS a real gap — a plain implementation inconsistency between two
-//      spellings of the same store (`this.P := e` vs bare `P := e`) — and
-//      is fixed by issue 4276 (ExprTypecheck.cpp, `currentType_ ==
-//      fs->parent`/`ps->parent` added at the four readonly-write gates).
-//      Row 10 below is updated to assert the new REJECTION instead of
-//      "still safely leaks": the program it names no longer compiles, so
-//      this fix's own release condition 2 (`sealed` + `!hasAnyConstructor`)
-//      is now redundant against this ONE vector specifically — condition 2
-//      stays as-is regardless (it is still independently load-bearing
-//      against #4275 and against the general non-sealed/has-a-constructor
-//      cases rows 4-5 exercise), per this run's brief: "do not touch
-//      anything else in 12e6f1e0's guard; if you think your fix makes part
-//      of it unnecessary, file an issue saying so, do not edit it."
-//   3. The field's OWN declaration initializer is provably a fresh,
-//      alias-free construction of exactly the declared record type —
-//      `Emitter::isFreshRecordConstructionOfExactType`, the SAME
-//      eligibility authority #2448/#4237 established for the LOCAL case,
-//      reused verbatim here (not re-derived, per LANE_RULES §6/§25).
+// a proof that the field is assigned EXACTLY ONCE, by a provably fresh /
+// alias-free construction, for the entire lifetime of every instance.
+//
+// #4253 built that proof out of THREE structural proxies — `readonly` on
+// the member, `sealed` on the declaring class, `!hasAnyConstructor(ts)` —
+// and recorded the residual as issue #4277.
+//
+// fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306) REPLACES all three with
+// the ONE question they were each a coarse answer to: is the field's own
+// declaration initializer the SOLE store its slot ever receives?
+// `Emitter::declarationInitializerIsSoleStore` (LlvmBackend_Setup.cpp)
+// answers it from two facts rather than three proxies —
+//
+//   (A) no write site can exist in a module this compilation cannot read.
+//       §13.2 defaults a top-level type to `internal`, so an undecorated
+//       class is unnameable outside its module; §23.1 (+ fix #4276's
+//       declaring-type narrowing) confines a `readonly` member's writes to
+//       its declaring type's own field initializer and constructors; and an
+//       IMPORTED declaring type, whose bodies never cross the §2.8.2
+//       interface, must therefore be `readonly` with no constructor at all
+//       (the one place #4253's `hasAnyConstructor` proxy was real evidence
+//       rather than a stand-in, and the one place it is kept).
+//   (B) no write site exists in THIS module, per a module-wide scan of
+//       every declaration body for an assignment / increment / `ref` /
+//       `out` position resolving to the member. The scan is fail-closed:
+//       an AST node kind it does not recognize disables every admission.
+//
+// Three shapes #4253 declined are admitted as a result, each measured
+// leaking on origin/main cafdfc52 and clean with the fix (200-iteration
+// loops): a NON-SEALED class (7490 B / 400 allocations), a class with an
+// UNRELATED explicit constructor (8600 B / 400), and a NON-READONLY
+// auto-property (7490 B / 400). Their three sanitizer_leak_exempt.txt rows
+// are removed with this fix.
+//
+// Its OWN eligibility authority is unchanged: the field's declaration
+// initializer must still be a provably fresh, alias-free construction of
+// exactly the declared record type — `Emitter::isFreshRecordConstruction
+// OfExactType`, the SAME proof #2448/#4237 established for a plain `var`
+// record local, reused verbatim (LANE_RULES §6/§25).
 //
 // DIRECTION: this fix only ever ADDS a release where none existed (a safe-
 // direction leak becomes balanced) — never removes one. Rows 1-2 prove the
-// leak closes; rows 4-8 prove the three gates are each independently
-// load-bearing (an accept-side sweep, not a volume of green); row 9 proves
-// the #4275 sema gap (a settled, DECLINED-to-fix behaviour) does NOT turn
-// this fix's guard into a double-free/UAF; row 10, post-issue-4276, proves
-// the program it used to exercise is now a REJECT (the gap it exercised is
-// fixed) rather than re-proving crash-freedom against an accepted program.
+// original leak closes; the three #4277 rows prove the three axes close;
+// the DECLINE controls prove each half of the predicate is load-bearing
+// (removing either turns a control into a use-after-free, not a leak);
+// rows 9-10 keep the two sema-gap shapes (#4275 accepted-by-design, #4276
+// now rejected) honest.
 //
-// Residual (NOT fixed here, filed as #4277): a field assigned via a
-// CONSTRUCTOR-BODY statement (`this.P := new Box(...);`) rather than its
-// own declaration initializer, or declared on a non-sealed class, or on a
-// class with ANY explicit constructor (even one that never touches the
-// field), is UNCHANGED — still safe-leaks exactly as before this fix.
+// STILL RESIDUAL under #4277, deliberately NOT closed here: a field
+// assigned by a CONSTRUCTOR-BODY statement (`this.P := new Box(...);`)
+// instead of its own declaration initializer. The predicate correctly
+// declines it — a constructor-body store IS a write site — and closing it
+// needs the store itself to transfer a +1 (drop-on-overwrite for record-
+// typed fields, §28.7's reference-field mechanism generalized), which is a
+// different change from proving how many stores there are.
 
 #include <regex>
 
@@ -201,23 +200,48 @@ BEZEL_TEST(class_field_record_string_release_4253,
 }
 
 // ===========================================================================
-// Accept-side / soundness controls (LANE_RULES §15/§25): each row disables
-// EXACTLY ONE of the fix's three gating conditions, otherwise keeping the
-// shape identical to row 1's admitted case. Every row below is EXPECTED to
-// still safely leak, unchanged from pre-fix behaviour -- proving each gate
-// is independently load-bearing, not merely correlated with the accepted
-// cases tested above (LANE_RULES §25: "what question was this predicate
-// validated to answer, not what it correlates with").
+// fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306) — THE THREE AXES #4253
+// LEFT OPEN, NOW CLOSED.
+//
+// Each row below disables EXACTLY ONE of #4253's three structural gates,
+// otherwise keeping the shape identical to row 1's admitted case. Until
+// #4277 each was EXPECTED to still safely leak, and each carried a row in
+// scripts/gate/sanitizer_leak_exempt.txt positively asserting that leak:
+//
+//   class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed
+//   class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor
+//   class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly
+//
+// All three exempt rows are REMOVED by this fix, and all three programs are
+// now leak-free. MEASURED on origin/main cafdfc52 (bezelc --sanitize=address,
+// the exact 200-iteration programs below): 7490 B / 400 allocations,
+// 8600 B / 400 allocations, and 7490 B / 400 allocations respectively —
+// clean on all three with the fix.
+//
+// The three gates were not three defects: they were three coarse answers to
+// ONE question — "is the field's own declaration initializer the SOLE store
+// this slot ever receives?" — which `declarationInitializerIsSoleStore`
+// (LlvmBackend_Setup.cpp) now asks directly. The DECLINE controls that keep
+// that predicate honest are the rows further down, not these three.
+//
+// Each row asserts the exact accumulated value (`acc mod 100`), not merely
+// leak-freedom: `runChecked` fails on ANY sanitizer finding, so a release
+// emitted at the wrong place would surface here as a use-after-free rather
+// than as a silently-different number.
 // ===========================================================================
 
 // Axis: `sealed`. Otherwise identical to row 1 (readonly, no explicit
 // constructor, fresh-construction initializer) but the class is NOT
-// sealed -- a subclass could exist (in this module or an importer) whose
-// constructor reassigns the inherited field with no diagnostic (issue
-// #4276). The fix must decline this shape.
+// sealed. #4253 declined this because a subclass's constructor could
+// reassign the inherited field with no diagnostic — a sema gap that WAS
+// real when #4253 was written and was closed by fix #4276 (the four
+// readonly-write gates now require `currentType_ == ps->parent`). With
+// §23.1 confining a readonly write to the declaring type's own body and
+// the module-wide write-site scan finding no such write, `sealed` is not
+// evidence this predicate needs.
 BEZEL_TEST(class_field_record_string_release_4253,
-           non_sealed_class_still_leaks_axis_sealed) {
-    const char* prog =
+           non_sealed_class_record_string_field_no_leak_spec_9_7_issue_4277) {
+    BEZEL_EXPECT_EQ(runChecked(
         "module M; record Box(Value: string); "
         "class Holder(s: int) "
         "  public readonly property P: Box := new Box(\"hi\" + s.ToString()); "
@@ -231,26 +255,26 @@ BEZEL_TEST(class_field_record_string_release_4253,
         "    i += 1; "
         "  end; "
         "  return acc mod 100; "
-        "end Main; end C;";
-    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 6000));
+        "end Main; end C;"), 90);
 }
 
 // Axis: `!hasAnyConstructor`. Otherwise identical to row 1 but the class
-// declares an EXPLICIT constructor (which never touches the field) --
-// issue #4275 means a readonly field WITH a declaration initializer can
-// currently be reassigned again inside SOME constructor body with no
-// diagnostic; the fix conservatively declines any class with an explicit
-// constructor at all, not just ones that are proven to reassign the field.
+// declares an EXPLICIT constructor that never touches the field. #4253
+// declined every class with any constructor at all, because it had no way
+// to tell "a constructor exists" from "a constructor writes this field".
+// The write-site scan tells them apart: this constructor assigns `_n`, not
+// `P`, so `P` still has exactly one store.
 BEZEL_TEST(class_field_record_string_release_4253,
-           class_with_unrelated_constructor_still_leaks_axis_no_ctor) {
-    const char* prog =
+           class_with_unrelated_constructor_record_string_field_no_leak_spec_9_7_issue_4277) {
+    BEZEL_EXPECT_EQ(runChecked(
         "module M; record Box(Value: string); "
         "sealed class Holder "
         // "fixed" + "value" -- MUST be a concatenation, not a bare literal:
         // a bare string literal is an immortal sentinel with nothing to
         // leak regardless of this fix's gating (confirmed while authoring
         // this row: a bare `new Box("fixed")` measured 0 B / clean here,
-        // which would have made this row vacuous per LANE_RULES §3).
+        // which would have made the pre-#4277 leak assertion vacuous per
+        // LANE_RULES §3 — and would make THIS row prove nothing either).
         "  public readonly property P: Box := new Box(\"fixed\" + \"value\"); "
         "  private _n: int; "
         "  public constructor(n: int) "
@@ -266,19 +290,22 @@ BEZEL_TEST(class_field_record_string_release_4253,
         "    i += 1; "
         "  end; "
         "  return acc mod 100; "
-        "end Main; end C;";
-    // MEASURED (this lane, scratch bezelc --sanitize=address, 200 iterations):
-    // "8600 byte(s) leaked in 400 allocation(s)" -- floor set comfortably
-    // below per LANE_RULES §30.
-    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 6000));
+        "end Main; end C;"), 0);
 }
 
 // Axis: `readonly`. Otherwise identical to row 1 but P is a PLAIN
-// (non-readonly) auto-property -- any method could reassign it at any
-// time during the instance's life, so the fix must decline it.
+// (non-readonly) auto-property, so §23.1 does not confine its writes at
+// all — any method in this module, and an importer if it could name the
+// type, may assign it. #4253 declined on that possibility alone. The
+// predicate instead checks the two facts that decide it: §13.2 makes the
+// undecorated `class Holder` **internal**, so no importer can name it, and
+// the module-wide scan finds no assignment to `P` anywhere. (Remove EITHER
+// fact and the shape is correctly declined again — see the two decline
+// controls `non_readonly_property_reassigned_by_method_declined_no_uaf`
+// and `public_type_public_non_readonly_property_declined` below.)
 BEZEL_TEST(class_field_record_string_release_4253,
-           non_readonly_property_still_leaks_axis_readonly) {
-    const char* prog =
+           non_readonly_property_record_string_field_no_leak_spec_9_7_issue_4277) {
+    BEZEL_EXPECT_EQ(runChecked(
         "module M; record Box(Value: string); "
         "sealed class Holder(s: int) "
         "  public property P: Box := new Box(\"hi\" + s.ToString()); "
@@ -292,8 +319,82 @@ BEZEL_TEST(class_field_record_string_release_4253,
         "    i += 1; "
         "  end; "
         "  return acc mod 100; "
+        "end Main; end C;"), 90);
+}
+
+// ===========================================================================
+// DECLINE controls for the #4277 predicate (LANE_RULES §15/§25). These are
+// the rows that make `declarationInitializerIsSoleStore` load-bearing: each
+// removes ONE of the two facts its proof rests on, and each would become a
+// use-after-free — not a leak — if the predicate admitted it anyway.
+// ===========================================================================
+
+// (B) half: the module-wide WRITE-SITE scan. Same non-readonly shape as the
+// `readonly`-axis row above, except a method assigns `this.P := b` from a
+// BORROWED parameter, so the slot ends up aliasing a record the caller still
+// owns. `keep`'s string is read AFTER the Holder is disposed, so admitting
+// this shape would free `keep.Value` out from under that read — a
+// heap-use-after-free, which `runAotCheckedLenient` reports as ran=false.
+// Deleting the scan from the predicate turns this row red.
+BEZEL_TEST(class_field_record_string_release_4253,
+           non_readonly_property_reassigned_by_method_declined_no_uaf) {
+    const char* prog =
+        "module M; record Box(Value: string); "
+        "sealed class Holder "
+        "  public property P: Box := new Box(\"fresh\" + \"init\"); "
+        "  public method Take(b: Box) "
+        "    this.P := b; "
+        "  end Take; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var i := 0; "
+        "  var acc := 0; "
+        "  while i < 200 do "
+        "    var keep := new Box(\"kept\" + i.ToString()); "
+        "    do "
+        "      using var h := new Holder(); "
+        "      h.Take(keep); "
+        "    end; "
+        "    acc += keep.Value.Length; "
+        "    i += 1; "
+        "  end; "
+        "  return acc mod 100; "
         "end Main; end C;";
-    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 6000));
+    BEZEL_EXPECT_TRUE(didNotCrash(prog));
+    BEZEL_EXPECT_EQ(run(prog), 90);
+}
+
+// (A1) half: cross-module reachability. A `public` type with a `public`,
+// NON-readonly property is the one shape whose write sites this compilation
+// genuinely cannot enumerate — an importer may assign `h.P` with a value
+// this module never sees (§13.2 makes the type nameable there; §23.1
+// confines nothing, the member not being readonly). The predicate declines
+// it, so it still safely leaks exactly as before #4277.
+//
+// HONEST LABEL: this row passes on BOTH sides of #4277 — the decline is
+// what it pins, and a single-module program cannot exhibit the importing
+// module's write. It is a recorded-decision control, not a FAIL-WITHOUT
+// row. The `didNotCrash` oracle (detect_leaks=0) is used deliberately so
+// the still-present leak needs no sanitizer_leak_exempt.txt declaration.
+BEZEL_TEST(class_field_record_string_release_4253,
+           public_type_public_non_readonly_property_declined) {
+    const char* prog =
+        "module M; public record Box(Value: string); "
+        "public sealed class Holder(s: int) "
+        "  public property P: Box := new Box(\"hi\" + s.ToString()); "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var i := 0; "
+        "  var acc := 0; "
+        "  while i < 200 do "
+        "    using var h := new Holder(i); "
+        "    acc += h.P.Value.Length; "
+        "    i += 1; "
+        "  end; "
+        "  return acc mod 100; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(didNotCrash(prog));
+    BEZEL_EXPECT_EQ(run(prog), 90);
 }
 
 // Axis: fresh-construction eligibility. Otherwise identical to row 1
@@ -381,10 +482,20 @@ BEZEL_TEST(class_field_record_string_release_4253,
 // ===========================================================================
 
 // Shape of issue #4275: a readonly field with a declaration initializer,
-// reassigned again inside an explicit constructor body. `hasAnyConstructor`
-// is true here (an explicit constructor exists), so this fix's own release
-// never registers for `P` at all -- no UAF, whatever sema does or does not
-// accept for the reassignment itself.
+// reassigned again inside an explicit constructor body. §22.8's own scope
+// statement and DECLINED.md (v0.271) record that the single-assignment rule
+// deliberately does NOT extend to readonly auto-properties, so this program
+// is ACCEPTED by design and the constructor-body store overrides the
+// initializer at runtime (#3207).
+//
+// UPDATED for fix #4277 — same verdict, better reason. #4253 declined it
+// because `hasAnyConstructor(ts)` was true; the #4277 predicate declines it
+// because the module-wide write-site scan SEES the `this.P := new Box(...)`
+// store, so `P`'s declaration initializer is demonstrably not its sole
+// store. That distinction is what lets the unrelated-constructor row far
+// above be admitted while this one stays declined: the two shapes differ
+// only in whether the constructor writes THIS field, and only the scan can
+// tell them apart. No UAF either way.
 BEZEL_TEST(class_field_record_string_release_4253,
            sema_gap_4275_shape_still_safe_no_uaf) {
     // NO primary constructor here -- deliberately: §22.10 requires an
@@ -424,11 +535,15 @@ BEZEL_TEST(class_field_record_string_release_4253,
 // gates in ExprTypecheck.cpp, closing exactly this shape (the explicit
 // `this.P` spelling now agrees with the bare `P := e` spelling, which was
 // already rejected). The program below therefore no longer compiles at
-// all, so this fix's own release condition 2 (`sealed` +
-// `!hasAnyConstructor`) never gets a chance to matter for THIS vector —
-// but it is unchanged and stays independently load-bearing against #4275
-// (row 9 above) and the general non-sealed / has-a-constructor cases
-// (rows 4-5 above), per this run's instruction not to re-scope it.
+// all, so no release condition gets a chance to matter for THIS vector.
+//
+// UPDATED for fix #4277: #4253's condition 2 (`sealed` +
+// `!hasAnyConstructor`) is GONE — fix #4276 is precisely what made the
+// `sealed` half unnecessary, since a derived constructor can no longer
+// reach an inherited readonly member from any module, and the write-site
+// scan replaced the `!hasAnyConstructor` half for every module this
+// compilation CAN read. This row keeps pinning the rejection itself, which
+// is the fact (A)'s readonly argument now leans on.
 BEZEL_TEST(class_field_record_string_release_4253,
            derived_ctor_inherited_readonly_reassignment_rejected_spec_23_1_issue_4276) {
     const char* prog =

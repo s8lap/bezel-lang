@@ -36615,6 +36615,390 @@ void Emitter::collectBoxStorageFields() {
 }
 
 
+// fix #4277 (§9.7 "Records and disposal" / §28.9 "Runtime-managed types" /
+// §13.2 "Top-level types" / §23.1 "Auto-properties", v0.306): the module-wide
+// WRITE-SITE scan behind `declarationInitializerIsSoleStore` — see the
+// declaration in LlvmBackend_impl.hpp.
+//
+// The traversal is deliberately structured as "recognize every node kind, and
+// treat an UNRECOGNIZED one as a scan failure". A read-position miss would be
+// harmless, but a WRITE hidden inside a node kind with no arm here would make
+// the disposal walk release a slot somebody else still owns, so the walk sets
+// `recordFieldWriteScanIncomplete_` rather than assume the node is inert.
+//
+// WRITE POSITIONS, exhaustively: an `AssignmentStmt` target (every operator,
+// not just `:=`), an `IncrementStmt` target (§17.6), and a `ref`/`out`
+// argument (§22.3 — "out", "out var", "out using var", "out owned" all begin
+// with "out"). A `WithExpr` is NOT one: §14 `with` copies its source's storage
+// into a fresh value and never writes back through it.
+//
+// NOT WALKED, with reasons: contract clauses (`requires`/`ensures`/
+// `invariant` expressions) — §22.16 states a clause "can neither write state,
+// consume or dispose a value, nor suspend", so no write can live there; and
+// `Type` nodes, which carry no expressions.
+void Emitter::collectRecordFieldWriteSites() {
+    if (recordFieldWriteScanDone_) return;
+    recordFieldWriteScanDone_ = true;
+
+    std::function<void(const ast::Expr*)> walkExpr;
+    std::function<void(const ast::Stmt*)> walkStmt;
+
+    // While true, every expression `walkExpr` visits has its resolved symbol
+    // recorded as WRITTEN. `noteWrite` turns it on for the duration of one
+    // write-target subtree.
+    //
+    // WHY A WHOLE SUBTREE and not just the target node. An earlier draft
+    // resolved the target node alone and failed the scan closed when it
+    // resolved to nothing — which is what `a[i] := v` and `x.F.G := v` both
+    // do, so the fix would have switched itself off for essentially every
+    // real module. Marking every symbol the target MENTIONS is the
+    // conservative direction instead: the member actually being written must
+    // appear somewhere inside its own target expression, so no write can be
+    // missed, and the extra symbols picked up (the receiver local, an index
+    // variable) are never the record-typed field this predicate asks about
+    // — and if one ever were, the answer would be the safe "declined".
+    bool inWriteTarget = false;
+    auto noteWrite = [&](const ast::Expr* e) {
+        if (!e) return;
+        const bool saved = inWriteTarget;
+        inWriteTarget = true;
+        walkExpr(e);
+        inWriteTarget = saved;
+    };
+
+    // §22.3 `ref`/`out` argument slots are write positions; every other slot
+    // is a read. `isDiscard` slots (`_`) carry no expression at all.
+    auto walkArgs = [&](const std::vector<ast::CallArgument>& args) {
+        for (const ast::CallArgument& a : args) {
+            if (!a.value) continue;
+            if (a.modifier == "ref" || a.modifier.rfind("out", 0) == 0)
+                noteWrite(a.value.get());
+            walkExpr(a.value.get());
+        }
+    };
+
+    walkExpr = [&](const ast::Expr* e) {
+        if (!e) return;
+        if (inWriteTarget) {
+            // Both keys: the symbol itself and its declaration node (the decl
+            // key is what makes the answer instantiation-independent — see
+            // recordFieldWritten_'s comment in LlvmBackend_impl.hpp).
+            if (const sema::Symbol* w = ctx_.exprSymbol(*e)) {
+                recordFieldWritten_.insert(static_cast<const void*>(w));
+                if (w->decl)
+                    recordFieldWritten_.insert(static_cast<const void*>(w->decl));
+            }
+        }
+        // --- leaves: no sub-expression, so no store can hide inside ---------
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::CharLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::StringLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return;
+        if (dynamic_cast<const ast::BoolLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::IdentifierExpr*>(e)) return;
+        if (dynamic_cast<const ast::TypeOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::NameOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::DefaultExpr*>(e)) return;
+        if (dynamic_cast<const ast::UnitExpr*>(e)) return;
+        // §28.3 `owned x` in expression position names a binding, nothing more.
+        if (dynamic_cast<const ast::MarkedTransferExpr*>(e)) return;
+        // --- composites ------------------------------------------------------
+        if (auto* si = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& part : si->parts) walkExpr(part.expr.get());
+            return; }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            walkExpr(ma->target.get()); return; }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            walkExpr(nm->target.get()); return; }
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            walkExpr(ce->callee.get()); walkArgs(ce->args); return; }
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            walkExpr(nc->callee.get()); walkArgs(nc->args); return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            walkExpr(ix->target.get()); walkArgs(ix->indices); return; }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            walkExpr(pb->operand.get()); return; }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            walkArgs(ne->args); return; }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            walkExpr(be->left.get()); walkExpr(be->right.get()); return; }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            walkExpr(ue->operand.get()); return; }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            walkExpr(tt->operand.get()); return; }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            walkExpr(co->condition.get()); walkExpr(co->thenValue.get());
+            walkExpr(co->elseValue.get()); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            walkExpr(th->operand.get()); return; }
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+            walkExpr(rg->lo.get()); walkExpr(rg->hi.get());
+            walkExpr(rg->step.get()); return; }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+            walkExpr(we->source.get());
+            for (const auto& a : we->assigns) walkExpr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& el : cl->elements) walkExpr(el.get());
+            for (const auto& k : cl->keys) walkExpr(k.get());
+            return; }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            walkExpr(lam->exprBody.get());
+            for (const auto& s : lam->stmts) walkStmt(s.get());
+            for (const ast::Param& p : lam->params)
+                walkExpr(p.defaultValue.get());
+            return; }
+        if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+            walkExpr(cx->scrutinee.get());
+            for (const ast::CaseArm& arm : cx->arms) {
+                walkExpr(arm.guard.get());
+                walkExpr(arm.exprBody.get());
+                for (const auto& s : arm.stmts) walkStmt(s.get());
+            }
+            return; }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (const auto& c : bx->clauses) walkStmt(c.get());
+            walkExpr(bx->body.get());
+            return; }
+        recordFieldWriteScanIncomplete_ = true;
+    };
+
+    walkStmt = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            walkExpr(ld->initializer.get()); return; }
+        // §21.1's runtime `const` local is a SIBLING node of LocalDecl, not a
+        // subclass — the #3591/#2802 family this codebase has paid for six
+        // times. Its initializer can hold a lambda that stores to a member.
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            walkExpr(lc->value.get()); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            noteWrite(as->target.get());   // walks the target too
+            walkExpr(as->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            noteWrite(is->target.get()); return; }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            walkExpr(rs->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            walkExpr(es->expr.get()); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            walkExpr(th->value.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            walkExpr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            walkExpr(ys->value.get()); return; }
+        if (dynamic_cast<const ast::BreakStmt*>(s)) return;
+        if (dynamic_cast<const ast::ContinueStmt*>(s)) return;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            walkExpr(ifs->ifBranch.condition.get());
+            for (const auto& b : ifs->ifBranch.body) walkStmt(b.get());
+            for (const auto& br : ifs->elifBranches) {
+                walkExpr(br.condition.get());
+                for (const auto& b : br.body) walkStmt(b.get());
+            }
+            for (const auto& b : ifs->elseBody) walkStmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            walkExpr(ws->condition.get());
+            for (const auto& b : ws->body) walkStmt(b.get()); return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            walkExpr(fs->iterable.get()); walkExpr(fs->withExpr.get());
+            for (const auto& b : fs->body) walkStmt(b.get()); return; }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (const auto& b : db->body) walkStmt(b.get()); return; }
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (const auto& b : tr->body) walkStmt(b.get());
+            for (const ast::CatchArm& c : tr->catches) {
+                walkExpr(c.guard.get());
+                walkStmt(c.body.get());
+            }
+            for (const auto& b : tr->finallyBody) walkStmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            walkExpr(cs->scrutinee.get());
+            for (const ast::CaseArm& arm : cs->arms) {
+                walkExpr(arm.guard.get());
+                walkExpr(arm.exprBody.get());
+                for (const auto& a : arm.stmts) walkStmt(a.get());
+            }
+            return; }
+        recordFieldWriteScanIncomplete_ = true;
+    };
+
+    // A member declaration's own bodies. A FieldDecl/PropertyDecl declaration
+    // INITIALIZER is deliberately NOT noted as a write: it is precisely the
+    // store this predicate asks about. Its sub-expressions are still walked,
+    // because a lambda inside one can store to a DIFFERENT member.
+    std::function<void(const ast::Member*)> walkMember;
+    walkMember = [&](const ast::Member* mem) {
+        if (!mem) return;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(mem)) {
+            walkExpr(fd->initializer.get()); return; }
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem)) {
+            walkExpr(pd->autoInitializer.get());
+            walkExpr(pd->exprBody.get());
+            for (const ast::PropertyAccessor& acc : pd->accessors) {
+                walkExpr(acc.exprBody.get());
+                for (const auto& s : acc.stmts) walkStmt(s.get());
+            }
+            return; }
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
+            walkExpr(md->exprBody.get());
+            for (const auto& s : md->stmts) walkStmt(s.get());
+            for (const ast::Param& p : md->params)
+                walkExpr(p.defaultValue.get());
+            return; }
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
+            walkExpr(od->exprBody.get());
+            for (const auto& s : od->stmts) walkStmt(s.get());
+            return; }
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(mem)) {
+            for (const auto& s : cd->body) walkStmt(s.get());
+            for (const ast::Param& p : cd->params)
+                walkExpr(p.defaultValue.get());
+            return; }
+        if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(mem)) {
+            for (const auto& s : dd->body) walkStmt(s.get()); return; }
+        // §22.16 invariant: a pure predicate, cannot write state; walked only
+        // so an unrecognized-kind fail-close is not tripped by it.
+        if (dynamic_cast<const ast::InvariantDecl*>(mem)) return;
+        // An `ast::EventDecl` carries only a name and a type — no
+        // initializer, no body — so it holds no expression at all.
+        if (dynamic_cast<const ast::EventDecl*>(mem)) return;
+        if (auto* kd = dynamic_cast<const ast::ConstDecl*>(mem)) {
+            walkExpr(kd->value.get()); return; }
+        if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(mem)) {
+            if (nt->decl)
+                for (const auto& sub : nt->decl->members) walkMember(sub.get());
+            return; }
+        recordFieldWriteScanIncomplete_ = true;
+    };
+
+    // Every declaration body in THIS module. `ctx_.symbols()` holds only the
+    // module being compiled (imported symbols live in a separate list,
+    // SemaContext.hpp) — which is exactly the right domain: a write site in
+    // another module is handled by the reachability half of the proof in
+    // `declarationInitializerIsSoleStore`, not by this walk.
+    //
+    // Three arms, because a body can hang off three shapes: a `TypeDecl`'s
+    // members, a §26 `ExtensionDecl`'s members (an ExtensionSymbol is a
+    // TOP-LEVEL symbol whose members are not reachable from any TypeDecl), and
+    // a member symbol's own decl (belt-and-braces: idempotent, and it reaches
+    // an extension member even if the block itself were ever absent here).
+    for (const auto& sym : ctx_.symbols()) {
+        const ast::Node* d = sym ? sym->decl : nullptr;
+        if (!d) continue;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(d)) {
+            for (const auto& mem : td->members) walkMember(mem.get());
+        } else if (auto* xd = dynamic_cast<const ast::ExtensionDecl*>(d)) {
+            for (const auto& mem : xd->members) walkMember(mem.get());
+        } else if (auto* mem = dynamic_cast<const ast::Member*>(d)) {
+            walkMember(mem);
+        }
+        // Any other symbol decl (ModuleDecl, Import, TypeAliasDecl,
+        // ExternBlock, a local/parameter symbol) carries no member body.
+    }
+}
+
+
+// fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306) — see the declaration in
+// LlvmBackend_impl.hpp. Is `m`'s OWN declaration initializer the SOLE store
+// its slot ever receives?
+//
+// The proof has exactly two halves, and both are about WRITE SITES:
+//
+//  (A) NO write site can exist outside this module. Two independent grounds,
+//      either sufficient:
+//        * `m` is `readonly`. §23.1 admits a write to a readonly member only
+//          from a field initializer or a constructor, and since fix #4276 the
+//          four readonly-write gates additionally require the writing context
+//          to be the DECLARING type (`currentType_ == ps->parent` /
+//          `fs->parent`) — so a derived class's constructor, in this module or
+//          any importer, is rejected. A readonly auto-property has no setter
+//          (§23.1), so there is no call-shaped write either. Every admissible
+//          write site therefore lives in `ts`'s own body, which is local.
+//        * `m` is not REACHABLE from another module. §13.2 defaults a
+//          top-level type to `internal`, and `internal` is what the test
+//          programs' undecorated `class Holder` gets: an importer cannot name
+//          the type, so it cannot write the member however public the member
+//          itself is. Symmetrically a `private`/`internal` member of a public
+//          type is unreachable.
+//      When NEITHER holds — a public-or-protected, non-readonly member of a
+//      public type — an importer can write the slot with a value this compiler
+//      never sees, and no local scan can prove anything. Declined.
+//
+//  (B) NO write site exists inside this module, per collectRecordFieldWriteSites.
+//
+// Together: the declaration initializer is the only store, so the value the
+// disposer releases is exactly the +1 that initializer's own eligibility proof
+// (`isFreshRecordConstructionOfExactType`, unchanged at the call site) showed
+// to be fresh and alias-free.
+//
+// WHY THIS REPLACES THREE CONDITIONS WITH ONE. `sealed`, `!hasAnyConstructor`
+// and `readonly` were three different coarse answers to this one question, and
+// each over-rejected on its own axis (measured on origin/main cafdfc52, the
+// 200-iteration loop in class_field_record_string_release_4253_test.cpp):
+// a non-sealed class with no subclass leaked 7490 B / 400 allocations; a
+// sealed class whose only constructor never mentions the field leaked 8600 B /
+// 400; a non-readonly property nothing ever assigns leaked 7490 B / 400. All
+// three have exactly one store — the initializer — and asking that directly
+// admits all three without widening the safety claim by one inch. Adding three
+// separate arms instead would have re-formed the predicate family this
+// codebase keeps paying to collapse.
+bool Emitter::declarationInitializerIsSoleStore(const sema::TypeSymbol* ts,
+                                                const sema::Symbol* m) {
+    if (!ts || !m) return false;
+    auto* ms = dynamic_cast<const sema::MemberSymbol*>(m);
+    if (!ms) return false;  // no visibility/modifiers to read: decline
+
+    collectRecordFieldWriteSites();
+    if (recordFieldWriteScanIncomplete_) return false;  // fail closed
+
+    // (A) no write site OUTSIDE this module.
+    bool isReadonly = false;
+    for (auto mod : ms->modifiers)
+        if (mod == "readonly") { isReadonly = true; break; }
+
+    // (A1) a THIRD module. It can write the slot only if it can both NAME
+    // and ASSIGN the member: §13.2 keeps an `internal` top-level type
+    // (the default) unnameable outside its module, and §23.1 keeps a
+    // `readonly` member unassignable outside its declaring type's own
+    // constructors and field initializer.
+    const bool memberReachableAcrossModules =
+        ts->visibility == ast::Visibility::Public &&
+        (ms->visibility == ast::Visibility::Public ||
+         ms->visibility == ast::Visibility::Protected);
+    if (!isReadonly && memberReachableAcrossModules) return false;
+
+    // (A2) the DECLARING module, when that is not the module being compiled.
+    // An imported type's own bodies are not in `ctx_.symbols()` and no AST
+    // for them crosses the §2.8.2 interface (the #3671 seam), so the (B)
+    // scan cannot see them and the only evidence is what the interface
+    // carries. §23.1 (+ fix #4276's declaring-type narrowing) confines a
+    // readonly member's writes to the declaring type's OWN field initializer
+    // — the store under question — and its OWN constructor bodies, so an
+    // imported type with no constructor at all has no other write site there.
+    // This is the ONE place #4253's `!hasAnyConstructor` proxy was answering
+    // a question nothing else can: it is kept here, where it is the evidence
+    // rather than a stand-in, and dropped everywhere it was over-rejecting a
+    // module this compilation CAN read.
+    const bool declaringModuleUnscannable =
+        ctx_.isImported(ts) || ts->decl == nullptr;
+    if (declaringModuleUnscannable &&
+        (!isReadonly || hasAnyConstructor(ts)))
+        return false;
+
+    // (B) no write site INSIDE this module.
+    if (recordFieldWritten_.count(static_cast<const void*>(m))) return false;
+    if (m->decl &&
+        recordFieldWritten_.count(static_cast<const void*>(m->decl)))
+        return false;
+    return true;
+}
+
+
 // #383 / §28: a reference TypeRef carrying a vtable — a user class or
 // interface (Named, with a class/interface declaration). Such objects are
 // disposed dynamically through their own vtable slot 2 (CG35-itable).

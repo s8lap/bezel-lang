@@ -73,6 +73,26 @@ sys.path.insert(0, str(SCRIPTS))
 from gate import sanitizer as S      # noqa: E402
 from gate import summary as _summary  # noqa: E402
 
+
+LEAK_EXEMPT = SCRIPTS / "gate" / "sanitizer_leak_exempt.txt"
+
+
+def a_declared_leak_key():
+    """One key that the SHIPPED sanitizer_leak_exempt.txt really declares.
+
+    DERIVED, never hardcoded (fix #4277). Two tests below drive the real
+    gate.sh blocks with a leak report attributed to a declared row, and both
+    spelled one key literally — `class_field_record_string_release_4253.
+    non_sealed_class_still_leaks_axis_sealed`. That row was removed when the
+    leak it asserted was FIXED, which is the normal, intended lifecycle of
+    every row in that file, and both tests went red for a reason that had
+    nothing to do with what they test. The file is the authority for what it
+    declares; ask it. Sorted so the choice is deterministic across runs.
+    """
+    declared = sorted(S.read_exempt(str(LEAK_EXEMPT)))
+    assert declared, "sanitizer_leak_exempt.txt declares nothing to exercise"
+    return declared[0]
+
 # A REAL clang/ASan report, captured verbatim from an instrumented program
 # (`int *p = malloc(16); free(p); p[1] = 7;` built with -fsanitize=address),
 # wrapped in the banner aot_support.hpp's emitSanitizerReportToStderr writes to
@@ -672,11 +692,12 @@ class GateBlockTest(unittest.TestCase):
                              "fail() exits before this echo is reached")
 
     def test_a_declared_leak_only_run_passes_the_cycle(self):
-        """The 11 real leaksAtLeast rows are declared in the SHIPPED
+        """The real leaksAtLeast rows are declared in the SHIPPED
         sanitizer_leak_exempt.txt — exercise one end to end through the real
-        gate.sh block, not just the unit-level verdict()."""
-        declared = ("class_field_record_string_release_4253."
-                   "non_sealed_class_still_leaks_axis_sealed")
+        gate.sh block, not just the unit-level verdict(). The row is DERIVED
+        from that file (see a_declared_leak_key): a removed row must not fail
+        a test that is not about that row."""
+        declared = a_declared_leak_key()
         with tempfile.TemporaryDirectory() as tmp:
             r = self._run(tmp, self._log(**{"a.0": _scope(declared, "pass", LEAK)}))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -726,8 +747,7 @@ class CanaryBlockTest(unittest.TestCase):
             self.assertIn("sanitizer_leak_exempt.txt", r.stdout)
 
     def test_a_declared_leak_in_the_canary_does_not_brick_the_gate(self):
-        declared = ("class_field_record_string_release_4253."
-                   "non_sealed_class_still_leaks_axis_sealed")
+        declared = a_declared_leak_key()   # DERIVED — see the helper
         with tempfile.TemporaryDirectory() as tmp:
             r = self._run(tmp, GateBlockTest._log(**{"a.0": _scope(declared, "pass", LEAK)}))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

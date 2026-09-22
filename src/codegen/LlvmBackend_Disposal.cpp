@@ -1765,69 +1765,57 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // existed (a safe-direction leak becomes balanced). It can turn that
     // leak into a double-free / UAF only if the field's value at Dispose
     // time could differ from what the admitted initializer constructed,
-    // or could alias another live binding. Three conditions below close
-    // every reassignment vector found while investigating this issue —
-    // each verified against the REAL compiler, not assumed:
-    //   1. `readonly` — MEASURED: an ordinary (non-constructor) method
-    //      assigning `this.P := ...` to a readonly property is REJECTED
-    //      ("cannot assign to readonly property `P` outside a field
-    //      initializer or constructor (\xC2\xA7 23.1)"). Closes the
-    //      arbitrary-method-reassignment vector.
-    //   2. `!hasAnyConstructor(ts)` — no EXPLICIT constructor exists on
-    //      THIS type, so there is no user-written constructor BODY that
-    //      could reassign the field after its own declaration initializer
-    //      runs. Worth recording because it is NOT redundant with (1):
-    //      MEASURED that a readonly property WITH a declaration
-    //      initializer can currently ALSO be reassigned a second time
-    //      inside an explicit constructor body with NO diagnostic at
-    //      all — sema does not yet enforce §22.8's "at most once,
-    //      counting the field initializer and every constructor body in
-    //      the this(...) chain together" rule when an initializer is
-    //      already present (filed as issue #4275 — a sema gap, out of
-    //      scope for this codegen fix). This condition is the guard
-    //      against it: no constructor body exists to exploit the gap.
-    //   3. `sealed` on `ts` — MEASURED: a DERIVED class's constructor can
-    //      currently reassign a readonly property INHERITED from its
-    //      base with NO diagnostic (a second, broader sema gap than #2 —
-    //      filed as issue #4276). `hasAnyConstructor` only inspects
-    //      `ts`'s OWN members, so it cannot see a subclass's
-    //      constructor; requiring `ts` to be `sealed` closes the vector
-    //      structurally — no subclass can exist to hold such a
-    //      constructor, in this module or any importer.
-    // Together: the field is assigned EXACTLY ONCE, by its own
-    // declaration initializer, for the entire lifetime of every
-    // instance — no other write site exists (own methods barred by (1),
-    // an own constructor body doesn't exist by (2), a derived-class
-    // constructor cannot exist by (3)). The initializer's own
-    // eligibility proof (isFreshRecordConstructionOfExactType) is what
-    // makes that ONE assignment's value provably alias-free.
+    // or could alias another live binding — i.e. only if some OTHER store
+    // to the slot can run.
     //
-    // A field lacking any of these three properties, or whose
-    // initializer is not a provably-fresh NewExpr of the declared type,
-    // is UNCHANGED — still safe-leaks exactly as before this fix
-    // (deliberately narrow, matching #2866/#4237's own local-binding
-    // admission). The residual — constructor-body-assigned fields,
-    // non-sealed classes — is filed as issue #4277.
+    // fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306): that is now asked
+    // DIRECTLY, by `declarationInitializerIsSoleStore` (LlvmBackend_Setup.cpp).
+    // #4253 asked it through three structural PROXIES instead — `readonly`
+    // on the member, `sealed` on `ts`, and `!hasAnyConstructor(ts)` — and
+    // each over-rejected on its own axis, so three whole shapes with exactly
+    // ONE store went on leaking: a non-sealed class with no subclass, a class
+    // whose only constructor never mentions the field, and a non-readonly
+    // property nothing ever assigns (7490 B / 400 allocations, 8600 B / 400,
+    // and 7490 B / 400 respectively at 200 loop iterations, measured on
+    // origin/main cafdfc52). The predicate proves the same safety property
+    // the three proxies were reaching for — the declaration initializer is
+    // the SOLE store the slot ever receives — out of a module-wide write-site
+    // scan plus §13.2/§23.1 cross-module reachability, and is fail-closed on
+    // any AST node kind it does not recognize.
+    //
+    // The two sema facts the proxies were standing in for are unchanged and
+    // still load-bearing, just consulted at their source rather than
+    // approximated: §23.1 (+ fix #4276's declaring-type narrowing) is what
+    // makes a `readonly` member's write sites all local, and §13.2's
+    // default-`internal` top-level visibility is what makes a non-readonly
+    // member of an undecorated type unreachable from an importer.
+    //
+    // A field whose initializer is not a provably-fresh NewExpr of the
+    // declared type, or which any other store site can reach, is UNCHANGED —
+    // still safe-leaks exactly as before. The residual #4277 records and this
+    // fix does NOT close: a field assigned by a CONSTRUCTOR-BODY statement
+    // (`this.P := new Box(...);`) rather than its own declaration
+    // initializer. That shape needs the store site itself to transfer a +1
+    // (drop-on-overwrite for record-typed fields, §28.7's reference-field
+    // mechanism generalized), not merely a proof about how many stores there
+    // are, and stays filed.
     {
         llvm::StructType* rst = classStruct(ts);
-        bool tsSealed = false;
-        for (auto tmod : ts->modifiers)
-            if (tmod == "sealed") { tsSealed = true; break; }
-        bool tsHasCtor = hasAnyConstructor(ts);
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;  // fix #3152 — see the string walk above
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            if (!tsSealed || tsHasCtor) continue;
             const sema::TypeRef* fieldTr = recordMemberType(m);
             if (!isRecordWithStringFieldsTypeRef(fieldTr)) continue;
-            bool isReadonly = false;
-            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
-                for (auto fmod : ms->modifiers)
-                    if (fmod == "readonly") { isReadonly = true; break; }
-            if (!isReadonly) continue;
+            // fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306): ONE predicate
+            // in place of #4253's three structural proxies (`sealed`,
+            // `!hasAnyConstructor`, `readonly`). See its definition in
+            // LlvmBackend_Setup.cpp — it asks the question those three were
+            // each a coarse stand-in for, and so admits the three shapes they
+            // each over-rejected without widening what is being claimed.
+            if (!declarationInitializerIsSoleStore(ts, m)) continue;
             const ast::Expr* init = nullptr;
             // SEAM-ACCESSOR: `m->decl` is nullptr for an IMPORTED field (no
             // ast::FieldDecl crosses the module boundary, the #3671 seam) --
