@@ -71,6 +71,34 @@ namespace bezel::codegen {
 
 Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
                                                   bool owningFamily) {
+    // fix #4596 / §28.11 / §14.1 / §14.4 (v0.306): inside a MONOMORPHIZED
+    // generic body the collection's `genericArgs[0]` is still the placeholder
+    // type parameter (`T`), a Named TypeRef with a null `declaration`. Every
+    // arm below is a declaration- or builtin-name test, so an unresolved `T`
+    // fell past all of them into the Value row (null disposer) — and §28.11's
+    // element-slot table is keyed on the element type's *element category*,
+    // which §14.4 fixes at the INSTANTIATION, not at the generic declaration.
+    // The consequence was that `using var l := new OwningLinkedList<T>();
+    // l.AddLast(owned x);` inside `Inner<T>.Make` emitted
+    // `bz_llist_free(l, NULL)` — the §28.11 "Dispose() of the collection /
+    // owned slots: disposes every live element" row was skipped and the
+    // transferred element leaked (issue #4596: 8,000 B / 500 allocations at
+    // 500 iterations, for OwningLinkedList<T> and OwningArray<T> alike).
+    //
+    // Resolving here rather than at each of the ~80 call sites is deliberate:
+    // this factory is the single source of truth for element-slot behaviour
+    // (see the file header), and the per-site fix has already been paid for
+    // once — `stampOwningElemDisposer` carries #816's local
+    // `elementPolicyFor(resolveTypeParamRef(elemTy), true)`, which fixed only
+    // the construction-time header stamp and left every free site behind.
+    // Resolving centrally also keeps the INSERT and DISPOSE halves of a
+    // co-ownership (`LinkedList<string>`'s retain/release, #2686) reading the
+    // same category inside one monomorphization, which a per-site fix would
+    // not guarantee. `resolveTypeParamRef` returns its argument unchanged for
+    // any non-parameter ref and outside an active substitution, so nothing
+    // outside a monomorphized generic body changes.
+    elemTy = resolveTypeParamRef(elemTy);
+
     // ── Row 3: class / interface type ──────────────────────────────────────
     // per §28.11 v0.135: class/interface × owning  → owned (disposer thunk)
     //                    class/interface × borrowing → borrow (no disposer)
