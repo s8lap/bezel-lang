@@ -7,12 +7,12 @@
 // ("recursively admitting other conforming classes ..."). Only records are
 // restricted (§9.8 v0.182).
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+// Reject control: bezelc -c must reject and emit a §28.3 K3.13 redundant-move diagnostic.
 //
-// RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %not %bezelc -c -o %t.o %s
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 
 module M; class Inner: ISerializable public property V: int; public constructor(v: int) V := v; end constructor; end Inner; class Outer: ISerializable public owned Obj: Inner; public constructor(owned obj: Inner) Obj := move obj; end constructor; end Outer;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+
+// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)

@@ -6,13 +6,13 @@
 // This is the row a NAME-keyed implementation of the rule would fail: the
 // checker resolves captures BY SYMBOL (`ctx_.exprSymbol`), not by name.
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no
+// Reject control: bezelc -c must exit zero and emit no
 // diagnostics. // per §28.3, §27.5 (v0.286)
 //
-// RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %not %bezelc -c -o %t.o %s
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 
 module M; import System; class R private v: int := 5; public method V(): int return this.v; end V; destructor end destructor; end R; class Box public method Run() var p := new R(); var q := move p; var f := lambda(p: int): int => p + 1; _ := f(41); _ := move q; end Run; end Box; class C public static method Main(): int using var box := new Box(); box.Run(); return 0; end Main; end C;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+
+// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.9)

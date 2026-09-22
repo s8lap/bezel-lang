@@ -3478,6 +3478,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
+            // §28.3 K3.13 (marker economy) / K3.9 (discard `_ := x;`): the
+            // discard statement is the announcement (consume table K3.9 row,
+            // Spelling column = "the discard statement itself, or the
+            // `Dispose()` call — no marker"); `_ := move x;` is rejected as
+            // redundant. Bounded to LOCAL or PARAMETER sources (LocalSymbol /
+            // ParameterSymbol); a discard of a field move `_ := move _f;` is
+            // NOT redundant — the field's slot needs the marker for K9
+            // restoration.
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr *>(ds->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr *>(ue->operand.get())) {
+                    auto *id = static_cast<const ast::IdentifierExpr *>(
+                        ue->operand.get());
+                    auto *sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol *>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol *>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "discard right-hand side — the discard "
+                                        "statement already announces the "
+                                        "dispose; write `_ := ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker economy; "
+                                "K3.9 discard)");
+                    }
+                }
+            }
             handleDischarge(*ds->value);
             // §17.13 / §28.3 v0.184 (#1651): `_ := x;` where `x` is a named
             // owned binding — a plain owned LOCAL (a `var`/`using var`
@@ -3708,6 +3738,45 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // §28.3 K3.13 (marker economy) / K3.1 (store into an `owned` field /
+        // owning-collection slot): the declared slot announces the consume
+        // (consume table K3.1 row, Spelling column = "none — the declared slot
+        // announces (marker-free)"). A marker on the RHS of such a store is
+        // rejected as redundant. Limited to assignment (`:=`) — compound
+        // assignments (`+=`, `??=`, etc.) don't enter this consume position.
+        //
+        // Bounded to LOCAL or PARAMETER RHS sources. A field-to-field store
+        // `_ownedA := move _ownedB;` is NOT redundant — both fields' K9.2
+        // restoration rules need the explicit marker on the RHS to track the
+        // moved-from slot.
+        if (as->op == ":=" && as->target && as->value &&
+            exprIsOwnedFieldRead(*as->target)) {
+            if (auto* ue =
+                    dynamic_cast<const ast::UnaryExpr*>(as->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on "
+                                        "the right-hand side of a store into "
+                                        "an `owned` field — the declared "
+                                        "field slot already announces the "
+                                        "ownership transfer; write `") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.1 owned-field store)");
+                    }
+                }
+            }
+        }
         handleAssignment(*as);
         return;
     }
@@ -3742,7 +3811,44 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) handleReturn(*rs->value);
+        if (rs->value) {
+            // §28.3 K3.13 (marker economy) / K3.2 (return under an owned or
+            // mint-announcing return type): `return move x;` is rejected as
+            // redundant — the `return` keyword / declared return type already
+            // announces the ownership transfer (the [consume table](#sec-consume-table)
+            // K3.2 row, Spelling column = "none"). Per K3.13 the marker is admitted
+            // at the marker-required consuming positions and only at those.
+            //
+            // Bounded to LOCAL or PARAMETER sources. A field move
+            // `return move _f;` is NOT redundant even under an owned return —
+            // the field's slot needs the explicit marker to drive the K9.2
+            // restoration tracking, and the §28.8.1 terminal-move /
+            // not-reassigned diagnostic that owns those cases must continue to
+            // fire (`s28_8_1_0002`, etc.).
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
+                if (ue->op == "move" && returnOwned_ &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "`return` operand — the owned return "
+                                        "type already announces the ownership "
+                                        "transfer; write `return ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.2 return)");
+                    }
+                }
+            }
+            handleReturn(*rs->value);
+        }
         return;
     }
     // §29.6 / §29.8 (#945): walk a `yield return EXPR` operand through the shared
@@ -3758,6 +3864,45 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // `yield break` (null value) carries nothing to walk.
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         if (ys->value) {
+            // §28.3 K3.13 (marker economy) / K3.7 (operand of `yield return` in an
+            // OWNING iterator): the declared owning interface already announces
+            // (consume table K3.7 row, Spelling column = "none"); a marker on the
+            // yielded value is rejected as redundant. The owning-iterator test
+            // is shared with the using-var / dispose-by-name check below.
+            bool owningIter =
+                returnType_ && returnType_->kind == ast::TypeKind::Named &&
+                returnType_->name && !returnType_->name->parts.empty() &&
+                common::isIterFormatEnumerableHead(
+                    returnType_->name->parts.front()) &&
+                common::isOwningIterableInterfaceHead(
+                    returnType_->name->parts.front());
+            if (owningIter) {
+                if (auto* ue =
+                        dynamic_cast<const ast::UnaryExpr*>(ys->value.get())) {
+                    if (ue->op == "move" &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ue->operand.get())) {
+                        auto* id = static_cast<const ast::IdentifierExpr*>(
+                            ue->operand.get());
+                        auto* sym = ctx_.exprSymbol(*id);
+                        bool sourceIsLocalOrParam =
+                            sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                    dynamic_cast<sema::ParameterSymbol*>(sym));
+                        if (sourceIsLocalOrParam) {
+                            report(
+                                Severity::Error, ue->span.begin,
+                                std::string("the `move` marker is redundant "
+                                            "on a `yield return` operand in an "
+                                        "owning iterator — the declared "
+                                        "owning interface already announces "
+                                        "the transfer; write `yield return ") +
+                                    std::string(id->name) +
+                                    "` without `move` (§28.3 K3.13 marker "
+                                    "economy; K3.7 owning-iterator yield)");
+                        }
+                    }
+                }
+            }
             handleDischarge(*ys->value);
             // fix #1863 / §29.1 v0.196 (IOwningEnumerable ownership transfer): in
             // an OWNING iterator (return type IOwningEnumerable<T> /
@@ -3777,14 +3922,8 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             //
             // #3419 class-H: the OWNING half of the four iterator-format
             // ENUMERABLE heads, same composition as iterableIsOwningEnumerable
-            // above. // per §29.2, #3419
-            bool owningIter =
-                returnType_ && returnType_->kind == ast::TypeKind::Named &&
-                returnType_->name && !returnType_->name->parts.empty() &&
-                common::isIterFormatEnumerableHead(
-                    returnType_->name->parts.front()) &&
-                common::isOwningIterableInterfaceHead(
-                    returnType_->name->parts.front());
+            // above; `owningIter` itself is computed at the top of this YieldStmt
+            // arm (the §28.3 K3.13 redundant-move check shares it). // per §29.2, #3419
             if (owningIter) {
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         ys->value.get())) {
@@ -3847,6 +3986,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // as opposed to a borrow — is a separate announced-consume case, handled
     // explicitly below after the discharge walk.) // per §31.1, §28.8
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        // §28.3 K3.13 (marker economy) / K3.8 (throw operand): `throw move e;`
+        // is rejected as redundant — the `throw` keyword already announces the
+        // ownership transfer (consume table K3.8 row, Spelling column = "none").
+        // Bounded to LOCAL or PARAMETER sources; `throw move _f;` of a field
+        // is NOT redundant — the field's K9.2 restoration tracking still
+        // needs the marker.
+        if (th->value) {
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(th->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "`throw` operand — the `throw` "
+                                        "keyword already announces the "
+                                        "ownership transfer; write `throw ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.8 throw)");
+                    }
+                }
+            }
+        }
         // §31.1 (issue #430): check for a catch borrow escaping via a
         // NON-OWNED constructor argument of the thrown object. This is the
         // `throw new Wrap(ex)` pattern where Wrap's ctor stores ex in a
