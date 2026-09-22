@@ -8718,6 +8718,15 @@ private:
     // body-emission loops; loops until the worklist stays empty.
     void emitPendingUncheckedFaces();
 
+    // fix #4614(b) (§22.16, v0.306): the class whose invariant a store through
+    // `ps`'s SETTER, written at `target`, must evaluate on entry and normal
+    // exit — or null when §22.16 instruments nothing there (release mode, a
+    // non-public/static setter, a class with no invariant, or the
+    // `this`-receiver reentrancy exemption). See the definition in
+    // LlvmBackend_Assign.cpp for why the exemption is decided here.
+    const sema::TypeSymbol* instrumentedSetterClass(
+        const ast::Expr& target, const sema::PropertySymbol* ps) const;
+
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
     // the exception global, dispose the unwound using-vars, and branch to

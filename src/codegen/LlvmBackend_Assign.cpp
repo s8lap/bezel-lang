@@ -6860,6 +6860,79 @@ bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) 
 }
 
 
+// fix #4614(b) (§22.16, v0.306): §22.16's instrumentation set names
+//
+//   "- **Entry and normal exit** of every `public` **setter** — block-form,
+//      auto-property, indexer, `set(owned)` alike."
+//
+// and NO accessor path emitted it. `grep -n emitInvariantCheck src/codegen/`
+// found six call sites — the public-method entry (`emitFunctionBody`), the
+// public-method exit (`armEnsuresEpilogue` -> `finalizeEnsuresEpilogue`) and
+// four construction-exit sites — so the whole setter row of the set was
+// absent. Measured on this HEAD before this fix: a `public property Q: int`
+// whose block-form setter drives the instance through a state the class
+// invariant rejects ran to completion and returned 42, where §22.16 requires
+// ContractViolationException (99). That is a SILENT UNDER-CHECK, the
+// direction §22.16's observable-boundary property exists to prevent.
+//
+// This predicate answers "does a store written at `target`, through `ps`'s
+// setter, sit on one of those boundaries?" and returns the class whose
+// conjunction to evaluate, or null.
+//
+// THE `this`-REENTRANCY EXEMPTION IS PART OF THE ANSWER, not a separate
+// concern: §22.16's "A call whose receiver is `this` — explicit or implicit
+// — from inside any instance member of the class or a subclass enters the
+// member's unchecked face" governs setters exactly as it governs methods,
+// and instrumenting without it would turn a silent under-check into a loud
+// OVER-check — a public method that legitimately drives its own instance
+// through a broken intermediate state via its own setter would fault. The
+// test is on the SYNTAX, character for character the one `emitMethodCall`
+// applies (#4597): `this.P := v`, `base.P := v`, a bare `P := v` inside an
+// instance member, and the indexer spellings of each.
+const sema::TypeSymbol* Emitter::instrumentedSetterClass(
+    const ast::Expr& target, const sema::PropertySymbol* ps) const {
+    // §22.16 / #4386: nothing is instrumented in release mode.
+    if (!checkedContracts_ || !ps) return nullptr;
+    // §22.16 "Never instrumented: non-public methods and setters, static
+    // members, destructors, and `Dispose`". Records and enums have no class
+    // invariant (the member is a class member, §22.16).
+    if (!ps->parent || ps->parent->kind != ast::TypeDeclKind::Class)
+        return nullptr;
+    if (isStaticProperty(ps)) return nullptr;
+    if (ps->visibility != ast::Visibility::Public) return nullptr;
+    // §13.6 accessor visibility: `public property Id: int private set;` is a
+    // public property with a NON-public setter, and §22.16's row is about the
+    // setter. An IMPORTED property carries no `ast::PropertyDecl` (#2414), so
+    // this refinement simply does not apply there.
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        if (pd->hasAutoAccessorVis && pd->autoAccessorIsSet &&
+            pd->autoAccessorVis != ast::Visibility::Public)
+            return nullptr;
+        for (const auto& a : pd->accessors)
+            if (a.isSet && a.visibility != ast::Visibility::None &&
+                a.visibility != ast::Visibility::Public)
+                return nullptr;
+    }
+    if (!hasClassInvariant(ps->parent)) return nullptr;
+    // The §22.16 `this`-reentrancy exemption, decided from the receiver's own
+    // SYNTAX (see the header). `currentThis_` guards the implicit spelling so
+    // a bare name lowered outside any instance member is never mistaken for
+    // one.
+    const ast::Expr* recvExpr = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+        recvExpr = ma->target.get();
+    else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target))
+        recvExpr = ix->target.get();
+    else if (dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return currentThis_ ? nullptr : ps->parent;  // implicit `this`
+    if (recvExpr)
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(recvExpr))
+            if ((tid->name == "this" || tid->name == "base") && currentThis_)
+                return nullptr;
+    return ps->parent;
+}
+
+
 bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
                                     const ast::Expr* valueExpr) {
     const ast::PropertyAccessor* setter = computedSetterOf(target);
@@ -7033,6 +7106,12 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         }
     }
     if (!recv) return false;
+    // fix #4614(b) (§22.16, v0.306): the setter ENTRY boundary. Emitted
+    // before the inlined setter body so the instance is observed in the
+    // state the caller handed over, exactly as the public-method entry
+    // check is emitted before the method body (`emitFunctionBody`).
+    const sema::TypeSymbol* invCls4614 = instrumentedSetterClass(target, ps);
+    if (invCls4614) emitInvariantCheck(recv, invCls4614);
     // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
     llvm::AllocaInst* slot = entryAlloca(v->getType());
     builder_.CreateStore(v, slot);
@@ -7059,6 +7138,13 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
+    // fix #4614(b) (§22.16, v0.306): the setter NORMAL-EXIT boundary.
+    // `accEndBB` is the join every non-throwing path through the inlined
+    // body reaches (§21.7's accessor-end target, #739), which is exactly
+    // §22.16's "normal exit" — "throw exits check nothing" is why an
+    // unwinding path must not reach it.
+    if (invCls4614 && !builder_.GetInsertBlock()->getTerminator())
+        emitInvariantCheck(recv, invCls4614);
     // fix #2568 (§23.3/§28.9/§4.6, v0.236): the INSTANCE-PATH twin of the
     // static-path emitProducerRelease above. Same gate (classOwned) for the
     // same record-UAF reason. See the long comment above the static branch
