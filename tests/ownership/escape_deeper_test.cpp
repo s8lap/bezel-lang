@@ -150,7 +150,7 @@ BEZEL_TEST(own_field_store_escape, store_move_of_owned_local_into_field_clean_28
     auto r = parseAndCheckOwnership(wrap(
         "public static method Give(box: Box) "
         "  var r := new R(); "
-        "  box.Owned := move r; "
+        "  box.Owned := r; "
         "end Give;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

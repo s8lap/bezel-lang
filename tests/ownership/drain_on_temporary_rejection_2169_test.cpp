@@ -48,7 +48,7 @@ const char* kR =
     "  public static method Make(): owned OwningArray<R> "
     "    var a := new OwningArray<R>(); "
     "    a.Add(new R()); "
-    "    return move a; "
+    "    return a; "
     "  end Make; "
     "end F; ";
 

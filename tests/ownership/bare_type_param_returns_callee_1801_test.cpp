@@ -237,7 +237,7 @@ BEZEL_TEST(bare_type_param_returns_callee,
         "module M; "
         "class Util "
         "  public static method Take<T>(a: T, owned b: T): owned T "
-        "    where T: class return move b; end Take; "
+        "    where T: class return b; end Take; "
         "end Util;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

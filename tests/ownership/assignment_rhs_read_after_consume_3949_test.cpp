@@ -371,7 +371,7 @@ BEZEL_TEST(assignment_rhs_read_after_consume_3949,
     JitResult jr = runAot(wrap(
         "var h := new Holder(); "
         "var x := new Res(7); "
-        "h.f := move x; "
+        "h.f := x; "
         "var t := 0; "
         "if h.f <> null then t := h.f!.tag; end; "
         "h.Dispose(); "

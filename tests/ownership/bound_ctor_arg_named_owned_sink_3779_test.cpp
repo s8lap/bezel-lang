@@ -93,7 +93,7 @@ const char* kTwo =
     "  private _bid: int; "
     "  private _c: int; "
     "  public constructor(owned a: Res, b: Res, c: int := 1) "
-    "    _a := move a; "
+    "    _a := a; "
     "    _bid := b.Id(); "
     "    _c := c; "
     "    _sum := _sum + _a.Id() + _bid + _c; "

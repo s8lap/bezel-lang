@@ -335,7 +335,7 @@ BEZEL_TEST(owned_param_store_escape_3746,
         "class Box "
         "  public owned r: R?; "
         "  public method Take(p: owned R) "
-        "    this.r := move p; "
+        "    this.r := p; "
         "  end Take; "
         "end Box; "
         "class C "

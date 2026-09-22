@@ -567,7 +567,7 @@ BEZEL_TEST(lambda_body_escape_owned_3800,
         "  public method Run(): int "
         "    var r := new R(); "
         "    var b := new Box(); "
-        "    b.a := move r; "
+        "    b.a := r; "
         "    return b.a!.V(); "
         "  end Run; "
         "  public static method Main(): int "

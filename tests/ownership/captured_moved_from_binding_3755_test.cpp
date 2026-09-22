@@ -417,7 +417,7 @@ BEZEL_TEST(own_captured_moved_from_3755, lambda_param_shadow_accepted_28_3) {
         "  var q := move p; "
         "  var f := lambda(p: int): int => p + 1; "
         "  _ := f(41); "
-        "  _ := move q; "
+        "  _ := q; "
         "end Run; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
@@ -432,7 +432,7 @@ BEZEL_TEST(own_captured_moved_from_3755, lambda_body_local_shadow_accepted_28_3)
         "  var q := move p; "
         "  var f := lambda(): int => do var p := 7; return p; end; "
         "  _ := f(); "
-        "  _ := move q; "
+        "  _ := q; "
         "end Run; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
