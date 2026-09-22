@@ -5898,6 +5898,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // moved" on a marked move-only-array transfer). // per §28.3 v0.180 #1962
         if (!ld.initializerHasOwnedMarker)
             noteMoveOnlyArrayWholeMoveRead(*ld.initializer);
+        // §15.3 (#4587) bullet 1, the OTHER move-only kind: the identical
+        // move for an owning-classified choice (§35.4) initializer —
+        // `var c := b;` where `b: Bundle` (owning) — same guard (skipped
+        // under the `owned` marker for the same double-mark reason above).
+        // // per §15.3, §28.7, v0.306, #4587
+        if (!ld.initializerHasOwnedMarker)
+            noteOwningChoiceWholeMoveRead(*ld.initializer);
     }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
@@ -7104,6 +7111,52 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
     recordMovesIn(*as.value);
+    // §15.3 (#4587) bullet 1: the plain-`:=` twin of `handleLocalDecl`'s
+    // `noteOwningChoiceWholeMoveRead` call above — `c := b;` where `b: Bundle`
+    // (owning-classified, §35.4) is a local-to-local move exactly as
+    // `var c := b;` is, and had no dataflow coverage at all before #4587 (only
+    // #4566's codegen-side runtime zero-store protected it, memory-safety-wise).
+    // Gated on the same `valueHasOwnedMarker` condition `recordMovesIn`'s own
+    // caller context establishes: a marked `c := owned b;` was already
+    // diverted to `handleMarkedOwnedAssignment` above for a tracked-local
+    // target (which calls `markMovedByName` itself) — running this
+    // unconditionally would double-mark that shape. `recordMovesIn` handled
+    // `move`/`await` top-level forms immediately above; this call's own
+    // bare-IdentifierExpr gate naturally no-ops for those (they are not
+    // IdentifierExpr nodes), mirroring `noteMoveOnlyArrayWholeMoveRead`'s
+    // identical reliance in `handleLocalDecl`. Self-assignment (`b := b;`) is
+    // not specially excluded here (unlike #4566's codegen mark, which must
+    // avoid a destructive runtime zero-store): the state-scan below
+    // immediately re-derives this same symbol's state from `producerState`,
+    // so a transient MovedFrom mark here never survives past this statement
+    // and no spurious diagnostic can result from it.
+    //
+    // TARGET-SHAPE GATE: §15.3 bullet 1 is "Local-to-local assignment" — BOTH
+    // ends locals — so this only fires when `as.target` is ALSO a bare
+    // identifier naming a plain `ast::LocalDecl`-backed local, mirroring
+    // #4566's `Emitter::markOwningChoiceLocalMovedFrom` target gate exactly.
+    // A field / owning-array-slot / index / discard (`_ := b;`, §35.10's
+    // move-only discard — §17.13's own clause, a DIFFERENT rule from bullet
+    // 1) target is deliberately left unmarked here: #4566 declined the
+    // runtime zero-store for every one of those shapes ("FIELD targets, a
+    // parameter at either end, `_ := b;`, ... remain open"), and widening the
+    // READ rejection to cover them would flip programs #4587 never audited —
+    // exactly the "while we're at it" scope creep CLAUDE.md forbids. Each is
+    // a separate, already-filed gap, not silently absorbed into this fix.
+    // // per §15.3, §28.7, v0.306, #4587
+    if (!as.valueHasOwnedMarker) {
+        bool targetIsPlainLocal = false;
+        if (auto* tid2 = dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+            if (auto* tlsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid2)))
+                // LOCALDECL-ONLY: `tlsym->decl` here is the decl behind an
+                // ASSIGNMENT TARGET (`as.target`) — §21.1 forbids a `const`
+                // local from ever being a reassignment target ("assignment
+                // ... are compile errors"), so a `LocalConstDecl` is
+                // structurally unreachable at this cast.
+                targetIsPlainLocal = dynamic_cast<const ast::LocalDecl*>(tlsym->decl) != nullptr;
+        }
+        if (targetIsPlainLocal) noteOwningChoiceWholeMoveRead(*as.value);
+    }
     // §28.3 K3.4/K7.4 (v0.209, #2080): an assignment RHS containing MARKED
     // arm transfers (`x := (if c then owned a else new Res(2));`) — run the
     // consume-if-selected processing so the marked binding's state joins
@@ -7779,6 +7832,64 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
     // source was already diagnosed by the checkRead that precedes this call;
     // re-marking would either duplicate that diagnostic or (via markMovedByName)
     // resurrect a poisoned local. // per §15.3 bullet 1
+    if (st->state != OwnershipState::Owned &&
+        st->state != OwnershipState::Borrowed)
+        return;
+    markMovedByName(id->name, id->span.begin);
+}
+
+// §15.3 (#4587) bullet 1: mark an owning-choice local read by a bare
+// identifier at a local-to-local transfer position as moved-from. Sibling of
+// `noteMoveOnlyArrayWholeMoveRead` above, for the OTHER move-only kind (§35.4's
+// owning-classified choice) — §15.3's opening rule ("Assignment transfers the
+// value from source to destination, leaving the source in moved-from state")
+// and its own first Rules bullet ("Local-to-local assignment `var y := x;`:
+// ... moves for a move-only value type. After the move, `x` is in moved-from
+// state ... and may not be read until reassigned") apply to it exactly as they
+// do to a move-only inline array; the dataflow had no analogue for it at all
+// (#4566 found and worked around the gap at the codegen layer with a runtime
+// zero-store, deliberately leaving this compile-time half for #4587).
+//
+// SCOPE. This function checks only the SOURCE (`src`) shape: a bare
+// identifier naming a plain `ast::LocalDecl`-backed local (no field,
+// parameter, index, or §21.1 `const`). The TARGET-shape half of #4566's
+// `Emitter::markOwningChoiceLocalMovedFrom` gate (both ends must be such a
+// local) is the CALLER'S responsibility — `handleLocalDecl`'s target is
+// always a fresh local by construction, and `handleAssignment` adds an
+// explicit target check at its call site so the combined scope matches
+// #4566's codegen counterpart exactly. So a read this rejects is a read the
+// runtime store #4566 already zeroes, and nothing this declines is newly
+// left unsafe (the codegen mark was already scoped the same way; #4566's
+// runtime zero-store is unconditional regardless of this compile-time check,
+// so a shape this declines to reject is not newly UB — it just keeps reading
+// the zeroed moved-from value, unchanged from pre-#4587 behaviour).
+void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
+    if (!id) return;  // only a WHOLE bare-identifier read is a move; `.f` /
+                      // `[i]` / `.M()` are borrows of the receiver, not moves
+    auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!lsym) return;  // not a tracked local (e.g. a parameter — §15.3's
+                        // "Parameter passing" bullet 3 is a separate rule,
+                        // out of scope here, matching #4566's codegen twin)
+    // LOCALDECL-ONLY: mirrors `markOwningChoiceLocalMovedFrom`'s `sld` gate —
+    // a §21.1 `const` local can never BIND an owning-choice production (§21.1
+    // forbids the initializer that would admit it), so it is never enrolled
+    // in the scope-end active-case disposal pass and has no read obligation
+    // for this to protect either way.
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl);
+    if (!ld) return;
+    auto verdict = common::classifyChoiceType(ctx_.exprType(src), ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    auto* st = lookupState(id->name);
+    if (!st) return;
+    // A live source (Owned when a `using var`, Borrowed when a plain `var` —
+    // the default bare-identifier producerState, mirroring
+    // `noteMoveOnlyArrayWholeMoveRead`'s identical comment for the sibling
+    // move-only kind) is the genuine move. A MovedFrom / Disposed / Poisoned
+    // source was already diagnosed by the checkRead that precedes every
+    // caller of this function; re-marking would either duplicate that
+    // diagnostic or (via markMovedByName) resurrect a poisoned local.
+    // // per §15.3 bullet 1
     if (st->state != OwnershipState::Owned &&
         st->state != OwnershipState::Borrowed)
         return;

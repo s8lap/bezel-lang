@@ -1518,6 +1518,25 @@ private:
     // MovedFrom/Disposed/Poisoned source was already diagnosed by the preceding
     // checkRead). // per §15.3 bullet 1
     void noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src);
+    // §15.3 (#4587) bullet 1 sibling, for the OTHER move-only kind (§35.4's
+    // owning-classified choice): a bare-identifier read of an owning-choice
+    // LOCAL at a local-to-local transfer position (the `var y := x;`
+    // initializer, or the RHS of a plain `y := x;`) MOVES the whole value —
+    // mark the source moved-from in `states_` so a later read/move/dispose is
+    // the use-after-move compile error §15.3 mandates. This function checks
+    // only the SOURCE shape — a bare identifier naming a plain (non-`const`,
+    // non-parameter) `ast::LocalDecl`-backed local of owning-classified type
+    // whose current state is live. The `handleLocalDecl` caller's target is
+    // always such a local by construction (a fresh binding); the
+    // `handleAssignment` caller additionally gates on the TARGET being one
+    // too, matching #4566's codegen counterpart
+    // (`Emitter::markOwningChoiceLocalMovedFrom`) exactly — see that call
+    // site for why (a field / index / discard target is deliberately left
+    // out of THIS fix's scope). A no-op when `src` is not such an identifier,
+    // its type is not owning-classified, or its state is not a live source (a
+    // MovedFrom/Disposed/Poisoned source was already diagnosed by the
+    // preceding checkRead). // per §15.3, §28.7, v0.306, #4587
+    void noteOwningChoiceWholeMoveRead(const ast::Expr& src);
     struct MoveOnlyArraySlots {
         long long size = 0;
         std::unordered_set<long long> movedSlots;  // provably moved-from
