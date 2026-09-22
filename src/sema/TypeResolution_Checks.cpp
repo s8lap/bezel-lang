@@ -3862,7 +3862,10 @@ void Resolver::checkOwningElementInstantiations() {
     // error, and §3.6 rule 2 asks for one diagnostic at the instantiation site.
     // Container and parameter ARE in the key, so a body that misuses two
     // different parameters still reports each one.
-    std::set<std::tuple<const ast::Type*, std::string_view, std::string_view>>
+    // fix #4582: the site key is `GenericInstantiation::siteKey`, an opaque
+    // identity (an ast::Type node for a type-position spelling, or the
+    // IdentifierExpr of a static-member-access receiver, which has none).
+    std::set<std::tuple<const void*, std::string_view, std::string_view>>
         reported;
     for (const OwningElementSite& s : owningElementSites_) {
         if (!s.enclosingType) continue;
@@ -3953,7 +3956,7 @@ void Resolver::checkOwningElementInstantiations() {
 
                 std::string badDesc = owningElementBadDesc(arg);
                 if (badDesc.empty()) continue;
-                if (!reported.insert({inst.site, s.container, s.paramName})
+                if (!reported.insert({inst.siteKey, s.container, s.paramName})
                          .second)
                     continue;
                 // The message names the type that DECLARES the owning
@@ -3962,8 +3965,7 @@ void Resolver::checkOwningElementInstantiations() {
                 // the reader must go fix. The location is the instantiation
                 // that made the binding concrete, per §3.6 rule 2.
                 ctx_.diagnostics().report(
-                    Severity::Error,
-                    inst.site ? inst.site->span.begin : SourceLocation{},
+                    Severity::Error, inst.loc,
                     std::string("`") + std::string(s.container) +
                     "` requires a class or interface element type "
                     "(stdlib \xC2\xA7""4.2 / spec \xC2\xA7""14.4, #1327) "
@@ -4003,7 +4005,9 @@ void Resolver::checkAsTargetInstantiations() {
     // `as T` several times over the same parameter for one user error, and
     // §3.6 rule 2 asks for one diagnostic at the instantiation site. The
     // parameter IS in the key, so a body misusing two parameters reports each.
-    std::set<std::pair<const ast::Type*, std::string_view>> reported;
+    // fix #4582: the site key is `GenericInstantiation::siteKey`, an opaque
+    // identity — a static-member-access receiver has no ast::Type node.
+    std::set<std::pair<const void*, std::string_view>> reported;
     for (const AsTargetSite& s : asTargetSites_) {
         if (!s.enclosingType) continue;
         // Index of the recorded parameter within the enclosing type's list.
@@ -4085,7 +4089,8 @@ void Resolver::checkAsTargetInstantiations() {
                 }
                 const std::string degenerate = degenerateAsTargetReason(arg);
                 if (degenerate.empty()) continue;
-                if (!reported.insert({inst.site, s.paramName}).second) continue;
+                if (!reported.insert({inst.siteKey, s.paramName}).second)
+                    continue;
                 // §3.6 rule 2 wants the diagnostic AT the instantiation site,
                 // and that is where it goes — except that some `Named<…>`
                 // nodes carry no span (measured: a `new Box<[3]int>()` type
@@ -4094,9 +4099,7 @@ void Resolver::checkAsTargetInstantiations() {
                 // naming the body at fault; the message identifies both ends
                 // either way.
                 const SourceLocation at =
-                    (inst.site && inst.site->span.begin.line != 0)
-                        ? inst.site->span.begin
-                        : s.loc;
+                    inst.loc.line != 0 ? inst.loc : s.loc;
                 ctx_.diagnostics().report(
                     Severity::Error, at,
                     "type parameter `" + std::string(s.paramName) + "` of `" +
@@ -4475,9 +4478,7 @@ void Resolver::checkStaticReadonlyBareTInstantiations() {
                 classifyStaticReadonlySubstitution(
                     arg, s.paramName, s.memberName,
                     /*isField=*/s.isField,
-                    (inst.site && inst.site->span.begin.line != 0)
-                                ? inst.site->span.begin
-                                : s.declLoc,
+                    inst.loc.line != 0 ? inst.loc : s.declLoc,
                     p.type->name);
             }
         }
@@ -13831,7 +13832,7 @@ SourceLocation declarationAnchor(const Symbol* sym) {
 // shape is preferable to missing an expanding one.
 //
 // Diagnostic placement: at the declaration holding the edge — the AST
-// node of the recorded instantiation site (`inst.site`). The shape the
+// node of the recorded instantiation site (`inst.siteKey`). The shape the
 // spec names is "the declaration-site shape of §14.2's bound-cycle rule
 // and §27.8's alias rule", so the message names the cycle (the SCC's
 // representative target), the growing argument (the failing substitution
@@ -14011,7 +14012,7 @@ void Resolver::checkExpandingInstantiationEdges() {
                      tgt->genericParams[e.paramIdx])
                 paramName = std::string(tgt->genericParams[e.paramIdx]->name);
             // §14.6 places the error "at the declaration holding the edge".
-            // `inst.site` is the `Node<Pair<T, T>>` AST node, which is the
+            // `inst.loc` is the `Node<Pair<T, T>>` AST node's span, which is
             // most precise anchor available — but `Parser::parseType` stamps
             // no span (the #1307/#2496 degenerate-span class, called out in
             // Parser_Stmts.cpp's catch-arm stamping comment), so every site
@@ -14020,9 +14021,7 @@ void Resolver::checkExpandingInstantiationEdges() {
             // site's span is still preferred so this needs no revisiting if
             // parseType is ever taught to stamp.
             SourceLocation loc =
-                (inst.site && inst.site->span.begin.line != 0)
-                    ? inst.site->span.begin
-                    : declarationAnchor(src);
+                inst.loc.line != 0 ? inst.loc : declarationAnchor(src);
             std::string message =
                 "the type parameter `" + paramName +
                 "` of generic type `" + targetName +

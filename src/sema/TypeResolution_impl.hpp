@@ -651,8 +651,37 @@ private:
     // member surface — the #3147 channel, no new module metadata — so Pass 2
     // answers the cross-module case with the SAME predicate and diagnostic.
     // Scanned once per imported TypeSymbol (importedOwningElementScanned_).
+    // `site` is the ast::Type node that spelled the instantiation, or null
+    // when the spelling has none (fix #4582's static-member-access receiver).
+    // It is stored into `OwningElementSite::site`, which no consumer reads —
+    // Pass 2 keys on (container, paramName, enclosingType) — so a null is
+    // behaviour-neutral.
     void recordImportedOwningElementObligations(TypeSymbol* tsym,
-                                                const ast::Type& site);
+                                                const ast::Type* site);
+
+    // fix #4582 (§3.6 rule 2 / §14.4 / §28.5, v0.306) — THE one place a
+    // concrete generic-type instantiation becomes visible to the §3.6 rule-2
+    // Pass-2 family. Called from `resolveNamed` for every type-position
+    // spelling (typed local, field, parameter, return type, `new`) and from
+    // `recordStaticReceiverInstantiation` for the static-member-access
+    // receiver `G<Arg>.M(…)`, which has no ast::Type node at all. Doing this
+    // ONCE is deliberate: `instantiations_` is read by eight independent
+    // checks, so a spelling that does not record here is silently exempt from
+    // all seven (the #4582 defect) and patching them one at a time is how
+    // that family acquired its holes.
+    void recordGenericInstantiation(
+        TypeSymbol* tsym, const std::vector<TypeRef*>& argRefs,
+        const std::vector<const ast::Type*>& argAsts,
+        const ast::Type* siteType, const void* siteKey, SourceLocation loc);
+
+    // fix #4582: record the instantiation a static-member-access receiver
+    // spells (`Fac<string>.Make(…)`). Runs from the `resolveTypesInExpr`
+    // body walk — i.e. inside `resolveTopDecl`, which strictly precedes every
+    // Pass-2 check in `Resolver::run` — so the record is visible to all of
+    // them, which a record made from ExprTypecheck (where the §14.2 use-site
+    // constraint check lives, #3160/#4465) could never be.
+    void recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
+                                           Scope* scope);
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
     // degenerate-`as`-target rule at a TYPE-level generic parameter. The
@@ -1328,7 +1357,20 @@ private:
         TypeSymbol* enclosingType = nullptr;         // body this site sits in
         std::vector<TypeRef*> argRefs;               // concrete arg TypeRefs
         std::vector<const ast::Type*> argAsts;       // arg AST nodes (spelling)
-        const ast::Type* site = nullptr;             // the `Box<IFoo>` node
+        // The instantiation SITE's identity, used only as a per-site key for
+        // "one diagnostic per site" dedup in the Pass-2 walks. For a
+        // type-position spelling this is the `Box<IFoo>` ast::Type node; for a
+        // static-member-access receiver (`Fac<string>.Make(…)`, fix #4582)
+        // there IS no ast::Type node in the AST at all — the receiver is an
+        // `ast::IdentifierExpr` carrying `typeArgs` — and that node stands in.
+        // Only ever compared, never dereferenced, hence `const void*`.
+        const void* siteKey = nullptr;
+        // The site's source location. §3.6 rule 2 puts the per-instantiation
+        // diagnostic AT the instantiation site, so every Pass-2 walk reports
+        // here. Carried explicitly rather than derived from an ast::Type span
+        // for the same reason as `siteKey` — the static-receiver spelling has
+        // no ast::Type node to take a span from.
+        SourceLocation loc;
         // #2713: the generic parameters the METHOD enclosing this site binds
         // (null outside a method signature/body). A chained obligation that
         // re-keys through this site must not attribute an argument name to

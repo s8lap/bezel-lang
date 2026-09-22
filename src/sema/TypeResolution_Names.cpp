@@ -2094,7 +2094,7 @@ TypeRef* Resolver::substituteAliasGenericArgs(
 //   - A field inherited from an imported BASE class: `tsym->members` is this
 //     type's own member list.
 void Resolver::recordImportedOwningElementObligations(TypeSymbol* tsym,
-                                                      const ast::Type& site) {
+                                                      const ast::Type* site) {
     if (!tsym || tsym->genericParams.empty()) return;
     // LOCAL types are already covered by the declaration-site recorder in
     // resolveNamed(), which sees their bodies; running this walk for them too
@@ -2126,7 +2126,7 @@ void Resolver::recordImportedOwningElementObligations(TypeSymbol* tsym,
         // with the same (loader-owned) lifetime as the symbol it walks.
         for (const Symbol* gp : tsym->genericParams) {
             if (!gp || gp->name != elName) continue;
-            owningElementSites_.push_back({head, gp->name, &site, tsym});
+            owningElementSites_.push_back({head, gp->name, site, tsym});
             return;
         }
     };
@@ -2165,6 +2165,167 @@ void Resolver::recordImportedOwningElementObligations(TypeSymbol* tsym,
         for (std::size_t pi = 0; pi < formalParamCount(*ms); ++pi)
             recordIfOwningElementSlot(formalParamResolvedType(*ms, pi));
     }
+}
+
+// fix #4582 (§3.6 rule 2, v0.306) — see the declaration comment in
+// TypeResolution_impl.hpp. Extracted VERBATIM out of `resolveNamed`'s
+// arity-matched tail so the two spellings that instantiate a generic type
+// share ONE recorder: `resolveNamed` (every ast::Type position) and
+// `recordStaticReceiverInstantiation` (`G<Arg>.M(…)`, which has no ast::Type
+// node). `siteType` is that node when there is one and null otherwise;
+// `siteKey`/`loc` carry the site identity and location the node used to
+// supply. The §14.2 constraint check stays at the call sites: the type-node
+// spelling runs `checkGenericConstraints` (which needs the node), the
+// static-receiver spelling already runs `checkGenericConstraintsAtExpr`
+// (#3160/#4465) from ExprTypecheck, and running both here would double-report.
+void Resolver::recordGenericInstantiation(
+    TypeSymbol* tsym, const std::vector<TypeRef*>& argRefs,
+    const std::vector<const ast::Type*>& argAsts, const ast::Type* siteType,
+    const void* siteKey, SourceLocation loc) {
+    // §28.5 (#1107, sweep #9): a generic CLASS with an `owned T` field (T a
+    // type parameter) admits T = class/interface only. A `where T: class`
+    // constraint over-admits `string` and function types (§14.2), which are
+    // runtime-managed (§28.9) and carry no disposal obligation — so binding
+    // such a type to the owned field's parameter is a compile error at the
+    // instantiation site (paralleling the §14.4 owning-collection element
+    // check and the `[N owned]T` rule of spec L1946). Fires for every
+    // spelling — typed local / field / parameter / `new` — like §14.4.
+    //
+    // fix #3147 (§2.8.3 rule 4, v0.252; family F12 of the imported-symbol
+    // seam #3152): this walk used to run over the DECLARING type's
+    // `ast::TypeDecl` member list. `tsym` here is the type at a USE site, so
+    // it is routinely IMPORTED — and `ModuleLoader` never assigns
+    // `Symbol::decl` for an imported type, so the whole check was skipped
+    // across a module boundary. MEASURED on a0b655e with a real two-module
+    // build: `public class HolderO<T> where T: class` carrying
+    // `public owned f: T?` in the DEPENDENCY admitted `HolderO<string>` in
+    // the importer with NO diagnostic at any severity, while the identical
+    // declarations compiled as ONE module produced the §28.5 reject below.
+    //
+    // The walk is now over `tsym->members` — FieldSymbols, which BOTH sides
+    // populate — and the field's declared type comes from
+    // `ownedBareTypeParamOfField`, which reads the local `ast::FieldDecl`
+    // and the imported `SemaContext::importedMemberType` in ONE place.
+    if (tsym->kind == ast::TypeDeclKind::Class) {
+        for (const Symbol* mem : tsym->members) {
+            auto* fs = dynamic_cast<const FieldSymbol*>(mem);
+            if (!fs) continue;
+            // The field's type must be a bare type parameter of tsym
+            // (`T` or `T?`); a concrete or composite type carries its own
+            // §28.5 field check at the declaration.
+            std::string_view pn = ownedBareTypeParamOfField(*fs, ctx_);
+            if (pn.empty()) continue;
+            std::size_t pIdx = tsym->genericParams.size();
+            for (std::size_t i = 0; i < tsym->genericParams.size(); ++i)
+                if (tsym->genericParams[i] &&
+                    tsym->genericParams[i]->name == pn) {
+                    pIdx = i;
+                    break;
+                }
+            if (pIdx >= argRefs.size()) continue;
+            const TypeRef* arg = argRefs[pIdx];
+            const char* badKind = nullptr;
+            if (arg && arg->kind == TypeRef::Kind::Primitive &&
+                arg->primitive == PrimitiveType::String)
+                badKind = "`string`";
+            else if (arg && arg->kind == TypeRef::Kind::Function)
+                badKind = "a function value";
+            if (badKind) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("`") + std::string(tsym->name) +
+                    "` may not be instantiated with " + badKind +
+                    " for type parameter `" + std::string(pn) +
+                    "`: it is the type of the `owned` field `" +
+                    std::string(fs->name) +
+                    "`, and only class or interface types may be "
+                    "`owned` \xE2\x80\x94 `string` and function values "
+                    "are runtime-managed and carry no disposal "
+                    "obligation (\xC2\xA7""28.5 / \xC2\xA7""28.9); use a "
+                    "class-typed argument.");
+            }
+        }
+    }
+    // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
+    // imported-symbol seam #3152): the same cross-module gap #3147 closed
+    // for the §28.5 owned-field check, at the §14.4 owning-collection
+    // ELEMENT check. An imported generic's obligations are not in
+    // `owningElementSites_` because nothing in this compilation ever
+    // resolved its body; synthesize them from its reconstructed member
+    // surface before the instantiation is recorded just below, so Pass 2
+    // sees both halves.
+    recordImportedOwningElementObligations(tsym, siteType);
+    // §14.2: record this concrete instantiation so a deferred inner
+    // obligation owned by `tsym` (recorded while resolving tsym's body)
+    // can be re-checked against the binding it supplies here. Recording
+    // every well-formed instantiation (not only constrained ones) keeps
+    // the final join order-independent: the instantiation site may be
+    // visited before tsym's body, so the body's obligations may not yet
+    // exist when we get here.
+    GenericInstantiation inst;
+    inst.type = tsym;
+    inst.enclosingType = currentOuterType_;  // body this site sits in
+    inst.siteKey = siteKey;
+    inst.loc = loc;
+    // #2713: record which names the ENCLOSING METHOD binds here, so a
+    // chained owning-element obligation re-keying through this site can
+    // tell a name bound by the method from one bound by enclosingType.
+    inst.methodGenericParams = currentMethodGenericParams_;
+    inst.argRefs = argRefs;
+    inst.argAsts = argAsts;
+    instantiations_.push_back(std::move(inst));
+}
+
+// fix #4582 (§3.6 rule 2, v0.306) — the static-member-access receiver half of
+// the recorder above. `Fac<string>.Make(…)` parses as a CallExpr whose callee
+// is a MemberAccessExpr whose target is an `ast::IdentifierExpr` carrying
+// `typeArgs` — there is no `ast::Type` node anywhere on that path, so
+// `resolveNamed` is never reached and nothing recorded the instantiation.
+// §3.6 rule 2 ("the property is evaluated at EACH instantiation ... rejected
+// at the instantiation site") does not distinguish spellings, and §14.4's
+// class-only restriction on owning generics is one of the two patterns that
+// sentence names, so the record belongs here too.
+//
+// This is deliberately a RECORD rather than a per-check workaround. #3160 and
+// #4465 both reached this same obstacle from the §14.2 side and answered it
+// with a temporary `Resolver` (`checkGenericConstraintsAtExpr`), which by
+// construction cannot write into the real Resolver's `instantiations_` — and
+// `instantiations_` is read by EIGHT independent checks, so one workaround per
+// check is how the family acquired its holes. Recording here needs no
+// temporary Resolver at all: `resolveTypesInExpr` is already part of the
+// `resolveTopDecl` walk, which `Resolver::run` completes before it runs any
+// Pass-2 check, so the record is in place for every one of them.
+void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
+                                                 Scope* scope) {
+    if (id.typeArgs.empty()) return;
+    // The spelled name must denote a TYPE. An IdentifierExpr carrying explicit
+    // type arguments is either a generic type used as a static-member-access
+    // receiver (`Fac<string>.Make(…)`) or a generic METHOD call (`M<int>(…)`);
+    // only the first is an instantiation `instantiations_` models at all — a
+    // generic method's own bindings are the #2736(a) residual. ExprTypecheck's
+    // §14.2 use-site check discriminates with the same `dynamic_cast` (fix
+    // #3160), so the two paths agree on which spellings are type receivers.
+    // A generic ALIAS receiver is NOT handled here, matching that path.
+    auto* tsym = dynamic_cast<TypeSymbol*>(lookupName(id.name, scope));
+    if (!tsym) return;
+    // Arity mismatch: the same posture as resolveNamed's guard — the mismatch
+    // is diagnosed elsewhere and re-checking a misaligned argument list would
+    // only add noise.
+    if (id.typeArgs.size() != tsym->genericParams.size()) return;
+    std::vector<TypeRef*> argRefs;
+    std::vector<const ast::Type*> argAsts;
+    argRefs.reserve(id.typeArgs.size());
+    argAsts.reserve(id.typeArgs.size());
+    for (const auto& ta : id.typeArgs) {
+        argRefs.push_back(ta ? ctx_.resolvedType(*ta) : nullptr);
+        argAsts.push_back(ta.get());
+    }
+    // No ast::Type node exists for the receiver, so the IdentifierExpr is both
+    // the per-site dedup key and the diagnostic anchor. Its span IS stamped
+    // (it comes through parseExpression's stampSpan wrap), which is why #3160
+    // chose it over the wrapping type path that prints 0:0.
+    recordGenericInstantiation(tsym, argRefs, argAsts, /*siteType=*/nullptr,
+                               /*siteKey=*/&id, id.span.begin);
 }
 
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
@@ -3484,99 +3645,15 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (tsym && !t.genericArgs.empty() &&
         t.genericArgs.size() == tsym->genericParams.size()) {
         checkGenericConstraints(t, tsym, ref.genericArgs, scope);
-        // §28.5 (#1107, sweep #9): a generic CLASS with an `owned T` field (T a
-        // type parameter) admits T = class/interface only. A `where T: class`
-        // constraint over-admits `string` and function types (§14.2), which are
-        // runtime-managed (§28.9) and carry no disposal obligation — so binding
-        // such a type to the owned field's parameter is a compile error at the
-        // instantiation site (paralleling the §14.4 owning-collection element
-        // check and the `[N owned]T` rule of spec L1946). Fires for every
-        // spelling — typed local / field / parameter / `new` — like §14.4.
-        //
-        // fix #3147 (§2.8.3 rule 4, v0.252; family F12 of the imported-symbol
-        // seam #3152): this walk used to run over the DECLARING type's
-        // `ast::TypeDecl` member list. `tsym` here is the type at a USE site, so
-        // it is routinely IMPORTED — and `ModuleLoader` never assigns
-        // `Symbol::decl` for an imported type, so the whole check was skipped
-        // across a module boundary. MEASURED on a0b655e with a real two-module
-        // build: `public class HolderO<T> where T: class` carrying
-        // `public owned f: T?` in the DEPENDENCY admitted `HolderO<string>` in
-        // the importer with NO diagnostic at any severity, while the identical
-        // declarations compiled as ONE module produced the §28.5 reject below.
-        //
-        // The walk is now over `tsym->members` — FieldSymbols, which BOTH sides
-        // populate — and the field's declared type comes from
-        // `ownedBareTypeParamOfField`, which reads the local `ast::FieldDecl`
-        // and the imported `SemaContext::importedMemberType` in ONE place.
-        if (tsym->kind == ast::TypeDeclKind::Class) {
-            for (const Symbol* mem : tsym->members) {
-                auto* fs = dynamic_cast<const FieldSymbol*>(mem);
-                if (!fs) continue;
-                // The field's type must be a bare type parameter of tsym
-                // (`T` or `T?`); a concrete or composite type carries its own
-                // §28.5 field check at the declaration.
-                std::string_view pn = ownedBareTypeParamOfField(*fs, ctx_);
-                if (pn.empty()) continue;
-                std::size_t pIdx = tsym->genericParams.size();
-                for (std::size_t i = 0; i < tsym->genericParams.size(); ++i)
-                    if (tsym->genericParams[i] &&
-                        tsym->genericParams[i]->name == pn) {
-                        pIdx = i;
-                        break;
-                    }
-                if (pIdx >= ref.genericArgs.size()) continue;
-                const TypeRef* arg = ref.genericArgs[pIdx];
-                const char* badKind = nullptr;
-                if (arg && arg->kind == TypeRef::Kind::Primitive &&
-                    arg->primitive == PrimitiveType::String)
-                    badKind = "`string`";
-                else if (arg && arg->kind == TypeRef::Kind::Function)
-                    badKind = "a function value";
-                if (badKind) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t.span.begin,
-                        std::string("`") + std::string(tsym->name) +
-                        "` may not be instantiated with " + badKind +
-                        " for type parameter `" + std::string(pn) +
-                        "`: it is the type of the `owned` field `" +
-                        std::string(fs->name) +
-                        "`, and only class or interface types may be "
-                        "`owned` \xE2\x80\x94 `string` and function values "
-                        "are runtime-managed and carry no disposal "
-                        "obligation (\xC2\xA7""28.5 / \xC2\xA7""28.9); use a "
-                        "class-typed argument.");
-                }
-            }
-        }
-        // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
-        // imported-symbol seam #3152): the same cross-module gap #3147 closed
-        // for the §28.5 owned-field check, at the §14.4 owning-collection
-        // ELEMENT check. An imported generic's obligations are not in
-        // `owningElementSites_` because nothing in this compilation ever
-        // resolved its body; synthesize them from its reconstructed member
-        // surface before the instantiation is recorded just below, so Pass 2
-        // sees both halves.
-        recordImportedOwningElementObligations(tsym, t);
-        // §14.2: record this concrete instantiation so a deferred inner
-        // obligation owned by `tsym` (recorded while resolving tsym's body)
-        // can be re-checked against the binding it supplies here. Recording
-        // every well-formed instantiation (not only constrained ones) keeps
-        // the final join order-independent: the instantiation site may be
-        // visited before tsym's body, so the body's obligations may not yet
-        // exist when we get here.
-        GenericInstantiation inst;
-        inst.type = tsym;
-        inst.enclosingType = currentOuterType_;  // body this site sits in
-        inst.site = &t;
-        // #2713: record which names the ENCLOSING METHOD binds here, so a
-        // chained owning-element obligation re-keying through this site can
-        // tell a name bound by the method from one bound by enclosingType.
-        inst.methodGenericParams = currentMethodGenericParams_;
-        for (std::size_t i = 0; i < ref.genericArgs.size(); ++i) {
-            inst.argRefs.push_back(ref.genericArgs[i]);
-            inst.argAsts.push_back(t.genericArgs[i].get());
-        }
-        instantiations_.push_back(std::move(inst));
+        // fix #4582: collect the spelled argument AST nodes and hand the
+        // whole instantiation to the ONE shared recorder, which the
+        // static-member-access receiver path calls too.
+        std::vector<const ast::Type*> argAsts;
+        argAsts.reserve(t.genericArgs.size());
+        for (const auto& ga : t.genericArgs) argAsts.push_back(ga.get());
+        recordGenericInstantiation(tsym, ref.genericArgs, argAsts,
+                                   /*siteType=*/&t, /*siteKey=*/&t,
+                                   t.span.begin);
     }
 }
 
@@ -4003,6 +4080,12 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         for (const auto& ta : id->typeArgs) {
             if (ta) resolveType(*ta, scope);
         }
+        // fix #4582 (§3.6 rule 2, v0.306): the receiver is an INSTANTIATION of
+        // that generic type, exactly as a type-position spelling is — record
+        // it, or the whole §3.6 rule-2 Pass-2 family is blind at this
+        // spelling. Runs after the loop above so every argument already has a
+        // resolved TypeRef to record.
+        recordStaticReceiverInstantiation(*id, scope);
         return;
     }
     // Literals + ThisBaseTypeOf — no nested Types/Exprs.
