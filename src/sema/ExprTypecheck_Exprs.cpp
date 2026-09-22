@@ -7859,6 +7859,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         const ast::MethodDecl* calleeMd2 = nullptr;
         sema::MethodSymbol* calleeMs2 = nullptr;
         sema::TypeSymbol* calleeParent2 = nullptr;
+        // per §32.5 *Boundary `out` and `ref`* (v0.306): "The inline
+        // declaration `out var x` (§22.4) … is admitted" at a boundary `out`
+        // parameter. An `extern` callee is an `ExternDeclSymbol`, not a
+        // `MethodSymbol`, and carries its formals on `ast::ExternDecl::params`
+        // — neither source `formalOutParamType2` reads below. Third source,
+        // same shape as #2657's imported-callee fallback and for the same
+        // reason: with no formal type the recipient local stays untyped, which
+        // costs twice over (see that lambda's comment).
+        const ast::ExternDecl* calleeXd2 = nullptr;
+        if (auto* xs2 = dynamic_cast<sema::ExternDeclSymbol*>(calleeSym2))
+            calleeXd2 = xs2->externDecl;
         if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2)) {
             calleeMs2 = ms2;
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
@@ -7882,6 +7893,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // the imported symbol's own parameter type otherwise.
         auto formalOutParamType2 =
             [&](std::size_t pos) -> TypeRef* {
+            // fix #4607 (§32.5 *Boundary `out` and `ref`* / §22.4, v0.306): an
+            // `extern` callee's formals. Without this arm `out var x` at an
+            // extern left `lsym->declType` NULL, and BOTH consequences #2657
+            // records for the imported case followed: the recipient got no
+            // exprType (a record-typed one then failed to lower at `x.Field`,
+            // "internal: lowerExpr returned null"), and codegen's
+            // `ensureOutVarSlots` fell through to its `i32()` DEFAULT — a
+            // 4-byte alloca the NATIVE callee writes 8 bytes through.
+            // Measured with `--sanitize=address` on
+            // `strtol(s, out var e, 10)`: "stack-buffer-overflow … WRITE of
+            // size 8 … [320, 324) <== Memory access at offset 324 overflows".
+            if (calleeXd2) {
+                if (pos < calleeXd2->params.size() && calleeXd2->params[pos].type)
+                    return ctx_.resolvedType(*calleeXd2->params[pos].type);
+                return nullptr;
+            }
             if (calleeMd2) {
                 if (pos < calleeMd2->params.size() && calleeMd2->params[pos].type)
                     return ctx_.resolvedType(*calleeMd2->params[pos].type);
