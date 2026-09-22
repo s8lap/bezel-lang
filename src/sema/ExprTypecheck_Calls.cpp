@@ -2759,6 +2759,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         }
     }
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+        // SEAM-ACCESSOR: the AST arm of this both-sources arity read (#4589
+        // below) — ModuleLoader never assigns MethodSymbol::decl for an
+        // imported method, so this is null across a module boundary and the
+        // symbol-side arm (`ms->genericParams`) is read instead.
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         // §14.5 (v0.184, #1687): "Explicit lists are all-or-nothing." An
         // explicit type-argument list binds the method's declared type
@@ -2772,7 +2776,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // ignores the mismatch otherwise (a partial list left later
         // parameters unbound and inference never ran to fill them; an excess
         // list silently dropped the extra arguments) — issue #1687.
-        if (md && !md->genericParams.empty()) {
+        //
+        // fix #4589 (§14.5, v0.306): BOTH sources, AST first. This check used
+        // to be gated on `md` end-to-end, and `ModuleLoader` never assigns
+        // `Symbol::decl` for an imported method (there is no AST for a
+        // dependency's method bodies) — so the entire check was skipped for
+        // EVERY imported generic method, `md` being null. `MethodSymbol::
+        // genericParams` (populated from `MetaMember::genericParams` at
+        // import time, the same channel #4590 relied on for this file's
+        // neighbouring §14.5 phase-3 seam) carries the same arity the AST
+        // side would, so read whichever side is present rather than the AST
+        // unconditionally.
+        std::size_t declaredArity =
+            md ? md->genericParams.size() : ms->genericParams.size();
+        if (declaredArity > 0) {
             const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
                 nullptr;
             if (auto* cma =
@@ -2785,14 +2802,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
                 callTypeArgs = &cid->typeArgs;
             if (callTypeArgs && !callTypeArgs->empty() &&
-                callTypeArgs->size() != md->genericParams.size()) {
+                callTypeArgs->size() != declaredArity) {
                 ctx_.diagnostics().report(
                     Severity::Error, ce.span.begin,
                     "call to `" + std::string(ms->name) +
                     "` supplies " + std::to_string(callTypeArgs->size()) +
                     " explicit type argument(s), but `" +
                     std::string(ms->name) + "` declares " +
-                    std::to_string(md->genericParams.size()) +
+                    std::to_string(declaredArity) +
                     " type parameter(s) — an explicit type-argument list "
                     "must supply exactly as many arguments as the method "
                     "declares type parameters; there are no partial lists "
