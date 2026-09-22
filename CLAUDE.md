@@ -542,6 +542,34 @@ dispose-count/ASan-clean for a double-free.
   not work that is 80% done. Re-derive the diagnosis from the issue and HEAD:
   5 of 5 inherited WIPs were once defective, and two would have shipped a bug.
 
+### The orchestrator MUST run a CronCreate heartbeat
+
+**An autonomous run's coordinator schedules a recurring heartbeat (CronCreate) for the
+whole run, as its first action.** Without one the coordinator can go silent for hours: it
+launches a long job detached, nothing wakes it, and the run stalls with the machine idle.
+
+Measured 2026-09-23: a consolidated pre-gate sweep was launched with
+`setsid nohup … &` and **no waiter**. It finished in minutes; the coordinator did not look
+again for **~3 hours**. The sweep had also reported a failure, so the gate was blocked that
+whole time. Nothing was wrong with the build, the lanes, or the machine — only with the
+coordinator's own wake-up path.
+
+Two mechanisms, and they are not interchangeable:
+
+1. **Per-job waiters** — the primary. Launch long work so its completion re-invokes you
+   (a background Bash job, or `scripts/wait_pid.sh "$PIDFILE"` on an identity, never a
+   `pgrep` pattern). This is precise: you wake when the job ends, not on a timer.
+2. **A CronCreate heartbeat** — the backstop, for everything a waiter cannot cover: a job
+   that dies without writing its marker, an uncatchable kill, a waiter that was never set,
+   or a coordinator that simply stopped having a reason to run. Schedule it once at run
+   start and let it fire for the run's duration.
+
+⚠ A heartbeat is a **backstop, not a scheduler**. Cycle 9 lost ~12 h of a run when a
+misfiring cron hit the hard-stop early and left the ASan oracle INCOMPLETE — so the
+heartbeat must only *prompt a status check*, never take an action (never launch a gate,
+never push, never dispatch). Keep its interval coarse (tens of minutes); a tight interval
+burns budget re-reading state that has not moved.
+
 ### Gate protocol
 
 1. **Never launch a gate you expect to fail.** Run every targeted filter for
