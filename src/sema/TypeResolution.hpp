@@ -261,6 +261,23 @@ std::string degenerateAsTargetReason(const TypeRef* target);
 // #4047 tracks it, not this function.
 TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym);
 
+// fix #4554 (§2.7, v0.306): the chain-head warning row — a chain head
+// resolves to a type while a same-named accessible member exists on the
+// enclosing type (§2.7 rule 1's "type outranks member" precedence for chain
+// heads), AND/OR a local type shadows an imported module-name prefix. The
+// declaration-site warning fires only when the member's declared type is
+// NOT the resolved type (the `property Color: Color` carve-out); the
+// module-shadow warning fires when the head name is in `sourceImports_`.
+// Called from ExprTypecheck_Exprs.cpp's IdentifierExpr handler right after
+// the chain-head lookup resolves to a type.
+void warnChainHeadTypeShadows(
+    SemaContext& ctx,
+    std::string_view headName,
+    const TypeSymbol* resolvedType,
+    const std::unordered_set<std::string>& sourceImports,
+    const Symbol* shadowedEnclosingMember,
+    SourceLocation loc);
+
 // fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): THE shared
 // authority for "does `default(T)` (equivalently, at a value-type
 // substitution, `new T()`) have NO well-defined value?" — the §17.11

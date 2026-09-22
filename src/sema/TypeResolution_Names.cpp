@@ -4126,4 +4126,112 @@ TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym
     return underlying->declaration;
 }
 
+// fix #4554 (§2.7, v0.306): the chain-head warning row. A chain head
+// resolves to a TYPE while a same-named accessible member exists on the
+// enclosing type — per §2.7 the type wins for chain purposes (the rule-1
+// "type outranks member" precedence for chain heads), but the spec asks
+// for a declaration-site warning so the programmer can choose to qualify
+// `this.` to reach the member. The carve-out: *unless* the member's
+// declared type is the resolved type (or an instantiation of the resolved
+// generic) — the `property Color: Color` idiom; in that shape the chain
+// head and the member refer to the same store and the warning would be
+// misleading.
+//
+// Plus the §2.7 *Consequences* sentence: "a type named `A` in scope
+// shadows a module-name prefix `A.…` for chain purposes (the compiler
+// warns when both readings exist — qualify via an alias to reach the
+// module)". This is the second half of the same warning family: a chain
+// head resolving to a local type while an imported module with the same
+// name is also in scope (rule 2's prefix would have matched). The local
+// type wins per §2.2 — locals beat imports — but the spec asks for the
+// warning so the module remains reachable via an explicit alias.
+//
+// Called from ExprTypecheck_Exprs.cpp's IdentifierExpr handler right
+// after the chain-head lookup resolves to a type. `shadowedEnclosingMember`
+// is the same-named member in the enclosing type (nullable — null when
+// the chain head's enclosing type has no such member); the warning row
+// is suppressed when its declared type matches the resolved type. Both
+// halves are independent — a case may fire only one, both, or neither.
+void warnChainHeadTypeShadows(
+    SemaContext& ctx,
+    std::string_view headName,
+    const TypeSymbol* resolvedType,
+    const std::unordered_set<std::string>& sourceImports,
+    const Symbol* shadowedEnclosingMember,
+    SourceLocation loc) {
+    // (A) §2.7 warning row: chain head resolves to a type while a
+    // same-named accessible member exists. Carve-out: the member's
+    // declared type must NOT be the resolved type — the `property
+    // Color: Color` idiom is exactly the case where it IS, and the
+    // warning would falsely advise `this.` qualification for what is
+    // already the same store.
+    if (shadowedEnclosingMember && resolvedType) {
+        const TypeRef* memberType =
+            storageComponentType(shadowedEnclosingMember, ctx);
+        bool carveOut = false;
+        if (memberType && memberType->kind == TypeRef::Kind::Named &&
+            memberType->declaration == resolvedType) {
+            carveOut = true;
+        }
+        // §2.7 generic carve-out: the member's declared type is an
+        // instantiation of the resolved generic (e.g.
+        // `property Buffer: Buffer<int>` with resolved type `Buffer`).
+        // Detected when the member's declared TypeRef is Named, the
+        // resolved type is a generic, and the member's declaration is
+        // the same generic type symbol. (An exact-arity check isn't
+        // necessary: a member declared with the wrong number of type
+        // args would already have been rejected at the declaration
+        // site, so a Named TypeRef whose declaration matches the
+        // resolved generic is by construction an instantiation of it.)
+        if (!carveOut && memberType &&
+            memberType->kind == TypeRef::Kind::Named &&
+            memberType->declaration == resolvedType &&
+            !resolvedType->genericParams.empty()) {
+            carveOut = true;
+        }
+        if (!carveOut) {
+            std::string memberKind = "member";
+            if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
+                memberKind = "field";
+            else if (dynamic_cast<const PropertySymbol*>(
+                         shadowedEnclosingMember))
+                memberKind = "property";
+            else if (dynamic_cast<const MethodSymbol*>(
+                         shadowedEnclosingMember))
+                memberKind = "method";
+            else if (dynamic_cast<const ConstMemberSymbol*>(
+                         shadowedEnclosingMember))
+                memberKind = "const";
+            else if (dynamic_cast<const EventSymbol*>(
+                         shadowedEnclosingMember))
+                memberKind = "event";
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("warning: chain head `") + std::string(headName) +
+                    "` resolves to type `" +
+                    std::string(resolvedType->name) +
+                    "` while the enclosing type declares a same-named " +
+                    memberKind + " — the type wins for chain purposes; "
+                    "qualify with `this." + std::string(headName) +
+                    "` to reach the " + memberKind +
+                    " (\xC2\xA7""2.7)");
+        }
+    }
+
+    // (B) §2.7 consequence: a type named `A` in scope shadows an imported
+    // module-name prefix `A.…` — warn when both readings exist. The local
+    // type wins per §2.2 (locals beat imports), but the spec asks for the
+    // warning so the module remains reachable via an explicit alias.
+    if (!sourceImports.empty() &&
+        sourceImports.count(std::string(headName))) {
+        ctx.diagnostics().report(
+            Severity::Warning, loc,
+            std::string("warning: chain head `") + std::string(headName) +
+                "` resolves to the local type, which shadows the imported "
+                "module-name prefix `" + std::string(headName) +
+                ".\xE2\x80\xA6` — qualify via an alias to reach the "
+                "module (\xC2\xA7""2.7)");
+    }
+}
+
 }  // namespace bezel::sema

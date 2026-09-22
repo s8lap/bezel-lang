@@ -1593,6 +1593,59 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                        /*memberBeforeModuleType=*/&e != maTargetHint_);
         if (sym) {
             ctx_.setExprSymbol(&e, sym);
+            // fix #4554 (§2.7, v0.306): the chain-head warning row — a
+            // chain head resolves to a type while a same-named accessible
+            // member exists on the enclosing type. The TYPE wins for chain
+            // purposes (the §2.7 rule-1 "reachable type outranks a same-named
+            // member" precedence for chain heads), but the spec asks for a
+            // declaration-site warning so the programmer can qualify `this.`
+            // to reach the member. The carve-out: warn only when the
+            // member's declared type is NOT the resolved type (or an
+            // instantiation of the resolved generic) — the `property Color:
+            // Color` idiom is exactly the case where it IS and the warning
+            // would mislead.
+            //
+            // Plus the §2.7 *Consequences* sentence on type-vs-module-
+            // prefix shadowing: a local type named `A` shadows an imported
+            // module-name prefix `A.…` for chain purposes; warn when both
+            // readings exist.
+            //
+            // Fired ONLY at chain-head positions (`&e == maTargetHint_`,
+            // set only while visiting a MemberAccessExpr's target — see
+            // ~line 7735 below), so a bare value-position name like
+            // `Status := v;` does NOT trigger — §2.7's value-position table
+            // says the member outranks a same-named type, the opposite of
+            // the chain-head rule, and no warning is wanted there.
+            if (&e == maTargetHint_) {
+                const TypeSymbol* resolvedType = nullptr;
+                if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                    resolvedType = ts;
+                } else if (auto* alias =
+                               dynamic_cast<TypeAliasSymbol*>(sym)) {
+                    // §27.8: a `type` alias resolves transparently to its
+                    // underlying type; the warning reads against the
+                    // underlying type, not the alias name (otherwise
+                    // `type Alias := Widget; Alias.Field` would name the
+                    // alias's chain head instead of the type the alias
+                    // points at, defeating the carve-out for a member
+                    // declared with the aliased type).
+                    resolvedType = resolveAliasToTypeSymbol(alias);
+                }
+                if (resolvedType) {
+                    const Symbol* shadowedMember = nullptr;
+                    if (currentType_) {
+                        for (const Symbol* m : currentType_->members) {
+                            if (m && m->name == id->name) {
+                                shadowedMember = m;
+                                break;
+                            }
+                        }
+                    }
+                    sema::warnChainHeadTypeShadows(
+                        ctx_, id->name, resolvedType, sourceImports_,
+                        shadowedMember, e.span.begin);
+                }
+            }
             // §10.6 (#772): a bare enum constant `Green` resolved via the
             // case-scrutinee enum scope injection carries the enum's type, so an
             // arm body that yields it has a determinable common arm type (§20).
