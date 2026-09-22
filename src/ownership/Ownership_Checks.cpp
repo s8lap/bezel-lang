@@ -944,7 +944,34 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 if (auto* sym = ctx_.exprSymbol(*id)) {
                     if (auto* ps =
                             dynamic_cast<sema::ParameterSymbol*>(sym)) {
-                        if (ps->modifier != "owned") {
+                        // fix #4636 (§28.1 clause 1 / §15.3, found while
+                        // working #4628): a MOVE-ONLY VALUE TYPE parameter
+                        // (an owning inline array or an owning-classified
+                        // choice, common::isMoveOnlyValueType) is exempt from
+                        // this borrow-marker rejection — §28.1 clause 1 says
+                        // the `owned` modifier is "admitted-but-redundant"
+                        // for such a type, "the type's own move semantics
+                        // already transfer the obligation", so a PLAIN
+                        // (non-`owned`) move-only-value-type parameter's bare
+                        // `move` is the NORMAL, and in fact only meaningful,
+                        // way to transfer it — unlike a plain CLASS/interface
+                        // parameter, which really is a borrow with no
+                        // obligation (this rule's original #1125/s28_3_0020
+                        // target). Without this exemption every `move` of a
+                        // plain move-only-array parameter was rejected with
+                        // this borrow-specific wording — even the FIRST,
+                        // otherwise-legal move — which is a genuine over-
+                        // rejection this section's own `markMovedByName` (and
+                        // the lazy-seed machinery `noteMoveOnlyArrayWholeMoveRead`
+                        // documents, Ownership.cpp) already handle correctly
+                        // once this earlier gate stops shadowing them.
+                        const char* moveOnlyKind = nullptr;
+                        const bool isMoveOnlyParam =
+                            ps->declType &&
+                            common::isMoveOnlyValueType(
+                                ctx_.resolvedType(*ps->declType), ctx_,
+                                moveOnlyKind);
+                        if (ps->modifier != "owned" && !isMoveOnlyParam) {
                             report(
                                 Severity::Error, un->span.begin,
                                 std::string("`move` is not admitted on a "
