@@ -10591,6 +10591,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // of this function. Null when the receiver is not such a temporary.
     llvm::AllocaInst* recvUnwindSlot = nullptr;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
+    // fix #4597 (§22.16, v0.306): "A call whose receiver is `this` — explicit
+    // or implicit — from inside any instance member of the class or a
+    // subclass enters the member's unchecked face". Decided HERE, from the
+    // callee's own SYNTAX, because that is what the spec makes the rule turn
+    // on and what makes it "statically decidable": a bare callee is the
+    // implicit `this`; `this.M()` and `base.M()` are the explicit spellings.
+    // Deliberately NOT `recv == currentThis_` — a value test would also
+    // capture `var a := this; a.M();`, which §22.16 leaves checked, and would
+    // miss nothing it gains. Guarded on `currentThis_` so a call lowered
+    // outside any instance member (a static body, a module function) is never
+    // mistaken for one.
+    bool thisReceiver = false;
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
         llvm::Value* recv = nullptr;
@@ -10599,10 +10611,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     ma->target.get())) {
                 if (tid->name == "base") baseQualified = true;
+                if (tid->name == "this" || tid->name == "base")
+                    thisReceiver = currentThis_ != nullptr;
             }
             recv = ma->target ? lowerExpr(*ma->target) : nullptr;
         } else {
             recv = currentThis_;
+            thisReceiver = currentThis_ != nullptr;
         }
         if (!recv) return nullptr;
         // #2106 / §7.4: a flow-narrowed nullable VALUE-type receiver (`p: Point?`
@@ -12076,7 +12091,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
-                                         call.span.begin);
+                                         call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
@@ -12867,7 +12882,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
                             const std::vector<const ast::Expr*>* argExprs,
-                            SourceLocation callLoc) {
+                            SourceLocation callLoc,
+                            bool thisReceiver) {
     // issue #421 / #410: is the argument at index `ai` an unsigned source?
     // Defaults to false (signed) when no source expression is known for the
     // slot (e.g. the receiver) or no argExprs vector was supplied.
@@ -13655,6 +13671,24 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             calleeTy->getParamType(0)->isPointerTy())
             return nullptr;
     }
+    // fix #4597 (§22.16, v0.306): "call sites with syntactic receiver `this`
+    // bind to the unchecked face — statically decidable". This is that
+    // binding, and this arm is where "statically decidable" is true: the
+    // callee is already resolved to one function. Placed AFTER the two
+    // bail-out guards above so a call that declines to lower mints no
+    // face; the face has the checked face's exact signature, so neither
+    // guard could answer differently for it. `uncheckedFaceFor` returns
+    // null for everything §22.16 does not instrument, so the overwhelmingly
+    // common call keeps `callee` exactly as it was.
+    //
+    // Without it, an `invariant(E)` whose E calls a public method of the same
+    // instance emitted a call to that method's ONE face, whose prologue
+    // re-ran the invariant: unbounded recursion, SIGSEGV. The same binding is
+    // what makes §22.16's other promise hold — a public method may call
+    // `this.Other()` while its own state is legitimately mid-update, "where an
+    // algorithm may pass through broken intermediate states".
+    if (thisReceiver)
+        if (llvm::Function* face = uncheckedFaceFor(ms)) callee = face;
     // CG-generic: if the generic substitution is active and the method
     // is on a class that has generic parameters, we must specialize the
     // call — even for methods with non-generic param/return types (like

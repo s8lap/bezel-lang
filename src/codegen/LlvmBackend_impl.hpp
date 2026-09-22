@@ -875,6 +875,14 @@ public:
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (ts && initFns_.count(ts)) emitInstanceInitFunction(ts);
         }
+        // fix #4597 (§22.16, v0.306): lower the §22.16 unchecked faces every
+        // loop above minted at its `this`-receiver call sites. Here, and not
+        // inside the methodFns_ loop, because a face is minted DURING a body's
+        // lowering (so the loop's own iteration is already in flight) and
+        // because a ctor, disposer or init body's `this`-receiver call mints
+        // one too. Before finalizeVtableTable() for the reason stated there —
+        // every body must be lowered before allVtables_ is closed.
+        emitPendingUncheckedFaces();
         // #1843 / §8.6 #417: now that every method/ctor/disposer/init body has
         // been lowered, allVtables_ holds every vtable an object can carry —
         // including the per-monomorphization vt$C$specN created lazily above.
@@ -8618,13 +8626,82 @@ private:
                             const sema::TypeSymbol* classType,
                             bool disposeAndFreeOnThrow = false);
 
-    // §22.16 (v0.240, #2941): true while emitting an invariant check, so
-    // nested pure-method calls (a clause may call a `pure` public method
-    // of the same instance without recursion, §22.16 "Invariant evaluation
-    // is a boundary-time read of instance state") suppress the re-entry
-    // check. Pushed/popped by emitInvariantCheck around the predicate
-    // walk — no other site touches it.
+    // §22.16 (v0.240, #2941): true while emitting an invariant check.
+    // Pushed/popped by emitInvariantCheck around the predicate walk — no
+    // other site touches it.
+    //
+    // fix #4597 (§22.16, v0.306): this used to be described as what makes
+    // "a clause may call a `pure` public method of the same instance without
+    // recursion" hold. It is not — it is a COMPILE-TIME flag, so it stops a
+    // check being emitted INSIDE the predicate's own lowering and nothing
+    // more; the emitted call still entered the callee's sole face, whose
+    // prologue re-evaluated the invariant (SIGSEGV, measured). What honours
+    // "without recursion" is the face split below. The flag stays for the
+    // narrower job it really does: a construction-exit check reached from
+    // within a clause's lowering is still suppressed here.
     bool insideInvariantCheck_ = false;
+
+    // fix #4597 (§22.16, v0.306) — the UNCHECKED FACE.
+    //
+    // §22.16: "Every instrumented public member compiles to a checked face
+    // (entry checks -> unchecked face -> exit checks) and an unchecked face
+    // (the body); call sites with syntactic receiver `this` bind to the
+    // unchecked face". `insideInvariantCheck_` above is a COMPILE-TIME flag
+    // held only while a predicate is being lowered, so it never stopped the
+    // RUNTIME cycle the spec's "without recursion" forbids: the clause emits
+    // a call to the callee's ONE face, whose prologue re-evaluates the
+    // invariant, which calls it again. Measured on origin/main @ cafdfc52,
+    // `invariant(Ok());` over `public pure method Ok(): bool`: unbounded
+    // self-recursion in `bz$M.C$Ok` -> SIGSEGV (exit 139) where §22.16
+    // requires ContractViolationException.
+    //
+    // `uncheckedFaceFns_` holds the second face: a private-linkage clone of
+    // the method's body with the §22.16 entry/exit invariant checks (and only
+    // those — `requires` is "evaluated on every invocation" and `ensures` "on
+    // every normal-completion path", in EVERY mode) suppressed. The checked
+    // face keeps the public symbol, the vtable slot and every external call
+    // site, so nothing outside a `this`-receiver call site changes.
+    std::unordered_map<sema::MethodSymbol*, llvm::Function*> uncheckedFaceFns_;
+
+    // Faces whose body is not lowered yet. A face is minted lazily at the
+    // first `this`-receiver call site that needs it, which is mid-body-
+    // emission; the bodies are drained after the ordinary emission loops (and
+    // before `finalizeVtableTable`), re-checking the worklist because one
+    // face's body can mint another's.
+    std::vector<std::pair<sema::MethodSymbol*, llvm::Function*>>
+        pendingUncheckedFaces_;
+
+    // True while `emitFunctionBody` is lowering an unchecked face, so the two
+    // §22.16 invariant-instrumentation sites in `emitMethodBody` (entry) and
+    // `armEnsuresEpilogue` (exit) stand down. Nothing else differs.
+    bool emittingUncheckedFace_ = false;
+
+    // §22.16 "The class invariant of C is the conjunction of every invariant
+    // member of C and of every base class, evaluated base-first, declaration
+    // order within each class". ONE walk, used by both readers —
+    // `emitInvariantCheck` (which lowers each clause) and `hasClassInvariant`
+    // (which only asks whether the conjunction is empty). Stating it twice
+    // would let the gate and the emitter disagree about what an invariant IS.
+    // Appended base-first; each entry names the declaring class (for the
+    // violation message) and the clause expression.
+    void collectInvariantChain(
+        const sema::TypeSymbol* classType,
+        std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>>& out)
+        const;
+
+    // §22.16: true when `classType`'s conjunction has at least one clause, so
+    // `emitInvariantCheck` would emit something. Gates face creation, so a
+    // program with no `invariant` member mints no faces at all.
+    bool hasClassInvariant(const sema::TypeSymbol* classType) const;
+
+    // §22.16: the unchecked face of `ms`, minted on demand, or null when `ms`
+    // is not an instrumented public member (then the sole face already IS the
+    // unchecked one and the call site binds to it unchanged).
+    llvm::Function* uncheckedFaceFor(sema::MethodSymbol* ms);
+
+    // Lower every pending unchecked-face body. Called once after the ordinary
+    // body-emission loops; loops until the worklist stays empty.
+    void emitPendingUncheckedFaces();
 
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
@@ -19702,12 +19779,22 @@ private:
     // expression to locate a diagnostic on; the §14.1/#783 imported-generic
     // layout gate needs one. Defaulted, so the synthesized callers (ToString /
     // Equals / operator dispatch) are unchanged and simply report unlocated.
+    // `thisReceiver` (fix #4597, §22.16 v0.306) is the SYNTACTIC test the spec
+    // makes the face-binding rule turn on: "A call whose receiver is `this` —
+    // explicit or implicit — from inside any instance member of the class or a
+    // subclass enters the member's unchecked face". Set by `lowerCallDispatch`
+    // from the callee's own syntax (a bare callee = implicit `this`; a
+    // `this.M()`/`base.M()` member access), never from a value comparison, so
+    // `var a := this; a.M();` is a checked call exactly as the spec says.
+    // Defaulted false: every synthesized caller (ToString / Equals / operator
+    // dispatch / iterator protocol) is a non-`this` call by construction.
     llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
                                 std::vector<llvm::Value*>& args,
                                 bool baseQualified,
                                 const std::vector<const ast::Expr*>* argExprs
                                     = nullptr,
-                                SourceLocation callLoc = {});
+                                SourceLocation callLoc = {},
+                                bool thisReceiver = false);
 
     // §12 / §14 (issue #585): compute the concrete generic substitution for an
     // ANCESTOR generic class reached through inheritance from `recvTy`. When a

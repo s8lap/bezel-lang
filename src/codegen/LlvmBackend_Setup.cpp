@@ -6510,42 +6510,24 @@ void Emitter::finalizeEnsuresEpilogue() {
 }
 
 
-// §22.16 (v0.240, #2941): emit runtime checks for the class invariant of
-// `classType`. Walks the class hierarchy BASE-FIRST (§22.16 "evaluated
-// base-first, declaration order within each class"): for each class in the
-// chain (root base → most-derived), evaluate every `invariant(E);` member's
-// expression in declaration order. A false predicate throws
-// ContractViolationException with a message naming the class and member
-// text; otherwise the next predicate runs. The check fires on every public
-// instance method entry/exit, every public setter entry/exit, and at
-// construction exit (the latter is wired at `new` sites, not ctor bodies,
-// per the spec's "most-derived" requirement — a base ctor completing as
-// part of a derived construction is NOT an instrumentation point).
+// fix #4597 (§22.16, v0.306): the ONE walk of §22.16's "conjunction of every
+// invariant member of C and of every base class". Extracted verbatim from
+// `emitInvariantCheck` so the face gate (`hasClassInvariant`) asks the same
+// question the emitter answers -- a second, independently written "does this
+// class have an invariant?" predicate could mint a face for a class the
+// emitter instruments nothing on, or (worse) skip one it does.
 //
-// Predicate lowering caveat. The predicate's expression is a normal Bezel
-// expression that reads `this`'s fields (and may call `pure` public methods
-// of the same instance — §22.16 "Invariant evaluation is a boundary-time
-// read of instance state"). We rebound `currentThis_` to `thisVal` so the
-// predicate's field reads GEP through the right base. We also suppress
-// re-entry via `insideInvariantCheck_`: a predicate that invokes a `pure`
-// public method would otherwise fire this same check at the public method's
-// entry, infinite-looping. The spec admits that invariant evaluation runs as
-// interior code ("calls to pure members of the same instance without
-// recursion") — that's exactly what this flag models.
-void Emitter::emitInvariantCheck(llvm::Value* thisVal,
-                                 const sema::TypeSymbol* classType,
-                                 bool disposeAndFreeOnThrow) {
-    // §22.16 / issue #4386: in unchecked (release) mode — the default —
-    // invariant checks are NOT emitted at any of the construction-exit /
-    // public-method-entry / public-method-exit points. Clauses are pure, so
-    // non-evaluation is unobservable for any program whose checked clauses
-    // never fault. `requires` is always-on regardless of this bit.
-    if (!checkedContracts_) return;
-    if (!classType || insideInvariantCheck_) return;
+// NOTE: the `std::reverse` below reverses the WHOLE vector, so clauses are
+// base-first between classes but REVERSED within each class -- issue #4598,
+// pre-existing and deliberately NOT changed here (this commit moves the line,
+// it does not touch its behaviour).
+void Emitter::collectInvariantChain(
+    const sema::TypeSymbol* classType,
+    std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>>& out)
+    const {
+    if (!classType) return;
     // Find source-defined invariants across the base chain. A class with no
     // invariants at any level is a no-op (the common case).
-    struct Inv { const sema::TypeSymbol* cls; const ast::Expr* expr; };
-    std::vector<Inv> chain;
     for (const sema::TypeSymbol* c = classType; c; c = baseClassOf(c)) {
         const auto* td = dynamic_cast<const ast::TypeDecl*>(c->decl);
         if (td) {
@@ -6553,7 +6535,7 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
                 if (auto* inv =
                         dynamic_cast<const ast::InvariantDecl*>(m.get())) {
                     if (inv->expr && !inv->isStatic) {
-                        chain.push_back({c, inv->expr.get()});
+                        out.push_back({c, inv->expr.get()});
                     }
                 }
             }
@@ -6588,12 +6570,166 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
         // base-first conjunction composes across any mix of local and
         // imported links.
         for (const ast::Expr* e : c->importedInvariantExprs)
-            if (e) chain.push_back({c, e});
+            if (e) out.push_back({c, e});
     }
     // §22.16 base-first → base at the END of the vector, most-derived at
     // the FRONT (we built the chain most-derived-first above). Reverse so
     // the iteration order is base-first.
-    std::reverse(chain.begin(), chain.end());
+    std::reverse(out.begin(), out.end());
+}
+
+
+// fix #4597 (§22.16, v0.306): does `classType` carry a non-empty class
+// invariant? Exactly the question `emitInvariantCheck`'s `if (chain.empty())
+// return;` asks, so a class with no clause anywhere in its chain mints no
+// unchecked face and the whole two-face machinery stays inert for it.
+bool Emitter::hasClassInvariant(const sema::TypeSymbol* classType) const {
+    std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>> chain;
+    collectInvariantChain(classType, chain);
+    return !chain.empty();
+}
+
+
+// fix #4597 (§22.16, v0.306): mint (or return) the UNCHECKED FACE of `ms`.
+//
+// §22.16: "Every instrumented public member compiles to a checked face (entry
+// checks -> unchecked face -> exit checks) and an unchecked face (the body);
+// call sites with syntactic receiver `this` bind to the unchecked face —
+// statically decidable". Returns null when `ms` is not an instrumented public
+// member, in which case its single face already IS the unchecked one and the
+// `this`-receiver call site binds to it unchanged.
+//
+// WHY A CLONE AND NOT A WRAPPER. The alternative shape — keep the body as the
+// unchecked face and wrap it in a thin checked face — would have to MOVE the
+// public symbol: `bz$C$M` is what the vtable slot holds, what another module's
+// call site links against, and what `methodFns_` hands to every existing call
+// path. Renaming it makes the unchecked face the default for virtual dispatch
+// and for every importer — the exact inverse of the spec, and a silent loss of
+// checking rather than a crash. Cloning leaves all of that untouched: the
+// checked face keeps the name, the linkage and the slot, and the new face is
+// PrivateLinkage, reachable only from this module's `this`-receiver sites.
+//
+// The clone is also confined: it exists only under `--checked-contracts`, only
+// for a public instance method of a class whose invariant conjunction is
+// non-empty, and only when some `this`-receiver call site actually asks for
+// it. A program with no `invariant` member mints none.
+llvm::Function* Emitter::uncheckedFaceFor(sema::MethodSymbol* ms) {
+    // §22.16 / #4386: in unchecked (release) mode nothing is instrumented, so
+    // the single face is already the unchecked one.
+    if (!checkedContracts_ || !ms) return nullptr;
+    // The instrumentation gate, stated exactly as `emitMethodBody` states it
+    // (§22.16 "Entry and normal exit of every `public` instance method";
+    // static members, destructors and `Dispose` are on the never-instrumented
+    // list).
+    if (isStaticMethod(ms) || ms->visibility != ast::Visibility::Public ||
+        !ms->parent || ms->parent->kind != ast::TypeDeclKind::Class ||
+        ms->name == std::string_view("Dispose"))
+        return nullptr;
+    if (!hasClassInvariant(ms->parent)) return nullptr;
+    // An IMPORTED method's body lives in the exporter; there is nothing here
+    // to clone, and emitting one would multiply-define the symbol. Recorded
+    // residual: a `this`-receiver call to an imported instrumented method
+    // keeps its pre-fix (checked-face) binding.
+    if (ctx_.isImported(ms)) return nullptr;
+    // §30.1 / §29.3: an `async` or iterator method never reaches
+    // `emitMethodBody` — `emitFunctionBody` routes it to its own state-machine
+    // emitter, which emits no invariant check at all. There is nothing to
+    // suppress, and a second state machine is not something to mint.
+    if (isAsyncMethod(ms) || returnsAsyncIteratorType(ms)) return nullptr;
+    CallableInfo ci;
+    if (!callableInfo(ms, ci)) return nullptr;
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
+        containsYield(*ci.stmts))
+        return nullptr;
+
+    if (auto it = uncheckedFaceFns_.find(ms); it != uncheckedFaceFns_.end())
+        return it->second;
+    auto fnIt = methodFns_.find(ms);
+    if (fnIt == methodFns_.end() || !fnIt->second) return nullptr;
+    llvm::Function* checked = fnIt->second;
+
+    auto* face = llvm::Function::Create(
+        checked->getFunctionType(), llvm::Function::PrivateLinkage,
+        checked->getName() + "$uncheckedface", module_.get());
+    // Carry the checked face's parameter/return ABI decorations (`sret`,
+    // `byval`, zeroext/signext …) verbatim: the two faces are the same
+    // callable and a call site forwards the same argument values to either.
+    face->setAttributes(checked->getAttributes());
+    face->setCallingConv(checked->getCallingConv());
+    uncheckedFaceFns_[ms] = face;
+    pendingUncheckedFaces_.push_back({ms, face});
+    return face;
+}
+
+
+// fix #4597 (§22.16, v0.306): lower every unchecked-face body minted during
+// the ordinary emission loops. Drained AFTER them (and before
+// `finalizeVtableTable`, which needs every body lowered), and re-drained until
+// the worklist stays empty because one face's body can mint another's — the
+// transitive shape `invariant(Ok());` / `Ok()` calls `Helper()` is precisely
+// the one a call-site-local fix does not terminate.
+void Emitter::emitPendingUncheckedFaces() {
+    const bool savedFace = emittingUncheckedFace_;
+    emittingUncheckedFace_ = true;
+    while (!pendingUncheckedFaces_.empty()) {
+        // #3020: emit in a deterministic order, keyed on the LLVM function
+        // name, so the rodata/global order (and therefore the build-id) does
+        // not vary with a pointer-keyed map's bucket layout.
+        std::vector<std::pair<sema::MethodSymbol*, llvm::Function*>> batch;
+        batch.swap(pendingUncheckedFaces_);
+        std::sort(batch.begin(), batch.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second->getName() < b.second->getName();
+                  });
+        for (auto& [ms, face] : batch) emitFunctionBody(ms, face);
+    }
+    emittingUncheckedFace_ = savedFace;
+}
+
+
+// §22.16 (v0.240, #2941): emit runtime checks for the class invariant of
+// `classType`. Walks the class hierarchy BASE-FIRST (§22.16 "evaluated
+// base-first, declaration order within each class"): for each class in the
+// chain (root base → most-derived), evaluate every `invariant(E);` member's
+// expression in declaration order. A false predicate throws
+// ContractViolationException with a message naming the class and member
+// text; otherwise the next predicate runs. The check fires on every public
+// instance method entry/exit, every public setter entry/exit, and at
+// construction exit (the latter is wired at `new` sites, not ctor bodies,
+// per the spec's "most-derived" requirement — a base ctor completing as
+// part of a derived construction is NOT an instrumentation point).
+//
+// Predicate lowering caveat. The predicate's expression is a normal Bezel
+// expression that reads `this`'s fields (and may call `pure` public methods
+// of the same instance — §22.16 "Invariant evaluation is a boundary-time
+// read of instance state"). We rebind `currentThis_` to `thisVal` so the
+// predicate's field reads GEP through the right base.
+//
+// fix #4597 (§22.16, v0.306): this comment used to claim that
+// `insideInvariantCheck_` is what lets "a clause call a `pure` public method
+// of the same instance without recursion" — "that's exactly what this flag
+// models". It modelled no such thing. The flag is held while the predicate is
+// LOWERED; the emitted call still entered the callee's one face, whose
+// prologue re-evaluated the invariant. Measured on origin/main @ cafdfc52:
+// unbounded self-recursion, SIGSEGV. What actually closes the cycle is the
+// §22.16 face split (`uncheckedFaceFor`), which binds the clause's
+// `this`-receiver call to the callee's unchecked face. The flag is KEPT — it
+// still stops a check nested inside the predicate's own lowering (a `new` in
+// a clause reaching a construction-exit check) — but it is no longer the
+// answer to "without recursion".
+void Emitter::emitInvariantCheck(llvm::Value* thisVal,
+                                 const sema::TypeSymbol* classType,
+                                 bool disposeAndFreeOnThrow) {
+    // §22.16 / issue #4386: in unchecked (release) mode — the default —
+    // invariant checks are NOT emitted at any of the construction-exit /
+    // public-method-entry / public-method-exit points. Clauses are pure, so
+    // non-evaluation is unobservable for any program whose checked clauses
+    // never fault. `requires` is always-on regardless of this bit.
+    if (!checkedContracts_) return;
+    if (!classType || insideInvariantCheck_) return;
+    // §22.16 conjunction, base-first (see `collectInvariantChain`).
+    std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>> chain;
+    collectInvariantChain(classType, chain);
     if (chain.empty()) return;
 
     // Push the interior-code gate.
@@ -6612,7 +6748,7 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
     // path; nothing else here mutates the per-function scope.
 
     for (const auto& iv : chain) {
-        llvm::Value* condV = lowerExpr(*iv.expr);
+        llvm::Value* condV = lowerExpr(*iv.second);
         if (!condV) continue;  // purity/type-error already diagnosed upstream
         llvm::Value* failed = builder_.CreateNot(condV, "inv.fail");
         auto* throwBB =
@@ -6641,7 +6777,7 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
             builder_.CreateCall(freeFn(), {thisVal});
         }
         std::string msg = std::string("invariant of ") +
-                          std::string(iv.cls->name) + " failed";
+                          std::string(iv.first->name) + " failed";
         llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
         emitThrowContractViolation(msgStr);
         builder_.SetInsertPoint(contBB);
@@ -9706,21 +9842,33 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // (§22.16 "The visibility boundary": non-public calls are the
             // implementation's interior where an algorithm may pass through
             // broken intermediate states; static methods are exempt per the
-            // never-instrumented list). The this-receiver unchecked-face
-            // refinement is a follow-up — for this slice every public
-            // instance method call goes through the checked face, and the
-            // `insideInvariantCheck_` guard prevents a clause that invokes a
-            // pure public method of the same instance from re-entering the
-            // check (§22.16 "Invariant evaluation itself runs as interior
-            // code, so a clause may call a pure public method of the same
-            // instance without recursion").
+            // never-instrumented list).
+            //
+            // fix #4597 (§22.16, v0.306): the this-receiver unchecked-face
+            // refinement this comment used to defer as "a follow-up" is
+            // implemented — see `uncheckedFaceFor`. It is NOT an optimisation:
+            // §22.16 states it normatively ("Every instrumented public member
+            // compiles to a checked face … and an unchecked face"), and
+            // without it the sentence two lines further on — "a clause may
+            // call a `pure` public method of the same instance WITHOUT
+            // RECURSION" — was simply false. `insideInvariantCheck_` is a
+            // compile-time flag held while a predicate is LOWERED; it never
+            // reached the emitted call, so `invariant(Ok());` over a public
+            // `Ok()` self-recursed until the stack died (SIGSEGV, exit 139,
+            // measured on origin/main @ cafdfc52).
+            //
+            // `emittingUncheckedFace_` is what makes this function emit the
+            // OTHER face: same body, same `requires` prologue (§22.16
+            // "evaluated on every invocation"), same `ensures` epilogue
+            // ("every normal-completion path") — only the two invariant
+            // instrumentation points stand down.
             const bool isPublicInstanceMethod =
                 !isStaticMethod(ms) &&
                 ms->visibility == ast::Visibility::Public &&
                 ms->parent &&
                 ms->parent->kind == ast::TypeDeclKind::Class &&
                 ms->name != std::string_view("Dispose");
-            if (isPublicInstanceMethod) {
+            if (isPublicInstanceMethod && !emittingUncheckedFace_) {
                 emitInvariantCheck(currentThis_, ms->parent);
             }
             // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
@@ -9755,7 +9903,15 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                                ms->parent ? ms->parent->name
                                           : std::string_view{},
                                md->name,
-                               isPublicInstanceMethod ? ms->parent : nullptr);
+                               // fix #4597 (§22.16, v0.306): the EXIT half of
+                               // the face split. An unchecked face still runs
+                               // its `ensures` clauses — only the invariant
+                               // that follows them is suppressed, which is
+                               // exactly what "no invariant evaluation at that
+                               // call's entry or exit" says.
+                               (isPublicInstanceMethod &&
+                                !emittingUncheckedFace_)
+                                   ? ms->parent : nullptr);
         }
     }
 

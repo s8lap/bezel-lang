@@ -757,8 +757,12 @@ struct DestructorDecl : Member {
 // either — a `static invariant` in an ordinary class compiles clean today,
 // and per the spec text above, should.
 //
-// Slice 1 carries the parsed member only; instrumentation, instrumentation
-// set, and the checked/unchecked face split land in later slices.
+// Slice 1 carried the parsed member only. Instrumentation landed with #2941
+// (construction exit, public-method entry/exit), and the §22.16
+// checked/unchecked FACE SPLIT with fix #4597 (v0.306) — see
+// `Emitter::uncheckedFaceFor` in LlvmBackend_Setup.cpp. Still outstanding on
+// the instrumentation set: public SETTERS (§22.16 lists them as an
+// instrumentation point; no site emits a check for one).
 struct InvariantDecl : Member {
     bool isStatic = false;
     std::unique_ptr<Expr> expr;
