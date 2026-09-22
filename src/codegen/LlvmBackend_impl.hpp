@@ -8703,6 +8703,17 @@ private:
     // unchecked one and the call site binds to it unchanged).
     llvm::Function* uncheckedFaceFor(sema::MethodSymbol* ms);
 
+    // fix #4613 (§22.16, v0.306): the VIRTUAL half of the same binding.
+    // `checkedFnPtr` is the function pointer a class-virtual dispatch just
+    // loaded out of the receiver's vtable slot; the result is that pointer
+    // rewritten, by a chain of `select`s over the implementations this
+    // compilation can name, to the dynamic target's UNCHECKED face. Null when
+    // §22.16 instruments nothing here, in which case the call site keeps the
+    // loaded pointer unchanged. See the definition for why this is not a
+    // parallel vtable slot.
+    llvm::Value* uncheckedFacePtrForThisVirtualCall(
+        sema::MethodSymbol* ms, llvm::Value* checkedFnPtr);
+
     // Lower every pending unchecked-face body. Called once after the ordinary
     // body-emission loops; loops until the worklist stays empty.
     void emitPendingUncheckedFaces();

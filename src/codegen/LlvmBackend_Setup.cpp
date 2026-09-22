@@ -6692,6 +6692,123 @@ llvm::Function* Emitter::uncheckedFaceFor(sema::MethodSymbol* ms) {
     return face;
 }
 
+// fix #4613 (§22.16, v0.306): the VIRTUAL half of #4597's unchecked-face
+// binding.
+//
+// §22.16: "call sites with syntactic receiver `this` bind to the unchecked
+// face — statically decidable, **including for virtual dispatch (a
+// `this`-receiver dispatching call reaches the dynamic target's unchecked
+// face)**."
+//
+// #4597 implemented only the statically-bound arm of that sentence. A
+// `this`-receiver call to a `virtual` member loads a function pointer out of
+// the object's vtable slot, which holds the CHECKED face and has no unchecked
+// sibling — so `invariant(Ok());` over a `public virtual pure method Ok()`
+// still re-entered the checked face from inside its own prologue's invariant
+// evaluation and recursed to a stack overflow. Measured on this HEAD before
+// this fix: exit 139 (SIGSEGV) where §22.16 requires 99, and 88 (a faulted
+// invariant) where §22.16's "an algorithm may pass through broken
+// intermediate states" requires 3.
+//
+// WHAT THIS DOES. The dynamic target of a virtual call is exactly "which
+// function did the slot hold", so the binding is decided on that value: the
+// loaded slot pointer is compared against each candidate implementation's
+// CHECKED function and, on a match, replaced by that implementation's
+// unchecked face. The candidates are every implementation of this vtable slot
+// declared by a class in this compilation — `ms` itself plus every override —
+// so the select chain reproduces §22.16's "the dynamic target's unchecked
+// face" for every dynamic target the compilation can name. A dynamic target
+// it cannot name (an override compiled into a module that imports this one)
+// falls through to the loaded pointer unchanged, i.e. to exactly today's
+// behaviour.
+//
+// WHY NOT A PARALLEL UNCHECKED VTABLE SLOT (the issue's candidate 1). It is
+// the direct reading of the spec sentence and it reaches the unnameable
+// targets too — but it MOVES THE ARTIFACT ABI: every class's vtable grows,
+// `kVirtualMethodsBase` shifts, and a `.o` compiled before the change linked
+// against one compiled after it would dispatch through the wrong slot with no
+// diagnostic. Worse, the face split exists ONLY under `--checked-contracts`,
+// which is a per-compilation flag: a release-mode library and a
+// checked-contracts consumer are a supported combination today (nothing
+// records the mode in the artifact interface), and a mode-dependent vtable
+// layout would silently miscompile it. Keeping the vtable shape untouched
+// makes both mixes a non-question: old and new artifacts, and either mode on
+// either side, keep the layout they have.
+//
+// WHY NOT MOVING THE CHECK TO THE EXTERNAL CALL SITE (candidate 2). It buys
+// more — it would also fix §22.16's "an external call through a base-typed
+// reference evaluates the full dynamic class invariant", which today
+// evaluates the STATIC class's conjunction — but it needs the dynamic class's
+// invariant function reachable from the object, which is the same ABI move by
+// another route, and it has to instrument every external call site (ordinary
+// calls, property and indexer accesses, interface dispatch) rather than one.
+// That deviation is left recorded in #4613 rather than bundled here.
+//
+// Returns null — leaving the call site untouched — for everything §22.16 does
+// not instrument, so the overwhelmingly common virtual call is unaffected and
+// no chain is emitted in release mode at all.
+llvm::Value* Emitter::uncheckedFacePtrForThisVirtualCall(
+    sema::MethodSymbol* ms, llvm::Value* checkedFnPtr) {
+    if (!checkedContracts_ || !ms || !checkedFnPtr) return nullptr;
+    if (isStaticMethod(ms) || !ms->parent ||
+        ms->parent->kind != ast::TypeDeclKind::Class)
+        return nullptr;
+    // The same gate `uncheckedFaceFor` applies, asked once up front so a
+    // class with no invariant anywhere in its chain emits nothing.
+    if (!hasClassInvariant(ms->parent)) return nullptr;
+    auto slotIt = vtableSlot_.find(ms);
+    if (slotIt == vtableSlot_.end() || slotIt->second < kVirtualMethodsBase)
+        return nullptr;
+    const unsigned idx = slotIt->second - kVirtualMethodsBase;
+
+    // Candidate dynamic targets: the implementation each class in this
+    // compilation installs at THIS vtable slot. The subclass test is load-
+    // bearing — slot indices are per-hierarchy, so an unrelated class can
+    // hold an entirely different method at the same index, and matching on
+    // the index alone would bind a call to a stranger's body.
+    std::vector<std::pair<llvm::Function*, llvm::Function*>> cands;
+    for (const auto& [ts, slots] : vtableMethods_) {
+        if (!ts || idx >= slots.size()) continue;
+        bool derives = false;
+        for (const sema::TypeSymbol* c = ts; c; c = baseClassOf(c))
+            if (c == ms->parent) { derives = true; break; }
+        if (!derives) continue;
+        sema::MethodSymbol* impl = slots[idx].method;
+        if (!impl) continue;
+        auto fnIt = methodFns_.find(impl);
+        if (fnIt == methodFns_.end() || !fnIt->second) continue;
+        // `uncheckedFaceFor` is null for an imported implementation (no local
+        // body to clone) and for everything outside the instrumentation set —
+        // in both cases the checked pointer already IS the unchecked face, or
+        // is the only one there is, and the candidate simply drops out.
+        llvm::Function* face = uncheckedFaceFor(impl);
+        if (!face || face == fnIt->second) continue;
+        // The face must be call-compatible with the slot: the call
+        // instruction below keeps the slot's `fnTy`, and `uncheckedFaceFor`
+        // clones the checked face's type verbatim, so this only ever declines
+        // a widened/thunked slot.
+        if (face->getFunctionType() != fnIt->second->getFunctionType())
+            continue;
+        cands.emplace_back(fnIt->second, face);
+    }
+    if (cands.empty()) return nullptr;
+    // #3020: a pointer-keyed map has no stable iteration order, and the
+    // emitted select chain would otherwise vary with bucket layout. Key on
+    // the checked face's name, which is unique per implementation.
+    std::sort(cands.begin(), cands.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first->getName() < b.first->getName();
+              });
+    llvm::Value* sel = checkedFnPtr;
+    for (const auto& [checked, face] : cands) {
+        llvm::Value* hit = builder_.CreateICmpEQ(
+            checkedFnPtr, checked, "ufc.is");
+        sel = builder_.CreateSelect(hit, face, sel, "ufc.sel");
+    }
+    return sel;
+}
+
+
 
 // fix #4597 (§22.16, v0.306): lower every unchecked-face body minted during
 // the ordinary emission loops. Drained AFTER them (and before

@@ -13556,6 +13556,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             llvm::Value* slotPtr = builder_.CreateGEP(
                 ptrTy(), vptr, {builder_.getInt32(vtSlot)});
             fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+            // fix #4613 (§22.16, v0.306): the VIRTUAL half of #4597's
+            // unchecked-face binding — "a `this`-receiver dispatching call
+            // reaches the dynamic target's unchecked face". The non-virtual
+            // arm below binds by rewriting `callee`; here the callee is a
+            // loaded slot value, so the rewrite is on that value. Returns
+            // null (leaving `fnPtr` untouched) for every call §22.16 does not
+            // instrument.
+            if (thisReceiver)
+                if (llvm::Value* uf =
+                        uncheckedFacePtrForThisVirtualCall(ms, fnPtr))
+                    fnPtr = uf;
         }
         // #1183 / §11.2 / §12.1: builtin generic interfaces
         // (IComparable<T>/IEquatable<T>/IEqualityComparer<T>) compile
