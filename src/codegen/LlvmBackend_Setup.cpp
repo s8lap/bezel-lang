@@ -166,6 +166,17 @@ void Emitter::declareExterns() {
                                     : llvm::Type::getVoidTy(llvm_);
             std::vector<llvm::Type*> paramTys;
             for (const auto& p : ed->params) {
+                // per §32.5 *Boundary `out` and `ref`* (v0.306): "`ref p: T` —
+                // C sees `T*`, receiving the **address of the caller's
+                // storage**"; `out p: T` is "same address passing". The slot's
+                // C type is therefore a pointer, NOT the lowered value type.
+                // Kept in lockstep with lowerExternCall's matching by-address
+                // argument marshalling — a value-here/address-there mismatch
+                // is exactly the silent wrong-code this fixes.
+                if (isByRefMod(p.modifier)) {
+                    paramTys.push_back(ptrTy());
+                    continue;
+                }
                 // fix #1720 (§32.5, v0.186): a `RawBytes` parameter — of an
                 // extern method or FFI function type — occupies TWO consecutive
                 // C argument slots: the buffer pointer (const void*) then the

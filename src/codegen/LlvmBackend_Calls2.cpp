@@ -6119,10 +6119,56 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // and it is unreachable from the unwind edge, so a later argument that
         // throws leaks the buffer. Both reclaims are now established here, at
         // production, and discharged at the full-expression boundary.
+        // per §32.5 *Boundary `out` and `ref`* (v0.306): an accessor-mediated
+        // `ref`/`out` target goes through §22.3's copy-in/copy-out bracket;
+        // the records collected here are flushed after the call returns ("the
+        // setter is called once with the slot's final value"). An extern
+        // call's only non-normal exit is §32.8's callback abort, which
+        // terminates the process, so there is no exception edge to suppress
+        // the write-back on.
+        std::vector<AccessorRefArg> externRefArgs;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
+            // per §32.5 *Boundary `out` and `ref`* (v0.306): "`ref p: T` — C
+            // sees `T*`, receiving the **address of the caller's storage** …
+            // Direct passing is the *normative* semantics, not an as-if
+            // shortcut"; `out p: T` is "same address passing". Before this
+            // branch the extern arm lowered EVERY argument with `lowerExpr` —
+            // i.e. by VALUE — so a `ref`/`out` extern parameter silently
+            // dropped the native callee's write (`strtol(s, out e, 10)` left
+            // `e` at its pre-call value with no diagnostic anywhere). Mirrors
+            // the imported-method path's identical `lvalueAddr` + §22.3
+            // accessor-bracket shape; kept in lockstep with declareExterns'
+            // matching `ptrTy()` slot.
+            std::string_view refMod =
+                (ed && idx < ed->params.size() && !ed->params[idx].modifier.empty())
+                    ? ed->params[idx].modifier
+                    : a.modifier;
+            if (isByRefMod(refMod)) {
+                llvm::Type* slotTy = nullptr;
+                llvm::Value* addr = lvalueAddr(*a.value, slotTy);
+                if (!addr) {
+                    // §22.3's copy-in/copy-out bracketing, applied unchanged
+                    // (§32.5): a property/indexer target has no true-alias
+                    // location, so the hidden slot's address is what crosses.
+                    addr = emitAccessorRefArgCopyIn(
+                        *a.value, /*paramTy=*/nullptr,
+                        /*isOut=*/refMod != "ref", externRefArgs);
+                }
+                if (!addr) {
+                    emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+                    return nullptr;
+                }
+                args.push_back(addr);
+                ++llvmIdx;
+                ++idx;
+                continue;
+            }
             llvm::Value* v = lowerExpr(*a.value);
-            if (!v) return nullptr;
+            if (!v) {
+                emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+                return nullptr;
+            }
             // fix #3296 / §17.12 (v0.266): a `throw` expression used as an
             // argument diverges (CG40 — `lowerExpr` set `diverged_ = true` and
             // branched the current BB to `unwindBB`). The loop body below
@@ -6257,7 +6303,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             ++llvmIdx;
             ++idx;
         }
-        if (args.size() != it->second->arg_size()) return nullptr;
+        if (args.size() != it->second->arg_size()) {
+            emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+            return nullptr;
+        }
         // fix #3296 / §17.12 (v0.266): an argument `throw` expression broke
         // the loop above (the BB is already terminated by the unwind branch
         // from `emitThrowValue`). The CreateCall below would emit into that
@@ -6267,11 +6316,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // throw edge already branched to `unwindBB`, no join can reach a
         // join that consumes this). Mirrors the combinator-path fix in
         // `tryLowerResultCombinatorCall`.
-        if (diverged_) return llvm::PoisonValue::get(it->second->getReturnType());
+        if (diverged_) {
+            emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+            return llvm::PoisonValue::get(it->second->getReturnType());
+        }
         // per §32 / issue #496: coerce the return value if the canonical
         // function returns a different type than the user's extern declared.
         // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
         llvm::Value* result = builder_.CreateCall(it->second, args);
+        // per §32.5 *Boundary `out` and `ref`* (v0.306): "write-back on return
+        // — an extern call's only non-normal exit is the callback abort of
+        // §32.8, which terminates the process, so no write-back question
+        // arises on it". Flush the §22.3 bracket in argument textual order.
+        emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/true);
         // fix #2733 (§28.3, v0.240): NO post-call reclaim is emitted here for
         // either FFI-buffer family. Both are now established on the
         // establishment-ordered cleanup stack at production and discharged at
