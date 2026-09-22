@@ -2718,16 +2718,66 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // payload bytes out of the wrapper. So once the operand is proven to be a
     // fresh, solely-owned box, releasing it here is exactly-once.
     //
-    // TWO independent proofs, either of which suffices:
+    // THREE independent proofs, any one of which suffices:
     //   * the mint-identity check below (`lastBoxMint_`), which covers every
     //     box minted IN THIS FRAME while lowering the operand — the inline
     //     indexer/property read paths (shape 2);
     //   * `isUserMethodBoxReturnCall`, the SAME predicate `isPlusOneBoxProducer`
     //     case (b) uses to arm the bound-local release, which covers a box
     //     minted by a locally-compiled `boxReturnMethods_` callee at its return
-    //     edge and transferred to us (shape 1).
+    //     edge and transferred to us (shape 1);
+    //   * `isUserPropertyBoxRead` (fix #4497, §8.6 / §28.9 / §23.3, v0.306) —
+    //     the PROPERTY twin of the previous one, reusing #2760's predicate
+    //     rather than re-spelling "is this a fresh box" a third time. A
+    //     locally-compiled, non-virtual `Object`-typed property whose getter
+    //     provably mints at every exit hands this frame exactly +1, the same
+    //     way a `boxReturnMethods_` call does.
     // Anything else keeps leaking — the safe direction (a bounded leak over a
     // double free), and what the filed residuals track.
+    //
+    // WHY #4497 EXISTED. #2760 gave the two §23.3 accessor body spellings one
+    // reclaim rule, but wired it into `boxLocalAssignmentSourceKind` only —
+    // the classifier for a box BOUND to a local. At a type-test site the
+    // EXPRESSION-bodied getter is inlined, so its mint is visible through
+    // `lastBoxMint_` and was already reclaimed; the BLOCK-bodied getter mints
+    // in `bz$prop$<N>$get` and neither existing disjunct saw it. MEASURED on
+    // `ea93ea1c` via `scripts/agent_check.sh --probe --asan` over
+    // `if h.O is int then … end;` ×200: block-bodied 4800 B / 200
+    // allocations, expression-bodied clean. §28.9's *Accessor faces are
+    // uniform across type kinds* paragraph says the two spellings are
+    // "semantically indistinguishable at every read site"; this is the read
+    // site at which that had not yet been made true.
+    //
+    // ⚠ WHY NOT HOIST THE WHOLE `boxLocalAssignmentSourceKind` HERE, which is
+    // the tidier-looking "one authority" move: it is UNSOUND at this site, and
+    // that is MEASURED, not reasoned. That classifier also answers +1 for
+    // `isBoxableValueType(srcTy)`, and at a type test the operand's resolved
+    // type is its §12.7-NARROWED type — so inside `if o is int then` a nested
+    // `o is T` on the bare identifier would classify as a fresh box and
+    // release the box the LOCAL still owns and still releases at scope end.
+    // That variant was built (`freshBoxTemp` = `boxLocalAssignmentSourceKind(
+    // te.operand.get()) == 1`) and run under `agent_check.sh --probe --asan`
+    // on exactly that nested shape ×200: `ERROR: AddressSanitizer: attempting
+    // double-free`, abort. The narrow disjunct above cannot reach it — an
+    // IDENTIFIER operand is not a `MemberAccessExpr`, so
+    // `isUserPropertyBoxRead` answers false for it, exactly as
+    // `isUserMethodBoxReturnCall` does.
+    //
+    // DELIBERATELY NOT WIDENED, with numbers. Two other property-read faces
+    // still leak 24 B/read, and both are OUT of #4497's subject because
+    // neither DIVERGES between the two §23.3 body spellings — the property of
+    // this site that made #4497 a defect rather than a residual. Measured
+    // ×200 under `agent_check.sh --probe --asan`, block-bodied and
+    // expression-bodied alike:
+    //   * `var ob: Object := h.O as Object;` — the #3351 `as <reference
+    //     type>` local-bind arm, which gates on `isUserMethodBoxReturnCall`
+    //     only: 4800 B / 200 for BOTH spellings;
+    //   * `Take(h.O)` — argument position, #2876's residual family:
+    //     4800 B / 200 for BOTH spellings.
+    // Since both spellings are equally unreclaimed there, §28.9's "the two
+    // accessor body spellings … are semantically indistinguishable at every
+    // read site" is not violated at those faces; they are the ordinary
+    // unbound-value leak the #2876 family tracks.
     llvm::Value* savedBoxMint = lastBoxMint_;
     lastBoxMint_ = nullptr;
     // fix #3090 (§12.7 / §8.6, v0.252): a type test whose operand is a BARE
@@ -2763,7 +2813,8 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     const bool freshBoxTemp =
         obj && obj->getType()->isPointerTy() &&
         ((lastBoxMint_ && obj == lastBoxMint_) ||
-         isUserMethodBoxReturnCall(te.operand.get()));
+         isUserMethodBoxReturnCall(te.operand.get()) ||
+         isUserPropertyBoxRead(te.operand.get()));   // fix #4497
     lastBoxMint_ = savedBoxMint;
     // Release the operand's wrapper. Call ONLY where `obj` is provably dead:
     // never on an `as` whose target is a REFERENCE type, because that arm
@@ -4167,6 +4218,27 @@ struct CaptureWalker {
                 for (auto& s : arm.stmts) stmt(s.get());
             }
             return; }
+        // fix #4527 / §17.15 (v0.216): the BINDING ATOM `(var y := E; body)`.
+        // Its clauses are embedded plain-`var` LocalDecl nodes and its body is
+        // one full Expression, so an enclosing local it references can sit in
+        // either — and without this arm a BindExpr fell through to the leaf
+        // tail below, taking BOTH with it. A symbol invisible here never
+        // reaches `capturedSyms`, so the closure gets no env field for it and
+        // the reference does not lower at all: measured on origin/main
+        // (6c05b4cf) as "internal: lowerLocalDecl's initializer expression
+        // failed to lower to a value for this local's slot (degraded to a
+        // zero-initialized value) — #2434" on
+        // `var x := 7; var f := lambda(): int => (var y := x; y + 1);`.
+        //
+        // The same atom compiles today when it captures nothing, and when it
+        // names the lambda's OWN parameter (bound by the lambda, never routed
+        // through this walker) — so the gap is precisely the capture path.
+        // Clauses go through `stmt`, whose LocalDecl arm already walks an
+        // initializer; nothing about a clause differs from any other `var`.
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& c : bx->clauses) stmt(c.get());
+            expr(bx->body.get());
+            return; }
         // Literals and other leaf expressions: nothing to do.
     }
 
@@ -5428,8 +5500,27 @@ bool Emitter::isObjectMemberMethodRef(const ast::Expr* e) const {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
     if (!ma || !ma->target) return false;
     if (ctx_.exprSymbol(*e)) return false;          // a real MethodSymbol ref
+    // fix #4578 (§8.1 / §27.6 / §28.9, v0.306): do NOT require the reference's
+    // own exprType to be Function. Unlike every sibling arm of
+    // `isPlusOneClosureProducer`, the Function type on THIS shape is written by
+    // CG60 ITSELF (LlvmBackend_Exprs.cpp — `ctx_.setExprType(&e, fnTy)`), at
+    // lowering time: sema deliberately leaves the bare reference untyped so the
+    // §27.7 "cannot call a value of type `string`" reject cannot fire on it
+    // (ExprTypecheck_Calls.cpp, the CG27c Object carve-out). So the predicate
+    // answered FALSE for the entire pre-lowering pass and TRUE afterwards — and
+    // `collectClosureReleaseEligible` (LlvmBackend_Setup.cpp), which runs at
+    // function ENTRY, is a pre-lowering consumer. `var f := o.GetHashCode;`
+    // therefore never entered `closureReleaseEligible_`, no scope-end
+    // `bz_closure_release` was armed, and the cell minted by
+    // `makeObjectMemberThunk` leaked on every reference (measured: 48 B cell +
+    // 8 B env per reference; the IR carried zero `bz_closure_release`). A null
+    // type is now admitted; a type that is PRESENT but not Function is still
+    // declined, which keeps the call-position spelling `o.ToString()` out (sema
+    // types that MA `string` via the `&ma == calleeOfCallCtx_` arm). The
+    // remaining three checks are exactly CG60's own gate, so eligibility still
+    // tracks the producer that minted the cell.
     const sema::TypeRef* t = ctx_.exprType(*e);      // sema/CG60 typed it
-    if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
+    if (t && t->kind != sema::TypeRef::Kind::Function) return false;
     // CG60 patches the receiver's type checks (Object primitive); we do the
     // same check on the side that asks whether the producer ran.
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
@@ -7124,6 +7215,103 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     }
     elemTy = st->getElementType(idxIt->second);
     return builder_.CreateStructGEP(st, obj, idxIt->second);
+}
+
+
+// fix #1748 (§22.7 "Observing `this` during construction", recorded
+// residual, v0.306): rules 1-3's static observation gate (checkDefiniteAssignment)
+// rejects every UNSAFE `this`-observation it can SEE, but is explicitly "not a
+// completeness guarantee" (the spec's own words, same bound as §22.13's cycle
+// approximation): a virtual call reached through a non-virtual helper invoked
+// after the gate, external code reached by an admitted `this`-escape that
+// dispatches back, or a during-construction closure invocation (rule 3:
+// "closures observe at invocation, not at capture" — deliberately NOT gated by
+// rule 1) can all still read a field before its constructor-body assignment
+// runs. None of those routes are visible to the DA pass — a closure body's
+// field reads are exempt from the enclosing constructor's DA tracking by
+// design (rule 3), and a helper/escape call site has no static link back to
+// "am I being invoked mid-construction" — so the field read reaches codegen
+// with no compile-time diagnostic. The spec's own runtime backstop: "a read of
+// a non-nullable reference field still at that null watermark raises
+// NullReferenceException (§31.4) in checked disposal mode (§28.2) and,
+// unchecked, observes the watermark `null` with undefined behavior ... the
+// same checked/unchecked split as use-after-dispose." Before this fix,
+// checked-disposal mode had NO watermark guard at all: a program built with
+// --checked-disposal segfaulted identically to an unchecked build instead of
+// raising NullReferenceException (measured: a `this`-capturing closure
+// invoked synchronously from the constructor body, reading a field before the
+// statement that assigns it — SIGSEGV in both modes pre-fix).
+//
+// Scoped to non-nullable REFERENCE fields only (sema::isNonNullableReferenceType)
+// — a value-typed or nullable field has a well-defined §7.9 default and is
+// never reported, matching the spec's own "reference-typed field" wording.
+// `elemTy->isPointerTy()` is a belt-and-braces match against the LLVM shape
+// isNonNullableReferenceType predicts (a bare generic type parameter reads as
+// a non-nullable reference type even before monomorphization; an
+// unspecialized generic body's fallback lowering for such a field is not a
+// pointer, so the guard correctly declines there rather than misreading
+// fallback bits as an address).
+//
+// Gated on checkedDisposal_ only — not on "are we inside a constructor" or
+// "inside a this-capturing closure" — matching the spec's checked/unchecked
+// split and mirroring the existing checked-disposal DisposedAccessException
+// guard's shape (fieldAddr, above, issue #621): in a checked build this fires
+// on EVERY class/record instance-field read, regardless of whether it happens
+// during construction. That is deliberately sound rather than merely
+// sufficient: after construction completes, a non-nullable reference field
+// can never legitimately be null (§7.9's definite-assignment guarantee), so
+// the guard is a provably-false no-op on every ordinary post-construction
+// read, and it closes all three residual routes above uniformly — the
+// runtime VALUE being the null watermark is exactly the condition the spec
+// names, independent of which route produced it. A narrower guard keyed to
+// "lexically inside a constructor" would miss the helper-call and
+// this-escape routes entirely, since neither is lexically inside the
+// constructor body.
+void Emitter::emitFieldWatermarkGuard(const ast::Expr& e, llvm::Value* val,
+                                      llvm::Type* elemTy) {
+    if (!checkedDisposal_ || diverged_ || !val || !elemTy) return;
+    if (!elemTy->isPointerTy()) return;
+    const sema::TypeRef* fty = ctx_.exprType(e);
+    // fix #1748 follow-up (§7.10 "Generics and nullability", v0.306): a bare
+    // type parameter `T` is only *conservatively* non-nullable. §7.10's own
+    // words: "A field ... of bare type T ... follows §7.9's non-nullable-
+    // reference rules ... since T may be instantiated non-nullable; *reads*
+    // remain conservatively possibly-null per this section." That
+    // conservatism exists to make §7.9's DEFINITE-ASSIGNMENT obligation sound
+    // (the field must be assigned SOMETHING), not to claim every read is
+    // non-null: `new Box<string?>(null)` assigns null legitimately, and
+    // §7.10's "idempotent `?` under substitution" rule makes the substituted
+    // field genuinely `string?` there — `sema::isNonNullableReferenceType`
+    // itself has no way to see that (it reads the unsubstituted declared
+    // TypeRef, which for a bare `T` field is always Named/no-declaration,
+    // §7.10's own conservative default). Resolve through the active
+    // monomorphization binding first — `resolveTypeParamRef` is the same
+    // `genericSubstSemaTy_` lookup already trusted elsewhere in this file for
+    // the identical bare-T ambiguity (issue #567's hash-collection dispatch,
+    // #568's nullable-value unwrap) — so a nullable instantiation's read
+    // reports its true substituted type instead of T's declared-site
+    // pessimism. Empirically confirmed, not assumed: `BEZEL_DUMP_IR=1` on
+    // `new Box<string?>(null); var s := b.Get();` under --checked-disposal
+    // shows `Box$Get$spec` as bare `getelementptr`/`load`/`ret`, byte-for-
+    // byte the same shape the plain (unchecked) build already emits there —
+    // no compare, because resolveTypeParamRef found genericSubstSemaTy_["T"]
+    // = `string?` and isNonNullableReferenceType declined on the nullable
+    // result. If resolution does NOT find a binding (genericSubstSemaTy_ has
+    // no entry for this name — an unspecialized generic body is already
+    // excluded above by elemTy->isPointerTy(), i32 there, not ptr, so this
+    // is only a genuinely unrelated/headless reference type, e.g. an
+    // imported builtin whose name collides with no active generic param),
+    // resolveTypeParamRef returns `fty` UNCHANGED and classification falls
+    // through to isNonNullableReferenceType's existing, pre-#1748 posture
+    // for that shape (the same one every other call site in this codebase
+    // already relies on) — this fix adds no NEW guess in the raising
+    // direction; it only stops MIS-guessing on the one shape (a resolvable
+    // bare T) that #1748's original fix did not consider.
+    fty = resolveTypeParamRef(fty);
+    if (!fty || !sema::isNonNullableReferenceType(fty)) return;
+    emitGuardThrow(
+        builder_.CreateICmpEQ(val, llvm::ConstantPointerNull::get(ptrTy())),
+        "NullReferenceException");
 }
 
 

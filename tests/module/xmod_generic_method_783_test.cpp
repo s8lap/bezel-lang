@@ -99,7 +99,8 @@ static int compileImportAndRun783(const std::string& bSrc,
     d.metadataPath = aObj;
     d.objectPath = aObj;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc, bExe, deps).success) return -1;
+    if (!driver.compileFile(bSrc, bExe, deps).success)
+        return bezel::test::asanBuildFailure("compileFile");
     int status = std::system(bExe.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
@@ -182,7 +183,7 @@ static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -3;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 99) return 1;
     if (code == expectedCode) return 0;

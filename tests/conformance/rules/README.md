@@ -238,3 +238,43 @@ type-level invariant with no accept/reject surface (§7.10's `?` idempotence), a
 build-request property (§2.8.4's artifact kind, `--main-class`), and anything
 needing two *versions* of one module (§2.8.3's staleness clause, §2.8.6's
 interface delta). Each is recorded where a lane hit it rather than approximated.
+
+### First classification — v0.306 (2026-09-21)
+
+The acceptance pass the founding record was waiting for. Run on a dev box with
+a current toolchain, against `build/bezelc` at commit `c52916d9` (integration
+branch `r18-c7`), documents at spec v0.306.
+
+```bash
+python3 tests/conformance/rules/runner.py build/bezelc --classify --jobs 6
+```
+
+**2149 cases: 1736 pass, 413 divergent (80.8%).** Divergence by tier:
+
+| tier | cases | divergent | pass rate |
+|---|---|---|---|
+| `accept` | 352 | 32 | 91% |
+| `reject` | 788 | 148 | 81% |
+| `run` | 918 | 185 | 80% |
+| `quiet` | 42 | 4 | 90% |
+| `warn` | 49 | **44** | **10%** |
+
+The `warn` row is not 44 separate defects. The compiler implements a handful of
+warnings (the mutable-static forms in §22.12/§22.13, the fresh-producer forms in
+stdlib §4.4/§4.9) and essentially nothing else: must-use and unused-result
+(§17.7, §17.13), case exhaustiveness (§19.6), constant-range direction
+(§16.4–§16.6), chain shadowing (§2.7) and enum-static sharing (§10.4) all
+"compiled silently; the spec requires a warning here". The warning surface is a
+single unimplemented area, and it is the corpus's largest finding.
+
+Of the 185 `run` divergences, 124 do not reach execution at all — the case
+compiles with an error, so they are over-rejections wearing a `run` label. The
+remaining ~61 are wrong behaviour, and they are the severe end: two LLVM IR
+verifier failures (`s2_8_2_0005` "Call parameter type does not match function
+signature", `s17_5_0004` "Invalid operand types for ICmp instruction"), several
+omitted disposals (`s28_3_0043`, `s35_5_0006`, `s35_9_0001`, `s28_12_0005`), one
+cleanup that runs twice (`s28_12_0006`), and disposal-ordering violations
+(`s15_1_1_0005`–`0007`, `s35_4_0005`).
+
+Per the triage rule above these are class (1) — the compiler has not caught up —
+until a case is shown wrong. None were edited to match the compiler.

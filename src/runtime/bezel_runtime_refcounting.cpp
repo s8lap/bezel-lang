@@ -127,8 +127,15 @@ extern "C" void bz_string_release(void* s) {
     int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
     if (__atomic_load_n(rcp, __ATOMIC_RELAXED) == BZ_STRING_RC_SENTINEL)
         return;                                // static/literal — never freed
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("string");
     // Last reference gone: free the data buffer, then the header. Read the data
     // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
     // empty-string case may carry a null data pointer).
@@ -270,7 +277,7 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
-// increment; issue #672 typed env-disposer foundation).
+// increment; issue #672 typed env-disposer foundation; #4475 dispose flag).
 //
 // Function-typed values (lambda closures — capturing or not — and method
 // references) are RUNTIME-MANAGED (§28.9): "Runtime management governs the
@@ -280,14 +287,21 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 //     void* env     (off  8),
 //     int64_t rc    (off 16),
 //     void* envdtor (off 24),
-//     int64_t kind  (off 32) }  = 40 bytes.
+//     int64_t kind  (off 32),
+//     int8_t disposed (off 40) }  = 48 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
 // keep their offsets: every codegen call site loads fn at offset 0 and env at
 // GEP index 1, both unmoved. `kind` (off 32, §27.7.1 / #1544) tags the
 // function-value equality rule (see bezel_runtime_internal.hpp's BZ_FVK_*
-// constants); retain/release never read it.
+// constants); retain/release never read it. `disposed` (off 40, #4475) is the
+// §28.2 use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+// bz_closure_mark_disposed on an explicit `c.Dispose()`. bz_closure_release
+// reads it at last-drop: when 1, the cell is QUARANTINED instead of freed (a
+// deliberate leak parallel to bz_array_mark_disposed), so a post-dispose
+// invoke's guard can read the flag and throw DisposedAccessException instead
+// of UAF-reading freed memory.
 //
 // #672 TYPED ENV-DISPOSER (foundation). `envdtor` (off 24) is a per-lambda
 // typed disposal function emitted by codegen beside the trampoline. When
@@ -326,6 +340,10 @@ static const int64_t BZ_CLOSURE_RC_OFFSET = 16;
 // Byte offset of the env pointer inside the closure cell (after fn).
 // #672: byte offset of the envdtor pointer inside the closure cell (after rc).
 static const int64_t BZ_CLOSURE_ENVDTOR_OFFSET = 24;
+// #4475 (§28.2): byte offset of the disposed flag (after kind). Single byte
+// is enough — the flag is binary. calloc zero-fill makes a fresh cell read
+// as "not disposed" (0), which is the only safe default.
+static const int64_t BZ_CLOSURE_DISPOSED_OFFSET = 40;
 
 extern "C" void bz_closure_retain(void* c) {
     if (!c) return;
@@ -336,8 +354,16 @@ extern "C" void bz_closure_retain(void* c) {
 extern "C" void bz_closure_release(void* c) {
     if (!c) return;
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site, e.g. #4540's racing releases) drives the count
+    // negative. Report it HERE, at the release that first goes negative,
+    // instead of falling through to a second free() below (see
+    // bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("closure");
     // Last reference gone.
     void* env;
     memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
@@ -355,11 +381,50 @@ extern "C" void bz_closure_release(void* c) {
         typedef void (*envdtor_t)(void*);
         ((envdtor_t)envdtor_fn)(env);
     }
-    // Free the env block (uniquely owned by this cell; allocations in
-    // lowerLambda/makeMethodThunk each produce one fresh env per cell).
-    // free(NULL) is safe (a non-capturing closure carries a null env).
-    free(env);
+    // #4475 (§28.2): if the closure was EXPLICITLY DISPOSED (codegen emits
+    // bz_closure_mark_disposed under --checked-disposal on `c.Dispose()`),
+    // the disposed flag is 1. The cell must stay alive (quarantined) so the
+    // closure-invoke guard can read the flag and throw DisposedAccessException
+    // instead of UAF-reading a freed cell at fn (offset 0). free the env block
+    // (it is uniquely owned) but NOT the cell. Outside --checked-disposal the
+    // flag is never written, so the legacy free-on-last-drop path is unchanged
+    // and calloc's zero-fill keeps the byte at 0.
+    int8_t disposed = 0;
+    memcpy(&disposed, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    free(env);  // env is owned by this cell; release it either way.
+    if (disposed) {
+        // Quarantine: do NOT free(c). The cell becomes a deliberate leak
+        // until the process exits (the same lifetime-end semantics as
+        // bz_array_mark_disposed / bz_dict_mark_disposed). The disposed flag
+        // is still readable, and the rc remains 0, so a future retain on the
+        // same pointer would be unsound — but the codegen stops retaining
+        // post-dispose (the `c.Dispose()` arm in --checked-disposal nulls
+        // the slot after the mark, parallel to channel/semaphore, so any
+        // second access goes through the same guard).
+        return;
+    }
     free(c);
+}
+
+// #4475 (§28.2): mark a closure-typed value as disposed. Called by codegen
+// BEFORE the explicit `c.Dispose()` release under --checked-disposal, so the
+// release's last-drop path sees the flag and quarantines instead of freeing.
+// Idempotent — repeated calls are no-ops. null is a no-op.
+extern "C" void bz_closure_mark_disposed(void* c) {
+    if (!c) return;
+    int8_t one = 1;
+    memcpy((uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, &one, sizeof(int8_t));
+}
+
+// #4475 (§28.2): read the per-instance disposed flag. Returns 0 for null
+// (a null closure is never "disposed" — it never held anything). The codegen
+// guard at the closure-invoke lower site calls this and throws
+// DisposedAccessException on a nonzero return.
+extern "C" int8_t bz_closure_is_disposed(void* c) {
+    if (!c) return 0;
+    int8_t d = 0;
+    memcpy(&d, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +483,15 @@ extern "C" void bz_box_retain(void* b) {
 extern "C" void bz_box_release(void* b) {
     if (!b) return;
     int64_t* rcp = (int64_t*)((uint8_t*)b + BZ_BOX_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("box");
     // Last reference gone: free the box wrapper. The boxed value is a value type
     // (a leaf — no owned sub-objects), so nothing else is freed; the single
     // calloc'd cell is released exactly once. The box was proven non-escaping by
@@ -534,7 +606,6 @@ extern "C" void bz_wait_for_borrows(void* obj) {
         return e->borrow_count.load(std::memory_order_acquire) == 0;
     });
 }
-
 // fix #3460 follow-up: process-exit drain for the borrow-tracker side table.
 //
 // The entry-retain-not-erase design (above) keeps BzBorrowEntry instances alive
@@ -583,4 +654,63 @@ static void bz_drain_borrow_table(void) {
     // frees its BzBorrowEntry (which destructs the std::condition_variable;
     // the libstdc++ cv destructor is lock-free).
     (void)drained.size();
+}
+
+// ---------------------------------------------------------------------------
+// fix #4509 (§27.5 / §28.9, v0.306): CAPTURE-CELL reference counting.
+//
+// The full protocol is documented at the declarations in bezel_runtime.h. In
+// one line: the declaring frame's reference to a capture cell is implicit and
+// unannounced, every closure env that captures the cell announces itself with
+// `bz_cell_retain`, and each of them — envs and frame alike — lets go with
+// `bz_cell_release`; the last one out frees the cell.
+//
+// WHY A SIDE TABLE and not a header word: see bezel_runtime.h. The pattern is
+// the one `g_identity_hashes` above already uses, mutex and all.
+//
+// WHY THE FIRST RETAIN RECORDS 2: the frame's reference exists from the
+// `calloc` in `boxLocalSlot` and is never announced — announcing it would mean
+// teaching all three allocation sites which cells are refcounted, which they
+// cannot know (the classification is made later, at the capture site). So the
+// table's invariant is "entry present ⇒ value == frame + live envs", and the
+// first env to arrive establishes it at 2. A cell that no env ever retains
+// stays out of the table entirely, and `bz_cell_release` on it is a plain
+// `free` — which is exactly what the pre-#4509 scope-end path emitted, so an
+// unclassified cell is byte-identical.
+//
+// EXACTLY-ONCE: codegen emits one retain per env capture-store, one release in
+// that env's envdtor, and one release at the declaring scope's end (on both the
+// normal and the unwind edge, a given exit going one way only). So releases ==
+// 1 + N and the count reaches 0 exactly once. An env that is never released
+// (a leaked closure) leaves the cell alive — the leak direction, which is the
+// PRIME DIRECTIVE's safe side.
+//
+// ADDRESS REUSE is not a hazard: the entry is erased under the lock in the same
+// critical section that decides to free, so a later `calloc` handing back the
+// same address finds no stale entry.
+// ---------------------------------------------------------------------------
+static std::unordered_map<void*, int64_t> g_cell_rc;
+static std::mutex                         g_cell_rc_mtx;
+
+extern "C" void bz_cell_retain(void* cell) {
+    if (!cell) return;
+    std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+    auto it = g_cell_rc.find(cell);
+    if (it == g_cell_rc.end()) g_cell_rc.emplace(cell, 2);  // frame + this env
+    else ++it->second;
+}
+
+extern "C" void bz_cell_release(void* cell) {
+    if (!cell) return;
+    {
+        std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+        auto it = g_cell_rc.find(cell);
+        if (it != g_cell_rc.end()) {
+            if (--it->second > 0) return;
+            g_cell_rc.erase(it);
+        }
+        // Not in the table: no env ever retained it, so the frame is the only
+        // holder and this release is the cell's one and only free.
+    }
+    free(cell);
 }

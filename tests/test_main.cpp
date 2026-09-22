@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "native_test_harness.hpp"
+#include "support/asan_infra_failure.hpp"  // asanInfraFailures() (#4563)
 #include "support/aot_support.hpp"
 #include "support/force_sanitize.hpp"
 #include "support/scratch_dir.hpp"
@@ -263,8 +264,51 @@ int main(int argc, char** argv) {
 
         ::bezel::test::currentTestFailed() = false;
         std::cout << "[ RUN  ] " << test.suite << "." << test.name << "\n";
+        // fix #4533: BRACKET THE BODY ON fd 2, NOT ON stdout.
+        //
+        // The gate hard-fails a cycle on a fired generated-code sanitizer
+        // report, and to do that soundly it has to know WHICH TEST produced
+        // one: a row that deliberately runs an undefined-behaviour program
+        // (§28.2 use-after-dispose unchecked) gets a report AND passes, while
+        // the same report in any other row is a memory-safety defect.
+        //
+        // That question cannot be answered from the `[ RUN  ]` lines above.
+        // They go to `std::cout`, which is FULLY BUFFERED when a shard is
+        // redirected into a file, while the sanitizer report is written to
+        // unbuffered fd 2 (aot_support.hpp's emitSanitizerReportToStderr) — so
+        // the two streams interleave in the log in an order that has nothing to
+        // do with the order of execution. Attribution by position is wrong, and
+        // wrong in a way that LOOKS right: it names a plausible neighbour.
+        //
+        // These markers are on the SAME unbuffered stream as the report, so
+        // their relative order is exactly the execution order and a report
+        // between `enter X` and `leave X` belongs to X. Only under the sweep,
+        // where reports can actually occur — a normal single-binary run's
+        // stderr stays byte-for-byte as it was. The spelling deliberately does
+        // not start with `[ RUN`: scripts/gate/summary.py's crashed-shard
+        // culprit extraction is anchored on that prefix (#1608).
+        const bool sanScope = ::bezel::test::forceSanitizeAddress();
+        if (sanScope) {
+            // Flush the buffered `[ RUN  ]` line first, so that UNDER THE SWEEP
+            // the two streams also read in order for a human — the gate prints
+            // excerpts of these logs to an operator. Deliberately only here: on
+            // the plain oracle the log stays byte-for-byte as it was, which
+            // keeps summary.py's documented #1608 last-[ RUN ]-line culprit
+            // behaviour (and its buffering quirks) exactly as consumers expect.
+            std::cout.flush();
+            std::fprintf(stderr, "[san-scope] enter %s.%s\n",
+                         test.suite.c_str(), test.name.c_str());
+            std::fflush(stderr);
+        }
         test.body();
-        if (::bezel::test::currentTestFailed()) {
+        const bool testFailed = ::bezel::test::currentTestFailed();
+        if (sanScope) {
+            std::fprintf(stderr, "[san-scope] leave %s.%s %s\n",
+                         test.suite.c_str(), test.name.c_str(),
+                         testFailed ? "fail" : "pass");
+            std::fflush(stderr);
+        }
+        if (testFailed) {
             ++failed;
             std::cout << "[ FAIL ] " << test.suite << "." << test.name << "\n";
         } else {
@@ -318,6 +362,30 @@ int main(int argc, char** argv) {
     std::cout << "NATIVE SANITIZER: " << nativeSanitizerSkips
               << " check(s) skipped (ASan/TSan runtime unavailable — see"
                  " tests/native_test_harness.hpp sanitizerRuntimeMaster())\n";
+
+    // fix #4563: the SIBLING of the line above, for the other two outcomes the
+    // native-sanitizer leg used to collapse into the same -1. `NATIVE
+    // SANITIZER:` counts only "the runtime could not be built" — a genuine
+    // environment SKIP. A test program that failed to BUILD, or failed to
+    // LINK, is a failure of the leg's own setup, and before #4563 it returned
+    // the same -1 and every `if (rc == -1) return;` read it as that SKIP: the
+    // row printed [ OK ] having asserted nothing about memory safety, and no
+    // counter moved, so a suite-wide outage of either kind was invisible here.
+    //
+    // Each such failure now also fails its own test, so the gate cannot miss
+    // ONE of them; this tally is about the SHAPE of an outage, which otherwise
+    // reads as N unrelated test failures. Printed UNCONDITIONALLY for the same
+    // reason as its two neighbours — "0" is a positive confirmation the leg
+    // built and linked, not the absence of a signal. A separate line so the
+    // LOAD-BEARING legacy-line regex (scripts/gate/summary.py) is untouched,
+    // and deliberately not the word "failure(s)" so it cannot be confused with
+    // aot_support.hpp's `INFRA: N failure(s)` tally (a different subsystem,
+    // asserted on by tests/support/aot_infra_loud_3007_test.cpp).
+    const std::size_t nativeSanitizerInfra =
+        ::bezel::test::asanInfraFailures().load(std::memory_order_relaxed);
+    std::cout << "NATIVE SANITIZER INFRA: " << nativeSanitizerInfra
+              << " build/link/exec break(s) (the leg's own setup failed — see"
+                 " tests/support/asan_infra_failure.hpp)\n";
 
     // fix #3733: loud, not silent. runAotChecked's toolchain probe at
     // tests/support/aot_support.hpp takes a single early-return when
@@ -388,6 +456,17 @@ int main(int argc, char** argv) {
         // is nonzero.
         json += ",\"native_sanitizer_unavailable_skips\":";
         json += std::to_string(nativeSanitizerSkips);
+        // fix #4563: additive field — same rationale as #3626/#3733 above; a
+        // reader that does not know this key ignores it (summary.py's
+        // check_agreement compares only passed/failed/total/selected/schema),
+        // so no schema-version bump. Deliberately NOT wired into
+        // run_parallel.sh's nonzero-fails-the-run check the way #3626's field
+        // is: unlike an unavailable toolchain, every one of these ALREADY
+        // failed its own test, so the shard fails on its own. The field is for
+        // triage — it tells a reader at a glance whether N failures are one
+        // infrastructure outage or N distinct defects.
+        json += ",\"native_sanitizer_infra_failures\":";
+        json += std::to_string(nativeSanitizerInfra);
         // fix #3733: additive field — same rationale as #3626 above; an older
         // reader that does not know this key ignores it (summary.py's
         // check_agreement only compares passed/failed/total/selected/schema),

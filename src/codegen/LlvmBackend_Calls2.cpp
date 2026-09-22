@@ -593,43 +593,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        // Widen to i32 for libc functions if needed.
+        // Widen to i32 for the runtime helper if needed.
         if (!arg->getType()->isIntegerTy(32))
             arg = builder_.CreateSExt(arg, i32());
-        // Map Bezel method names to libc functions.
+        // fix #4420 (stdlib §9.5, v0.306): these used to lower directly onto
+        // <ctype.h> (isdigit/isalpha/.../toupper/tolower), which is
+        // undefined for any argument not representable as `unsigned char`
+        // (0-255) or `EOF` (C11 §7.4p1). A Bezel char is a 32-bit Unicode
+        // scalar up to U+10FFFF (§4.5), so any code point above U+00FF was
+        // an out-of-bounds libc table read, not merely a wrong answer. The
+        // bz_char_* runtime helpers (bezel_runtime_strings.cpp) are the ONE
+        // shared, UB-free lowering — also used by string.IsNullOrWhiteSpace
+        // below — see their definitions for exactly which categories are
+        // Unicode-exact across the full range (IsControl/Cc, IsWhiteSpace/
+        // White_Space — each a closed, stable code-point list) versus
+        // ASCII-only pending full Unicode category data (IsDigit/IsLetter/
+        // IsLetterOrDigit/IsUpper/IsLower/IsPunctuation/ToUpper/ToLower).
         const char* fnName = nullptr;
-        if (m == "IsDigit") fnName = "isdigit";
-        else if (m == "IsLetter") fnName = "isalpha";
-        else if (m == "IsLetterOrDigit") fnName = "isalnum";
-        else if (m == "IsWhiteSpace") fnName = "isspace";
-        else if (m == "IsUpper") fnName = "isupper";
-        else if (m == "IsLower") fnName = "islower";
-        else if (m == "IsPunctuation") fnName = "ispunct";
-        else if (m == "IsControl") fnName = "iscntrl";   // stdlib §9.5 (sweep #7)
+        bool boolResult = true;
+        if (m == "IsDigit") fnName = "bz_char_is_digit";
+        else if (m == "IsLetter") fnName = "bz_char_is_letter";
+        else if (m == "IsLetterOrDigit") fnName = "bz_char_is_letter_or_digit";
+        else if (m == "IsWhiteSpace") fnName = "bz_char_is_white_space";
+        else if (m == "IsUpper") fnName = "bz_char_is_upper";
+        else if (m == "IsLower") fnName = "bz_char_is_lower";
+        else if (m == "IsPunctuation") fnName = "bz_char_is_punctuation";
+        else if (m == "IsControl") fnName = "bz_char_is_control";   // stdlib §9.5 (sweep #7)
+        else if (m == "ToUpper") { fnName = "bz_char_to_upper"; boolResult = false; }
+        else if (m == "ToLower") { fnName = "bz_char_to_lower"; boolResult = false; }
         if (fnName) {
-            auto* fn = module_->getFunction(fnName);
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
-            }
+            auto* fn = declareC(fnName, i32(), {i32()});
             llvm::Value* res = builder_.CreateCall(fn, {arg}, std::string(fnName) + ".res");
-            return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
-        }
-        if (m == "ToUpper") {
-            auto* fn = module_->getFunction("toupper");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "toupper", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "toupper.result");
-        }
-        if (m == "ToLower") {
-            auto* fn = module_->getFunction("tolower");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "tolower.result");
+            if (boolResult)
+                return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
+            return res;
         }
         // char.ToString(c): string — convert char code point to string.
         // Uses the same path as c.ToString() for a char value.
@@ -764,11 +761,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        auto* isspaceFn = module_->getFunction("isspace");
-        if (!isspaceFn) {
-            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-            isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
-        }
+        // fix #4420 (stdlib §9.6/§9.5, v0.306): this used to call raw
+        // isspace(cp) on the loaded code point, which — like the char.Is*
+        // dispatch above — is undefined above U+00FF (C11 §7.4p1); a
+        // width≥2 string's code points reach this loop unmasked via
+        // loadCodePoint (which is already width-aware, not "width=1 chars
+        // only" as the stale comment here used to claim). Routed through the
+        // same bz_char_is_white_space helper as char.IsWhiteSpace so the
+        // fix is one shared lowering, not two — see that helper's comment
+        // for why it is Unicode-exact (the White_Space property) across the
+        // full char domain, unlike libc's ASCII-only "C"-locale isspace.
+        auto* isspaceFn = declareC("bz_char_is_white_space", i32(), {i32()});
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* isNull = builder_.CreateICmpEQ(
             arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
@@ -789,7 +792,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
         builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
-        // For now: only check width=1 chars (ASCII whitespace check).
+        // loadCodePoint decodes the code point at the string's actual
+        // per-string storage width (1/2/4 bytes, §4.6) — every code point
+        // is checked, not just width-1 (ASCII) strings.
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
         llvm::Value* cp = loadCodePoint(arg, idxB);
         llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});
@@ -820,7 +825,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // with `pt == String && m == "Compare"` any more. The replacement
     // instance member `CompareTo(other[, ignoreCase])` lowers in
     // tryLowerStringMethod (LlvmBackend_String.cpp), reusing the same
-    // `bz_string_compare` runtime helper the 3-arg form used here.
+    // ordinal string comparison the 3-arg form used here (`bz_str_compare_cp`
+    // since fix #4487; `bz_string_compare` before it).
     // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
     // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
     if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&
@@ -2727,10 +2733,13 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                         // — needs the same §8.6 argument boxing, or
                         // `t.Equals(5)` inside a generic body drops exactly as
                         // the concrete `Object` receiver's did.
-                        if (llvm::Value* other =
-                                lowerUniversalEqualsArg(*call.args[0].value))
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        // fix #3480: same one-step dispatch as the concrete
+                        // `Object`-receiver spelling, so the three §8.1
+                        // `Equals` faces share one box-lifetime rule.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     }
                 }
             }
@@ -2917,7 +2926,17 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     // §22.5 order: the receiver was evaluated by the caller; the argument is
     // evaluated (and boxed) next. Minting the receiver's box afterwards copies
     // an SSA value the argument's evaluation cannot have changed.
-    llvm::Value* other = lowerUniversalEqualsArg(*call.args[0].value);
+    // fix #3480 (§8.6 / §28.9, v0.306): capture the argument's fresh mint.
+    // The RECEIVER here is a box THIS function is about to mint from a
+    // statically-known value type, so its vtable is `boxVtableFor(recvTy)` and
+    // the dispatch below necessarily lands on a compiler-generated box-equals
+    // thunk — the receiver-is-a-box premise holds by construction, without any
+    // analysis. The argument box is therefore dead after the comparison, on
+    // exactly the reasoning this function's own header already gives for the
+    // RECEIVER's box ("minted here, only READ by bz$boxeq").
+    llvm::Value* argMint = nullptr;
+    llvm::Value* other =
+        lowerUniversalEqualsArg(*call.args[0].value, &argMint);
     if (!other || !other->getType()->isPointerTy()) return nullptr;
     // `boxValue` publishes its mint in `lastBoxMint_` for #2865's reader; this
     // box is claimed HERE, so the caller's view of that field is restored.
@@ -2932,6 +2951,7 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     auto* relFn = declareC("bz_box_release", llvm::Type::getVoidTy(llvm_),
                            {ptrTy()});
     builder_.CreateCall(relFn, {boxedRecv});   // null-safe (§28.9)
+    if (argMint) builder_.CreateCall(relFn, {argMint});   // fix #3480
     return r;
 }
 
@@ -3002,6 +3022,18 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         recvTy->primitive != sema::PrimitiveType::Object &&
         (isEquals || isGetHashCode)) {
         if (isGetHashCode) {
+            // fix #4562 (§4.4/§8.3, v0.306): a `decimal` receiver lowers to a
+            // 16-byte STRUCT (decimalStructType()), not an LLVM int/float, so
+            // it matched neither shape check below and this arm answered
+            // `nullptr` for every decimal `GetHashCode()` call. Reuse
+            // `emitValueHashCode`'s own decimal arm (LlvmBackend_String.cpp)
+            // — the SAME `bz_decimal_hash` call the box-Equals thunk
+            // (`primBoxHashThunk`) and every decimal record/dictionary-key
+            // hash site already use — rather than re-deriving the runtime
+            // call here, so a decimal's boxed and unboxed `GetHashCode()`
+            // can never disagree.
+            if (recv->getType() == decimalStructType())
+                return emitValueHashCode(recv, recvTy);
             // §8.3-style: the value itself as an i32 hash (bit-pattern for FP).
             if (recv->getType()->isDoubleTy())
                 recv = builder_.CreateBitCast(recv, i64());
@@ -3013,6 +3045,44 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         // isEquals: value equality, returning i1 (Bool).
         if (!call.args[0].value) return nullptr;
+        // fix #4562 (§4.4/§8.3, v0.306): the DECIMAL twin of the FP/int shape
+        // checks below. A `decimal` receiver lowers to a struct, so it
+        // matched neither `isFloatingPointTy()` nor `isIntegerTy()` and this
+        // whole arm fell through to the unconditional `return nullptr;` at
+        // its end — for EVERY argument, including another decimal of the
+        // identical value — after already having (uselessly) lowered the
+        // argument. A caller further out then silently answered a bare
+        // `false`, with no diagnostic. Classify the ARGUMENT's static type
+        // BEFORE lowering it (§22.5: a reroute below must not lower it a
+        // second time) — the same settle-vs-dispatch split the record/enum/
+        // choice arms below use for their own `Equals`: an argument whose
+        // static type is decimal itself (§9.1's `IEquatable<decimal>` fast
+        // path) is compared directly via `emitValueEquality` — the same
+        // canonical per-value helper `=`, record-field equality, and the
+        // box-Equals thunk (`primBoxEqualsThunk`, #2793) all call, which
+        // routes a decimal payload through `bz_decimal_cmp` so `1.5m` and
+        // `1.50m` compare equal despite differing scale bits. Any other
+        // static shape (`Object`, an interface, a class, `string`, a
+        // nullable form, or an unresolved generic) can dynamically BE a
+        // boxed decimal and is routed through `lowerValueSemUniversalEquals`
+        // — the SAME box+dispatch+release helper #4559's sibling fix wired
+        // the int/FP family's mismatched-shape argument to, and every
+        // record/enum/choice receiver below already uses — so this stays
+        // the fourth face of one rule (§8.1's universal `Equals`) rather
+        // than a new dispatch site.
+        if (recv->getType() == decimalStructType()) {
+            const ast::Expr& argE = *call.args[0].value;
+            const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+            bool argIsDecimal = at && !at->nullable &&
+                at->kind == sema::TypeRef::Kind::Primitive &&
+                at->primitive == sema::PrimitiveType::Decimal;
+            if (!argIsDecimal)
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            llvm::Value* other = lowerExpr(argE);
+            if (!other || other->getType() != decimalStructType())
+                return nullptr;
+            return emitValueEquality(recv, other, recvTy);
+        }
         llvm::Value* other = lowerExpr(*call.args[0].value);
         if (!other) return nullptr;
         if (recv->getType()->isFloatingPointTy()) {
@@ -5102,6 +5172,27 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // arm's inline copy of them was the one the
             // collection arms next door were missing.
         }
+    } else if (recvTy && recvTy->kind == sema::TypeRef::Kind::Function) {
+        // fix #4475 (§28.2 v0.30x): explicit `c.Dispose()` on a closure-typed
+        // value. The closure cell is NOT a vtable-backed class — its word 0
+        // is the `fn` pointer, not a class vtable, so the user-class arm
+        // below (emitDynamicDispose → slot 2 dispatch) would read fn+0x10 as
+        // a function pointer and WILD-JUMP. Without this arm the existing
+        // codegen silently produced a SEGV on the Dispose call itself.
+        //
+        // Emit the SAME `bz_closure_release(c)` that the auto-dispose path
+        // uses, but preceded by `bz_closure_mark_disposed(c)` so the
+        // release's last-drop path QUARANTINES instead of freeing — the
+        // closure-invoke guard then reads the disposed flag and throws
+        // DisposedAccessException (§31.4). The mark is gated on
+        // --checked-disposal: outside that mode the byte stays 0 and the
+        // release frees as before (unchecked mode's UB allowance per §28.2).
+        auto* mkFn = declareC("bz_closure_mark_disposed",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        if (checkedDisposal_) builder_.CreateCall(mkFn, {recv});
+        auto* relFn = declareC("bz_closure_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(relFn, {recv});
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
@@ -5204,6 +5295,12 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // owned TEMPORARY explicitly disposed (no second reclaim
         // path, but no slot to null either) is the deferred sub-
         // case noted in #415.
+        // fix #1878 (§28.4, v0.306): bracket the dispatch below so the check at
+        // the end of this chain can tell a fault THIS disposal raised from one
+        // that was already propagating when the statement was reached (an
+        // `x.Dispose()` inside an iterator `finally` run during §29.7
+        // abandonment is such a place). See emitDisposalFaultCheck.
+        llvm::Value* excBeforeDispose = snapshotInFlightExc();
         llvm::Type* slotTy = nullptr;
         llvm::Value* slot =
             explicitDisposeOwnedReceiverSlot(target,
@@ -5297,6 +5394,38 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             builder_.CreateBr(dcont);
             builder_.SetInsertPoint(dcont);
         }
+        // fix #1878 (§28.4, v0.306): "The exception propagates from the
+        // **disposal point** — the explicit `Dispose()` call, ...". Every arm
+        // above dispatches the object's vtable Dispose, which runs the USER
+        // destructor body; when that body throws, `Dispose` returns with the
+        // exception parked in the bz_exc slot (emitDisposerCore's `dtor.threw`
+        // /`dtor.restore` tail leaves it there after completing the remaining
+        // owned-field and base-chain steps, #1546). Every OTHER user-code call
+        // in this backend is followed by a pending check — this one was not, so
+        // the in-flight exception simply stayed in the slot and control fell
+        // through to the next statement. Two contradictory manifestations
+        // followed from that single omission: with no later pending check in
+        // the function the exception was SILENTLY SWALLOWED (the reported
+        // `r.Dispose(); Console.WriteLine("no-throw")` printing "no-throw" and
+        // exiting 0), and with one — any later call, including the §22.13
+        // static-init guard — it surfaced at that unrelated site instead, which
+        // is typically OUTSIDE the `try` whose body held the disposal point, so
+        // it escaped the enclosing `catch` as unhandled (#1882's face of the
+        // same gap at the scope-end site).
+        //
+        // The check is bracketed (`excBeforeDispose` above) rather than a plain
+        // "is anything in flight": a `Dispose()` reached while an exception is
+        // already propagating — an `x.Dispose()` inside an iterator `finally`
+        // running under §29.7 abandonment, a destructor body on an unwind edge
+        // (#1468) — must route ONLY a genuinely new fault and leave the
+        // propagating one alone. It is a no-op on every non-throwing disposal
+        // (the slot is unchanged), which is why it can sit here unconditionally.
+        //
+        // Placed after the whole arm chain rather than inside each arm so the
+        // reclaim tail (identity-hash reap, CauseChain reclaim, `free`) and the
+        // slot-null still run before the exception leaves — §28.4's "physical
+        // reclamation still occurs — a cleanup fault never leaks the object".
+        emitDisposalFaultCheck(excBeforeDispose);
     }
     // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
     // exit. Every built-in branch above released the receiver
@@ -5306,6 +5435,44 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     if (builtinReleasedHere)
         nullExplicitlyDisposedBuiltinSlot(target);
     return true;
+}
+
+// fix #2590 (§2.8.2 / §9.2 / §22.8 / §28.9, v0.306): the ONE predicate that
+// says whether an imported member's declared type may be recovered from the
+// `importedMemberType` side table for a direct closure dispatch
+// (`recv.F(args)` where `F` is a function-typed field or auto-property).
+//
+// An imported member carries no `ast::FieldDecl`/`ast::PropertyDecl` — the
+// importer (ModuleLoader) reconstructs the Symbol from dependency metadata —
+// so its resolved type rides `ctx_.importedMemberType()`. #2300 (fields) and
+// #2589 (auto-properties) each added that fallback behind its OWN copy of a
+// receiver-kind allowlist, and both copies excluded `Record` for the same
+// stated reason: at the time, an imported record's function-typed field was
+// never INITIALIZED across the module boundary, so the read yielded a null
+// closure pointer and routing the direct invoke through `emitClosureCall`
+// would only convert #2477's silent zero-init into a SIGSEGV (#2590's own
+// repro). That premise no longer holds: the imported-record field-initializer
+// replay (#2874's parsed-AST carriage, #3671's `buildRecordValue` consumer,
+// #3723's writer-side `(isGenericType || Record)` widening) now runs the
+// exporter's initializer at the consumer's `new` site, so the record read
+// lands a real closure pointer — measured: the local-bind spelling
+// `var g := b.F; g(5)` returns the correct value on an imported record, while
+// the direct spelling `b.F(5)` still degrades to 0. §2.8.2 clause 1 requires a
+// consumer to type-check and run "every well-formed use of the module's public
+// surface"; §9.2 makes a function-typed record field such a use, and §28.9
+// makes its value runtime-managed with unbounded lifetime (so no ownership
+// rule distinguishes the record receiver from the class one).
+//
+// Interface is admitted for both member kinds: an interface declares no
+// fields (§11.2 — its members are methods, properties, indexers and events,
+// all bodiless), so the FieldSymbol arm simply never observes that
+// alternative. One predicate, no per-arm drift — the drift between the two
+// copies is what left the record case half-open in the first place.
+static bool importedMemberTypeAdmitsClosureDispatch(
+    const sema::TypeSymbol* parent) {
+    return parent && (parent->kind == ast::TypeDeclKind::Class ||
+                      parent->kind == ast::TypeDeclKind::Interface ||
+                      parent->kind == ast::TypeDeclKind::Record);
 }
 
 // fix #2963 (codegen, v0.240): the one place that classifies a null return.
@@ -6148,6 +6315,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (!closurePtr || !rt ||
             rt->kind != sema::TypeRef::Kind::Function)
             return nullptr;
+        // fix #4475 (§28.2 v0.30x): under --checked-disposal, an explicit
+        // `c.Dispose()` BEFORE the invoke must raise DisposedAccessException
+        // (§31.4) instead of UAF-reading the freed cell. The explicit
+        // Dispose arm emits `bz_closure_mark_disposed(c)` which sets the
+        // closure's disposed flag (offset 40); the release that follows
+        // quarantines the cell at last-drop instead of freeing it (the
+        // same shape bz_array_mark_disposed / bz_dict_mark_disposed use).
+        // We read the flag here and throw on non-zero. Sibling to the
+        // channel/semaphore/stream disposed-flag guards (#4354, #4357,
+        // #4336). Outside --checked-disposal the flag is never written,
+        // so the guard's read sees the calloc zero-fill and the throw is
+        // unreachable.
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_closure_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag = builder_.CreateCall(
+                isFn, {closurePtr}, "cd.cdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
         // Load fn_ptr from closure[0].
         llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
         // Load env_ptr from closure[1].
@@ -6632,18 +6820,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // through the LocalSymbol path with the field read supplying the
         // closure pointer; only the FieldSymbol callee path missed the type.
         //
-        // Gated on a CLASS receiver: an imported RECORD function-typed field
-        // has a SEPARATE, deeper pre-existing defect — the cross-module field
-        // READ itself yields a bad closure pointer (the local-bind workaround
-        // `g := r.F; g(n)` segfaults on an imported record on origin/main,
-        // independent of this fix). Routing the record direct-invoke through
-        // emitClosureCall here would only turn that case's silent zero-init
-        // into a segfault without fixing the underlying read. The record
-        // field-read ABI is filed separately and out of scope for #2300
-        // (which is class-specific); leave the record direct-invoke on its
-        // pre-fix #2477 zero-init path until that lands.
-        if (!rt && fs->parent &&
-            fs->parent->kind == ast::TypeDeclKind::Class) {
+        // #2300 gated this on a CLASS receiver, because an imported RECORD's
+        // function-typed field was then never initialized across the module
+        // boundary — the read yielded null and dispatching here would have
+        // turned #2477's silent zero-init into a SIGSEGV (#2590). fix #2590
+        // (§2.8.2 / §9.2 / §28.9, v0.306) retires that carve-out: the
+        // field-initializer replay (#2874/#3671/#3723) now lands a real
+        // closure pointer at the consumer's `new` site, so a record receiver
+        // is as sound here as a class one. The allowlist itself moved to the
+        // single `importedMemberTypeAdmitsClosureDispatch` predicate above —
+        // see it for why one copy, shared with the PropertySymbol arm below,
+        // replaces the two that had drifted apart.
+        if (!rt && importedMemberTypeAdmitsClosureDispatch(fs->parent)) {
             if (sema::TypeRef* it = ctx_.importedMemberType(fs))
                 rt = it;
         }
@@ -6691,17 +6879,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the backing-field closure value; for a computed/block property the
     // getter yields it directly), and emitClosureCall on that pointer.
     //
-    // Gated on a CLASS or INTERFACE receiver for the imported-type fallback.
-    // An imported RECORD function-typed property read shares the separate
-    // deeper defect filed as #2590 (the cross-module field/closure READ
-    // yields a bad pointer): verified empirically, opening this gate to
-    // Record segfaults the imported-record direct-invoke (exit 139) — the
-    // same ABI defect #2300's record gate guards against for fields. The
-    // LOCAL record case (which has an AST decl and a sound read path) is
-    // covered by the `pd->type` branch above. Interface is included because
-    // the imported interface property read dispatches through the itable
-    // (lowerVirtualPropertyGet), which yields a sound closure pointer —
-    // verified: `i.F(10)` on an imported `IFunc` returns 11, no segfault.
+    // #2589 gated the imported-type fallback on a CLASS or INTERFACE
+    // receiver: an imported RECORD's function-typed auto-property shared the
+    // #2590 defect (its backing field was never initialized across the module
+    // boundary, so opening this gate produced a SIGSEGV rather than the #2477
+    // zero-init). fix #2590 (§2.8.2 / §9.2 / §23.1 / §28.9, v0.306) retires
+    // that carve-out for the same reason the FieldSymbol arm's above is
+    // retired — the #2874/#3671/#3723 replay initializes the backing field at
+    // the consumer's `new` site — and both arms now ask the SINGLE
+    // `importedMemberTypeAdmitsClosureDispatch` predicate instead of keeping
+    // one receiver-kind allowlist each. The LOCAL record case (which has an
+    // AST decl and a sound read path) is covered by the `pd->type` branch
+    // below and is untouched. Interface stays admitted because the imported
+    // interface property read dispatches through the itable
+    // (lowerVirtualPropertyGet), which yields a sound closure pointer.
     // The `rt->kind == Function` guard still gates dispatch, so a non-
     // function-typed property read (`obj.N`, an int) is wholly unaffected —
     // it never enters this arm's dispatch.
@@ -6710,12 +6901,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             sema::TypeRef* rt = nullptr;
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                 if (pd->type) rt = ctx_.resolvedType(*pd->type);
-            } else if (ps->parent &&
-                       (ps->parent->kind == ast::TypeDeclKind::Class ||
-                        ps->parent->kind == ast::TypeDeclKind::Interface)) {
-                // Imported class/interface property: no ast::PropertyDecl
-                // (the importer reconstructs the PropertySymbol from
-                // dependency metadata), so the resolved type rides the
+            } else if (importedMemberTypeAdmitsClosureDispatch(ps->parent)) {
+                // Imported class/interface/record property: no
+                // ast::PropertyDecl (the importer reconstructs the
+                // PropertySymbol from dependency
+                // metadata), so the resolved type rides the
                 // importedMemberType side table — mirroring #2300's
                 // imported-field fallback and every other imported-property
                 // read site (LlvmBackend_Exprs.cpp ~L4844
@@ -8231,11 +8421,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // was missing. This is fix #3422's sibling on the other
                         // operand: that one is the `()` RECEIVER, this the
                         // value-typed ARGUMENT.
-                        llvm::Value* other =
-                            lowerUniversalEqualsArg(*call.args[0].value);
-                        if (recv && other)
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        //
+                        // fix #3480 (§8.6 / §28.9, v0.306): the argument box's
+                        // §28.9 discharge now rides the SAME helper as its
+                        // mint, so the lifetime rule cannot be applied here and
+                        // forgotten at the `?.`, generic-T or value-receiver
+                        // spelling. `isKnownBoxReceiverExpr` is what makes it
+                        // admissible — see `lowerUniversalEqualsDispatch`.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     } else {
                         if (recv)
                             if (llvm::Value* r = lowerObjectGetHashCode(recv))
@@ -10626,6 +10822,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (!recvUnwindSlot) {
                 disposeFreshNewReceiverTempDeferred(
                     recvTempExpr, recv, ctx_.exprType(call), &call);
+                // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): the
+                // non-nullable-`string`-result arm that
+                // `freshNewReceiverTempEligible` declines (so `recvUnwindSlot`
+                // is null here) and `disposeFreshNewReceiverTempDeferred`
+                // declines too (its result must be a deferred-activation head,
+                // which a primitive never is — the two predicates are
+                // disjoint). §28.3 puts this reclaim at the K8 full-expression
+                // boundary rather than inline after the call; the queue entry
+                // carries it there, and the disposeStack_ entry the helper also
+                // pushes covers the exception edge.
+                registerFreshNewReceiverTempK8(recvTempExpr, recv,
+                                               ctx_.exprType(call));
             }
         }
     }
@@ -11341,14 +11549,50 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             std::unordered_map<std::string_view,
                                                const sema::TypeRef*>
                                 newSema;
+                            // fix #2755 (§14.1 *Instantiation and its site*,
+                            // §2.8.3 rule 4, v0.306): compose the SEMA
+                            // argument through the still-active OUTER
+                            // substitution before storing it, exactly as the
+                            // INSTANCE arm of this same function does
+                            // (`newSema[pname] = argSema;` above). The two
+                            // halves used to disagree: `lowerTypeRef` reads
+                            // `genericSubst_`, which is still the outer map
+                            // at this point, so the LLVM half COMPOSED
+                            // (`T → i64` for `Inner<U>.Head()` inside a live
+                            // `OuterU<long>`), while the sema half stored the
+                            // still-open `U` RAW. Every consumer of the sema
+                            // half then saw an unbound type parameter: the
+                            // specialization NAME loop skips a `declaration`-
+                            // less ref, so the callee was emitted as
+                            // `Inner$Head$spec` with no `$Long` suffix —
+                            // indistinguishable from the dead-template
+                            // pseudo-specialization; the specialization CACHE
+                            // KEY keyed on `typeRefIdentityKey(U)` so distinct
+                            // instantiations collided; and `lowerTypeRef`'s
+                            // nullable bare-parameter branch fell back to the
+                            // `{i8, i32}` placeholder. A live, concrete caller
+                            // (`OuterU$Head$spec$long`, returning `{i8,i64}`)
+                            // therefore called a body built under a
+                            // NON-concrete substitution, returning `{i8,i32}`
+                            // — malformed IR, caught by `verifyModule` as
+                            // "Function return type does not match operand
+                            // type of return inst!" on a legal program.
+                            // `substituteTypeRefLocal` is the RECURSIVE
+                            // superset of `resolveTypeParamRef`, needed here
+                            // because a nested `Inner<Wrap<U>>` argument is
+                            // not a top-level bare parameter. An empty outer
+                            // map makes it the identity, so the direct
+                            // `Inner<long>.Head()` path is unchanged.
                             for (std::size_t gi = 0; gi < nGP; ++gi) {
-                                llvm::Type* concrTy =
-                                    lowerTypeRef(recvTy->genericArgs[gi]);
+                                const sema::TypeRef* argSema =
+                                    substituteTypeRefLocal(
+                                        recvTy->genericArgs[gi],
+                                        genericSubstSemaTy_);
                                 // Local generic: name comes from ast::TypeDecl;
                                 // imported: name comes from sema::Symbol.
                                 std::string_view pname = gpNames[gi];
-                                newSubst[pname] = concrTy;
-                                newSema[pname] = recvTy->genericArgs[gi];
+                                newSubst[pname] = lowerTypeRef(argSema);
+                                newSema[pname] = argSema;
                             }
                             genericSubst_ = std::move(newSubst);
                             genericSubstSemaTy_ = std::move(newSema);
@@ -15004,10 +15248,11 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             // receiver arm, so §7.5's "nothing to its right in
                             // the chain is evaluated" still holds: a null
                             // receiver evaluates no argument and mints no box.
-                            llvm::Value* ncoOther =
-                                lowerUniversalEqualsArg(*call.args[0].value);
-                            if (ncoOther)
-                                ncoRes = lowerObjectEquals(recv, ncoOther);
+                            // fix #3480: the `?.` mirror discharges the
+                            // argument box on the SAME terms as the `.` form.
+                            ncoRes = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(nm.target.get()));
                         }
                         if (!ncoRes) return nullptr;
                         bool ncoRef = ncoRes->getType()->isPointerTy();
@@ -15744,12 +15989,11 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     // comparator — bz_dict_keys_str would treat those 8-byte pointer buffers
     // as char data and produce garbage bytes for the bz_string_t readback.
     // buildValueHashTrampoline's elementHashFn / elementEqFn already route
-    // string elements through bz_str_hash / bz_string_compare; we mirror that
-    // here for the runtime-allocated `int (*)(const void*, const void*)` that
-    // bz_sort_kv_gen requires. The string comparator below dereferences both
-    // keys[i] into their bz_string_struct* and forwards data/len to
-    // bz_string_compare — same content ordering SortedDictionary<string,V>
-    // gets from its strcmp-driven bz_sort_kv_str path.
+    // string elements through bz_str_hash / the ordinal string comparison; we
+    // mirror that here for the runtime-allocated
+    // `int (*)(const void*, const void*)` that bz_sort_kv_gen requires. The
+    // string comparator below dereferences both keys[i] into their
+    // bz_string_struct* and forwards them to bz_str_compare_cp.
     using K = sema::TypeRef::Kind;
     bool isStringElem = elemTy->kind == K::Primitive &&
                         elemTy->primitive == sema::PrimitiveType::String;
@@ -15780,10 +16024,22 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     } else {
         // #2550 string comparator: two `void*` args (each pointing to a
         // malloc(8) buffer holding a bz_string_struct* pointer value).
-        // Single-load each to recover the bz_string_struct*, then load
-        // data/len and forward to bz_string_compare — yielding the same
-        // ordinal ordering SortedDictionary<string,V> gets from its
-        // strcmp-driven bz_sort_kv_str path.
+        // Single-load each to recover the bz_string_struct*, then forward
+        // both to bz_str_compare_cp.
+        //
+        // fix #4487 (stdlib §4.18 + §9.6, v0.306): this used to load data/len
+        // off each operand and call `bz_string_compare`, which walked
+        // `min(len)` BYTES over a CODE-POINT length (the #535 defect class),
+        // so every non-ASCII element whose first `len` storage BYTES matched
+        // another's compared EQUAL and the "ascending order" §4.18 promises
+        // silently degraded to insertion order. Measured on HEAD (4d9d186a):
+        // a SortedSet<string> given "日本", "日x", "日a" enumerated
+        // 日本,日x,日a — the insertion order — because all three share the
+        // storage bytes `E5 65`. §4.18 defines this order as the element
+        // type's own `CompareTo`, and §9.6 gives `string.CompareTo` the
+        // ordinal code-point relation, so this comparator MUST be the same
+        // relation the `CompareTo` member is: it is now literally the same
+        // runtime call.
         llvm::Function* strCmp = nullptr;
         if (auto* existing = module_->getFunction("bz$sscmp$string"))
             strCmp = existing;
@@ -15806,15 +16062,10 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
                 ptrTy(), strCmp->getArg(0), "sa");
             llvm::Value* bStr = builder_.CreateLoad(
                 ptrTy(), strCmp->getArg(1), "sb");
-            llvm::Value* aData = loadStringData(aStr);
-            llvm::Value* aLen  = loadStringLen(aStr);
-            llvm::Value* bData = loadStringData(bStr);
-            llvm::Value* bLen  = loadStringLen(bStr);
-            auto* cmpFnRt = declareC("bz_string_compare",
-                i32(), {ptrTy(), i64(), ptrTy(), i64(), i32()});
+            auto* cmpFnRt = declareC("bz_str_compare_cp",
+                i32(), {ptrTy(), ptrTy(), i32()});
             llvm::Value* res = builder_.CreateCall(cmpFnRt,
-                {aData, aLen, bData, bLen,
-                 llvm::ConstantInt::get(i32(), 0)},
+                {aStr, bStr, llvm::ConstantInt::get(i32(), 0)},
                 "scmp");
             builder_.CreateRet(res);
             builder_.restoreIP(savedIP);
@@ -15962,6 +16213,7 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
 
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -15975,8 +16227,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
@@ -15984,6 +16237,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -15998,8 +16254,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         }
     } else {
         auto* sortFn = declareC("bz_sort_kv_str",
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(), i64()});
-        builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+        // fix #4499: the width spine permutes with keys/lens/values.
+        builder_.CreateCall(sortFn, {keysArr, lensArr, widsArr, valsArr, cnt});
     }
 
     // Allocate a fresh bz_array_t of {K, V} entries.
@@ -16041,7 +16299,8 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         // lowerToLazyEnumerator's dict arm.) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto strPr =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             keyDecoded = strPr.first;
             builder_.CreateCall(freeFn, {strPr.second});
         } else {
@@ -16071,7 +16330,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     }
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // String keys: use the #2522 string-key Dispose-walker so the rebuilt

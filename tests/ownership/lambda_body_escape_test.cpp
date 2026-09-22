@@ -19,7 +19,7 @@
 //   and ASSIGNED to a local declared outside the arm compiled clean inside a
 //   lambda body and heap-use-after-freed (measured rc=139 / ASan UAF).
 //
-//   #3564 — §28.9 "Runtime-managed types" (v0.286): "Capturing an *owned*
+//   #3564 — §28.3 "Borrow lifetime rules / Captured owned bindings" (v0.286): "Capturing an *owned*
 //   class-typed local does **not** transfer ownership into the closure: the
 //   capture is a borrow whose source is the local's enclosing scope,
 //   borrow-state throughout — the closure may not assign to, transfer from, or
@@ -51,7 +51,7 @@ namespace {
 // A helper class with a disposable instance method, and a `Use` that borrows
 // an exception for the duration of a call — the two building blocks the rows
 // below need. `R` is an ordinary class, so `using var r := new R();` is an
-// owned scope-bound local (§28.3) whose capture is a §28.9 borrow.
+// owned scope-bound local (§28.3) whose capture is a §28.3 borrow.
 std::string wrap(const std::string& method) {
     return std::string(
         "module M; "
@@ -415,7 +415,7 @@ BEZEL_TEST(lambda_body_escape, catch_closure_assign_to_deeper_nested_block_local
 
 // ---------------------------------------------------------------- #3564 ----
 
-// POSITIVE (§28.9, #3564): the filed repro. `r` is an owned scope-bound local
+// POSITIVE (§28.3, #3564): the filed repro. `r` is an owned scope-bound local
 // of the lambda body's inner `do ... end`; the closure capturing it is
 // RETURNED out of the lambda, so it outlives `r`'s disposal.
 BEZEL_TEST(lambda_body_escape, owned_local_returned_closure_rejected_28_9) {
@@ -438,7 +438,7 @@ BEZEL_TEST(lambda_body_escape, owned_local_returned_closure_rejected_28_9) {
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
-// POSITIVE (§28.9, #3564): the same escape with the owned local at the lambda
+// POSITIVE (§28.3, #3564): the same escape with the owned local at the lambda
 // body's TOP level rather than in a nested block — the depth is irrelevant to
 // this leg (the return leaves the whole lambda invocation either way), and the
 // row proves the seed is not accidentally scoped to nested blocks only.
@@ -459,9 +459,9 @@ BEZEL_TEST(lambda_body_escape, owned_top_level_local_returned_closure_rejected_2
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
-// NEGATIVE (§28.9, #3564) — the ESCAPE boundary. Same owned local, same
+// NEGATIVE (§28.3, #3564) — the ESCAPE boundary. Same owned local, same
 // capture, no return: the closure is invoked in place inside the block that
-// owns `q`. §28.9 bounds the capture by "may not outlive that scope"; §28.3
+// owns `q`. §28.3 bounds the capture by "may not outlive that scope"; §28.3
 // spells the admission out — "Capture is permitted for closures that are
 // immediately invoked" — so this is the legal shape the rule leaves alone.
 BEZEL_TEST(lambda_body_escape, owned_local_closure_invoked_in_lambda_accepted_28_9) {
@@ -481,7 +481,7 @@ BEZEL_TEST(lambda_body_escape, owned_local_closure_invoked_in_lambda_accepted_28
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// NEGATIVE (§28.9, #3564) — the OBLIGATION boundary. The closure escapes the
+// NEGATIVE (§28.3, #3564) — the OBLIGATION boundary. The closure escapes the
 // lambda exactly as in the positive rows, but captures a value-typed local,
 // which is never Owned (§28.3) and carries no scope-bound discharge
 // obligation. A seed that marked every lambda-body local Owned would reject
@@ -499,7 +499,7 @@ BEZEL_TEST(lambda_body_escape, value_local_returned_closure_accepted_28_9) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// NEGATIVE (§28.9, #3564) — the LAMBDA PARAMETER boundary. A lambda's own
+// NEGATIVE (§28.3, #3564) — the LAMBDA PARAMETER boundary. A lambda's own
 // parameter is not a local of its body and is never seeded, so a closure
 // returned over it stays accepted.
 BEZEL_TEST(lambda_body_escape, lambda_param_returned_closure_accepted_28_9) {
@@ -516,7 +516,7 @@ BEZEL_TEST(lambda_body_escape, lambda_param_returned_closure_accepted_28_9) {
 
 // ------------------------------------------------- scope of the fix --------
 
-// POSITIVE (§28.9 / §31.1): NESTED lambdas. `collectBodyLambdas` produces a
+// POSITIVE (§28.3 / §31.1): NESTED lambdas. `collectBodyLambdas` produces a
 // FLAT list containing the inner lambda too, and each lambda is seeded from
 // its OWN body — so an escape wholly inside the inner lambda is still caught.
 BEZEL_TEST(lambda_body_escape, owned_local_returned_closure_in_nested_lambda_rejected_28_9) {
@@ -542,7 +542,7 @@ BEZEL_TEST(lambda_body_escape, owned_local_returned_closure_in_nested_lambda_rej
 // recorded choice rather than a later surprise.
 //
 // `q` is a METHOD-scope owned local. The lambda body's re-seeded `states_`
-// holds only the LAMBDA's own owned obligations, so the §28.9 leg does not see
+// holds only the LAMBDA's own owned obligations, so the §28.3 leg does not see
 // `q` from inside the lambda — deliberately. A `return` inside a lambda leaves
 // only THAT LAMBDA; whether the lambda's own value then escapes the METHOD is
 // escape analysis this pre-pass does not have, and issue #3564 records it as
@@ -572,7 +572,7 @@ BEZEL_TEST(lambda_body_escape, method_scope_owned_local_capture_still_accepted_2
 // rejection owes the test that pins the reversal).
 //
 // `checkOneLambdaBodyEscapes` clears and re-seeds `states_` before running the
-// §28.9 leg; an expression-bodied lambda has no statements to seed FROM, so
+// §28.3 leg; an expression-bodied lambda has no statements to seed FROM, so
 // the clear must still happen and leave the map EMPTY. The first draft
 // returned early before the clear, and the leg then resolved the enclosing
 // METHOD's `q` and rejected this program at 11:55 — a false reject of a

@@ -1719,6 +1719,79 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         return builder_.CreateICmpEQ(el, target);
     }
 
+    // fix #4553 (§17.5 / §8.4, v0.306): a NULLABLE VALUE element — `Array<int?>`,
+    // `Set<Color?>`, a `T?` span slot — lowers to the tagged
+    // `{i8 hasValue, T value}` struct, and NO arm above claims it:
+    // `recordTypeOfRef` declines a primitive, the class arm needs two pointers,
+    // the string arm needs two pointers. It therefore fell through to the scalar
+    // comparison below, which emitted `icmp eq { i8, i32 } %el, %tgt` — an
+    // operand shape `ICmp` rejects outright, so the whole compile died in IR
+    // verification ("Invalid operand types for ICmp instruction").
+    //
+    // §17.5 fixes what the comparison must be: "Where the selected `Contains`
+    // parameter is **itself** nullable — `Array<int?>`'s `Contains(item: int?)`
+    // … — a nullable left operand is **admitted**: the test performed is the
+    // null-safe equality of §8.4, total over an absent operand". §8.4's rule is
+    // both-null → equal, exactly-one-null → not-equal, both-present → the inner
+    // type's equality — which `emitValueEquality`'s nullable-value branch
+    // already implements (issue #364), so route to it rather than re-deriving
+    // it here and risking a second spelling of one rule.
+    //
+    // fix #4580 (§17.5/§8.4/§5.1, v0.306): the arm above only fired when BOTH
+    // operands already arrived as the tagged struct. `el` (the stored element,
+    // loaded at the element stride) always does — but `target`, the QUERY
+    // operand, may instead be a NON-nullable value: `3 in xs` over
+    // `Array<int?>` lowers the literal `3` straight from its `int` type
+    // (`lowerExpr`'s IntLiteralExpr arm reads `rt->primitive` and ignores
+    // `rt->nullable`), so it arrives as a bare `i32`. §5.1 admits this — `T`
+    // converts to `T?` implicitly (the "present-value wrapping" of §7.2) —
+    // before §17.5's own admissibility rule even engages. Coerce EACH operand
+    // up to the tagged struct with `ensureNullableElementValue` (the same
+    // helper fix #4579 uses to spill a bare value into a nullable-value slot)
+    // before dispatching, so a bare inner value on either side is admitted
+    // rather than declined into the invalid-IR fallback below.
+    // `ensureNullableElementValue` is a no-op on a value that is already the
+    // tagged struct, so the pre-existing both-tagged case is unaffected.
+    //
+    // Every caller of this helper gets the fix at once: `x in coll` (the §17.5
+    // lowering), `.Contains`, `.Remove`, `.IndexOf`, and the array-backed
+    // `Set<T>` dedup insert all compare elements through here.
+    if (isNullableValueTy(elemTy)) {
+        llvm::Value* l = ensureNullableElementValue(elemTy, el);
+        llvm::Value* r = ensureNullableElementValue(elemTy, target);
+        if (l->getType()->isStructTy() && r->getType()->isStructTy())
+            return emitValueEquality(l, r, elemTy);
+    }
+
+    // fix #4571 (§4.4/§8.3, v0.306): a non-nullable DECIMAL element —
+    // `Array<decimal>`, `LinkedList<decimal>`, the array-backed `Set<decimal>`
+    // dedup insert — lowers to the 16-byte `%bz.decimal` struct
+    // (decimalStructType(), `{i32×4}`). No arm above claims it: `recordTypeOfRef`
+    // declines a primitive, the class arm needs two pointers, and the
+    // nullable-value arm just above declines it too (a bare `decimal` is not a
+    // nullable-value SHAPE — `isNullableValueTy` is false for it; only `decimal?`
+    // would match, and that already routes correctly through the arm above). It
+    // therefore fell through to the scalar fallback at the bottom of this
+    // function, which built `icmp eq %bz.decimal %el, %tgt` — an operand shape
+    // `ICmpInst` rejects outright (int/ptr/vector-of-int-or-ptr only), so the
+    // whole compile died in IR verification ("Invalid operand types for ICmp
+    // instruction").
+    //
+    // `emitValueEquality` already has a non-nullable-decimal arm
+    // (LlvmBackend_Layout.cpp, fix #663) implementing the correct comparison —
+    // `bz_decimal_cmp`, scale-invariant per §4.4 (`3.0m == 3.00m` despite
+    // differing scale bits) — and fix #4562 routed the sibling
+    // `lowerValueSemMethodOn` dispatch (`decimal.Equals`) through that SAME
+    // helper for that SAME reason. Route here too rather than re-deriving a
+    // third spelling of one rule: narrow #4553, immediately above, made exactly
+    // this argument for the nullable-value shape ("route to it rather than
+    // spelling one rule twice").
+    if (elemTy && elemTy->kind == sema::TypeRef::Kind::Primitive &&
+        elemTy->primitive == sema::PrimitiveType::Decimal && !elemTy->nullable &&
+        el->getType() == decimalStructType() &&
+        target->getType() == decimalStructType())
+        return emitValueEquality(el, target, elemTy);
+
     // String element: content equality (§4.6).
     if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
         return emitStringEq(el, target);
@@ -3492,9 +3565,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // generic i32 path below loads the element and truncs it to i32
             // (`trunc ptr … to i32` → malformed IR). Instead, dispatch the
             // element ordering through the element's `CompareTo` (string:
-            // ordinal strcmp on the data pointers, mirroring the Sort()
-            // comparator), returning the winning element pointer. (Related:
-            // Math.Min/Max IComparable, #1148/#1141.)
+            // `bz_str_compare_cp`, the width-aware §9.6 relation #4487/#4495
+            // route every ordinal string comparison through), returning the
+            // winning element pointer. (Related: Math.Min/Max IComparable,
+            // #1148/#1141.)
             if (call.args.empty()) {
                 sema::TypeRef* elemTypeRef =
                     (recvTy && !recvTy->genericArgs.empty())
@@ -3577,22 +3651,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         ptrFn, {recv, idx, builder_.getInt64(esz)});
                     llvm::Value* el  = builder_.CreateLoad(ptrTy(), ep, "mm.el");
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
-                    // cmp = (el <=> acc): el.CompareTo(acc), or strcmp(el, acc).
+                    // cmp = (el <=> acc): el.CompareTo(acc), or the §9.6
+                    // ordinal string relation.
+                    //
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to
+                    // extract each string's raw `.data` pointer and call
+                    // plain `strcmp` — byte-wise AND NUL-terminated, disagreeing
+                    // with `CompareTo`/`SortedSet<string>` after #4487 moved
+                    // those to `bz_str_compare_cp`. `el`/`acc` are already the
+                    // full string OBJECTS (not just `.data`), so this routes to
+                    // the SAME width-aware relation #4487 established rather
+                    // than a second spelling of "ordinal string comparison"
+                    // (the drift #2590 records).
                     llvm::Value* cmp = nullptr;
                     if (isStrElem) {
-                        llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), el, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {el, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (ifaceCmpFn) {
                         // fix #2770: §13 itable dispatch of the element's own
                         // `CompareTo` — the identical dispatch a written-out
@@ -3718,7 +3794,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // IComparable<U> (§14.2) or string (§9.6). Mirror the no-selector
             // pointer path (above), but project each element through the
             // selector first; compare the projected values via CompareTo /
-            // ordinal strcmp and return the winning projection. The result is a
+            // `bz_str_compare_cp` (§9.6) and return the winning projection. The
+            // result is a
             // borrow (§28.3, tracked in the ownership pass); codegen returns the
             // pointer and takes no disposal obligation. ---
             if (uRef) {
@@ -3793,20 +3870,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
                     llvm::Value* cmp = nullptr;
                     if (uIsStr) {
-                        llvm::Value* pvData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), pv, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
-                                                  "mm.cmp");
+                        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                        // through the same width-aware relation #4487
+                        // established — see the no-selector Min()/Max() arm
+                        // above for the full citation. `pv`/`acc` are already
+                        // the full string OBJECTS.
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {pv, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (uIfaceCmpFn) {
                         // fix #2770: the thunk's ABI is slot ADDRESSES, and the
                         // projection `pv` is a value, so spill it to an entry
@@ -4027,7 +4099,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* el  = builder_.CreateLoad(elemLLTy, ep, "mon.el");
             llvm::Value* acc = builder_.CreateLoad(elemLLTy, accSlot, "mon.acc");
             // For class/string/interface (pointer) elements, use
-            // ordinal strcmp (string), itable CompareTo (interface,
+            // bz_str_compare_cp (string, §9.6), itable CompareTo (interface,
             // #2770), or direct CompareTo call (class). For numeric
             // primitive elements, use direct icmp/fcmp.
             llvm::Value* shouldUpdate;
@@ -4056,26 +4128,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
             if (isStrElem || cmpMs || ifaceCmpFn) {
-                // Pointer-typed element: string-ordinal strcmp (string),
+                // Pointer-typed element: §9.6 ordinal string relation,
                 // itable CompareTo (interface, #2770), or direct
                 // CompareTo call (class).
                 llvm::Value* cmp = nullptr;
                 if (isStrElem) {
-                    llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), el, 0));
-                    llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), acc, 0));
-                    auto* strcmpFn = module_->getFunction("strcmp");
-                    if (!strcmpFn) {
-                        auto* ft = llvm::FunctionType::get(
-                            i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn = llvm::Function::Create(
-                            ft, llvm::Function::ExternalLinkage, "strcmp",
-                            module_.get());
-                    }
-                    cmp = builder_.CreateCall(strcmpFn,
-                                              {elData, accData},
-                                              "mon.cmp");
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                    // through the same width-aware `bz_str_compare_cp`
+                    // relation #4487 established — see the Min()/Max() arm
+                    // above for the full citation. `el`/`acc` are already
+                    // the full string OBJECTS.
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmp = builder_.CreateCall(
+                        cmpCpFn, {el, acc, builder_.getInt32(0)}, "mon.cmp");
                 } else if (ifaceCmpFn) {
                     cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
                                               "mon.cmp");
@@ -4866,7 +4932,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<M.Name>,
             // interface IComparable → bz$ifacecmp$<M.Name>,
-            // string → bz$strcmp, int/other → bz$intcmp.  Both reference-type
+            // string → bz$strcmp (routes through bz_str_compare_cp, fix #4495),
+            // int/other → bz$intcmp.  Both reference-type
             // names are MODULE-QUALIFIED (`mangledTypeName`), per §2.8.3
             // rule 3 — see buildObjectCompareToThunk for what the unqualified
             // class name cost (#3512).
@@ -4899,7 +4966,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // bz_array_sort as the comparator and called through.
                 if (!cmpFn) return nullptr;
             } else if (isStringElem) {
-                // String comparator: load two ptr elements, call strcmp on their data.
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this thunk used
+                // to extract each element's raw `.data` pointer and call plain
+                // `strcmp` — byte-wise AND NUL-terminated, disagreeing with
+                // `CompareTo`/`SortedSet<string>` after #4487 moved those to
+                // `bz_str_compare_cp`. `bz$strcmp` (the internal name is
+                // unchanged so no other reference to it needs to move) now
+                // routes through that SAME width-aware relation instead of
+                // being a second spelling of "ordinal string comparison" —
+                // the drift #2590 records.
                 auto* cmpName2 = "bz$strcmp";
                 cmpFn = module_->getFunction(cmpName2);
                 if (!cmpFn) {
@@ -4909,24 +4984,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
                     llvm::IRBuilder<> cmpB2(bb2);
                     // Each argument is a ptr* (pointer to bz.string*).
-                    // Load the bz.string* from each slot, then load data pointer.
+                    // Load the bz.string* from each slot — bz_str_compare_cp
+                    // takes the string OBJECTS directly, so no further
+                    // `.data`-field extraction is needed.
                     llvm::Value* aSlot = &*cmpFn->arg_begin();
                     llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    // Load data pointer (field 0) from bz.string struct
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    // Call strcmp
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn2 = declareC("bz_str_compare_cp", i32(),
+                                              {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn2, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 // Integer comparator
@@ -5175,6 +5243,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // would reach bz_array_sort as the comparator and be called.
                 if (!cmpFn2) return nullptr;
             } else if (isStringElem2) {
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): the `.Sorted()`
+                // twin of the `Sort()` thunk above — both build the SAME
+                // internal function name `bz$strcmp`, so only whichever runs
+                // first in a module actually emits the body, but the source is
+                // a separate inline copy (per narrow #3488's own note that this
+                // arm has drifted from Sort()'s before) and must be fixed here
+                // too. See the Sort() arm's comment for the full citation.
                 auto* cmpName = "bz$strcmp";
                 cmpFn2 = module_->getFunction(cmpName);
                 if (!cmpFn2) {
@@ -5187,17 +5262,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 auto* cmpName = "bz$intcmp";
@@ -5415,30 +5483,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // bare T value into the SAME tagged {i8, T} struct the (now 8-byte) esz
         // and the caller-side `arr[i]` decode expect. Without this the bare value
         // was stored at the nullable element's stride → garbage tag/value on read.
+        // fix #4579: the body moved verbatim to `ensureNullableElementValue`
+        // (LlvmBackend_impl.hpp) so the node-backed `LinkedList<T>` family —
+        // a different function in a different file, which never got this rule
+        // and stored bare inner bytes at the tagged stride — applies the SAME
+        // rule rather than a second spelling of it. Behaviour here is unchanged.
         auto ensureNullableElem = [&](llvm::Value* v) -> llvm::Value* {
-            const sema::TypeRef* elemTyRef =
-                (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
-            if (!elemTyRef) return v;
-            sema::TypeRef nvBuf;
-            const sema::TypeRef* nvTy = nullptr;
-            if (isNullableValueTy(elemTyRef)) {
-                nvTy = elemTyRef;
-            } else if (elemTyRef->nullable &&
-                       elemTyRef->kind == sema::TypeRef::Kind::Named &&
-                       !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
-                if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
-                    isNullableValueTy(&nvBuf))
-                    nvTy = &nvBuf;
-            }
-            if (!nvTy) return v;
-            llvm::StructType* expected = nullableValueStructTy(nvTy);
-            if (!expected || v->getType() == expected) return v;
-            // (b) null pointer → null tagged struct.
-            if (v->getType()->isPointerTy())
-                return nullableValueNull(nvTy);
-            // (a) inner scalar/struct value → {hasValue=1, v}.
-            return wrapNullableValue(nvTy, v);
+            return ensureNullableElementValue(
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr,
+                v);
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)
@@ -5470,6 +5524,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool isOwnedSetRecv = recvTy && recvTy->astNode &&
             recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
             recvTy->headName() == "OwningSet";
+        // fix #3491 / stdlib §4.10: isBorrowingSetRecv — the borrowing
+        // counterpart of isOwnedSetRecv, i.e. this call's receiver is exactly
+        // a `Set<T>` (class T). Gates the dedup handling for `.Add`/`.TryAdd`
+        // below on a BORROWING class-element set — Array<T>/Stack<T>/Queue<T>
+        // (which share the generic Add/Push/Enqueue handler further down)
+        // must keep their plain-append behavior.
+        bool isBorrowingSetRecv = recvTy && recvTy->astNode &&
+            recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "Set";
         // stdlib §4.10 / §8.3 (#837): OwningSet<T>.Add(owned item) for class-typed
         // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
         // user `Equals` override) it silently disposes the passed item rather than
@@ -5494,6 +5557,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // call on the dup branch). Mirrors the OwningArray.Add/Insert and
             // user-method nulling paths (#1955 / #1918).
             nullTransferredOwnedLocalSlot(call.args[0].value.get());
+            return llvm::ConstantInt::get(i32(), 0);  // unit
+        }
+        // fix #3491 / stdlib §4.10 / §8.3: Set<T>.Add(item: T) for class-typed
+        // T must DEDUPLICATE exactly like OwningSet<T>.Add above — "the
+        // element type supplies the identity" (§4.10) and adding an
+        // already-present element leaves the set unmodified. Before this fix
+        // a borrowing Set<T> with a class element fell through to the generic
+        // array Add/Push/Enqueue handler further below, which just appends
+        // unconditionally: `Count` grew and the element was stored twice even
+        // though `Contains` already reported it present (issue #3491).
+        // Uses the SAME shared emitArrayBackedSetInsert helper as
+        // OwningSet<T>.Add — the one fix-at-the-shared-path-once — but with a
+        // NULL dupDisposer (arrElemPol was computed with owningFamily=false
+        // above, so its ClassBorrow row already carries a null disposerThunk,
+        // per §28.11 v0.135: a BORROWING Set<T> must never dispose a rejected
+        // duplicate, unlike OwningSet<T>). `item` is a pure borrow
+        // (`Add(item: T)`, no `owned`) either way — appended or not.
+        // fix #1881 / §28.3: mirror the generic borrowing Add path's rule for
+        // a fresh owned producer argument used only as a borrow (`st.Add(new
+        // C(...))`) — Set<T>.Add never takes ownership of `item`, dup or not,
+        // so such a producer must still be disposed at the end of this full
+        // expression.
+        if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
+            isBorrowingSetRecv && arrElemIsClass && !arrIsOwning) {
+            llvm::Value* item = lowerExpr(*call.args[0].value);
+            if (!item) return nullptr;
+            if (!emitSetDedupInsert(item)) return nullptr;
+            if (isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return llvm::ConstantInt::get(i32(), 0);  // unit
         }
         // fix #1474 / stdlib §4.10: OwningSet<T>.UnionWith(owned other:
@@ -5894,8 +5986,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Semantics: scan the array for an EQUAL element; if not found, append
         // and return true; if found, dispose the passed item (caller transferred
         // ownership; §4.10 "on false, the item is disposed") and return false.
+        // fix #3491: widened to also cover the BORROWING Set<T>.TryAdd(item):
+        // bool (isBorrowingSetRecv) — before this fix no handler existed for a
+        // class-element receiver with arrIsOwning=false, so the call lowered
+        // to nullptr and the caller's local degraded to codegen's #2434
+        // zero-init fallback (the `bool` result was silently `false`
+        // regardless of the answer). arrElemPol was computed with
+        // owningFamily=arrIsOwning above, so on the borrowing arm its
+        // ClassBorrow row already carries a null disposerThunk — the
+        // `if (arrElemPol.disposerThunk)` dup-branch guard below therefore
+        // already does the right thing unmodified: a borrowing Set<T> must
+        // NOT dispose a rejected duplicate (§28.11 v0.135), only
+        // OwningSet<T> does.
         if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
-            arrElemIsClass && arrIsOwning) {
+            arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -5955,6 +6059,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "ta.r");
             phi->addIncoming(builder_.getFalse(), foundBB);
             phi->addIncoming(builder_.getTrue(), newBB);
+            // fix #3491 / #1881 / §28.3: a BORROWING Set<T>.TryAdd never takes
+            // ownership of `item` (dup or newly-inserted alike — the dup
+            // branch above deliberately does NOT dispose it, per §28.11's
+            // borrowing-column rule). Mirror the generic borrowing Add path's
+            // rule for a fresh owned producer argument used only as a borrow
+            // (`st.TryAdd(new C(...))`): dispose it here so it does not leak.
+            // Not applicable to the owning arm — OwningSet<T>.TryAdd's `owned
+            // item` always has its ownership resolved above (transferred into
+            // the array on insert, disposed on the dup path).
+            if (!arrIsOwning && isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return phi;
         }
         // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T): owned T —
@@ -7043,11 +7158,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // and Interface correctly per §28.11 v0.135 fix #619.
         llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
 
-        // Helper: extract string data/len from bz.string ptr
-        auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+        // Helper: extract the (data, code-point length, storage width) TRIPLE
+        // every string-key runtime entry point takes. fix #4499 (spec §4.6 /
+        // §8.3, v0.306): the width is not optional — a string's byte size is
+        // `len * width`, so a table given only (data, len) treats a code-point
+        // count as a byte count and truncates every width>1 key.
+        auto strDataLen = [&](llvm::Value* s)
+                -> std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> {
             llvm::Value* data = loadStringData(s);
             llvm::Value* len  = loadStringLen(s);
-            return {data, len};
+            llvm::Value* w    = loadStringWidth(s);   // i8, fix #4499
+            return {data, len, w};
         };
         // issues #343 / D3: spill a generic key value to a stack slot and return
         // the byte pointer the generic runtime entry points expect. A record key
@@ -7437,14 +7558,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (non-string) key keeps the pre-existing `bz_dict_keys_gen`
             // path unchanged.
             llvm::Value* dtLensArr = nullptr;
+            llvm::Value* dtWidthsArr = nullptr;   // fix #4499
             if (dtIsStringKey) {
                 auto* dtLensOutSlot = entryAlloca(ptrTy());
+                // fix #4499: the snapshot's third parallel spine — the per-key
+                // §4.6 storage width `decodeDictStringKeyAt` needs to rebuild
+                // the key at its true byte size (`len * width`).
+                auto* dtWidthsOutSlot = entryAlloca(ptrTy());
                 auto* kfnStr = declareC("bz_dict_keys_str",
                     llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(kfnStr,
-                    {recv, dtKeysOutSlot, dtLensOutSlot, dtCntSlot});
-                dtLensArr = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                    {recv, dtKeysOutSlot, dtLensOutSlot, dtWidthsOutSlot,
+                     dtCntSlot});
+                dtLensArr   = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                dtWidthsArr = builder_.CreateLoad(ptrTy(), dtWidthsOutSlot);
             } else {
                 auto* kfn = declareC("bz_dict_keys_gen",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
@@ -7479,9 +7607,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (dtIsStringKey) {
                     auto* sortStrFn = declareC("bz_sort_kv_str",
                         llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #4499: the width spine is permuted with keys/lens/
+                    // values — otherwise a sorted key's bytes and its width
+                    // come from different entries.
                     builder_.CreateCall(sortStrFn,
-                        {dtKeysArr, dtLensArr, dtValsArr, dtCnt});
+                        {dtKeysArr, dtLensArr, dtWidthsArr, dtValsArr, dtCnt});
                 } else if (llvm::Function* cmpFn =
                                buildSortedKeyComparator(keyTy)) {
                     auto* sortFn = declareC("bz_sort_kv_gen",
@@ -7506,7 +7637,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (see this arm's opening comment), or safely leaked otherwise.
             llvm::Value* dtKeyDecoded =
                 dtIsStringKey
-                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtIdx).first
+                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtWidthsArr,
+                                            dtIdx).first
                     : decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
                                              "dictterm.kgen").first;
 
@@ -7557,8 +7689,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // spine from `dtKeysArr`, freed by the for-in path's own endBB
             // (`lensArr`) the same way — a generic key never allocates one
             // (`dtLensArr` stays null).
-            if (dtIsStringKey)
+            if (dtIsStringKey) {
                 builder_.CreateCall(dtFreeFn, {dtLensArr});
+                builder_.CreateCall(dtFreeFn, {dtWidthsArr});   // fix #4499
+            }
             builder_.CreateCall(dtFreeFn, {dtValsArr});
 
             // #1013-style reclaim: a fresh unbound Dictionary/SortedDictionary
@@ -7638,9 +7772,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
             }
-            auto [kd, kl] = strDataLen(k);
-            auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
-            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            auto [kd, kl, kw] = strDataLen(k);
+            auto* fn = declareC("bz_dict_contains_str", i1(),
+                                {ptrTy(), ptrTy(), i64(), i8()});
+            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.contains");
             // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into
             // the table BY VALUE (bz_dict_contains_str reads kd/kl, never the
             // bz_string* itself — unlike the VALUE slot, which is retained
@@ -7672,10 +7807,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy()});
                 isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "tryadd.dup");
             } else {
-                auto [kd0, kl0] = strDataLen(k);
+                auto [kd0, kl0, kw0] = strDataLen(k);
                 auto* cf = declareC("bz_dict_contains_str", i1(),
-                                    {ptrTy(), ptrTy(), i64()});
-                isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "tryadd.dup");
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "tryadd.dup");
             }
             auto* dupBB = llvm::BasicBlock::Create(llvm_, "tryadd.dup.disp",
                                                    currentFn_);
@@ -7706,11 +7841,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_set_str",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             }
             llvm::BasicBlock* insEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
@@ -7777,11 +7912,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "add.dup"),
                         "ArgumentException");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
                     llvm::Value* isDup =
-                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                        builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                     // fix #3703 / §28.9: the real insert below re-derives
                     // kd/kl from `k` a SECOND time and releases a fresh +1 KEY
                     // producer only after that insert — which never runs on
@@ -7818,10 +7953,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)},
                                                 "add.dup");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
-                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
+                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                 }
                 auto* dupBB  = llvm::BasicBlock::Create(
                     llvm_, "add.dup.disp", currentFn_);
@@ -7871,10 +8006,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     nullTransferredOwnedLocalSlot(call.args[1].value.get());
                 return llvm::ConstantInt::get(i32(), 0);
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+            builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for
             // OwningDictionary<K,V> with a string key, the value (arg 1) has
             // just been transferred. Null the caller's bare owned local/param
@@ -7938,18 +8073,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             llvm::Value* removeResult;
             if (valDisp) {
                 // OwningDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
                 removeResult = builder_.CreateCall(
-                    fn, {recv, kd, kl, llvm::cast<llvm::Value>(valDisp)},
+                    fn, {recv, kd, kl, kw, llvm::cast<llvm::Value>(valDisp)},
                     "dict.remove");
             } else {
-                auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
-                removeResult = builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+                auto* fn = declareC("bz_dict_remove_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                removeResult = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.remove");
             }
             // fix #3703 / §28.9: Remove never throws (absent key just returns
             // false), so `k`'s single use above (kd/kl) is unconditionally
@@ -7979,10 +8115,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "pv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "pv.found");
                 // fix #3703 / §28.9: this call is the sole use of `k`'s
                 // buffer (kd2/kl2 alias it); release a fresh +1 KEY producer
@@ -8049,10 +8185,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "tpv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "tpv.found");
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryPopValue
                 // never throws, so release a fresh +1 KEY producer now.
@@ -8147,10 +8283,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryGetValue
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8240,10 +8376,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; GetOrNull
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8374,8 +8510,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             llvm::Value* genKey = keyTy ? genKeyPtr(k) : nullptr;
-            llvm::Value* strKd = nullptr, *strKl = nullptr;
-            if (!keyTy) { auto p = strDataLen(k); strKd = p.first; strKl = p.second; }
+            llvm::Value* strKd = nullptr, *strKl = nullptr, *strKw = nullptr;
+            if (!keyTy) {
+                auto p = strDataLen(k);
+                strKd = std::get<0>(p); strKl = std::get<1>(p);
+                strKw = std::get<2>(p);   // fix #4499
+            }
 
             // Lower the factory closure (K) -> V. Build a synthetic Function
             // TypeRef so an unannotated lambda param/return picks up the right
@@ -8461,8 +8601,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKey, tmpSlot});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot});
             }
 
             auto* missBB = llvm::BasicBlock::Create(llvm_, "goa.miss", currentFn_);
@@ -8496,8 +8636,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, encoded});
             } else {
                 auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, encoded});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, encoded});
             }
             // Re-read the now-stored slot so the returned value is the BORROW of the
             // stored slot (mirrors the indexer-get-borrow; for a record value this
@@ -8509,8 +8649,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, tmpSlot2});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot2});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot2});
             }
             llvm::Value* missSlot = builder_.CreateLoad(ptrTy(), tmpSlot2, "goa.mslot");
             llvm::Value* missVal = decodeSlot(missSlot);
@@ -8617,22 +8757,29 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                               : "bz_dict_min_key_str";
                 auto* dataSlot = entryAlloca(ptrTy());
                 auto* lenSlot  = entryAlloca(i64());
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                // fix #4499: the key's §4.6 storage width is a third out-slot.
+                // Pre-fix this site stamped width 1 on every returned key, so a
+                // width>1 MinKey/MaxKey was reinterpreted as `len` Latin-1 code
+                // points over a buffer that actually held `len * width` bytes.
+                auto* wSlot    = entryAlloca(i8Ty);
                 builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), dataSlot);
                 builder_.CreateStore(builder_.getInt64(0), lenSlot);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), wSlot);
                 auto* mmStrFn = declareC(rtNameStr, i1(),
-                                         {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot});
-                // data and len are now filled; build a heap bz_string object.
+                                         {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot, wSlot});
+                // data, len and width are now filled; build a heap bz_string.
                 llvm::Value* kdata = builder_.CreateLoad(ptrTy(), dataSlot, "sd.kd");
                 llvm::Value* klen  = builder_.CreateLoad(i64(), lenSlot, "sd.kl");
-                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* kwid  = builder_.CreateLoad(i8Ty, wSlot, "sd.kw");
                 uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
                 auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
                 llvm::Value* strObj = builder_.CreateCall(callocFn,
                     {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
                 builder_.CreateStore(kdata, builder_.CreateStructGEP(stringType(), strObj, 0));
                 builder_.CreateStore(klen,  builder_.CreateStructGEP(stringType(), strObj, 1));
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStore(kwid,
                     builder_.CreateStructGEP(stringType(), strObj, 2));
                 initStringRc(strObj);
                 return strObj;
@@ -10897,27 +11044,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return t && t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::String;
         };
-        // fix #2785: ORDINAL comparison on the two data pointers — the same
+        // fix #2785: ORDINAL comparison on the two string OBJECTS — the same
         // lowering `Array<string>.Min()` already uses (tryLowerCollectionInstanceCall's
         // `isStrElem` arm), so `Math.Min` and the collection form agree by
         // construction. stdlib §9.6 fixes string ordering as ordinal.
+        //
+        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to extract
+        // each operand's raw `.data` pointer and call plain `strcmp` —
+        // byte-wise AND NUL-terminated, disagreeing with `CompareTo`/
+        // `SortedSet<string>` after #4487 moved those to `bz_str_compare_cp`.
+        // Routes through that SAME width-aware relation now, keeping the
+        // "agree by construction" comment above true post-#4487 too.
         auto emitStrCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
             if (!a || !b || !a->getType()->isPointerTy() ||
                 !b->getType()->isPointerTy())
                 return nullptr;
-            llvm::Value* aData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), a, 0));
-            llvm::Value* bData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), b, 0));
-            auto* strcmpFn = module_->getFunction("strcmp");
-            if (!strcmpFn) {
-                auto* ft =
-                    llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                strcmpFn = llvm::Function::Create(
-                    ft, llvm::Function::ExternalLinkage, "strcmp",
-                    module_.get());
-            }
-            return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
+            auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                     {ptrTy(), ptrTy(), i32()});
+            return builder_.CreateCall(cmpCpFn, {a, b, builder_.getInt32(0)},
+                                       "mm.strcmp");
         };
         // fix #2786 (stdlib §2.2, spec §14.2, v0.240): the float fallback below
         // is reached by anything the integer, CompareTo (#1141/#1148/#2782) and

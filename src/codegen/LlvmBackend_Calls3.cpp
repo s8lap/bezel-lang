@@ -841,8 +841,24 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
         // The VIRTUAL arm above was already correct (the per-instantiation
         // `vt$<C>$specN` carries the specialized method), which is why only a
         // non-virtual `CompareTo` was affected.
+        // fix #3566 (second shape, stdlib §4.17 / §2.8.3 rule 4, v0.306): the
+        // `genericInst` gate asks whether the ELEMENT type is a constructed
+        // generic, which is the right question only while the `CompareTo`
+        // being specialized is declared by that element type. A NON-generic
+        // class over a generic base — `class DPlain: GBase<long>` — has no
+        // generic params of its own, so `genericInst` is false and the
+        // placeholder template was called: measured `first=3 last=2 count=3`
+        // (insertion order) on the identical `SortedDictionary` repro. The
+        // layout that matters belongs to `GBase<long>`, not to `DPlain`.
+        // `specializedClassCompareToFn` resolves the base's parameters from
+        // the base CLAUSE in that case, so the element type need not be
+        // generic at all; `instArgs` and `gpNames` are both empty here, which
+        // its own `instArgs.size() != gpNames.size()` guard admits, and the
+        // thunk name and cache key (`descIdentityKey(decl, {})`) are the
+        // pre-#3530 one-thunk-per-type form, unchanged.
         llvm::Function* target = nullptr;
-        if (genericInst)
+        if (genericInst || (cmpMs->parent && ty->declaration &&
+                            cmpMs->parent != ty->declaration))
             target = specializedClassCompareToFn(ty, cmpMs, gpNames, instArgs,
                                                  fnIt->second);
         if (!target) target = fnIt->second;
@@ -876,21 +892,43 @@ llvm::Function* Emitter::specializedClassCompareToFn(
         const std::vector<std::string_view>& gpNames,
         const std::vector<const sema::TypeRef*>& instArgs,
         llvm::Function* templateFn) {
-    // ⚠ DECLINE AN INHERITED `CompareTo` (issue 3566). `findMethodByName` walks
-    // the base chain, so `ms` can belong to a BASE class whose body reads the
-    // BASE's type-parameter names — and `gpNames` are the DERIVED class's.
-    // For `class Base<U>` / `class Derived<T>: Base<T>`, installing
-    // {"T" -> long} leaves Base's `U` unbound, so the "specialization" lowers
-    // Base's `U`-typed fields at the i32 placeholder and comes out
-    // INSTRUCTION-IDENTICAL to the template — while `buildSpecializedMethodFn`
-    // clears `emittingGenericTemplateBody_`, disabling the template-only return
-    // backstop for a body that is still effectively a template. Declining here
-    // restores the pre-#3530 template call byte-for-byte for that shape, which
-    // is the honest answer until the fix issue 3566 proposes lands: compose the
-    // derived arguments through `TypeSymbol::baseTypeRefs` to the declaring
-    // base, the walk `instanceDescriptorFor` already performs.
-    if (!ms->parent || !ty->declaration || ms->parent != ty->declaration)
-        return nullptr;
+    // fix #3566 (stdlib §4.17 / spec §2.8.3 rule 4 / §14.1, v0.306) — AN
+    // INHERITED `CompareTo` IS NOW SPECIALIZED, not declined.
+    //
+    // `findMethodByName` walks the base chain, so `ms` can belong to a BASE
+    // class whose body reads the BASE's type-parameter names — while `gpNames`
+    // are the DERIVED class's. For `class GBase<T>` / `class Derived<U>:
+    // GBase<U>`, installing {"U" -> long} leaves `GBase`'s `T` unbound, so the
+    // "specialization" lowered `GBase`'s `T`-typed fields at the i32
+    // placeholder and came out INSTRUCTION-IDENTICAL to the template. #3530
+    // therefore silently did nothing for that shape, and #3566 declined it
+    // outright rather than emit a body that was still effectively a template.
+    //
+    // MEASURED consequence of the decline (on integration HEAD 00e10c0e, the
+    // issue's own repro): `SortedDictionary<Derived<long>, int>` with keys
+    // inserted 3, 1, 2 printed `first=3 last=2 count=3` — insertion order, i.e.
+    // the comparator answered garbage for every pair. stdlib §4.17 makes
+    // `K`'s `IComparable<K>.CompareTo` the ordering authority AND the key
+    // identity ("two keys are the same key exactly when `CompareTo` returns
+    // 0"), so a comparator reading the wrong field offsets decides both
+    // ITERATION ORDER and MAP MEMBERSHIP. Silent wrong answer, rc=0.
+    //
+    // THE FIX is the one #3566 proposes, and it reuses the walk that already
+    // exists rather than adding a second spelling of it (LANE_RULES §6):
+    // `computeAncestorGenericSubst` walks `ty->declaration`'s base chain up to
+    // `ms->parent`, composing each level's `baseTypeRefs[i]->genericArgs`
+    // through the substitution built so far, and fills both maps keyed by the
+    // ANCESTOR's parameter names. It is the same authority `fieldAddr`'s
+    // inherited-field branch uses (#2840/#585), so the body is lowered against
+    // exactly the offsets the field reads use. It is called BEFORE the new maps
+    // are installed, so its own seed composes through the still-active outer
+    // substitution (the transitive `Outer<X>` case, #2202).
+    //
+    // The thunk NAME and CACHE KEY keep using the DERIVED class's `instArgs`
+    // — correct, because the thunk is per derived instantiation; only the
+    // substitution the BODY is built under moves to the base's names.
+    if (!ms->parent || !ty->declaration) return nullptr;
+    const bool inheritedCompareTo = (ms->parent != ty->declaration);
     // The thunk loads two `ptr`s and calls `i32 (ptr, ptr)`. Require the
     // TEMPLATE to already have that signature before specializing: it is the
     // signature `CompareTo(other: Self): int` produces for every instantiation
@@ -917,13 +955,29 @@ llvm::Function* Emitter::specializedClassCompareToFn(
     auto savedSemaTy = genericSubstSemaTy_;
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-    // Both halves come from the caller's composed `instArgs`, in the lockstep
-    // order the sibling site uses (`newSubst[p] = lowerTypeRef(argSema);
-    // newSema[p] = argSema;`), so the LLVM and sema maps cannot desync — the
-    // desync #3020 records as corrupting the buildSpecializedMethodFn cache key.
-    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
-        newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
-        newSema[gpNames[gi]] = instArgs[gi];
+    if (inheritedCompareTo) {
+        // fix #3566: the body reads the DECLARING BASE's parameter names.
+        // `computeAncestorGenericSubst` re-derives them POSITIONALLY from each
+        // base clause, so a renamed parameter (`Derived<U>: GBase<U>`, body
+        // reading `T`) resolves exactly as an identically-spelled one does; a
+        // shared spelling never reaches it by name. It returns false when the
+        // ancestor is non-generic or the chain could not pin every parameter —
+        // and in both cases declining is still the honest answer: the template
+        // is then either already correct (nothing to substitute) or we cannot
+        // prove what to substitute, which is #3530's own "no worse than the
+        // behaviour it replaces" fallback.
+        if (!computeAncestorGenericSubst(ty, ms->parent, newSubst, newSema))
+            return nullptr;
+    } else {
+        // Both halves come from the caller's composed `instArgs`, in the
+        // lockstep order the sibling site uses (`newSubst[p] =
+        // lowerTypeRef(argSema); newSema[p] = argSema;`), so the LLVM and sema
+        // maps cannot desync — the desync #3020 records as corrupting the
+        // buildSpecializedMethodFn cache key.
+        for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+            newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
+            newSema[gpNames[gi]] = instArgs[gi];
+        }
     }
     genericSubst_ = std::move(newSubst);
     genericSubstSemaTy_ = std::move(newSema);
@@ -2027,6 +2081,7 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             // --- snapshot keys + values ---
             auto* keysOutSlot = entryAlloca(ptrTy());
             auto* lensOutSlot = entryAlloca(ptrTy());
+            auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: §4.6 widths
             auto* cntSlot     = entryAlloca(i64());
             auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -2040,9 +2095,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             } else {
                 auto* kfn = declareC("bz_dict_keys_str",
                     llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(kfn,
-                    {recv, keysOutSlot, lensOutSlot, cntSlot});
+                    {recv, keysOutSlot, lensOutSlot, widsOutSlot, cntSlot});
                 auto* vfn = declareC("bz_dict_values_str",
                     llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), ptrTy(), ptrTy()});
@@ -2052,6 +2107,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
             llvm::Value* lensArr = isStringKey
                                        ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                                       : nullptr;
+            llvm::Value* widsArr = isStringKey            // fix #4499
+                                       ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                        : nullptr;
             llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
             llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -2087,8 +2145,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 if (!useGen && lensArr) {
                     auto* sortFn = declareC(
                         "bz_sort_kv_str", llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), ptrTy(), i64()});
-                    builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #4499: the width spine permutes with the others.
+                    builder_.CreateCall(sortFn,
+                        {keysArr, lensArr, widsArr, valsArr, cnt});
                 } else if (useGen) {
                     // A key type `buildSortedKeyComparator` cannot rank returns
                     // null; leaving the snapshot unsorted then matches what the
@@ -2149,7 +2209,8 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 // "should not happen" null fallback verbatim.) ---
                 llvm::Value* keyDecoded;
                 if (isStringKey) {
-                    auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+                    auto strPr =
+                        decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
                     keyDecoded = strPr.first;
                     builder_.CreateCall(freeFn, {strPr.second});
                 } else if (useGen) {
@@ -2185,8 +2246,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
 
             builder_.SetInsertPoint(endBB);
             builder_.CreateCall(freeFn, {keysArr});
-            if (isStringKey)
+            if (isStringKey) {
                 builder_.CreateCall(freeFn, {lensArr});
+                builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+            }
             builder_.CreateCall(freeFn, {valsArr});
 
             // #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): for string-keyed
@@ -3280,14 +3343,47 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
                           : llvm::cast<llvm::Value>(
                                 llvm::ConstantPointerNull::get(ptrTy()));
     };
+    // fix #4579 (§4.6 / §4.7 / §7.2, v0.306): every `bz_llist_add_*` below hands
+    // the runtime a POINTER to this slot plus `esz`, and `llist_node_alloc`
+    // memcpy's exactly `esz` bytes out of it. `esz` is `collectionElemSize`, the
+    // ALLOCATION size of the element's LLVM type — for a nullable VALUE element
+    // (`LinkedList<int?>`) that is the tagged `{i8 hasValue, T value}` struct, 8
+    // bytes for `int?`. But the arms lowered the argument with a bare
+    // `lowerExpr`, which for `ll.AddLast(1)` yields the inner `i32` (the
+    // IntLiteral arm lowers from `rt->primitive` and ignores `rt->nullable`), so
+    // the slot was a 4-byte `alloca i32` and the memcpy read 4 bytes PAST it.
+    //
+    // MEASURED on 75ae6094 (gate `--full`, shard codegen/5): "AddressSanitizer:
+    // stack-buffer-overflow … READ of size 8 … in memcpy / llist_node_alloc /
+    // bz_llist_add_last", with the frame report naming the two slots the repro
+    // creates — `[64, 68)` (the 4-byte `AddLast(1)` slot, overflowed) beside
+    // `[32, 40)` (the correctly-sized 8-byte `AddLast(null)` slot, because the
+    // NullLiteral arm DOES consult `isNullableValueTy`).
+    //
+    // It is a wrong ANSWER before it is a memory error: `{i8, T}` puts the tag at
+    // offset 0, so the stored node's hasValue byte became the payload's LOW BYTE
+    // and the payload came from the uninitialized 4 bytes past the slot. Any
+    // value whose low byte is zero read back as `null` — `ll.AddLast(256)` then
+    // `256 in ll` answered FALSE on the plain build (§17.5's membership test over
+    // §8.4 equality), which is why the plain oracle passed the ASan-failing row.
+    //
+    // The array-backed family has had the rule since fix #455 (§4.5); this is the
+    // same helper, now shared (`ensureNullableElementValue`). Spill through one
+    // place so the "slot type == element type" invariant cannot be restated
+    // wrongly in a fifth arm.
+    auto llElemSlot = [&](llvm::Value* v) -> llvm::AllocaInst* {
+        v = ensureNullableElementValue(llElemRef, v);
+        llvm::AllocaInst* s = entryAlloca(v->getType());
+        builder_.CreateStore(v, s);
+        return s;
+    };
 
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3311,8 +3407,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3332,8 +3427,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3353,8 +3447,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
+        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,

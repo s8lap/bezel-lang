@@ -436,10 +436,28 @@ def build_section_context(blocks):
         # Look up earlier providers in same section
         providers = section_type_providers.get(heading, [])
 
-        # Find which providers supply types that THIS block references
+        # Find which providers supply types that THIS block references but does
+        # NOT itself declare.
+        #
+        # The `- my_types` term is load-bearing: the docs routinely re-show a
+        # type's declaration in a later block of the same section (a positional
+        # record restated beside its serialization form, a class restated with
+        # doc comments). Such a block both DEFINES and REFERENCES the name, so
+        # the original `ptypes & my_refs` test chained the earlier declaration in
+        # ahead of the block's own — and the case then failed on
+        #   "a top-level type named `X` is already declared in this module
+        #    — top-level type names must be unique (§11.3 well-formedness)"
+        # which is an artifact of the extractor's scaffolding, not a claim of the
+        # document. Skipping a provider whose types the block redeclares is the
+        # narrow fix; a provider supplying some OTHER type the block needs is
+        # still chained. (Measured on the v0.278 corpus: spec_0021, spec_0040 and
+        # stdlib_0019 fail exactly this way.)
+        my_needs = my_refs - my_types
         needed_providers = []
         for (pidx, pcode, ptypes) in providers:
-            if ptypes & my_refs:
+            if ptypes & my_types:
+                continue          # the block redeclares it; chaining would clash
+            if ptypes & my_needs:
                 needed_providers.append((pidx, pcode))
 
         if needed_providers:

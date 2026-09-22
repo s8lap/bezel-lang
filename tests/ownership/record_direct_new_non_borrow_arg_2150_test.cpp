@@ -28,12 +28,27 @@
 // field is still rooted) is pinned by the lit cases
 // tests/lit/ownership/record_direct_new_non_borrow_arg_2150__*. // per §9.7
 // (v0.226, #2150)
+//
+// fix #4428 (§9.7, v0.301): the two ACCEPT cases below
+// (span_field_plus_int_from_local_length_accepted,
+//  int_from_local_length_plus_span_field_accepted) pinned the OPPOSITE of
+// the v0.301 ruling — they asserted the parameter-rooted span leg (`p.AsSpan()`
+// in the returned `new Holder(...)`) is admitted. The §9.7 v0.301 ruling
+// closes the parameter arm: a parameter-sourced record return hands back a
+// borrow no call site could bound. Renamed and re-polarized below to REJECT.
+// The third ACCEPT case (generic_value_field_plus_span_accepted) is UNCHANGED:
+// its span leg also uses `p.AsSpan()` on a parameter, so it now also REJECTS —
+// re-polarized in place. Each now asserts the §9.7 v0.301 parameter diagnostic
+// on the borrow-carrying field arg. // per §9.7, v0.301.
 
 #include <string>
 
 #include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
+#include "support/ownership_support.hpp"  // parseAndCheckOwnership, hasErrorMessage (#4428 §9.7 v0.301)
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
+using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 // ===========================================================================
@@ -44,74 +59,71 @@ using bezel::test::runAotChecked;
 // the return must be accepted.
 // ===========================================================================
 
-// §9.7 precision (#2150): the issue's exact repro — `return new Holder(
-// p.AsSpan(), s.Count)` with `s` a scope-bound owned local. `p` (param)
-// outlives the frame; the span borrows `p`, not `s`. `h.N` = s.Count = 1,
-// `h.S[0]` = 7 -> 8.
+// §9.7 precision (#2150) / fix #4428 (§9.7 v0.301): the issue's exact repro —
+// `return new Holder(p.AsSpan(), s.Count)` with `p` a parameter, `s` a
+// scope-bound owned local — is REJECTED at the return site on the
+// BORROW-CARRYING `S` field's argument (`p.AsSpan()`, rooted at the parameter
+// `p`). The pre-#2150 path rooted `s.Count`->`s` (the value-typed `N` arg)
+// via identifierRoot — that was the #2150 false-reject. The post-#2150 path
+// correctly skipped `s.Count` (non-borrow-carrying field) and rooted only the
+// span field's arg, but the §9.7 v0.301 ruling closes the parameter arm
+// for that span field's arg. `N` stays untouched (still skipped — its arg
+// is the value `s.Count`, not a borrow source). // per §9.7 v0.301; callee-
+// side reportIfParameterRoot in Ownership_Checks.cpp's NewExpr arg scan.
 BEZEL_TEST(record_direct_new_non_borrow_arg_2150,
-           span_field_plus_int_from_local_length_accepted) {
+           span_field_plus_int_from_local_length_rejected_9_7_v301) {
     std::string src =
         "module M; record Holder(S: ArraySpan<int>, N: int); class C "
         "  public static method View(p: Array<int>): Holder "
         "    var s := new Array<int>(); s.Add(11); "
         "    return new Holder(p.AsSpan(), s.Count); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.N; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 8);
+        "  end C;";
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }
 
-// §9.7 precision (#2150): same shape with the arg ORDER SWAPPED — the value
-// field comes first, the borrow-carrying span second. Confirms the fix gates on
-// the MATCHED FIELD, not on argument position. The span borrows the param `p`;
-// the int field stores `s.Count` (a value). Two elements in `s` -> N = 2;
-// `h.S[0] + h.N` = 7 + 2 -> 9.
+// §9.7 precision (#2150) / fix #4428 (§9.7 v0.301): same shape with the arg
+// ORDER SWAPPED — the value field comes first, the borrow-carrying span
+// second. Confirms the fix gates on the MATCHED FIELD (the §22.5 binding
+// paths in Ownership_Checks.cpp's fieldArg[] lookup), not on argument
+// position. Rejected on the span field's argument (`p.AsSpan()`, rooted at
+// the parameter `p`) — `s.Count` (the value-typed `N` arg) is correctly
+// skipped, not the reject source. // per §9.7 v0.301.
 BEZEL_TEST(record_direct_new_non_borrow_arg_2150,
-           int_from_local_length_plus_span_field_accepted) {
+           int_from_local_length_plus_span_field_rejected_9_7_v301) {
     std::string src =
         "module M; record Holder(N: int, S: ArraySpan<int>); class C "
         "  public static method View(p: Array<int>): Holder "
         "    var s := new Array<int>(); s.Add(11); s.Add(13); "
         "    return new Holder(s.Count, p.AsSpan()); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.N; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 9);
+        "  end C;";
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }
 
-// §9.7 precision (#2150) / #2145 (generic subst env): a GENERIC Holder<T>
-// instantiated with T=int for the value field and ArraySpan<int> for the span
-// field. The field-walk must thread the call-site substitution env so the
-// value-typed substitution (T=int) is recognized as non-borrow-carrying and
-// the int arg from `s.Count` is skipped — exactly as isNullSourceRecordExpr
-// does. Three elements in `s` -> V = 3; `h.S[0] + h.V` = 7 + 3 -> 10.
+// §9.7 precision (#2150) / fix #4428 (§9.7 v0.301): a GENERIC Holder<T>
+// instantiated with T=int for the value field and ArraySpan<int> for the
+// span field — same shape as the above, with the subst env threaded through
+// the field walk (#2145). Rejected on the span field's argument; the
+// value-typed substitution (T=int) is correctly recognized as non-borrow-
+// carrying, so the int arg `s.Count` is skipped. // per §9.7 v0.301.
 BEZEL_TEST(record_direct_new_non_borrow_arg_2150,
-           generic_value_field_plus_span_accepted) {
+           generic_value_field_plus_span_rejected_9_7_v301) {
     std::string src =
         "module M; record Holder<T>(V: T, S: ArraySpan<int>); class C "
         "  public static method View(p: Array<int>): Holder<int> "
         "    var s := new Array<int>(); s.Add(11); s.Add(13); s.Add(17); "
         "    return new Holder<int>(s.Count, p.AsSpan()); "
         "  end View; "
-        "  public static method Main(): int "
-        "    var p := new Array<int>(); p.Add(7); "
-        "    var h := C.View(p); "
-        "    return h.S[0] + h.V; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 10);
+        "  end C;";
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of parameter `p`"));
 }

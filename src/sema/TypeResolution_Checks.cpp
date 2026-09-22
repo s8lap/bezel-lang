@@ -2073,17 +2073,26 @@ void Resolver::checkChoiceSelfContainment() {
 }
 
 void Resolver::checkUserDeclaredDispose() {
-    // #594 (§28.2): "User code does not implement Dispose() directly.  The
-    // customization points are: a destructor for cleanup logic; owned fields
-    // for fields that should be disposed with the containing object."
+    // #594 + #4421 (§28.2, stdlib §2.10, v0.300): "User code does not implement
+    // `Dispose()` directly. ... Declaring a member named `Dispose` on a class
+    // or a record is a compile error at that declaration, whatever its
+    // parameter list; the diagnostic names the two customization points above
+    // — the §9.3 posture for a body member colliding with a compiler-generated
+    // one, keyed on the name as §12.2 is."
     //
-    // A user-declared `Dispose()` on a class or record is never invoked by
-    // the compiler's ownership machinery (using var / owned field teardown /
+    // A user-declared `Dispose` on a class or record is never invoked by the
+    // compiler's ownership machinery (using var / owned field teardown /
     // explicit Dispose call all go through the compiler-generated Dispose) so
     // the user body silently never runs — a silent trap.  Reject it here.
     //
+    // The v0.300 widening to "whatever its parameter list" matters at
+    // optional-parameter declarations specifically (`Dispose(mode: int := 0)`,
+    // §22.5): the zero-argument call `x.Dispose()` is then ambiguous against
+    // the generated member, so the body silently never runs even though the
+    // call looks right.
+    //
     // Applies to both Class and Record even though records cannot normally
-    // carry a destructor (§9.7): a user who accidentally writes a Dispose()
+    // carry a destructor (§9.7): a user who accidentally writes a Dispose
     // method on a record also gets a clear diagnostic rather than a silent
     // no-op (the destructor restriction is a separate, earlier check).
     if (!ctx_.module()) return;
@@ -2096,18 +2105,13 @@ void Resolver::checkUserDeclaredDispose() {
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || ms->name != "Dispose") continue;
-            // Only reject a zero-parameter Dispose(): that's the exact
-            // signature the compiler generates per §28.2.  A user method named
-            // Dispose with parameters is unusual but technically unambiguous
-            // and not what §28.2 restricts.
-            if (!ms->params.empty()) continue;
             ctx_.diagnostics().report(
                 Severity::Error, ms->declLoc,
                 std::string(t->kind == ast::TypeDeclKind::Record ? "record" : "class") +
                 " `" + std::string(t->name) +
-                "` may not declare a `Dispose()` method directly (§28.2): "
+                "` may not declare a `Dispose` method directly (§28.2): "
                 "the compiler synthesises `Dispose()` from the `destructor`; "
-                "user-declared `Dispose()` bodies are never called by the "
+                "user-declared `Dispose` bodies are never called by the "
                 "ownership machinery.  Use a `destructor` for cleanup logic "
                 "and `owned` fields for resource fields instead.");
         }
@@ -2822,6 +2826,161 @@ void Resolver::checkIndexerParamDefaults() {
                     "reached from an index position; remove the `:= …` "
                     "(§23.5)");
             }
+        }
+    }
+}
+
+// fix #4494 (§22.5 "Defaults and modifiers", v0.306). The paragraph's closing
+// sentence, verbatim: "Every parameter after the first defaulted parameter must
+// itself have a default."
+//
+// It was unenforced. MEASURED on 3975958e: `class B(n: int := 41, s: string)`
+// with `new B(1, "ab")` compiled at exit 0 with no diagnostic, and the program
+// ran and returned 3.
+//
+// WHY IT MATTERS BEYOND TIDINESS. A parameter that can never be omitted sitting
+// BEHIND one that can makes the earlier one's default unreachable by any
+// positional call — it is reachable only by NAMING, which is precisely the
+// machinery §22.5 is about. The §22.5 binder already DEPENDS on the rule:
+// `sema::FormalsView::ofNames` represents a built-in row's optionality as a
+// single "how many leading parameters are required" count and says so in as
+// many words ("the registry's rows put every defaulted parameter LAST … §22.5
+// requires it"), a shape that cannot express an interleaved list at all. So the
+// gap admitted declarations one of the binder's five formal sources
+// structurally cannot represent.
+//
+// THE RULE IS READ THROUGH `sema::FormalsView`, deliberately. Its two facts are
+// exactly `name(i)` and `hasDefault(i)`, which is the same view and the same
+// pair of accessors `bindArgsToParams` runs on — so the declaration check and
+// the call-site binder can never disagree about which parameters are optional,
+// and the AST-vs-imported split stays inside `formalParam*`'s sanctioned
+// accessors (SymbolCollection.cpp) instead of being re-spelled here as a
+// `dynamic_cast<const ast::MethodDecl*>(ms->decl)` family, which would be four
+// new #3152 imported-symbol seam reads for a fact the symbol already carries.
+//
+// WHAT THIS COVERS: every LOCAL formal list that can carry a `:= Expr` — a
+// method and an operator (both are a `MethodSymbol`, and `FormalsView::of`
+// resolves the `ast::MethodDecl` / `ast::OperatorDecl` split through
+// `methodDeclParams`), a constructor, and a §22.10 primary-constructor
+// parameter list (the positional-field view) — at every nesting depth
+// (`visitTypeAndNested`, #3574/#3597) and inside extensions (`ExtensionSymbol`,
+// which `forEachTypeAndNested` deliberately does not visit; see
+// NestedTypeWalk.hpp, so the extension arm is walked explicitly here).
+//
+// WHAT IT DOES NOT, each with its reason:
+//   * IMPORTED declarations. The rule is a property of the DECLARATION, so it
+//     is caught when the declaring module is compiled. This walk starts from
+//     `ctx_.module()->children`, which is the local module — the same scoping
+//     `checkIndexerParamDefaults` uses, for the same reason.
+//   * Indexer parameter lists. §23.5 forbids a default on ANY indexer
+//     parameter and `checkIndexerParamDefaults` (a few hundred lines above)
+//     already reports it, so the ordering rule can never be the first thing
+//     wrong with one; adding it here would only double-report. An indexer is a
+//     `PropertySymbol`, so the member walk below skips it structurally rather
+//     than by a special case.
+//   * Record positional fields. A.3 `PositionalField` admits no default syntax
+//     at all (the parser routes records through `parsePositionalFieldList`), so
+//     the rule is vacuous there — the walk still visits them and finds
+//     nothing, rather than special-casing, which a control row pins.
+//   * Lambda parameters (§27.4). `parseLambdaParam` parses no `:=` default, so
+//     no lambda formal list can violate the rule.
+//   * `extern` declarations (§32). They parse through the same
+//     `parseParamList` and so CAN syntactically carry a default; whether §32
+//     admits one at all is a separate question this fix does not answer, and
+//     answering it here would be a second new rejection smuggled into a
+//     one-sentence fix.
+//
+// ONE diagnostic per list, at the FIRST offending parameter: the rule names a
+// single boundary ("the first defaulted parameter"), so a list with three
+// offenders has one defect, not three.
+// // per §22.5, fix #4494
+void Resolver::checkParamListDefaultOrdering(
+    sema::FormalsView params, const std::vector<SourceLocation>& locs,
+    const std::string& what, SourceLocation fallback) {
+    std::size_t firstDefaulted = params.size();
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (params.hasDefault(i)) {
+            if (firstDefaulted == params.size()) firstDefaulted = i;
+            continue;
+        }
+        // `>= i` and not `> i`: the FIRST defaulted parameter is not "after"
+        // itself, so slot `firstDefaulted` must never report against itself.
+        if (firstDefaulted >= i) continue;
+        SourceLocation at = (i < locs.size() && locs[i].line != 0) ? locs[i]
+                                                                  : fallback;
+        ctx_.diagnostics().report(
+            Severity::Error, at,
+            what + ": parameter `" + std::string(params.name(i)) +
+                "` declares no default but follows defaulted parameter `" +
+                std::string(params.name(firstDefaulted)) +
+                "` — every parameter after the first defaulted parameter must "
+                "itself have a default (§22.5); give it a default, or move it "
+                "ahead of `" +
+                std::string(params.name(firstDefaulted)) + "`");
+        return;
+    }
+}
+
+void Resolver::checkParamDefaultOrdering() {
+    if (!ctx_.module()) return;
+    // Per-parameter locations, symbol-side. `ParameterSymbol::declLoc` is
+    // stamped from `ast::Param::loc` by `SymbolCollection::collectParams`, and
+    // a §22.10 positional field's is on its `posParam` — both are members of
+    // the SYMBOL, so a precise diagnostic costs no AST classification read.
+    auto paramLocs = [](const std::vector<Symbol*>& ps) {
+        std::vector<SourceLocation> out;
+        out.reserve(ps.size());
+        for (Symbol* p : ps) out.push_back(p ? p->declLoc : SourceLocation{});
+        return out;
+    };
+    auto fieldLocs = [](const std::vector<const Symbol*>& fs) {
+        std::vector<SourceLocation> out;
+        out.reserve(fs.size());
+        for (const Symbol* f : fs) {
+            const auto* fld = dynamic_cast<const FieldSymbol*>(f);
+            out.push_back(fld && fld->posParam ? fld->posParam->loc
+                                               : SourceLocation{});
+        }
+        return out;
+    };
+    auto checkMembers = [&](const std::vector<Symbol*>& members,
+                            const std::string& ownerDesc) {
+        for (Symbol* m : members) {
+            if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                const std::string what =
+                    (ms->isOperator
+                         ? "operator `" + std::string(ms->operatorToken) + "`"
+                         : "method `" + std::string(ms->name) + "`") +
+                    ownerDesc;
+                checkParamListDefaultOrdering(sema::FormalsView::of(*ms),
+                                              paramLocs(ms->params), what,
+                                              m->declLoc);
+            } else if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                checkParamListDefaultOrdering(sema::FormalsView::of(*cs),
+                                              paramLocs(cs->params),
+                                              "constructor" + ownerDesc,
+                                              m->declLoc);
+            }
+        }
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
+            visitTypeAndNested(t, [&](TypeSymbol* ts) {
+                if (!ts) return;
+                const std::string owner = " of `" + std::string(ts->name) + "`";
+                if (ts->hasPositionalFields) {
+                    const std::vector<const Symbol*> fields =
+                        recordPositionalFieldSymbols(ts);
+                    if (!fields.empty())
+                        checkParamListDefaultOrdering(
+                            sema::FormalsView::of(fields), fieldLocs(fields),
+                            "primary constructor" + owner, ts->declLoc);
+                }
+                checkMembers(ts->members, owner);
+            });
+        } else if (auto* ex = dynamic_cast<ExtensionSymbol*>(child)) {
+            checkMembers(ex->members,
+                         " of extension `" + std::string(ex->name) + "`");
         }
     }
 }
@@ -3654,6 +3813,24 @@ bool Resolver::isBareGenericParamBinding(const TypeRef* bound,
            builtinTypeArity(boundAst->name->parts.front()) == kNotBuiltin;
 }
 
+// fix #2742 (§3.6 rule 2 "Per-instantiation evaluation for generics" / §14.1
+// *Instantiation and its site*, v0.306). See the header comment for the
+// contract and for why a non-shadowing method parameter is skipped too.
+//
+// This predicate had been hand-inlined at THREE recorders
+// (`owningElementSites_`, `owningBufferSpanMoveOnlySites_`, `asTargetSites_`)
+// and was missing from TWO (`hashContainerSites_` — #2742 itself — and
+// `moveOnlyElementSites_`, the same defect unreported). That is the Family I1
+// mechanism at the deferred-obligation recorder: the copies agreed when they
+// were written and one was later taught something the others were not. One
+// definition, five call sites, so a sixth recorder cannot silently omit it.
+bool Resolver::nameBoundByCurrentMethod(std::string_view name) const {
+    if (!currentMethodGenericParams_) return false;
+    for (const ast::GenericParam& gp : *currentMethodGenericParams_)
+        if (gp.name == name) return true;
+    return false;
+}
+
 // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713) — Pass 2 for the owning-
 // collection element check.
 //
@@ -4415,11 +4592,62 @@ void Resolver::checkTypeDuplicates(TypeSymbol* t) {
             "another member of the same type; §11.3 lists the member "
             "kinds — uniqueness is a well-formedness requirement)");
     }
+    // fix #4444: reservation of the three Object-virtual names against
+    // choice-case names — §35.1 (v0.302). Runs alongside the duplicate
+    // walk because it is the choice-specific counterpart to §11.3's
+    // member-naming rule: cases ARE members (§35.1, "case names… may
+    // not collide with any member name"), and the reservation sits one
+    // rung further out — the name itself is off-limits regardless of
+    // whether anything else holds it. Keying it on classification is
+    // explicitly declined (§35.1 DECLINED.md) — the use-site compile
+    // error the §35.7 auto-package removes exists on exactly the
+    // classifications where the synthesis does NOT fire, so the
+    // reservation must hold there precisely.
+    checkChoiceCaseReservedNames(t);
     // Recurse into nested types.
     for (Symbol* m : t->members) {
         if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
             if (nt->type) checkTypeDuplicates(nt->type);
         }
+    }
+}
+
+// fix #4444 (§35.1, v0.302). The three names §35.7 calls "the member
+// §35.7 lets the author declare" are reserved against choice case names
+// on every classification, whether or not a member of that name is
+// declared. Holding the reservation even on choices that declare the
+// member would still be a compile error (the case and the member would
+// be §11.3 duplicates by the walk above), but keying it on "a member
+// is declared" would silently legalize the case on every choice that
+// does NOT declare it — exactly the gap #4444 closes.
+//
+// The reservation is choice-specific (records, enums, and classes do
+// not have cases), so the predicate is intentionally narrow: the three
+// exact strings, no more, no less. Any widening is a separate ruling.
+static bool isChoiceCaseReservedName(std::string_view n) {
+    return n == "Equals" || n == "GetHashCode" || n == "ToString";
+}
+
+void Resolver::checkChoiceCaseReservedNames(const TypeSymbol* t) {
+    if (!t) return;
+    if (t->kind != ast::TypeDeclKind::Choice) return;
+    for (const Symbol* m : t->members) {
+        auto* ccs = dynamic_cast<const ChoiceCaseSymbol*>(m);
+        if (!ccs) continue;
+        if (!isChoiceCaseReservedName(ccs->name)) continue;
+        // The diagnostic names the case, the choice, the reserved name,
+        // the spec section that imposes the reservation, the §35.7
+        // declared-member fix, and a concrete REMEDY (rename the case) —
+        // exactly the kind of compile error §11.3 / §35.1 produces
+        // elsewhere in this file.
+        ctx_.diagnostics().report(
+            Severity::Error, ccs->declLoc,
+            std::string("choice `") + std::string(t->name) +
+            "`: case `" + std::string(ccs->name) + "` is named `" +
+            std::string(ccs->name) + "`, which is reserved against case "
+            "names on every classification (§35.1, v0.302); rename the "
+            "case, because the name is reserved for the member §35.7 "
+            "lets the author declare");
     }
 }
 
@@ -7238,6 +7466,17 @@ void Resolver::recheckDeferredTypeBounds() {
     deferredTypeBoundFailures_.clear();
 }
 
+void Resolver::flushDeferredTypeBoundFailures() {
+    for (const auto& d : deferredTypeBoundFailures_) {
+        ctx_.diagnostics().report(
+            Severity::Error, d.loc,
+            std::string("type argument `") + d.argName +
+            "` does not satisfy the constraint `where " + d.param +
+            ": " + d.boundName + "` (§14.2)");
+    }
+    deferredTypeBoundFailures_.clear();
+}
+
 // §11.8 (v0.176, #807): a class/record declaring `: I<...>` where I carries
 // STATIC members (static methods / static operators) must itself supply
 // matching statics — exact signatures per the §11.2 matching rule applied to
@@ -7850,6 +8089,17 @@ const std::array<std::string_view, 25>& nonConstructibleBuiltinInterfaceNames() 
     return kNonConstructibleBuiltinInterfaceNames;
 }
 
+// fix #4472 (§14.2, v0.302; follow-up to fix #4446) — see the header
+// declaration (TypeResolution.hpp) for the full rationale and the three
+// call sites this unifies.
+bool isAbstractOrClosedClass(const TypeSymbol* d) {
+    if (!d) return false;
+    for (auto mod : d->modifiers) {
+        if (mod == "abstract" || mod == "closed") return true;
+    }
+    return false;
+}
+
 bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     decided = false;
     if (!arg) return false;
@@ -7994,6 +8244,22 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // a primary constructor carries its params on the TypeDecl, not a
             // ConstructorSymbol; treat a non-empty primary param list as a
             // non-parameterless constructor.
+            //
+            // fix #4472 (§14.2, v0.302; follow-up to fix #4446 — this arm was
+            // the un-fixed duplicate "Site A" the issue names): an `abstract`
+            // or `closed` class does NOT satisfy `new()` even when the ctor
+            // scan below would otherwise say yes (§22.7's implicit
+            // parameterless constructor is not enough — §12.5 makes `new` on
+            // such a class a compile error regardless). Shared with
+            // `ExprTC::groundSatisfiesNew` (#4446) and
+            // `checkMethodGenericConstraints`'s "new" item
+            // (ExprTypecheck_Calls.cpp) through ONE function rather than a
+            // third copy of the modifier test — see
+            // `sema::isAbstractOrClosedClass`'s own comment (TypeResolution.hpp).
+            if (isAbstractOrClosedClass(d)) {
+                decided = true;
+                return false;
+            }
             //
             // fix #3141: read `hasPositionalFields` off the TypeSymbol (#501)
             // and the parameters themselves as FieldSymbols (#2516) — through

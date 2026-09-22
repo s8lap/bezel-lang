@@ -68,6 +68,29 @@ bool Emitter::exprContainsAwait(const ast::Expr* e) {
 }
 
 
+// fix #4461 (§30.5 Pattern A kind 1, §30.6, v0.306): narrow predicate for the
+// Task-factory CallExpr shape that this fix's rejection fires on. Matches
+// `Task.FromOwnedResult(...)` / `Task.FromResult(...)` / `Task.FromException(...)`:
+// a `CallExpr` whose callee is a `MemberAccessExpr` on the bare identifier
+// `Task` with one of the three factory member names. Every other `CallExpr`
+// shape — `SomeFactory()` returning a fresh owned class value (a legitimate
+// kind-1 return), an `await`-bound local's call, an instance-method call on
+// `this`, etc. — is admitted unchanged, matching the narrow-to-known-shape
+// discipline #4285's rejection set follows.
+// // per §30.5 Pattern A, §30.6, v0.306
+bool Emitter::isTaskFactoryCallExpr(const ast::Expr* valueExpr) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(valueExpr);
+    if (!call) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id || id->name != "Task") return false;
+    return ma->member == "FromOwnedResult" ||
+           ma->member == "FromResult" ||
+           ma->member == "FromException";
+}
+
+
 bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     for (const auto& s : stmts) {
         if (!s) continue;
@@ -1032,26 +1055,47 @@ void Emitter::detectAsyncPatternAKind(const ast::Expr* valueExpr) {
         // of scope here to avoid a duplicated, drifting classification
         // (LANE_RULES §6) and a false-reject regression on that shape.
         // // per §30.5 kind 1, §28.3 Producers, v0.298
+        // fix #4461 (§30.5 Pattern A kind 1, §30.6, v0.306): a Task-factory
+        // `CallExpr` (`Task.FromOwnedResult(...)`, `Task.FromResult(...)`,
+        // `Task.FromException(...)`) on a Pattern A `Task<T:class>` non-await
+        // return returns a Task pointer whose value (a `bz_task_t*`, the
+        // inner OwningTask/Task struct, NOT the class value T) lands in the
+        // result slot the kind-1 result disposer reads as a T pointer — a
+        // type-mismatch SEGV at the first Dispose (#1503's measurement path,
+        // reproduced on this tree, probe1 from cycle-13 L6: 5/5 plain runs
+        // SIGSEGV). The existing #4285 rejection set above covers the borrow-
+        // shaped expressions the §28.3 Producers table marks as UNCONDITIONAL
+        // borrows (MemberAccessExpr / NullCondMemberExpr / IndexExpr); extend
+        // it to cover this Task-factory CallExpr shape with the same diagnostic,
+        // since the diagnostic gates the codegen module from being produced
+        // (`return nullptr` on `hasErrors()` in `generateModule`,
+        // LlvmBackend_impl.hpp ~908) — the same mechanism #4285's existing
+        // rejection set uses. Restricted to Task-factory members (not every
+        // CallExpr) so genuine kind-1 factory calls that return a fresh owned
+        // class value (`=> SomeFactory()` where SomeFactory returns a Widget,
+        // NOT a Task<Widget>) continue to compile, matching the
+        // narrow-to-known-shape discipline #4285's own set follows.
+        // // per §30.5, §30.6, v0.306
         if (asyncPatternAResultDisposer_ &&
             (dynamic_cast<const ast::MemberAccessExpr*>(valueExpr) ||
              dynamic_cast<const ast::NullCondMemberExpr*>(valueExpr) ||
-             dynamic_cast<const ast::IndexExpr*>(valueExpr))) {
+             dynamic_cast<const ast::IndexExpr*>(valueExpr) ||
+             isTaskFactoryCallExpr(valueExpr))) {
             ctx_.diagnostics().report(
                 Severity::Error, valueExpr->span.begin,
                 "an async method returning a class-typed `Task<T>` (§30.5 "
                 "Pattern A) may only `return` an OWNED expression on a "
                 "non-`await` return path — §30.5 kind 1: \"a `return` of an "
                 "owned expression: the task owns the result and its "
-                "destructor disposes it directly.\" A field, property, or "
-                "indexer read is a BORROW with no admitted producer-side "
-                "chain (§28.3 *Producers*: a plain field/property/indexer "
-                "read is Borrowed even when the field itself is `owned` — "
-                "only `move obj.f` transfers it), so the task's teardown "
-                "would dispose a value it never owned, a use-after-free once "
-                "the real owner disposes it independently. If the value is "
-                "genuinely owned by this frame, transfer it explicitly "
-                "(`move`); otherwise return `await` an admitted Pattern A "
-                "source instead");
+                "destructor disposes it directly.\" "
+                "`Task.FromOwnedResult(...)` (and `Task.FromResult(...)`, "
+                "`Task.FromException(...)`) returns an `OwningTask<T>` / "
+                "`Task<T>` value whose Task pointer would land in the "
+                "result slot the kind-1 disposer reads as a T pointer, a "
+                "use-after-free once any consumer's `await` reads it. Add "
+                "`await` (e.g. `=> await Task.FromOwnedResult(new T())`); "
+                "for a block-bodied method use `return await "
+                "Task.FromOwnedResult(...);` (§30.6, §30.5)");
         }
         return;
     }
@@ -1348,13 +1392,26 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // suspends registers + immediately releases inside emitAsyncComplete,
         // leaving the OWNER's wait a no-op.
         if (isInstance) {
-            llvm::Value* thisVal = currentThis_
-                                       ? currentThis_
-                                       : &*currentFn_->arg_begin();
-            auto* registerBorrowFn =
-                declareC("bz_register_borrow",
-                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(registerBorrowFn, {thisVal});
+            // fix #3460 (§28.3 / §30.1): register the borrow ONLY when
+            // currentThis_ is set — this matches the three release sites
+            // (emitAsyncComplete, named-method fault, lambda fault) all of
+            // which gate on `if (currentThis_)`. The earlier
+            // `arg_begin()`-fallback form was asymmetric: it would register
+            // against the wrong pointer for an `isInstance` method that
+            // reached this site without currentThis_ bound (e.g. an extension
+            // method lowered as an instance shape, or a builder that
+            // populated the frame before bind-this ran) and the OWNER's
+            // `bz_wait_for_borrows(this)` would then block on the wrong
+            // address forever. With this gate the register/release pair is
+            // symmetric: any frame that registers a borrow releases the
+            // borrow, the OWNER's wait unblocks, and a frame whose body has
+            // no `this` simply does not touch the side table at all.
+            if (currentThis_) {
+                auto* registerBorrowFn =
+                    declareC("bz_register_borrow",
+                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(registerBorrowFn, {currentThis_});
+            }
         }
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
@@ -2233,7 +2290,10 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             collectBoxCaptureLocals(lam.stmts);
             collectDefinitelyEscapingLambdas(lam.stmts);
             // Must run AFTER collectClosureReleaseEligible (uses its result).
-            collectCellFreeEligible(lam.stmts);
+            // fix #4524 (§27.5 / §28.9, v0.306): the async twin of the sync
+            // lambda's own re-scan — `&lam` gates the #3426 election exactly
+            // as it does there.
+            collectCellFreeEligible(lam.stmts, &lam);
         } else {
             closureReleaseEligible_.clear();
             // fix #3773 (§27.5 / §28.9, v0.286): closureLocalCandidates_ must
@@ -4641,8 +4701,39 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
             !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
             !taskTy->astNode->name->parts.empty() &&
             taskTy->headName() == "OwningTask");
+        bool isPlainTask = (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
+            !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
+            !taskTy->astNode->name->parts.empty() &&
+            taskTy->headName() == "Task");
         if (isOwnedTask && !freeTaskAfter) {
             markSpentAfter = true;
+            if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
+                takeResultAfter =
+                    (elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true).cat ==
+                     ElementPolicy::Category::ClassOwned);
+            }
+        }
+        // fix #4462 (§30.5 Pattern A, §30.6, v0.306): for a BOUND plain
+        // `Task<T:class>` await in a CONSUMING binding (`using var x := await
+        // t;`), set `takeResultAfter` so the existing post-await
+        // `bz_task_take_result(t, 0)` clears the task's result slot. The
+        // producer-side kind-1 disposer then sees `task->result == nullptr`
+        // and skips the dispose at task scope end — closing the UAF where the
+        // consumer's `x` already disposed the value and the task's kind-1
+        // disposer (attached by `emitAsyncPatternAResultDecision`'s kind-2
+        // chained arm when the producer's body is `return await
+        // Task.FromOwnedResult(new X)`) would dispose the same freed value a
+        // second time. Mirror of the OwningTask arm above, gated on the
+        // emitter-wide `awaitConsumesPlainTaskResult_` flag set by
+        // `lowerLocalDecl` ONLY when this await is the init of a `using var`
+        // LocalDecl (a non-consuming binding `var x := await t;` leaves the
+        // slot populated so the disposer still fires and disposes the class
+        // value once at task scope end, which is the existing Pattern A
+        // borrow-correctness contract). `markSpentAfter` is NOT set here:
+        // plain `Task<T>` is re-awaitable per §30.4 (#854) and the existing
+        // borrow-iteration `var a := await t; var b := await t;` shape must
+        // keep working.
+        else if (isPlainTask && !freeTaskAfter && awaitConsumesPlainTaskResult_) {
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
                 takeResultAfter =
                     (elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true).cat ==

@@ -2759,6 +2759,81 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 builtinOutOwnedArg(call->callee.get(), pos)) {
                 ++pos; continue;
             }
+            // fix #4023 (§28.3 K3.4, v0.294): a `move`/`await` TOP-LEVEL
+            // argument is a WRITE/consume position — validated and marked
+            // exclusively by `recordMovesIn`/`recordMovesInArgs`
+            // (`markMovedByName`/`recordFieldMove`), which runs AFTER this
+            // checkRead walk and needs to observe the argument's ORIGINAL
+            // Disposed/MovedFrom state to report the precise §28.3 "cannot
+            // move from disposed/already-moved local" ERROR. The blank
+            // `checkRead(*a.value, false)` recurses through the generic
+            // `UnaryExpr` → `IdentifierExpr` arms, which — for a Disposed
+            // source — report the (correct for a plain read, wrong for a
+            // move site) §28.2 use-after-dispose WARNING and then POISON
+            // the tracked state as a side effect. `markMovedByName`'s
+            // Poisoned fallthrough (by design silent, see its own comment)
+            // never fires, so the precise error is MASKED and the program
+            // is silently ACCEPTED instead of rejected. Measured pre-fix:
+            // `var y := Factory.Make(move x);` on an already-`Dispose()`d
+            // `x` compiled with only the Warning above (no Error) and
+            // SEGV'd under ASan reading freed memory inside the callee;
+            // the byte-identical `using var h := new Holder(move x);`
+            // ctor-argument spelling was and remains correctly rejected
+            // ("cannot move from disposed local `x` (§28.3)"). This is
+            // the SAME `isTopLevelConsumingForm` carve-out `readOperand`
+            // (the new-arms section below) and `readNullCondReceiver`
+            // (the `NullCondCallExpr` arm further below) already apply for
+            // every other read position `checkRead` walks — the bare
+            // `CallExpr` argument loop was the one position that still ran
+            // the unguarded `checkRead(*a.value, false)` predating #3971.
+            // // per §28.3 K3.4, v0.294, #3971, #4023
+            //
+            // fix #4141 (§28.3 K1.3, v0.298): CARVE-OUT to #4023 — for a
+            // top-level `move x` whose source identifier is currently in
+            // the `maybeConsumed` state (a join-fact, set by `joinInto`'s
+            // §28.3 Owned ⊓ MovedFrom meet — see this file ~line 9142),
+            // ALSO run `checkRead` over the argument so the read-side
+            // diagnostic ("local `x` may have already been consumed on
+            // another branch and may not be read here (maybe-consumed
+            // join, §28.3)") fires alongside the consume-side one
+            // (`markMovedByName`'s own maybeConsumed arm, which checks
+            // the FLAG not the STATE so it survives the cascade poison).
+            // §28.3 K1.3 lists read, borrow, and consume as the three
+            // uses a maybe-consumed join forbids — a `move` is BOTH a
+            // read (the slot is dereferenced to hand the receiver the
+            // pointer) AND a consume (the slot is zeroed). The consume-
+            // side diagnostic is the precise one; the read-side is a
+            // correct companion at this position and is what the
+            // regression-test Row 6 / 7 / 13 of #4141 (a lambda-body
+            // `while true do move x; break; end; move x;` shape) pins.
+            // The cascade-poisoning hazard #4023 fixed — `checkRead`'s
+            // `Disposed` arm masking `markMovedByName`'s precise §28.3
+            // ERROR via the Poisoned fallthrough — does NOT apply here:
+            // the `maybeConsumed` FLAG survives the state poison, so
+            // `markMovedByName`'s `if (st->maybeConsumed)` arm fires
+            // regardless, and the precise §28.3 consume-side ERROR is
+            // NOT masked. For `Disposed` / `MovedFrom` / `Uninitialized`
+            // sources the original #4023 skip remains correct (those
+            // are the states that trigger the cascade-mask bug).
+            // Limited to bare-identifier operands (`move x` / `await x`);
+            // complex move places (`move recv.field`, `move recv[i]`)
+            // reach `recordFieldMove` instead of `markMovedByName` and
+            // are unaffected either way.
+            // // per §28.3 K1.3, §28.3 K7, v0.298, #4141, #4023
+            if (isTopLevelConsumingForm(*a.value)) {
+                bool sourceMaybeConsumed = false;
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        a.value.get())) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get())) {
+                        if (auto* st = lookupState(id->name)) {
+                            if (st->maybeConsumed) sourceMaybeConsumed = true;
+                        }
+                    }
+                }
+                if (sourceMaybeConsumed) checkRead(*a.value, false);
+                ++pos; continue;
+            }
             checkRead(*a.value, false);
             ++pos;
         }
@@ -3150,7 +3225,7 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
 // "value-typed returns") is a copy and can never outlive its source, so
 // it is never a borrow escape and is reported here as may-borrow = false.
 bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
-    // #791 / §28.9 / §27.6: a method/property REFERENCE `recv.M` (a member access
+    // #791 / §28.3 / §27.6: a method/property REFERENCE `recv.M` (a member access
     // resolving to a method or property, used as a function value) captures `recv`
     // as a BORROW in its closure cell — `recv.GetN` ≡ `() => recv.GetN()`. It is
     // therefore a borrow of the receiver, NOT a value copy, even though its type
@@ -3392,7 +3467,7 @@ void MethodOwnership::collectIdentifiersIn(
     // method-scope local capture (literals, default/typeof/nameof, …).
 }
 
-// fix #3656 (§9.7 / §28.9, v0.286): the per-statement action is now a single
+// fix #3656 (§9.7 / §28.3, v0.286): the per-statement action is now a single
 // `fn`; the statement recursion (control-flow forms and their nested bodies)
 // is owned by `forEachNestedStmt`. This walker still scans the control-flow
 // forms' OWN expression positions (condition / iterable / withExpr /
@@ -3462,7 +3537,7 @@ void MethodOwnership::collectIdentifiersInStmt(
             if (is->target) collectIdentifiersIn(*is->target, out);
             return;
         }
-        // §9.7 / §28.9 (v0.220, #2181): a capture appearing ONLY under a
+        // §9.7 / §28.3 (v0.220, #2181): a capture appearing ONLY under a
         // control-flow statement of a block-bodied lambda is as much a capture
         // of the enclosing-method local as a top-level-statement one, and must
         // reach the SAME escape check. The walker descends into every nested
@@ -4430,7 +4505,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                         continue;
                     findLambdas(*a.value);
                 }
-                // fix #3702 (§28.9, v0.286): the SIGSEGV residual of #3564.
+                // fix #3702 (§28.3, v0.286): the SIGSEGV residual of #3564.
                 // `return mk();` is a CallExpr whose callee is a function-
                 // typed local whose value comes from a lambda-literal
                 // initializer. `findLambdas` historically descended into a
@@ -4480,7 +4555,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                                 ls->decl)) {
                             calleeInit = ld->initializer.get();
                         }
-                        // fix #3591 (§21.1 / §27.5 / §28.9, v0.286): §21.1's
+                        // fix #3591 (§21.1 / §27.5 / §28.3, v0.286): §21.1's
                         // runtime `const` is a SEPARATE AST node
                         // (LocalConstDecl) from `var`'s LocalDecl, and
                         // §21.1 explicitly admits a `const` binding a
@@ -4491,7 +4566,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                         // return-position CallExpr could be a `const mk :=
                         // lambda(): int => ...;` — the same #3702 / #3564
                         // escape shape, one binding-form over — and the
-                        // method-level §28.9 escape check silently never
+                        // method-level §28.3 escape check silently never
                         // visited its initializer lambda. Measured: identical
                         // to the #3702 repro, replacing `var mk := ...` with
                         // `const mk := ...` compiled clean and disposed the
@@ -4581,16 +4656,16 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     "instead)");
                 return;  // one diagnostic per return is enough
             }
-            // fix #3546 (§31.1, v0.283), narrowed by fix #3564 (§28.9,
+            // fix #3546 (§31.1, v0.283), narrowed by fix #3564 (§28.3,
             // v0.286): from `EscapeScope::LambdaBody` the §27.5 leg just
             // below and the §9.7 leg after it still answer about the WRONG
             // scope — `isRefOutParam` resolves the enclosing METHOD's
             // parameter and `recordBorrowLocalSource_` is method-scope
             // provenance, neither of which the lambda-body seeding supplies.
-            // The §28.9 leg at the bottom is no longer in that set: fix #3564
+            // The §28.3 leg at the bottom is no longer in that set: fix #3564
             // re-seeds `states_` from the lambda body's own owned
             // obligations, which is exactly that leg's input. See the header
-            // for the per-leg rationale. // per §31.1, §28.9, v0.286
+            // for the per-leg rationale. // per §31.1, §28.3, v0.286
             // §27.5 / §28.6 (#1217): a `ref` or `out` parameter is a pointer
             // into the CALLER's stack frame (§22.3). The pointer is valid only
             // for the duration of this method call. A closure that captures a
@@ -4618,7 +4693,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // §9.7 (#2144): "A borrow-bearing record may not be captured by a
             // closure that escapes its source's scope." A captured local of
             // borrow-bearing record / builtin-span type is a VALUE — never
-            // Owned in `states_`, so the §28.9 owned-capture leg below never
+            // Owned in `states_`, so the §28.3 owned-capture leg below never
             // sees it — but it carries its borrow's source set in
             // recordBorrowLocalSource_ (collectRecordBorrowSource, the
             // #1726/#1966 provenance machinery). Resolve the carried sources;
@@ -4717,7 +4792,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // call is answering about. A captured lambda parameter is not in
             // `states_`, so it is naturally excluded. In
             // `EscapeScope::Method` only an enclosing-method local/owned-param
-            // can match; in `EscapeScope::LambdaBody` (fix #3564, §28.9,
+            // can match; in `EscapeScope::LambdaBody` (fix #3564, §28.3,
             // v0.286) `states_` holds ONLY the lambda body's own owned
             // obligations, seeded by `seedLambdaBodyOwnedLocals`, so a local
             // declared in the lambda body whose closure escapes that body
@@ -4738,7 +4813,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 //       (so `savedMethodStates` holds the enclosing-method state
                 //        and the symbol IS present there — but we want the
                 //        CURRENT state, not the saved one)
-                // The §28.9 Owned leg below handles the non-disposed case.
+                // The §28.3 Owned leg below handles the non-disposed case.
                 if (st->state == OwnershipState::Disposed) {
                     report(
                         Severity::Error, id->span.begin,
@@ -4774,7 +4849,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                 }
             }
             if (!st) continue;
-            // §28.9: capturing an *owned* local (a `using var` or an
+            // §28.3: capturing an *owned* local (a `using var` or an
             // owned-producing local / `owned` parameter) is a borrow whose
             // source is the local's enclosing scope; the returned closure
             // outlives that scope. Only the Owned state carries this
@@ -4783,7 +4858,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // capturing one is not constrained and is not diagnosed here.
             if (st->state != OwnershipState::Owned) continue;
             // Belt-and-braces: confirm the captured local's declared type is
-            // a class/interface reference (the only thing a §28.9 borrow can
+            // a class/interface reference (the only thing a §28.3 borrow can
             // alias). An Owned non-reference would be surprising, but the
             // type gate keeps the check from ever firing on a value-typed
             // local even if a future producer marked one Owned.
@@ -5267,6 +5342,54 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         return true;
     };
 
+    // fix #4428 (§9.7, v0.301): the parameter-rooted rejection. §9.7's
+    // admitted-return set for a borrow-bearing record is receiver-sourced,
+    // static-storage-sourced, or the null-source form — and the closing text
+    // expressly excludes "a plain parameter of the returning method" (the
+    // shape #4428 names — `public static method Trim(s: ReadOnlySpan<byte>):
+    // ReadOnlySpan<byte> => s.Slice(1);` — carries a borrow of `s`, a
+    // parameter, and the call site cannot re-establish the source against
+    // anything but the receiver the record type announces no source set).
+    // `this` (an IdentifierExpr with name "this", which sema leaves
+    // unresolved) is NOT a ParameterSymbol and falls through this check,
+    // so the receiver-sourced arm stays admitted — exactly the §4.14
+    // `FrameBuffer.ScanLine` shape that constructs the span off `this`'s
+    // own fields. A static-storage source (the `static`-getter form) is
+    // also not a parameter, so its arm is untouched. Per §9.7 v0.301; the
+    // callee-side arm that closes this gap.
+    auto reportIfParameterRoot =
+        [&](const ast::IdentifierExpr* root, SourceLocation loc,
+            bool spanForm) -> bool {
+        if (!root) return false;
+        // A `this` IdentifierExpr resolves to no symbol — sema treats it as
+        // an implicit-meaning identifier (ExprTypecheck_Exprs.cpp:1457-1494).
+        // Skip it; the receiver-sourced arm admits this case upstream.
+        if (root->name == "this") return false;
+        sema::Symbol* sym = ctx_.exprSymbol(*root);
+        if (!sym) return false;
+        if (!methodParamSet_.count(sym)) return false;
+        report(
+            Severity::Error, loc,
+            spanForm
+                ? (std::string("returned span is rooted at parameter `") +
+                   std::string(root->name) +
+                   "` — a span (§4.14/§4.15) is a borrow of its backing "
+                   "Array / OwningBuffer and may not outlive it, but the "
+                   "caller has no way to re-establish a parameter-sourced "
+                   "borrow against its own actuals, so §9.7 rejects the "
+                   "return (v0.301; expose the backing storage and "
+                   "re-derive the span at the call site instead)")
+                : (std::string("returned borrow-bearing record carries a "
+                   "borrow of parameter `") +
+                   std::string(root->name) +
+                   "` — a borrow-bearing record may not outlive the "
+                   "source of any borrow it carries, and a plain parameter "
+                   "of the returning method has no source the caller can "
+                   "re-establish (§9.7, v0.301; bind the source in the "
+                   "caller's scope and build the record there instead)"));
+        return true;
+    };
+
     // §9.7 transitivity (#2127): report the escape of a returned record / span
     // whose CARRIED borrow source is the escape-bound local `src` (identified by
     // name, forked span / record / catch — the same three wordings as
@@ -5371,6 +5494,23 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             if (reportIfScopeBoundOwned(argRoot, ne->span.begin,
                                         /*spanForm=*/typeIsSpan))
                 return true;  // one diagnostic per return is enough
+            // (a') fix #4428 (§9.7, v0.301): the argument root is a plain
+            //      parameter of the returning method (`new Holder(s.AsSpan())`
+            //      — root `s`). The scope-bound-owned check above does not
+            //      catch parameters (they are not in `states_`); §9.7 closes
+            //      the parameter arm explicitly — re-establish the source the
+            //      caller-side has nothing to anchor against. For a user record
+            //      (`recordTs` set) only BORROW-CARRYING-field args are walked
+            //      above, so every arg here is a borrow source — safe to reject
+            //      unconditionally. For a builtin span (no user record decl)
+            //      the conservative every-arg loop below walks offset/length
+            //      args too, which are not borrow sources; the caller below
+            //      filters to the first arg only — the buffer — in that case.
+            if (!typeIsSpan) {
+                if (reportIfParameterRoot(argRoot, ne->span.begin,
+                                          /*spanForm=*/typeIsSpan))
+                    return true;
+            }
             // (b) §9.7 transitivity (#2127): the argument is itself a borrow-
             //     bearing local whose CARRIED source is a live escape-bound
             //     obligation — a span var (`var s := local.AsSpan(); return new
@@ -5456,6 +5596,22 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
                 const ast::CallArgument& a = ne->args[i];
                 if (!a.value) continue;
                 if (checkArg(*a.value)) return;
+                // fix #4428 (§9.7, v0.301): the parameter-root check above is
+                // gated to user records only (checkArg's (a') arm). For a
+                // builtin span constructor every arg is conservatively scanned,
+                // so the (a') arm can't fire — but the buffer (the FIRST arg
+                // by stdlib §4.14/§4.15 convention) IS the borrow source, while
+                // start/length are offsets. Reject the span construction only
+                // when the BUFFER's root is a parameter — `new Span<T>(s, 0, 1)`
+                // where `s` is a parameter. `new Span<T>(_buf.Data, 0, 1)` (a
+                // static-field buffer) is admitted unchanged — the §9.7
+                // static-storage-sourced arm keeps it sound.
+                if (i == 0) {
+                    const ast::IdentifierExpr* bufRoot = identifierRoot(*a.value);
+                    if (reportIfParameterRoot(bufRoot, ne->span.begin,
+                                              /*spanForm=*/typeIsSpan))
+                        return;
+                }
             }
         }
         return;
@@ -5473,7 +5629,19 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // and require the receiver ROOT (`identifierRoot` peels the member/call/
     // index chain) to be a tracked owned local. // per §9.7, §4.14, §4.15
     if (!typeIsSpan) return;  // a user record → not the span gap
-    reportIfScopeBoundOwned(identifierRoot(e), e.span.begin, /*spanForm=*/true);
+    const ast::IdentifierExpr* projRoot = identifierRoot(e);
+    // fix #4428 (§9.7, v0.301): the parameter arm. Today, `local.AsSpan()` /
+    // `local[i]` with `local` a tracked owned local is rejected; with `local`
+    // a plain parameter (`s.Slice(1)` returning a span view of `s`) it slips
+    // through, because parameters are not in `states_` — a use-after-free
+    // shape, since the caller's actuals carry the source the record type
+    // announces nothing about. Reject the parameter root here, ahead of the
+    // scope-bound-owned check below. The receiver-sourced arm (this IdentifierExpr
+    // — sema leaves it unresolved) and the static-storage arm (a static-field
+    // IdentifierExpr) are unaffected, since neither is a ParameterSymbol.
+    if (reportIfParameterRoot(projRoot, e.span.begin, /*spanForm=*/true))
+        return;
+    reportIfScopeBoundOwned(projRoot, e.span.begin, /*spanForm=*/true);
 }
 
 bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
@@ -5891,7 +6059,7 @@ static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym) {
 }
 
 void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
-    // §28.9 / §9.7 indirect form: `return holder;` where `holder` is a bare
+    // §28.3 / §9.7 indirect form: `return holder;` where `holder` is a bare
     // local whose tracked borrow-source aliases a still-owned scope-bound
     // local. The returned expression must be the bare holder identifier — a
     // value projection off the holder (`holder.SomeInt`, `holder()`) returns
@@ -6027,7 +6195,7 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     }
     if (!st || !st->source) return;
     // The source must still be a live scope-bound obligation at the return
-    // point: an owned scope-bound local (§28.9 / §9.7) or a catch-bound
+    // point: an owned scope-bound local (§28.3 / §9.7) or a catch-bound
     // exception variable (§31.1, issue #392). If an owned source was already
     // disposed / moved out, there is no live borrow to dangle (and a separate
     // diagnostic would have covered misuse); a catch binding is always live
@@ -9840,8 +10008,27 @@ void MethodOwnership::collectRecordBorrowRoots(
         // The carried source is the identifier at the root of the chain:
         // `buf.AsSpan()` / `s.Slice(r)` → `buf` / `s`, a bare alias `s` → `s`.
         if (const ast::IdentifierExpr* r = identifierRoot(sub)) {
-            if (sema::Symbol* sym = ctx_.exprSymbol(*r))
-                if (sym != self) srcs.push_back(sym);
+            sema::Symbol* sym = ctx_.exprSymbol(*r);
+            if (!sym) return;
+            // fix #4428 (§9.7, v0.301): the type-name root. For a static call
+            // `Util.Trim(s.AsSpan())`, `identifierRoot` peels the chain to the
+            // type name `Util` (a TypeSymbol) — not a borrow source. The pre-fix
+            // code added it to srcs anyway, polluting the provenance map with
+            // a meaningless "source" the consume-site freeze treats as live
+            // (TypeSymbols are never owned, so the freeze is never triggered —
+            // and yet the carried borrow's actual source is the parameter `s`,
+            // which the callee-side fix now rejects at the return site, so the
+            // the type-name-rooted path no longer reaches this branch for the
+            // it was the only thing that reached it). Skip TypeSymbol roots;
+            // for admitted forms (receiver-sourced `this`/field and
+            // static-storage-sourced static field), the chain's root is
+            // neither — `this` resolves to no symbol (so the `!sym` arm
+            // already skips it), and a static-field identifier is a
+            // FieldSymbol (preserved through unchanged). The pre-fix pollution
+            // was the only way a TypeSymbol could land in srcs. // per §9.7
+            // v0.301
+            if (dynamic_cast<sema::TypeSymbol*>(sym)) return;
+            if (sym != self) srcs.push_back(sym);
         }
     };
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
@@ -10375,10 +10562,32 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     if (st->state == OwnershipState::Disposed) {
+        // §28.2 (v0.303): under a *dominating* Dispose()/discard, EVERY use
+        // — read, borrow, AND consume (a `move`, an `owned` argument, a
+        // `using var` adoption) — draws §28.2's use-after-dispose WARNING,
+        // not §28.3's consume-table ERROR. The Disposed state here was set
+        // by a prior explicit Dispose() that dominates this consume site on
+        // every path (otherwise `lookupState` would have surfaced the
+        // `maybeConsumed` join flag, which still errors below), so the
+        // severity ruling applies: demote this arm to Warning. The
+        // diagnostic TEXT stays specific — "move from a local already
+        // disposed" rather than the read-side wording `checkRead` uses — so
+        // a programmer reading the warning still sees the consume shape and
+        // the disposed state at a glance; the message cites §28.2 explicitly
+        // to mark the regime change from the prior §28.3 error text.
+        //
+        // Conditional-kill arms (the `maybeConsumed` branch below, and
+        // `markDisposedByName`'s own maybeConsumed arm) are UNCHANGED — the
+        // ruling is the severity of the dominating kill, not a relaxation of
+        // the conditional kill, which is §28.3's harder contract and the
+        // checked-disposal backstop the language relies on. // per §28.2,
+        // v0.303, #4450 (closes the implementation half of #3975)
         report(
-            Severity::Error, loc,
-            std::string("cannot move from disposed local `") +
-            std::string(name) + "` (§28.3)");
+            Severity::Warning, loc,
+            std::string("move from a local `") + std::string(name) +
+            "` already disposed at this point (§28.2) — "
+            "use-after-dispose is undefined behaviour in unchecked mode "
+            "and raises DisposedAccessException in checked mode");
         // fix #3931 sibling sweep: deferred to the emit pass for the reason
         // traced in `markDisposedByName`'s MovedFrom arm above — a
         // suppressed-phase poison collapses the loop-header meet and silences
@@ -18090,6 +18299,19 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                            "` itself `scoped` to store it (§28.14, v0.177)");
                 return;
             }
+            // §28.14 v0.301 (#4429): a VALUE-TYPED parameter (string, int,
+            // …) is captured by value into the lambda's heap capture cell
+            // and contributes no borrow source (spec §28.3, "a value-typed
+            // capture contributes nothing"). Mirror the LocalSymbol branch's
+            // filter below to fix the asymmetry that previously rejected
+            // value-typed parameter captures while admitting the same
+            // capture as a value-typed local. Null declType stays
+            // conservative (treated as a reference — admit and let the
+            // downstream check classify it).
+            const sema::TypeRef* pDeclTy = nullptr;
+            if (ps->declType) pDeclTy = ctx_.resolvedType(*ps->declType);
+            else pDeclTy = ps->resolvedDeclType;
+            if (pDeclTy && !isBorrowableType(pDeclTy)) continue;
             anyCapture = true;
             nonThisCaptures.push_back(id);  // a param is not `this` (forms 3/4)
             // Parameters precede every local — declaration order holds. An

@@ -19,6 +19,7 @@
 
 using bezel::test::runAot;
 using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::diagnosticMessageContains;
 
 namespace {
 int run(const std::string& program) {
@@ -451,5 +452,155 @@ BEZEL_TEST(enum_underlying_1189, signed_enum_relational_compare_unaffected) {
         "  if not (E.Pos > E.Neg)  then return 2; end; "
         "  if not (E.Neg <= E.Pos) then return 3; end; "
         "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// ── §10.3 (#4565): the colon-list HEAD gate ──────────────────────────────
+//
+// §10.3: "The colon list is one list: if its first item resolves to one of
+// the eight underlying-type keywords, that item is the underlying type;
+// otherwise the underlying type is `int` and every item names an interface.
+// Where the otherwise branch then fails because the first item names a type
+// that is not an interface — `enum Ratio: double` — the diagnostic should
+// name the underlying-type fact."
+//
+// Pre-fix, TypeResolution_Names.cpp's enum-underlying-type arm fired on
+// `ref->kind == TypeRef::Kind::Primitive` alone — ANY primitive (not just the
+// eight integer kinds), at ANY colon-list position. That produced two
+// distinct pre-fix failure modes, both closed by the same gate:
+//   * `double`/`float`/`decimal` reached codegen carrying that "underlying
+//     type", and enum equality's unconditional `CreateICmpEQ`
+//     (LlvmBackend_Setup.cpp, emitEnumEquals) emitted an invalid `icmp` on a
+//     float/struct operand — LLVM IR verification failure (measured: "Invalid
+//     operand types for ICmp instruction" / "codegen error: IR verification
+//     failed", a bare LLVM-verifier message with no `file:line:col:` prefix).
+//   * `bool`/`char`/`string`/a class/a record were SILENTLY ACCEPTED (no
+//     diagnostic at all, `ran == true`): `bool` (i1), `char` (an integer
+//     width) and `string` (a pointer) are each a VALID icmp operand shape, so
+//     they never tripped the verifier; a class or record is Kind::Named and
+//     was pushed into the enum's `baseTypes` completely unexamined.
+//
+// FAIL-WITHOUT is asserted directly against these two distinct shapes rather
+// than a bare `!ran` (issue #3892: vacuous for the silently-accepted shapes,
+// which have `ran == true` pre-fix, not a different diagnostic) or
+// `failedAtCompileTimeWithRealLocation` (CLAUDE.md's own caution: that helper
+// can return true on both sides whenever a crash's backstop diagnostic
+// happens to carry a location — here the pre-fix LLVM-verifier text has none,
+// but the project's discipline is to assert the specific diagnostic anyway
+// rather than lean on that).
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, double_head_rejected_not_crashed) {
+    // per §10.3 — pre-fix this reached codegen and crashed IR verification
+    // ("icmp eq double"); post-fix it is a clean compile-time rejection
+    // naming the underlying-type fact, not "IR verification failed".
+    auto r = runAot(
+        "module M; "
+        "enum Ratio: double Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "malformed IR"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, float_head_rejected_not_crashed) {
+    // per §10.3 — `float` is Kind::Primitive but not one of the eight; pre-fix
+    // it reached codegen and emitted `icmp eq float`.
+    auto r = runAot(
+        "module M; "
+        "enum Ratio: float Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, decimal_head_rejected_not_crashed) {
+    // per §10.3 — `decimal` lowers to a struct (`%bz.decimal`); pre-fix
+    // `icmp eq %bz.decimal` was rejected by the verifier as an
+    // aggregate-typed ICmp operand.
+    auto r = runAot(
+        "module M; "
+        "enum Ratio: decimal Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, bool_head_now_rejected) {
+    // per §10.3 — pre-fix `bool` (PrimitiveType::Bool, i1) was a VALID icmp
+    // operand shape, so it was silently ACCEPTED as an underlying type with
+    // NO diagnostic at all (`ran == true`, not a crash). The fix rejects it
+    // outright: `bool` is not one of the eight, and is not an interface.
+    auto r = runAot(
+        "module M; "
+        "enum Ratio: bool Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, string_head_now_rejected) {
+    // per §10.3 — pre-fix `string` (a pointer at codegen) was ALSO a valid
+    // icmp operand shape, so a string-"backed" enum was silently accepted.
+    auto r = runAot(
+        "module M; "
+        "enum Ratio: string Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, class_head_now_rejected) {
+    // per §10.3 — a class is Kind::Named with a declaration; nothing checked
+    // it against the eight primitives OR against "is this an interface", so
+    // it was pushed into the enum's `baseTypes` unexamined and accepted.
+    auto r = runAot(
+        "module M; "
+        "class Box end Box; "
+        "enum Ratio: Box Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, record_head_now_rejected) {
+    // per §10.3 — the same gap as the class case above, for a record head.
+    auto r = runAot(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "enum Ratio: Point Half, Whole; end Ratio; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "admissible underlying types"));
+}
+
+// Regression guards: a real interface head, and the eight admissible
+// primitives (by keyword and by reserved PascalCase alias), are unaffected.
+BEZEL_TEST(enum_colon_list_underlying_type_4565, real_interface_head_still_accepted) {
+    // per §10.3 — a genuine interface at colon-list position 0 is admitted;
+    // the underlying type defaults to `int` (§10.3's "otherwise" branch).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface ITagged method Tag(): int; end ITagged; "
+        "enum Ratio: ITagged "
+        "  Half, Whole; "
+        "  public method Tag(): int => 0; "
+        "end Ratio; "
+        "class C public static method Main(): int "
+        "  return (if int(Ratio.Half) = 0 then 0 else 1); "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(enum_colon_list_underlying_type_4565, pascalcase_alias_head_still_accepted) {
+    // per §10.3 / §3.4 — `Int16` (the reserved PascalCase alias for `short`)
+    // is one of the eight, spelled differently: `enum E: Int16` and
+    // `enum E: short` declare the same type.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Ratio: Int16 Half, Whole := 30000; end Ratio; "
+        "class C public static method Main(): int "
+        "  return (if int(Ratio.Whole) = 30000 then 0 else 1); "
         "end Main; end C;"), 0);
 }

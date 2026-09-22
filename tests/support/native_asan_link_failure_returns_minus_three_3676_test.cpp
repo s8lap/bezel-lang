@@ -89,9 +89,21 @@ BEZEL_TEST(native_asan_link_failure_returns_minus_three_3676,
         (dir / "definitely-not-a-runtime-for-3676.o").string();
 
     int status = 0;
-    const int rc = bezel::test::asan_detail::linkAndRunUnderAsan(
-        bogusRtObj, objPath.string(), exe.string(),
-        "detect_leaks=1:exitcode=99", status);
+    int markers = 0;
+    int rc = 0;
+    {
+        // #4504 made an infra failure mark the current test failed directly,
+        // so that a link failure cannot masquerade as a clean sanitizer run.
+        // This ratchet INDUCES exactly that failure to pin the -3 contract,
+        // so the marking is the mechanism under test rather than a verdict on
+        // this test. The guard suppresses the marking for its scope and counts
+        // the markers, so both halves stay asserted.
+        bezel::test::asan_detail::ExpectAsanInfraFailure guard;
+        rc = bezel::test::asan_detail::linkAndRunUnderAsan(
+            bogusRtObj, objPath.string(), exe.string(),
+            "detect_leaks=1:exitcode=99", status);
+        markers = guard.count();
+    }
 
     std::remove(objPath.string().c_str());
     std::remove(exe.string().c_str());
@@ -102,4 +114,11 @@ BEZEL_TEST(native_asan_link_failure_returns_minus_three_3676,
     // conflation that hid #3653's detect_leaks regression until the ASan
     // sweep forced the refusal in #3682.
     BEZEL_EXPECT_EQ(rc, -3);
+
+    // The other half of the #4504 contract: the link failure must also have
+    // announced itself. Asserting the count (not merely tolerating the
+    // marking) is what keeps the suppression above from hiding a marker that
+    // stopped firing -- a silent -3 is the #3676 conflation wearing a new
+    // number.
+    BEZEL_EXPECT_EQ(markers, 1);
 }

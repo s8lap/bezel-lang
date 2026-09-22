@@ -30,15 +30,18 @@
 // same order, so the fix inherits their validation rather than adding a
 // third/fourth spelling of the same checks (LANE_RULES §6/§25).
 //
-// EXCLUDED, DELIBERATELY: §17.7 explicitly carves a LAMBDA's ascribed return
-// out of "return statements" ("It is not permitted at ... a lambda's ascribed
-// return"), even though a lambda body's own `return` reuses the identical
-// `returnCtx_ == ValueMethod` machinery (§27.3/#2101) the fix's return-
-// position gate reads. The fix additionally gates on `!inLambda_` (the
-// existing §29.9/#747 lambda-body marker) to hold that carve-out — see the
-// `control_lambda_ascribed_return_unaffected` row below, which pins that the
-// lambda position's pre-existing (separately filed, still-open) #2491
-// degradation is UNCHANGED by this fix.
+// EXCLUDED FROM THE GRANT, THEN REJECTED (#4249): §17.7 explicitly carves a
+// LAMBDA's ascribed return out of "return statements" ("It is not permitted at
+// ... a lambda's ascribed return"), even though a lambda body's own `return`
+// reuses the identical `returnCtx_ == ValueMethod` machinery (§27.3/#2101)
+// the fix's return-position gate reads. #4208 gated on `!inLambda_` (the
+// existing §29.9/#747 lambda-body marker) to hold that carve-out. But
+// declining to TYPE the shorthand is not the same as DIAGNOSING it: the
+// untyped NewExpr fell through to codegen's #2491 zero/null backstop, so the
+// position compiled and then SEGV'd on the null it returned. #4249 (v0.306)
+// closes that by REJECTING both spellings of the excluded position — see the
+// two rows at the end of this file, whose oracle was strengthened from "not
+// 77" to the located §17.7 rejection when #4249 landed.
 //
 // MEASURED pre-fix (base 6f46a73, this issue's own probes, record and class
 // targets both): `method M(p: T := new(3, 4)): int => ...` and `method
@@ -342,20 +345,40 @@ BEZEL_TEST(sema_new_shorthand_default_param_and_return_4208,
 }
 
 // =====================================================================
-// CONTROL: a lambda's ASCRIBED return is explicitly excluded by §17.7
-// ("It is not permitted at ... a lambda's ascribed return") even though it
-// reuses the same returnCtx_ == ValueMethod machinery this fix's return-
-// position gate reads (§27.3/#2101). The fix's `!inLambda_` guard keeps this
-// position's pre-existing #2491 degradation UNCHANGED — this row passes
-// IDENTICALLY before and after this fix (a deliberate control, not a
-// fix-dependent row; LANE_RULES §20). The lambda position's own degradation
-// is a separate, still-open gap outside #4208's scope (a lambda's ascribed
-// return is NOT one of the four positions #4208 names) — filed separately.
+// §17.7's EXCLUDED declared-result position: a lambda's ascribed return.
+// §17.7 (v0.306) grants the shorthand positions (i), (ii), (iii) and the
+// `return e;` STATEMENT of (v), then excludes this one verbatim: "It is
+// **not** permitted at an expression body or at a lambda's ascribed
+// return". Member (v)'s third declared-result position is itself "a
+// `return` operand or expression body checked against a lambda's
+// return-type ascription" (§27.3), so BOTH spellings pinned below — the
+// block body's `return new();` and the expression body `=> new()` — are
+// excluded by that ONE clause.
+//
+// HISTORY / why the oracle changed (#4249). #4208 held the carve-out by
+// declining to TYPE the shorthand here (its `!inLambda_` gate), and this
+// row originally asserted only `77 != runProg(...)` — i.e. merely that the
+// program did not produce the constructed value. That oracle was WEAK:
+// declining to type the shorthand is not the same as DIAGNOSING it, so the
+// untyped NewExpr fell through to codegen's #2491 zero/null backstop, the
+// program COMPILED (an `internal:` Warning at most, and for the
+// expression-body spelling no diagnostic at all), and then SEGV'd on the
+// first member read of the null it returned — exit 139, measured 60/60 at
+// e672e7e1. `runAot` reports a signal-killed program as `ran=false`, so the
+// row went GREEN over a memory-safety crash reachable from ordinary Bezel
+// source: exactly the failure mode the row existed to catch. #4249 fixes
+// that by rejecting both spellings where §17.7 says they are not permitted.
+//
+// These rows therefore assert the LOCATED §17.7 compile-time rejection the
+// spec requires, which strictly dominates the old "not 77" oracle (a
+// compile-time rejection gives `ran=false`, so 77 is unreachable). The
+// oracle is STRENGTHENED, never weakened. The first row keeps its original
+// name so its gate identity is preserved.
 // =====================================================================
 
 BEZEL_TEST(sema_new_shorthand_default_param_and_return_4208,
            control_lambda_ascribed_return_shorthand_unaffected_spec_17_7) {
-    BEZEL_EXPECT_TRUE(77 != runProg(
+    auto r = runAot(
         "module M; "
         "class WidgetLambdaCtl4208 "
         "  public property Tag: int := 77; "
@@ -367,5 +390,33 @@ BEZEL_TEST(sema_new_shorthand_default_param_and_return_4208,
         "    var w: WidgetLambdaCtl4208 := f(); "
         "    return w.Tag; "
         "  end Main; "
-        "end ProgramWidgetLambdaCtl4208;"));
+        "end ProgramWidgetLambdaCtl4208;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "not permitted at a lambda's return"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§17.7"));
+}
+
+// The expression-body spelling of the SAME §17.7 clause ("not permitted at
+// an expression body or at a lambda's ascribed return"). Pre-#4249 this one
+// compiled with NO diagnostic whatsoever — not even #2491's `internal:`
+// Warning the block-body spelling emitted — and SEGV'd identically.
+BEZEL_TEST(sema_new_shorthand_default_param_and_return_4208,
+           reject_lambda_expression_body_shorthand_spec_17_7_4249) {
+    auto r = runAot(
+        "module M; "
+        "class WidgetLambdaExpr4249 "
+        "  public property Tag: int := 77; "
+        "end WidgetLambdaExpr4249; "
+        "class ProgramWidgetLambdaExpr4249 "
+        "  public static method Main(): int "
+        "    var f := lambda(): WidgetLambdaExpr4249 => new(); "
+        "    var w: WidgetLambdaExpr4249 := f(); "
+        "    return w.Tag; "
+        "  end Main; "
+        "end ProgramWidgetLambdaExpr4249;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "not permitted at a lambda's return"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§17.7"));
 }

@@ -98,15 +98,30 @@ void expectAsanSafeIgnoringLeaks(const std::string& source,
 
 // Confirms a leak IS reported — proves the conservative-leak fallback below
 // is actually armed (not vacuously passing because nothing leaks).
-void expectAsanLeakDetected(const std::string& source) {
-    int a = runUnderAsanWithOptions(source, /*expectedExitCode=*/0,
+//
+// fix #4577: `expectedExitCode` MUST be the program's real value, passed by
+// the caller, not hardcoded. `runUnderAsanWithOptions` (family A,
+// tests/support/run_under_asan.hpp `runUnderAsanValue`) returns 1 for THREE
+// distinct outcomes — a raw crash, a genuine sanitizer report (exitcode=99),
+// AND a clean run whose own exit value merely differs from
+// `expectedExitCode` — and every program this helper is called on returns
+// `Tracked._count == 1`. A hardcoded `expectedExitCode=0` therefore made `1`
+// come back unconditionally (the "wrong value" branch fires every time,
+// sanitizer report or not), so `BEZEL_EXPECT_EQ(a, 1)` below could never
+// fail — CLAUDE.md's "oracles that pass vacuously" class. Passing the real
+// expected value collapses the helper to two outcomes (crash or genuine
+// sanitizer report vs. a correct clean run), so `1` here is reachable ONLY
+// via an actual sanitizer/crash finding.
+void expectAsanLeakDetected(const std::string& source, int expectedExitCode) {
+    int a = runUnderAsanWithOptions(source, expectedExitCode,
                                     "detect_leaks=1:exitcode=99");
     if (a == -1) return;  // toolchain unavailable: skip
     // runUnderAsanWithOptions returns 1 for ANY sanitizer report, including a
     // leak (exitcode=99) — so `1` here means "a leak (or crash) occurred".
     // Distinguish leak-vs-crash is not needed: expectAsanSafeIgnoringLeaks
     // above already proves this same shape has no crash/UAF, so a nonzero
-    // result here is necessarily the conservative leak, not a fresh crash.
+    // result here is necessarily the conservative leak, not a fresh crash —
+    // PROVIDED `expectedExitCode` is the program's real value (see above).
     BEZEL_EXPECT_EQ(a, 1);
 }
 
@@ -275,22 +290,42 @@ BEZEL_TEST(taskscope_asan_2334, unwind_edge_conservative_leak_not_uaf) {
     // disposed normally by the `using var` unwind path; only the 8-byte
     // CAPTURE-CELL free is what this fix conservatively skips on unwind).
     expectAsanSafeIgnoringLeaks(source, 1);
-    expectAsanLeakDetected(source);
+    expectAsanLeakDetected(source, 1);
 }
 
 // Control shape / #694 loop-guard interaction: `t` is declared BEFORE
 // `scope` (satisfies §28.14's declared-before admission), but the Spawn call
 // recurs across loop iterations, so boxLocalSlot uses GUARDED boxing for
-// `t`'s cell (one cell shared across all three spawned closures) — exactly
-// the shape LlvmBackend_Exprs2.cpp's `wasGuardedLocal`/`guardedOk` check
-// (pre-existing, untouched by this fix) conservatively excludes, mirroring
-// #694's own `loopStack_.empty()` guard for the SAME reason: a single
-// shared cell cannot be safely freed at any one capturing closure's own
-// point without risking a UAF on a sibling iteration's still-live closure.
-// Must stay memory-SAFE and still dispose `t` exactly once; the cell itself
-// is allowed (expected) to leak — this fix does not, and must not, touch
-// that pre-existing conservative exclusion.
-BEZEL_TEST(taskscope_asan_2334, loop_capture_stays_conservative_leak_not_uaf) {
+// `t`'s cell (one cell shared across all three spawned closures) — ORIGINALLY
+// (see 9ed5152, this file's own creation) exactly the shape
+// LlvmBackend_Exprs2.cpp's `wasGuardedLocal`/`guardedOk` check conservatively
+// excluded, mirroring #694's own `loopStack_.empty()` guard for the SAME
+// reason: a single shared cell cannot be safely freed at any one capturing
+// closure's own point without risking a UAF on a sibling iteration's
+// still-live closure.
+//
+// fix #4577: that premise is now STALE, and this row's oracle was hiding it.
+// #3498 (b43196a4, "narrow #3498: feed §28.14's call-bounded default to the
+// capture-cell walker, and let #969 answer the in-loop question it already
+// answers", §27.5/§28.9/§28.14, v0.283) added a `declaredShallower` conjunct
+// to `guardedOk` (`git blame` on that line: b43196a48) — reading #969's own
+// `declScopeDepth_` predicate, already computed at the capture site — and `t`
+// is declared SHALLOWER than the loop that captures it, so `declaredShallower`
+// is true here and `guardedOk` now admits the free. That free lands at `t`'s
+// OWN scope end, i.e. AFTER `await scope.Join()` has already awaited every
+// spawned iteration's closure to completion — which is exactly #3498's GAP-2
+// argument (the exclusion was "answering a question its own consumer answers
+// better") and is NOT the per-iteration free the original comment worried
+// about, so it is sound, not a UAF: measured `detect_leaks=0` clean (no
+// crash/UAF/double-free) AND `detect_leaks=1` clean (no leak) at the SAME
+// exit code (1) — the row's own `expectAsanLeakDetected(source, 1)` FAILED
+// the instant #4577 fixed that helper's vacuous oracle (hardcoded
+// `expectedExitCode=0` made it unconditionally return 1, so it could not have
+// caught #3498 closing this leak at the time it happened). Re-pointed at what
+// is now true, with the single ordinary `expectAsanClean` this file's other
+// fully-clean rows already use: `t`'s cell is reclaimed exactly once, with no
+// leak and no UAF.
+BEZEL_TEST(taskscope_asan_2334, loop_capture_over_shallower_local_now_reclaimed_3498) {
     const std::string source =
         std::string("module M; import System.Threading; ") + kTrackedClass +
         "class Prog "
@@ -310,8 +345,7 @@ BEZEL_TEST(taskscope_asan_2334, loop_capture_stays_conservative_leak_not_uaf) {
         "    return Tracked._count; "
         "  end Main; "
         "end Prog;";
-    expectAsanSafeIgnoringLeaks(source, 1);
-    expectAsanLeakDetected(source);
+    expectAsanClean(source, 1);
 }
 
 // Control shape: EventSource<T>.Subscribe (also a `scoped` position, stdlib

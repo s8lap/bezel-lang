@@ -48,6 +48,34 @@ static std::string owningRenameHint(std::string_view name) {
     return std::string();
 }
 
+// stdlib §4.2 / spec §14.4 (v0.306): the index of the OWNED element slot in
+// one of the six owning collections' generic-argument lists, or npos when
+// `name` is not one of them. Slot 0 is `T` for the list/set/stack/queue
+// families; slot 1 is `V` for `OwningDictionary<K, V>` (the key K is
+// borrowed and value-like by design, §28.11, and is checked by
+// checkHashContainerKeys instead).
+//
+// fix #2735: hoisted out of the declaration-site `ownedSlot` block below so
+// the cross-module instantiation-site walk asks the SAME table. Two hand-typed
+// copies of a name list is precisely the skew #2742 was about (one recorder
+// taught something four siblings were not) — one definition, two call sites.
+//
+// `OwningBuffer<T>` / `Span<T>` / `ReadOnlySpan<T>` are DELIBERATELY absent:
+// §14.4 names them as explicit exceptions that admit value-typed T, and they
+// carry their own §28.11 move-only obligation via
+// owningBufferSpanMoveOnlySites_. `OwningTask<T>` and the `IOwning*`
+// interfaces are absent too — they are the #4305 kNullDeclClassConstraints
+// table's subject (and #2736(b)'s residual for the task form), a different
+// recorder with a different diagnostic.
+static std::size_t owningCollectionOwnedSlot(std::string_view name) {
+    if (name == "OwningArray" || name == "OwningSet" ||
+        name == "OwningStack" || name == "OwningQueue" ||
+        name == "OwningLinkedList")
+        return 0;
+    if (name == "OwningDictionary") return 1;
+    return static_cast<std::size_t>(-1);
+}
+
 // fix #3147 (§14.4 / §28.5 / §2.8.3 rule 4, v0.252; family F12 of the
 // imported-symbol seam #3152): the name of the BARE type parameter that is the
 // declared type of the `owned` field `fs` — `T` or `T?` — or "" when `fs` is
@@ -470,9 +498,16 @@ int Resolver::builtinTypeArity(std::string_view n) {
 // so `Array<byte>`'s own head `Array` was wrongly bound as a fresh free type
 // parameter (silently discarding the `<byte>` argument) and the extension
 // target unified with any `IEnumerable<X>` receiver.
-void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
-                                              Scope& extScope,
-                                              Scope* parent) {
+//
+// `functionSlotDiagReported` is shared with the recursive calls so the §26.4
+// diagnostic fires EXACTLY ONCE per extension head (per issue #4448,
+// v0.303, the spec's "should report once per extension head, at the
+// offending identifier" wording) — even when the function-type slot is
+// nested under multiple generic-instantiation heads
+// (`extension IEnumerable<Array<(T) -> T>>`).
+void Resolver::bindExtensionTargetTypeParams(
+        const ast::Type& target, Scope& extScope, Scope* parent,
+        bool& functionSlotDiagReported) {
     for (const auto& ga : target.genericArgs) {
         if (!ga) continue;
         if (ga->kind == ast::TypeKind::Named && ga->name &&
@@ -480,7 +515,8 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
             // Concrete generic-instantiation head (e.g. `Array` in
             // `Array<byte>` / `Array<T>`): not a free type parameter.
             // Recurse to bind any nested bare identifiers in its own args.
-            bindExtensionTargetTypeParams(*ga, extScope, parent);
+            bindExtensionTargetTypeParams(*ga, extScope, parent,
+                                          functionSlotDiagReported);
             continue;
         }
         if (ga->kind == ast::TypeKind::Named &&
@@ -550,6 +586,101 @@ void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
                 }
             }
             extScope.names[paramName] = nullptr;
+            continue;
+        }
+        if (ga->kind == ast::TypeKind::Function) {
+            // §26.4 (v0.303, issue #4448): "Argument positions" are a
+            // constructed generic type's argument positions and nothing
+            // else — a function type's parameter and return slots are
+            // NOT among them, so `extension Array<(T) -> T>` binds no
+            // `T`, and the bare identifier there is a compile error
+            // naming this rule rather than an unresolved-name error.
+            // The nesting clause composes only through generic
+            // arguments — `extension IEnumerable<Array<(T) -> T>>`
+            // binds nothing either. This is the same near-miss, same
+            // treatment as the nullable-marked argument-position
+            // diagnostic above (which is itself §26.4's other named
+            // reject): do NOT fall through to the generic "unresolved
+            // type name `T`" fallback, because that is actively
+            // misleading here — `T` is not a typo, it is written in
+            // exactly the position a type-parameter head would occupy
+            // (had the surrounding slot been an argument position
+            // rather than a function-type slot). Report THIS rule
+            // here, at the first offending bare identifier inside the
+            // function type, naming the section and the reason.
+            auto tryBare = [&](const ast::Type* t) -> std::string_view {
+                if (t && t->kind == ast::TypeKind::Named &&
+                    t->name && t->name->parts.size() == 1 &&
+                    !t->nullable) {
+                    std::string_view n = t->name->parts[0];
+                    // The §26.4 diagnostic REPLACES the generic "unresolved
+                    // type name" fallback (per issue #4448: "a compile
+                    // error naming this rule rather than an unresolved-
+                    // name error"). Skip any bare identifier that would
+                    // resolve normally — i.e. primitives, built-in types
+                    // (Array / String / Exception / ...), and types
+                    // already in scope via the enclosing module —
+                    // because for those `resolveNamed` does NOT emit
+                    // "unresolved type name" and there is nothing to
+                    // replace. The bare form matters precisely because
+                    // it would otherwise cascade two `unresolved type
+                    // name `T`` errors for one mistake (#4192's repro);
+                    // a resolvable identifier is not that mistake.
+                    if (primitiveFromName(n) != PrimitiveType::None)
+                        return {};
+                    if (isBuiltinTypeName(n))
+                        return {};
+                    if (lookupName(n, parent) != nullptr)
+                        return {};
+                    return n;
+                }
+                return {};
+            };
+            std::string_view firstBare;
+            SourceLocation firstBareLoc = ga->span.begin;
+            for (const auto& p : ga->funcParams) {
+                auto n = tryBare(p.type.get());
+                if (!n.empty()) {
+                    // Register the unbound name anyway so the recursive
+                    // resolution of this same argument below does not
+                    // cascade a second, redundant "unresolved type
+                    // name" diagnostic over the identical span — this
+                    // rule is the diagnostic of record for the
+                    // declaration, exactly as the nullable-marked arm
+                    // above does. The same suppression is required for
+                    // any *other* bare identifiers that appear in the
+                    // same function type: each would otherwise fall
+                    // through to ordinary name resolution and trigger
+                    // an "unresolved type name" error of its own.
+                    extScope.names[n] = nullptr;
+                    if (firstBare.empty()) {
+                        firstBare = n;
+                        firstBareLoc = p.type->span.begin;
+                    }
+                }
+            }
+            if (ga->funcReturn) {
+                auto n = tryBare(ga->funcReturn.get());
+                if (!n.empty()) {
+                    extScope.names[n] = nullptr;
+                    if (firstBare.empty()) {
+                        firstBare = n;
+                        firstBareLoc = ga->funcReturn->span.begin;
+                    }
+                }
+            }
+            if (!firstBare.empty() && !functionSlotDiagReported) {
+                ctx_.diagnostics().report(
+                    Severity::Error, firstBareLoc,
+                    "bare identifier `" + std::string(firstBare) +
+                    "` in an extension's target-type function slot binds "
+                    "nothing (§26.4): a function type's parameter and "
+                    "return slots are not argument positions \xE2\x80\x94 "
+                    "binding reaches only a constructed generic type's "
+                    "argument positions, at any nesting depth through "
+                    "generic arguments");
+                functionSlotDiagReported = true;
+            }
         }
     }
 }
@@ -701,7 +832,13 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
         // head, not a free type parameter, even though it is a bare
         // single-segment non-nullable name. See bindExtensionTargetTypeParams.
         if (ext->targetType) {
-            bindExtensionTargetTypeParams(*ext->targetType, extScope, parent);
+            // §26.4 (v0.303, #4448): track whether the function-slot
+            // diagnostic has fired for THIS extension head; reset per
+            // top-level `extension` so nested extensions each get their
+            // own once-per-head budget.
+            bool functionSlotDiagReported = false;
+            bindExtensionTargetTypeParams(*ext->targetType, extScope, parent,
+                                          functionSlotDiagReported);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
         // fix #4144 (§26.2, v0.295): reject a target kind the closed
@@ -895,16 +1032,67 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // base classes (we don't enforce here — that's a separate
     // syntactic/structural check).
     std::size_t classBaseCount = 0;
+    // §10.3 (fix #4565): "The colon list is one list ... if its first item
+    // resolves to one of [the eight underlying-type] types, that item is the
+    // underlying type ...; otherwise the underlying type is `int` and every
+    // item names an interface." Only the list's FIRST item (index 0) may
+    // supply the underlying type, and only when it is one of the eight
+    // INTEGER primitive kinds — not any of PrimitiveType's other values
+    // (`double`, `float`, `decimal`, `bool`, `char`, `string`, `Object`).
+    std::size_t colonIndex = 0;
+    auto isEnumUnderlyingPrimitive = [](PrimitiveType p) {
+        switch (p) {
+            case PrimitiveType::Byte:  case PrimitiveType::SByte:
+            case PrimitiveType::Short: case PrimitiveType::UShort:
+            case PrimitiveType::Int:   case PrimitiveType::UInt:
+            case PrimitiveType::Long:  case PrimitiveType::ULong:
+                return true;
+            default: return false;
+        }
+    };
     for (const auto& bt : td.baseTypes) {
-        if (!bt) continue;
+        if (!bt) { ++colonIndex; continue; }
         TypeRef* ref = resolveType(*bt, &typeScope);
-        // §10.3 (#740): an enum's base type is its underlying integer type
-        // (a primitive, e.g. `: long`), which does NOT resolve to a TypeSymbol
-        // declaration and so is not a `baseTypes` entry. Record it on the enum's
-        // TypeSymbol so codegen lowers the enum to the right integer width.
-        if (tsym && td.kind == ast::TypeDeclKind::Enum && ref &&
-            ref->kind == TypeRef::Kind::Primitive) {
+        // §10.3 (#740, fix #4565): an enum's base type is its underlying
+        // integer type (a primitive, e.g. `: long`), which does NOT resolve
+        // to a TypeSymbol declaration and so is not a `baseTypes` entry.
+        // Record it on the enum's TypeSymbol so codegen lowers the enum to
+        // the right integer width. Pre-fix, this fired for ANY colon-list
+        // position and ANY Primitive kind — `enum Ratio: double` (`double`
+        // is Kind::Primitive but not one of the eight) was silently carried
+        // into codegen as the underlying type, and enum equality's
+        // unconditional `CreateICmpEQ` then emitted `icmp eq double`, which
+        // fails IR verification (#4565's measured repro).
+        if (tsym && td.kind == ast::TypeDeclKind::Enum && colonIndex == 0 &&
+            ref && ref->kind == TypeRef::Kind::Primitive &&
+            isEnumUnderlyingPrimitive(ref->primitive)) {
             tsym->enumUnderlyingType = ref;
+        } else if (tsym && td.kind == ast::TypeDeclKind::Enum &&
+                   colonIndex == 0 && ref &&
+                   ref->kind != TypeRef::Kind::Error &&
+                   !(ref->kind == TypeRef::Kind::Named &&
+                     (!ref->declaration ||
+                      ref->declaration->kind ==
+                          ast::TypeDeclKind::Interface))) {
+            // The "otherwise" branch's first-item failure (§10.3, v0.306):
+            // the head is neither an admissible underlying-type keyword nor
+            // an interface (a class, a record, another enum, or a
+            // non-integer primitive like `double`). Per the spec's own
+            // ruling (changelog: "§10.3's colon-list fallback names the
+            // underlying-type fact"), the diagnostic names the
+            // underlying-type fact rather than the literally-failing "not
+            // an interface" — a conformance case pins the rejection, not
+            // the wording (Appendix D).
+            std::string spelling = "?";
+            if (bt->name && !bt->name->parts.empty())
+                spelling = std::string(bt->name->parts.back());
+            ctx_.diagnostics().report(
+                Severity::Error, bt->span.begin,
+                std::string("enum `") + std::string(td.name) +
+                "`'s underlying type `" + spelling + "` is not one of the "
+                "eight admissible underlying types — byte, sbyte, short, "
+                "ushort, int, uint, long, ulong — or their reserved "
+                "PascalCase aliases, and is not an interface (§10.3)");
         }
         // §12 / §31.4 (#2950): a BUILT-IN exception base resolves to a Named
         // TypeRef with `declaration == nullptr` — it has no user TypeSymbol —
@@ -1034,6 +1222,7 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
                 }
             }
         }
+        ++colonIndex;
     }
     // Generic constraints.
     for (const auto& gc : td.genericConstraints) {
@@ -1841,6 +2030,143 @@ TypeRef* Resolver::substituteAliasGenericArgs(
                         /*validateNestedInlineArrays=*/true});
 }
 
+// stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
+// imported-symbol seam #3152) — the CROSS-MODULE half of #2713's
+// per-instantiation owning-element sweep.
+//
+// §14.4 "Class-only restriction on owning generics" (v0.306) restricts the
+// owning collections' element type to class and interface types, and §3.6
+// rule 2 requires the property to be evaluated "at each instantiation, after
+// substituting the type arguments ... rejected *at the instantiation site*".
+// #2713 satisfies that by recording an `OwningElementSite` while resolving
+// THIS compilation's own type bodies. An IMPORTED generic has no AST here at
+// all — `ModuleLoader` builds its TypeRefs directly and `Symbol::decl` stays
+// null for every imported symbol — so no site was ever recorded for it and
+// `checkOwningElementInstantiations()` had nothing to walk; the defining
+// module never instantiates the type, so it could not catch it either.
+//
+// MEASURED on 6f252b1d: a dependency's `public class Holder<T> where T: class`
+// carrying `private owned _l: OwningLinkedList<T>` admitted `Holder<string>`
+// in the importer with NO diagnostic at any severity, and the program was a
+// `heap-use-after-free` (ASan, READ of size 8 in the importing module's
+// method) — NOT the merely-wrong-value the issue reported. The mechanism is
+// #2713's: codegen's `elementPolicyFor()` falls back to the Value row for a
+// runtime-managed element in the owning family, so the collection stores the
+// pointer WITHOUT taking a reference while the `owned` argument transfer still
+// releases the caller's, leaving a dangling slot. The `OwningDictionary<K, V>`
+// value slot and a method RETURN type (`static Make(owned x: T): owned
+// OwningLinkedList<T>`, no field at all) reproduce the identical ASan report.
+//
+// NO NEW MODULE METADATA IS REQUIRED, and this is the point the issue got
+// wrong. #3147 closed the byte-identical cross-module gap in the §28.5
+// owned-field check by walking `tsym->members` at the instantiation site
+// instead of the declaring type's AST: FieldSymbols are populated on BOTH
+// sides, and `sema::storageComponentType` reads the local `ast::FieldDecl` and
+// the imported `SemaContext::importedMemberType` in ONE place. That same
+// channel already carries everything this rule needs — verified by direct
+// instrumentation on the repro: the imported `Holder`'s private `_l` is
+// present in `tsym->members` with a Named TypeRef whose `headName()` is
+// `OwningLinkedList` and whose slot-0 argument is a declaration-less Named
+// TypeRef with `importedName == "T"`, exactly the deferred shape the
+// declaration-site recorder records locally. Method return types ride the
+// sibling `SemaContext::importedReturnType` table, and parameter types the
+// named both-sources accessor `formalParamResolvedType` (#3189's family).
+//
+// Rather than re-decide the rule here, the walk RECORDS an `OwningElementSite`
+// keyed to the imported type, so `checkOwningElementInstantiations()` answers
+// it with the same `owningElementBadDesc` predicate, the same chained-binding
+// worklist, and the same diagnostic text the local path already emits — the
+// #2742 discipline (one predicate, many recorders) applied to a new recorder.
+//
+// RESIDUALS, deliberately left and recorded rather than guessed at:
+//   - A local variable inside an IMPORTED generic method's body. Its type is
+//     not part of the exported signature surface at all (the body rides
+//     `methodBodyText` and is re-parsed in a FRESH SemaContext, whose
+//     obligations never reach this Resolver). MEASURED: that shape compiles
+//     and runs CORRECTLY — it is a missing rejection, not a memory-safety
+//     hole — so closing it is the part that would genuinely need new
+//     metadata, and it stays on #2735.
+//   - An obligation reached through an imported INTERMEDIATE generic
+//     (`class Outer<U>` in the dependency holding an `Inner<U>` that holds the
+//     collection). Pass 2's chained-binding worklist re-keys through
+//     `instantiations_`, and no instantiation node exists for a member type
+//     the loader built rather than `resolveType`.
+//   - A field inherited from an imported BASE class: `tsym->members` is this
+//     type's own member list.
+void Resolver::recordImportedOwningElementObligations(TypeSymbol* tsym,
+                                                      const ast::Type& site) {
+    if (!tsym || tsym->genericParams.empty()) return;
+    // LOCAL types are already covered by the declaration-site recorder in
+    // resolveNamed(), which sees their bodies; running this walk for them too
+    // would be redundant (Pass 2's `reported` key would collapse the duplicate)
+    // but would also widen a well-tested path for no gain. Imported only.
+    if (!ctx_.isImported(tsym)) return;
+    if (!importedOwningElementScanned_.insert(tsym).second) return;
+
+    // Record `container<... paramName ...>` when `ft` names an owning
+    // collection whose OWNED slot is a bare type parameter of `tsym`.
+    auto recordIfOwningElementSlot = [&](const TypeRef* ft) {
+        if (!ft || ft->kind != TypeRef::Kind::Named) return;
+        std::string_view head = ft->headName();
+        std::size_t slot = owningCollectionOwnedSlot(head);
+        if (slot == static_cast<std::size_t>(-1)) return;
+        if (slot >= ft->genericArgs.size()) return;
+        const TypeRef* el = ft->genericArgs[slot];
+        // Only a DEFERRED element is recordable. A concrete or composite one
+        // was already decided at the exporter's own declaration site (and by
+        // `owningElementBadDesc` there), and carries no per-instantiation
+        // obligation here.
+        if (!el || el->kind != TypeRef::Kind::Named || el->declaration) return;
+        if (!el->genericArgs.empty()) return;
+        std::string_view elName = el->headName();
+        if (elName.empty()) return;
+        // The name must be one `tsym` itself binds; match against the type's
+        // own parameter list and record THAT view, so Pass 2's
+        // `genericParams[i]->name == s.paramName` comparison is over storage
+        // with the same (loader-owned) lifetime as the symbol it walks.
+        for (const Symbol* gp : tsym->genericParams) {
+            if (!gp || gp->name != elName) continue;
+            owningElementSites_.push_back({head, gp->name, &site, tsym});
+            return;
+        }
+    };
+
+    for (const Symbol* mem : tsym->members) {
+        // Fields and properties (including auto-property storage): the
+        // #3147 channel, via the ONE accessor that consults both sources.
+        if (dynamic_cast<const FieldSymbol*>(mem) ||
+            dynamic_cast<const PropertySymbol*>(mem)) {
+            recordIfOwningElementSlot(storageComponentType(mem, ctx_));
+            continue;
+        }
+        auto* ms = dynamic_cast<const MethodSymbol*>(mem);
+        if (!ms) continue;
+        // A generic METHOD's own type parameter is NOT this check's subject:
+        // its bindings are calls, which `instantiations_` does not record, and
+        // a method parameter may legally SHADOW the type's (fix #2742). The
+        // per-parameter name match below is against `tsym->genericParams`
+        // only, so a shadowing method parameter is rejected by that test for
+        // the same reason `nameBoundByCurrentMethod` rejects it locally — but
+        // a NON-shadowing method parameter of the same name would not be
+        // distinguishable, so skip a generic method's signature outright.
+        // That residual is #2736(a), unchanged by this fix.
+        if (!ms->genericParams.empty()) continue;
+        recordIfOwningElementSlot(ctx_.importedReturnType(ms));
+        // §2.8.2 (#2373 / #3194): an IMPORTED member's parameter carries no
+        // syntactic `declType` at all — there is no `ast::Type` to attach —
+        // and `ModuleLoader::convertParams` stashes the already-resolved
+        // TypeRef on `resolvedDeclType` instead. Reading `declType` alone was
+        // MEASURED here to make this arm DEAD for every import: an imported
+        // `method Take(l: OwningLinkedList<T>)` still admitted `Taker<string>`
+        // with the arm present. That is the exact false ACCEPT #2373 and #3194
+        // each had to fix at their own site, so ask the named both-sources
+        // accessor (`formalParamResolvedType`, sema/Symbol.hpp) rather than
+        // hand-inlining the fallback a fourth time.
+        for (std::size_t pi = 0; pi < formalParamCount(*ms); ++pi)
+            recordIfOwningElementSlot(formalParamResolvedType(*ms, pi));
+    }
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -2022,13 +2348,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // for the list/set/stack/queue families and `V` (slot 1, the
                 // value) for `OwningDictionary<K, V>` (the key K is value-like
                 // by design, §28.11).
-                std::size_t ownedSlot = static_cast<std::size_t>(-1);
-                if (first == "OwningArray" || first == "OwningSet" ||
-                    first == "OwningStack" || first == "OwningQueue" ||
-                    first == "OwningLinkedList")
-                    ownedSlot = 0;
-                else if (first == "OwningDictionary")
-                    ownedSlot = 1;
+                // fix #2735: the slot table lives in ONE place
+                // (owningCollectionOwnedSlot above), shared with the
+                // cross-module instantiation-site walk.
+                std::size_t ownedSlot = owningCollectionOwnedSlot(first);
                 if (ownedSlot != static_cast<std::size_t>(-1) &&
                     ownedSlot < ref.genericArgs.size()) {
                     const TypeRef* el = ref.genericArgs[ownedSlot];
@@ -2067,17 +2390,12 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         // generic-method bindings are not in instantiations_ at
                         // all. That residual is filed as #2736(a); a false
                         // reject would be strictly worse than carrying it.
-                        bool boundByMethod = false;
-                        if (currentMethodGenericParams_) {
-                            for (const ast::GenericParam& gp :
-                                 *currentMethodGenericParams_) {
-                                if (gp.name == el->headName()) {
-                                    boundByMethod = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!boundByMethod)
+                        //
+                        // fix #2742: the test itself now lives in ONE place
+                        // (Resolver::nameBoundByCurrentMethod) — it had been
+                        // hand-inlined here and at two more recorders while two
+                        // OTHER recorders lacked it entirely.
+                        if (!nameBoundByCurrentMethod(el->headName()))
                             owningElementSites_.push_back(
                                 {first, el->headName(), &t, currentOuterType_});
                     }
@@ -2311,7 +2629,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     hashRole = "element";
                 else if (first == "Dictionary" || first == "OwningDictionary")
                     hashRole = "key";
-                if (!hashRole.empty() && !ref.genericArgs.empty())
+                // fix #2742 (§3.6 rule 2 / §14.1, v0.306): apply the #2713
+                // MISATTRIBUTION guard here too. `checkHashContainerKeys`'
+                // Pass 2 recovers this site's bare parameter NAME and resolves
+                // it against `s.enclosingType->genericParams`; when a generic
+                // METHOD shadows an enclosing type parameter
+                // (`class Box<T>` + `method M<T>()`, which nothing forbids),
+                // the recorded `T` is the METHOD's and the check runs against
+                // `Box`'s — a different binding. MEASURED as a false reject:
+                // `Box2742<NoEq2742>` calling `M2742<int>()` over a body
+                // holding `new Set<T>()` was rejected naming `NoEq2742`, while
+                // the `Set`'s actual element type is the method's `int`.
+                // (The reverse direction — an ill-formed method binding
+                // admitted because the enclosing one is fine — is the same
+                // misattribution and is closed by the same guard; the residual
+                // "generic-method bindings are never re-checked at all" is
+                // #2736(a), and a false reject is strictly worse than carrying
+                // it, per #2713's own recorded trade-off.)
+                if (!hashRole.empty() && !ref.genericArgs.empty() &&
+                    !(isBareGenericParamBinding(
+                          ref.genericArgs[0],
+                          ref.genericArgs[0] ? ref.genericArgs[0]->astNode
+                                             : nullptr) &&
+                      nameBoundByCurrentMethod(ref.genericArgs[0]->headName())))
                     hashContainerSites_.push_back(
                         {first, hashRole, ref.genericArgs[0], &t,
                          currentOuterType_});  // #1384: for per-instantiation check
@@ -2342,6 +2682,19 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     }
                     for (const auto& slot : categorySlots) {
                         if (slot.first >= ref.genericArgs.size()) continue;
+                        // fix #2742 (sibling, same mechanism):
+                        // `checkElementCategoryInstantiations`' Pass 2 resolves
+                        // this site's bare parameter name against the ENCLOSING
+                        // TYPE's params exactly as the hash-container Pass 2
+                        // does, so it carries the identical #2713
+                        // misattribution when a generic METHOD shadows the
+                        // name. This recorder was one of the two that never got
+                        // the guard; it now asks the same shared predicate.
+                        const TypeRef* el = ref.genericArgs[slot.first];
+                        if (isBareGenericParamBinding(
+                                el, el ? el->astNode : nullptr) &&
+                            nameBoundByCurrentMethod(el->headName()))
+                            continue;
                         moveOnlyElementSites_.push_back(
                             {first, slot.second, ref.genericArgs[slot.first],
                              &t, currentOuterType_});
@@ -2416,19 +2769,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             // generic method may declare a parameter of the
                             // same name, and that name inside the method body
                             // denotes the METHOD's parameter whose bindings
-                            // `instantiations_` knows nothing about.
-                            bool boundByMethod = false;
-                            if (currentMethodGenericParams_) {
-                                for (const ast::GenericParam& gp :
-                                     *currentMethodGenericParams_) {
-                                    if (gp.name ==
-                                        el->astNode->name->parts.front()) {
-                                        boundByMethod = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!boundByMethod) {
+                            // `instantiations_` knows nothing about. fix #2742
+                            // made that one shared predicate.
+                            if (!nameBoundByCurrentMethod(
+                                    el->astNode->name->parts.front())) {
                                 owningBufferSpanMoveOnlySites_.push_back(
                                     {first,
                                      std::string(
@@ -2857,6 +3201,179 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     underlying =
                         substituteAliasGenericArgs(underlying, aliasSubst,
                                                     t.span.begin);
+                    // fix #4464 (§14.2, §27.8, v0.298): a generic type alias
+                    // may carry `where` clauses (§27.8: "uses of the alias must
+                    // satisfy it"). The substitution above substituted the
+                    // concrete args into the alias body, but the alias's own
+                    // `where` clauses were never checked against those concrete
+                    // args. Walk each GenericParamSymbol's constraints (populated
+                    // by SymbolCollection::collectGenericParams from
+                    // aliasDecl->genericConstraints) and validate the concrete
+                    // substitution against each bound.
+                    for (std::size_t gi = 0; gi < aliasSym->genericParams.size();
+                         ++gi) {
+                        auto* gp =
+                            dynamic_cast<GenericParamSymbol*>(aliasSym->genericParams[gi]);
+                        if (!gp || gp->constraints.empty()) continue;
+                        auto it = aliasSubst.find(gp->name);
+                        if (it == aliasSubst.end()) continue;
+                        TypeRef* arg = it->second;
+                        if (!arg) continue;
+                        // Build a scope for resolving constraint bounds: module
+                        // names plus the alias's own generic-param markers.
+                        Scope boundModule;
+                        if (ctx_.module()) {
+                            for (Symbol* child : ctx_.module()->children) {
+                                if (!child->name.empty())
+                                    boundModule.names[child->name] = child;
+                            }
+                        }
+                        Scope boundScope;
+                        boundScope.parent = &boundModule;
+                        for (const auto& g : aliasDecl->genericParams) {
+                            boundScope.names[g.name] = nullptr;
+                        }
+                        for (const auto& c : gp->constraints) {
+                            // Spellings for TypeRef* args (no ast::Type needed).
+                            auto typeRefSpelling =
+                                [](const TypeRef* r) -> std::string {
+                                if (!r) return "<type>";
+                                if (r->kind == TypeRef::Kind::Named) {
+                                    if (r->declaration)
+                                        return std::string(r->declaration->name);
+                                    if (!r->importedName.empty())
+                                        return std::string(r->importedName);
+                                } else if (r->kind == TypeRef::Kind::Primitive) {
+                                    // Mirror the names in primitiveFromName (TypeResolution.cpp).
+                                    switch (r->primitive) {
+                                        case PrimitiveType::Bool:    return "bool";
+                                        case PrimitiveType::Char:    return "char";
+                                        case PrimitiveType::String:   return "string";
+                                        case PrimitiveType::Int:      return "int";
+                                        case PrimitiveType::UInt:     return "uint";
+                                        case PrimitiveType::Long:     return "long";
+                                        case PrimitiveType::ULong:    return "ulong";
+                                        case PrimitiveType::Byte:     return "byte";
+                                        case PrimitiveType::SByte:   return "sbyte";
+                                        case PrimitiveType::Short:   return "short";
+                                        case PrimitiveType::UShort:  return "ushort";
+                                        case PrimitiveType::Float:   return "float";
+                                        case PrimitiveType::Double:   return "double";
+                                        case PrimitiveType::Decimal:  return "decimal";
+                                        case PrimitiveType::Object:   return "Object";
+                                        default: break;
+                                    }
+                                }
+                                return "<type>";
+                            };
+                            std::string argName = typeRefSpelling(arg);
+
+                            // "type" bound: satisfied when arg conforms to the bound
+                            // type (BFS over arg's base types).
+                            if (c.kind == "type") {
+                                TypeRef* bound = nullptr;
+                                if (c.astBound) {
+                                    bound = resolveType(*c.astBound, &boundScope);
+                                } else if (c.importedBound) {
+                                    bound = c.importedBound;
+                                }
+                                if (!bound) continue;
+                                bool satisfied = argSatisfiesTypeBound(arg, bound);
+                                // A "type" bound that is itself a type parameter:
+                                // resolve it through aliasSubst to get the concrete
+                                // bound before emitting the diagnostic.
+                                if (!satisfied &&
+                                    bound->kind == TypeRef::Kind::Named &&
+                                    !bound->declaration && bound->astNode &&
+                                    bound->astNode->name &&
+                                    bound->astNode->name->parts.size() == 1) {
+                                    std::string_view bpName =
+                                        bound->astNode->name->parts.front();
+                                    auto jt = aliasSubst.find(bpName);
+                                    if (jt != aliasSubst.end() && jt->second &&
+                                        jt->second->declaration) {
+                                        bound = jt->second;
+                                        satisfied = argSatisfiesTypeBound(arg, bound);
+                                    }
+                                }
+                                if (!satisfied) {
+                                    std::string boundName;
+                                    if (bound->kind == TypeRef::Kind::Named) {
+                                        if (bound->declaration) {
+                                            boundName = bound->declaration->name;
+                                        } else if (!bound->importedName.empty()) {
+                                            boundName = bound->importedName;
+                                            if (!bound->genericArgs.empty()) {
+                                                std::string withArgs = boundName + "<";
+                                                for (std::size_t i = 0;
+                                                     i < bound->genericArgs.size();
+                                                     ++i) {
+                                                    if (i > 0) withArgs += ", ";
+                                                    withArgs +=
+                                                        typeRefSpelling(
+                                                            bound->genericArgs[i]);
+                                                }
+                                                withArgs += '>';
+                                                boundName = std::move(withArgs);
+                                            }
+                                        }
+                                    }
+                                    if (boundName.empty()) boundName = "<type>";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, t.span.begin,
+                                        std::string("type argument `") +
+                                            argName +
+                                            "` does not satisfy the "
+                                            "constraint `where " +
+                                            std::string(gp->name) + ": " +
+                                            boundName + "` (§14.2)");
+                                }
+                                continue;
+                            }
+                            // All other constraint kinds ("class", "value", "notnull",
+                            // "new", …): checked inline using the same logic as
+                            // checkOneConstraint.
+                            bool violated = false;
+                            std::string reason;
+                            if (c.kind == "notnull") {
+                                violated = arg->nullable;
+                                reason = "notnull";
+                            } else if (c.kind == "class") {
+                                // §14.2: non-nullable reference types only.
+                                if (arg->nullable) {
+                                    violated = true;
+                                } else {
+                                    TypeCategory cat = categorize(arg);
+                                    violated = (cat == TypeCategory::Value);
+                                }
+                                reason = "class";
+                            } else if (c.kind == "value") {
+                                // §14.2: non-nullable value types only.
+                                if (arg->nullable) {
+                                    violated = true;
+                                } else {
+                                    TypeCategory cat = categorize(arg);
+                                    violated = (cat == TypeCategory::Reference);
+                                }
+                                reason = "value";
+                            } else if (c.kind == "new") {
+                                bool decided = false;
+                                bool ok = argSatisfiesNew(arg, decided);
+                                violated = (decided && !ok);
+                                reason = "new()";
+                            }
+                            // "sendable" and "hashable" are deferred (require
+                            // late resolution, same as checkOneConstraint).
+                            if (violated) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, t.span.begin,
+                                    std::string("type argument `") + argName +
+                                        "` does not satisfy the constraint `where " +
+                                        std::string(gp->name) + ": " + reason +
+                                        "` (§14.2)");
+                            }
+                        }
+                    }
                     // Copy the underlying kind and payload into ref. The nullable
                     // flag on ref was already set from the syntactic `?` suffix in
                     // resolveType; the underlying type's nullable flag is
@@ -3031,6 +3548,15 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 }
             }
         }
+        // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the
+        // imported-symbol seam #3152): the same cross-module gap #3147 closed
+        // for the §28.5 owned-field check, at the §14.4 owning-collection
+        // ELEMENT check. An imported generic's obligations are not in
+        // `owningElementSites_` because nothing in this compilation ever
+        // resolved its body; synthesize them from its reconstructed member
+        // surface before the instantiation is recorded just below, so Pass 2
+        // sees both halves.
+        recordImportedOwningElementObligations(tsym, t);
         // §14.2: record this concrete instantiation so a deferred inner
         // obligation owned by `tsym` (recorded while resolving tsym's body)
         // can be re-checked against the binding it supplies here. Recording
@@ -3224,9 +3750,9 @@ void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
     // method parameter that does not shadow is skipped by the same test, which
     // is correct for the same reason — and is not a residual here, because
     // ExprTC::checkDeferredAsTargetInstantiations owns exactly that case.
-    if (currentMethodGenericParams_)
-        for (const ast::GenericParam& gp : *currentMethodGenericParams_)
-            if (gp.name == name) return;
+    // fix #2742: one shared predicate (Resolver::nameBoundByCurrentMethod),
+    // not a third hand-inlined copy of the loop.
+    if (nameBoundByCurrentMethod(name)) return;
     asTargetSites_.push_back({name, currentOuterType_, loc});
 }
 

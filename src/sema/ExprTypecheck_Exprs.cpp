@@ -318,16 +318,32 @@ const char* primitiveSpelling(PrimitiveType p) {
     return "<unknown>";
 }
 
-// §6.2/#1204: returns true when `e` is a "literal-derived expression" — built
-// entirely from integer or float literals via unary/binary operators.  Such
-// expressions have no declared signed/unsigned type of their own and are
-// compatible with any numeric operand in a comparison (e.g. `ulong > 1000`,
-// `ulong > 0 - 5`).  Only named variable references or non-literal sub-exprs
-// cause this to return false, triggering the signed↔unsigned rejection below.
+// §5.1/#1204: returns true when `e` is an "integer-literal-derived
+// expression" — built entirely from INTEGER literals via unary/binary
+// operators.  Such expressions have no declared signed/unsigned type of
+// their own and are the §5.1 "constant narrowing" source: "AN EXPRESSION OF
+// INTEGER TYPE that is a compile-time constant implicitly converts to any
+// integer type whose range contains its value" (e.g. `ulong > 1000`,
+// `ulong > 0 - 5`).  Only named variable references or non-integer-literal
+// sub-exprs cause this to return false, triggering the signed↔unsigned
+// rejection below.
+//
+// fix #4512 (§5.1, v0.306): narrowed from also matching `FloatLiteralExpr` —
+// this predicate is the ONE gate for §5.1's constant-narrowing escape
+// (reportNoImplicitConversionBetweenOperands, below), and that paragraph's
+// own text is exact about its domain: an INTEGER-typed constant into an
+// integer-typed target, never a float/decimal one. The old (over-broad)
+// match let a FLOAT literal "adopt" a `decimal` operand it has no §5.1
+// relation to (`decimal` and binary floats are on §5.1's "never implicit"
+// list, and neither is an integer type, so nothing else in this rule would
+// have caught it): measured on 67b79744 (docs v0.306), `var d: decimal :=
+// 1m; if d > 5.0 then …` reached codegen and failed IR verification
+// (`sext double 5.0 to i32`, "SExt only operates on integer"). No caller
+// outside `reportNoImplicitConversionBetweenOperands` uses this predicate,
+// so narrowing it is invisible everywhere else.
 static bool isLiteralDerivedExpr(const ast::Expr* e) {
     if (!e) return false;
     if (dynamic_cast<const ast::IntLiteralExpr*>(e))   return true;
-    if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return true;
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e))
         return isLiteralDerivedExpr(ue->operand.get());
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
@@ -347,6 +363,14 @@ static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
     if (!ref || ref->kind != TypeRef::Kind::Named) return {};
     if (ref->declaration) return ref->declaration->name;
     if (!ref->importedName.empty()) return ref->importedName;
+    // fix #4570 (§27.8, v0.306): the alias-transparency leg, identical to
+    // the one on ExprTypecheck.cpp's `namedTypeSimpleName` this is a copy of
+    // (see the full rationale there). A type alias restores `astNode` to the
+    // USE SITE, so without this the read below answers the ALIAS name. Here
+    // that mis-spelled `type Al := IEnumerable<int>` as the non-existent type
+    // `Al<int>` in the §15.4 collection-literal diagnostic and hid the
+    // builtin interface head from `isCollectionLiteralInterfaceTarget`.
+    if (!ref->aliasResolvedHead.empty()) return ref->aliasResolvedHead;
     if (ref->astNode && ref->astNode->name &&
         !ref->astNode->name->parts.empty())
         return ref->astNode->name->parts.back();
@@ -1057,6 +1081,37 @@ bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
         return true;
     }
     return false;
+}
+
+// fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
+// above and `rejectNewOnNonInstantiableKind` below — same shape, one
+// authority, per this repo's "duplicated classification predicates"
+// caution, CLAUDE.md / LANE_RULES.md §6). See the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. In one line: §17.7
+// grants the `new()` shorthand only positions (i), (ii), (iii) and the
+// `return e;` STATEMENT of (v), and excludes this one verbatim — "It is
+// **not** permitted at an expression body or at a lambda's ascribed
+// return". #4208 held that carve-out by declining to TYPE the shorthand
+// here (`!inLambda_`), but an untyped NewExpr is exactly what codegen's
+// #2491 zero/null backstop swallows, so the position compiled and
+// SEGV'd instead of being rejected. Both spellings of the excluded
+// position route here.
+void ExprTC::rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                               const TypeRef* rt) {
+    std::string named = "new T(...)";
+    if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration)
+        named = "new " + std::string(rt->declaration->name) + "(...)";
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "the `new()` shorthand is not permitted at a lambda's return. "
+        "§17.7 grants the shorthand exactly four positions — field "
+        "initializers, typed local-variable declarations, default "
+        "parameter values, and a `return` statement of a method with a "
+        "declared return type — and excludes this one: \"It is not "
+        "permitted at an expression body or at a lambda's ascribed "
+        "return\". (A lambda whose return type arrives only by target "
+        "inference is outside the written-declared-type family "
+        "altogether.) Name the type explicitly (`" + named + "`) (§17.7)");
 }
 
 // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298; sibling to
@@ -2767,6 +2822,33 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         &e, rangeIndex
                                 ? ctx_.primitiveTypeRef(PrimitiveType::String)
                                 : ctx_.primitiveTypeRef(PrimitiveType::Char));
+                }
+                // fix #4502 (§23.4, v0.306): every OTHER primitive — `bool`,
+                // `char`, and every numeric type (`byte` .. `decimal`),
+                // `Object` — declares no indexer. §23.4: "An indexer is a
+                // property whose name is replaced by `[parameters]`" —
+                // i.e. an indexer is a DECLARED member, and no primitive
+                // declares one; `string`'s `[i]`/`[range]` form (typed by
+                // the branch immediately above, §3.4/§4.6) is the sole
+                // built-in exception. Before this branch, `bool`/`int`/
+                // `decimal` (and every other non-`string` primitive) fell
+                // through this entire if/else-if chain with NO diagnostic:
+                // the IndexExpr was left untyped, exactly the hole the
+                // #2800 fix closed for a Named-declaration receiver with no
+                // indexer member (see the `!anyIndexer` branch ~900 lines
+                // below) — codegen's #2434 backstop degraded the read to a
+                // zero-initialized value and the program COMPILED AND RAN.
+                // Measured on d3b36b1c (docs v0.306): `var v := b[0];` on a
+                // `bool` local exited 0 (only the #2434 warning on stderr)
+                // and the program printed "ok". Reject cleanly instead,
+                // mirroring the #2800 wording so the message family reads
+                // the same regardless of receiver kind.
+                else if (tt->kind == TypeRef::Kind::Primitive) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("type `") + primitiveSpelling(tt->primitive) +
+                            "` does not declare an indexer — `a[i]` requires "
+                            "an indexer (§23.4)");
                 }
                 // issue #388: heap-collection indexer `a[i]` / `dict[key]`. The
                 // built-in collections resolve to a Named TypeRef with a null
@@ -5170,6 +5252,216 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     return fromLeft ? fromLeft : fromRight;
 }
 
+// fix #4501 (§5.1 / §6.2 / §17.3 / §8.4, v0.306): the ONE place that answers
+// "does §5.1 admit an implicit conversion between these two operand types?"
+//
+// WHY IT IS ONE PLACE NOW. `typeBinary` carried TWO copies of this question:
+// one in the equality/relational arm (#1204) and one in the §6.2
+// arithmetic-promotion arm. The two agreed on the numeric-vs-numeric case and
+// both had the SAME hole — each made `isPromotablePrimitive(lt) &&
+// isPromotablePrimitive(rt)` a PRECONDITION OF REJECTING, so a pair in which
+// either operand was not a promotable numeric fell through the check entirely
+// and was silently admitted. That inverted the rule: §5.1 lists the pairs that
+// DO convert, and §6.2 makes a pair with no conversion a compile error, so
+// "not on the promotion list" is a reason to reject, never a reason to skip.
+//
+// Measured on 16e992f0 (docs v0.306), one compile + one run each:
+//   `string = 0`      -> reached codegen; `icmp eq ptr %2, i32 0` (+ five more
+//                        malformed instructions) -> "IR verification failed";
+//                        on an assertions-enabled LLVM the same IR aborts the
+//                        compiler in `ICmpInst::AssertOK` (SIGABRT, exit 134,
+//                        the symptom #4501 reports).
+//   `bool = "x"`      -> the same.
+//   `decimal = "x"`   -> "SExt only operates on integer".
+//   `bool = 0`        -> compiled with NO diagnostic and the program printed
+//                        `True`: a fabricated answer, the worst of the four.
+//
+// §17.3 fixes the authority for the equality arm: "`=` and `<>` invoke
+// `Equals` with a null-safe wrapper (§8.4)". `string` has no `Equals(int)` and
+// `bool` has no `Equals(int)`; the candidate set is empty, and §5.1 supplies
+// no conversion that would make one applicable. For the relational and
+// arithmetic arms the authority is §6.2 directly.
+//
+// WHAT IS NOT REJECTED, deliberately:
+//   * `Object` on either side. §5.1's reference conversions include "any type
+//     to `Object`" (boxing, §8.6), so `o = 5` IS admissible under §8.4 —
+//     `Object.Equals(Object?)` (§8.1) is the applicable candidate. (That row
+//     currently fails in LLVM's IR verifier; it is a CODEGEN defect with its
+//     own issue, and rejecting it here would be a false reject with no
+//     authority behind it.)
+//   * A nullable operand on either side: `s = null`, `x = null` and the
+//     lifted forms are §8.4/§7.11 questions answered elsewhere.
+//   * Identical primitives, and §5.1 widening pairs in either direction.
+//   * Named/unit/inline-array/function operands — the record, choice,
+//     interface, enum, `Object` and unit gates above own those, each with its
+//     own wording.
+//
+// THE LITERAL ESCAPE IS NOW KEYED ON THE OTHER OPERAND. §5.1's constant
+// narrowing lets an untyped INTEGER constant adopt the other operand's
+// INTEGER type, which is why `uint > 1000` must keep compiling (#1204). The
+// escape is exactly as narrow as the paragraph's own text — "an expression
+// of integer type … converts to any integer type whose range contains its
+// value" — never a float/decimal constant, never a float/decimal/`bool`/
+// `string` target (fix #4512, §5.1, v0.306: an earlier spelling here matched
+// a FLOAT literal too and accepted any `isPromotablePrimitive` target
+// including `decimal`/`float`/`double`, which let a float constant "adopt"
+// `decimal` — a pair §5.1 never relates — and reach codegen; see
+// `isLiteralDerivedExpr`'s header comment for the measured crash).
+// `isTrueIntegerType` below is the same 8-type "any integer type" set §4.2
+// enumerates (`isTrueInt` in the compound-assignment §6.6 check,
+// ExprTypecheck.cpp, is the identical set under a local name — `char` is a
+// distinct §4.5 kind and is excluded from both). The old spelling asked only
+// "is either side literal-derived?" with no target-type gate at all, so the
+// `0` in `string = 0` and in `bool = 0` exempted the pair all by itself — a
+// second, independent reason those two rows were admitted, and the reason
+// fixing the `isPromotablePrimitive` precondition alone would not have
+// closed them.
+bool ExprTC::reportNoImplicitConversionBetweenOperands(
+    const ast::BinaryExpr& be, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt, bool allowLiteralAdoption) {
+    return reportNoImplicitConversionBetweenOperands(
+        be.span.begin, op, lt, rt, allowLiteralAdoption, be.left.get(),
+        be.right.get());
+}
+
+// fix #4513 (§5.1/§6.2/§6.6, v0.306): the location-and-expr-pointer core the
+// BinaryExpr overload above delegates to, so the §6.6 compound-assignment
+// family check (ExprTypecheck.cpp) — which has an AssignmentStmt's
+// `target`/`value`, not a `BinaryExpr` — can ask this SAME question instead
+// of computing its own, independent (and, for a `bool`/`string` right-hand
+// operand, WRONG) answer. See the class-declaration comment (impl.hpp) for
+// why `leftExpr`/`rightExpr` may be null.
+bool ExprTC::reportNoImplicitConversionBetweenOperands(
+    SourceLocation loc, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt, bool allowLiteralAdoption, const ast::Expr* leftExpr,
+    const ast::Expr* rightExpr) {
+    if (!lt || !rt) return false;
+    if (lt->kind != TypeRef::Kind::Primitive ||
+        rt->kind != TypeRef::Kind::Primitive)
+        return false;
+    if (lt->nullable || rt->nullable) return false;
+    if (lt->primitive == rt->primitive) return false;
+    if (lt->primitive == PrimitiveType::None ||
+        rt->primitive == PrimitiveType::None)
+        return false;
+    // §5.1 reference conversions: "any type to `Object`" (boxing, §8.6).
+    if (lt->primitive == PrimitiveType::Object ||
+        rt->primitive == PrimitiveType::Object)
+        return false;
+    // §5.1 numeric/char widening, either direction.
+    if (primitiveWidens(lt->primitive, rt->primitive) ||
+        primitiveWidens(rt->primitive, lt->primitive))
+        return false;
+    if (allowLiteralAdoption) {
+        // §5.1 constant narrowing — see the header comment: the constant
+        // adopts the OTHER operand's type, so the escape requires that type
+        // to be one an INTEGER constant can have — the 8 sized integer
+        // types, per §4.2/§5.1's own "any integer type" wording (fix #4512:
+        // narrower than `isPromotablePrimitive`, which also admits
+        // `float`/`double`/`decimal`/`char` — types a §5.1 constant can be
+        // ASSIGNED to via ordinary widening, but not "adopt" via this
+        // constant-only escape).
+        auto isTrueIntegerType = [](PrimitiveType p) {
+            switch (p) {
+                case PrimitiveType::Byte:  case PrimitiveType::SByte:
+                case PrimitiveType::Short: case PrimitiveType::UShort:
+                case PrimitiveType::Int:   case PrimitiveType::UInt:
+                case PrimitiveType::Long:  case PrimitiveType::ULong:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        if (isLiteralDerivedExpr(leftExpr) &&
+            isTrueIntegerType(rt->primitive))
+            return false;
+        if (isLiteralDerivedExpr(rightExpr) &&
+            isTrueIntegerType(lt->primitive))
+            return false;
+    }
+    const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
+                             isPromotablePrimitive(rt->primitive);
+    const std::string head =
+        std::string("operator `") + std::string(op) +
+        "` has no implicit conversion between operand types `" +
+        primitiveSpelling(lt->primitive) + "` and `" +
+        primitiveSpelling(rt->primitive) + "`";
+    if (bothNumeric) {
+        // The pre-existing §6.2 mixed-numeric wording, byte-for-byte: several
+        // lit rows pin it (`sema_mixed_numeric__*`, `sema_521_incompatible__*`).
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            head + " (§6.2); add an explicit cast (§5.2) to convert"
+                   " one operand to the other's type.");
+    } else if (op == "=" || op == "<>") {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            head + " (§5.1) — `=`/`<>` invoke `Equals` "
+                   "(§17.3/§8.4) and §5.1 admits no conversion "
+                   "between these operand types, so there is no applicable "
+                   "`Equals` for the pair. Compare values of the same type, or "
+                   "convert one operand explicitly (§5.2) — for a flag, "
+                   "`int(b)`; for a rendering, `.ToString()` (§8.5).");
+    } else {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            head + " (§5.1) — §5.1's table has no row between "
+                   "them, so the operation is a compile error (§6.2); "
+                   "convert one operand explicitly (§5.2).");
+    }
+    return true;
+}
+
+// fix #4513 (§3.5/§6.6, v0.306): extracted from fix #4500's inline gate in
+// `typeBinary` (below) so the §6.6 compound-assignment family check
+// (ExprTypecheck.cpp) can ask the IDENTICAL §3.5 question instead of
+// computing its own — see the impl.hpp declaration for the full rationale.
+// `+` defers to string concatenation (§4.6) when either operand is `string`;
+// every other reader of this predicate (ordering, and every other arithmetic
+// op) has no such deferral.
+bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
+    SourceLocation loc, std::string_view op, const TypeRef* lt,
+    const TypeRef* rt) {
+    auto isBool = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::Bool;
+    };
+    auto isStringPrim = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::String;
+    };
+    const bool ordering =
+        (op == "<" || op == ">" || op == "<=" || op == ">=");
+    // §4.6 is the MORE SPECIFIC authority for `string + <anything>`: `+` on a
+    // string operand is concatenation (a declared `String.operator +`,
+    // §3.5), not §3.5's numeric-arithmetic bullet, and its remedy is
+    // interpolation or `.ToString()` — not `int(b)`. The caller's own
+    // string-mismatch check already covers every non-string right operand,
+    // `bool` included, so this gate stands aside for exactly that pair
+    // rather than answering it with advice that does not fit.
+    const bool deferToStringConcat =
+        (op == "+") && (isStringPrim(lt) || isStringPrim(rt));
+    if ((isBool(lt) || isBool(rt)) && !deferToStringConcat) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "operator `" + std::string(op) + "` is not defined for `bool` "
+            "operands (\xC2\xA7""3.5) \xE2\x80\x94 " +
+            (ordering
+                 ? std::string(
+                       "no ordering of `false`/`true` is "
+                       "defined; only `=`/`<>` are valid on bool. To order "
+                       "by a flag, convert explicitly (`int(b)`).")
+                 : std::string(
+                       "\xC2\xA7""3.5 defines arithmetic (`+`, `-`, `*`, `/`) "
+                       "on the numeric types only, and \xC2\xA7""5.1 admits no "
+                       "implicit conversion out of `bool`, so the operation "
+                       "is a compile error (\xC2\xA7""6.2). To compute with a "
+                       "flag, convert explicitly (`int(b)`).")));
+        return true;
+    }
+    return false;
+}
+
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     const auto& op = be.op;
     // §25: a user-defined operator overload takes precedence over the
@@ -5686,58 +5978,120 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     // wrong: `true < false` compiled to `true`, and `string? < string?`
     // segfaulted on a null operand. Reject both here. Only `=`/`<>` are valid
     // on bool / `string?` (the general equality path below is unaffected).
-    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+    //
+    // fix #4500 (§3.5 / §6.2 / §5.1, v0.306): the ARITHMETIC operators
+    // `+ - * /` join this gate's operator set rather than growing a second,
+    // parallel `bool`-operand check further down. §3.5 answers ONE question
+    // for both families — "does the intrinsic-operator table admit an operand
+    // of this type?" — by enumerating each group BY OPERAND TYPE:
+    // "**Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`, `float`, `double`, `decimal`: `+`, `-`, `*`, `/` …"
+    // (no `bool`) beside "**Ordering** … on every primitive **except
+    // `bool`**". §5.1's table has no row out of `bool` ("Between integers and
+    // `bool`" is on its never-implicit list), so §6.2's disposition applies:
+    // "If no implicit conversion exists between the operand types … the
+    // operation is a compile error and an explicit cast is required". The
+    // remedy is the same one the ordering arm already names — `int(b)`.
+    //
+    // Measured on HEAD before this fix (bezelc @ 8fd7cabf, docs v0.306), one
+    // compile + one run each: `decimal * bool` and `double * bool` compiled
+    // with NO diagnostic and the program printed `-2`; `bool + bool` printed
+    // `True` and `bool * bool` printed `False` (arithmetic answered in the
+    // boolean domain); `int * bool` and `int + bool` emitted malformed IR
+    // ("Call parameter type does not match function signature",
+    // `@llvm.smul.with.overflow.i32(i32, i1)`) and died in LLVM's verifier.
+    // One clean rejection replaces all four outcomes, in either operand order
+    // and at a same-typed `bool op bool` pair alike — the gate is per-OPERAND
+    // (§3.5's table is read per operand type), not per pair, so it does not
+    // depend on the other operand being numeric.
+    //
+    // NOT folded in, deliberately: `mod` (§6.1), and the bitwise/shift set
+    // `& | ^ << >>` (§6.5) already reject a `bool` operand further down, each
+    // under its OWN spec rule with its own remedy ("boolean operations use
+    // `and`/`or`/`not`" for bitwise; "`mod` is defined on the integer types and
+    // `decimal`" for mod). Those are not copies of this rule that drifted —
+    // they are different sections answering different questions, they already
+    // agree with §3.5's table, and their wording is pinned by lit rows. What
+    // was missing was §3.5's ARITHMETIC bullet, and it is added here, at the
+    // one site that already answered the identical question for ordering.
+    if (op == "<" || op == ">" || op == "<=" || op == ">=" ||
+        op == "+" || op == "-" || op == "*" || op == "/") {
         // #1574: bool ordering. §7.11's relational-lifting excludes `bool?`
         // for the same reason, so checking the primitive kind here (ignoring
-        // nullability) covers a `bool?` operand too.
+        // nullability) covers a `bool?` operand too. The same reading covers
+        // the arithmetic arm (#4500): §7.11 lifts an operator "only where it
+        // is defined on the underlying type `T`", and `+ - * /` are defined
+        // nowhere on `bool`.
         auto isBool = [](const TypeRef* t) {
             return t && t->kind == TypeRef::Kind::Primitive &&
                    t->primitive == PrimitiveType::Bool;
         };
         TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
         TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
-        if (isBool(lt) || isBool(rt)) {
-            ctx_.diagnostics().report(
-                Severity::Error, be.span.begin,
-                "operator `" + std::string(op) + "` is not defined for `bool` "
-                "operands (\xC2\xA7""3.5) \xE2\x80\x94 no ordering of `false`/`true` is "
-                "defined; only `=`/`<>` are valid on bool. To order by a flag,"
-                " convert explicitly (`int(b)`).");
-            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+        const bool ordering =
+            (op == "<" || op == ">" || op == "<=" || op == ">=");
+        // fix #4513 (§3.5/§6.6, v0.306): the gate itself — the diagnostic
+        // and the string-concat deferral — is now the ONE call
+        // `reportBoolOperandExcludedFromArithmeticOrOrdering` (impl.hpp),
+        // shared with the §6.6 compound-assignment family check
+        // (ExprTypecheck.cpp), which asks this exact question about the same
+        // (target, right-hand-operand) pair. Only the error-RECOVERY typing
+        // below is specific to this expression-typing caller.
+        if (reportBoolOperandExcludedFromArithmeticOrOrdering(
+                be.span.begin, op, lt, rt)) {
+            // Error recovery, mirroring the unit-operand gate above: an
+            // ordering yields `bool`; an arithmetic yields the OTHER
+            // (non-bool) operand's type when there is one, else `int`.
+            if (ordering) {
+                ctx_.setExprType(&be,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (!isBool(lt) && lt) {
+                ctx_.setExprType(&be, lt);
+            } else if (!isBool(rt) && rt) {
+                ctx_.setExprType(&be, rt);
+            } else {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            }
             return;
         }
-        // #1575: ordering on `string` requires non-nullable operands; a
-        // `string?` operand is a compile error (narrow first, §7.4) — the same
-        // use-requires-narrowing discipline as member access on a nullable
-        // reference. Distinct from §7.11 lifting, which is confined to nullable
-        // VALUE types and does NOT extend to `string`. Previously a `string?`
-        // operand fell through to ordinal-compare codegen and segfaulted on a
-        // null operand; `=`/`<>` stay null-safe (§8.4) and are unaffected.
-        auto nullableStringOperand = [&](const ast::Expr* operand) -> bool {
-            if (!operand) return false;
-            const TypeRef* t = ctx_.exprType(*operand);
-            if (!t || t->kind != TypeRef::Kind::Primitive ||
-                t->primitive != PrimitiveType::String || !t->nullable)
-                return false;
-            // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
-            // known non-null even though exprType keeps the nullable flag
-            // (null-narrowing does not rewrite exprType). This is the same
-            // question §7.11's own gates ask, so it is the same predicate
-            // (#3298) rather than a fifth copy of the lookup.
-            return !isNarrowedNonNullRead(operand);
-        };
-        if (nullableStringOperand(be.left.get()) ||
-            nullableStringOperand(be.right.get())) {
-            ctx_.diagnostics().report(
-                Severity::Error, be.span.begin,
-                "operator `" + std::string(op) + "` requires non-nullable "
-                "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
-                "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
-                "use-requires-narrowing discipline as member access on a "
-                "nullable reference. Equality (`=`/`<>`) stays null-safe "
-                "(\xC2\xA7""8.4) and is unaffected.");
-            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-            return;
+        // The #1575 `string?` rule below is ORDERING-only: §4.6 defines
+        // `<`/`<=`/`>`/`>=` on `string`, while `+` on a string operand is the
+        // §4.6 CONCATENATION rule, checked below with its own nullability
+        // handling. Arithmetic therefore stops here.
+        if (ordering) {
+            // #1575: ordering on `string` requires non-nullable operands; a
+            // `string?` operand is a compile error (narrow first, §7.4) — the same
+            // use-requires-narrowing discipline as member access on a nullable
+            // reference. Distinct from §7.11 lifting, which is confined to nullable
+            // VALUE types and does NOT extend to `string`. Previously a `string?`
+            // operand fell through to ordinal-compare codegen and segfaulted on a
+            // null operand; `=`/`<>` stay null-safe (§8.4) and are unaffected.
+            auto nullableStringOperand = [&](const ast::Expr* operand) -> bool {
+                if (!operand) return false;
+                const TypeRef* t = ctx_.exprType(*operand);
+                if (!t || t->kind != TypeRef::Kind::Primitive ||
+                    t->primitive != PrimitiveType::String || !t->nullable)
+                    return false;
+                // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
+                // known non-null even though exprType keeps the nullable flag
+                // (null-narrowing does not rewrite exprType). This is the same
+                // question §7.11's own gates ask, so it is the same predicate
+                // (#3298) rather than a fifth copy of the lookup.
+                return !isNarrowedNonNullRead(operand);
+            };
+            if (nullableStringOperand(be.left.get()) ||
+                nullableStringOperand(be.right.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) + "` requires non-nullable "
+                    "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
+                    "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
+                    "use-requires-narrowing discipline as member access on a "
+                    "nullable reference. Equality (`=`/`<>`) stays null-safe "
+                    "(\xC2\xA7""8.4) and is unaffected.");
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
         }
     }
     // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
@@ -6096,39 +6450,22 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return;
             }
         }
-        // per §6.2/§5.1 (#1204): relational/equality operators require that
-        // the two operand types be compatible (one must implicitly widen to
-        // the other, §5.1).  When both operands are non-nullable, non-literal
-        // typed primitives with no widening relation (e.g. `int` vs `uint`,
-        // `double` vs `decimal`), reject with the same §6.2 diagnostic the
-        // arithmetic path uses.  An operand that is a literal-derived
-        // expression (a bare integer or float literal, or a unary/binary
-        // expression built entirely from such literals) is treated as
-        // "adoptable" and does NOT trigger the rejection — this preserves
-        // patterns like `ulong > 1000` or `ulong > 0 - 5` which work without
-        // an explicit cast because the constant has no declared signedness.
+        // per §6.2/§5.1 (#1204) and §17.3/§8.4 (fix #4501, v0.306):
+        // relational and equality operators require the two operand types to
+        // be compatible — one must implicitly convert to the other (§5.1).
+        // This arm and the §6.2 arithmetic-promotion arm below are now ONE
+        // call rather than two near-identical copies: see
+        // `reportNoImplicitConversionBetweenOperands` for the rule, the four
+        // measured rows the shared hole admitted (`string = 0`, `bool = 0`,
+        // `bool = "x"`, `decimal = "x"`), and why `Object`, nullable operands
+        // and the §5.1 constant-narrowing escape (`ulong > 1000`) stay
+        // admitted. `and`/`or` are excluded: their operands are checked
+        // against `bool` by the §7.11/§6 gates above, not by a conversion.
         if (op != "and" && op != "or") {
             TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
             TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
-            if (lt && rt &&
-                lt->kind == TypeRef::Kind::Primitive &&
-                rt->kind == TypeRef::Kind::Primitive &&
-                !lt->nullable && !rt->nullable &&
-                lt->primitive != rt->primitive &&
-                !primitiveWidens(lt->primitive, rt->primitive) &&
-                !primitiveWidens(rt->primitive, lt->primitive) &&
-                isPromotablePrimitive(lt->primitive) &&
-                isPromotablePrimitive(rt->primitive) &&
-                !isLiteralDerivedExpr(be.left.get()) &&
-                !isLiteralDerivedExpr(be.right.get())) {
-                ctx_.diagnostics().report(
-                    Severity::Error, be.span.begin,
-                    std::string("operator `") + std::string(op) +
-                    "` has no implicit conversion between operand types `" +
-                    primitiveSpelling(lt->primitive) + "` and `" +
-                    primitiveSpelling(rt->primitive) +
-                    "` (§6.2/§5.1); add an explicit cast (§5.2) to convert"
-                    " one operand to the other's type.");
+            if (reportNoImplicitConversionBetweenOperands(
+                    be, op, lt, rt, /*allowLiteralAdoption=*/true)) {
                 ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 return;
             }
@@ -6509,19 +6846,35 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
                 // §6.2: no implicit conversion between the operand types
                 // (e.g. `double` and `decimal`, `float` and `decimal`,
-                // signed/unsigned same-or-narrower-width pairs).
-                if (isPromotablePrimitive(lt->primitive) &&
-                    isPromotablePrimitive(rt->primitive)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, be.span.begin,
-                        std::string("operator `") + std::string(op) +
-                        "` has no implicit conversion between operand types `" +
-                        primitiveSpelling(lt->primitive) + "` and `" +
-                        primitiveSpelling(rt->primitive) +
-                        "` (§6.2); add an explicit cast (§5.2) to convert one"
-                        " operand to the other's type.");
+                // signed/unsigned same-or-narrower-width pairs) — and, since
+                // fix #4501, any other primitive pair §5.1 does not relate
+                // (`string * int` died in LLVM's IR verifier before). This is
+                // the SAME call the equality/relational arm above makes; the
+                // two copies that used to answer it independently shared one
+                // hole, which is what made both #4500's and #4501's rows
+                // invisible.
+                //
+                // fix #4512 (§5.1/§6.2, v0.306): `allowLiteralAdoption` is now
+                // `true` here too. §5.1's constant-narrowing paragraph states
+                // it "applies at every position where this section's implicit
+                // conversions apply — there is no position carve-out", and
+                // arithmetic is exactly such a position (§6.2 explicitly
+                // promotes "using §5.1"); the old asymmetry (relational
+                // admitted `ulong > 1000`, arithmetic rejected `ulong + 1000`)
+                // had no textual authority — it was `reportNoImplicitConversion
+                // BetweenOperands`'s ORIGINAL literal escape's own asymmetry
+                // (#1204 was written for the relational/equality arm only,
+                // arithmetic was never visited), pinned only by this arm's own
+                // test (`t6_arithmetic_arm_has_no_literal_escape_spec_6_2`,
+                // now renamed/flipped). Safe to enable now that the escape
+                // itself is exact to §5.1's own domain (fix #4512's other
+                // half, `isLiteralDerivedExpr`/`isTrueIntegerType` above): it
+                // can no longer let a float/decimal constant slip through a
+                // pair §5.1 never relates, which is what made a naive flip of
+                // this flag alone unsafe before that narrowing.
+                if (reportNoImplicitConversionBetweenOperands(
+                        be, op, lt, rt, /*allowLiteralAdoption=*/true))
                     return;
-                }
             }
         }
         // The result follows the (normalized) left operand: `lt` is already
@@ -7540,6 +7893,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     return ps2->resolvedDeclType;
             return nullptr;
         };
+        // fix #4510 (§2.8.2 clause 1 / §27.4 / §27.1, v0.306): the formal a
+        // call-argument lambda takes its inferred parameter types from — from
+        // BOTH sources, exactly as `formalOutParamType2` above (#2657/#3186)
+        // and `formalCtorOutParamType` on the `new` path (#3772) already do.
+        //
+        // The fix-#829 seeding below used to read `calleeMd2` alone, and an
+        // IMPORTED method has no `ast::MethodDecl` at all (ModuleLoader
+        // reconstructs a bare `sema::MethodSymbol`; the formal types survive
+        // only as `ParameterSymbol::resolvedDeclType`). So across a module
+        // boundary an unannotated lambda argument got NO target type —
+        // silently, because #3756's "no target type anywhere" diagnostic is
+        // suppressed for a call argument (`hadArgContext`), which is exactly
+        // the context this thread was supposed to supply. §2.8.2 clause 1
+        // makes that a defect: the artifact interface must be sufficient to
+        // type-check every well-formed use of the public surface with FULL
+        // signatures, and §27.4 admits the omitted annotation whenever the
+        // target type is known from context — the boundary does not change
+        // whether it is known.
+        //
+        // MEASURED (real `bezelc`, a `-c` library plus an importing exe, an
+        // imported `ApplyHof(f: ((int) -> int) -> int)` called with
+        // `lambda(g) => g(9)`): the single-module twin answers 10 and the
+        // imported call answered 0. A one-level `(int) -> int` formal masked
+        // it — with no type the parameter slot falls through `lowerLambda`'s
+        // `llvm::Type* ty = i32()` DEFAULT, which happens to be right for an
+        // `int` parameter — while the nested function-typed slot lowered `g`
+        // as `i32`, left `g(9)` un-typed, and the body was dropped to
+        // `ret i32 0` (read off `BEZEL_DUMP_IR=1`: the twin emits a second
+        // lambda `i32 (ptr, ptr)` whose body is an indirect call, the importer
+        // emits `i32 (ptr, i32)` whose body is a bare `ret i32 0`).
+        //
+        // A GENERIC callee is skipped on BOTH sides: there the function-param
+        // type may be an unresolved type parameter (`(T) -> int`) inferred
+        // from another argument, and the generic-inference path types the
+        // lambda parameter correctly (#505).
+        auto formalFnParamType2 =
+            [&](std::size_t pos) -> TypeRef* {
+            if (calleeMd2) {
+                if (!calleeMd2->genericParams.empty()) return nullptr;
+            } else if (!calleeMs2 || !calleeMs2->genericParams.empty()) {
+                return nullptr;
+            }
+            return formalOutParamType2(pos);
+        };
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
             // §22.4: `out var x` declares x in the current scope.
@@ -8063,11 +8460,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // another argument; the existing generic-inference path types
                     // the lambda param correctly, and threading the bare `T` here
                     // would override it with the unsubstituted parameter (#505).
-                    if (calleeMd2 && calleeMd2->genericParams.empty() &&
-                        pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        if (auto* pt = ctx_.resolvedType(
-                                *calleeMd2->params[pos2].type)) {
+                    // fix #4510: `formalFnParamType2` (both sources; see its
+                    // header) in place of the former `calleeMd2`-only lookup.
+                    // For a LOCAL callee it resolves through the very same
+                    // `ctx_.resolvedType(*calleeMd2->params[pos2].type)` under
+                    // the very same guards, so that path is unchanged; for an
+                    // IMPORTED one it reads the reconstructed symbol's
+                    // `resolvedDeclType`, which is where the formal's type
+                    // lives when there is no AST decl (§2.8.2 clause 1).
+                    if (calleeMs2) {
+                        if (auto* pt = formalFnParamType2(pos2)) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 !pt->funcParams.empty()) {
                                 // #1140 / §14: a function-typed param `(T)->R`
@@ -8180,6 +8582,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // path). Positional binding via calleeMd2/pos2 mirrors the
                     // out-var inference above; the common positional call gets
                     // the hint, named/overloaded forms simply do not.
+                    // fix #4443 (v0.302, §28.3 Keying rule): a parameter typed
+                    // `(…) -> Task?` / `(…) -> Task<T>?` is mint-announcing at
+                    // its declared type (nullability stripped per §28.3 Keying);
+                    // use the stripped `isTaskFamilyRef` so the lambda body is
+                    // checked under the peeled-element context the same way.
                     if (lam->isAsync && calleeMd2 &&
                         pos2 < calleeMd2->params.size() &&
                         calleeMd2->params[pos2].type) {
@@ -8187,7 +8594,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 *calleeMd2->params[pos2].type)) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 pt->funcReturn &&
-                                isTaskShapedRef(pt->funcReturn) &&
+                                isTaskFamilyRef(pt->funcReturn) &&
                                 !pt->funcReturn->genericArgs.empty())
                                 pendingLambdaReturnType_ =
                                     pt->funcReturn->genericArgs.front();
@@ -9150,6 +9557,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // compile error; the async-iterator interfaces are method-level
         // forms (§30.7, `yield` is rejected in lambda bodies) and do not
         // apply here.
+        // fix #4443 (v0.302, §17.13 Keying rule): this site STAYS strict
+        // (`isTaskShapedRef`, non-nullable). §30.1's async-readiness mapping
+        // is about the DECLARED wrapper — a `Task?` ascription is a different
+        // question (the §17.13 Keying-strips-nullability ruling does not
+        // extend to the declared-wrapper check).
         if (hasAscription && lam->isAsync && !isTaskShapedRef(ascribedRet)) {
             ctx_.diagnostics().report(
                 Severity::Error, lam->span.begin,
@@ -9412,6 +9824,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // wider-integer literal hint, the §22.4 postcondition plumbing).
         // Without one the lambda keeps its no-return-context inference
         // posture unchanged.
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable)
+        // — peeling the task wrapper (§30.1/§30.6) is keyed on the declared
+        // wrapper; the ascription check above already rejected a non-Task-
+        // family ascription, and a `Task?` ascription is the same question
+        // the negation check decided.
         if (hasAscription && lam->isAsync && isTaskShapedRef(ascribedRet)) {
             // per §30.1/§30.6: peel the task wrapper — `Task` behaves as a
             // void-method context; `Task<T>`/`OwningTask<T>` as a value-
@@ -9484,6 +9901,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
                     lamBodyAdmittedLiteral = clE;
                 }
+            }
+            // fix #4249 (§17.7, v0.306): the expression-body spelling of the
+            // position the ReturnStmt visitor rejects for the block-body
+            // spelling (ExprTypecheck.cpp). §17.7 excludes BOTH in one
+            // clause — "It is **not** permitted at an expression body or at
+            // a lambda's ascribed return" — and member (v)'s third
+            // declared-result position is itself "a `return` operand or
+            // expression body checked against a lambda's return-type
+            // ascription" (§27.3), so rejecting only the statement form
+            // would leave the identical silent miscompile one keystroke
+            // away. Measured at e672e7e1: `lambda(): W => new()` compiled
+            // with NO diagnostic at all (not even #2491's `internal:`
+            // Warning the block-body form emits) and SEGV'd on the first
+            // member read. Runs BEFORE the body visit, which for a typeless
+            // NewExpr would type nothing and report nothing.
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(lam->exprBody.get())) {
+                if (!shNe->type)
+                    rejectNewShorthandAtLambdaReturn(
+                        *shNe,
+                        currentReturnType_ ? currentReturnType_
+                                           : lamTargetRet);
             }
             visitExpr(*lam->exprBody);
             // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310
@@ -9687,6 +10126,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // task pointer into the element-sized async result slot (corruption /
         // SIGSEGV). The legitimate `(…) -> Task<Task<U>>` case is exempt because
         // lamRetHint (= Task<U>) is itself Task-shaped.
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable).
+        // lamRetHint is the peeled element type threaded in from the declared
+        // ascription (non-nullable per §30.1), and a body's static type at
+        // this position is the body's declared wrapper check — a `Task?` body
+        // is a different question the dedicated diagnostics handle.
         if (lam->isAsync && lam->exprBody && lamRetHint &&
             !isTaskShapedRef(lamRetHint) &&
             isTaskShapedRef(ctx_.exprType(*lam->exprBody))) {

@@ -56,6 +56,22 @@ struct DepCollector {
     // following there (recording the edge is still correct). Erring toward a
     // missed transitive edge (a safe false negative) over a false one.
     bool suppressGetterFollow = false;
+    // fix #4531 / §22.13: when non-null, this walk is also collecting
+    // SAME-TYPE static references for the forward-reference rule — see
+    // checkSameTypeForwardRefs below. Null for the ordinary cross-type edge
+    // walk, which records nothing for `u == owner`.
+    std::vector<std::pair<const MemberSymbol*, SourceLocation>>* sameTypeOut =
+        nullptr;
+    // fix #4531: 0 while walking the initializer expression itself, >0 once
+    // inside a followed method / getter body. Only the >0 references are the
+    // transitive half of §22.13's forward-reference rule; the depth-0 ones are
+    // the direct half, already reported by ExprTypecheck.cpp.
+    int followDepth = 0;
+    struct DepthGuard {
+        DepCollector& c;
+        explicit DepthGuard(DepCollector& c_) : c(c_) { ++c.followDepth; }
+        ~DepthGuard() { --c.followDepth; }
+    };
 
     // A reference to a static FIELD / METHOD / PROPERTY of another local type
     // triggers that type's static initialization, so it is a dependency edge.
@@ -77,6 +93,13 @@ struct DepCollector {
         const TypeSymbol* u = mem->parent;
         if (u != owner && !ctx.isImported(u))
             out.emplace(u, e->span.begin); // first reference's location wins
+        // fix #4531 / §22.13: a reference to one of `owner`'s OWN statics made
+        // from inside a followed body is the transitive half of the same-type
+        // forward-reference rule. It is not an edge (edges require T != U,
+        // rule 1) — it is a textual-order question, answered by
+        // checkSameTypeForwardRefs against the declaration order.
+        if (sameTypeOut && u == owner && followDepth > 0)
+            sameTypeOut->emplace_back(mem, e->span.begin);
         // #804: a READ of a static property runs its getter body — fold the
         // statics it references into `owner`'s edge set (transitive dependency).
         // A method reference is NOT followed here (referencing a method value
@@ -94,6 +117,7 @@ struct DepCollector {
         if (!m || !visited.insert(m).second) return;
         auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl);
         if (!md) return;
+        DepthGuard dg{*this};                              // fix #4531
         if (md->bodyKind == ast::MethodBodyKind::Expression)
             expr(md->exprBody.get());
         else
@@ -105,6 +129,7 @@ struct DepCollector {
         if (!p || !visited.insert(p).second) return;
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(p->decl);
         if (!pd) return;
+        DepthGuard dg{*this};                              // fix #4531
         if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
             expr(pd->exprBody.get());
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
@@ -287,6 +312,153 @@ void collectDeps(const SemaContext& ctx, const TypeSymbol* t,
     }
 }
 
+// --- §22.13 same-type forward references reached THROUGH a call body --------
+//
+// fix #4531, per §22.13 (v0.306): "if the initializer expression for a
+// `static readonly` field F reads a `static readonly` field G of the same type
+// declared *after* F in the source — **directly, or transitively through the
+// bodies of statically-resolvable calls** (the same call set as the cross-type
+// dependency graph below — static methods and static property getters reached
+// by direct name within the compilation unit, §2.5; function values, virtual
+// dispatch, and code outside the compilation unit contribute nothing) — the
+// reference is rejected at compile time."
+//
+// ExprTypecheck.cpp's `checkStaticReadonlyForwardRefImpl` implements only the
+// DIRECT half: it walks the initializer expression and stops at a call. The
+// transitive half belongs HERE, for two reasons:
+//
+//   * it needs exactly this file's call set — the `followCalledStaticMethod` /
+//     `followMethod` / `followProperty` walk that §22.13 defines by pointing at
+//     "the same call set as the cross-type dependency graph"; and
+//   * it must run after typecheck. The helper is routinely declared *after*
+//     the initializer that calls it (t7's `Helper` is the last member of its
+//     type), so during ExprTypecheck's own member-by-member pass the helper
+//     body's `exprSymbol` entries do not exist yet.
+//
+// Until this check existed the shape fell through to the RUNTIME, where fix
+// #4486 correctly stopped it raising: §22.13 rule 2's backstop is scoped to
+// cross-type re-entrancy ("a touch of T is *re-entrant* when that innermost
+// initialization belongs to a different type — the T → U → T signature — and
+// is *ordinary execution* when it is T's own"), and the paragraph says so
+// again in its own parenthesis ("A type's *own* initialization code observing
+// its own later statics is governed by the forward-reference rule and its
+// recorded residual above, not by this backstop"). The residual it is governed
+// by is scoped just as tightly — it covers a read "routed through a function
+// value, virtual dispatch, or a module boundary", which a direct static call
+// within the compilation unit is not. So there is no runtime rule that admits
+// this program: the rule that governs it is the compile-time one, and the
+// defect was that the compile-time check did not implement its own transitive
+// clause.
+//
+// This predicate mirrors ExprTypecheck.cpp's `ExprTC::staticReadonlyStorageName`
+// — the two must agree about which members §22.13's textual-order rule ranges
+// over: a `static readonly` field, or a `static readonly` AUTO-property whose
+// §23.1 backing field the same textual-order pass writes (#3774). Never an
+// indexer, and never a getter-bearing property, which recomputes on every read
+// and owns no static-init-written storage.
+bool isStaticReadonlyStorage(const Symbol* s) {
+    auto hasMod = [](const std::vector<std::string_view>& mods,
+                     std::string_view m) {
+        return std::find(mods.begin(), mods.end(), m) != mods.end();
+    };
+    if (auto* fs = dynamic_cast<const FieldSymbol*>(s))
+        return hasMod(fs->modifiers, "static") &&
+               hasMod(fs->modifiers, "readonly");
+    if (auto* ps = dynamic_cast<const PropertySymbol*>(s)) {
+        if (ps->isIndexer) return false;
+        // The declaration is the ONLY channel for "is this a static
+        // AUTO-property": `PropertySymbol::isAutoProperty` is an
+        // INSTANCE-storage predicate that SymbolCollection and
+        // ModuleMetadataBuilder both clear on `static`, so it is false for
+        // every static auto-property. ExprTypecheck.cpp's
+        // `staticReadonlyStorageName` reads the decl here for the same reason,
+        // under the same marker.
+        //
+        // SEAM-ACCESSOR: local-only by construction — the sole caller walks
+        // `t->members` of a type it already tested `!ctx.isImported(t)`. #3152
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer || pd->bodyKind != ast::PropertyBodyKind::Auto)
+            return false;
+        return hasMod(ps->modifiers, "static") &&
+               hasMod(ps->modifiers, "readonly");
+    }
+    return false;
+}
+
+// The one initializer expression a static-readonly storage member has: a
+// field's `:= expr`, or (§23.1) an auto-property's. A getter body is not an
+// initializer — it runs on demand, after static init.
+const ast::Expr* staticReadonlyInitializerOf(const Symbol* s) {
+    // An initializer EXPRESSION exists only in the AST — there is no
+    // symbol-side channel for it, and there cannot be one across a module
+    // boundary (an imported member's initializer already ran in its own
+    // compilation, and is not a SAME-TYPE reference here in any case).
+    if (auto* fs = dynamic_cast<const FieldSymbol*>(s)) {
+        // SEAM-ACCESSOR: local-only by the same construction as above. #3152
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        return fd ? fd->initializer.get() : nullptr;
+    }
+    if (auto* ps = dynamic_cast<const PropertySymbol*>(s)) {
+        // SEAM-ACCESSOR: ditto, for §23.1's auto-property initializer. #3152
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        return pd ? pd->autoInitializer.get() : nullptr;
+    }
+    return nullptr;
+}
+
+// Reports every same-type forward reference in `t` that is reachable only
+// through a followed body. Returns false if it reported anything.
+bool checkSameTypeForwardRefs(SemaContext& ctx, const TypeSymbol* t,
+                              std::set<std::pair<std::uint32_t, std::string>>&
+                                  alreadyReported) {
+    // `t->members` is declaration order — the same list ExprTypecheck.cpp's
+    // `indexOf` walks to answer "declared *after* F in the source".
+    std::unordered_map<const Symbol*, int> index;
+    for (std::size_t i = 0; i < t->members.size(); ++i)
+        index.emplace(t->members[i], static_cast<int>(i));
+
+    bool clean = true;
+    for (std::size_t i = 0; i < t->members.size(); ++i) {
+        const Symbol* f = t->members[i];
+        if (!isStaticReadonlyStorage(f)) continue;
+        const ast::Expr* init = staticReadonlyInitializerOf(f);
+        if (!init) continue;
+        // A fresh collector per F: `visited` is the interprocedural recursion
+        // guard for ONE root walk, so sharing it across roots would silently
+        // drop the second root's view of a helper the first already folded.
+        std::unordered_map<const TypeSymbol*, SourceLocation> edgesUnused;
+        std::vector<std::pair<const MemberSymbol*, SourceLocation>> refs;
+        DepCollector c{ctx, t, edgesUnused};
+        c.sameTypeOut = &refs;
+        c.expr(init);
+
+        std::unordered_set<const Symbol*> reportedForF;
+        for (const auto& [g, loc] : refs) {
+            auto it = index.find(g);
+            if (it == index.end() || it->second <= static_cast<int>(i)) continue;
+            if (!isStaticReadonlyStorage(g)) continue;
+            if (!reportedForF.insert(g).second) continue;
+            // Same wording as ExprTypecheck.cpp's direct arm: one rule, one
+            // voice. Reported at the read inside the followed body, which is
+            // where the forward reference actually happens.
+            std::string msg =
+                std::string("static readonly `") +
+                std::string(dynamic_cast<const MemberSymbol*>(f)->name) +
+                "` reads static readonly `" + std::string(g->name) +
+                "`, which is declared later in the same type — a forward "
+                "reference between static readonly fields is not allowed; "
+                "reorder the declarations or use a static constructor (§22.13)";
+            // One diagnostic per (location, message) across the whole unit: a
+            // generic type's template and any instantiation sharing that AST
+            // would otherwise report the identical read twice.
+            if (!alreadyReported.emplace(loc.offset, msg).second) continue;
+            clean = false;
+            ctx.diagnostics().report(Severity::Error, loc, msg);
+        }
+    }
+    return clean;
+}
+
 bool typeHasStaticInit(const TypeSymbol* t) {
     for (const Symbol* m : t->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
@@ -304,6 +476,24 @@ bool typeHasStaticInit(const TypeSymbol* t) {
 }  // namespace
 
 bool checkStaticInitCycles(const ast::SourceFile& /*src*/, SemaContext& ctx) {
+    // fix #4531 / §22.13: the transitive half of the SAME-TYPE
+    // forward-reference rule — a `static readonly` initializer reading a
+    // later-declared `static readonly` sibling through the body of a
+    // statically-resolvable call. Runs over every local type, including one
+    // whose only static init is an auto-property initializer (which
+    // `typeHasStaticInit` below does not count, because such a member creates
+    // no cross-type EDGE bookkeeping of its own).
+    bool sameTypeClean = true;
+    {
+        std::set<std::pair<std::uint32_t, std::string>> reported;
+        for (const auto& sym : ctx.symbols()) {
+            auto* t = dynamic_cast<const TypeSymbol*>(sym.get());
+            if (!t || ctx.isImported(t)) continue;
+            if (!checkSameTypeForwardRefs(ctx, t, reported))
+                sameTypeClean = false;
+        }
+    }
+
     // Build the direct static-init dependency graph over LOCAL types. Each edge
     // carries a representative source location (a reference that creates it).
     using EdgeMap = std::unordered_map<const TypeSymbol*, SourceLocation>;
@@ -320,7 +510,7 @@ bool checkStaticInitCycles(const ast::SourceFile& /*src*/, SemaContext& ctx) {
             sources.push_back(t);
         }
     }
-    if (deps.empty()) return true;
+    if (deps.empty()) return sameTypeClean;
 
     // DFS for a back-edge to a node on the current path = a cycle. Report each
     // distinct cycle once (keyed on its member set).
@@ -367,7 +557,7 @@ bool checkStaticInitCycles(const ast::SourceFile& /*src*/, SemaContext& ctx) {
     for (const TypeSymbol* t : sources)
         if (color[t] == 0) dfs(t);
 
-    return clean;
+    return clean && sameTypeClean;
 }
 
 }  // namespace bezel::sema

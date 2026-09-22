@@ -326,22 +326,29 @@ BEZEL_TEST(collection_literal_element_interface_conformance_4310,
 // ============================================================
 
 // A genuinely conforming class as a single inline-array element.
+// NOTE: switched to `[1 owned]` (the spec-conformant form per §15.1.1 /
+// #4336 / `569a680`): the non-owning `[1]IHolder` is a BORROW slot per §15.1
+// and the `new Widget3Ok(s)` initializer is now rejected by #4351's sema
+// fix. The owning form takes ownership of the fresh widget on construction
+// and exercises the SAME inline-array element conformance path this test
+// pins.
 BEZEL_TEST(collection_literal_element_interface_conformance_4310,
            conforming_single_element_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [1]IHolder := [new Widget3Ok(s)]; "
+        "var outer: [1 owned]IHolder := [new Widget3Ok(s)]; "
         "return outer[0].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
 // TWO DIFFERENT conforming implementors in one inline array.
+// See note above: switched to `[2 owned]` for #4351.
 BEZEL_TEST(collection_literal_element_interface_conformance_4310,
            two_different_conforming_implementors_accepted_control) {
     auto r = run(
         "var s := \"he\" + \"llo\"; "
-        "var outer: [2]IHolder := [new Widget3Ok(s), new Widget4Ok(\"world\")]; "
+        "var outer: [2 owned]IHolder := [new Widget3Ok(s), new Widget4Ok(\"world\")]; "
         "return outer[0].GetV().Length + outer[1].GetV().Length;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);

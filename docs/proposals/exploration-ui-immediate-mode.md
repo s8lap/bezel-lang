@@ -9,7 +9,7 @@
 | **Design influences** | Dear ImGui (ID stack, seed-hashed identity, `bool*`-style write-back), egui (`Ui` sub-allocators, closure-nested layout, `Response`, per-widget `Memory`, headless testing), microui (fixed-vocabulary command list). Not Unity IMGUI's global-state formulation. |
 | **Verdict up front** | Immediate mode is *more* at home in Bezel than in C or Rust, for three compiler-checked reasons: (1) the **call-bounded default** for function-typed parameters (§28.14) makes "the library retains nothing of the caller's" a *type-system fact* — a layout closure cannot be stored, so the defining immediate-mode invariant needs no discipline; (2) **`ref` parameters** (§22.3) give `ui.Checkbox("Dark", ref dark)` without pointers, and a `ref` argument may never name owned state, so a widget can never be bound to a slot whose disposal it could race; (3) the **mutable-static ban** (§22.12) makes `ImGui::GetCurrentContext()` unwritable — the context is an explicit object everywhere, which is the egui shape, and because it holds borrows it is **non-sendable by construction** (§30.14), so "call the UI from a worker" is a compile error at the send site (exploration-ui.md §0's headline, again). The costs are the known immediate-mode ones (no native look, accessibility, IME depth, continuous redraw) plus one Bezel-specific one: **no `Any`**, so per-widget memory is a closed set of typed side tables rather than egui's type-erased map. The whole library is ordinary user-level Bezel over the shipped stdlib; the only foreign code is the platform layer (window, input pump, rasterizer), which — unlike the retained lane — needs **no callback inversion**, only a non-blocking poll. |
 
-**API-invention notice (CLAUDE.md rule 2):** `UiContext`, `Ui`, `Response`, `WidgetId`, `DrawCommand`, `FrameInput`, `UiMemory`, `IFontMetrics`, `IUiPlatform` and every member on them are **sketch-only vocabulary** — no such stdlib exists and none is proposed here. The types that *are* real, and are the whole substrate the sketch stands on: `Array<T>`, `Dictionary<K,V>`, `OwningDictionary<K,V>`, `OwningArray<T>`, `Set<T>`, `IReadOnlyList<T>` (stdlib §4), `StringBuilder` (§3), `TimeSpan`, `Stopwatch` (`System.Diagnostics`), `Channel<T>`/`ChannelSender<T>`, `Domain.Spawn` (§6), `Debug.Assert`, and the FFI carriers (§10). Every *language* rule cited is normative at the pinned revision; every line of Bezel below was traced against `Bezel_For_Code_Generation.md` v0.306 and the spec sections it cites.
+**API-invention notice (CLAUDE.md rule 2):** `UiContext`, `Ui`, `Response`, `WidgetId`, `DrawCommand`, `FrameInput`, `UiMemory`, `IFontMetrics`, `IUiPlatform` and every member on them are **sketch-only vocabulary** — no such stdlib exists and none is proposed here. The types that *are* real, and are the whole substrate the sketch stands on: `Array<T>`, `Dictionary<K,V>`, `OwningDictionary<K,V>`, `OwningArray<T>`, `Set<T>`, `IReadOnlyList<T>` (stdlib §4), `StringBuilder` (§3), `TimeSpan`, `Stopwatch` (`System.Diagnostics`), `Channel<T>`/`ChannelSender<T>`, `Domain.Spawn` (§6), `Debug.Assert`, and the FFI carriers (§10). Every *language* rule cited is normative at the pinned revision; every line of Bezel below was traced against `Bezel_For_Code_Generation.md` v0.306 and the spec sections it cites, then adversarially re-checked against the spec and stdlib themselves (2026-09-19). Blocks marked `…` or "body elided", and the body-less signature listing in §4.3, are deliberate elisions and not compilable fragments; every *complete* method is meant to compile as written.
 
 ## 0. The headline: three rules that make the paradigm's discipline a type-system fact
 
@@ -17,14 +17,14 @@ Immediate mode's defining property is that the UI is a **function called once pe
 
 | Immediate-mode invariant | How C/ImGui holds it | How Bezel holds it | Authority |
 |---|---|---|---|
-| The library never retains a caller's callback | convention | A function-typed parameter without `scoped` is **call-bounded**: "invocable during the call, never retained — and callers may pass any closure." A nested-layout closure (`ui.Horizontal(lambda(row) => …)`) therefore cannot end up in a library field, and the caller may capture anything, borrows included. | §28.14 (v0.177 call-bounded default) |
-| Widgets write back into caller state without owning it | `bool*` / `float*` | `ref` parameters, written at the declaration and the call site. A `ref` argument "may not name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`" — so a widget is bound only to value storage the caller keeps alive for the call. | §22.3 |
+| The library never retains a caller's callback | convention | A function-typed parameter without `scoped` is **call-bounded**: "the callee receives the callback for the duration of the call only", and "**any** closure — capture-bearing or not — may be passed to a call-bounded parameter." A nested-layout closure (`ui.Horizontal(lambda(row) => …)`) therefore cannot end up in a library field, and the caller may capture anything, borrows included. | §28.14 (v0.177 call-bounded default) |
+| Widgets write back into caller state without owning it | `bool*` / `float*` | `ref` parameters, written at the declaration and the call site. A `ref` argument may name "no `using var` binding" and "no location of **owned state** — an owned local or `owned` parameter, an `owned` field, an owning-collection or owning-inline-array slot" — so a widget is bound only to value storage the caller keeps alive for the call. | §22.3 |
 | Locals mutated by a nested closure are the caller's locals | n/a | "Captured variables are heap-allocated in a closure object. Modifications to a captured variable inside the lambda are visible outside." A local passed as `ref` inside any lambda is *mutably captured* (§7.4), which is exactly the shared-cell semantics a nested `row.Checkbox("x", ref flag)` needs. | §27.5, §7.4 |
 | There is one UI thread | documentation | The context holds borrows and is therefore not transfer-closed; sending it is a send-site compile error. The frame loop runs on one domain; background results re-enter only as sendable values through a channel. | §30.13, §30.14 |
 | There is no hidden global context | `ImGui::SetCurrentContext` | A mutable static is a compile error outside four admitted forms, none of which is "a UI context". The context is a parameter or a field, always. | §22.12 |
 | Per-frame allocations are freed every frame | manual arena reset | A child `Ui` created for a nested closure is an owned local of the parent's method: disposed at return, on the exception edge too, with no plumbing. The library's per-frame objects are trivial-dispose classes (no destructor, no owned resource fields), so no must-use warnings attach anywhere. | §28.3, §28.9 |
 
-What does **not** carry over from C or Rust, stated once: no `Any`/`Box<dyn Any>` (per-widget memory is a closed typed set — §6), no wrapping integer arithmetic (a hand-rolled FNV faults with `OverflowException` under §6.1's checked arithmetic — widget IDs are built from the auto-generated record hash instead, §3.2), no global font/style singleton (the platform lends fonts to the context; style is a record on the context), and no `&mut` exclusivity: Bezel does not stop a nested closure from calling the *outer* `ui` instead of the child it was handed (§4.3 records the residual and its runtime backstop).
+What does **not** carry over from C or Rust, stated once: no `Any`/`Box<dyn Any>` (per-widget memory is a closed typed set — §6), no wrapping integer arithmetic (a hand-rolled FNV faults with `OverflowException` under §6.1's checked arithmetic — widget IDs are built from the auto-generated record hash instead, §2.1), no global font/style singleton (the platform lends fonts to the context; style is a record on the context), and no `&mut` exclusivity: Bezel does not stop a nested closure from calling the *outer* `ui` instead of the child it was handed (§4.2 records the residual and its runtime backstop).
 
 ## 1. The frame model
 
@@ -64,7 +64,7 @@ public class Program
 end Program;
 ```
 
-Why each line is admitted: `SoftwarePlatform.Open` is a static returning a class, so it must (and does) declare `: owned SoftwarePlatform` (§28.3 corollary 1); `platform.Fonts` is a property read — a borrow of the platform's storage — bound into the context's `_fonts` field under the constructor-parameter back-reference idiom (§28.3), the K4.3 trust clause being discharged by declaration order (the platform is declared first, so it is disposed *last*, §28.3 reverse-order disposal of owned locals); `ctx.Input`/`ctx.Root`/`ctx.Output` are property reads, so each is a borrow of the context's storage that the callee may use for the call and not retain (§28.3 "reads of storage are not calls"); `app` is a plain `var` on a trivial-dispose class and so carries no must-use warning (§28.9).
+Why each line is admitted: `SoftwarePlatform.Open` is a static returning a class, so it must (and does) declare `: owned SoftwarePlatform` (§28.3, *factory methods and sourceless returns*); `platform.Fonts` is a property read — a borrow of the platform's storage — bound into the context's `_fonts` field under the constructor-parameter back-reference idiom (§28.3), the K4.3 trust clause being discharged by declaration order (the platform is declared first, so it is disposed *last*, §28.3 reverse-order disposal of owned locals); `ctx.Input`/`ctx.Root`/`ctx.Output` are property reads, so each is a borrow of the context's storage that the callee may use for the call and not retain (§28.3 "reads of storage are not calls"); `app` is a plain `var` on a trivial-dispose class and so carries no must-use warning (§28.9).
 
 ## 2. The value vocabulary
 
@@ -107,8 +107,9 @@ end Modifiers;
 public enum LayoutDirection  TopDown, LeftToRight;  end LayoutDirection;
 public enum Align            Start, Center, End_;   end Align;
 
-/// What a widget wants to react to; Interact (§4.1) reads it.
-public record Sense(Click: bool, Drag: bool, Focus: bool)
+/// What a widget wants to react to; Interact (§4.2) reads it. The positional fields may not share a
+/// name with the static members (§9.3/§11.3), hence the `Wants` prefix.
+public record Sense(WantsClick: bool, WantsDrag: bool, WantsFocus: bool)
   public static readonly property Hover: Sense := new Sense(false, false, false);
   public static readonly property Click: Sense := new Sense(true, false, false);
   public static readonly property Drag:  Sense := new Sense(true, true, false);
@@ -142,14 +143,14 @@ public record WidgetId(Seed: int, Own: int)                  // auto-hashable (�
 end WidgetId;
 ```
 
-- `GetHashCode()` on `this` is the compiler-generated positional hash (§9.1), which §8.3 requires to be **order-sensitive** over `(Seed, Own)` — so `Root.Child("a").Child("b")` and `Root.Child("b").Child("a")` are not systematically equal, and the ID stack is a chain of these calls. `string.GetHashCode()` is `pure` (stdlib §9.1).
+- `GetHashCode()` on `this` is the compiler-generated positional hash (§9.1), which §8.3 requires to be **order-sensitive** over `(Seed, Own)` — so `Root.Child("a").Child("b")` and `Root.Child("b").Child("a")` are not systematically equal, and the ID stack is a chain of these calls. `string.GetHashCode()` is `pure` (stdlib §9.6).
 - A `WidgetId` keys every memory table (`Dictionary<WidgetId, …>` requires `hashable`, which a positional record of `int`s is — spec §3.6's derived-property table).
 - **Two labels in one scope collide**, as in ImGui — and the remedy is the same: salt the scope (`ui.WithId(i, …)`, §4.2) or the widget (`id := …`). The sketch does not adopt ImGui's `"label##salt"` string convention: parsing meaning out of a display string is the kind of implicit convention the language declines elsewhere, and a named argument does the job visibly.
 - **Not stable across builds.** §8.3 leaves the combining algorithm implementation-defined, and `string.GetHashCode()`'s algorithm is unspecified, so IDs are valid within one process only. That is all in-process memory needs; persisting window positions across runs (egui does) would need a stable hash — open question 4.
 
 ## 3. Input in, commands out: the two boundaries with the platform
 
-Both boundaries are **plain data**: a closed `choice` of input events and a closed `choice` of draw commands, each carrying only value payloads (records, primitives, `string`), hence value-like (§35.4) and sendable (§35.12). That is what lets the platform layer live on another domain if it ever needs to, and what makes headless testing (§5.4) a matter of pushing events and reading commands.
+Both boundaries are **plain data**: a closed `choice` of input events and a closed `choice` of draw commands, each carrying only value payloads (records, primitives, `string`), hence value-like (§35.4) and sendable (§35.12). That is what lets the platform layer live on another domain if it ever needs to, and what makes headless testing (§5.5) a matter of pushing events and reading commands.
 
 ```bezel
 public choice InputEvent
@@ -204,7 +205,7 @@ public interface IFontMetrics
 end IFontMetrics;
 ```
 
-`Array<DrawCommand>` is a **borrowing-family** collection over **value** elements: `Add` stores a copy, `Dispose()` is a no-op, no fresh-store lint attaches (§15.4 exempts runtime-managed and value elements), and the class is trivial-dispose (§28.9). The command vocabulary is microui-sized on purpose: a backend that can fill, stroke, draw text and clip can render everything the widget set produces; images and custom meshes are §9's open question 3.
+`Array<DrawCommand>` is a **borrowing-family** collection over **value** elements: `Add` stores a copy, `Dispose()` is a no-op, no fresh-store lint attaches (§15.4 exempts runtime-managed and value elements), and the class is trivial-dispose (§28.9). The command vocabulary is microui-sized on purpose: a backend that can fill, stroke, draw text and clip can render everything the widget set produces; images and custom meshes are §10's open question 3.
 
 ## 4. The context and the `Ui` handle
 
@@ -255,7 +256,7 @@ public class UiContext(fonts: IFontMetrics)
 end UiContext;
 ```
 
-- `_root` is a **nullable owned field** because its constructor needs `this`, and a `this`-passing `new` inside the context's own constructor would run before `_root` is definitely assigned (§22.7's gate). Assigning a fresh `Ui` each frame is drop-on-overwrite (§28.7): last frame's root is disposed at the store. `Ui` is trivial-dispose, so this is a free allocation policy, not a resource one.
+- `_root` is a **nullable owned field** because its constructor needs `this`, which a field initializer may not reference (§22.8), and a primary-constructor class has no body in which to assign it (§22.10) — so it is created at the first `BeginFrame`. Assigning a fresh `Ui` each frame is drop-on-overwrite (§28.7): last frame's root is disposed at the store. `Ui` is trivial-dispose, so this is a free allocation policy, not a resource one.
 - `Style` is a record auto-property: `ctx.Style := ctx.Style with(Accent := Color.Rgb(40, 120, 255));` is a whole-value replacement (§9.5) — there is no push/pop style stack; scoped restyling is a `Ui`-level override (§4.2), which is a parameter, not hidden state.
 - The context is **not sendable**: `_fonts` is a plain borrow field, so the class is not transfer-closed (§30.14 rule 3). Handing `ctx` to `Domain.Spawn` is rejected at the call. This is the UI-thread guarantee, free.
 
@@ -328,7 +329,7 @@ public class Ui(ctx: UiContext, rect: Rect, id: WidgetId, direction: LayoutDirec
     try
       body(child);                                          // the caller's closure, invoked exactly here
     finally
-      _suspended := false;                                  // a throwing body must not wedge the parent (§21.7)
+      _suspended := false;                                  // a throwing body must not wedge the parent (§31.2)
     end try;
     Advance(child.MinSize);                                 // the child's extent becomes the parent's step
   end RunChild;
@@ -344,11 +345,11 @@ Why each line is admitted:
 - **`var child := new Ui(…)`** is an owned local (fresh producer, §28.3 row 1) of a trivial-dispose class: no must-use warning, disposed at method return on both edges (§28.9, §28.3). Passing `child` to `RunChild(child, …)` lends it (§28.6). The closure sees a plain borrow parameter.
 - **`_ctx: UiContext := ctx`** is the back-reference idiom (§28.3): a constructor-parameter borrow into a plain field, admitted structurally; the K4.3 outlives obligation is discharged by construction because every `Ui` is created by the context or by a `Ui` the context transitively owns, inside one frame.
 - **`_suspended` plus `requires(not _suspended)`** is the runtime backstop for the one thing Rust's `&mut` gives egui and Bezel deliberately does not (no exclusivity on borrows): inside `ui.Horizontal(lambda(row) => …)`, calling `ui.Button(...)` instead of `row.Button(...)` compiles. It is a contract violation at the parent's `Allocate` — `ContractViolationException` (§22.16), in every build mode because it is a `requires` — and reads as "you used the outer Ui inside a child scope". Cheap, deterministic, and the failure names itself.
-- `Paint()` returns a *fresh record*: the sketch makes `Painter` a borrow-bearing record over the draw list (§4.4), constructed from the field-sourced borrow `_ctx.Output`, which is not a temporary (§9.7's construction rule).
+- `Paint()` returns a *fresh record*: the sketch makes `Painter` a borrow-bearing record over the draw list (§4.4), constructed from the field-sourced borrow `_ctx.Output`, which is not a temporary (§9.7 rejects only literals and unbound fresh call results; a getter result is a receiver-sourced borrow, §28.3, and the hop composes: `_ctx.Output` is sourced from `_ctx`, itself sourced from `this`).
 
 ### 4.3 Widgets: the surface
 
-Every widget is a method on `Ui` and takes its display text first and its bound state as `ref` where it has any. The surface is split into three tiers by **what §21.9 says about an ignored result**: an expression statement whose result is non-`()` draws an *unused result* warning, so a `Response` may only be returned where the caller nearly always branches on it. Fact-returning widgets return `Response`; display-only widgets and containers return `()`; state-writing widgets return `()` and offer an **`out response: Response`** overload — the standard library's own Try-shape convention (stdlib §1: a result plus an `out` for the extra information) — for the frames where the caller wants the `Changed` edge or the rectangle. The list is the "minimal viable" set; each is buildable from `Allocate` + `Interact` + `Paint()` + memory, and the sketch shows two in full (§4.5).
+Every widget is a method on `Ui` and takes its display text first and its bound state as `ref` where it has any. The surface is split into three tiers by **what §21.9 says about an ignored result**: an expression statement whose result is non-`()` draws an *unused result* warning, so a `Response` may only be returned where the caller nearly always branches on it. Fact-returning widgets return `Response`; display-only widgets and containers return `()`; state-writing widgets return `()` and offer an **`out response: Response`** overload — an ordinary plain `out` (§22.3/§22.4), not one of stdlib §1's four Try shapes, chosen so that the common line draws no §21.9 warning — for the frames where the caller wants the `Changed` edge or the rectangle. The list is the "minimal viable" set; each is buildable from `Allocate` + `Interact` + `Paint()` + memory, and the sketch shows two in full (§4.5).
 
 ```bezel
   // ---- fact-returning widgets: the caller nearly always branches on the result -----------
@@ -405,8 +406,8 @@ Every widget is a method on `Ui` and takes its display text first and its bound 
 
 Design notes, each a recorded choice:
 
-1. **`ref` for every bound value; `out response` for the edge.** `ui.Checkbox("Dark", ref dark);` is the whole write-back story on the frames nobody cares about the edge, and `ui.Checkbox("Dark", ref dark, out var r); if r.Changed then Restyle(); end;` on the ones somebody does. Two alternatives were considered and declined for the sketch. Returning the new value (`dark := ui.Checkbox("Dark", dark);`) forces an assignment statement per widget (assignments are not expressions, §17.2), loses the edge, and reads as if the widget owned the value. Returning `Response` unconditionally — egui's shape — makes the *common* line warn under §21.9 and pushes `_ := ui.Checkbox(…)` onto every slider and checkbox; the language's own convention for "a result you may not want" is an `out`, so the sketch follows it. The price is that egui's one-liner `if ui.checkbox(..).changed()` becomes two lines.
-2. **Overloads by `ref` type** (`Slider` over `ref float` and `ref int`) are ordinary overloads: `ref int` and `ref float` are distinct parameter types (§22.6). A generic `Slider<T> where T: INumber<T>` was considered; `INumber<T>` (stdlib §2.15) has `+ - * /` and `<` but no float conversion, so the mapping to pixels needs a per-type helper anyway. Two overloads are honest.
+1. **`ref` for every bound value; `out response` for the edge.** `ui.Checkbox("Dark", ref dark);` is the whole write-back story on the frames nobody cares about the edge, and `ui.Checkbox("Dark", ref dark, out var r); if r.Changed then Restyle(); end;` on the ones somebody does. Two alternatives were considered and declined for the sketch. Returning the new value (`dark := ui.Checkbox("Dark", dark);`) forces an assignment statement per widget (assignments are not expressions, §17.2), loses the edge, and reads as if the widget owned the value. Returning `Response` unconditionally — egui's shape — makes the *common* line warn under §21.9 and pushes `_ := ui.Checkbox(…)` onto every slider and checkbox; an `out` parameter is the language's spelling for a second result the caller may decline to bind (`out _`), so the sketch uses it. The price is that egui's one-liner `if ui.checkbox(..).changed()` becomes two lines.
+2. **Overloads by `ref` type** (`Slider` over `ref float` and `ref int`) are ordinary overloads: `ref int` and `ref float` are distinct parameter types (§22.6). A generic `Slider<T> where T: INumber<T>` was considered; `INumber<T>` (stdlib §2.19) has `+ - * /` and `<` but no float conversion, so the mapping to pixels needs a per-type helper anyway. Two overloads are honest.
 3. **Two spellings for open/closed state** (`CollapsingHeader` with and without `ref open`): memory-held state is the immediate-mode convenience; app-held state is what a program that saves layouts needs. Both exist in egui for the same reason.
 4. **`Popup` takes its anchor `Response`** rather than reading "the last item". The sketch has no last-item register on `Ui` at all: every relation between two calls is a value passed between them. That is the explicit-over-implicit ethos applied one step further than ImGui goes.
 5. **`Tabs` and `Table` take a body with an extra parameter** (`(Ui, int) -> ()`; `(TableBody) -> ()`): function types with several parameters are ordinary (§27.1), and a lambda under that target type infers its parameter types (§27.4).
@@ -439,7 +440,7 @@ end Painter;
   public method Paint(): Painter => new Painter(_ctx.Output, _rect);
 ```
 
-A record method may not store into its own receiver (§9.4), and none of these does — every write hops through the class-typed `Target` field, which is exactly the sanctioned mediating shape (§9.4: "a chain that hops through a class- or interface-typed member, leaving the receiver"). `Paint()` is a *method* rather than a property only for symmetry with the other producers; a property would be admitted too, since the value is a record built from a field-sourced borrow (§28.3 corollary 3 forbids fresh **owned class** values from getters, not records). The methods are named `FillRect`/`StrokeRect` rather than `Rect`/`Stroke` so that no member shares a name with the `Rect` type it takes.
+A record method may not store into its own receiver (§9.4), and none of these does — every write hops through the class-typed `Target` field, which is exactly the sanctioned mediating shape (§9.4: "a chain that hops through a class- or interface-typed member, leaving the receiver"). `Paint()` is a *method* rather than a property only for symmetry with the other producers; a property would be admitted too, since the value is a record built from a field-sourced borrow (§28.6 forbids fresh **owned class** values from getters, not records). The methods are named `FillRect`/`StrokeRect` rather than `Rect`/`Stroke` so that no member shares a name with the `Rect` type it takes.
 
 ### 4.5 Two widgets in full
 
@@ -483,7 +484,7 @@ Everything in §4.3 reduces to `Allocate` + `Interact` + `Paint` + memory. `Butt
 ```
 
 - `(if … elif … else …)` is the paren atom (§20); `else` is mandatory and the arms meet at one record type.
-- `r := r with(Changed := true)` is the only way to "set a field" of a record local: the record is a value (§9.5); `r.Changed := true` would be a store into a value's own storage through a named binding — legal on a local, in fact (§9.4 bounds the rule to *receiver* positions) — but the `with` form reads as the copy it is.
+- `r := r with(Changed := true)` is the only way to "set a field" of a `Response` local: `Response` is positional, so `Changed` is a read-only property (§9.1, §9.4) and `r.Changed := true` is a compile error even on a local; `with` copies the storage with the override applied (§9.5), which is exactly the update idiom §9.4's diagnostic names.
 - `checked := not checked;` through a `ref` parameter is the write-back the paradigm needs and nothing more: the widget never sees the slot after `Checkbox` returns (§22.3). `response := r;` discharges the `out` obligation on the single normal path (§22.4); the unit-returning twin forwards with `out _`, which is the sanctioned spelling for an ignored `out` (`out var _` is the rejected one, §22.4).
 - `Interact` is where all the between-frame state lives: it compares `_ctx.Input.PointerPosition` against `rect`, consults `_ctx.Memory.Active` (the ImGui *active item* — the one that captured the press) and `_ctx.Memory.Focused`, and sets them on press/release. Its body is the same ~40 lines in every immediate-mode library and is elided.
 
@@ -630,10 +631,10 @@ public class TaskUi
 end TaskUi;
 ```
 
-- **`toDelete`** is the standard immediate-mode idiom for mutating a collection you are iterating: record the intent, apply after the loop. Bezel adds a real reason: `Array<T>` raises `InvalidOperationException` on structural mutation during a comparer (stdlib §4.4), and the `for` desugaring pins the source — the honest spelling is to leave the loop first. The local is mutably captured (assigned inside a lambda), so it is a shared cell (§27.5) and the read after `ScrollArea` returns sees the closure's write.
+- **`toDelete`** is the standard immediate-mode idiom for mutating a collection you are iterating: record the intent, apply after the loop. Here the loop is a counted range over `0..<t.Titles.Count`, evaluated once at range construction (§16.5), so a `RemoveAt` inside it would leave the bound stale and `t.Titles[i]` would raise `IndexOutOfRangeException` at the tail; had the loop iterated `t.Titles` directly, §29.12 would raise `InvalidOperationException` at the next advance. Either way the honest spelling is to leave the loop first. The local is mutably captured (assigned inside a lambda), so it is a shared cell (§27.5) and the read after `ScrollArea` returns sees the closure's write.
 - **`WithId(i, …)`** salts the scope, so the two `SmallButton("×")` calls in consecutive rows get `Root…Child(i).Child("×")` rather than one shared ID. Without it, hovering one would hover both — the ImGui `PushID(i)` bug in every tutorial.
 - **`row.Tooltip(del, "Delete")`** is the explicit-anchor form: the tooltip is *for* that response, not for "the last item".
-- **`t.Titles[i]`** is an indexer read at a `string` element — a shared reference, no obligation (§28.1).
+- **`t.Titles[i]`** is an indexer read at a `string` element — a shared reference, no obligation (§28.9).
 
 ### 5.4 Background work: results re-enter as sendable messages, polled per frame
 
@@ -662,7 +663,7 @@ public class JobUi
         Progress(var f) => do j.Fraction := f; end,
         Finished(var s) => do j.Summary := s; j.Running := false; end,
         Failed(var why) => do j.Summary := $"failed: {why}"; j.Running := false; end
-      end case;                                    // exhaustive by case coverage (§35.5): no `_`
+      end case;                                    // exhaustive by case coverage (§35.6): no `_`
     end;
   end Pump;
 
@@ -699,7 +700,7 @@ end Worker;
 
 ### 5.5 Headless: driving frames in a test
 
-Because both boundaries are data (§3), a test needs no platform: push events, run a frame, read responses or commands. (Proposal 0022's test framework is the eventual harness; the sketch uses `Debug.Assert`.)
+Because both boundaries are data (§3), a test needs no platform: push events, run a frame, read responses or commands. (Proposal 0022's test framework — accepted, wave D3, not yet in the stdlib — is the eventual harness; the sketch uses `Debug.Assert`.)
 
 ```bezel
 import System.Diagnostics;
@@ -752,7 +753,8 @@ end WindowState;
 public class TextEditState
   public property Cursor: int := 0;
   public property SelectionAnchor: int := -1;
-  public property Undo: Array<string> := new Array<string>();   // trivial-dispose; strings are runtime-managed
+  private owned _undo: Array<string> := new Array<string>();   // a fresh value needs an owned slot even at a trivial-dispose type (§28.6)
+  public property Undo: Array<string> => _undo;                  // a borrow of storage
 end TextEditState;
 
 public class UiMemory
@@ -873,9 +875,9 @@ Three relationships worth stating:
 1. **`Response` as a plain record vs. a borrow-bearing one.** The sketch keeps `Response` value-only and passes it back to `Ui` for tooltips and popups (`ui.Tooltip(r, …)`). egui's `response.on_hover_text(…)` fluent form needs the response to carry a borrow of its `Ui`, making it borrow-bearing (§9.7) — still legal (never stored, never awaited), but it stops being freely storable in the app's own state. Which reads better in practice is a usage question, not a soundness one.
 2. **App-extensible memory.** A `MemoryTable<T> where T: class` owned by the app and registered with `UiMemory` for the touched-set sweep — the registration would store a parameter-sourced borrow into the context (§28.3 admits it; K4.3 residual: the app's table must outlive the context, which the declaration order in §1's loop guarantees). Needs a design pass on the registration surface before it can be sketched honestly.
 3. **Images and custom geometry.** `DrawCommand` has no image or mesh case. Adding `Image(rect, textureId: int, uv: Rect)` makes texture ownership a platform concern (the platform mints the id from an `Array<byte>`); a mesh case needs a vertex buffer, which is `OwningBuffer<float>` territory and drags the command list away from "plain sendable values".
-4. **Stable IDs across runs.** In-process identity is all the sketch needs. Persisting layout (window positions) requires a hash that is stable across builds; `string.GetHashCode()` is unspecified (stdlib §9.1) and §8.3 leaves the record combiner implementation-defined. A library-owned stable string hash needs wrapping multiplication, which §6.1's checked arithmetic does not provide — proposal 0008's integer toolkit would be the place to look, and its status decides whether this is a one-liner or a shift-and-xor construction.
+4. **Stable IDs across runs.** In-process identity is all the sketch needs. Persisting layout (window positions) requires a hash that is stable across builds; `string.GetHashCode()` is unspecified beyond "content-based" (stdlib §9.6) and §8.3 leaves the record combiner implementation-defined. A library-owned stable string hash needs wrapping multiplication, which §6.1's checked arithmetic does not provide — proposal 0008's integer toolkit (accepted 2026-07-07, in its implementation run, not in the v0.306 stdlib) is the place to look; until it ships, a stable hash is a shift-and-xor construction (shifts discard bits silently within their domain, §6.5).
 5. **Waking a sleeping loop.** A platform that blocks in `Pump` waiting for OS input will not notice a worker's `Channel` message until the next OS event. The fix is platform-specific (SDL's `PushEvent` from the worker; or the worker sending to a platform-level wake channel) and belongs to the platform layer, not the library — but the contract ("a message arrival is a repaint request") should be written down when the platform exists.
-6. **`float` vs `double` for geometry.** The sketch uses `float` (every immediate-mode library does; halves the size of the draw list). `Math.Floor`/`Round` take `double` only (stdlib §2.3), so pixel snapping needs `float(Math.Round(double(x)))`. Cheap, but if it turns out to be everywhere, `double` geometry is the simpler spelling.
+6. **`float` vs `double` for geometry.** The sketch uses `float` (every immediate-mode library does; halves the size of the draw list). `Math.Round` takes `double` only (stdlib §2.2; `Floor`/`Ceiling`/`Truncate` add `decimal`, never `float`), so pixel snapping needs `float(Math.Round(x))` with the implicit `float`→`double` widening (§5.1). Cheap, but if it turns out to be everywhere, `double` geometry is the simpler spelling.
 
 ## 11. Relationship
 

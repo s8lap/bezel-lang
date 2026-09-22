@@ -631,9 +631,10 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     } else {
         llvm::Value* kd = loadStringData(k);
         llvm::Value* kl = loadStringLen(k);
+        llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
         // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into the
         // table BY VALUE (bz_dict_try_get_str reads kd/kl and never retains
         // the bz_string* itself — unlike the VALUE slot, which stores the
@@ -857,6 +858,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     llvm::Value* keyPtr = nullptr;     // generic-key path needs it again to null
     llvm::Value* kd = nullptr;         // string-key path needs it again to null
     llvm::Value* kl = nullptr;
+    llvm::Value* kw = nullptr;         // fix #4499: storage width rides along
     if (keyTy) {
         keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
@@ -870,9 +872,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     } else {
         kd = loadStringData(k);
         kl = loadStringLen(k);
+        kw = loadStringWidth(k);        // fix #4499
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
     }
     // §4.8/§4.9: a `move` of an absent key raises, same as the indexer get.
     // fix #3703 / §28.9: unlike lowerCollectionIndexerGet (a SINGLE read of
@@ -911,8 +914,8 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         builder_.CreateCall(fn, {recv, keyPtr, nullV});
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, nullV});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, nullV});
         // fix #3703 / §28.9: kd/kl alias k's own buffer and are read TWICE in
         // this function (the try_get probe above and this null-store); only
         // now, after the last read, is it safe to discharge a fresh +1 KEY
@@ -1521,11 +1524,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     }
     llvm::Value* kd = loadStringData(k);
     llvm::Value* kl = loadStringLen(k);
+    llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
     if (valDisp) {
         auto* fn = declareC("bz_dict_set_str_disposing",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr, valDisp});
+            {ptrTy(), ptrTy(), i64(), i8(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr, valDisp});
         // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for an
         // OwningDictionary<K,V> with string key the value has just been
         // transferred; null the caller's slot for a bare owned local/param RHS.
@@ -1533,8 +1537,8 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             nullTransferredOwnedLocalSlot(valueExpr);
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
         // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
         // borrow": the borrowing Dictionary<K,V> string-key branch of the
         // indexer-set `d[k] := rhs` — identical to the gen-key branch above
@@ -8365,6 +8369,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // value-disposer argument is null.
     if (actualTy && (actualTy->headName() == "SortedSet" ||
                      builtinTypeName(actualTy) == "SortedSet")) {
+        // fix #4099 (stdlib §4.18, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedSet<T>` coerced to
+        // `IEnumerable<T>` here used to silently admit an element type that
+        // is eligible ONLY via the auto-hashable (§9.2) or class/interface
+        // (hasObjectHeaderEquality) branches — both of which establish
+        // hashing/equality but not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). Reuses the shared authority
+        // `reportSortedElementNeedsCompareTo` (LlvmBackend_Calls3.cpp) rather
+        // than a fourth inline copy of the predicate (LANE_RULES §15). The
+        // poison-value return mirrors the indexer's own — well-formed no-op.
+        if (reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<T>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (outWrapMade) *outWrapMade = true;
         // Snapshot the source FIRST, then free the source. The snapshot is
         // built FROM the live source dict (bz_dict_keys_gen reads the key
@@ -8433,6 +8454,32 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // splits that obligation into the half the source free discharges and
         // the half the snapshot's slot-1 Dispose does — so the gate is handed
         // the SOURCE type and admits every shape those two disposers cover.
+        //
+        // fix #4099 (stdlib §4.17, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedDictionary<K, V>`
+        // coerced to `IEnumerable<DictionaryEntry<K, V>>` here used to
+        // silently admit a key type eligible ONLY via the auto-hashable
+        // (§9.2) or class/interface (hasObjectHeaderEquality) branches —
+        // hashing/equality, not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). The plain `Dictionary<K, V>` arm
+        // is unaffected — its `where K: IEquatable<K>` constraint (§4.8)
+        // admits any key with structural equality, which is the right
+        // contract for an unordered map. The poison-value return mirrors
+        // the indexer's own — well-formed no-op. This check fires BEFORE
+        // `dictEntryWrapShapeSupported` so a SortedDictionary<Pt, int> widened
+        // to `IEnumerable<DictionaryEntry<Pt, int>>` is rejected even when
+        // the wrap helper declines (the helper's own decline is the
+        // historical fail-loud path, not a silent admit — but it was
+        // unreachable in the rejection lane without this check landing
+        // first).
+        if (builtinTypeName(actualTy) == "SortedDictionary" &&
+            reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<DictionaryEntry<K, V>>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (!dictEntryWrapShapeSupported(targetTy, actualTy)) return v;
         // The two halves are derived TOGETHER, at the one site that decides
         // both, so a shape can never take one without the other. Both stay null
@@ -11631,6 +11678,7 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // --- snapshot keys + values ---
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -11644,8 +11692,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy(), ptrTy()});
@@ -11655,6 +11704,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -11693,7 +11745,8 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
         // #3576's arm — see LlvmBackend_impl.hpp for the helpers) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto [strObj, kp] = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto [strObj, kp] =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             // Free the raw key bytes from bz_dict_keys_str.
             builder_.CreateCall(freeFn, {kp});
             keyDecoded = strObj;
@@ -11725,7 +11778,10 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
 
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // Wrap the materialised entries as an OWNING vtable-backed IEnumerable
@@ -13408,7 +13464,24 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // lvalue; an ordinary parameter receives the argument's value.
         // §22.4: `out var x` — ensureOutVarSlots already allocated the
         // slot; lvalueAddr will find it via locals_ lookup.
-        llvm::Value* v;
+        //
+        // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): INITIALIZED. This was a
+        // bare `llvm::Value* v;`, and not every arm below assigns it — the
+        // §15.4 inline-array arm assigns only when `lowerTypeRef` of the
+        // formal yields an `llvm::ArrayType`, and falls straight through when
+        // it yields the i32 placeholder instead (an inline-array formal whose
+        // extent did not fold — see `lowerTypeRef`'s `arraySizeValue < 0`
+        // fallback). Every subsequent read of `v` in this loop then touched an
+        // indeterminate value: MEASURED as `v = 0xffffffff` and a SIGSEGV at
+        // `v->getType()` about 200 lines down, on the issue's repro (a
+        // `const`-named extent `[MAX]int` on an IMPORTED GENERIC constructor's
+        // parameter, whose importer-side reconstruction left the extent
+        // unfolded). A null here routes that same shape into the `#1386`
+        // internal-error diagnostic below — a clean compile-time failure with
+        // a real location — instead of a crash. This is the general guard: any
+        // future arm that declines without assigning now fails loudly rather
+        // than reading garbage. // per §15.1
+        llvm::Value* v = nullptr;
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
@@ -13507,6 +13580,32 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                  builder_.getInt32(static_cast<unsigned>(k))}));
                     }
                     v = builder_.CreateLoad(aty, aslot);
+                } else {
+                    // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): sema says the
+                    // formal IS an inline array, but `lowerTypeRef` answered
+                    // something other than an `llvm::ArrayType` — which it does
+                    // for exactly one shape, an extent that is neither an AST
+                    // literal nor a folded `arraySizeValue >= 0`, where it
+                    // returns the bare `i32` placeholder ("what keeps an
+                    // unfoldable size failing loudly", LlvmBackend_Layout.cpp).
+                    // Say so HERE rather than letting the null `v` fall through
+                    // to the generic `#1386` "lowerExpr returned null" line: the
+                    // argument expression is fine, the PARAMETER's type is what
+                    // could not be lowered, and naming the extent is what points
+                    // a reader at the real defect (cross-module, this is a
+                    // §2.8.3 rule 3 reconstruction gap — see #4514's other
+                    // half). Returning false declines the call cleanly.
+                    ctx_.diagnostics().report(
+                        Severity::Error, a.value->span.begin,
+                        "the inline-array parameter `" +
+                            std::string(params[idx].name) +
+                            "` has an extent that is not a compile-time "
+                            "constant at this call site, so the argument "
+                            "cannot be laid out (§15.1); for an IMPORTED "
+                            "declaration this means the dependency's metadata "
+                            "did not carry the folded extent (§2.8.3 rule 3, "
+                            "#4514)");
+                    return false;
                 }
             } else {
                 llvm::Value* coll =

@@ -79,13 +79,44 @@ foreach(g IN LISTS BEZEL_TEST_GROUPS)
     list(APPEND BEZEL_TEST_CLAIMED_DIRS ${BEZEL_TEST_GROUP_${g}_DIRS})
 endforeach()
 
+# fix #4530: glob each CLAIMED directory's `*.cpp` pattern EXACTLY ONCE at
+# CONFIGURE time and reuse the result everywhere below, instead of the THREE
+# separate `file(GLOB ... CONFIGURE_DEPENDS ...)` calls this used to make per
+# directory (once here to populate `_d_srcs` for the truthy check below, once
+# more inside the flat "everything" builder, and a third time inside the
+# per-group builder). `VerifyGlobs.cmake_force` (a zero-input phony) forces
+# ninja to re-run `cmake -P VerifyGlobs.cmake` on EVERY invocation regardless
+# — that check-time triplication was already free there, because CMake's own
+# glob-verification manager merges identical glob EXPRESSIONS into one watched
+# entry (confirmed by inspecting a configured build's generated
+# VerifyGlobs.cmake: each entry is annotated with every consuming variable/
+# line, e.g. `_d_srcs`, `BEZEL_TEST_ALL_SOURCES` and `BEZEL_TEST_SOURCES_codegen`
+# all cite the SAME single `tests/codegen/*.cpp` block). What the triplication
+# actually tripled was CONFIGURE-TIME work: every full reconfigure (the
+# `RERUN_CMAKE` this same force-check can trigger, per #4530's title) re-listed
+# and re-processed each claimed directory's files three times over instead of
+# once. Discovery semantics are unchanged — every claimed dir is still globbed,
+# both FATAL_ERROR invariants below are unchanged, and a new file is picked up
+# exactly as before (see the commit body for the before/after proof).
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    file(GLOB _bezel_claimed_srcs_${_d} CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+endforeach()
+
 # Invariant (2): no unclaimed area.
 file(GLOB _bezel_test_entries RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
      CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*)
 foreach(_d IN LISTS _bezel_test_entries)
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${_d})
-        file(GLOB _d_srcs CONFIGURE_DEPENDS
-             ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        if(_d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
+            # Already globbed above; reuse it instead of re-globbing (#4530).
+            set(_d_srcs ${_bezel_claimed_srcs_${_d}})
+        else()
+            # An unclaimed dir (e.g. tests/lit/) — this IS the only place that
+            # glob is needed, so it stays a fresh call.
+            file(GLOB _d_srcs CONFIGURE_DEPENDS
+                 ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        endif()
         if(_d_srcs AND NOT _d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
             message(FATAL_ERROR
                 "Bezel: tests/${_d}/ contains test sources but no group in "
@@ -96,26 +127,27 @@ foreach(_d IN LISTS _bezel_test_entries)
     endif()
 endforeach()
 
-# The flat "everything" list invariant (1) is checked against.
-set(_bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
-foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
-    list(APPEND _bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
-endforeach()
-file(GLOB BEZEL_TEST_ALL_SOURCES CONFIGURE_DEPENDS ${_bezel_all_globs})
-
-# Root-level tests (everything but the shared entry point).
-file(GLOB BEZEL_TEST_ROOT_SOURCES CONFIGURE_DEPENDS
+# Root-level tests (everything but the shared entry point) — also the "root
+# pattern" contribution to the flat "everything" list below, globbed once.
+file(GLOB _bezel_root_srcs CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+set(BEZEL_TEST_ROOT_SOURCES ${_bezel_root_srcs})
 list(REMOVE_ITEM BEZEL_TEST_ROOT_SOURCES ${BEZEL_TEST_ENTRY})
 
-# Per-group source lists.
+# The flat "everything" list invariant (1) is checked against — built from the
+# already-globbed per-dir results above instead of re-globbing them (#4530).
+set(BEZEL_TEST_ALL_SOURCES ${_bezel_root_srcs})
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    list(APPEND BEZEL_TEST_ALL_SOURCES ${_bezel_claimed_srcs_${_d}})
+endforeach()
+
+# Per-group source lists — reuse the already-globbed per-dir results (#4530).
 set(_bezel_assigned "")
 foreach(g IN LISTS BEZEL_TEST_GROUPS)
-    set(_g_globs "")
+    set(BEZEL_TEST_SOURCES_${g} "")
     foreach(_d IN LISTS BEZEL_TEST_GROUP_${g}_DIRS)
-        list(APPEND _g_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        list(APPEND BEZEL_TEST_SOURCES_${g} ${_bezel_claimed_srcs_${_d}})
     endforeach()
-    file(GLOB BEZEL_TEST_SOURCES_${g} CONFIGURE_DEPENDS ${_g_globs})
     if(g STREQUAL BEZEL_TEST_ROOT_GROUP)
         list(APPEND BEZEL_TEST_SOURCES_${g} ${BEZEL_TEST_ROOT_SOURCES})
     endif()
@@ -285,6 +317,36 @@ function(bezel_add_test_binary group)
     # target_link_libraries), so a fresh tree building one test target alone
     # never builds the archive; make the edge explicit.
     add_dependencies(${tgt} bezel_runtime)
+    # fix #4386: CLI-surface tests (e.g. checked_contracts_4386_cli) exec the
+    # real bezelc binary via BEZELC_PATH (set with $<TARGET_FILE:bezelc>);
+    # the option produces no dependency edge of its own, so make the build
+    # edge explicit.
+    add_dependencies(${tgt} bezelc)
+    # fix #4529 (follow-up to #2877): state the link's provenance instead of
+    # leaving the harness to infer it from mtimes. The AOT bincache keys on
+    # SHA-256(libbezel_core.a) for a binary that was linked from that archive,
+    # and it decided "was it?" by comparing mtimes — which a no-op re-archive
+    # (identical bytes, new timestamp; llvm-ar is deterministic here) inverts,
+    # cooling the whole shared store and failing aot_cache_key's safety pin.
+    # This step records the digest the link actually consumed, so the harness
+    # can compare CONTENT. It runs on every link, so the record can never be
+    # stale with respect to its binary. See aot_support.hpp's LINK-TIME
+    # PROVENANCE comment.
+    #
+    # No BYPRODUCTS: `$<TARGET_FILE:${tgt}>` is rejected there ("No target
+    # bezel_tests_<g>") because BYPRODUCTS of a POST_BUILD command is evaluated
+    # without the owning target in scope, and the record is a 65-byte file that
+    # is rewritten on every link — nothing downstream consumes it as a build
+    # input, so ninja does not need to know about it.
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DBEZEL_CORE_LIB=$<TARGET_FILE:bezel_core>
+                -DBEZEL_OUT=$<TARGET_FILE:${tgt}>.coreid
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/record_core_identity.cmake
+        COMMENT "Recording libbezel_core.a identity for ${tgt} (#4529)"
+        VERBATIM)
+    set_property(TARGET ${tgt} APPEND PROPERTY
+        ADDITIONAL_CLEAN_FILES $<TARGET_FILE:${tgt}>.coreid)
     add_test(NAME ${tgt} COMMAND ${tgt})
     set(BEZEL_TEST_TARGETS ${BEZEL_TEST_TARGETS} ${tgt} PARENT_SCOPE)
 endfunction()

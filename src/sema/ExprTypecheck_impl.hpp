@@ -641,8 +641,16 @@ private:
     bool pendingLambdaArgContext_ = false;
 
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
-    // (the async task wrapper). Used to detect a forgotten `await`.
+    // (the async task wrapper). Used to detect a forgotten `await`. STRICT
+    // (non-nullable): use for §30.1 / §30.6's declared-wrapper checks where a
+    // `Task?` is a different question.
     bool isTaskShapedRef(const TypeRef* t) const;
+
+    // fix #4443 (v0.302, §17.13 / §28.3 Keying rule): the task-family
+    // predicate with nullability STRIPPED. Used by §17.13's discard + anonymous-
+    // binding halves and by §28.3's mint-announcing sites (calls-mint, function-
+    // slot threading) where the rule keys on "is this a Task-family value".
+    bool isTaskFamilyRef(const TypeRef* t) const;
 
     // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
     // class-or-interface slot that triggers the Concrete-slot function bodies
@@ -1471,6 +1479,61 @@ private:
     // true iff `from` implicitly widens to `to` (both primitives,
     // distinct). Identity is handled by the caller.
     static bool primitiveWidens(PrimitiveType from, PrimitiveType to);
+
+    // fix #4501 (§5.1/§6.2/§17.3/§8.4, v0.306): THE answer to "does §5.1
+    // admit an implicit conversion between these two operand types?", asked
+    // once for every binary operator that needs it. `typeBinary` carried TWO
+    // copies of this question — one in the equality/relational arm, one in the
+    // §6.2 arithmetic-promotion arm — and BOTH bailed out on any pair that was
+    // not numeric-vs-numeric, which is how `string = 0`, `bool = 0`,
+    // `bool = "x"` and `decimal = "x"` reached codegen. Reports and returns
+    // true iff the pair is inadmissible; the caller then does its own
+    // error-recovery typing.
+    //
+    // `allowLiteralAdoption` is the §5.1 constant-narrowing escape ("`uint >
+    // 1000`"): the equality/relational arm has had it since #1204. fix #4512
+    // (§5.1/§6.2, v0.306) enables it for the arithmetic arm too (`ulong +
+    // 1000` now admits, matching `ulong > 1000`) and narrows the escape's own
+    // predicates (`isLiteralDerivedExpr`, and the true-integer-only target
+    // check inside this function) to §5.1's exact domain — see that fix's
+    // citation trail for why the escape needed narrowing before it could be
+    // safely enabled for a second call site.
+    bool reportNoImplicitConversionBetweenOperands(const ast::BinaryExpr& be,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption);
+
+    // fix #4513 (§5.1/§6.2/§6.6, v0.306): the SAME question as above, asked
+    // from a position with no `ast::BinaryExpr` to hand — the §6.6 compound-
+    // assignment family check (ExprTypecheck.cpp), whose "operands" are an
+    // AssignmentStmt's `target`/`value`. The BinaryExpr overload delegates
+    // here; `leftExpr`/`rightExpr` are only consulted for the §5.1 constant-
+    // narrowing escape's literal-derived test (`isLiteralDerivedExpr`) and may
+    // be null (then the escape never applies from that side).
+    bool reportNoImplicitConversionBetweenOperands(SourceLocation loc,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption,
+                                                   const ast::Expr* leftExpr,
+                                                   const ast::Expr* rightExpr);
+
+    // fix #4513 (§3.5/§6.6, v0.306): the §3.5 per-operand-type table's `bool`
+    // exclusion from the arithmetic (`+ - * /`) and ordering (`< <= > >=`)
+    // families — fix #4500's typeBinary gate, extracted so the §6.6 compound-
+    // assignment family check can ask the IDENTICAL question about the SAME
+    // (target, right-hand-operand) pair instead of falling through to the
+    // §6.6 write-back diagnostic, which names a binary result type (`bool`)
+    // the binary path no longer computes for that pair. `+` defers to string
+    // concatenation when either operand is `string` (§4.6 is the more
+    // specific authority there), exactly as the typeBinary gate does. Reports
+    // and returns true iff the pair is excluded; unlike the BinaryExpr call
+    // site, the caller here does its own consequence (typeBinary does
+    // error-recovery typing; the compound-assignment check just stops).
+    bool reportBoolOperandExcludedFromArithmeticOrOrdering(
+        SourceLocation loc, std::string_view op, const TypeRef* lt,
+        const TypeRef* rt);
 
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
@@ -2551,6 +2614,35 @@ private:
     // §22.8-step-0 body serves the chain site as well as the `new` site. See
     // the definition in ExprTypecheck_Calls.cpp.
     void publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd);
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
+    // of the above — the §22.5 binding of a derived constructor's leading
+    // `base(...)` arguments to the BASE class's primary-constructor parameter
+    // list, read by codegen's `prePopulateBasePositionalFields`. Called only
+    // from `publishPrimaryCtorChainBinding`, which owns the chain-call
+    // recognition both arms share. Since #4496 the binder runs with
+    // `emit=true`, so this also CHECKS the call; since #4519 a ZERO-argument
+    // `base()` reaches it too (§12.8's "requires the base class to have a
+    // parameterless constructor"). See the definition in
+    // ExprTypecheck_Calls.cpp.
+    void publishBaseChainPrimaryBinding(const ast::CallExpr& chain);
+    // fix #4549 (§12.8 / §22.5 / §22.7 / §22.10, v0.306): §12.8's
+    // "which requires the base class to have a parameterless constructor",
+    // as ONE predicate read by BOTH spellings of the same call — the
+    // IMPLICIT chain (`visitTopDecl`) and the explicit zero-argument
+    // `base()` (`publishBaseChainPrimaryBinding`). The two cannot drift
+    // because there is one body; see the definition in
+    // ExprTypecheck_Calls.cpp for what "parameterless" means for each of
+    // the three constructor forms a class can carry.
+    bool baseHasParameterlessConstructor(const TypeSymbol* base,
+                                         SourceLocation loc);
+    // fix #4549: the two spellings' diagnostics, reported from the two call
+    // sites above. `implicitSpelling` picks the remedy §12.8 names for the
+    // inserted chain ("otherwise the chain must be explicit") over the one
+    // an explicit `base()` admits (supply the arguments); the predicate and
+    // the sentence naming the defect are shared.
+    void reportNoParameterlessBaseCtor(const TypeSymbol* base,
+                                       SourceLocation loc,
+                                       bool implicitSpelling);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,
@@ -2815,6 +2907,34 @@ private:
     // constructor to check args against.
     bool rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
                                          const TypeRef* rt);
+
+    // fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
+    // and `rejectNewOnNonInstantiableKind` above, same shape): the single
+    // authority for "§17.7 does not admit the `new()` shorthand HERE".
+    // §17.7's written-declared-type family gives its member (v) three
+    // declared-result positions, and the shorthand's own subset takes only
+    // the first: "The shorthand is permitted at the written-declared-type
+    // positions (i), (ii), (iii) and the `return e;` statement of (v) ...
+    // It is **not** permitted at an expression body or at a lambda's
+    // ascribed return". #4208 wired position (iii) and the `return e;`
+    // statement of (v), and gated that wiring on `!inLambda_` so the
+    // carve-out held — but declining to TYPE the shorthand is not the same
+    // as DIAGNOSING it. The untyped NewExpr simply fell through to codegen's
+    // #2491 zero/null backstop, so both spellings of a lambda's ascribed
+    // return — `lambda(): W => do return new(); end` (an `internal:` Warning,
+    // measured) and `lambda(): W => new()` (no diagnostic at all, measured) —
+    // compiled and then SEGV'd (exit 139, 60/60 runs) on the first member
+    // read of the null they returned. That is the same silent-wrong-answer
+    // class #4170/#4176 closed at the other shorthand sites, and #4208
+    // removed from the method-return position, left standing at this one.
+    // Reports the §17.7 exclusion at the operand's own span. `rt` may be
+    // null (a lambda whose return type would arrive only by target
+    // inference — outside the written-declared-type family entirely, per
+    // §17.7's "A lambda whose return type arrives only by target inference
+    // ... [is] outside the family"); it is used only to name the type in
+    // the suggested explicit spelling.
+    void rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                           const TypeRef* rt);
 
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the

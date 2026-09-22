@@ -98,17 +98,32 @@ BEZEL_TEST(primary_ctor_param_default_local_3202,
         "end Main; end C;"), 0);
 }
 
-// T3 — §22.5 "Every parameter after the first defaulted parameter must
-// itself have a default" — a class with a defaulted parameter followed by a
-// required parameter is a PARSE-/DECL-level error. Pin the runtime arm of
-// the rule: a class with a defaulted middle parameter and a required tail
-// still stores the supplied tail correctly (the gap-default contract is
-// checked at declaration, not construction).
+// T3 — every supplied slot overrides its default, including the slots AFTER
+// the first defaulted one. A construction that supplies all three must read
+// back all three supplied values, not a mix of supplied and defaulted.
+//
+// ⚠ UPDATED BY fix #4494, NOT weakened — the reasoning, because the diff
+// looks like a fixture swap. This row used to declare
+// `public class Triple(A: int, B: int := 7, C: int)` and its own comment said
+// that shape "is a PARSE-/DECL-level error", pinning the runtime arm only
+// "(the gap-default contract is checked at declaration, not construction)".
+// That parenthesis was a statement about a GAP: §22.5 *Defaults and
+// modifiers* says "Every parameter after the first defaulted parameter must
+// itself have a default", and nothing enforced it, so the illegal
+// declaration compiled. #4494 enforces it, so the old fixture is now a
+// compile error and this row could not have kept its old text.
+//
+// The oracle is UNCHANGED (`run(...) == 0`, with the same distinguishing
+// return code 4 and the same expected total of 6) and the runtime property is
+// unchanged; only the declaration was made legal, by giving `C` a default it
+// never takes here. The REJECTION of the old shape is pinned in its own right
+// by tests/sema/param_default_ordering_4494_test.cpp, so nothing that used to
+// be covered here is now uncovered.
 BEZEL_TEST(primary_ctor_param_default_local_3202,
-           required_after_defaulted_still_resolves_at_construction_spec_22_5) {
+           every_supplied_slot_overrides_its_default_spec_22_5) {
     BEZEL_EXPECT_EQ(run(
         "module M;"
-        "public class Triple(A: int, B: int := 7, C: int)"
+        "public class Triple(A: int, B: int := 7, C: int := 11)"
         "  public method Total(): int return A + B + C; end Total;"
         "end Triple;"
         "class C public static method Main(): int"

@@ -1,5 +1,5 @@
 // Spec-derived regression tests for issue #3702 — the SIGSEGV residual of
-// #3564. #3564 gave the §28.9 owned-local return-escape check a lambda-body
+// #3564. #3564 gave the §28.3 owned-local return-escape check a lambda-body
 // scope; #3702 closes the method-level sibling the issue's repro exercises:
 //
 //     using var r := new R();
@@ -20,8 +20,8 @@
 //
 // The fix adds the callee's initializer lambda to the same `lambdas` list the
 // lambda-literal arm feeds; the existing capture walks run against it and the
-// §28.9 leg resolves `r` against the method's `states_` and rejects. Cited
-// spec: §28.9 ("Runtime-managed types", v0.286) — the closure-over-owned-
+// §28.3 leg resolves `r` against the method's `states_` and rejects. Cited
+// spec: §28.3 ("Borrow lifetime rules", v0.286) — the closure-over-owned-
 // local does-not-outlive-its-scope rule — and §27.5 ("Closure literals", v0.286)
 // for the lambda-literal initializer shape.
 //
@@ -44,7 +44,7 @@ namespace {
 
 // A helper class with a `V(): int` instance method and the framework the
 // rows below need. `R` is a plain class so `using var r := new R();` is a
-// §28.3 scope-bound owned local whose capture is a §28.9 borrow.
+// §28.3 scope-bound owned local whose capture is a §28.3 borrow.
 std::string wrap(const std::string& method) {
     return std::string(
         "module M; "
@@ -56,11 +56,11 @@ std::string wrap(const std::string& method) {
 
 }  // namespace
 
-// POSITIVE (§28.9 / §27.5, #3702): the filed repro. `Mk()` returns `mk()`,
+// POSITIVE (§28.3 / §27.5, #3702): the filed repro. `Mk()` returns `mk()`,
 // whose result is a closure that captures method-scope `r`; `r` is disposed
 // when `Mk` returns, and the returned closure (now held by the caller) is
 // the borrow source the next call reads — a SIGSEGV measured on the parent.
-// The method-level return check must REJECT this on the same §28.9 wording
+// The method-level return check must REJECT this on the same §28.3 wording
 // the method-level twin ("return a lambda literal directly") has always
 // used; that wording is verbatim here, so the fix introduces no second
 // spelling of the rule.
@@ -80,7 +80,7 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_returned_method_closure_reje
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
-// POSITIVE (§28.9 / §27.5, #3702): the structurally SIMPLER unsafe case —
+// POSITIVE (§28.3 / §27.5, #3702): the structurally SIMPLER unsafe case —
 // mk's body returns the inner closure directly via a single `return`. No
 // intervening `do ... end`, no `f` local. `mk`'s body is `=> E` (expression-
 // bodied), where `E` is the inner lambda literal capturing `r`. The fix's
@@ -100,12 +100,12 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_exprbody_returns_closure_rejected
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
-// NEGATIVE (§28.9 / §27.5, #3702) — the OBLIGATION boundary. Same shape as
+// NEGATIVE (§28.3 / §27.5, #3702) — the OBLIGATION boundary. Same shape as
 // the first positive row but `q` is a value-typed local, so it is never
 // Owned in `states_` (§28.3) and carries no scope-bound discharge
 // obligation. A seed that admitted every identifier as Owned would reject
 // this; the fix's check consults `states_` so a non-Owned binding falls
-// through the §28.9 leg.
+// through the §28.3 leg.
 BEZEL_TEST(method_scope_owned_local_escape, mk_call_over_value_local_accepted_28_9) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Mk(): int "
@@ -116,7 +116,7 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_over_value_local_accepted_28
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// NEGATIVE (§28.9, #3702) — the CONSUME-IN-PLACE boundary. The lambda
+// NEGATIVE (§28.3, #3702) — the CONSUME-IN-PLACE boundary. The lambda
 // stored in `mk` is invoked inside the body but NOT in the return position
 // (the ExpressionStmt `mk();` discards the int result). `findLambdas`
 // reaches only return-position expressions; an ExpressionStmt is not
@@ -132,7 +132,7 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_discarded_not_returned_accep
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// NEGATIVE (§28.9, #3702) — the CONSUMED-IN-METHOD boundary. The closure
+// NEGATIVE (§28.3, #3702) — the CONSUMED-IN-METHOD boundary. The closure
 // returned by `mk()` (the inner closure over `r`) is bound to `g` and
 // invoked twice before `Mk` returns. The captures are read while `r` is
 // still in scope, and `g` is consumed at end of `Mk`. This is the SAFE
@@ -153,13 +153,13 @@ BEZEL_TEST(method_scope_owned_local_escape, mk_call_result_consumed_in_method_ac
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// POSITIVE (§28.9 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
+// POSITIVE (§28.3 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
 // of the filed repro. `mk` is a `const` local (§21.1) bound to a
 // lambda-literal initializer, and §21.1 explicitly admits a `const` carrying
 // the initializer's source-liveness constraints, exactly as a plain
 // unmarked `var` alias. Without the #3591 sibling `LocalConstDecl` arm the
 // walker at Ownership_Checks.cpp:3277 silently never visited the lambda
-// literal, so the method-level §28.9 escape check fired on NO closures and
+// literal, so the method-level §28.3 escape check fired on NO closures and
 // `Mk()` returned a closure capturing `r` past `r`'s scope end — identical
 // to the `var mk := ...` repro, one binding-form over.
 BEZEL_TEST(method_scope_owned_local_escape, const_mk_call_returned_method_closure_rejected_28_9) {
@@ -178,7 +178,7 @@ BEZEL_TEST(method_scope_owned_local_escape, const_mk_call_returned_method_closur
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "(§28.3 closure-capture escape"));
 }
 
-// POSITIVE (§28.9 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
+// POSITIVE (§28.3 / §27.5, #3702 + #3591): the §21.1 `const`-binding sibling
 // of the expression-bodied row. `mk` is a `const` local whose initializer is
 // an expression-bodied lambda returning an inner closure that captures `r`.
 // Without the #3591 sibling arm the exprBody branch never ran for a `const`,

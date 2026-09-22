@@ -80,6 +80,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
@@ -147,19 +148,22 @@ bool lowerAndLink(const std::string& source, std::string& obj,
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return false;
+        if (!unit) { bezel::test::asanBuildFailure("parse"); return false; }
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return false;
+        if (diags.hasErrors()) { bezel::test::asanBuildFailure("sema"); return false; }
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return false;
+        if (!module) { bezel::test::asanBuildFailure("emitModule"); return false; }
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, obj, err)) return false;
+        if (!bezel::test::emitObjectFileForTest(*module, obj, err)) {
+            bezel::test::asanBuildFailure("emitObjectFile");
+            return false;
+        }
     }
     std::string linkCmd = "clang++ -fsanitize=address -g " + obj + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +

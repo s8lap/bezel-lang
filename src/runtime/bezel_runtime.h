@@ -266,21 +266,29 @@ void    bz_dict_mark_disposed(void* d, void (*dispose_val)(void*));
 // via bz_dict_mark_disposed (checked mode only).
 int8_t  bz_dict_is_disposed(void* d);
 
-bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, void** out);
-void    bz_dict_set_str(void* d, const char* k, int64_t k_len, void* val);
+// fix #4499 (spec §4.6 / §8.3, v0.306): every string-key entry point takes the
+// key as (raw data, CODE-POINT count, storage width). The width is load-bearing
+// — a string's byte size is `len * width`, and the pre-fix ABI carried only
+// (data, len) and used `len` as a byte count, truncating every width>1 key to
+// its first `len/width` code points so distinct keys collided into one entry.
+bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                            void** out);
+void    bz_dict_set_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                        void* val);
 
 // issue #388 / stdlib §4.9: the OwningDictionary<string,V> indexer setter —
 // if the key is already present, dispose the value currently stored under it via
 // `dispose_val` (null-safe) before storing the new (owned) value; on a fresh key
 // it just inserts. Used by OwningDictionary<K,V>'s `set(owned)` indexer.
 void    bz_dict_set_str_disposing(void* d, const char* k, int64_t k_len,
-                                  void* val, void (*dispose_val)(void*));
-bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len);
+                                  int8_t k_w, void* val,
+                                  void (*dispose_val)(void*));
+bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len, int8_t k_w);
 // issue M1 / stdlib §4.9: OwningDictionary<string,V>.Remove — disposes the
 // removed value via dispose_val before unlinking (null-safe: skip if null).
 bool    bz_dict_remove_str_disposing(void* d, const char* k, int64_t k_len,
-                                     void (*dispose_val)(void*));
-bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len);
+                                     int8_t k_w, void (*dispose_val)(void*));
+bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len, int8_t k_w);
 int64_t bz_dict_count(void* d);
 
 // §29.12 / issue #1232: return the current modification epoch of the dict/set.
@@ -304,10 +312,13 @@ void     bz_runtime_dispose(void* p, void (*dispose_elem)(void*));
 // code.
 int64_t  bz_runtime_kind(void* p);
 
-// Enumerate all keys as (char*, int64_t len) pairs. The caller must free the
-// returned arrays with free(). `*keys_out` and `*lens_out` are malloc'd arrays.
+// Enumerate all keys as (char* data, int64_t code-point len, int8_t width)
+// triples. The caller must free the returned arrays with free(). `*keys_out`,
+// `*lens_out` and `*widths_out` are malloc'd parallel arrays; each `keys[i]` is
+// its own malloc'd `lens[i] * widths[i]`-byte copy (fix #4499 — the width is
+// what lets a caller rebuild the key at its true storage width).
 void bz_dict_keys_str(void* d, char*** keys_out, int64_t** lens_out,
-                      int64_t* n_out);
+                      int8_t** widths_out, int64_t* n_out);
 
 // Generic-key variant: key_size bytes per key; hash and eq work on raw bytes.
 void* bz_dict_alloc_generic(int64_t key_size,
@@ -331,7 +342,8 @@ bool  bz_dict_contains_gen(void* d, const void* key);
 // fix #643 / stdlib §4.9: PopValue(key) — retrieve the stored value pointer
 // (written into *out) then remove the entry WITHOUT disposing the value
 // (ownership transfers to the caller).  Returns false when key is absent.
-bool  bz_dict_pop_value_str(void* d, const char* k, int64_t k_len, void** out);
+bool  bz_dict_pop_value_str(void* d, const char* k, int64_t k_len, int8_t k_w,
+                            void** out);
 bool  bz_dict_pop_value_gen(void* d, const void* key, void** out);
 
 // stdlib §4.10 / §4.8: empty a hash table in place (keeps it allocated). Frees
@@ -373,9 +385,12 @@ void* bz_dict_min_key_gen(void* d, int (*cmp)(const void* a, const void* b));
 void* bz_dict_max_key_gen(void* d, int (*cmp)(const void* a, const void* b));
 //
 // bz_dict_min_key_str / bz_dict_max_key_str — least/greatest key in a string-key
-// dict.  Fills *out_data (strndup'd) and *out_len.  Returns false if empty.
-bool bz_dict_min_key_str(void* d, char** out_data, int64_t* out_len);
-bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len);
+// dict.  Fills *out_data (a malloc'd `*out_len * *out_w`-byte copy), *out_len
+// (code points) and *out_w (storage width, fix #4499).  False if empty.
+bool bz_dict_min_key_str(void* d, char** out_data, int64_t* out_len,
+                         int8_t* out_w);
+bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len,
+                         int8_t* out_w);
 //
 // Sorted-snapshot helpers: reorder snapshot arrays in ascending key order.
 // O(n log n); used for SortedDictionary/SortedSet iteration (§4.17/§4.18).
@@ -385,16 +400,19 @@ bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len);
 void bz_sort_kv_gen(void** keys, void** values, int64_t n,
                     int (*cmp)(const void* a, const void* b));
 //
-// bz_sort_kv_str: sort char** keys + int64_t* lens + void** values together
-// by lexicographic string comparison (§9.6).
-void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n);
+// bz_sort_kv_str: sort char** keys + int64_t* lens + int8_t* widths +
+// void** values together by lexicographic string comparison (§9.6). The width
+// spine is permuted with the others (fix #4499); the COMPARISON itself is still
+// byte-wise strcmp and is #4493's to make code-point-aware.
+void bz_sort_kv_str(char** keys, int64_t* lens, int8_t* widths, void** values,
+                    int64_t n);
 //
 // bz_sort_keys_gen: sort a void** key-bytes-pointer array in ascending order.
 void bz_sort_keys_gen(void** keys, int64_t n,
                       int (*cmp)(const void* a, const void* b));
 //
-// bz_sort_keys_str: sort char** + int64_t* arrays in ascending string order.
-void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n);
+// bz_sort_keys_str: sort char** + int64_t* + int8_t* arrays in ascending order.
+void bz_sort_keys_str(char** keys, int64_t* lens, int8_t* widths, int64_t n);
 
 //
 // #628 / stdlib §4.9 v0.135: ownership-transferring drain iteration.
@@ -407,7 +425,7 @@ void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n);
 // `cursor` is a caller-supplied int64_t scan position (start at 0).
 bool bz_dict_drain_next_str(void* d, int64_t* cursor,
                              char** key_out, int64_t* key_len_out,
-                             void** val_out);
+                             int8_t* key_w_out, void** val_out);
 //
 // bz_dict_drain_next_gen — generic-keyed dict (key_size > 0).
 // Same as bz_dict_drain_next_str but the key is returned as a malloc'd copy
@@ -1323,11 +1341,58 @@ int32_t bz_identity_hash_table_size(void);
 // +1-retained string / class / box captures.  Foundation: all producers store
 // envdtor = null (calloc zero-fill + explicit store); behaviour is identical
 // to the prior 24-byte layout.
+// `disposed` (off 40, #4475): §28.2 use-after-dispose guard. One-byte flag set
+// to 1 by an explicit `c.Dispose()` (codegen emits bz_closure_mark_disposed
+// before the release under --checked-disposal). bz_closure_release reads the
+// byte at last-drop and, when set, QUARANTINES the cell instead of freeing —
+// a deliberate memory leak parallel to bz_array_mark_disposed /
+// bz_dict_mark_disposed (the same shape that lets a post-dispose member
+// access throw DisposedAccessException under --checked-disposal instead of
+// UAF). Outside --checked-disposal the byte is never written, so the legacy
+// "free on last drop" path is unchanged.
 // A closure owns NEITHER its captures (they are borrows per §28.9 / §28.3) nor
 // the boxed cells backing them in the current foundation state; release frees
 // only the cell + env block, never a captured value. null is a no-op.
 void bz_closure_retain(void* c);
 void bz_closure_release(void* c);
+// fix #4509 (§27.5 / §28.9, v0.306): CAPTURE-CELL reference counting.
+//
+// A captured local is promoted to a shared heap CELL (`boxLocalSlot`). The
+// declaring frame holds one reference to it (the cell-holder alloca) and every
+// closure env that captures the local holds another. When at least one of those
+// envs belongs to a lambda the escape analysis can only class as
+// CONSERVATIVELY escaping — "merely passed as an argument", which proves
+// nothing about when the env dies — no static route can name a single safe free
+// site, so today nobody frees the cell at all (the 8 B/capture leak #4509
+// measures). These two entry points make that decision at RUNTIME instead: the
+// last holder to let go frees the cell, whichever it is.
+//
+// PROTOCOL, and it is opt-in per cell. `bz_cell_retain` is emitted at an env's
+// capture-store and `bz_cell_release` in that env's `envdtor` and once at the
+// declaring scope's end, and ONLY for cells codegen has classed as refcounted
+// (see `CaptureEntry::retainCellInEnv`). A cell nobody retains never enters the
+// table, and `bz_cell_release` on such a cell is a plain `free` — so the two
+// protocols coexist and an unclassified cell keeps byte-identical behaviour.
+//
+// The count is kept in a side table rather than in a header word on the cell
+// (the layout #2718 sketches) deliberately: the cell holds a value of arbitrary
+// type at offset 0 and is read through by `boxedStorage`, every lambda body,
+// and several by-value struct GEPs, so a header is an ABI change across all of
+// them, while a side table is none. It costs a lock + hash per capture and per
+// drop, which is the simplicity-over-speed trade this project makes until the
+// compiler is functionally complete.
+//
+// The FIRST retain records 2, not 1: the frame's own reference is implicit (it
+// exists from `calloc` and is never announced), so the first env to arrive is
+// the second holder. null is a no-op for both.
+void bz_cell_retain(void* cell);
+void bz_cell_release(void* cell);
+// #4475 (§28.2): closure-as-object use-after-dispose guard. Set/read the
+// per-instance disposed flag (offset 40, see layout above). bz_closure_mark_disposed
+// is idempotent (subsequent calls no-op). bz_closure_is_disposed returns 0 for
+// null (a null closure is never "disposed" — it never held anything).
+void bz_closure_mark_disposed(void* c);
+int8_t bz_closure_is_disposed(void* c);
 
 // ---------------------------------------------------------------------------
 // Boxed value-type reference counting (§8.6 / §28.9, issue #422 boxes
@@ -1363,15 +1428,6 @@ void bz_box_release(void* b);
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len);
 
-// per §9.6 Compare(a, b, ignoreCase: bool): int — ordinal string comparison
-// over code points (width-1/byte mode). Returns negative/0/positive like the
-// 2-arg form. When `ignore_case` is non-zero, each byte is compared under its
-// simple ASCII case-folded form (tolower), per §9.6's note that ignoreCase
-// comparison is ordinal case-folding with no culture tailoring. Either pointer
-// may be null (a null string compares as empty: null==null is 0, null<non-empty).
-int32_t bz_string_compare(const char* a, int64_t a_len,
-                          const char* b, int64_t b_len, int32_t ignore_case);
-
 // per §9.6 Split(separators: Array<char>): owned Array<string>. Splits `s` at
 // every position where ONE OF the `nsep` code points in `seps` occurs (each
 // separator is a single code point — the §9.6 char-set overload). A run of two
@@ -1395,6 +1451,33 @@ int32_t bz_str_endswith(const void* self, const void* suffix);
 int32_t bz_str_contains(const void* self, const void* sub);
 int32_t bz_str_indexof(const void* self, const void* sub);
 int32_t bz_str_lastindexof(const void* self, const void* sub);
+// fix #4483 (stdlib §9.6, v0.306): Equals(other, ignoreCase: true) — ordinal,
+// code-point-wise equality under the simple case fold. Replaces a codegen-
+// inlined lowering that (a) passed width-aware code points to <ctype.h>'s
+// tolower (undefined above U+00FF, C11 §7.4p1 — the #4420 defect class) and
+// (b) truncated each folded code point to ONE BYTE at a hardcoded stride of
+// 1, so distinct strings above U+00FF compared equal. The fold is
+// bz_char_to_lower, the same shared helper the #4420 char.* family uses, so
+// the runtime holds one case policy rather than two. Either pointer may be
+// null (null equals only null); widths may differ (§4.6).
+int32_t bz_str_equals_ignorecase(const void* self, const void* other);
+// fix #4487 (stdlib §9.6 + spec §4.6, v0.306): the ONE ordinal string
+// comparison — CompareTo(other), CompareTo(other, ignoreCase), and the
+// </<=/>/>= operators, which both documents define as the same relation
+// ("ordinal lexicographic comparison of the code-point sequence", §4.6).
+// Returns -1/0/+1 (stdlib §2.8 specifies the SIGN only, not the magnitude).
+//
+// It REPLACES bz_string_compare(a_data, a_len, b_data, b_len, ignore_case),
+// which is deleted: that signature carried no storage width, so it walked
+// min(a_len, b_len) BYTES over a CODE-POINT length (the #535 defect class)
+// and two different non-ASCII strings compared EQUAL. Every former caller
+// has the string OBJECT in hand and now passes it here, so the width is no
+// longer discarded. The fold is bz_char_to_lower — the same shared helper
+// #4420 introduced and #4483 reused — so the runtime holds ONE case policy.
+// Either pointer may be null (a null operand compares as EMPTY, exactly as
+// bz_string_compare documented); widths may differ (§4.6).
+int32_t bz_str_compare_cp(const void* self, const void* other,
+                          int32_t ignore_case);
 // Substring(start, count): fresh string of `count` code points from `start`.
 void*   bz_str_substring(const void* self, int64_t start, int64_t count);
 // stdlib §3.3 / #971 item 1: the ReadOnlyStringSpan search + compare family.
@@ -1417,6 +1500,25 @@ int32_t bz_strspan_seqequal(const void* self, int64_t s_start, int64_t s_len,
 // #1282: char.ToString() / char interpolation — a single-code-point string at
 // the narrowest storage width (preserves the full Unicode scalar, no truncation).
 void*   bz_char_to_string(int32_t cp);
+// fix #4420 (stdlib §9.5, v0.306): the single shared, UB-free lowering for
+// every char classification / simple-case-mapping member — see the
+// definitions in bezel_runtime_strings.cpp for exactly which categories are
+// Unicode-exact across the FULL char domain (IsControl/Cc, IsWhiteSpace/
+// White_Space — each a closed, version-stable code-point list) versus
+// ASCII-only pending full Unicode category data (everything else). Replaces
+// the direct <ctype.h> calls that were undefined above U+00FF. Also used by
+// string.IsNullOrWhiteSpace's per-code-point loop (§9.6), so the fix is one
+// lowering, not two.
+int32_t bz_char_is_digit(int32_t cp);
+int32_t bz_char_is_letter(int32_t cp);
+int32_t bz_char_is_letter_or_digit(int32_t cp);
+int32_t bz_char_is_white_space(int32_t cp);
+int32_t bz_char_is_upper(int32_t cp);
+int32_t bz_char_is_lower(int32_t cp);
+int32_t bz_char_is_control(int32_t cp);
+int32_t bz_char_is_punctuation(int32_t cp);
+int32_t bz_char_to_upper(int32_t cp);
+int32_t bz_char_to_lower(int32_t cp);
 // §9.6 / #1295: PadLeft/PadRight — width-aware padding to `totalWidth` code
 // points with `padChar` (leftAlign=1 for PadRight, self-then-pad; 0 for PadLeft,
 // pad-then-self). Preserves code points > U+00FF (fixed-width storage, §4.6).

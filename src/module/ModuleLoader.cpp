@@ -1,7 +1,7 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
-#include <cstdlib>   // std::strtoll (fix #3183)
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -183,6 +183,29 @@ std::vector<sema::ContractRecord> toContractRecords(
     return out;
 }
 
+// fix #4508 (§15.1 / §2.8.3 rule 4, v0.306): the ONE decode of an inline array's
+// EXTENT from its textual form, shared by every reader that needs the number.
+//
+// `MetaType::arraySize` carries the extent as a folded decimal (#3183); the
+// synthetic reconstruction source `metaTypeToSourceText` writes carries the same
+// digits; and `Loader::convert` turns them into `TypeRef::arraySizeValue`. Three
+// readers, one rule — and two of the three are the §14/#705 signature-key
+// renderers that must agree BYTE FOR BYTE (`metaTypeSigText` vs
+// `astTypeToSigText`), so a second copy of the rule is a silent
+// stops-matching defect waiting to happen. Returns the extent, or -1 for any
+// shape that is not a well-formed positive decimal — including the empty string
+// an old artifact carries and the deliberate omission for a size the exporter
+// could not fold, which #3183 keeps failing loudly downstream.
+static long long metaInlineArrayExtent(std::string_view s) {
+    if (s.empty() || s.size() > 18) return -1;  // 18 digits < 2^63, no overflow
+    long long n = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return -1;
+        n = n * 10 + (c - '0');
+    }
+    return n > 0 ? n : -1;
+}
+
 // One reconstruction context for a single loadMetadata call. Holds the
 // name → reconstructed-TypeSymbol map so a MetaType::Named referring to another
 // exported type of the same module resolves to its symbol (§2.5 by-name
@@ -303,16 +326,14 @@ struct Loader {
                 // leaves `arraySizeValue` at -1, which is the condition
                 // `sema::serializationComponentTypeIsEmittable` and
                 // `Emitter::lowerTypeRef` both key on to fail LOUDLY.
-                if (!mt.arraySize.empty()) {
-                    const std::string& s = mt.arraySize;
-                    bool allDigits = true;
-                    for (char c : s)
-                        if (c < '0' || c > '9') { allDigits = false; break; }
-                    if (allDigits && s.size() <= 18) {
-                        long long n = std::strtoll(s.c_str(), nullptr, 10);
-                        if (n > 0) ref->arraySizeValue = n;
-                    }
-                }
+                //
+                // fix #4508: the acceptance rule moved VERBATIM into
+                // `metaInlineArrayExtent` (semantically identical — a
+                // well-formed positive decimal of at most 18 digits, -1
+                // otherwise, which is already this field's default) so the two
+                // §14/#705 signature-key renderers decode the same text the
+                // same way. See that helper's header.
+                ref->arraySizeValue = metaInlineArrayExtent(mt.arraySize);
                 break;
             }
             case TypeKind::Function: {
@@ -1335,24 +1356,39 @@ static std::string metaNamedSimpleName(const MetaType& mt) {
 // Render a MetaType as Bezel source text for use in a synthetic class source.
 static std::string metaTypeToSourceText(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
+        std::string s;
         switch (mt.primitive) {
-            case PrimitiveKind::Bool:    return "bool";
-            case PrimitiveKind::Char:    return "char";
-            case PrimitiveKind::String:  return "string";
-            case PrimitiveKind::Byte:    return "byte";
-            case PrimitiveKind::SByte:   return "sbyte";
-            case PrimitiveKind::Short:   return "short";
-            case PrimitiveKind::UShort:  return "ushort";
-            case PrimitiveKind::Int:     return "int";
-            case PrimitiveKind::UInt:    return "uint";
-            case PrimitiveKind::Long:    return "long";
-            case PrimitiveKind::ULong:   return "ulong";
-            case PrimitiveKind::Float:   return "float";
-            case PrimitiveKind::Double:  return "double";
-            case PrimitiveKind::Decimal: return "decimal";
-            case PrimitiveKind::Object:  return "Object";
-            default: return "int";
+            case PrimitiveKind::Bool:    s = "bool";    break;
+            case PrimitiveKind::Char:    s = "char";    break;
+            case PrimitiveKind::String:  s = "string";  break;
+            case PrimitiveKind::Byte:    s = "byte";    break;
+            case PrimitiveKind::SByte:   s = "sbyte";   break;
+            case PrimitiveKind::Short:   s = "short";   break;
+            case PrimitiveKind::UShort:  s = "ushort";  break;
+            case PrimitiveKind::Int:     s = "int";     break;
+            case PrimitiveKind::UInt:    s = "uint";    break;
+            case PrimitiveKind::Long:    s = "long";    break;
+            case PrimitiveKind::ULong:   s = "ulong";   break;
+            case PrimitiveKind::Float:   s = "float";   break;
+            case PrimitiveKind::Double:  s = "double";  break;
+            case PrimitiveKind::Decimal: s = "decimal"; break;
+            case PrimitiveKind::Object:  s = "Object";  break;
+            default:                     s = "int";     break;
         }
+        // fix #4516 (§7.1 / §7.2 / §22.6, v0.306): render the nullable `?` on a
+        // PRIMITIVE, as the Named arm below has always done. Dropping it here
+        // replayed `x: int?` as `x: int` — a declared type the exporter never
+        // wrote — and, because this text is the source the §14/#705 AST-side
+        // key is re-parsed from, it also made nullability UNRENDERABLE in the
+        // key: `Pick(a: int)` beside `Pick(b: int?)` emitted two IDENTICAL
+        // stubs, which is a duplicate-member error that takes the whole
+        // reconstruction down (MEASURED: §14/#662 rejection of a program the
+        // exporter compiled). `string` and `string?` are distinct types (§7.1)
+        // and `int?` is a distinct type from `int` (§7.2), so §22.6's
+        // "overloads differing in ... types are distinguishable" covers the
+        // pair and the stub must spell the two apart.
+        if (mt.nullable) s += "?";
+        return s;
     }
     if (mt.kind == TypeKind::Named) {
         std::string s = metaNamedSimpleName(mt);  // fix #3540 — see the helper
@@ -1367,17 +1403,159 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
         if (mt.nullable) s += "?";
         return s;
     }
-    // Fallback for unsupported shapes (Function, InlineArray): use a placeholder.
+    // fix #4480 (§3.1, §15.1, §27.1, Appendix A.5, v0.306): render the three
+    // remaining renderable shapes instead of substituting `Object`. This
+    // function produces the SYNTHETIC RECONSTRUCTION SOURCE an importer
+    // re-parses (field-initializer replay #2874/#3671/#3723, ctor/dtor body
+    // re-parse #662c, base-clause argument re-parse #3911), so a placeholder
+    // here silently replays an exporter's declaration at a type the exporter
+    // never wrote. For a function-typed field that happened to be harmless —
+    // a function type is a reference type deriving from `Object` (§3), the
+    // replayed lambda re-announces its own parameter types, and the slot is a
+    // `ptr` either way — but none of those three mitigations hold for an
+    // inline array, whose type is neither a reference type nor `ptr`-shaped.
+
+    // §3.1 / A.5 `TypeNoNullable ::= … | "(" ")"`: the unit type. Reached
+    // mainly as a function type's return (`(string) -> ()`); a method's own
+    // unit return is already omitted by buildMethodStub before it gets here.
+    // fix #4516: `Type ::= TypeNoNullable "?"?` (A.5) admits `()?` and the
+    // parser accepts it, so the nullable form is rendered here for the same
+    // reason it is on every other spellable kind.
+    if (mt.kind == TypeKind::Unit) return mt.nullable ? "()?" : "()";
+
+    // §15.1 / A.5 `InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type`.
+    // The size is textual on the wire and already a folded decimal (#3183).
+    // An inline array has NO nullable form (A.5), so `nullable` is not
+    // rendered. An UNFOLDABLE size reaches the wire empty — #3183 keeps that
+    // shape failing loudly rather than acquiring a wrong number, and there is
+    // no source spelling for an unknown extent — so it falls through below.
+    if (mt.kind == TypeKind::InlineArray && !mt.arraySize.empty() &&
+        mt.children.size() == 1) {
+        std::string s = "[" + mt.arraySize;
+        if (mt.arrayOwned) s += " owned";
+        s += "]";
+        s += metaTypeToSourceText(mt.children[0]);
+        return s;
+    }
+
+    // §27.1 / A.5 `FunctionType ::= "(" (FuncParamType …)? ")" "->" "owned"?
+    // Type`, with `children[0..n-1]` the parameters and `children[n]` the
+    // return (ModuleMetadata.hpp).
+    //
+    // Parameter MODIFIERS are rendered and parameter NAMES are not: §27.1
+    // makes the modifier "part of the type" — "`(T) -> ()` and `(owned T) ->
+    // ()` are distinct function types" — while its own table spells every
+    // function type without names (`method Foo(x: int): bool` ↔ `(int) ->
+    // bool`), so a name is decoration that A.5 admits and identity ignores.
+    //
+    // §27.2: the nullable form must be PARENTHESISED — `((int) -> bool)?` —
+    // because in `-> T?` the `?` binds to the return type.
+    if (mt.kind == TypeKind::Function && !mt.children.empty()) {
+        const std::size_t n = mt.children.size() - 1;  // children[n] = return
+        std::string s = "(";
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i) s += ", ";
+            if (i < mt.funcParamMods.size() && !mt.funcParamMods[i].empty())
+                s += mt.funcParamMods[i] + " ";
+            s += metaTypeToSourceText(mt.children[i]);
+        }
+        s += ") -> ";
+        if (mt.funcReturnOwned) s += "owned ";
+        s += metaTypeToSourceText(mt.children[n]);
+        if (mt.nullable) s = "(" + s + ")?";
+        return s;
+    }
+
+    // What remains has no source spelling at all: the `Error` sentinel (a type
+    // the exporter could not resolve — "should not normally be emitted",
+    // ModuleMetadata.hpp), an inline array whose extent did not fold, and a
+    // structurally malformed Function/InlineArray. The placeholder is kept for
+    // those rather than emitting text that cannot parse: a stub that fails to
+    // parse would take down reconstruction for the whole type, where a wrong
+    // declared type on one member surfaces at that member's own use site.
     return "Object";
 }
 
 // §14/#705: canonical type text for a MetaType, used as a signature key for
 // overload-safe matching (not for source-code generation — that is
-// metaTypeToSourceText).  Uses ',' without space for generic args, and omits
-// the nullable '?' suffix: stubs do not reliably preserve nullability for
-// primitive types, and nullable-vs-non-nullable overloads are rare; the key's
-// purpose is to distinguish base types, not nullability.
+// metaTypeToSourceText).  Uses ',' without space for generic args, and renders
+// the nullable '?' suffix (fix #4516).
+//
+// NULLABILITY IS PART OF THE KEY (fix #4516, §7.1 / §7.2 / §22.6, v0.306).
+// This comment used to read "omits the nullable '?' suffix: stubs do not
+// reliably preserve nullability for primitive types, and nullable-vs-non-
+// nullable overloads are rare". Both halves were defects rather than reasons.
+// §7.1: "`string` and `string?` are distinct types"; §7.2 says the same of a
+// nullable value type, and §14.2 leans on it ("a nullable value type is a
+// distinct type from its non-nullable form (§7.1)"). §22.6 opens "Overload
+// resolution considers number, TYPES, the `ref`/`out` modifiers, and the
+// presence of `owned` on an ordinary parameter — overloads differing in any of
+// these are distinguishable", and closes with the same list — so a pair
+// differing only in nullability is legal, and the compiler accepts it
+// (MEASURED: a single module resolves `Pick(a: T)` beside `Pick(b: T?)` to the
+// non-nullable member and answers 105). The "stubs do not preserve it" half
+// was true of `metaTypeToSourceText`'s PRIMITIVE arm only, and that arm is the
+// other half of this fix: it now renders the `?` the Named and Function arms
+// always did, so all three sides can see it.
+//
+// MEASURED pre-fix, real `bezelc`, a `-c` library plus an importing executable:
+//   * `Pick(a: SC<T>)` beside `Pick(b: SC<T>?)` — single module 105, imported
+//     205, the OTHER overload's body. The collision of facet (a): a silent
+//     wrong value across a module boundary.
+//   * `Pick(a: int)` beside `Pick(b: int?)` — single module 105, imported
+//     REJECTED with §14/#662, because both stubs rendered `int` and the
+//     synthetic source declared the same method twice. Facet (b).
+//
+// An InlineArray is excluded: A.5 gives it no nullable form (`([2]int)?` does
+// not parse — MEASURED), so `nullable` cannot be true for one and rendering it
+// would be a spelling no side could produce.
+//
+// THE PARTICIPATING SET IS FOUR FUNCTIONS, not the three below. For obligation
+// (b) `metaTypeToSourceText` is a participant too: the AST side re-parses ITS
+// output, so a facet it cannot spell is a facet the AST key can never carry,
+// whatever these three do. That is why #4508 could not render parameter names
+// and why nullability could not be rendered before this fix — and why all four
+// move in one commit.
+//
+// THE KEY HAS TWO OBLIGATIONS, and this function is one of THREE renderers that
+// must discharge both together (fix #4508):
+//
+//   (a) two DIFFERENT signatures must get DIFFERENT keys — otherwise the
+//       last-writer / first-match of the attachment loops binds an exporter's
+//       body to the wrong imported overload;
+//   (b) the SAME signature must get the SAME key on BOTH SIDES of whichever
+//       comparison it is in — otherwise attachment silently stops and the
+//       importer rejects a program the exporter compiled (§14/#662).
+//
+// The comparisons, and so the renderers that must stay byte-identical:
+//   * metaMemberSigKey (this function)  vs  freshMethodSigKey (astTypeToSigText)
+//     — MetaType vs the RE-PARSED SYNTHETIC STUB's AST, at the importedMethods
+//     map;
+//   * metaMemberSigKey (this function)  vs  typeRefSigText — MetaType vs the
+//     imported ParameterSymbol's `resolvedDeclType`, at the ctor-body and
+//     method-body attachment loops.
+//
+// Obligation (b) is why parameter NAMES are not rendered inside a function type
+// (§27.1, v0.306: a name is decoration — its own table spells every function
+// type without one — and metaTypeToSourceText omits it from the stub, so the
+// AST side could never see it) while parameter MODIFIERS are (§27.1: "`(T) ->
+// ()` and `(owned T) -> ()` are distinct function types", and the modifier
+// string round-trips verbatim through the wire, the stub source and
+// Loader::convert).
+static std::string metaTypeSigTextCore(const MetaType& mt);
+
+// The nullability-appending wrapper (fix #4516). Every recursive use below —
+// generic arguments, function parameters and returns, an inline array's
+// element — goes through THIS function, so a nested `Box<int?>` and a nested
+// `((int) -> int)?` render their `?` exactly as a top-level one does, on all
+// three sides.
 static std::string metaTypeSigText(const MetaType& mt) {
+    std::string s = metaTypeSigTextCore(mt);
+    if (mt.nullable && mt.kind != TypeKind::InlineArray) s += '?';
+    return s;
+}
+
+static std::string metaTypeSigTextCore(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
         switch (mt.primitive) {
             case PrimitiveKind::Bool:    return "bool";
@@ -1408,10 +1586,63 @@ static std::string metaTypeSigText(const MetaType& mt) {
             }
             s += '>';
         }
-        // Nullable omitted intentionally (see comment above).
+        // The nullable `?` is appended by the `metaTypeSigText` wrapper.
         return s;
     }
-    return "?";  // Unit, Function, InlineArray: placeholder
+
+    // fix #4508 (§3.1 / §15.1 / §27.1 / §22.6, v0.306): render the three
+    // remaining SPELLABLE kinds instead of collapsing them onto one "?".
+    //
+    // THE DEFECT. Unit, Function and InlineArray all keyed "?", so §22.6
+    // overloads differing ONLY at such a parameter — legal declarations; §27.1
+    // makes `(int) -> int` and `(bool) -> int` distinct types, §15.1 makes
+    // `[2]int` a type of its own — were indistinguishable to the §14/#705
+    // matcher. The attachment loops then bound the exporter's body to the
+    // wrong imported overload (`importedMethods[key] = …` is an assignment,
+    // and the ctor/method loops `break` on the first key match), which is a
+    // SILENT cross-module wrong value: a call the exporter compiles to one
+    // answer returns the other overload's. Unit additionally MISMATCHED, since
+    // both mirrors already render it "()" — so a unit-typed parameter stopped
+    // ctor-body attachment outright and the importer rejected the program.
+    if (mt.kind == TypeKind::Unit) return "()";
+
+    // §27.1 / A.5 `FunctionType ::= "(" (FuncParamType …)? ")" "->" "owned"?
+    // Type`; children[0..n-1] are the parameters and children[n] the return
+    // (ModuleMetadata.hpp). Modifiers in, names out — see the header.
+    if (mt.kind == TypeKind::Function) {
+        const std::size_t n = mt.children.empty() ? 0 : mt.children.size() - 1;
+        std::string s = "(";
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i) s += ',';
+            if (i < mt.funcParamMods.size() && !mt.funcParamMods[i].empty())
+                s += mt.funcParamMods[i] + " ";
+            s += metaTypeSigText(mt.children[i]);
+        }
+        s += ")->";
+        if (mt.funcReturnOwned) s += "owned ";
+        s += mt.children.empty() ? "?" : metaTypeSigText(mt.children[n]);
+        return s;
+    }
+
+    // §15.1 / A.5 `InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type`.
+    // The extent decodes through the ONE shared rule so this side and
+    // typeRefSigText's `arraySizeValue` (which Loader::convert produces from
+    // the same text through the same helper) cannot drift; an extent the
+    // exporter could not fold renders "?" on BOTH, keeping them in lockstep
+    // rather than agreeing on a wrong number. The element mirrors convert()'s
+    // own `children.front()` read for the same reason. A.5 gives an inline
+    // array no nullable form, so there is none to omit.
+    if (mt.kind == TypeKind::InlineArray) {
+        const long long n = metaInlineArrayExtent(mt.arraySize);
+        std::string s = "[";
+        s += n > 0 ? std::to_string(n) : "?";
+        if (mt.arrayOwned) s += " owned";
+        s += ']';
+        s += mt.children.empty() ? "?" : metaTypeSigText(mt.children.front());
+        return s;
+    }
+
+    return "?";  // Error: the sentinel kind has no canonical spelling
 }
 
 // §14/#705: canonical signature key for a MetaMember method or constructor:
@@ -1432,12 +1663,62 @@ static std::string metaMemberSigKey(std::string_view name,
 
 // §14/#705: canonical type text from an ast::Type node produced by re-parsing
 // a synthetic stub.  Mirrors metaTypeSigText so that a fresh MethodSymbol's
-// param type produces the same key as the MetaParam it was generated from.
-// Only Named (which covers both user-declared names and primitive keywords)
-// is handled; other shapes return "?" (a no-match sentinel).
+// param type produces the same key as the MetaParam it was generated from —
+// see metaTypeSigText's header for the two obligations both sides discharge.
+// A shape with no canonical spelling returns "?" (a no-match sentinel).
+static std::string astTypeToSigTextCore(const ast::Type* t);
+
+// The nullability-appending wrapper (fix #4516) — the AST mirror of
+// `metaTypeSigText`'s. `ast::Type::nullable` is the `?` suffix the parser read
+// back out of `metaTypeToSourceText`'s output, which now spells it on every
+// kind that has a nullable form (its PRIMITIVE arm was the gap this fix
+// closes). A `null` node has no flag to read and stays the no-match sentinel.
 static std::string astTypeToSigText(const ast::Type* t) {
+    std::string s = astTypeToSigTextCore(t);
+    if (t && t->nullable && t->kind != ast::TypeKind::InlineArray) s += '?';
+    return s;
+}
+
+static std::string astTypeToSigTextCore(const ast::Type* t) {
     if (!t) return "?";
     if (t->kind == ast::TypeKind::Unit) return "()";
+
+    // fix #4508 (§27.1 / §15.1 / A.5, v0.306): the mirrors of
+    // metaTypeSigText's two new arms. The stub this AST was parsed from is
+    // `metaTypeToSourceText`'s output for the very MetaType the other side
+    // renders, so the two agree spelling for spelling: modifiers rendered
+    // (§27.1 identity), names not (metaTypeToSourceText omits them), nullable
+    // not (both sides omit it), generic args joined with a bare ','.
+    if (t->kind == ast::TypeKind::Function) {
+        std::string s = "(";
+        for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+            if (i) s += ',';
+            if (!t->funcParams[i].modifier.empty())
+                s += std::string(t->funcParams[i].modifier) + " ";
+            s += astTypeToSigText(t->funcParams[i].type.get());
+        }
+        s += ")->";
+        if (t->funcReturnOwned) s += "owned ";
+        s += astTypeToSigText(t->funcReturn.get());
+        return s;
+    }
+    if (t->kind == ast::TypeKind::InlineArray) {
+        // The stub spells the extent as the folded decimal the wire carried
+        // (#3183), so decoding the literal's own lexeme through the SHARED
+        // rule reproduces metaTypeSigText's number exactly. Anything else — a
+        // non-literal extent, which a stub never produces — renders "?" on
+        // this side, the same no-match sentinel the other side uses for an
+        // extent it could not fold.
+        const auto* lit =
+            dynamic_cast<const ast::IntLiteralExpr*>(t->arraySize.get());
+        const long long n = lit ? metaInlineArrayExtent(lit->text) : -1;
+        std::string s = "[";
+        s += n > 0 ? std::to_string(n) : "?";
+        if (t->arrayOwned) s += " owned";
+        s += ']';
+        s += astTypeToSigText(t->arrayElement.get());
+        return s;
+    }
     if (t->kind == ast::TypeKind::Named && t->name &&
         !t->name->parts.empty()) {
         // In Bezel's grammar, primitive keywords (int, bool, string, …) parse
@@ -1456,7 +1737,7 @@ static std::string astTypeToSigText(const ast::Type* t) {
             }
             s += '>';
         }
-        // Nullable omitted (mirrors metaTypeSigText).
+        // The nullable `?` is appended by the `astTypeToSigText` wrapper.
         return s;
     }
     return "?";
@@ -1481,8 +1762,25 @@ static std::string freshMethodSigKey(const sema::MethodSymbol* ms) {
 // §14/#705: canonical type text from a reconstructed TypeRef (an imported
 // ParameterSymbol's resolvedDeclType).  Mirrors metaTypeSigText so the same
 // signature key is produced for a MetaParam and its corresponding
-// ParameterSymbol (used for ctor-body attachment matching in facet b).
+// ParameterSymbol (used for ctor-body and method-body attachment matching in
+// facet b) — see metaTypeSigText's header for the two obligations. This side's
+// input is `Loader::convert(MetaType)`, a field-for-field structural copy of
+// the very MetaType the other side renders, so the two stay in lockstep by
+// construction (fix #4508).
+static std::string typeRefSigTextCore(const sema::TypeRef* tr);
+
+// The nullability-appending wrapper (fix #4516) — the TypeRef mirror.
+// `Loader::convert` copies `nullable` field-for-field off the very MetaType
+// `metaTypeSigText` renders (`ref->nullable = mt.nullable;`), so the two sides
+// read ONE flag and cannot drift.
 static std::string typeRefSigText(const sema::TypeRef* tr) {
+    std::string s = typeRefSigTextCore(tr);
+    if (tr && tr->nullable && tr->kind != sema::TypeRef::Kind::InlineArray)
+        s += '?';
+    return s;
+}
+
+static std::string typeRefSigTextCore(const sema::TypeRef* tr) {
     if (!tr) return "?";
     switch (tr->kind) {
         case sema::TypeRef::Kind::Unit:
@@ -1524,11 +1822,39 @@ static std::string typeRefSigText(const sema::TypeRef* tr) {
                 }
                 s += '>';
             }
-            // Nullable omitted (mirrors metaTypeSigText).
+            // The nullable `?` is appended by the `typeRefSigText` wrapper.
+            return s;
+        }
+        // fix #4508 (§27.1 / §15.1, v0.306): the third mirror. `funcParams`,
+        // `funcReturnOwned`, `arrayOwned` and `arraySizeValue` are all copied
+        // verbatim from the MetaType by Loader::convert (the extent through
+        // the same `metaInlineArrayExtent` rule), so rendering them in the
+        // same order with the same punctuation is byte-identical to
+        // metaTypeSigText for every type both can see.
+        case sema::TypeRef::Kind::Function: {
+            std::string s = "(";
+            for (std::size_t i = 0; i < tr->funcParams.size(); ++i) {
+                if (i) s += ',';
+                if (!tr->funcParams[i].modifier.empty())
+                    s += std::string(tr->funcParams[i].modifier) + " ";
+                s += typeRefSigText(tr->funcParams[i].type);
+            }
+            s += ")->";
+            if (tr->funcReturnOwned) s += "owned ";
+            s += typeRefSigText(tr->funcReturn);
+            return s;
+        }
+        case sema::TypeRef::Kind::InlineArray: {
+            std::string s = "[";
+            s += tr->arraySizeValue > 0 ? std::to_string(tr->arraySizeValue)
+                                        : "?";
+            if (tr->arrayOwned) s += " owned";
+            s += ']';
+            s += typeRefSigText(tr->arrayElement);
             return s;
         }
         default:
-            return "?";  // Error, InlineArray, Function: placeholder
+            return "?";  // Error: the sentinel kind has no canonical spelling
     }
 }
 
@@ -1747,6 +2073,59 @@ static bool methodSignatureIsStubSafe(const MetaMember& mm,
 // header comments there). `td` provides the enclosing-class name AND the
 // class's own generic-parameter names (both are bound by the synthetic
 // class header) so the per-stub check recognizes `T` and friends as in scope.
+// fix #4514 (§22.12 / §15.1 / §14.1/#783 / §2.8.3 rule 3, v0.306): emit the
+// class-level `const` members of `td` into a synthetic reconstruction source.
+//
+// WHY THIS WAS MISSING AND WHAT IT COST. Every synthetic source below declares
+// the class's FIELDS, PROPERTIES and METHOD STUBS so that a body (or signature)
+// carried across the wire VERBATIM can resolve the names it mentions. A
+// class-level `const` was never among them — and a `const` is nameable from
+// exactly the same verbatim texts. The measured shape (#4514) is a `const` used
+// as an INLINE-ARRAY EXTENT on a constructor parameter:
+//
+//     public class MxC<T>
+//       public const MAX: int := 2;
+//       public constructor(a: [MAX]int) … end constructor;
+//
+// `ctorBodyText` carries that declaration verbatim, `MAX` resolved to nothing in
+// the fresh context, and — because §15.1's extent expression is NOT visited by
+// ExprTC (see the `findConstShiftDomainFaultInScope` comment in
+// TypeResolution_Names.cpp) — the failure was SILENT: no diagnostic, no
+// `semaDiag->hasErrors()`, so the §14.1/#783 soundness gate saw a clean body and
+// ATTACHED a constructor decl whose parameter's `arraySizeValue` stayed at -1.
+// Codegen's `lowerTypeRef` then answered the bare `i32` placeholder for that
+// parameter and `buildOrderedArgs`' §15.4 inline-array arm declined without
+// producing a value — a SIGSEGV in the importing compile (the other half of
+// #4514). §2.8.3 rule 3 requires the artifact interface to carry enough to
+// reconstruct every public signature; `[MAX]int` is part of one.
+//
+// NARROWED to a PRIMITIVE-typed const with a non-empty, non-`default(...)`
+// `valueText`, deliberately. `valueText` is `renderConstExpr`'s output, which is
+// a re-parsable source lexeme for every literal arm (the lexer keeps the quotes
+// on a string/char literal, so the text round-trips) and the empty string for
+// anything it cannot render. `default(T)` is the one arm that renders a NAME —
+// `de->type->name->parts.back()`, unqualified — and a name this synthetic source
+// does not declare would fail to resolve and take the WHOLE reconstruction down,
+// turning a gap into a regression. A primitive const is also the only kind
+// §15.1 admits as an extent. Anything outside that set keeps exactly its
+// pre-fix behaviour: no stub, and the same silent non-resolution.
+static std::string buildConstStubs(const MetaTypeDecl& td) {
+    std::string s;
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Const) continue;
+        if (mm.name.empty() || mm.valueText.empty()) continue;
+        if (mm.type.kind != TypeKind::Primitive) continue;
+        if (mm.valueText.rfind("default(", 0) == 0) continue;
+        // §22.12: a class-level `const` is implicitly static, and the parser
+        // requires explicit visibility on one. `ConstMemberSymbol` carries no
+        // modifiers (SymbolCollection sets none), so there are none to render.
+        s += "  " + metaVisibilityToKeyword(mm.visibility) + " const " +
+             mm.name + " : " + metaTypeToSourceText(mm.type) + " := " +
+             mm.valueText + ";\n";
+    }
+    return s;
+}
+
 static std::string buildMethodStub(const MetaMember& mm,
                                    const MetaTypeDecl& td,
                                    bool importsModule) {
@@ -1916,6 +2295,10 @@ static std::string buildSyntheticClassSource(
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -2155,7 +2538,34 @@ static bool parseAndAttachCtorBody(
     // Walk fresh context's exprSymbols and remap into mainCtx.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             // Field reference: find same-named field in importedType.
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
@@ -2417,7 +2827,34 @@ static bool parseAndAttachDtorBody(
     // Remap exprSymbols.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -2764,7 +3201,34 @@ static bool parseAndAttachBaseCtorArgs(
     // same predicate across the two paths.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             // A base-clause argument that names a positional primary-ctor
             // parameter is the typical case (`Base(mp)` reads the fresh
             // FieldSymbol for `mp`); a non-positional field reference also
@@ -2845,6 +3309,91 @@ static bool parseAndAttachBaseCtorArgs(
     return true;
 }
 
+// fix #4553 (§2.8.2 / §14.2, v0.306): the §14.1/#783 synthetic reconstruction
+// source renders the class header's generic parameter LIST but dropped its
+// `where` CONSTRAINTS, so `class Holder<T> where T: Base` came back as
+// `class Holder<T>`. A body that uses a constraint-provided member
+// (`Describe(item: T): string => item.Tag();`) then fails to type-resolve in
+// the fresh context, the #783 soundness gate declines to attach the decl,
+// `ms->decl` stays null, and codegen's HARD route at emitMethodCall falls
+// through to the defining module's i32-PLACEHOLDER template — emitting
+// `call ptr @"bz$Lib.Holder$Describe"(ptr, ptr)` against a `(ptr, i32)`
+// declaration, which LLVM's own verifier rejects ("Call parameter type does
+// not match function signature"). §2.8.2 requires an external instantiation
+// at an arbitrary constraint-satisfying type argument to behave identically to
+// a same-module one, so the constraint must survive the round trip.
+//
+// The clause can only be rendered if every TYPE constraint on it can be NAMED
+// inside the single-type synthetic source. This helper answers that and, as a
+// side effect, collects the exporting module's sibling `TypeSymbol`s the
+// constraint names so the caller can register them in the fresh context (the
+// #3645 sibling-registry mechanism, scoped here to CONSTRAINT types only).
+// Scoping it that narrowly is deliberate: registering ALL public siblings would
+// also admit bodies that reach an arbitrary sibling, which is the shape
+// `xmod_generic_method_783`'s T5 canary deliberately keeps gated. A constraint
+// is part of the generic's own public signature (§14.2) and rides the wire
+// already, so admitting exactly it adds no new reconstruction guesswork.
+//
+// Returns false → the caller renders NO `where` clause, i.e. exactly the
+// pre-fix behaviour (a constrained generic whose body does not USE the
+// constraint keeps reconstructing as before).
+static bool collectRenderableConstraintTypes(
+    const MetaTypeDecl& td, const std::string& moduleName,
+    sema::SemaContext& mainCtx,
+    std::vector<sema::TypeSymbol*>& outSiblings) {
+    for (const MetaGenericParam& gp : td.genericParams) {
+        // A.3 `Constraint ::= "class" | "value" | "notnull" | "sendable" |
+        // "hashable" | "new" "(" ")" | Type`. Whitelist rather than
+        // blacklist: an unrecognised spelling would be rendered verbatim into
+        // the synthetic source and fail to PARSE, which costs the whole body
+        // (the §14.1/#783 gate declines and a previously-working
+        // reconstruction becomes a reject). §14.4's `where T is owned` /
+        // `is not owned` modifier form rides this same vector and has a
+        // DIFFERENT surface syntax (`is`, not `:`), so it is excluded here by
+        // simply not being on the list.
+        for (const std::string& sc : gp.specialConstraints) {
+            if (sc != "class" && sc != "value" && sc != "notnull" &&
+                sc != "sendable" && sc != "hashable" && sc != "new")
+                return false;
+        }
+        for (const MetaType& ct : gp.constraintTypes) {
+            if (ct.kind != TypeKind::Named) return false;
+            // A.3 `Constraint`'s Type alternative is not nullable, and
+            // `metaTypeToSourceText` would render `Base?` — a syntax error in
+            // constraint position. Decline rather than emit it.
+            if (ct.nullable) return false;
+            // A generic constraint naming a constructed type (`where T:
+            // IComparable<U>`) needs its own argument list rendered and
+            // resolved; out of scope here — decline and keep pre-fix behaviour.
+            if (!ct.genericArgs.empty()) return false;
+            const std::string simple = metaNamedSimpleName(ct);
+            if (simple == td.name) continue;  // self-reference: declared here
+            bool isOwnParam = false;
+            for (const MetaGenericParam& p : td.genericParams)
+                if (p.name == simple) { isOwnParam = true; break; }
+            if (isOwnParam) continue;  // `where T: U` — bound by the header
+            sema::TypeSymbol* found = nullptr;
+            if (const std::vector<sema::TypeSymbol*>* sibs =
+                    mainCtx.importedTypesOf(moduleName)) {
+                for (sema::TypeSymbol* sib : *sibs) {
+                    if (!sib) continue;
+                    if (sib->qualifiedTypeName() == ct.namedName ||
+                        std::string(sib->name) == simple) {
+                        found = sib;
+                        break;
+                    }
+                }
+            }
+            // Not an imported public sibling (a stdlib/builtin interface, an
+            // `internal` sibling that was never exported, a third module's
+            // type): it cannot be named in the synthetic source, so decline.
+            if (!found) return false;
+            outSiblings.push_back(found);
+        }
+    }
+    return true;
+}
+
 // §14.1 / #783: build a synthetic class source for re-parsing ONE imported
 // generic method's body.  All fields are declared (so field references resolve),
 // every OTHER method is emitted as a signature-only stub (so self-calls resolve),
@@ -2866,9 +3415,17 @@ static bool parseAndAttachBaseCtorArgs(
 static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
                                               const MetaMember& target,
                                               bool nonGenericRecordFactoryPath,
-                                              const std::string& moduleName) {
+                                              const std::string& moduleName,
+                                              bool renderConstraints,
+                                              bool constraintNamesSibling) {
     std::string src = "module _783_reparsed_method_;\n";
-    if (nonGenericRecordFactoryPath && !moduleName.empty()) {
+    // fix #4553 (§2.8.2 / §14.2, v0.306): a rendered `where T: Base` names a
+    // sibling of the EXPORTING module, so the synthetic source must import it
+    // for the name to bind — the same line the #3645 arm emits. Only the
+    // CONSTRAINT types are registered in the fresh context (see
+    // collectRenderableConstraintTypes), so this import widens nothing else.
+    if ((nonGenericRecordFactoryPath || constraintNamesSibling) &&
+        !moduleName.empty()) {
         src += "import " + moduleName + ";\n";
     }
     src += metaVisibilityToKeyword(td.visibility);
@@ -2886,6 +3443,36 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4553 (§2.8.2 / §14.2, v0.306): the `where` clauses (A.3
+    // `GenericConstraints*`, rendered after the header). Without them `T` is
+    // unconstrained in the fresh context and a body that calls a
+    // constraint-provided member does not resolve — see
+    // collectRenderableConstraintTypes for why this is all-or-nothing.
+    if (renderConstraints) {
+        for (const MetaGenericParam& gp : td.genericParams) {
+            if (gp.constraintTypes.empty() && gp.specialConstraints.empty())
+                continue;
+            src += "  where " + gp.name + ": ";
+            bool firstC = true;
+            for (const std::string& sc : gp.specialConstraints) {
+                if (!firstC) src += ", ";
+                // A.3 `Constraint ::= ... | "new" "(" ")"` — the wire carries
+                // the bare `new`; the surface form takes the parens.
+                src += (sc == "new" ? std::string("new()") : sc);
+                firstC = false;
+            }
+            for (const MetaType& ct : gp.constraintTypes) {
+                if (!firstC) src += ", ";
+                src += metaTypeToSourceText(ct);
+                firstC = false;
+            }
+            src += "\n";
+        }
+    }
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -3021,8 +3608,15 @@ static bool parseAndAttachMethodBody(
     sema::SemaContext& mainCtx,
     bool nonGenericRecordFactoryPath,
     const std::string& moduleName) {
+    // fix #4553 (§2.8.2 / §14.2, v0.306): decide whether the class header's
+    // `where` clauses can be reproduced, and collect the exporting module's
+    // sibling types they name so they can be registered below.
+    std::vector<sema::TypeSymbol*> constraintSiblings;
+    const bool renderConstraints = collectRenderableConstraintTypes(
+        td, moduleName, mainCtx, constraintSiblings);
     std::string source = buildSyntheticMethodSource(td, target,
-        nonGenericRecordFactoryPath, moduleName);
+        nonGenericRecordFactoryPath, moduleName, renderConstraints,
+        /*constraintNamesSibling=*/!constraintSiblings.empty());
 
     DiagnosticEngine freshDiag;
     Lexer freshLex(source, freshDiag);
@@ -3072,6 +3666,16 @@ static bool parseAndAttachMethodBody(
             }
         }
     }
+    // fix #4553 (§2.8.2 / §14.2, v0.306): register ONLY the sibling types the
+    // rendered `where` clauses name, so `where T: Base` binds to the REAL
+    // imported `Base` TypeSymbol and the body's `item.Tag()` resolves against
+    // it. Deliberately narrower than the #3645 arm above — a body reaching an
+    // arbitrary sibling stays gated (the T5 canary in
+    // tests/module/xmod_generic_method_783_test.cpp).
+    if (!moduleName.empty())
+        for (sema::TypeSymbol* sib : constraintSiblings)
+            if (sib && !sib->name.empty())
+                freshCtx.registerImportedType(moduleName, sib);
     sema::resolveTypes(*sf, freshCtx);
     if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
@@ -3203,9 +3807,45 @@ static bool parseAndAttachMethodBody(
         for (sema::Symbol* ps : syms)
             if (ps) freshLambdaParamSyms.insert(ps);
 
+    // fix #4553 (§2.8.2 / §14.2, v0.306): the constraint types registered into
+    // the fresh context above, as a set, so the MethodSymbol arm below can tell
+    // "a member the CONSTRAINT provides" (already an IMPORTED symbol — carry it
+    // over by identity) from "a member of some other type" (no binding, as
+    // before).
+    std::unordered_set<const sema::Symbol*> constraintSiblingSyms;
+    for (sema::TypeSymbol* sib : constraintSiblings)
+        if (sib) constraintSiblingSyms.insert(sib);
+
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -3241,8 +3881,24 @@ static bool parseAndAttachMethodBody(
             }
         } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
             auto it = importedMethods.find(freshMethodSigKey(fms));
-            if (it != importedMethods.end())
+            if (it != importedMethods.end()) {
                 mainCtx.setExprSymbol(expr, it->second);
+            } else if (fms->parent &&
+                       constraintSiblingSyms.count(fms->parent)) {
+                // fix #4553 (§2.8.2 / §14.2, v0.306): a call to a member the
+                // CONSTRAINT provides (`item.Tag()` under `where T: Base`).
+                // `importedMethods` only holds the reconstructed type's OWN
+                // members, so this arm used to drop the binding: codegen then
+                // saw no symbol for the callee, fell into the fieldAddr
+                // member-READ fallback, and reported the #2445 "no member
+                // `Tag` on substituted type `Local`" diagnostic instead of
+                // emitting the call. There is nothing to remap here — the
+                // constraint's type was registered into the fresh context AS
+                // the imported `TypeSymbol`, so `fms` already IS the symbol
+                // codegen consumes. Carry it over by identity, exactly as the
+                // body-local arm below does (#2818).
+                mainCtx.setExprSymbol(expr, fms);
+            }
         } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
             // fix #2818 (§14.1 monomorphization / §2.5 modules, v0.240): a
             // symbol DECLARED INSIDE the re-parsed body — a `var`/`const`
@@ -3396,6 +4052,10 @@ static std::string buildSyntheticPropertySource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields (needed so implicit field references inside the body resolve).
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Field) continue;
@@ -3550,7 +4210,34 @@ static bool parseAndAttachPropertyBody(
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
+        // v0.306): a class-level `const` reference. `buildConstStubs` now
+        // declares the type's consts in every synthetic reconstruction source,
+        // so a VERBATIM body that names one resolves — to a symbol of the
+        // FRESH context, which `mainCtx` knows nothing about. Without this arm
+        // the reference is DROPPED from `mainCtx`'s exprSymbols,
+        // `Emitter::constMemberValue` finds no `ConstMemberSymbol` and returns
+        // null, and the enclosing expression "failed to lower" (a #2491 /
+        // #2961 internal diagnostic and a silent zero). MEASURED: an imported
+        // generic's `return Tag + K;` over `public const K: int := 11;`
+        // answered 0 instead of 16 with the stubs in place and this arm
+        // missing — the stub and the remap are one change.
+        //
+        // Registered BY IDENTITY, exactly as a body-local `var` is (#2290
+        // bug 1), and deliberately NOT remapped to the imported
+        // `ConstMemberSymbol` by name: a §22.12 const has no storage and no
+        // runtime identity to unify (the library emits no global for one —
+        // issue #328 FINDING [3] BUG A), so §2.8.3 rule 4's one-identity
+        // obligation has nothing to bind here. What the fresh symbol DOES
+        // carry is the exporter's own `ast::ConstDecl`, whose initializer is
+        // the very expression `renderConstExpr` put on the wire, so
+        // `constMemberValue`'s local fold answers the value the exporter
+        // compiled. The fresh AST and context outlive this function already,
+        // for exactly the reason the local-`var` arm needs them to
+        // (ownImportedAst / ownImportedAuxiliary at the tail).
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
@@ -3914,6 +4601,10 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
         src += ">";
     }
     src += "\n";
+    // fix #4514 (§22.12 / §15.1 / §2.8.3 rule 3, v0.306): class-level `const`
+    // declarations, so a VERBATIM text this source carries can name one — see
+    // buildConstStubs for the measured `[MAX]int` constructor-parameter shape.
+    src += buildConstStubs(td);
     // Fields: any field carrying its own fieldInitText gets its real
     // initializer; every other field is a bare type re-declaration (name
     // resolution only — see comment above).
@@ -4273,6 +4964,18 @@ static bool parseAndAttachFieldInit(
         // sibling type's auto-property reference) remaps through the SAME
         // `importedFields` storage map exactly as a field does; see that
         // map's #3736 widening comment above.
+        // fix #4514 (§22.12 / §14.1 / §2.8.3 rule 3, v0.306): a class-level
+        // `const` named by a re-parsed field initializer. Registered by
+        // identity — see the long note on the identical arm in
+        // `parseAndAttachCtorBody` for why identity rather than a name remap,
+        // and why the stub and this arm are one change. Placed BEFORE the
+        // storage arm because the `importedFields` map below holds only
+        // FieldSymbols and auto-property storage, so a const falling into it
+        // would take the #2375 sibling branch and resolve to nothing.
+        if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
+            mainCtx.setExprSymbol(expr, freshSym);
+            continue;
+        }
         auto* propSym = dynamic_cast<sema::PropertySymbol*>(freshSym);
         if (dynamic_cast<sema::FieldSymbol*>(freshSym) ||
             (propSym && !propSym->isIndexer)) {

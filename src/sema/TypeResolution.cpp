@@ -325,6 +325,9 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticIndexers();
     // §23.5 (v0.241, #2758): indexer parameters may not declare defaults.
     checkIndexerParamDefaults();
+    // §22.5 (v0.306, #4494): every parameter after the first defaulted
+    // parameter must itself have a default.
+    checkParamDefaultOrdering();
     // §25.2 (#746): comparison/equality operators must form a complete group.
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
@@ -539,6 +542,12 @@ bool checkSendableConstraintsLate(const ast::SourceFile& src,
 // common-shape case (concrete typeArgs) is handled. See the comment on
 // `Resolver::checkGenericConstraintsAtUseSite` for the full rationale
 // and the deferred-nested edge case.
+//
+// fix #4465: the deferred type-bound failures pushed by
+// checkGenericConstraintsAtUseSite were NEVER reported — the temporary
+// Resolver `r` is discarded without flushing. At ExprTC time all types
+// are fully resolved, so flushing now correctly reports the constraint
+// violation at the static-call site.
 bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    SourceLocation useSite,
                                    const std::vector<const ast::Type*>& argAsts,
@@ -546,6 +555,7 @@ bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    TypeSymbol* tsym) {
     Resolver r(ctx);
     r.checkGenericConstraintsAtUseSite(useSite, argAsts, argRefs, tsym);
+    r.flushDeferredTypeBoundFailures();
     return !ctx.diagnostics().hasErrors();
 }
 

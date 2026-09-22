@@ -36,4 +36,21 @@ inline bool forceSanitizeAddress() {
     return v;
 }
 
+// §22.16 / issue #4386: the suite-wide checked-contracts override, parallel
+// to `forceSanitizeAddress` above. When `BEZEL_AOT_FORCE_CHECKED_CONTRACTS`
+// is set to `1` / `on` / `true`, every `runAot` call sets
+// `opts.checkedContracts = true` so the suite runs under checked-contracts
+// mode uniformly — used by the gate's "force the whole suite under
+// checked-contracts" sweep, mirroring the ASan sweep above. Unset/empty (the
+// default) leaves `runAot`'s own test default in effect.
+inline bool forceCheckedContracts() {
+    static const bool v = [] {
+        const char* e = std::getenv("BEZEL_AOT_FORCE_CHECKED_CONTRACTS");
+        if (!e || *e == '\0') return false;
+        std::string s(e);
+        return s == "1" || s == "on" || s == "true";
+    }();
+    return v;
+}
+
 }  // namespace bezel::test

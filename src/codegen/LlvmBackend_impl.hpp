@@ -611,6 +611,7 @@ public:
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
           builder_(llvmCtx),
           checkedDisposal_(opts.checkedDisposal),
+          checkedContracts_(opts.checkedContracts),
           isMainModule_(opts.isMainModule) {}
 
     std::unique_ptr<llvm::Module> run() {
@@ -919,6 +920,12 @@ private:
     // disposed-flag test on every instance-member entry; emitDisposeAndReclaim
     // suppresses the heap-free (quarantine) so the flag remains readable.
     bool checkedDisposal_ = false;
+    // §22.16 / issue #4386: in checked-contracts mode the `ensures` epilogue
+    // (armEnsuresEpilogue) and the `invariant` check (emitInvariantCheck) emit
+    // the clause-evaluation call. In unchecked (release) mode — the default —
+    // both are no-ops at codegen, so `ensures`/`invariant` clauses are pure
+    // (never evaluated). `requires` is always-on regardless of this bit.
+    bool checkedContracts_ = false;
     // per §33.1/§2.4/§33.6 (#1563): true when this compilation unit is the
     // executable's main module, so a qualifying `Main` (§33.2) is lowered as
     // the native process entry point. False for a library (`-c`) build — see
@@ -1289,6 +1296,90 @@ private:
     // LastCellEntry::isParam (fix #3403) carries the same fact without needing a
     // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
+    // fix #4523 (§27.5 / §28.9, v0.306): the FUNCTION each `declScopeDepth_`
+    // entry is a depth INTO. `declScopeDepth_` is module-wide and never cleared,
+    // while `disposeStack_` is cleared per body (lowerLambda, every async resume
+    // / iterator moveNext / thunk prolog). A depth recorded while lowering one
+    // body is therefore meaningless as an index into another body's
+    // `disposeStack_`, and nothing in the map itself says which body it came
+    // from. Any consumer that INDEXES `disposeStack_` with a depth from here
+    // must first check this map against `currentFn_`; consumers that only
+    // COMPARE depths within the current body (#969's nested-scope guard) do not.
+    // Written only through `recordDeclScopeDepth`, so the two maps cannot drift.
+    std::unordered_map<const void*, llvm::Function*> declScopeDepthFn_;
+    // fix #4523: record a local's declaring scope depth TOGETHER with the body
+    // that depth indexes. Every `declScopeDepth_` write goes through here — the
+    // pairing is the invariant, and a site that set one without the other would
+    // reintroduce exactly the cross-body mis-indexing this fixes.
+    void recordDeclScopeDepth(const void* declNode) {
+        declScopeDepth_[declNode]   = disposeStack_.size();
+        declScopeDepthFn_[declNode] = currentFn_;
+    }
+    // fix #4526 (§27.5 / §28.3 / §28.9, v0.306): the ONE sanctioned way to
+    // turn a recorded declaration depth into a `disposeStack_` INDEX. #4523
+    // proved the hazard is reachable rather than theoretical and closed the
+    // single site it was filed for with an inline conjunct; two siblings
+    // still indexed by a bare depth. Making the check and the index ONE
+    // operation is what stops the next site from forgetting it — the index is
+    // simply not obtainable without the proof.
+    //
+    // Returns false, leaving `idxOut` untouched, when no depth was recorded,
+    // when it was recorded while lowering a DIFFERENT body, or when it is out
+    // of range for the stack being held right now. Every caller's false
+    // branch must be the conservative one (register nothing), which costs a
+    // bounded leak; the alternative reading is a use-after-free.
+    //
+    // NOT for depth COMPARISONS. #969's `declaredShallower` test — "does this
+    // capture's local live in an ENCLOSING scope?" — only compares two
+    // depths, which `declScopeDepthFn_`'s declaration above documents as safe
+    // as it stands; routing it through here would change its meaning rather
+    // than tighten it.
+    bool declScopeDisposeIndex(const void* declNode,
+                               std::size_t& idxOut) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        if (fnIt == declScopeDepthFn_.end() || fnIt->second != currentFn_)
+            return false;
+        auto it = declScopeDepth_.find(declNode);
+        if (it == declScopeDepth_.end()) return false;
+        if (it->second < 1 || it->second > disposeStack_.size()) return false;
+        idxOut = it->second - 1;
+        return true;
+    }
+    // fix #4526: was this local's depth recorded while lowering a DIFFERENT
+    // body? Deliberately distinct from `!declScopeDisposeIndex(...)`, which is
+    // also true for "never recorded" and "out of range": a consumer whose
+    // pre-existing fallback for an UNRECORDED local is sound must keep it and
+    // refuse only when the recorded depth positively belongs to another
+    // frame — because for such a local no scope of THIS body is a correct
+    // place to dispose it, not even the innermost one.
+    bool declScopeDepthFromOtherFn(const void* declNode) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        return fnIt != declScopeDepthFn_.end() && fnIt->second != currentFn_;
+    }
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's per-DECL decision, made once
+    // and obeyed everywhere.
+    //
+    //   * `refcountedCellDecls_` — this local's capture cell is refcounted, so
+    //     EVERY env that stores its cell pointer must announce itself with
+    //     `bz_cell_retain` and drop it in its envdtor, whichever body builds
+    //     that env. The retain/envdtor-release pair is self-balancing and needs
+    //     no `disposeStack_` registration, so a holder in a NON-declaring body
+    //     joins the protocol instead of being declined out of it (the #4509
+    //     regression: a declined nested holder read through a cell the frame
+    //     had already released).
+    //   * `cellRefcountDeclined_` — a capture site in the declaring body looked
+    //     at this local and refused. STICKY: a later sibling lambda must not
+    //     arm a cell an earlier sibling's env is already holding uncounted.
+    //
+    // Both are keyed by the LocalDecl AST node because refcounted-ness is a
+    // property of the CELL, not of any one capturing lambda. The decision is
+    // always taken in the declaring body: a capture of a local can only appear
+    // in a lambda lexically inside that local's scope, and the outermost such
+    // lambda's capture loop runs while that body is being lowered — before any
+    // lambda nested within it. The locals capture loop in `lowerLambda` has no
+    // early `continue`, so every captured local reaches the decision.
+    std::unordered_set<const void*> refcountedCellDecls_;
+    std::unordered_set<const void*> cellRefcountDeclined_;
     // CG6: emitted LLVM function for each static method symbol.
     // fix #3550 (§23.3 / §23.4 / §30.5 / §28.4, v0.286): MapVector, NOT
     // unordered_map. The NestedBodyScope comment (LlvmBackend_Assign.cpp ~4665)
@@ -1396,6 +1487,13 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initStateGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initOwnerGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initProgressGV_;
+    // fix #4486 (§22.13, v0.306): initEpoch snapshots, at this type's own
+    // CAS-win, the POST-bump value of the thread-local monotonic
+    // `bz_static_init_epoch` (bezel_runtime_concurrency.cpp) — see that
+    // global's own comment for the full same-type-vs-cross-type rationale.
+    // emitStaticPartialReadGuard compares the CURRENT epoch against this
+    // snapshot to classify a same-thread partial-state touch.
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initEpochGV_;
     // Per-type sfinit / cctor functions, indexed for ensureinit emission. Built
     // from staticCtors_ in declareStaticInitializers.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
@@ -2036,6 +2134,24 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #4509 (§27.5 / §28.9, v0.306): drop the DECLARING FRAME's
+        // reference to a REFCOUNTED capture cell (`bz_cell_release`), rather
+        // than free it outright. Registered once per cell holder, in the scope
+        // that declared the captured local, for exactly the cells no static
+        // route can name a free site for — one whose capturers include a
+        // conservatively-escaping lambda (see `CaptureEntry::retainCellInEnv`).
+        // Emitted in the #1017 SECOND PASS beside `boxedCellFreeDeferred`, and
+        // for the same reason: it must run AFTER every reads-through-cell
+        // disposal in the scope. It differs from that flag in what it emits and
+        // in what it proves — `boxedCellFreeDeferred` is a free that a static
+        // proof licensed, this is a release whose safety the RUNTIME count
+        // establishes, so it is correct even when an env outlives the frame.
+        // Mutually exclusive with `boxedCellFree` / `boxedCellFreeDeferred`:
+        // those arm only where no escaping capturer exists, this only where one
+        // does. Reads nothing through the cell, so it is in the
+        // `consumeLastLambdaCapturedCells` / LlvmBackend_Stmts.cpp exclusion
+        // lists beside them.
+        bool cellRelease = false;
         // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): parallel to
         // `dictEntryKeyRelease` (LlvmBackend_Setup.cpp) but for a
         // string-keyed `DictionaryEntry<string,V>` local captured by a
@@ -2196,6 +2312,10 @@ private:
         bool dictEntryForSnapshot = false;
         llvm::AllocaInst* dictEntryForKeysOutSlot = nullptr;  // ptr* (char**/void**)
         llvm::AllocaInst* dictEntryForLensOutSlot = nullptr;  // ptr* (i64*); null unless string key
+        // fix #4499: the snapshot's THIRD spine (int8_t* of per-key §4.6
+        // storage widths), malloc'd by bz_dict_keys_str beside keys and lens
+        // and freed on exactly the same paths. Null unless string key.
+        llvm::AllocaInst* dictEntryForWidsOutSlot = nullptr;  // ptr* (i8*)
         llvm::AllocaInst* dictEntryForValsOutSlot = nullptr;  // ptr* (void**)
         llvm::AllocaInst* dictEntryForCntSlot     = nullptr;  // i64* — snapshot count
         llvm::AllocaInst* dictEntryForIdxSlot     = nullptr;  // i64* — current cursor
@@ -2611,6 +2731,61 @@ private:
     // exception propagates out of them (§28.3). 0 = dispose all (the
     // function propagate path).
     std::size_t unwindScopeDepth_ = 0;
+    // fix #1878 + #1882 (§28.4, v0.306): how many disposal emissions that can
+    // run USER code have been emitted so far in this module. Read only as a
+    // difference across a disposal pass, so its absolute value is meaningless
+    // and it never needs resetting per function. emitDisposals uses it to gate
+    // §28.4's propagate-from-the-disposal-point check, which would otherwise
+    // duplicate the enclosing scopes' unwind disposals at EVERY scope end.
+    //
+    // Counted: a vtable `Dispose` dispatch through `emitDynamicDispose`, and an
+    // owning container's element cascade whose per-element callback is
+    // `elementDisposerThunk()` (see elementDisposerRunsUserCode).
+    //
+    // ⚠ THIS IS A SOUND UNDERCOUNT, NOT AN EXACT CLASSIFICATION. Do not read it
+    // as "every route to a user destructor is counted" — an earlier revision of
+    // this comment said exactly that and it was false. Measured routes that do
+    // reach a user destructor and are NOT counted:
+    //
+    //   * `nestedCollectionDisposerThunk` — an `OwningArray<OwningArray<R>>`
+    //     cascades into the inner collection, and from there into `R`'s
+    //     destructor, without ever being `elementDisposerThunk()`.
+    //   * `sharedReleaseThunk` / `weakReleaseThunk` — `bz_shared_release` calls
+    //     the control block's `dispose_value`, which IS the element's vtable
+    //     `Dispose`. (An earlier revision of this comment listed the
+    //     Shared/Weak handle among the callbacks that "cannot reach user code";
+    //     that was wrong.)
+    //   * `tcsElementDisposerThunk`, and the `taskOwnedResultDisposer` arm.
+    //   * the iterator/enumerator-frame arm in emitDisposals, which dispatches
+    //     vtable slot 1 directly rather than through `emitDynamicDispose` — so
+    //     "the single funnel" is not literally true either.
+    //
+    // An uncounted route is not a regression and not a hazard: the gate simply
+    // does not fire, and the fault keeps BASE behaviour (it stays in the bz_exc
+    // slot for a later pending check) rather than being routed from its own
+    // disposal point. Those are pre-existing §28.4 gaps that neither #1878 nor
+    // #1882 names, tracked separately. Anything ADDED here must keep that
+    // direction: counting too little degrades to base, counting too much only
+    // costs a dead check.
+    unsigned userCodeDisposalCount_ = 0;
+
+    // fix #1878 (§28.4, v0.306): does this per-element / per-value disposer
+    // callback dispatch the element's own vtable `Dispose` DIRECTLY? Exactly
+    // one thunk does — `elementDisposerThunk()`, §28.4's "the owning
+    // container's cascade" in its plain form. The container arms use this to
+    // trip the propagate gate, because such a cascade reaches the element's
+    // destructor through a runtime loop rather than through emitDynamicDispose.
+    //
+    // ⚠ A `false` here does NOT mean "cannot reach user code": the nested-
+    // collection thunk and the `Shared`/`Weak` release thunks reach a user
+    // destructor by a longer path and answer false. See
+    // `userCodeDisposalCount_` for the full enumeration and for why
+    // undercounting is the safe direction.
+    bool elementDisposerRunsUserCode(const llvm::Value* disposer) const {
+        return disposer != nullptr && elementDisposerThunk_ != nullptr &&
+               disposer == static_cast<const llvm::Value*>(
+                               elementDisposerThunk_);
+    }
     // CG22: per-built-in-exception-type descriptor and vtable globals
     // (§31.4 hierarchy), keyed by type name (built-in exception types have
     // no user TypeSymbol). A shared no-op Dispose serves all of them.
@@ -4166,19 +4341,25 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
-    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544): the closure-cell heap layout —
+    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544) / #4475 (§28.2): the
+    // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
-    //     i64 kind (off 32) }
-    //   = 40 bytes.
+    //     i64 kind (off 32), i8 disposed (off 40) }
+    //   = 48 bytes (LLVM may pad the tail to 8-byte alignment = 48 bytes).
     // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
     // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
     // unchanged; envdtor (field index 3, off 24) is the #672 typed env-disposer;
-    // kind (field index 4, off 32) is NEW (#1544): a FnValKind tag recording which
-    // §27.7.1 equality rule the value obeys, consulted only by
-    // bz_closure_value_equals / bz_closure_same (never by retain/release). The
-    // values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_* constants.
+    // kind (field index 4, off 32) is the §27.7.1 FnValKind tag, consulted only
+    // by bz_closure_value_equals / bz_closure_same (never by retain/release).
+    // The values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_*
+    // constants. disposed (field index 5, off 40, #4475) is the §28.2
+    // use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+    // bz_closure_mark_disposed on an explicit `c.Dispose()` (codegen only,
+    // under --checked-disposal), read at the closure-invoke guard site.
     // Every closure-cell producer calloc's this size and stores rc := 1,
-    // envdtor := null, and kind := the producer-appropriate FnValKind.
+    // envdtor := null, kind := the producer-appropriate FnValKind, and
+    // disposed := 0 (calloc zero-fill; explicit initClosureDisposed() is
+    // provided as documentation).
     enum FnValKind : int64_t {
         // Lambda or value-shaped-receiver (record/enum/primitive) ref: equals
         // only itself (reference identity on the cell). §27.7.1 first & third.
@@ -4192,7 +4373,10 @@ private:
     llvm::StructType* closureCellType() {
         if (!closureCellTy_)
             closureCellTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy(), i64()}, "bz.closure");
+                llvm_,
+                {ptrTy(), ptrTy(), i64(), ptrTy(), i64(),
+                 llvm::Type::getInt8Ty(llvm_)},
+                "bz.closure");
         return closureCellTy_;
     }
 
@@ -5350,6 +5534,49 @@ private:
             return builder_.CreateInsertValue(res, v, {1u});
         }
         return v;
+    }
+
+    // fix #455 / §4.5, extracted for fix #4579 (§4.6 / §7.2, v0.306): lift a
+    // lowered element value `v` into the tagged `{i8 hasValue, T value}` struct
+    // an element of nullable-VALUE type `elemTyRef` occupies, so the alloca the
+    // caller spills it into MATCHES the stride `collectionElemSize` computed and
+    // the runtime memcpy's. Returns `v` unchanged for every other element type.
+    //
+    // This was the body of the `ensureNullableElem` lambda #455 put inside
+    // `tryLowerCollectionInstanceCall` (LlvmBackend_Calls.cpp) — see that call
+    // site's comment for the full rationale, which is unchanged. It is a member
+    // now because the NODE-backed `LinkedList<T>` family lives in a different
+    // function in a different file (`tryLowerLinkedListInstanceCall`,
+    // LlvmBackend_Calls3.cpp) and so never got the rule: its `AddLast(1)` on a
+    // `LinkedList<int?>` spilled a bare `i32` into a 4-byte alloca and handed
+    // `bz_llist_add_last` an 8-byte stride, which memcpy'd 4 bytes PAST the slot
+    // (ASan stack-buffer-overflow) and left the node holding the payload's low
+    // byte as its hasValue tag. One helper, both families — rather than the
+    // second spelling of one rule that narrow #4553 and fix #4571 each declined
+    // to introduce in `emitRemoveElementEquality`.
+    llvm::Value* ensureNullableElementValue(const sema::TypeRef* elemTyRef,
+                                            llvm::Value* v) {
+        if (!elemTyRef || !v) return v;
+        sema::TypeRef nvBuf;
+        const sema::TypeRef* nvTy = nullptr;
+        if (isNullableValueTy(elemTyRef)) {
+            nvTy = elemTyRef;
+        } else if (elemTyRef->nullable &&
+                   elemTyRef->kind == sema::TypeRef::Kind::Named &&
+                   !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
+            // fix #569 / §14.1: a BARE nullable type parameter (`T?`) inside a
+            // monomorphized body — resolve it through the active substitution.
+            if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
+                isNullableValueTy(&nvBuf))
+                nvTy = &nvBuf;
+        }
+        if (!nvTy) return v;
+        llvm::StructType* expected = nullableValueStructTy(nvTy);
+        if (!expected || v->getType() == expected) return v;
+        // (b) null pointer → the null tagged struct.
+        if (v->getType()->isPointerTy()) return nullableValueNull(nvTy);
+        // (a) inner scalar/struct value → {hasValue=1, v}.
+        return wrapNullableValue(nvTy, v);
     }
 
     // v0.171 (#1336) — the Try-convention writeback. Every extraction
@@ -8976,14 +9203,20 @@ private:
     // the `?.` mirror and the generic-T redirect cannot disagree about whether
     // the argument is boxed.
     //
-    // ⚠ THE FRESH BOX IS DELIBERATELY NOT RELEASED, and that is a MEASURED
-    // decision, not an oversight — do not "finish" this by adding a
-    // `bz_box_release` after the dispatch. #2952 discharges an argument-position
-    // box right after the call ONLY when `isCalleeParamNonEscaping` can prove
-    // the callee does not store the parameter; here the callee is a VTABLE
-    // DISPATCH (`lowerObjectEquals` → vtable[kEqualsSlot]) and so is not
-    // statically known at all. The release was implemented first and MEASURED
-    // to produce a heap-use-after-free under ASan on this program:
+    // ⚠ THE FRESH BOX IS RELEASED ONLY WHERE THE RECEIVER IS PROVABLY A BOX
+    // (fix #3480, v0.306) — see `lowerUniversalEqualsDispatch`, which owns
+    // that decision; this helper only REPORTS the mint through `freshMint`.
+    // Everywhere else the box is still deliberately left to leak, and that is
+    // a MEASURED decision rather than an oversight: #2952 discharges an
+    // argument-position box right after the call ONLY when
+    // `isCalleeParamNonEscaping` can prove the callee does not store the
+    // parameter, and here the callee is a VTABLE DISPATCH
+    // (`lowerObjectEquals` → vtable[kEqualsSlot]). It is statically known
+    // exactly when the RECEIVER's vtable is — which for a §8.6 box means a
+    // compiler-generated `bz$box$eq` / `bz$boxeq$<T>` thunk, and for a user
+    // class means the user's own override. The unconditional release was
+    // implemented first and MEASURED to produce a heap-use-after-free under
+    // ASan on this program:
     //
     //     class K
     //       public S: Object?;
@@ -8998,12 +9231,17 @@ private:
     // takes NO `bz_box_retain` and the caller's `+1` is the only reference.
     // §30.12's read-guard clause records the general shape ("a borrowed parameter
     // admits stores in the callee, which no caller-side rule can reject without
-    // rejecting the pass-and-read idiom wholesale"), so this is a program the
-    // compiler admits. Leaking is #2952's own stated conservative direction:
-    // "the compiler's escape analysis conservatively leaks rather than
-    // guessing." The residual leak (24 B per `Equals` call with a value-typed
-    // argument) is filed separately rather than traded for a UAF.
-    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr) {
+    // rejecting the pass-and-read idiom wholesale"), and §28.3's *deliberate
+    // asymmetry* paragraph states it as a rule ("a parameter-sourced object
+    // borrow may be stored into a field under §28.3's borrowed-field rule — a
+    // structural check whose residual is the caller's trust"), so this is a
+    // program the compiler admits. Leaking is #2952's own stated conservative
+    // direction: "the compiler's escape analysis conservatively leaks rather
+    // than guessing." The residual leak on THAT path (24 B per `Equals` call
+    // with a value-typed argument and a class receiver) stands rather than be
+    // traded for a UAF.
+    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr,
+                                         llvm::Value** freshMint = nullptr) {
         llvm::Value* savedBoxMint = lastBoxMint_;
         lastBoxMint_ = nullptr;
         llvm::Value* other = lowerExpr(argExpr);
@@ -9011,8 +9249,58 @@ private:
         // it keeps THIS argument's mint from leaking into a sibling
         // `boxForTarget`, or a previous mint into this one.
         other = boxForTarget(other, universalEqualsFormalTy(), &argExpr);
+        // fix #3480: hand back the box MINTED DURING THIS ARGUMENT'S lowering,
+        // if any — the mint-identity test #2865 established, reused here. It
+        // is the caller's decision whether discharging it is admissible (see
+        // `lowerUniversalEqualsDispatch`); this helper only reports the fact.
+        if (freshMint)
+            *freshMint = (other && lastBoxMint_ && other == lastBoxMint_)
+                             ? other : nullptr;
         lastBoxMint_ = savedBoxMint;
         return other;
+    }
+
+    // fix #3480 (§8.6 / §8.3 / §28.9 / §28.3, v0.306): lower `<recv>.Equals(
+    // <arg>)` for the sites this backend answers itself — argument boxing,
+    // vtable dispatch, and the argument box's §28.9 discharge — as ONE step,
+    // so the lifetime rule cannot be applied at three of the four `Equals`
+    // sites and forgotten at the fourth (this family's characteristic defect).
+    //
+    // `recvIsKnownBox` says the receiver's word 0 is provably a BOX VTABLE.
+    // Every box vtable's `kEqualsSlot` holds a compiler-generated thunk that
+    // reads `other` and returns an `i1` without storing it (see
+    // `pureBoxBindings_` for the enumeration), so the fresh argument box is
+    // dead the instant the dispatch returns and `bz_box_release` here is
+    // exactly-once.
+    //
+    // WHEN IT IS FALSE the box is LEFT TO LEAK, deliberately, and that is
+    // #3480's own measured verdict rather than a missing case: a user class
+    // receiver dispatches to a user `Equals` override, which the spec (v0.306
+    // §28.14's *deliberate asymmetry* paragraph, referring to §28.3's
+    // borrowed-field rule) permits to store its borrowed `Object?` parameter
+    // into a field — taking no `bz_box_retain`,
+    // because `collectBoxStorageFields` cannot classify a field whose only
+    // assignment source is an `Object?` PARAMETER. Releasing there was
+    // implemented and measured to produce a heap-use-after-free. A bounded
+    // leak is the conservative direction; a UAF is not.
+    llvm::Value* lowerUniversalEqualsDispatch(llvm::Value* recv,
+                                              const ast::Expr& argExpr,
+                                              bool recvIsKnownBox) {
+        llvm::Value* mint = nullptr;
+        llvm::Value* other = lowerUniversalEqualsArg(argExpr, &mint);
+        if (!recv || !other) return nullptr;
+        llvm::Value* r = lowerObjectEquals(recv, other);
+        if (!r) return nullptr;
+        if (recvIsKnownBox && mint) emitBoxRelease(mint);  // null-safe (§28.9)
+        return r;
+    }
+
+    bool isKnownBoxReceiverExpr(const ast::Expr* recv) {
+        // Arm (a) reads `pureBoxBindings_`, which describes the body
+        // `collectBoxReleaseEligible` last ran over; the same token check
+        // `lowerLocalDecl` applies to `boxReleaseEligible_`.
+        return knownBoxReceiverShape(recv,
+                                     currentFn_ == boxReleaseEligibleFn_);
     }
 
     // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): does the ARGUMENT's static type
@@ -10040,10 +10328,38 @@ private:
     // is lowered, so no normal-exit edge can name it and the marking has no
     // subject. Removed with mode 6 and the `undischargedOwned` parameter.)
 
+    // fix #1882 (§28.4, v0.306): the `unwindDisposeHi` sentinel — "every scope
+    // that is still live is still live", i.e. dispose disposeStack_ down to
+    // unwindScopeDepth_ from its current top. Every pre-#1882 caller means
+    // this, because a pending check after a CALL is emitted while no scope is
+    // mid-teardown. A SCOPE-END disposal pass is the one caller that cannot:
+    // the scope it just finished disposing is still ON disposeStack_ (its
+    // owner pops it after the pass returns), so it passes that scope's index
+    // and the unwind edge disposes only the scopes OUTSIDE it — re-running the
+    // pass that just threw would double-release the entries that do not null
+    // their own slot.
+    static constexpr std::size_t kAllLiveScopes =
+        static_cast<std::size_t>(-1);
+
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars
     // first), else continue.
-    void emitPendingCheck();
+    void emitPendingCheck(std::size_t unwindDisposeHi = kAllLiveScopes);
+
+    // fix #1878 + #1882 (§28.4, v0.306): load the in-flight-exception slot so a
+    // disposal site can bracket its dispatch and tell a fault the disposal
+    // RAISED from one that was already propagating when it started. Emitted at
+    // the site's current insert point, which dominates the check below.
+    llvm::Value* snapshotInFlightExc();
+
+    // fix #1878 + #1882 (§28.4, v0.306): §28.4's "the exception propagates from
+    // the disposal point". Fires iff the slot is non-null AND differs from
+    // `excBefore` (a `snapshotInFlightExc()` taken before the disposal) — a
+    // plain non-null test misroutes somebody else's in-flight exception, which
+    // for a §29.7 iterator-abandonment teardown means leaking the frame. See
+    // the definition for the measured case.
+    void emitDisposalFaultCheck(llvm::Value* excBefore,
+                                std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // CG20 + #792 / §22.13: route the pending exception ONLY when `cond` is
     // true. emitPendingCheck computes its own condition (bz_exc != null, ANDed
@@ -10055,7 +10371,8 @@ private:
     // misrouted here — it stays in bz_exc and routes at the next natural
     // pending check. The unwind block (scope disposal + #1216 supersede) is
     // shared verbatim with emitPendingCheck.
-    void emitPendingCheckIf(llvm::Value* cond);
+    void emitPendingCheckIf(llvm::Value* cond,
+                            std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
     // When the constructor of an in-flight `new T(...)` throws, the freshly-
@@ -12243,6 +12560,12 @@ private:
     static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     static bool exprContainsAwait(const ast::Expr* e);
 
+    // fix #4461 (§30.5 Pattern A kind 1, §30.6, v0.306): narrow predicate for
+    // the Task-factory CallExpr shape (`Task.FromOwnedResult(...)` etc.)
+    // `detectAsyncPatternAKind` rejects on a non-`await` Pattern A return.
+    // // per §30.5 Pattern A, §30.6, v0.306
+    static bool isTaskFactoryCallExpr(const ast::Expr* valueExpr);
+
     // §30.9 / §31.2 (#438): detect an `await` in a try POSITION that is STILL
     // deferred — i.e. inside a catch arm body, a catch guard, or a `finally`
     // body. `await` in a try BODY is now supported (the resume block is lowered
@@ -13155,10 +13478,12 @@ private:
             : e_(e),
               boxReleaseEligible_(e.boxReleaseEligible_),
               boxReassignedLocals_(e.boxReassignedLocals_),
+              pureBoxBindings_(e.pureBoxBindings_),   // fix #3447
               boxReleaseEligibleFn_(e.boxReleaseEligibleFn_) {}
         ~BoxReclaimSetScope() {
             e_.boxReleaseEligible_ = std::move(boxReleaseEligible_);
             e_.boxReassignedLocals_ = std::move(boxReassignedLocals_);
+            e_.pureBoxBindings_ = std::move(pureBoxBindings_);
             e_.boxReleaseEligibleFn_ = boxReleaseEligibleFn_;
         }
         BoxReclaimSetScope(const BoxReclaimSetScope&) = delete;
@@ -13168,6 +13493,7 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> boxReleaseEligible_;
         std::unordered_set<const void*> boxReassignedLocals_;
+        std::unordered_set<const void*> pureBoxBindings_;
         llvm::Function* boxReleaseEligibleFn_;
     };
 
@@ -13576,6 +13902,23 @@ private:
     // function that decides "Pattern A borrow". Reset to false after
     // lowerExpr returns in lowerStmt, like its kind-2 twin.
     bool asyncBorrowedReturn_ = false;
+    // fix #4462 (§30.5 Pattern A, §30.6, v0.306): set true by `lowerLocalDecl`
+    // when the init is `await <plain Task<T:class>>` AND the LocalDecl has the
+    // `using` modifier (the consuming binding `using var x := await t;`).
+    // Read by `lowerAwait`, which extends its `takeResultAfter` decision to
+    // fire for plain Task (the OwningTask half already fires unconditionally
+    // via `taskTy->headName() == "OwningTask"`). Without this, the consumer's
+    // `using var x := await t;` cascade-disposes the class value at its
+    // scope end AND the kind-1 disposer attached to the task at producer
+    // completion (the `emitAsyncPatternAResultDecision` kind-2 chained path
+    // that fires when the producer's body is `return await
+    // Task.FromOwnedResult(new X)`) then disposes the same freed value at
+    // `t`'s scope end — a heap-use-after-free, invisible on plain builds
+    // (the freed bucket is exactly the glibc 16-byte tcache width and is
+    // immediately reused) and caught only by ASan (#2633 oracle). Saving/
+    // restoring across `lowerExpr(*init)` so a nested LocalDecl in the same
+    // scope starts from the right value.
+    bool awaitConsumesPlainTaskResult_ = false;
     // §30.1 (#1521): the current plain (non-iterator) async method's frame,
     // published by emitAsyncMethod right after buildStateMachineFrame so
     // emitAsyncOwnedParamAutoDispose can walk frame.captures from EVERY
@@ -14137,6 +14480,24 @@ private:
                              bool coerceNumericDefaults,
                              std::vector<llvm::Value*>& args,
                              bool* outIsLocal);
+
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the PER-SLOT face of
+    // the fill above, and its body — `fillOmittedCtorArgs` is now a thin
+    // trailing-run wrapper over it, so "what value does an omitted parameter
+    // take" still has exactly one answer in the emitter (CLAUDE.md §6).
+    //
+    // `ordered` is the call's arguments IN PARAMETER ORDER, sized
+    // `target.params.size()`, with a null at every slot §22.5 leaves to its
+    // default; this fills those slots in place. The trailing wrapper cannot
+    // serve a call whose omitted slots are a HOLE rather than a tail, which is
+    // exactly what a NAMED inheritance clause omitting a defaulted parameter
+    // produces (`: B(k := 3)` against `constructor(a: int := 1, k: int)`).
+    // Same contract otherwise: false = an omitted slot declares no default or
+    // its default failed to lower, and the caller abandons the call.
+    bool fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
+                              llvm::FunctionType* fnTy,
+                              bool coerceNumericDefaults,
+                              std::vector<llvm::Value*>& ordered);
 
     // CG16: emit a resolved chain call with `this` + lowered arguments.
     void emitChainCall(const ast::CallExpr* call, bool isThis,
@@ -15462,6 +15823,92 @@ private:
     // sidecar bit has no reserved frame field; that shape remains conservatively
     // leaked rather than reading an uninitialized bit after resume.
     std::unordered_set<const void*> boxReassignedLocals_;
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): locals whose slot PROVABLY
+    // holds, for the whole of their scope, exactly the §8.6 box minted at
+    // their own initializer — `isPlusOneBoxProducer` AND SLOT-NEVER-WRITTEN
+    // (no assignment, no increment, no `ref`/`out` alias, including from
+    // inside a lambda body).
+    //
+    // ⚠ SLOT-NEVER-WRITTEN IS NOT "NON-ESCAPING", and the difference is the
+    // whole point of `slotWriteMode`. This set DOES contain locals that
+    // escape — `var o: Object := 7; Store(o); … o.Equals(q);` puts `o` here
+    // even though `boxReleaseEligible_` rejects it — because an escape does
+    // not change what the SLOT holds, and what the slot holds is the entire
+    // receiver-side claim. Non-escaping is the property one would cite to
+    // justify RELEASING `o`; it is emphatically not what this set carries, and
+    // reading it that way would license a release this set does not support.
+    //
+    // WHAT IT LICENSES. Such a local's runtime word 0 is a BOX VTABLE, and
+    // every box vtable's `kEqualsSlot` is filled by LlvmBackend_Setup with a
+    // compiler-generated thunk (`bz$box$eq`, `bz$boxeq$<T>`, and the
+    // inline-array / range / span variants). None of those thunks stores
+    // `other`: they read its word 0 and payload and return an `i1`. So for
+    // `knownBox.Equals(x)` the ARGUMENT is a call-bounded borrow — §8.6's own
+    // reading of a member call on a box ("it borrows the payload for the
+    // call's duration") applied to the other operand — and the argument's box
+    // needs no escape suppression.
+    //
+    // ⚠ THE INVARIANT IS "THE USER METHOD NEVER RECEIVES THE BOX POINTER",
+    // NOT "no user method is reachable". The blunter phrasing is false:
+    // `boxRecordEqualsThunkCore`'s ENUM arm calls `emitEnumEquals`, which
+    // DOES dispatch a user-declared `Equals(E)` from the boxed path. What
+    // makes that safe is a narrower gate in a DIFFERENT function — the
+    // `selfTy->isIntegerTy() && otherTy->isIntegerTy()` test in
+    // `emitEnumEquals` (LlvmBackend_Setup.cpp) — which passes the unboxed
+    // integer payload and DECLINES any `Object?`-signature override, leaving
+    // it to the default. A change that relaxed that gate (the adjacent
+    // "declares user equality" rescue is openly contemplated at the
+    // choice-vtable site) would hand a user body the box pointer and
+    // invalidate this relaxation, and no executable ratchet ties the two
+    // together — so anyone touching `emitEnumEquals`'s parameter test must
+    // re-read this.
+    //
+    // WARNING The receiver's box-ness is LOAD-BEARING, and is exactly what
+    // #3480's measured UAF turns on: when the receiver is a user CLASS
+    // reference the vtable slot holds the user's override, which the spec
+    // (v0.306, §28.14's *deliberate asymmetry* paragraph — which refers to
+    // §28.3's borrowed-field rule: "a parameter-sourced object borrow may be
+    // stored into a field under §28.3's borrowed-field rule — a structural
+    // check whose residual is the caller's trust") lets store its borrowed
+    // `Object?` parameter into a field taking no `bz_box_retain` — an
+    // ADMITTED program in which any caller-side release is a use-after-free.
+    // That case is not in this set and keeps its conservative leak.
+    std::unordered_set<const void*> pureBoxBindings_;
+
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): is `recv` an expression whose
+    // runtime value is provably a §8.6 box — so that §8.1's universal
+    // `Equals` on it necessarily dispatches to a compiler-generated
+    // box-equals thunk, which borrows its argument for the call's duration
+    // and stores nothing? Two shapes answer yes; anything else fails closed,
+    // which costs a bounded leak and never a use-after-free.
+    bool knownBoxReceiverShape(const ast::Expr* recv, bool allowPureBinding) {
+        if (!recv) return false;
+        // (a) a local whose slot provably holds the box its own initializer
+        //     minted (see `pureBoxBindings_`).
+        if (allowPureBinding)
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+                if (auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    if (loc->decl &&
+                        pureBoxBindings_.count(
+                            static_cast<const void*>(loc->decl)))
+                        return true;
+        // (b) a receiver whose STATIC type is a boxable value type. §8.1's
+        //     universal `Equals` on such a receiver is answered by this
+        //     backend boxing the receiver ITSELF
+        //     (`lowerValueSemUniversalEquals`: "Boxing both sides and
+        //     dispatching is not a workaround, it is §8.1's own model"), from
+        //     a statically-known `recvTy` — so the vtable the dispatch reads
+        //     is `boxVtableFor(recvTy)` BY CONSTRUCTION, with no analysis at
+        //     all, and its `kEqualsSlot` is the same family of compiler
+        //     thunks. Arm (b) is inert at `lowerUniversalEqualsDispatch`'s
+        //     three sites (their receivers are Object/interface/class by
+        //     construction); it exists for the escape walker, where it is the
+        //     twin of #3447's own relaxation for the shape
+        //     `record.Equals(<Object local>)`.
+        const sema::TypeRef* rt = ctx_.exprType(*recv);
+        return rt && (isBoxableValueType(rt) || isNullableValueTy(rt));
+    }
 
     // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): every LocalDecl
     // that is REASSIGNED by a statement-level `AssignmentStmt` in the current
@@ -15802,6 +16249,20 @@ private:
     // condition to prevent double-free when an escaping lambda also captures
     // the same local as a non-escaping lambda.
     std::unordered_set<const void*> declsCapturedByEscaping_;
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's `nestedWidenedCellKeys_` set
+    // is GONE, not moved. It existed to DECLINE a §27.5/#1135 nested-widened
+    // cell on the stated ground that "a capture site inside a NESTED lambda
+    // body runs with `currentFn_` set to the inner function, where the
+    // classification is short-circuited", so such an env would hold the cell
+    // uncounted. That ground was false — `cellFreeEligibleFn_` is set to the
+    // lambda's own function before its body is lowered
+    // (LlvmBackend_Exprs2.cpp), so `currentFn_ == cellFreeEligibleFn_` HOLDS
+    // there and the classification runs. What the set actually masked was the
+    // wrong-body `disposeStack_` index #4523 fixes. With the frame's release
+    // gated on `declScopeDepthFn_`, a nested holder RETAINS like any other and
+    // needs no `disposeStack_` entry, so there is nothing left to decline —
+    // and one question (may this cell be counted?) is answered in one place
+    // instead of two.
     // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
     bool isSharedCellEnvdtorFreeOwner(const void* key,
                                       const ast::LambdaExpr* lam) const {
@@ -15810,8 +16271,29 @@ private:
                it->second == static_cast<const void*>(lam);
     }
     // Compute cellFreeEligible_ for a block body (see the .cpp).
+    //
+    // fix #4524 (§27.5 / §28.9, v0.306): `ownLambda` is non-null exactly when
+    // `body` is a NESTED LAMBDA's own body being re-scanned (lowerLambda /
+    // emitAsyncLambda), and null for a true function frame (method, ctor,
+    // destructor, async resume, iterator moveNext). It gates the #3426
+    // sole-out-of-frame-holder ELECTION, whose soundness argument is an
+    // argument about ONE FRAME: "every non-escaping co-capturer's env is
+    // released at a scope end inside THIS frame; the escaping holder's env
+    // dies strictly after THIS frame is gone; therefore its envdtor is the
+    // cell's last reader." That reasoning only speaks about the cell's
+    // lifetime when THIS frame is the frame that ALLOCATES the cell — i.e.
+    // the frame that declares the local / binds the parameter. A nested
+    // lambda's rescan sees only its own body, so it cannot know how many
+    // times the ANCESTOR frame that owns the cell invokes it: each
+    // invocation mints its own "sole" holder over the SAME cell, and each
+    // holder's envdtor frees it (#4524's measured heap-use-after-free, and
+    // a double-free once the read is removed). A key the walked body does
+    // not itself bind therefore gets NO election here — the declaring
+    // frame's own answer reaches this body through the #3804 ancestor merge,
+    // which is exactly what that merge exists for.
     void collectCellFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LambdaExpr* ownLambda = nullptr);
     // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): the SINGLE authority
     // answering "does calling local L (bound `var/const L := lambda() =>
     // …`) transparently and exclusively produce one specific nested
@@ -15884,6 +16366,19 @@ private:
     // boxForTarget) and methods that sometimes return class references.
     // Parallel to isUserMethodClosureReturnCall for closures.
     bool isUserMethodBoxReturnCall(const ast::Expr* init) const;
+
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): true when `init` is a READ of
+    // a user-defined, locally-compiled, NON-VIRTUAL property whose declared
+    // type is Object or an interface AND whose getter body provably always
+    // produces a boxable value source — so `boxForTarget` at the getter's
+    // return edge always mints a fresh rc=1 box the read hands back. The
+    // property twin of `isUserMethodBoxReturnCall`; see
+    // `boxReturnPropertyMemo_` for the §28.9 warrant. Non-virtual is
+    // LOAD-BEARING: an override could return a class reference through the
+    // same `Object` face, and releasing THAT as a box is a UAF, not a leak.
+    bool isUserPropertyBoxRead(const ast::Expr* init);
+    // Uncached core of isUserPropertyBoxRead (memoized by it).
+    bool computeIsBoxReturnProperty(const sema::PropertySymbol* ps);
 
     // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: true when `target` is
     // an Object- or interface-typed CLASS instance field / auto-property lvalue
@@ -16012,6 +16507,33 @@ private:
     // are lowered. A call to such a method is recognized as a +1 box producer
     // by isUserMethodBoxReturnCall / isPlusOneBoxProducer.
     std::unordered_set<const sema::MethodSymbol*> boxReturnMethods_;
+
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): the PROPERTY analogue of
+    // `boxReturnMethods_`, memoized per PropertySymbol. §28.9's *Accessor
+    // faces are uniform across type kinds* paragraph settles the question
+    // #2760 asked ("ruling needed before implementing"): an `Object`-typed
+    // getter whose body produces a fresh runtime-managed value "remains
+    // admissible ... and the implementation reclaims the production; how is
+    // not specified" — so the shape is legal and the leak is a defect, and
+    // the SAME sentence makes the two body spellings of §23.3 (`get => e`
+    // and `get => do ... end`) "semantically indistinguishable at every read
+    // site", which is why one predicate covers both. The box the getter mints
+    // at its return edge is therefore discharged by the READER'S BINDING at
+    // that binding's release point, exactly as a `boxReturnMethods_` call's
+    // is — no obligation reaches user code, per the same paragraph's
+    // "a getter never transfers a reclamation obligation to its reader".
+    //
+    // ⚠ SCOPE: this predicate is consulted from `boxLocalAssignmentSourceKind`
+    // only, so it closes the BOUND face. At an unbound type-test site
+    // (`if h.O is int then`) `lowerTypeTest`'s `freshBoxTemp` still asks
+    // `lastBoxMint_ || isUserMethodBoxReturnCall`, which the INLINED
+    // expression-body form satisfies by mint identity and the compiled
+    // block-body form cannot — measured 4800 B / 200 for the block form,
+    // clean for the expression form. The two §23.3 spellings therefore still
+    // diverge there; that residual is tracked as issue #4497 rather than
+    // claimed closed here.
+    // Value: true = every getter exit produces a fresh +1 box.
+    std::unordered_map<const sema::PropertySymbol*, bool> boxReturnPropertyMemo_;
     // Scan all MethodDecl bodies to populate boxReturnMethods_. A method is a
     // "box return method" if its declared return type is Object/interface,
     // it is locally compiled (not imported), and every ReturnStmt in its body
@@ -16308,6 +16830,46 @@ private:
         llvm::Function* fn = nullptr;
     };
     std::vector<AwaitedTaskTemp> awaitedTaskTemps_;
+
+    // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): a fresh owned
+    // CLASS producer used only as the receiver of a call whose result is a
+    // non-nullable `string`. §28.3 disposes such a temporary "at the **end of
+    // the full expression** in which it is produced, after every use of it
+    // within that expression has completed" — so, unlike the value-result
+    // family, the reclaim may NOT be emitted inline after the call: the
+    // string result is still in flight through the rest of the expression and
+    // the receiver's destructor is user code that the spec sequences after it.
+    // MEASURED on §28.3's own shape, rule-corpus case s28_3_0043 —
+    // `Console.WriteLine(new Widget("temp").Describe());` — whose spec output
+    // is `widget temp` then `dispose temp`; an inline reclaim would print them
+    // the other way round, and `freshNewReceiverTempEligible` (which gates the
+    // inline path) therefore declines a `string` result outright, leaking the
+    // receiver. Same {slot, fn} contract as the two temp queues above.
+    struct K8RecvTemp {
+        llvm::AllocaInst* slot = nullptr;
+        llvm::Function* fn = nullptr;
+    };
+    std::vector<K8RecvTemp> k8RecvTemps_;
+
+    // The eligibility predicate for the queue above. NON-NULLABLE `string`
+    // only: a non-nullable `string` method return is minted `+1` BY THE CALLEE
+    // (the `emitStringRetain` in LlvmBackend_Stmts.cpp's return path and its
+    // expression-body twin, both gated `!nullable`), so the result owns its own
+    // reference and disposing the receiver — which releases the receiver's
+    // string fields — can never dangle it. A `string?` return does NOT mint
+    // (#2196 keeps that path un-refcounted), so it is excluded: there the
+    // result can be a borrow of a receiver field.
+    bool freshNewReceiverTempStringResult(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy) const;
+    // Register such a receiver at its PRODUCTION: an `unwindOnly` disposeStack_
+    // entry (the exception edge, exactly as registerFreshNewReceiverTempUnwind)
+    // plus a queue entry for the next K8 boundary (the normal edge).
+    void registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
+                                        llvm::Value* recvPtr,
+                                        const sema::TypeRef* resultTy);
+    // Emit the queued reclaims at a K8 full-expression boundary.
+    void flushK8RecvTemps();
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for
@@ -16453,9 +17015,101 @@ private:
     // case holds at scope end, and disposing it is the SOLE path for those
     // payloads (no separate `using var` registration fires for choice
     // payloads — the choice value IS the owner).
-    void emitOwningChoiceActiveCaseDisposal(llvm::AllocaInst* slot,
+    // fix #4552 / §35.9 (v0.306): `slot` is a `llvm::Value*`, not an
+    // `AllocaInst*` — `emitOwningChoiceLocationDisposal` below GEPs INTO a
+    // nullable wrapper and hands the inner address here, and the #4132
+    // recursive arm already passes a fresh alloca. Nothing in the body needs
+    // alloca-ness (it only loads the choice struct from the address).
+    void emitOwningChoiceActiveCaseDisposal(llvm::Value* slot,
                                             const sema::TypeSymbol* choiceTy,
                                             const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.9 *Nullable `C?`* + §35.4 *Disposal is defined by the
+    // active case* (v0.306): dispose the owning-choice value held at `addr`,
+    // unwrapping §35.9's `C?` representation first. For a non-nullable
+    // location this is `emitOwningChoiceActiveCaseDisposal` verbatim; for a
+    // `C?` location the storage is `{ i8 hasValue, <choice struct> }`
+    // (nullableValueStructTy), so the active-case walk must run on field 1
+    // under a `hasValue` guard — reading the wrapper's first bytes AS the
+    // choice struct (what every caller did before this fix) reads `hasValue`
+    // as the tag and either silently disposes nothing or dispatches through a
+    // payload slot that holds another case's bytes.
+    void emitOwningChoiceLocationDisposal(llvm::Value* addr,
+                                          const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.4 *Drop-on-overwrite is defined and automatic* + §35.9
+    // (v0.306): the owning-CHOICE sibling of `disposeDisplacedOwnedClassLocal`.
+    // "Whole-value reassignment of an owning-choice local or field *disposes
+    // the displaced value* per §28.7" — and "`x := null;` on an owned `C?`
+    // location likewise disposes the displaced value's payloads". Before this,
+    // codegen had no drop-on-overwrite path for a choice at all: the class
+    // helper bails on a non-class local and the scope-end active-case pass only
+    // ever sees the FINAL value, so every displaced owning-choice value leaked.
+    // Emitted between the RHS's evaluation and the store, which is §28.7's
+    // stated order. FIELD targets are NOT covered here (the helper requires a
+    // plain local identifier, exactly as the class sibling does).
+    void disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
+                                           llvm::Value* addr,
+                                           const ast::Expr* rhsExpr);
+
+    // fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from and
+    // null* (v0.306): the MOVE half of an owning-choice local-to-local
+    // transfer. §15.3 makes an owning choice a move-only value type — "`var y
+    // := x;`: copies for an ordinary value type; moves for a move-only value
+    // type. After the move, `x` is in moved-from state" — and §15.3's *Local
+    // lifetime* bullet says what that costs the source: a whole-value move
+    // "leaves the local holding no value rather than a hole, so no pass walks
+    // it". Codegen implemented only the store: `c := b;` / `var c := b;`
+    // plain-copied the choice struct, so BOTH slots held the same owned
+    // payload pointer and BOTH scope-end active-case passes dispatched
+    // `Dispose` on it (measured: `dispose b` then a SIGSEGV reading the freed
+    // vtable, and an ASan heap-use-after-free).
+    //
+    // The mark is a RUNTIME one — a zero-store over the source slot, the
+    // choice analogue of `nullTransferredOwnedLocalSlot`'s null-store over an
+    // owned class local's slot. It makes every §28.7 consumer of that slot a
+    // no-op without any of them needing a new predicate: the scope-end
+    // active-case pass reads tag 0, takes case 0's arm, and finds null payload
+    // pointers its existing null-guard already skips (a nested owning-choice
+    // payload recurses into the same all-zero state); `disposeDisplacedOwning
+    // ChoiceLocal` at a later re-acquiring store (`c := b; b := C.Ready(…);`)
+    // reads the same zeros and disposes nothing; and the next store into the
+    // source re-arms it with a live value. Being a runtime store it is exact
+    // on every control-flow path — a move under an `if` suppresses the source
+    // disposal on the taken path only — which a static "this local is
+    // transferred somewhere" set (the move-only inline array's
+    // `moveOnlyArrayTransferred_`) cannot be.
+    //
+    // SCOPE (#4566 is local-to-local; the rest is filed, not silently
+    // widened): both ends must be plain locals with an `ast::LocalDecl` — the
+    // exact set `registerOwningChoiceDisposal` enrolls in the scope-end pass,
+    // so "the target takes over the disposal obligation" is a fact rather than
+    // a hope. A field/index/static target, a parameter at either end, `_ :=
+    // b;` (§35.10's move-only discard) and arm-selection payload transfer are
+    // all declined here.
+    void markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
+                                        const ast::Expr* srcExpr);
+    // The shared core. `var c := b;` has no target EXPRESSION — the binding is
+    // the target — so the declaration site calls this form directly.
+    void markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
+                                        const ast::Expr* srcExpr);
+
+    // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
+    // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's
+    // "announcing scrutinee form"? See the definition for the admitted and
+    // excluded scrutinee shapes and why this gate is codegen-side.
+    bool unboundOwningChoiceTemp(const ast::Expr* e, const sema::TypeRef* rt);
+
+    // fix #4552 / §35.5 (v0.306): does `p` (or any pattern nested in it) bind
+    // a slot? An owning match's selected arm TRANSFERS the case's owned
+    // payloads into its bindings (§35.5), and `using var u := move r;` in a
+    // `do … end` arm is the spec's own adoption spelling — so a construct
+    // whose arms bind anything may not have its scrutinee temporary disposed
+    // wholesale at completion. Deliberately COARSE: a binding on a
+    // payload-free or value-payload case cannot take ownership of anything,
+    // but declining there only leaks (the sound direction), while getting it
+    // wrong the other way is a double free.
+    static bool patternBindsAnySlot(const ast::Pattern* p);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
@@ -16844,6 +17498,20 @@ private:
     sema::MemberSymbol* storageMemberOf(sema::Symbol* sym);
 
     llvm::Value* implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy);
+
+    // fix #1748 (§22.7 "Observing `this` during construction", recorded
+    // residual, v0.306): the checked-disposal-mode watermark guard for a
+    // just-loaded instance-field READ. `e` is the read expression (a
+    // MemberAccessExpr for a qualified `recv.field`, or an IdentifierExpr
+    // for the implicit-`this` bare form) whose sema type carries the
+    // field's declared nullability; `val`/`elemTy` are the value CG8/CG9
+    // just loaded and its LLVM slot type. No-op outside checkedDisposal_,
+    // for a diverged block, for a non-pointer slot, or for a field whose
+    // sema type is not sema::isNonNullableReferenceType — see the .cpp
+    // definition for the full rationale (why this cannot be caught
+    // statically, and why an unconditional guard here is sound).
+    void emitFieldWatermarkGuard(const ast::Expr& e, llvm::Value* val,
+                                 llvm::Type* elemTy);
 
     // Slice CG2: integer binary operators. NOTE (§6.1): `+ - * / mod`
     // are *overflow-checked* in Bezel (raise OverflowException) and
@@ -18096,8 +18764,13 @@ private:
     // materializer/GetEnumerator sites do, or deferred to a loop's increment
     // block, as the for-in site does) is the CALLER's job, unchanged from
     // before this fix.
+    // fix #4499: `widthsArr` is `bz_dict_keys_str`'s THIRD out-array (int8_t*
+    // per key, the §4.6 storage width). Without it the rebuilt key is a
+    // width-1 string of `lens[idx]` BYTES, which is a code-point count used as
+    // a byte count — the #4499 defect on the read side.
     std::pair<llvm::Value*, llvm::Value*> decodeDictStringKeyAt(
-        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx);
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* widthsArr,
+        llvm::Value* idx);
 
     // decodeDictGenericKeyAt loads a generic (non-string) key BY VALUE out of
     // the malloc'd raw-bytes copy `bz_dict_keys_gen` wrote at `idx`. Returns

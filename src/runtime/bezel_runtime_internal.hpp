@@ -77,6 +77,39 @@
     abort();
 }
 
+// ---- refcount over-release (§28.9, v0.306 / fix #4547) ----
+//
+// The runtime-managed types (string, closure, box — §28.9) are acyclic
+// reference-counted; codegen emits exactly one release per retain, so a
+// correct program's count reaches exactly 0 at the true last release and
+// never goes negative. An OVER-RELEASE — two releases issued for one
+// reference — is always a defect at the call site, never in the refcount
+// machinery itself (§28.9 leaves runtime-managed lifecycle unspecified, so
+// this is an implementation invariant, not a spec rule); but before #4547
+// the release guard on string/closure/box tested `count > 0` on the value
+// AFTER decrementing, so an over-release's -1 fell through to the last-drop
+// free() path exactly like a genuine 0 would — a SECOND free() of the same
+// block. Measured in #4540: two threads raced to release one closure, the
+// loser's decrement produced -1, and both callers freed the same block — a
+// double free that, one release earlier, was a single detectable bad release.
+//
+// bz_refcount_overrelease_fail reports and terminates AT THAT EARLIER POINT
+// — the release that drives the count negative — instead of silently falling
+// through to the free the following release would perform. It is
+// deliberately unconditional, not the `assert` macro: this project's
+// canonical RelWithDebInfo build (CMakeLists.txt's #3013 note) compiles
+// `assert` out via CMake's default `-DNDEBUG`, so an assert-based check here
+// would be a no-op in the very builds it must guard. Same fputs+abort() shape
+// as bz_alloc_fail above — every build gets one loud, named failure instead
+// of an intermittent double-free that names the allocator rather than the bug.
+[[noreturn]] inline void bz_refcount_overrelease_fail(const char* what) {
+    fputs("bezel: fatal: refcount over-release (", stderr);
+    fputs(what ? what : "unspecified", stderr);
+    fputs(") — two releases for one reference; terminating per §28.9\n", stderr);
+    fflush(stderr);
+    abort();
+}
+
 // ---- shared object-layout constants ----
 static const int64_t BZ_EXC_OBJ_SIZE = 40;
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;

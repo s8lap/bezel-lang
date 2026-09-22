@@ -120,6 +120,51 @@ def _indent_four(code):
     return indented + ("\n" if trailing_nl else "")
 
 
+# -----------------------------------------------------------------------
+# Synthesized `Main` signature.
+#
+# The stmt/mixed wraps put the block's statements in a synthesized `Main`. A
+# block whose statements contain a top-level `await` — the docs' §30 async
+# fragments — then fails on "`await` is valid only inside an `async` method or
+# `async` lambda", which is a property of the SCAFFOLDING, not of the document:
+# spec §33.2 (v0.306) admits `public static async method Main(): Task` as one of
+# the four accepted entry-point signatures. Promoting the synthesized signature
+# when, and only when, the body needs it is therefore enclosing scaffolding in
+# exactly the sense wrap_mixed already is: no token of the document is added,
+# rewritten, reordered, or dropped. Measured on this corpus: 25 cases carry the
+# await-outside-async diagnostic and every one of them loses it under the
+# promotion.
+#
+# `await` is detected as a whole word not preceded by `.` (so `x.await` — not
+# Bezel, but possible in a doc's prose-ish block — does not trigger) and not
+# inside a line comment. A false positive is harmless: an `async` Main with no
+# `await` is well-formed (§30.1 does not require one), so the promotion can only
+# add capability.
+# -----------------------------------------------------------------------
+
+_AWAIT_RE = re.compile(r'(?<![\w.])await(?![\w])')
+
+
+def _strip_line_comments(code):
+    """Drop `//` tails so a mention of `await` in a comment does not promote the
+    signature. Naive w.r.t. `//` inside a string literal, which would only ever
+    cost a harmless promotion (see above)."""
+    return "\n".join(re.sub(r'//.*$', '', line) for line in code.splitlines())
+
+
+def needs_async_main(body):
+    """True when the synthesized `Main` must be `async` to hold `body`."""
+    return bool(_AWAIT_RE.search(_strip_line_comments(body)))
+
+
+def main_header(body, indent="  "):
+    """The synthesized `Main` declaration line for a statement body, per §33.2's
+    accepted signatures."""
+    if needs_async_main(body):
+        return indent + "public static async method Main(): Task\n"
+    return indent + "public static method Main()\n"
+
+
 def classify_wrap(code):
     """Return (wrap_mode, wrapped_src) for a fragment body. A pure translation
     of run_conformance.sh wrap_fragment()'s heuristic cascade; the wrapped_src
@@ -190,7 +235,7 @@ def classify_wrap(code):
 
     # 7. Default: treat as statements in Main.
     return (WRAP_STMT,
-            "module Conf;\nclass W\n  public static method Main()\n"
+            "module Conf;\nclass W\n" + main_header(code)
             + _indent_four(code) + "\n  end Main;\nend W;\n")
 
 
@@ -314,7 +359,7 @@ def wrap_mixed(code):
     out += groups["moddecl"]
     out.append("\nclass W\n")
     out += groups["member"]
-    out.append("  public static method Main()\n")
+    out.append(main_header("".join(groups["stmt"])))
     out += [_indent_four(item) for item in groups["stmt"]]
     out.append("\n  end Main;\nend W;\n")
     return WRAP_STMT, "".join(out)
@@ -356,7 +401,12 @@ ENV_MEMBER = "member"    # a member of the synthesized class W
 ENV_TYPE = "type"        # a top-level declaration beside the module's others
 
 _ENV_HEADER_RE = re.compile(r'^//@\s+(local|member|type)\s+(\S+)\s*$')
-_ENV_MAIN_ANCHOR_RE = re.compile(r'^(\s*)public static method Main\(\)\s*$')
+# Matches both synthesized `Main` spellings — the plain one and the §33.2
+# `async … : Task` promotion (see main_header). A `local` env binding anchors on
+# whichever one the wrap emitted; before the promotion existed this regex saw
+# only the plain form, and an async-promoted case would have failed `env-error`.
+_ENV_MAIN_ANCHOR_RE = re.compile(
+    r'^(\s*)public static (?:async )?method Main\(\)(?:\s*:\s*Task)?\s*$')
 _ENV_CLASS_ANCHOR_RE = re.compile(r'^class W\s*$')
 
 
@@ -514,10 +564,25 @@ def _first_line(text):
     return no_cr if nl < 0 else no_cr[:nl]
 
 
-def _snippet(log, cut_chars, head_bytes):
+def _snippet(log, cut_chars, head_bytes, strip_dir=None):
     """`head -c N | tr '\\n' ' ' | cut -c1-M`: a flat one-line preview of the
-    compile log. ASCII diagnostics only — byte vs char slicing coincides."""
-    flat = log[:head_bytes].replace("\n", " ")
+    compile log. ASCII diagnostics only — byte vs char slicing coincides.
+
+    A bezelc diagnostic opens with the absolute path of the file it compiled,
+    and `cut_chars`/`head_bytes` budget characters over the WHOLE line, path
+    included — so the surviving message length is a function of how deep the
+    checkout happens to live, and a deep enough one truncates the message to
+    nothing (#4556). `strip_dir`, when given, is the directory the compiled
+    file lived in (the case corpus's `cases/`, or a doc-example run's per-run
+    tmpdir); its prefix (plus the path separator) is removed from the raw log
+    BEFORE the head/cut budget is spent, so the budget goes to the diagnostic
+    rather than to wherever the caller's checkout happens to be — the case id
+    is already the report's own first column, so the path carries no
+    information the report lacks."""
+    text = log or ""
+    if strip_dir:
+        text = text.replace(str(strip_dir).rstrip(os.sep) + os.sep, "")
+    flat = text[:head_bytes].replace("\n", " ")
     return flat[:cut_chars]
 
 
@@ -642,11 +707,11 @@ def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run,
     if case["cls"] == "error":
         if compile_rc != 0:
             return "PASS", "", ""
-        snippet = _snippet(compile_log, 80, 120)
+        snippet = _snippet(compile_log, 80, 120, strip_dir=tmpdir)
         return "FAIL", "missing-diagnostic", "compiled without error: " + snippet
 
     if compile_rc != 0:
-        snippet = _snippet(compile_log, 120, 200)
+        snippet = _snippet(compile_log, 120, 200, strip_dir=tmpdir)
         return "FAIL", "compile-error", snippet
 
     if wrap_mode in (WRAP_LIB, WRAP_AS_IS_LIB):

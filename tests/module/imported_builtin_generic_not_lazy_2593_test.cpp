@@ -137,6 +137,18 @@ constexpr const char* kNullableDiag =
 // type (so it resolves), but `Span` is a builtin — `lookupNamed("Span")`
 // fails in the importer and the TypeRef comes back astNode-less with
 // `importedName == "Span"`.
+//
+// The library exposes the span via an instance method on a class with an
+// `OwningBuffer<R>` field (the §9.7 v0.301 / #4428 receiver-sourced ADMITTED
+// arm — `new Span<R>(this.buf, …)` is the §4.14 `FrameBuffer.ScanLine`
+// shape). The earlier `static method Get(buf: …): Span<R> => new
+// Span<R>(buf, 0, 1);` was a parameter-rooted borrow return and is rejected
+// by #4428 (§9.7 v0.301: "a caller has nothing but the receiver to
+// re-establish and a parameter-sourced record return would hand back a
+// borrow no call site could bound"); the test's #2593 intent is the §7
+// nullability gate on the IMPORTER, not the LIBRARY's borrow return shape,
+// so the library is reshaped here to keep the §7 path exercised while
+// staying out of #4428's reject.
 constexpr const char* kLib =
     "module A; "
     "public class R "
@@ -144,8 +156,9 @@ constexpr const char* kLib =
     "  public constructor(v: int) this.V := v; end constructor; "
     "end R; "
     "public class Lib "
-    "  public static method Get(buf: OwningBuffer<R>): Span<R> "
-    "    => new Span<R>(buf, 0, 1); "
+    "  public owned buf: OwningBuffer<R>; "
+    "  public constructor(owned b: OwningBuffer<R>) this.buf := b; end constructor; "
+    "  public method Get(): Span<R> => new Span<R>(this.buf, 0, 1); "
     "end Lib;";
 
 }  // namespace
@@ -166,7 +179,8 @@ BEZEL_TEST(module_imported_builtin_generic_2593,
         "public class Main "
         "  public static method Main(): int "
         "    using var buf := new OwningBuffer<A.R>(1); "
-        "    var sp := A.Lib.Get(buf); "
+        "    using var lib := new A.Lib(buf); "
+        "    var sp := lib.Get(); "
         "    var r: A.R? := null; "
         "    if sp.Contains(r) then return 1; end; "
         "    return 0; "
@@ -189,7 +203,8 @@ BEZEL_TEST(module_imported_builtin_generic_2593,
         "public class Main "
         "  public static method Main(): int "
         "    using var buf := new OwningBuffer<A.R>(1); "
-        "    var sp := A.Lib.Get(buf); "
+        "    using var lib := new A.Lib(buf); "
+        "    var sp := lib.Get(); "
         "    var r: A.R? := null; "
         "    return sp.IndexOf(r); "
         "  end Main; "

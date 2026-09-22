@@ -261,6 +261,15 @@ struct CFGBlock {
     std::unordered_set<const CFGBlock*> completionSuccs;
 };
 
+// Options for CFG construction. Kept as a struct so new flags can be
+// added without changing call-site signatures.
+struct CFGBuildOptions {
+    // When true, a TryStmt is NOT expanded into the F2 try/catch/finally
+    // exception-edge shape — it is emitted as a single opaque statement.
+    // See the comment on buildCFG's `treatTryAsOpaque` parameter.
+    bool treatTryAsOpaque = false;
+};
+
 class CFG {
 public:
     CFG();
@@ -283,6 +292,15 @@ public:
     // Add an edge from `from` to `to`. Maintains both successor and
     // predecessor lists.
     void addEdge(CFGBlock* from, CFGBlock* to);
+
+    // prep #4146 Stage 2-A (§28.3, v0.298): build a CFG for a lambda body.
+    // Block-bodied lambdas (`isBlockBody == true`): walks `lam->stmts` with the
+    // Builder, same as buildCFG. Expression-bodied lambdas: wraps the single
+    // `exprBody` in a synthetic linear block that returns the expression value.
+    // The returned CFG is owned by the caller.
+    static std::unique_ptr<CFG> buildLambdaBodyCFG(
+        const ast::LambdaExpr* lam,
+        const CFGBuildOptions& opts = {});
 
     // F2 / O11-real: add an exception (stack-unwinding) edge from `from`
     // to `to`. Maintains the same succ/pred lists as a normal edge, and

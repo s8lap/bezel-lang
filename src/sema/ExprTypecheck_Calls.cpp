@@ -295,6 +295,14 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
     if (!ref || ref->kind != TypeRef::Kind::Named) return {};
     if (ref->declaration) return ref->declaration->name;
     if (!ref->importedName.empty()) return ref->importedName;
+    // fix #4570 (§27.8, v0.306): the alias-transparency leg, identical to
+    // the one on ExprTypecheck.cpp's `namedTypeSimpleName` this is a copy of
+    // (see the full rationale there). A type alias restores `astNode` to the
+    // USE SITE, so without this the read below answers the ALIAS name. Here
+    // that mis-spelled `type Al := IEnumerable<int>` as the non-existent type
+    // `Al<int>` in the §15.4 collection-literal diagnostic and hid the
+    // builtin interface head from `isCollectionLiteralInterfaceTarget`.
+    if (!ref->aliasResolvedHead.empty()) return ref->aliasResolvedHead;
     if (ref->astNode && ref->astNode->name &&
         !ref->astNode->name->parts.empty())
         return ref->astNode->name->parts.back();
@@ -3366,7 +3374,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // parameterless and so satisfied
                                         // `new()` at this call-site re-check.
                                         decided = true;
-                                        if (argDecl->hasPositionalFields &&
+                                        // fix #4472 (§14.2, v0.302; follow-up
+                                        // to fix #4446 — this arm was the
+                                        // un-fixed duplicate "Site B" the
+                                        // issue names, the direct-call-site
+                                        // re-check for the issue's own
+                                        // `Make<Shape>()` repro): an
+                                        // `abstract`/`closed` class never
+                                        // satisfies `new()`, regardless of
+                                        // the ctor scan below. Shared with
+                                        // `ExprTC::groundSatisfiesNew` and
+                                        // `Resolver::argSatisfiesNew` through
+                                        // ONE function — see
+                                        // `sema::isAbstractOrClosedClass`
+                                        // (TypeResolution.hpp).
+                                        if (isAbstractOrClosedClass(argDecl)) {
+                                            satisfied = false;
+                                        } else if (argDecl->hasPositionalFields &&
                                             !recordPositionalFieldSymbols(argDecl)
                                                  .empty()) {
                                             satisfied = false;  // primary ctor has params
@@ -11946,13 +11970,28 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 // is filed rather than smuggled in.
 void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
     if (cd.isStatic || !currentType_) return;
-    if (currentType_->kind != ast::TypeDeclKind::Class ||
-        !currentType_->hasPositionalFields)
-        return;
     if (cd.body.empty() || !cd.body[0]) return;
     bool isThis = false;
     const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
-    if (!chain || !isThis) return;
+    if (!chain) return;
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` arm.
+    // §22.8 gives step 0 for a base whose primary parameter list the chain
+    // call binds exactly one lowering site — codegen's
+    // `prePopulateBasePositionalFields`, case (b) — and that site paired
+    // `chainCall->args[i]` with the base's positional field `i` in TEXTUAL
+    // order, never consulting `arg.name`. §22.5 is explicit that "naming an
+    // argument changes which parameter it binds to, never when it runs", and
+    // that "every construction site in the language reaches it through the
+    // same binding — a call, a `new` expression, and a record construction
+    // alike". Publishing the binding here is what makes that true of this
+    // site as well: the binder body is the one `bindArgsToParams` over
+    // `FormalsView::of(fields)` that the `new` site (#3196) and the
+    // `this(...)` chain site (#3583) already run, and the channel is the one
+    // `SemaContext` table #3583 widened its key to `const ast::Expr*` for.
+    if (!isThis) { publishBaseChainPrimaryBinding(*chain); return; }
+    if (currentType_->kind != ast::TypeDeclKind::Class ||
+        !currentType_->hasPositionalFields)
+        return;
     // The chain may target an explicit SIBLING constructor rather than the
     // primary. Codegen takes its primary-constructor branch exactly when
     // `ctorByArity` finds no other non-static constructor of the call's arity
@@ -11990,6 +12029,297 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
                                       /*target=*/nullptr, currentType_);
         ctx_.setPositionalBinding(chain, b.paramToArg);
     }
+}
+
+// fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
+// §22.10, v0.306): the `base(...)` twin of `publishPrimaryCtorChainBinding`
+// above — publish the §22.5 argument BINDING for an explicit derived
+// constructor whose body opens with a `base(...)` call that binds the BASE
+// class's PRIMARY parameter list.
+//
+// §22.8 step 0 captures a primary constructor's parameters into their fields,
+// and for this shape — a base with a primary constructor and no explicit
+// constructor of the call's arity — the ONLY code that writes those fields is
+// codegen's `Emitter::prePopulateBasePositionalFields`, case (b). That site
+// paired chain argument `i` with the base's positional field `i` in TEXTUAL
+// order and never read `arg.name`, so `base(s := "x", n := 1)` against
+// `class B(n: int, s: string)` stored the string pointer into the 4-byte `n`
+// slot and the integer into the `string` slot — measured: `4627856` printed
+// for `n`, then SIGSEGV inside `bz_string_to_utf8z` dereferencing `0x9` as a
+// string (issue 4484). §22.5 states the rule this violates twice: "naming an
+// argument changes which parameter it binds to, never when it runs", and
+// "every construction site in the language reaches it through the same
+// binding — a call, a `new` expression, and a record construction alike".
+//
+// The binding is therefore computed by the SAME binder body every other
+// construction site uses (`bindArgsToParams` over
+// `sema::FormalsView::of(recordPositionalFieldSymbols(base))`, #3173/#3178)
+// and published on the SAME `SemaContext` table, whose key #3583 already
+// widened from `ast::NewExpr*` to `const ast::Expr*` precisely so a chain
+// `CallExpr` could be a key. #3791 closed this §22.5 gap for `emitChainCall`;
+// the pre-population site was never asked the question, and a SECOND copy of
+// the rule spelled out in codegen is what this project has repeatedly paid
+// for (see `sema::FormalsView`'s header on #3141/#3173).
+//
+// `emit=true` since fix #4496 (§22.5, v0.306), matching the `this(...)` arm.
+// #4484 left it false on purpose and filed the gap; this is that gap closed.
+//
+// §22.5 states both halves of the binding as REJECTIONS, not as preferences:
+// "Each supplied argument binds exactly one parameter and each parameter is
+// bound by at most one supplied argument: naming a parameter already bound
+// positionally …, or naming the same parameter twice, is a compile error at
+// the call naming that parameter", and "Every parameter that declares no
+// default must be bound, positionally or by name". Nothing enforced either
+// for a `base(...)` chain: measured on e9239ab4, against
+// `class Base(n: int, s: string)`,
+//
+//   base(1, n := 2, s := "x")   `bezelc` exit 0, no diagnostic; the binary
+//                                printed `1` and then SEGVed in
+//                                `bz_string_to_utf8z` at 0xa — the integer
+//                                `2` dereferenced as a string pointer
+//   base(1)                      `bezelc` exit 0, no diagnostic; the `s`
+//                                slot stayed calloc-zero (a NULL string
+//                                pointer, printed as a blank line; an
+//                                interpolating consumer SEGVs on it)
+//
+// Both are silent MISCOMPILES, not merely missing diagnostics: the
+// pre-population stores whatever the malformed argument list happens to
+// yield. Making the binder loud replaces both with the §22.5 rejection the
+// spec already prescribes — and the diagnostics are not new text, they are
+// the same five strings `bindArgsToParams` emits for a `new T(...)`, a
+// method call, an imported callee and a `this(...)` chain.
+//
+// WHAT IS STILL NOT CHECKED HERE, stated because each is a REACHABLE silent
+// shape rather than a hypothetical, and because the guards above are what
+// keeps them out (they are gates on PUBLISHING a binding that now double as
+// gates on checking):
+//
+//   * `base()` with NO arguments — `chain.args.empty()` returns before the
+//     binder runs. An explicit zero-argument `base()` into a base whose
+//     primary parameters are required is therefore still accepted silently.
+//     Left alone deliberately: §12.8 makes the IMPLICIT chain a `base()`
+//     too ("If neither base(...) nor this(...) is written, the compiler
+//     inserts an implicit base() call"), so rejecting the explicit spelling
+//     without settling what the implicit one means in the same shape would
+//     make two spellings of one call disagree. Filed rather than folded in.
+//   * A `base(...)` that binds an EXPLICIT base constructor — the arity
+//     early-return above. That call's own checking is a separate path and a
+//     separate question from this one.
+//   * §5.1 ASSIGNABILITY of each bound argument to its slot's type. The
+//     binder answers arity, parameter names and required-parameter coverage
+//     only; `base("bad", 1)` against `class Base(n: int, s: string)` still
+//     reaches a wild store. That is the same family #3583's comment records
+//     as outstanding for the `this(...)` arm, and it is unchanged here.
+// // per §22.5, fix #4484, fix #4496
+void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
+    // fix #4519 (§12.8 / §22.5 / §22.10, v0.306): a ZERO-ARGUMENT `base()`
+    // reaches the binder too. This used to `return` on `chain.args.empty()`
+    // above everything below, so #4496's `emit=true` never saw the one arity
+    // §22.5 can still reject for free: none supplied at all.
+    //
+    // MEASURED ON 6c05b4cf: `class D : B` with `constructor() base(); end`
+    // over `class B(n: int, s: string)` compiled at exit 0 with no
+    // diagnostic and RAN to exit 0, printing `0` and a blank line — both
+    // required primary parameters at their calloc zero, `s` a NULL string
+    // pointer that `Console.WriteLine` tolerates and an interpolating
+    // consumer dereferences.
+    //
+    // THE SPEC ALREADY RULES ON THIS, which is why it is a code change and
+    // not a question. §12.8 states the requirement in the same sentence that
+    // inserts the implicit chain: "If neither `base(...)` nor `this(...)` is
+    // written, the compiler inserts an implicit `base()` call (which requires
+    // the base class to have a parameterless constructor; otherwise the chain
+    // must be explicit)". §22.5 says what "parameterless" means for a primary
+    // constructor — "Every parameter that declares no default must be bound,
+    // positionally or by name" — so an all-defaulted primary list IS callable
+    // with no arguments and a required parameter is not. That is exactly what
+    // the binder below answers, with no new rule and no new diagnostic text.
+    //
+    // ⚠ THE IMPLICIT SPELLING IS NOT CLOSED HERE, and the asymmetry is
+    // recorded rather than hidden. #4496 deferred this shape on the ground
+    // that "rejecting the explicit spelling without settling what the
+    // implicit one means in the same shape would make two spellings of one
+    // call disagree" — the disagreement it feared was about the RULING, and
+    // §12.8 gives it: both spellings require a parameterless base
+    // constructor. What remains is an implementation gap, not a second
+    // reading: the implicit chain is not an `ast::CallExpr` this publisher
+    // ever sees, its predicate must also reach a base whose only
+    // constructors are EXPLICIT (which `!base->hasPositionalFields` below
+    // returns on), and it must settle accessibility and `abstract`. Filed
+    // with those three points rather than folded in.
+    //
+    // Codegen's `Emitter::baseClassOf`: the first CLASS entry of `baseTypes`.
+    TypeSymbol* base = nullptr;
+    for (TypeSymbol* b : currentType_->baseTypes) {
+        if (b && b->kind == ast::TypeDeclKind::Class) { base = b; break; }
+    }
+    if (!base) return;
+    if (!base->hasPositionalFields) {
+        // fix #4549 (§12.8, v0.306): this early return is the half of §12.8's
+        // requirement #4519 could not reach. The binder below answers
+        // "parameterless?" only for a base carrying a §22.10 PRIMARY
+        // parameter list; a base whose only constructors are EXPLICIT has no
+        // positional fields at all, so an explicit `base()` into one was
+        // still accepted silently — measured on fcb4dbd5, `class B public
+        // constructor(a: int) …` with `class D : B  public constructor()
+        // base(); end` compiled at exit 0 and printed `0`, the base's `n`
+        // left at its calloc zero. The SHARED predicate answers for every
+        // constructor form, so this spelling and the IMPLICIT one
+        // (`visitTopDecl`) now give the same verdict on the same base.
+        if (chain.args.empty() &&
+            !baseHasParameterlessConstructor(base, chain.span.begin))
+            reportNoParameterlessBaseCtor(base, chain.span.begin,
+                                          /*implicitSpelling=*/false);
+        return;
+    }
+    // Only when the call binds the base's PRIMARY parameter list. Codegen
+    // reaches that arm exactly when `ctorForArgs(baseTs, chainCall->args)`
+    // finds no explicit base constructor to bind (whose own §22.8 step 0 then
+    // writes these slots from inside the chained-to primary — fix #3562), so
+    // the same question is asked here by its dominant arity arm. When an
+    // arity match exists this publishes nothing and codegen keeps whichever
+    // disposition it has today: declining the stores outright for a local
+    // base (#3562's guard), or the textual-order fallback for an imported one
+    // (SEAM-DEBT #3625). Publishing a PRIMARY-parameter binding for a call
+    // that binds a convenience constructor's parameter list would be the very
+    // mispairing #3562 removed.
+    const std::size_t n = chain.args.size();
+    for (Symbol* m : base->members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic) continue;
+        if (other->params.size() == n) return;
+    }
+    const std::vector<const Symbol*> fields =
+        recordPositionalFieldSymbols(base);
+    if (fields.empty()) return;
+    const std::string desc =
+        std::string("`base(...)` chain to the primary constructor of `") +
+        std::string(base->name) + "`";
+    // fix #4496 (§22.5, v0.306): `emit=true` — see the header comment. A
+    // binding the rule REJECTS is now reported here instead of publishing
+    // nothing and letting codegen store a mispaired object.
+    BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain.args,
+                                    chain.span.begin, desc, /*emit=*/true);
+    // fix #4519: nothing to publish for a zero-argument chain — codegen's
+    // case (b) is gated on `!chainCall->args.empty()` and never installs a
+    // binding there, so `base()` lowers exactly as it did (every slot takes
+    // its §22.5 default) on the shapes the binder now accepts.
+    if (b.ok && !chain.args.empty())
+        ctx_.setPositionalBinding(&chain, b.paramToArg);
+}
+
+// fix #4549 (§12.8 "Constructor chaining" / §22.5 "Optional parameters and
+// named arguments" / §22.7 / §22.10, v0.306): §12.8's requirement on the
+// inserted chain, as ONE predicate.
+//
+// §12.8 states it in the same sentence that inserts the chain:
+//
+//   "If neither `base(...)` nor `this(...)` is written, the compiler inserts
+//    an implicit `base()` call (which requires the base class to have a
+//    parameterless constructor; otherwise the chain must be explicit)."
+//
+// Two spellings reach it — the INSERTED chain (`ExprTC::visitTopDecl`) and
+// the explicit zero-argument `base()` (`publishBaseChainPrimaryBinding`,
+// #4519) — and #4549 exists because they disagreed: #4519 closed the
+// explicit one through the §22.5 binder over the base's PRIMARY parameter
+// list, which answers nothing for a base whose only constructors are
+// EXPLICIT and nothing at all for the implicit spelling. One body, read from
+// both, is what stops them drifting again.
+//
+// "PARAMETERLESS" IS THE §22.5 QUESTION, NOT AN ARITY TEST, and that is why
+// every arm below runs `bindArgsToParams` against an EMPTY argument list
+// rather than comparing a count. §22.5: "Every parameter that declares no
+// default must be bound, positionally or by name" — so a §22.10 primary list
+// or an explicit constructor whose parameters ALL carry defaults IS callable
+// with no arguments. The nearest existing predicate, `groundSatisfiesNew`
+// (TypeResolution_Checks.cpp), asserts the opposite for its own §14.2
+// purpose ("treat a non-empty primary param list as a non-parameterless
+// constructor") and is therefore NOT reusable here; running the one binder
+// body keeps this answer identical to the one every construction site gets.
+//
+// THE THREE CONSTRUCTOR FORMS, in the order a base can carry them:
+//
+//   (1) the §22.10 PRIMARY parameter list. §22.10 requires every explicit
+//       constructor of a primary-ctor class to chain via `this(...)` (the
+//       resolver enforces it — measured: `constructor of class `B`, which
+//       has a primary constructor, must chain to another constructor via
+//       `this(...)` (§22.10)`), so an all-defaulted primary list is reachable
+//       with no arguments whatever else the class declares.
+//   (2) an explicit non-static CONSTRUCTOR with no required parameter.
+//   (3) §22.7's implicit parameterless constructor, which a class gets
+//       exactly when it declares neither of the above.
+//
+// DECLINED, WITH REASONS (CLAUDE.md §4) — each would be a NEW rejection of a
+// program that compiles and RUNS correctly today, so each is left alone and
+// the predicate answers "constructible":
+//
+//   * ACCESSIBILITY (§12.5). A `private constructor()` on the base is not
+//     callable from a derived class in another module, but it IS today:
+//     measured on fcb4dbd5, `class B private constructor() n := 5; end` with
+//     `class D : B` compiles and prints `5`. Rejecting it is a separate,
+//     wider question (it needs the §12.5 module/visibility rule, not this
+//     one), and getting it wrong here would break working code.
+//   * `abstract` / `closed` (§12.5 / §22.7). §12.5 forbids `new` on such a
+//     class; being a BASE is what they are for. Measured: `abstract class B`
+//     with `class D : B` compiles and prints `4`.
+//   * A base carrying an all-defaulted PRIMARY list AND explicit
+//     constructors of non-zero arity. Arm (1) accepts it, which is what
+//     §22.5 says — but codegen does NOT construct it (measured on fcb4dbd5:
+//     `emitImplicitBase`'s arity-0 fallback resolves no `ConstructorSymbol`
+//     for a primary constructor, and its field-init fallback is gated on
+//     `!hasAnyConstructor(b)`, so the primary's defaults never run). That is
+//     a codegen defect on a LEGAL program, filed separately; rejecting the
+//     program here would be the wrong fix for it.
+// // per §12.8, fix #4549
+bool ExprTC::baseHasParameterlessConstructor(const TypeSymbol* base,
+                                             SourceLocation loc) {
+    if (!base) return true;  // no base class: §12.8 inserts no chain
+    // The binder is run with `emit=false` throughout, so `desc` is never
+    // rendered; it is named for the reader of a future `emit=true`.
+    const std::vector<ast::CallArgument> noArgs;
+    const std::string desc = "implicit `base()`";
+    // (1) the §22.10 primary parameter list.
+    if (base->hasPositionalFields) {
+        const std::vector<const Symbol*> fields =
+            recordPositionalFieldSymbols(base);
+        if (bindArgsToParams(sema::FormalsView::of(fields), noArgs, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return true;
+    }
+    // (2) an explicit non-static constructor with no required parameter.
+    bool anyExplicitCtor = false;
+    for (Symbol* m : base->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        anyExplicitCtor = true;
+        if (bindArgsToParams(sema::FormalsView::of(*cs), noArgs, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return true;
+    }
+    // (3) §22.7's implicit parameterless constructor — a class that declares
+    // neither an explicit constructor nor a primary parameter list.
+    return !anyExplicitCtor && !base->hasPositionalFields;
+}
+
+// fix #4549: see `baseHasParameterlessConstructor` above. The sentence naming
+// the defect is shared; only the remedy differs, because only the implicit
+// spelling can be made explicit and only the explicit one can be given
+// arguments. §12.8 names both.
+void ExprTC::reportNoParameterlessBaseCtor(const TypeSymbol* base,
+                                           SourceLocation loc,
+                                           bool implicitSpelling) {
+    if (!base) return;
+    const std::string what =
+        std::string("base class `") + std::string(base->name) +
+        "` has no parameterless constructor";
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        implicitSpelling
+            ? "implicit `base()` chain: " + what +
+                  "; the chain must be explicit (§12.8)"
+            : "`base()` chain: " + what + "; supply its arguments (§12.8)");
 }
 
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.
@@ -14392,7 +14722,26 @@ void ExprTC::checkImportedNewExprArgs(
         const ast::CallArgument& a =
             ne.args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value) continue;
-        checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
+        // fix #4543 (§14.1 / §5.1 / §2.8.3 rule 4, v0.306): substitute the
+        // formal through THIS construction's concrete type arguments before
+        // comparing, exactly as the LOCAL `new` path does
+        // (`substituteMemberType(…, &ne, t)` in the overload-ranking block
+        // above). Without it an imported generic constructor whose parameter
+        // EMBEDS the class's own type parameter — `constructor(x: Sc<T>?)` on
+        // `class Sc<T>` — was compared bare: `Sc<int>?` (the argument) against
+        // `Sc<T>?` (the formal), which is a genericArgs mismatch, so
+        // `new Sc<int>(q)` was refused with the §5.1 "not implicitly
+        // convertible" message while the single-module twin compiled and
+        // answered 105 (MEASURED, real two-module `bezelc`). A bare `x: T` /
+        // `x: T?` formal escaped because `checkAssignable` treats a
+        // declaration-less Named as opaque; a CONSTRUCTED `Sc<T>` does not, so
+        // this was the one shape left unsubstituted. `substituteMemberType`
+        // already handles the imported side (its `importedName` arm, #428
+        // phase B) and returns its input unchanged when nothing applies, so a
+        // non-generic imported ctor is untouched. §2.8.3 rule 4: the same
+        // program must type the same way whichever artifact declared the type.
+        TypeRef* formal = substituteMemberType(p->resolvedDeclType, &ne, t);
+        checkAssignable(ctx_.exprType(*a.value), formal,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(j + 1),
                         a.value.get());  // per §7.4 / §27.6 (#1191)

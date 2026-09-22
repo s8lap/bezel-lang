@@ -476,9 +476,16 @@ BEZEL_TEST(sorted_1426, sorted_set_getenumerator_order_matches_forloop_order_dir
 // came back as `<F\\n0<F\\nP<F\\n`). The fix switches the string
 // element path to `bz_dict_keys_gen` + a `bz_sort_kv_gen` driven by a
 // codegen-side string-content comparator (`bz$sscmp$string`: deref
-// each keys[i] into its bz_string_struct*, load data/len, forward to
-// `bz_string_compare`) — same comparator contract SortedDictionary
-// uses via its own strcmp-driven bz_sort_kv_str path. Decoding stores
+// each keys[i] into its bz_string_struct*, then forward BOTH to the
+// runtime's ordinal string comparison). ⚠ That forward used to be
+// `bz_string_compare` with (data, len); fix #4487 deleted that helper
+// — it walked min(len) BYTES over a CODE-POINT length (#535 class) —
+// and this comparator now calls `bz_str_compare_cp`, which decodes
+// each operand at its own storage width (stdlib §9.6 / spec §4.6,
+// v0.306). ⚠ `SortedDictionary` is NO LONGER the same comparator
+// contract: it still runs on its own strcmp-driven bz_sort_kv_str
+// path, which #4487 did not move (see #4493). For the ASCII inputs
+// below the two agree; for non-ASCII they do not. Decoding stores
 // the live `bz_string_struct*` directly in the result array; the
 // wrapper shares the SortedSet's +1 (single owner at scope end via
 // `bz_set_string_keys_release` → `bz_string_release`).

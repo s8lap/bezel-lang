@@ -13,6 +13,30 @@
 //    0  clean
 //    1 / raw exit code  -- family-dependent, see each function below.
 //
+// #4504: -3/-4 are INFRASTRUCTURE failures, not memory-safety findings, but
+// every caller compares the same int against 0 or an expected exit code, so
+// `BEZEL_EXPECT_EQ(rc, 0)` fails IDENTICALLY for "LeakSanitizer found a leak"
+// (rc==1) and "clang++ could not link the test program" (rc==-3) -- and the
+// link command used to send both stdout and stderr to /dev/null, discarding
+// the reason. The numeric CONTRACT above is unchanged (112 call sites depend
+// on the exact values), but every -3/-4 now prints an `[ INFRA ]` marker
+// carrying the link command's captured stderr (mirrors `noteInfraFailure`,
+// tests/support/aot_support.hpp, and `sanitizerRuntimeMaster`'s `[ INFRA ]`
+// marker in tests/native_test_harness.hpp) and marks the test failed
+// directly, so an infra failure can no longer masquerade as a sanitizer
+// finding at the assertion site. Family A's three failure branches (crash /
+// sanitizer / wrong value) similarly each get a distinct `[ ASAN ]` marker
+// naming which one fired, without changing what they return.
+//
+// #4563: -2 joins them. It was already a distinct code HERE, but silent, and
+// the `if (rc < 0) return;` / `if (rc >= 0) BEZEL_EXPECT_EQ(rc, 0);` guards
+// this family carries swallow a silent -2 exactly as they swallowed -1. The
+// marker, not the number, is what makes an infra failure unignorable; the
+// numeric contract above is unchanged. The machinery moved to
+// support/asan_infra_failure.hpp so the ~77 hand-rolled per-file copies of this
+// helper — which had no -2 at all and returned -1 for EVERY build failure —
+// share the one implementation rather than growing a second.
+//
 // THREE FAMILIES, NOT ONE. Diffing all 42 copies (#3653 investigation, see the
 // commit body for the file-by-file table) found the copies do NOT all answer
 // the same question — they split cleanly into three shapes used by disjoint
@@ -32,12 +56,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
 #include "native_test_harness.hpp"
+#include "support/asan_infra_failure.hpp"  // noteAsanInfraFailure / ExpectAsanInfraFailure (#4563)
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
@@ -66,47 +94,96 @@ inline int lowerToObjectForAsan(const std::string& source,
     bezel::Lexer lexer(source, diags);
     bezel::Parser parser(lexer, diags);
     auto unit = parser.parseCompilationUnit();
-    if (!unit) return -2;
+    // #4563: -2 was already DISTINCT from -1, but it was SILENT, and ~49 sites
+    // in this family guard with `if (rc < 0) return;` / `if (rc >= 0) EXPECT`,
+    // which swallow -2 exactly as they swallowed -1. `asanBuildFailure` returns
+    // the same -2 and additionally marks the test failed at the chokepoint.
+    if (!unit) return asanBuildFailure("parse");
     bezel::sema::SemaContext ctx(diags);
     bezel::sema::collectSymbols(*unit, ctx);
     bezel::sema::resolveTypes(*unit, ctx);
     bezel::sema::typecheckExpressions(*unit, ctx);
     bezel::sema::checkDefiniteAssignment(*unit, ctx);
     bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -2;
+    if (diags.hasErrors()) return asanBuildFailure("sema");
     llvm::LLVMContext llvmCtx;
     auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -2;
+    if (!module) return asanBuildFailure("emitModule");
     std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+        return asanBuildFailure("emitObjectFile");
     return 0;
 }
 
 namespace asan_detail {
+
+// Best-effort: read a small captured-output file in full and remove it.
+// Returns "" on any failure to open/read (never throws) -- diagnostics
+// degrade gracefully rather than crash the harness.
+inline std::string readAndRemoveCapture(const std::string& path) {
+    std::string out;
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        out = ss.str();
+    }
+    std::remove(path.c_str());
+    return out;
+}
+
+// #4563 MOVED: `noteAsanInfraFailure` and `ExpectAsanInfraFailure` now live in
+// support/asan_infra_failure.hpp, in THIS namespace and with exactly this
+// behaviour, so every call site here and the #3676 ratchet are untouched. They
+// moved because the ~77 hand-rolled per-file copies of this helper need the
+// same one marker for their own build-failure path, and a second suppression
+// mechanism is the drift this header family exists to prevent. That header also
+// adds the three call-site spellings (`asanBuildFailure` / `asanLinkFailure` /
+// `asanExecFailure`) that return the canonical -2/-3/-4 while announcing.
 
 // Link `objPath` against the ASan runtime, run the resulting `exe` under
 // `asanOptions`, and hand back the raw `system()` status. Returns 0 when the
 // run happened (status is meaningful), -3 on link failure, -4 if `system()`
 // itself failed to run the program at all. Every family's cleanup discipline
 // (remove the .o and the exe, whatever happens) is identical, so it lives
-// here once too.
+// here once too. `tag` identifies the caller for the #4504 `[ INFRA ]`
+// marker; it is diagnostic-only and does not affect the return contract.
 inline int linkAndRunUnderAsan(const std::string& rtObj,
                                 const std::string& objPath,
                                 const std::string& exe,
-                                const std::string& asanOptions, int& status) {
+                                const std::string& asanOptions, int& status,
+                                const char* tag = nullptr) {
     auto cleanup = [&] {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
     };
+    // #4504: capture the link command's stderr instead of discarding it
+    // (was `> /dev/null 2>&1`), so a link failure's cause is diagnosable in
+    // one read instead of indistinguishable from a sanitizer finding.
+    std::string linkErrPath = exe + ".link.stderr";
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
+                          " > /dev/null 2> " + linkErrPath;
+    if (std::system(linkCmd.c_str()) != 0) {
+        std::string linkErr = readAndRemoveCapture(linkErrPath);
+        cleanup();
+        noteAsanInfraFailure(
+            tag, "link failed (`clang++ -fsanitize=address` exited "
+                 "nonzero); captured stderr:\n" +
+                     (linkErr.empty() ? std::string("    (empty)") : linkErr));
+        return -3;
+    }
+    std::remove(linkErrPath.c_str());  // link succeeded: nothing to keep
     std::string runCmd =
         "ASAN_OPTIONS=" + asanOptions + " " + exe + " > /dev/null 2>&1";
     status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -4;
+    if (status == -1) {
+        noteAsanInfraFailure(
+            tag, "system() failed to invoke the test program "
+                 "(fork/exec-level failure: OOM, disk, no fork slot, ...)");
+        return -4;
+    }
     return 0;
 }
 
@@ -136,12 +213,31 @@ inline int runUnderAsanValue(
     if (lowered != 0) return lowered;  // -2
     int status = 0;
     int rc = asan_detail::linkAndRunUnderAsan(rtObj, objPath, exe, asanOptions,
-                                              status);
-    if (rc != 0) return rc;  // -3 / -4
-    if (!WIFEXITED(status)) return 1;            // crashed/aborted
+                                              status, tag);
+    if (rc != 0) return rc;  // -3 / -4 (already reported via [ INFRA ], #4504)
+    // #4504: name which of the three causes fired -- all three still return
+    // `1`, unchanged, but the log now says which one so a wrong-value defect
+    // is never mistaken for a sanitizer report or vice versa.
+    if (!WIFEXITED(status)) {
+        std::cout << "    [ ASAN ] runUnderAsanValue(tag=\"" << tag
+                   << "\"): program did not exit normally (crashed/aborted, "
+                      "raw wait status=" << status << ") -- see #4504.\n";
+        return 1;                                    // crashed/aborted
+    }
     int code = WEXITSTATUS(status);
-    if (code == 99) return 1;                    // sanitizer reported a problem
-    return (code == expectedExitCode) ? 0 : 1;   // wrong value -> failure
+    if (code == 99) {
+        std::cout << "    [ ASAN ] runUnderAsanValue(tag=\"" << tag
+                   << "\"): sanitizer reported a problem (exitcode=99) -- "
+                      "see #4504.\n";
+        return 1;                                    // sanitizer reported a problem
+    }
+    if (code != expectedExitCode) {
+        std::cout << "    [ ASAN ] runUnderAsanValue(tag=\"" << tag
+                   << "\"): wrong exit value (expected " << expectedExitCode
+                   << ", got " << code << ") -- see #4504.\n";
+        return 1;                                    // wrong value -> failure
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,9 +267,14 @@ inline int runUnderAsan(const std::string& source, const char* tag,
                               (detectLeaks ? "1" : "0") + ":exitcode=99";
     int status = 0;
     int rc = asan_detail::linkAndRunUnderAsan(rtObj, objPath, exe, asanOptions,
-                                              status);
-    if (rc != 0) return rc;  // -3 / -4
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer hit
+                                              status, tag);
+    if (rc != 0) return rc;  // -3 / -4 (already reported via [ INFRA ], #4504)
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) {
+        std::cout << "    [ ASAN ] runUnderAsan(tag=\"" << tag
+                   << "\"): sanitizer reported a problem (exitcode=99) -- "
+                      "see #4504.\n";
+        return 1;                                                  // sanitizer hit
+    }
     return 0;                                                      // clean
 }
 
@@ -206,9 +307,15 @@ inline int runUnderAsanExitCode(const std::string& source, const char* tag,
                               ":exitcode=99:abort_on_error=0";
     int status = 0;
     int rc = asan_detail::linkAndRunUnderAsan(rtObj, objPath, exe, asanOptions,
-                                              status);
-    if (rc != 0) return rc;  // -3 / -4
-    if (!WIFEXITED(status)) return 99;  // crash/abort == corruption
+                                              status, tag);
+    if (rc != 0) return rc;  // -3 / -4 (already reported via [ INFRA ], #4504)
+    if (!WIFEXITED(status)) {
+        std::cout << "    [ ASAN ] runUnderAsanExitCode(tag=\"" << tag
+                   << "\"): program did not exit normally (crashed/aborted, "
+                      "raw wait status=" << status << "); reporting as 99 "
+                      "(corruption) -- see #4504.\n";
+        return 99;  // crash/abort == corruption
+    }
     return WEXITSTATUS(status);
 }
 

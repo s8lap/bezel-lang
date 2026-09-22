@@ -1593,6 +1593,41 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // default). A non-empty primary param list is a non-parameterless
             // constructor (mirroring Resolver::argSatisfiesNew).
             //
+            // fix #4446 (§14.2, v0.302): an `abstract` or `closed` class does
+            // NOT satisfy `new()` (§14.2 v0.302; per spec §12.5, `new` on such
+            // a class is itself a compile error, so admitting the substitution
+            // would satisfy a constraint whose sole purpose — `new T()` in the
+            // generic body — the language forbids on the substituted type).
+            // §22.7's implicit parameterless constructor (which `abstract` and
+            // `closed` classes still take, since §12.8 inserts a `base()` chain
+            // to it) is NOT enough — the substitution is unconstructible at
+            // every call site, on the same footing as the Interface arm above.
+            // Mirrors the §11.7 own `isInstanceless = abstract || closed` test
+            // this file already uses for §19.6 leaf-set extraction (line 2455).
+            // The diagnostic at the substitution site is the existing §14.2
+            // "type argument ... does not satisfy the constraint `where T:
+            // new()`" wording (TypeResolution_Names.cpp:3025 for the type-alias
+            // path; ExprTypecheck_Calls.cpp:3396 for the call-site re-check) —
+            // the predicate answering false here is what makes those sites
+            // fire.
+            //
+            // fix #4472 follow-up (§14.2, v0.302): this fix's own SCOPE NOTE
+            // named two further duplicate arms — `Resolver::argSatisfiesNew`
+            // (TypeResolution_Checks.cpp) and `checkMethodGenericConstraints`'s
+            // inline Class arm (ExprTypecheck_Calls.cpp) — that lacked this
+            // exact test. Rather than leave this arm's own local
+            // `hasModifier(d, "abstract") || hasModifier(d, "closed")` as a
+            // THIRD independently-maintained copy once those two were fixed,
+            // all three now ask the SAME shared predicate,
+            // `sema::isAbstractOrClosedClass` (TypeResolution.hpp) — see its
+            // own comment for the unification rationale. This call site's
+            // observable behavior is unchanged (`isAbstractOrClosedClass` is
+            // the identical two-modifier test, moved verbatim).
+            if (isAbstractOrClosedClass(d)) {
+                decided = true;
+                return false;
+            }
+            //
             // fix #3141: `hasPositionalFields` is on the TypeSymbol (#501) and
             // the parameters themselves are FieldSymbols on both sides (#2516),
             // so an imported primary-constructor class no longer answers "no
@@ -3087,9 +3122,29 @@ bool ExprTC::returnsValue(const ast::Type* rt) {
 // issue #777 / §30.6: a Named `Task<…>` / `OwningTask<…>` shape — the async task
 // wrapper. An async lambda/method body must produce the unwrapped element T, not
 // a Task value; a Task-shaped body where T is NOT itself Task-shaped is a
-// forgotten `await`.
+// forgotten `await`. STRICT form (non-nullable): use this where the rule is
+// about the DECLARED wrapper (§30.1 / §30.6 async-context mapping, the
+// declared-return-type check) — a `Task?` ascription/return is a different
+// question the relevant site decides on its own.
 bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
-    return t && t->kind == TypeRef::Kind::Named && !t->nullable &&
+    return isTaskFamilyRef(t) && !t->nullable;
+}
+
+// fix #4443 (v0.302, §17.13 / §28.3 Keying rule): the task-family predicate
+// with nullability STRIPPED. The §17.13 discard-and-anonymous-binding rule
+// keys on "is this a Task-family value", and a non-null `Task?` IS a Task-
+// family value (the rule exists to prevent abandonment of a running operation,
+// and a nullable static type changes what may be absent, not what is abandoned
+// when it is present) — exactly as the §28.3 announcement table's Keying rule
+// for its own rows ("read from the signature *before* generic substitution,
+// with nullability stripped: `Task?` … qualify"). The §28.3 mint-announcing
+// rule's calls-mint set therefore also admits `Task?`/`Task<T>?`/`OwningTask<T>?`,
+// and the §17.13 discard rule rejects their discards. The two sites that
+// strip are §17.13's discard + anonymous binding halves; the §30.1 / §30.6
+// async-context rules DO NOT strip — the declared wrapper is `Task`/`Task<T>`/
+// `OwningTask<T>`, not their nullable spellings.
+bool ExprTC::isTaskFamilyRef(const TypeRef* t) const {
+    return t && t->kind == TypeRef::Kind::Named &&
            t->astNode && t->astNode->name &&
            t->astNode->name->parts.size() == 1 &&
            (t->headName() == "Task" ||
@@ -3130,7 +3185,11 @@ bool ExprTC::isConcreteSlotReturnType(const TypeRef* t) const {
         t->primitive == PrimitiveType::Object) return true;
     if (t->kind != TypeRef::Kind::Named) return false;
     // Task-family: the v0.190 rule claims these (calls mint).
-    if (isTaskShapedRef(t)) return false;
+    // fix #4443 (v0.302, §28.3 Keying rule): the §28.3 announcement table's
+    // mint-announcing Keying strips nullability (`Task?` qualifies), so a
+    // nullable `Task?` slot is also claimed by calls-mint — not a concrete
+    // borrowed-slot. Use the stripped `isTaskFamilyRef`.
+    if (isTaskFamilyRef(t)) return false;
     // The eight iterator/enumerator interface heads (§29.3/§30.7) are
     // #1787's seam, deliberately unclassified by #1820.
     if (!t->nullable && t->astNode && t->astNode->name &&
@@ -6345,6 +6404,37 @@ static std::string_view namedTypeSimpleName(const TypeRef* ref) {
     if (!ref || ref->kind != TypeRef::Kind::Named) return {};
     if (ref->declaration) return ref->declaration->name;
     if (!ref->importedName.empty()) return ref->importedName;
+    // fix #4570 (§27.8, v0.306): a type alias resolves TRANSPARENTLY by
+    // copying the underlying TypeRef and then RESTORING astNode to the USE
+    // SITE (the alias name `Al`), so the astNode read below answers `Al`
+    // rather than the underlying builtin head. TypeRef.hpp names
+    // `aliasResolvedHead` as the compensating field carried for exactly this
+    // reason and `headName()` as "the ONE read every builtin-collection/
+    // wrapper identity check should use instead of astNode->name->parts[0]";
+    // this function is such a check and was missing the leg.
+    //
+    // Measured consequence: `type Al := Array<int>; var x: Al := src;`
+    // reached `variantGenericAssignable` with toName="Al" against
+    // fromName="Array", matched no ancestor of `Array<int>` under that name,
+    // and — because `Array` IS in `builtinBorrowingCollectionFullyModeled` —
+    // took that predicate's proof-of-non-conformance REJECT. That
+    // contradicts §27.8's "each instantiation of the alias is
+    // interchangeable with the corresponding instantiation of the aliased
+    // type". Every arity-1 builtin head in the modeled family (`Array`,
+    // `Set`, `Stack`, `Queue`, `LinkedList`, `SortedSet`, and the collection
+    // interfaces) was unusable through an alias; the arity-2 maps
+    // (`Dictionary`, `SortedDictionary`) only APPEARED to work because they
+    // sit outside that family and fell through to the conservative accept —
+    // they were never alias-transparent either, merely un-rejected.
+    //
+    // Placed AFTER `declaration` and `importedName` — through an alias copy
+    // both already carry the UNDERLYING type's own name, so those legs are
+    // already alias-transparent — and BEFORE the astNode read, the only leg
+    // the alias restore corrupts. Non-alias refs leave `aliasResolvedHead`
+    // empty and are unaffected, and the qualified-name `parts.back()`
+    // (last-component) behaviour this function deliberately keeps, unlike
+    // `headName()`'s `parts[0]`, is preserved for them.
+    if (!ref->aliasResolvedHead.empty()) return ref->aliasResolvedHead;
     if (ref->astNode && ref->astNode->name &&
         !ref->astNode->name->parts.empty())
         return ref->astNode->name->parts.back();
@@ -11379,17 +11469,369 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     }
                 }
             }
+            // fix #4491 (§22.5 "Optional parameters and named arguments" /
+            // §22.8 step 0 / §22.10, v0.306): publish the clause's §22.5
+            // argument BINDING, and use it below instead of the index `ai`.
+            //
+            // §22.5 says a named argument's name — not its position — picks
+            // the parameter ("naming an argument changes which parameter it
+            // binds to, never when it runs"), and names the reach of the
+            // rule: "every construction site in the language reaches it
+            // through the same binding — a call, a `new` expression, and a
+            // record construction alike". A §22.10 inheritance clause is such
+            // a site: `class D(v: int) : B(s := "clause", n := v)` supplies
+            // `B`'s primary parameter list. Nothing bound it by name — both
+            // this loop's #3750 modifier check AND codegen's
+            // `prePopulateBasePositionalFields` case (a) paired clause
+            // argument `i` with base positional field `i` — so the clause
+            // above stored the `string` pointer into `B`'s 4-byte `n` slot
+            // and the integer into its `string` slot (measured on e9239ab4:
+            // `Show()` printed `5811392`, then SEGV at `0x11` inside
+            // `bz_string_to_utf8z`, issue 4491).
+            //
+            // ONE binder body, as for the `new` site (#3196), the `this(...)`
+            // chain (#3583) and the `base(...)` chain (#4484): the same
+            // `bindArgsToParams` over the same
+            // `FormalsView::of(recordPositionalFieldSymbols(base))`. The
+            // channel is a table of its own only because the clause has no
+            // `ast::Expr` node to key on (see SemaContext.hpp).
+            //
+            // fix #4518 (§22.5 / §22.10, v0.306): `emit=true`. #4491 ran
+            // this binder with `emit=false` and recorded WHY — its subject
+            // was binding ORDER, so making the binder loud would have been a
+            // new rejection belonging to a different gap. This is that
+            // deferral closed, and it is the CLAUSE twin of #4496, which
+            // closed the same gap on the `base(...)` chain arm by the same
+            // one-word move.
+            //
+            // §22.10 is what makes the two arms one question: "When a class
+            // with a primary constructor has a base class, the base call
+            // appears in the inheritance clause … This replaces an explicit
+            // `base(...)` call" (v0.306). The clause IS the base call, so
+            // §22.5's two REJECTIONS reach it exactly as they reach the
+            // chain: "naming a parameter already bound positionally …, or
+            // naming the same parameter twice, is a compile error at the call
+            // naming that parameter", and "Every parameter that declares no
+            // default must be bound, positionally or by name".
+            //
+            // MEASURED ON 6c05b4cf, against `class B(n: int, s: string)`:
+            // `: B(n := v)` compiled at exit 0 and ran to exit 0 printing `4`
+            // and a blank line (the `s` slot kept its calloc zero — a
+            // half-constructed object, and an interpolating consumer
+            // dereferences the NULL); `: B(v, n := 2, s := "a")` compiled at
+            // exit 0 and SIGSEGV'd at run (exit 139) after printing `4`;
+            // `: B(v, "a", 3)` and `: B(zz := v, s := "a")` compiled at exit
+            // 0 and silently DROPPED the argument the rule rejects. The first
+            // two are silent MISCOMPILES, not merely missing diagnostics.
+            //
+            // The diagnostics are not new text: they are the five strings
+            // `bindArgsToParams` already emits for a `new T(...)`, a method
+            // call, a `this(...)` chain and (since #4496) a `base(...)`
+            // chain — the point of #3178's `FormalsView` being that one
+            // binder body serves every formal source.
+            //
+            // Checked (and published) only when the clause binds the base's
+            // PRIMARY parameter list — no explicit non-static base
+            // constructor of the clause's arity — which is the arity arm of
+            // codegen's own `baseClauseExplicitCtor` guard (the predicate
+            // that decides whether case (a) stores these slots at all). A
+            // clause that binds an explicit base constructor is neither
+            // checked nor published here and keeps whichever disposition it
+            // has today; its own §22.5 VALIDITY is the third site's question
+            // (#4520 binds it by name; its arity checking is filed, not
+            // folded in).
+            // // per §22.5, fix #4491
+            std::vector<int> clauseFieldToArg;
+            // fix #4551 (§22.5 / §22.6 / §22.10, v0.306): HOISTED out of the
+            // primary-list block below so the two arms read ONE answer.
+            // `explicitCtorOfThisArity` is what decides which of the two
+            // formal lists the clause binds — the base's §22.10 PRIMARY
+            // parameter list, or an explicit constructor — and each arm now
+            // CHECKS the clause it owns. Two independently computed copies
+            // could both fire (two diagnostics for one clause) or neither, so
+            // there is one.
+            bool explicitCtorOfThisArity = false;
+            // The count is the other half of §22.5's "report only where no
+            // candidate survives": with exactly one non-static constructor
+            // there is no sibling left to resolve to.
+            std::size_t nonStaticCtorCount = 0;
+            if (baseTs) {
+                for (Symbol* m : baseTs->members) {
+                    auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                    if (!other || other->isStatic) continue;
+                    ++nonStaticCtorCount;
+                    if (other->params.size() ==
+                        td->primaryBaseCtorArgs.size())
+                        explicitCtorOfThisArity = true;
+                }
+            }
+            if (baseTs && baseTs->hasPositionalFields) {
+                const std::vector<const Symbol*> fields =
+                    recordPositionalFieldSymbols(baseTs);
+                if (!explicitCtorOfThisArity && !fields.empty() &&
+                    td->primaryBaseCtorArgs[0].value) {
+                    const std::string desc =
+                        std::string("inheritance-clause base call to the "
+                                    "primary constructor of `") +
+                        std::string(baseTs->name) + "`";
+                    BindResult b = bindArgsToParams(
+                        sema::FormalsView::of(fields),
+                        td->primaryBaseCtorArgs,
+                        td->primaryBaseCtorArgs[0].value->span.begin, desc,
+                        /*emit=*/true);  // fix #4518 (§22.5, v0.306)
+                    if (b.ok) {
+                        clauseFieldToArg = b.paramToArg;
+                        ctx_.setInheritanceClauseBinding(
+                            &td->primaryBaseCtorArgs, b.paramToArg);
+                    }
+                }
+            }
+            // fix #4520 (§22.5 "Optional parameters and named arguments" /
+            // §22.8 step 1 / §22.10, v0.306): the THIRD §22.5 site of this
+            // family, and the last one still pairing by textual position.
+            //
+            // The block above binds a clause to the base's PRIMARY parameter
+            // list. A clause may instead bind an EXPLICIT base constructor,
+            // which codegen resolves with `Emitter::baseClauseExplicitCtor`
+            // and CALLS — `emitImplicitBase`, not
+            // `prePopulateBasePositionalFields`. That call's argument loop
+            // paired `clsBaseArgs[i]` with the constructor's parameter `i`
+            // and never read `arg.name`. §22.5 forbids exactly that twice:
+            // "naming an argument changes which parameter it binds to, never
+            // when it runs", and — naming the reach of the rule — "every
+            // construction site in the language reaches it through the same
+            // binding — a call, a `new` expression, and a record construction
+            // alike". §22.10 puts the clause among them: "When a class with a
+            // primary constructor has a base class, the base call appears in
+            // the inheritance clause … This replaces an explicit `base(...)`
+            // call."
+            //
+            // MEASURED ON 6c05b4cf: `class D(v: int) : B(b := "e", a := v)`
+            // over an explicit `constructor(a: int, b: string)` compiled at
+            // exit 0 with no diagnostic and printed `0` and a blank line,
+            // where `4` / `e` is correct — the clause values were DROPPED
+            // ENTIRELY rather than mispaired, because the callable test in
+            // `baseClauseExplicitCtor` never let a misordered pair through.
+            // The all-positional spelling of the same program prints `4` /
+            // `e`, so the plumbing works and it is the NAMES that were lost.
+            //
+            // THE BINDING IS NOT RESTATED IN CODEGEN, and it is not squeezed
+            // into the table above: that one describes the base's PRIMARY
+            // parameter list, and this call binds a DIFFERENT formal list, so
+            // reusing it would be precisely the mispairing #3562 removed. Same
+            // binder body (`bindArgsToParams`), a different `FormalsView` —
+            // `of(*ctor)` — and a channel of its own (see SemaContext.hpp).
+            //
+            // THE RESOLVED CONSTRUCTOR TRAVELS WITH THE BINDING. This picks
+            // the callee by ARITY; codegen's `ctorForArgs` also discriminates
+            // an overload set by argument type, so the two are two predicates
+            // even where they agree. Publishing the constructor lets the
+            // consumer check pointer identity and fall back to today's
+            // positional pairing if they ever disagree — the cost of a
+            // disagreement is then the by-name fix, never a wrong-slot store.
+            // An AMBIGUOUS arity match (two non-static constructors of the
+            // clause's arity) publishes nothing for the same reason.
+            //
+            // `emit=false`, matching what #4491 did for the primary arm and
+            // #4484 for the chain: §22.5 VALIDITY checking of a clause that
+            // binds an explicit base constructor is a separate, pre-existing
+            // gap (this arm has its own guards — `baseClauseExplicitCtor`'s
+            // callability test, the arity-0 fallback — and its own silent
+            // shapes, e.g. a NAMED clause omitting a defaulted trailing
+            // parameter, measured on 6c05b4cf to leave the base entirely
+            // unconstructed). Turning this binder loud is a new rejection
+            // belonging to that gap, filed rather than folded in; a clause
+            // the binder declines publishes nothing and lowers exactly as it
+            // does today.
+            //
+            // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the candidate
+            // scan falls back to constructors with MORE formals than the
+            // clause supplies.
+            //
+            // §22.5 admits omitting a parameter that declares a default, so a
+            // clause of arity N can legitimately name a constructor of arity
+            // M > N — and this scan, keyed on EXACT arity, found no candidate
+            // for one, published nothing, and codegen's
+            // `baseClauseExplicitCtor` then declared the clause "resolved but
+            // NOT callable" (its own #3777 exact-arity rule for a named
+            // clause). `emitImplicitBase` fell through to its arity-0
+            // fallback, found no parameterless constructor, and THE BASE WAS
+            // NEVER CONSTRUCTED: measured on fcb4dbd5, `class D(v: int) :
+            // B(a := v)` over `constructor(a: int, b: string := "zz")`
+            // compiled at exit 0 with no diagnostic and printed `0` and a
+            // blank line where `4` / `zz` is correct.
+            //
+            // THE WIDENING IS A FALLBACK, NOT A REPLACEMENT, and that is what
+            // keeps it from changing any program that resolves today. The
+            // EXACT-arity scan runs first and wins whenever it finds anything,
+            // so the constructor this publishes for an existing clause is the
+            // one it already published; the wider scan runs only where the
+            // narrow one found NOTHING, which is exactly the set of clauses
+            // that publish nothing today. Widening unconditionally would have
+            // turned a base declaring both `constructor(a: int)` and
+            // `constructor(a: int, b: string := "x")` into an ambiguity for
+            // `: B(a := v)`, losing a binding #4520 publishes.
+            //
+            // AMBIGUITY still publishes nothing, for #4520's reason: codegen
+            // picks the callee with `ctorForArgs` (which also discriminates by
+            // argument type) and checks pointer identity before reading the
+            // binding, so where the two could disagree the cost must be a lost
+            // fix, never a wrong-slot store.
+            if (baseTs && td->primaryBaseCtorArgs[0].value) {
+                const std::size_t nClauseArgs = td->primaryBaseCtorArgs.size();
+                ConstructorSymbol* clauseCtor = nullptr;
+                bool ambiguousArity = false;
+                for (Symbol* m : baseTs->members) {
+                    auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                    if (!other || other->isStatic) continue;
+                    if (formalParamCount(*other) != nClauseArgs) continue;
+                    if (clauseCtor) { ambiguousArity = true; break; }
+                    clauseCtor = other;
+                }
+                if (!clauseCtor && !ambiguousArity) {
+                    // fix #4550: no constructor of the clause's exact arity —
+                    // the omitted-default shape. A constructor with FEWER
+                    // formals can never take these arguments, so the test is
+                    // `>`, and the binder below is what decides whether the
+                    // omitted slots really are defaulted.
+                    for (Symbol* m : baseTs->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!other || other->isStatic) continue;
+                        if (formalParamCount(*other) <= nClauseArgs) continue;
+                        if (clauseCtor) { ambiguousArity = true; break; }
+                        clauseCtor = other;
+                    }
+                }
+                // fix #4551 (§22.5 "Optional parameters and named arguments"
+                // / §22.6 / §22.10, v0.306): §22.5 VALIDITY for THIS arm —
+                // the last silent one in the family #4496 (the `base(...)`
+                // chain) and #4518 (the clause bound to the base's PRIMARY
+                // list) closed. #4520 left this binder `emit=false` and
+                // recorded why: its subject was binding ORDER, so a new
+                // rejection belonged to this gap. This is that deferral
+                // closed.
+                //
+                // MEASURED ON 1ee866a9, all against `class B` whose only
+                // constructor is `constructor(a: int, b: string)`, compiled
+                // AND RUN — every one at exit 0 with NO diagnostic:
+                //
+                //   : B(zz := v, b := "e")   printed `4` / `e`. The WORST
+                //                            row: the argument naming a
+                //                            parameter that does not exist
+                //                            was not inert — it supplied `a`
+                //                            BY POSITION, exactly the
+                //                            pre-#4518 behaviour of the
+                //                            primary-list arm.
+                //   : B(a := v, a := 2)      printed `0` and a blank line
+                //   : B(v, a := 2, b := "e") printed `0` and a blank line
+                //   : B(v, "e", 3)           printed `0` and a blank line
+                //
+                // The three quiet rows are `B`'s own declared field
+                // initializers: neither resolver found a callee, so
+                // `emitImplicitBase` fell through to its arity-0 fallback and
+                // the base was never constructed.
+                //
+                // WHERE IT REPORTS, per §22.5's OWN split — this is not a
+                // one-word flip, because unlike the primary-list arm the
+                // binder must first decide whether the clause even NAMES this
+                // constructor. §22.5: an unbound required parameter "makes
+                // the candidate inapplicable … so at an overloaded name an
+                // applicable sibling still resolves and the error is reported
+                // only where no candidate survives". So the binder is LOUD
+                // only when both hold:
+                //
+                //   * the base declares exactly ONE non-static constructor —
+                //     no sibling can survive this one's rejection; and
+                //   * the clause does not bind the base's §22.10 PRIMARY
+                //     parameter list instead, which is the hoisted
+                //     `explicitCtorOfThisArity` gate above. That gate is the
+                //     EXACT complement of the primary-list block's own, so a
+                //     clause is checked by exactly one of the two arms — and
+                //     `class D(v: int) : B(v, "x")` over a base with a
+                //     §22.10 primary list of arity 2 and a convenience
+                //     `constructor(a: int)` still binds the PRIMARY list and
+                //     is checked there, not rejected here.
+                //
+                // DECLINED, WITH REASONS (CLAUDE.md §4): §22.5 also says a
+                // doubly-bound parameter or one named by no parameter "is a
+                // compile error at the call naming that parameter — not an
+                // applicability failure", so those two are in principle
+                // reportable even against an OVERLOAD SET. Not done here: at
+                // an overload set the name a clause gives may belong to a
+                // SIBLING, and `bindArgsToParams` answers per candidate, so
+                // reporting from a single candidate's decline would reject
+                // working code. It needs a scan over every candidate before
+                // it can say "no parameter of any candidate is named `zz`",
+                // which is a second change to a different shape; filed rather
+                // than folded in. Likewise "no constructor of this arity at
+                // all" is left to whatever diagnoses an unresolvable base
+                // call today — nothing is published or reported for it here.
+                //
+                // Also unchanged: §5.1 ASSIGNABILITY of each bound argument
+                // to its slot's type, the same outstanding item #4496 and
+                // #4518 record for their arms.
+                const bool soleCandidate = nonStaticCtorCount == 1;
+                const bool clauseBindsPrimaryList =
+                    baseTs->hasPositionalFields && !explicitCtorOfThisArity;
+                const bool emitClauseCtorBinding =
+                    soleCandidate && !clauseBindsPrimaryList;
+                // fix #4551: with exactly one non-static constructor, the
+                // candidate scan above found it or found nothing — and
+                // "nothing" happens only when that one constructor has FEWER
+                // formals than the clause supplies, which is §22.5's
+                // over-supply rejection and must be reported against it
+                // rather than dropped.
+                if (!clauseCtor && !ambiguousArity && emitClauseCtorBinding) {
+                    for (Symbol* m : baseTs->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!other || other->isStatic) continue;
+                        clauseCtor = other;
+                        break;
+                    }
+                }
+                if (clauseCtor && !ambiguousArity) {
+                    const std::string desc =
+                        std::string("inheritance-clause base call to a "
+                                    "constructor of `") +
+                        std::string(baseTs->name) + "`";
+                    BindResult cb = bindArgsToParams(
+                        sema::FormalsView::of(*clauseCtor),
+                        td->primaryBaseCtorArgs,
+                        td->primaryBaseCtorArgs[0].value->span.begin, desc,
+                        /*emit=*/emitClauseCtorBinding);  // fix #4551
+                    if (cb.ok)
+                        ctx_.setInheritanceClauseCtorBinding(
+                            &td->primaryBaseCtorArgs, clauseCtor,
+                            cb.paramToArg);
+                }
+            }
+            // The base positional field clause argument `ai` binds to. Empty
+            // binding (nothing published) degenerates to the textual-order
+            // `argument i ↔ field i` pairing this loop has always used, which
+            // is the same answer for an all-positional clause — fix #4491.
+            auto clauseFieldForArg = [&](std::size_t ai) -> std::size_t {
+                if (clauseFieldToArg.empty()) return ai;
+                for (std::size_t pi = 0; pi < clauseFieldToArg.size(); ++pi)
+                    if (clauseFieldToArg[pi] == static_cast<int>(ai))
+                        return pi;
+                return basePosParams.size();
+            };
             for (std::size_t ai = 0;
                  ai < td->primaryBaseCtorArgs.size(); ++ai) {
                 const auto& arg = td->primaryBaseCtorArgs[ai];
                 if (!arg.value) continue;
                 visitExpr(*arg.value);
-                // Same check as runMethodBody's parameter-default path, but
-                // keyed on the BASE class's positional parameter at index ai
-                // — the inheritance-clause binds positionally.
-                if (ai < basePosParams.size() &&
-                    basePosParams[ai]->posParam &&
-                    basePosParams[ai]->posParam->modifier.empty() &&
+                // Same check as runMethodBody's parameter-default path, on
+                // the BASE class's positional parameter the clause argument
+                // BINDS to. fix #4491: that is `clauseFieldForArg(ai)`, not
+                // `ai` — §22.5 binds `: B(r := new Res())` to the `r` slot
+                // wherever `r` sits, so reading the slot at the argument's
+                // SOURCE position asked the wrong parameter's modifier and
+                // both missed the rejection and raised it on the wrong one.
+                const std::size_t fi = clauseFieldForArg(ai);
+                if (fi < basePosParams.size() &&
+                    basePosParams[fi]->posParam &&
+                    basePosParams[fi]->posParam->modifier.empty() &&
                     exprIsOwnedProducerOfNonTrivialDisposeClass(*arg.value)) {
                     ctx_.diagnostics().report(
                         Severity::Error, arg.value->span.begin,
@@ -11496,6 +11938,110 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     }
                 }
                 currentScope_ = saveScope;
+            }
+        }
+        // fix #4549 (§12.8 "Constructor chaining" / §22.5 / §22.7 / §22.10,
+        // v0.306): the IMPLICIT `base()` chain, checked against §12.8's own
+        // requirement on it.
+        //
+        // §12.8: "If neither `base(...)` nor `this(...)` is written, the
+        // compiler inserts an implicit `base()` call (which requires the base
+        // class to have a parameterless constructor; otherwise the chain must
+        // be explicit)." Nothing asked that question — the chain is inserted
+        // by codegen (`Emitter::emitImplicitBase`), it is not an
+        // `ast::CallExpr` any publisher sees, and codegen's own arity-0
+        // fallback simply finds no constructor and constructs NOTHING.
+        //
+        // MEASURED ON fcb4dbd5, each compiled at exit 0 with no diagnostic and
+        // RUN, against `class B(n: int, s: string)`:
+        //
+        //   class D : B                      printed `0` and a blank line
+        //   class D(v: int) : B              printed `0` and a blank line
+        //   class D : B + `constructor()`    printed `0` and a blank line
+        //     writing no chain
+        //
+        // and against `class B public constructor(a: int) …` (no primary list
+        // at all, the form #4519's predicate could not reach):
+        //
+        //   class D : B                      printed `0`
+        //
+        // Both of `B`'s required primary parameters keep their calloc zero;
+        // `s` is a NULL string pointer that `Console.WriteLine` tolerates and
+        // an interpolating consumer (`$"n={n} s={s}"`) dereferences. These are
+        // silently HALF-CONSTRUCTED objects, not merely missing diagnostics.
+        //
+        // THE PREDICATE IS SHARED with the explicit zero-argument `base()`
+        // spelling (`publishBaseChainPrimaryBinding`, #4519) — see
+        // `baseHasParameterlessConstructor` (ExprTypecheck_Calls.cpp) for what
+        // "parameterless" means for each constructor form and for the three
+        // over-rejections it deliberately declines. #4549 exists because the
+        // two spellings of ONE call disagreed; one body is what stops that
+        // recurring.
+        //
+        // A §22.10 INHERITANCE CLAUSE WITH ARGUMENTS IS NOT THIS SHAPE.
+        // §22.10: "When a class with a primary constructor has a base class,
+        // the base call appears in the inheritance clause … This replaces an
+        // explicit `base(...)` call" — so `class D(v: int) : B(v)` writes the
+        // chain and §12.8 inserts none. A BARE `: B` clause writes no
+        // arguments and therefore does get the inserted chain, which is why
+        // the gate below is on `primaryBaseCtorArgs` being EMPTY rather than
+        // on the clause's presence.
+        // // per §12.8, fix #4549
+        if (td->kind == ast::TypeDeclKind::Class && currentType_ &&
+            td->primaryBaseCtorArgs.empty()) {
+            TypeSymbol* implicitBase = nullptr;
+            for (TypeSymbol* b : currentType_->baseTypes) {
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    implicitBase = b;
+                    break;
+                }
+            }
+            // The AST node naming that base, for the diagnostic's location:
+            // the `B` of `class D : B`. `baseTypes` may also list interfaces,
+            // so the entry is matched by resolved declaration rather than by
+            // position.
+            const ast::Type* baseTypeNode = nullptr;
+            if (implicitBase) {
+                for (const auto& bt : td->baseTypes) {
+                    if (!bt) continue;
+                    const TypeRef* rt = ctx_.resolvedType(*bt);
+                    if (rt && rt->kind == TypeRef::Kind::Named &&
+                        rt->declaration == implicitBase) {
+                        baseTypeNode = bt.get();
+                        break;
+                    }
+                }
+            }
+            if (implicitBase && baseTypeNode &&
+                !baseHasParameterlessConstructor(implicitBase,
+                                                 baseTypeNode->span.begin)) {
+                // Which spellings of "no chain written" this class actually
+                // has. A constructor whose leading statement is `this(...)`
+                // or `base(...)` writes its own chain and is not this defect
+                // (`ast::chainCallOfStmt` is the ONE spelling of that
+                // recognition, #3583); an `abstract` class is still checked,
+                // because its own derived classes construct it.
+                bool anyInstanceCtor = false;
+                for (const auto& m : td->members) {
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(
+                        m.get());
+                    if (!cd || cd->isStatic) continue;
+                    anyInstanceCtor = true;
+                    bool isThis = false;
+                    if (!cd->body.empty() && cd->body[0] &&
+                        ast::chainCallOfStmt(*cd->body[0], isThis))
+                        continue;
+                    reportNoParameterlessBaseCtor(implicitBase,
+                                                  cd->span.begin,
+                                                  /*implicitSpelling=*/true);
+                }
+                // No instance constructor at all: §22.7's implicit
+                // parameterless constructor for `td` itself chains to
+                // `base()`, and the `: B` clause is where a reader fixes it.
+                if (!anyInstanceCtor)
+                    reportNoParameterlessBaseCtor(implicitBase,
+                                                  baseTypeNode->span.begin,
+                                                  /*implicitSpelling=*/true);
             }
         }
         currentType_ = save;
@@ -12956,6 +13502,104 @@ void ExprTC::checkCollectionLiteralElementAssignability(
     };
     if (target->kind == TypeRef::Kind::InlineArray) {
         if (!target->arrayElement) return;
+        // fix #4351 (spec §15.1, v0.307): a NON-OWNING inline array of a
+        // class-typed element stores BORROWS, not owned values; the spec
+        // requires "the initializer expressions must be borrows of class
+        // instances already owned elsewhere". A `new T(...)` element is a
+        // fresh producer with no outer owner — at end-of-statement the
+        // temporary would be disposed and the array's slot would hold a
+        // dangling borrow from birth (the leak #4336 measured on its
+        // owning twin `569a680`, and the long-standing codegen-deferred
+        // ruling that becomes a sema rejection here). The owning form
+        // `[N owned]C` (per §15.1.1, already wired by #4336 / `569a680`)
+        // is exempt — its slot takes ownership, so a `new T(...)` element
+        // IS a valid fresh producer.
+        //
+        // Scope: rejects `new T(...)` ONLY (a `someOwnedVar` identifier is
+        // a borrow — fine). Class-typed element means the element type's
+        // declaration has kind Class or Interface; primitives, records,
+        // enums, choices, runtime-managed types (string, function types),
+        // and uninstantiated generic parameters are NOT in scope (per
+        // §15.1's "class-typed elements" wording, which the owning form
+        // §15.1.1 also keys on). The check is local-decl / field-init /
+        // property-init / return-stmt / default-param / call-arg uniform
+        // — every `CollectionLiteralExpr` against a non-owning inline-array
+        // target reaches this arm regardless of which position seeded it.
+        // Fires BEFORE the per-element `checkAssignable` below so the
+        // borrow-only-contract diagnostic is the one the reader sees on a
+        // `new SomeClass()` against `[N]IHolder`; a non-conforming class
+        // at the same slot additionally gets the §5.1/§11.2 message from
+        // `checkAssignable`.
+        if (!target->arrayOwned) {
+            const TypeRef* et = target->arrayElement;
+            const bool classTyped =
+                et && et->kind == TypeRef::Kind::Named && et->declaration &&
+                (et->declaration->kind == ast::TypeDeclKind::Class ||
+                 et->declaration->kind == ast::TypeDeclKind::Interface);
+            if (classTyped) {
+                for (const auto& el : cl.elements) {
+                    if (!el) continue;
+                    if (dynamic_cast<const ast::NewExpr*>(el.get())) {
+                        // narrow #4351 (spec §15.1 / §8.6 / §28.9, v0.306):
+                        // the class-typed test above reads the SLOT type, but
+                        // §15.1's borrow-only contract is a statement about
+                        // what the slot *stores*. A `new R(...)` whose R is a
+                        // VALUE type (a record, enum, or choice) at an
+                        // `Object`- or interface-typed slot does not store a
+                        // class instance at all: it is **boxed** (§8.6 — "a
+                        // heap-allocated wrapper holds the value"), and a box
+                        // is runtime-managed (§28.9's "Boxed value types"
+                        // bullet), i.e. exempt from manual disposal and of
+                        // unbounded lifetime by construction. There is no
+                        // fresh owned producer to leave ownerless and no
+                        // borrow whose source could die, so §15.1's "must be
+                        // borrows of class instances already owned elsewhere"
+                        // has nothing to bind — exactly as §15.1's own
+                        // `var pt: [2]Point := [new Point(0, 0), …]` example
+                        // (a record element) is admitted at a NON-owning
+                        // slot. #4351's scope note already said records were
+                        // out of scope; keying the test on the element
+                        // EXPRESSION's constructed type rather than the slot
+                        // type is what makes that true at an interface slot
+                        // (#4427 field/property init, #4467 static init).
+                        //
+                        // An unresolved element type keeps the rejection:
+                        // #4351's contract is no weaker for anything this
+                        // cannot prove to be a boxed value.
+                        //
+                        // UN-MASKED RESIDUAL (#4478). Admitting a record
+                        // element here exposes a pre-existing §8.6 hole that
+                        // this rejection had been incidentally hiding: a
+                        // boxed BORROW-BEARING record escaping its source
+                        // scope is not rejected, and that escape is a
+                        // measured heap-use-after-free. The defect is
+                        // #4478's, not this guard's — nothing here creates
+                        // it, and re-widening this rejection would not be
+                        // the fix for it — but a reader who reaches this
+                        // line without `git log` needs the pointer.
+                        const TypeRef* elTy = ctx_.exprType(*el);
+                        const bool constructsClassInstance =
+                            !elTy || elTy->kind != TypeRef::Kind::Named ||
+                            !elTy->declaration ||
+                            elTy->declaration->kind ==
+                                ast::TypeDeclKind::Class ||
+                            elTy->declaration->kind ==
+                                ast::TypeDeclKind::Interface;
+                        if (!constructsClassInstance) continue;
+                        ctx_.diagnostics().report(
+                            Severity::Error, el->span.begin,
+                            "collection-literal element is a fresh producer "
+                            "(`new ...`) of a class-typed element in a "
+                            "non-owning inline array — §15.1 requires the "
+                            "initializer to be a borrow of a class instance "
+                            "already owned elsewhere; add `owned` to the "
+                            "array type (`[N owned]C`) to take ownership, or "
+                            "bind the value to a local first (`using var x "
+                            ":= new T(...);` then `[x]`) (§15.1)");
+                    }
+                }
+            }
+        }
         for (const auto& el : cl.elements)
             checkOne(el.get(), target->arrayElement, "element");
         return;
@@ -14189,8 +14833,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
+                    // fix #4443 (v0.302, §28.3 Keying rule): a function-slot
+                    // declared as `(…) -> Task?` / `(…) -> Task<T>?` / `(…) ->
+                    // OwningTask<T>?` is a mint-announcing slot — the §28.3
+                    // announcement table's Keying rule strips nullability
+                    // ("`Task?` … qualify"), so the lambda body must be checked
+                    // under the §30.1 peeled-element-context as for the
+                    // non-nullable spelling. Use the stripped `isTaskFamilyRef`.
                     if (dt->kind == TypeRef::Kind::Function && dt->funcReturn &&
-                        isTaskShapedRef(dt->funcReturn) &&
+                        isTaskFamilyRef(dt->funcReturn) &&
                         !dt->funcReturn->genericArgs.empty())
                         pendingLambdaReturnType_ =
                             dt->funcReturn->genericArgs.front();
@@ -14257,16 +14908,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // a generic parameter IS recorded as `TypeRef::Kind::Named` with a
         // null declaration (TypeResolution_Names.cpp, "Generic parameter —
         // record as a Named with no declaration"), so it passes that check.
-        // The exclusion comes from `isTaskShapedRef`'s `headName()` test --
+        // The exclusion comes from `isTaskFamilyRef`'s `headName()` test --
         // the parameter's own name (`T`) is neither "Task" nor "OwningTask"
         // (K2.4 keying, matching the discard-statement check below). Only the ANONYMOUS spelling
         // (`ld->name == "_"`, set only by the parser's `using var _`/
         // `await using var _` production, Parser_Stmts.cpp) is rejected;
         // a NAMED `using var t := expr;` remains the unsupervised idiom
         // (§30.10) and is untouched by this check.
+        // fix #4443 (v0.302, §17.13 Keying rule): §17.13 covers the discard
+        // statement AND the anonymous owning binding in the same bullet, so the
+        // keying-strips-nullability ruling from the discard half applies here
+        // too — use the stripped form `isTaskFamilyRef`.
         if (ld->isUsing && ld->name == "_" && ld->initializer) {
             if (const TypeRef* it = ctx_.exprType(*ld->initializer)) {
-                if (isTaskShapedRef(it)) {
+                if (isTaskFamilyRef(it)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ld->initializer->span.begin,
                         "cannot bind a `Task` to the anonymous `using var _` — "
@@ -14874,6 +15529,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #4249 (§17.7, v0.306): the OTHER side of the `!inLambda_` gate
+        // just above. §17.7 excludes a lambda's ascribed return from the
+        // shorthand's grant in as many words — "It is **not** permitted at an
+        // expression body or at a lambda's ascribed return" — so #4208
+        // deliberately declined to TYPE the shorthand here. But declining to
+        // type it is not diagnosing it: the untyped NewExpr fell straight
+        // through to codegen's #2491 zero/null backstop, so
+        // `lambda(): W => do return new(); end` compiled with an `internal:`
+        // Warning at most and then SEGV'd (exit 139, measured 60/60) on the
+        // first member read of the null it returned — a memory-safety crash
+        // reachable from ordinary source, which is why #4249 asks for the
+        // reject rather than a wire. `currentReturnType_` is the lambda's own
+        // ascription here (§27.3/#2101 routes a lambda body's `return`
+        // through this same `returnCtx_ == ValueMethod` machinery); it may be
+        // null when the lambda has no ascription, which the shared authority
+        // handles — that shape is outside §17.7's family entirely.
+        if (rs->value && inLambda_) {
+            if (auto* shNe =
+                    dynamic_cast<const ast::NewExpr*>(rs->value.get())) {
+                if (!shNe->type)
+                    rejectNewShorthandAtLambdaReturn(*shNe, currentReturnType_);
+            }
+        }
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
         checkOutPostcondAtReturn(rs->value.get(), rs->span.begin);
@@ -14961,6 +15639,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the 8-byte task pointer into the element-sized result slot → memory
         // corruption / SIGSEGV. Reject it with a clear diagnostic, unless the
         // element T is itself Task-shaped (a legitimate `Task<Task<U>>` result).
+        // fix #4443 (v0.302): STAYS strict (`isTaskShapedRef`, non-nullable).
+        // currentReturnType_ is the peeled element T threaded from the declared
+        // `Task<T>` / `OwningTask<T>` return (§30.1, non-nullable), and the
+        // body-return check is about the declared-wrapper mapping (§30.6) — a
+        // `Task?` body return is a different question; this rule's
+        // forgetfulness diagnosis does not extend to nullable spellings.
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
             inAsyncContext_ && currentReturnType_ &&
             !isTaskShapedRef(currentReturnType_) &&
@@ -15440,6 +16124,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `Task.FireAndForget` lead, since discarding/disposing a task
         // abandons a running operation — `using var` is the fallback, not the
         // first-offered fix, unlike the class arm above.
+        // fix #4443 (v0.302, §17.13 Keying rule): the parallel to the §17.13
+        // discard site — a `Task?` bare expression-statement (e.g. a `()`
+        // returning `Task?`) is the same abandonment, and the v0.302
+        // "keying strips nullability" ruling applies here too. Use the
+        // stripped `isTaskFamilyRef`.
         if (es->expr) {
             const TypeRef* taskStmtTy = ctx_.exprType(*es->expr);
             // A `move <task>;` statement is an explicit ownership transfer that
@@ -15451,7 +16140,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // acknowledging the transfer, so it is excluded here.
             auto* moveExpr = dynamic_cast<const ast::UnaryExpr*>(es->expr.get());
             bool isMove = moveExpr && moveExpr->op == "move";
-            if (isTaskShapedRef(taskStmtTy) && !isMove) {
+            if (isTaskFamilyRef(taskStmtTy) && !isMove) {
                 ctx_.diagnostics().report(
                     Severity::Error, es->expr->span.begin,
                     "this expression statement discards a `Task` result — an "
@@ -16144,6 +16833,71 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // block, ExprTypecheck_Exprs.cpp): identical primitives
                     // keep that type; otherwise the narrower operand
                     // promotes to whichever of the two admits it.
+                    auto isTrueInt = [](P p) {
+                        switch (p) {
+                            case P::Byte: case P::SByte: case P::Short:
+                            case P::UShort: case P::Int: case P::UInt:
+                            case P::Long: case P::ULong:
+                                return true;
+                            default:
+                                return false;
+                        }
+                    };
+                    std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    // fix #4513 (§3.5/§5.1/§6.2/§6.6, v0.306): ask the SAME
+                    // two admissibility questions the binary `x op e` asks —
+                    // §3.5's bool exclusion (fix #4500) and §5.1's pairwise-
+                    // conversion rule (fix #4501/#4512) — through the SAME
+                    // shared calls `typeBinary` uses, BEFORE computing R.
+                    // Previously this branch computed R from tTy/rTy's
+                    // WIDENING relationship alone, with no bool/§5.1 gate:
+                    // for a pair the binary form outright REJECTS
+                    // (`int + bool`, `decimal * bool`, `int * string`), the
+                    // "no conversion either way" fallback below (`rPrim =
+                    // rTy->primitive`) manufactured a fictitious R and
+                    // reported "computes `bool`"/"computes `string`" — a
+                    // binary result type the binary path no longer computes
+                    // since fix #4500/#4501. Gating first means a pair the
+                    // binary form rejects is reported with the SAME wording
+                    // as the binary rejection, and the R computation below
+                    // only ever runs on a pair `x op e` actually has a
+                    // result for.
+                    //
+                    // Scoped to skip the ALREADY-handled integer/integer (or
+                    // char/integer) "no conversion either way" pair — e.g.
+                    // `int += ulong`, pinned by the #2155 lit rows with
+                    // `reportInadmissiblePair`'s own wording below. Both
+                    // gates would ALSO reject that exact pair (it is
+                    // §5.1-inadmissible either way), so running them
+                    // unconditionally would silently flip that pinned
+                    // wording — a second, out-of-scope unification #4513
+                    // does not attempt (narrowed in the issue tracker).
+                    // `integerKindPair` is exactly `reportInadmissiblePair`'s
+                    // own eligibility test, evaluated up front instead of via
+                    // the (now redundant) `rPrim`/`integerWriteBack`
+                    // fallback — a pair with ANY widening relation never
+                    // reaches this branch's "no conversion either way" case
+                    // regardless, so scoping on it changes nothing else.
+                    const bool integerKindPair =
+                        (isTrueInt(tTy->primitive) ||
+                         tTy->primitive == P::Char) &&
+                        isTrueInt(rTy->primitive);
+                    bool pairRejectedAsBinary =
+                        reportBoolOperandExcludedFromArithmeticOrOrdering(
+                            as->value->span.begin, binOp, tTy, rTy);
+                    if (!pairRejectedAsBinary && !integerKindPair) {
+                        pairRejectedAsBinary =
+                            reportNoImplicitConversionBetweenOperands(
+                                as->value->span.begin, binOp, tTy, rTy,
+                                /*allowLiteralAdoption=*/true,
+                                as->target.get(), as->value.get());
+                    }
+                    if (pairRejectedAsBinary) {
+                        // Reported above (either gate); nothing further to
+                        // check — computing a write-back R for a pair the
+                        // binary form itself rejects is exactly the bug this
+                        // fix removes.
+                    } else {
                     P rPrim = tTy->primitive;
                     if (tTy->primitive != rTy->primitive) {
                         if (primitiveWidens(tTy->primitive, rTy->primitive))
@@ -16157,16 +16911,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     bool rEqualsT = rPrim == tTy->primitive;
                     bool rConvertsToT =
                         !rEqualsT && primitiveWidens(rPrim, tTy->primitive);
-                    auto isTrueInt = [](P p) {
-                        switch (p) {
-                            case P::Byte: case P::SByte: case P::Short:
-                            case P::UShort: case P::Int: case P::UInt:
-                            case P::Long: case P::ULong:
-                                return true;
-                            default:
-                                return false;
-                        }
-                    };
                     bool integerWriteBack =
                         !rEqualsT && !rConvertsToT &&
                         (isTrueInt(tTy->primitive) ||
@@ -16196,7 +16940,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !isLitDerived(as->value.get()))
                         reportInadmissiblePair();
                     if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
-                        std::string binOp(as->op.substr(0, as->op.size() - 1));
                         // §7.11 (#2153): with a nullable operand the computed
                         // R lifts to `R?`; spell it so (`int? + double?`
                         // computes `double?`). The `T?(x op e)` remedy stays
@@ -16220,6 +16963,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "the right-hand operand explicitly, or write "
                             "`x := " + spellN(tTy) + "(x " + binOp +
                             " e);` if the loss is intended (§6.6)");
+                    }
                     }
                 }
             } else if (tTy && rTy &&
@@ -16804,7 +17548,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // rejected for a Task-family value (nothing can await an unnamed
             // binding, so it is the same abandonment one scope later). The
             // remaining scope-end remedy is the NAMED form only.
-            if (isTaskShapedRef(t)) {
+            // fix #4443 (v0.302, §17.13 Keying rule): the §17.13 keying strips
+            // nullability — a non-null `Task?` IS a Task-family value here, and
+            // discarding it is the same abandonment. Use `isTaskFamilyRef`
+            // (nullability-stripped); the strict `isTaskShapedRef` would let a
+            // `Task?` discard compile, which is the v0.302 spec-ahead-of-impl.
+            if (isTaskFamilyRef(t)) {
                 ctx_.diagnostics().report(
                     Severity::Error, ds->value->span.begin,
                     "cannot discard a `Task` — disposing it abandons a running "

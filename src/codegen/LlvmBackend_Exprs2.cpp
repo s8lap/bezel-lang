@@ -1215,6 +1215,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // local patches were tried and each is unsound, see #2718. Write paths
         // this gate does not see are #2719.
         bool                   suppressContentRcInEnvdtor = false;
+        // fix #4509 (§27.5 / §28.9, v0.306): this capture's cell is REFCOUNTED
+        // — the env announces itself with `bz_cell_retain` at the capture-store
+        // and drops that reference with `bz_cell_release` in the envdtor, and
+        // the declaring scope's end drops the frame's implicit one (a
+        // `Disposal::cellRelease` entry in the #1017 SECOND PASS). Set only for
+        // a cell that every STATIC route declines — an escaping capturer exists
+        // (`declsCapturedByEscaping_`) so `cellFreeEligible_` refused the
+        // scope-end free, and neither #694's nor #3426's envdtor route armed —
+        // i.e. exactly the cells that leak today. Because those cells have NO
+        // free emitted for them anywhere, adding a balanced retain/release pair
+        // cannot introduce a double free; the worst arithmetic error is a
+        // surviving leak. Disjoint from `freeCellInEnvdtor` by construction.
+        bool                   retainCellInEnv = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -2432,6 +2445,178 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             isSharedCellEnvdtorFreeOwner(static_cast<const void*>(decl), &lam))
             ce.freeCellInEnvdtor = true;
+        // fix #4509 (§27.5 / §28.9, v0.306): REFCOUNT this cell when — and only
+        // when — every static route has declined it, which is exactly the set
+        // that leaks today. The three declines, read off the sets that make
+        // them rather than respelled:
+        //
+        //   * the SCOPE-END route refused because an escaping lambda captures
+        //     the local (`declsCapturedByEscaping_`, #4210) and so it is not in
+        //     `cellFreeEligible_` — an escaping env holds a raw cell pointer
+        //     that MAY outlive the frame, which is a statement about what
+        //     cannot be PROVEN, not about what happens;
+        //   * #3426's shared-cell envdtor route refused (no
+        //     `sharedCellEnvdtorFreeOwner_` entry);
+        //   * #694's envdtor route refused — it needs the sole capturer to be
+        //     DEFINITELY escaping, and `definitelyEscapingLambdas_`'s own
+        //     condition (b) declines "a lambda merely passed as an argument"
+        //     because it "proves nothing about when its env dies".
+        //
+        // All three are the same missing fact: WHEN the escaped env dies. That
+        // is a runtime quantity, so answer it at runtime — the frame and every
+        // env each hold a counted reference and the last one out frees the
+        // cell. This is the narrow, cell-only half of the model #2718 sketches;
+        // it deliberately does not touch the cell's CONTENTS accounting, which
+        // is that issue's separate (and harder) half.
+        //
+        // SAFETY, stated as the property that makes this a narrow change: for
+        // this set of cells today's codegen emits NO free at all — that is the
+        // defect. So adding a balanced retain/release pair cannot turn a free
+        // into a double free; the only arithmetic failure available is a
+        // surviving leak, which is the PRIME DIRECTIVE's safe direction.
+        // fix #4523: that claim is TRUE BUT INCOMPLETE, and the gap was a
+        // deterministic SIGSEGV. The failure mode #4509 did not enumerate is
+        // not a double free but an extra release registered into the WRONG
+        // BODY's scope — see the classification below for how the frame's
+        // release is now gated, and `declScopeDepthFn_` for why the depth alone
+        // could never license the index.
+        //
+        // DELIBERATELY EXCLUDED, each a separate shape with its own reclaim
+        // story: a for-var (fresh cell per iteration, #4129/#4161), an inline
+        // owned array (the #747/#782 element-dispose-through-cell pairing), and
+        // a captured PARAMETER (`declScopeDepth_` holds LOCALS only, per
+        // #3403). A cell reached by the §27.5/#1135 NESTED-lambda widening is
+        // NO LONGER excluded (fix #4523): its nested holder now announces
+        // itself like any other env, which is what #4509's exclusion was
+        // reaching for and could not express.
+        // SCOPE OF THIS FIRST CUT, and the second half is measured, not
+        // assumed. A capture whose CONTENTS the envdtor or the box machinery
+        // also accounts for — a `string`/`string?`, a function type, a boxed
+        // value (`releaseBoxInEnvdtor`), or one under #2706's
+        // `suppressContentRcInEnvdtor` — is left alone. Two reasons, both
+        // load-bearing:
+        //
+        //   * The cell's lifetime is entangled there with the CONTENTS
+        //     refcount that #2718 leaves open ("rc(contents) must equal the
+        //     LIVE ENV COUNT"), and #4509 is deliberately only the cell half.
+        //   * Measured: for that shape the count cannot reach zero today
+        //     anyway, so arming it reclaims nothing. On
+        //     `const_narrowing_lambda_capture_value_2597` the escaping
+        //     closure is itself never released (the #4422/#4431 family), so
+        //     the cell keeps a live holder and `use_stacks=0` reports the
+        //     SAME 64 B / 3 allocations with and without this fix — while the
+        //     extra load+call+store perturbs the frame enough to move an
+        //     unrelated pre-existing 48 B closure leak out of LSan's
+        //     conservative stack scan and flip that row's one-shot oracle.
+        //     Reclaiming nothing is not worth unmasking somebody else's leak,
+        //     so it waits for #4509's follow-up alongside #2718.
+        const bool contentsAlsoManaged =
+            ce.releaseBoxInEnvdtor || ce.suppressContentRcInEnvdtor ||
+            (ce.semaTy &&
+             ((ce.semaTy->kind == sema::TypeRef::Kind::Primitive &&
+               ce.semaTy->primitive == sema::PrimitiveType::String) ||
+              ce.semaTy->kind == sema::TypeRef::Kind::Function));
+        // fix #4523 (§27.5 / §28.9, v0.306): #4509's arming, restated as TWO
+        // independent obligations instead of one.
+        //
+        //   (1) EVERY env that stores the cell pointer must announce itself —
+        //       `bz_cell_retain` at its capture-store, `bz_cell_release` in its
+        //       envdtor. That pair is SELF-BALANCING: it needs no
+        //       `disposeStack_` entry, so it is correct in ANY body, including
+        //       a nested lambda's.
+        //   (2) The DECLARING FRAME's implicit reference (the one `calloc`
+        //       created and nobody announced) must be dropped exactly once, by
+        //       a `Disposal::cellRelease` in the scope that declared the local.
+        //       That registration INDEXES `disposeStack_`, so it is only
+        //       meaningful in the body whose `disposeStack_` the recorded depth
+        //       came from.
+        //
+        // #4509 conflated them: it gated (1) on the same test as (2) and then
+        // indexed `disposeStack_[declScopeDepth_[decl] - 1]` with a depth this
+        // body may not own. `declScopeDepth_` is module-wide and never cleared
+        // while `disposeStack_` is cleared per body, so for a lambda NESTED
+        // inside another lambda that indexed the nested body's freshly-cleared
+        // stack with the outer method's depth — an extra release into the wrong
+        // function's scope, which nulls the holder and segfaults the next read
+        // through it (#4523's repro). The numeric bound `<= disposeStack_.size()`
+        // was the only thing standing between that and a wild index: an
+        // arithmetic accident, not a proof.
+        //
+        // `declScopeDepthFn_` makes (2) fail-closed BY CONSTRUCTION — a depth
+        // is only ever indexed into the body that recorded it — and (1) is then
+        // free to be satisfied everywhere, which is what a refcount protocol
+        // actually needs. #4509 instead declined nested holders, which is the
+        // unsound direction: a declined holder reads through a cell the counted
+        // holders may already have freed.
+        //
+        // The DECISION is per DECL and taken ONCE, in the declaring body:
+        //   * a capture of a local can only appear in a lambda lexically inside
+        //     that local's scope, and the outermost such lambda's capture loop
+        //     runs while the declaring body is being lowered — before any
+        //     lambda nested in it, and before any later sibling;
+        //   * this loop over `capturedLocalDecls` has no early `continue`, so
+        //     every captured local reaches the decision;
+        //   * a refusal is STICKY (`cellRefcountDeclined_`) so a later sibling
+        //     cannot arm a cell an earlier sibling's env already holds
+        //     uncounted, and an arm is sticky (`refcountedCellDecls_`) so a
+        //     later site cannot decline one the frame is already counting.
+        // Params are absent from `declScopeDepth_` by construction (#3403), so
+        // a captured parameter never reaches (2) and is never armed.
+        const void* dkey = static_cast<const void*>(decl);
+        // Is THIS body the one that declared the local, so that its recorded
+        // depth indexes the `disposeStack_` we are holding right now?
+        // fix #4526: this was #4523's own inline spelling of that test, kept
+        // beside a separate `ddit->second - 1` read below. It is now the
+        // single accessor both halves go through, so the check and the index
+        // are one operation and no site can take the index without the proof.
+        std::size_t ownerIdx = 0;
+        const bool inDeclaringFrame = declScopeDisposeIndex(dkey, ownerIdx);
+        bool armed = refcountedCellDecls_.count(dkey) != 0;
+        if (!armed && inDeclaringFrame && !cellRefcountDeclined_.count(dkey)) {
+            // The #4509 classification, unchanged except that
+            // `nestedWidenedCellKeys_` is gone: a nested-widened cell is now
+            // COUNTED by its nested holder rather than declined, which is what
+            // that set existed to avoid.
+            armed = !isForVar && !isInlineOwnedArray && !contentsAlsoManaged &&
+                    !ce.freeCellInEnvdtor &&
+                    currentFn_ == cellFreeEligibleFn_ &&
+                    declsCapturedByEscaping_.count(dkey) &&
+                    !cellFreeEligible_.count(dkey) &&
+                    !sharedCellEnvdtorFreeOwner_.count(dkey) &&
+                    !(singleCaptureLocals_.count(dkey) &&
+                      definitelyEscapingLambdas_.count(
+                          static_cast<const void*>(&lam)));
+            if (!armed) cellRefcountDeclined_.insert(dkey);
+        }
+        if (armed) {
+            // (1) — in every body, declaring or not.
+            ce.retainCellInEnv = true;
+            refcountedCellDecls_.insert(dkey);
+            if (inDeclaringFrame) {
+                // (2) — the frame's release goes in the scope that DECLARED the
+                // local (`declScopeDepth_` records disposeStack_.size() at the
+                // declaration, so the scope's index is one less), where the
+                // #1017 SECOND PASS runs it after every reads-through-cell
+                // disposal in that scope. One entry per cell holder, however
+                // many lambdas capture it — the second capture reaches
+                // boxLocalSlot's already-boxed path with the same `newSlot`,
+                // so the dedup is an identity test on the holder. A generic
+                // method re-lowered per specialization re-registers in each
+                // specialization's own frame, which is why this is keyed on the
+                // holder and not on `refcountedCellDecls_`.
+                bool alreadyRegistered = false;
+                for (const auto& existing : disposeStack_[ownerIdx])
+                    if (existing.slot == newSlot && existing.cellRelease) {
+                        alreadyRegistered = true;
+                        break;
+                    }
+                if (!alreadyRegistered) {
+                    Disposal dcr{newSlot, nullptr};
+                    dcr.cellRelease = true;
+                    disposeStack_[ownerIdx].push_back(dcr);
+                }
+            }
+        }
         captures.push_back(ce);
     }
 
@@ -3144,7 +3329,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         collectBoxCaptureLocals(lam.stmts);
         collectDefinitelyEscapingLambdas(lam.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses its result).
-        collectCellFreeEligible(lam.stmts);
+        // fix #4524 (§27.5 / §28.9, v0.306): `&lam` marks this as a NESTED
+        // LAMBDA's own re-scan, which may not elect a #3426 shared-cell owner
+        // for a key it does not itself bind — see the parameter's comment.
+        collectCellFreeEligible(lam.stmts, &lam);
     } else {
         closureReleaseEligible_.clear();
         // fix #3757 follow-up: closureLocalCandidates_ must clear alongside
@@ -3557,6 +3745,23 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             llvm::Value* dst = builder_.CreateStructGEP(
                 envTy, envAlloc, static_cast<unsigned>(i));
             builder_.CreateStore(ce.envValue, dst);
+            // fix #4509 (§27.5 / §28.9, v0.306): announce this env as a holder
+            // of a REFCOUNTED capture cell. Emitted HERE, at the one site that
+            // stores the cell pointer into an env, so the retain and the store
+            // are the same event — one retain per env, on whatever path builds
+            // the env, with no way for a conditional capture path to retain a
+            // cell it never stored. The matching drop is in this lambda's
+            // envdtor; the frame's own drop is the `Disposal::cellRelease`
+            // registered at the capture site. See CaptureEntry::retainCellInEnv.
+            //
+            // This is a reference to the CELL, which is a different object from
+            // the cell's CONTENTS — the retain the long note below declines is
+            // on the contents, and that reasoning is untouched.
+            if (ce.retainCellInEnv)
+                builder_.CreateCall(
+                    declareC("bz_cell_retain", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy()}),
+                    {ce.envValue});
             // #429 / #672 / §27.5 / §28.9: NO extra retain at capture-store time.
             //
             // RATIONALE: per §28.3/§28.9, ALL captures are borrows from the
@@ -3768,6 +3973,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // escaped), and this is the single holder, so this is the cell's
                 // only free — no double-free; the defining scope is gone before the
                 // escaped closure dies, so no later access through the cell — no UAF.
+                // fix #4509 (§27.5 / §28.9, v0.306): drop THIS env's counted
+                // reference to a refcounted capture cell. Runs after the
+                // content-release branches above, which read through the cell,
+                // and is the mirror of the `bz_cell_retain` at the env's
+                // capture-store. The cell is freed here only if this env is the
+                // last holder — if the frame has already let go and no sibling
+                // env remains. When the frame is still live (the ordinary case
+                // for a subscription disposed inside the declaring scope) the
+                // count merely falls and the frame's own later read through the
+                // cell is safe; when the env OUTLIVES the frame the order is
+                // reversed and this is the free. Neither order needs a static
+                // proof, which is the whole point.
+                //
+                // Mutually exclusive with `freeCellInEnvdtor` below: that flag
+                // arms only on #694/#3426's proven-sole-holder routes, which
+                // are preconditions this classification excludes.
+                if (ce.retainCellInEnv)
+                    builder_.CreateCall(
+                        declareC("bz_cell_release", llvm::Type::getVoidTy(llvm_),
+                                 {ptrTy()}),
+                        {cell});
                 if (ce.freeCellInEnvdtor) {
                     // fix #4210 (§27.5 / §28.9, v0.298): store the freed cell
                     // pointer to the module-level global so boxLocalSlot detects
@@ -4122,19 +4348,30 @@ namespace {
 // null `cs` (no explicit constructor bound — the call goes straight to the
 // primary) answers false, because the primary constructor is precisely the one
 // that does NOT skip step 0. File-local rather than an `Emitter` member: it
-// reads only the AST and has exactly one caller.
+// reads only the AST, and both of its callers are in this file — the `new`
+// site (#3583) and, since fix #3562, the explicit `base(...)`-chain arm of
+// `prePopulateBasePositionalFields`, which asks the identical question about
+// the BASE constructor the chain call binds to.
 bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
     if (!cs || cs->isStatic) return false;
     // The chain FORM of a constructor body has no symbol-side channel: nothing
     // on `ConstructorSymbol` records "chains via `this(...)`" — only the body's
     // first statement does, and an imported constructor has no body to read. So
-    // the cast below answers false for an import. That is inert today because
-    // both imported callers gate on `!hasAnyConstructor(t)` before reaching
-    // here, and an imported primary constructor plus a convenience constructor
-    // is non-functional end to end regardless (measured identical before and
-    // after fix #3583). If that is ever fixed by carrying the chain form across
-    // the wire, this read must be routed through the new channel rather than
-    // kept.
+    // the cast below answers false for an import. That falseness is inert at
+    // both call sites, but for DIFFERENT reasons, and conflating them hides a
+    // live gap:
+    //   * at the `new` site (#3583) the imported arms gate on
+    //     `!hasAnyConstructor(t)` before reaching here, and an imported primary
+    //     constructor plus a convenience constructor is non-functional end to
+    //     end regardless (measured identical before and after fix #3583);
+    //   * at the `base(...)`-chain site (#3562) there is NO such gate. False
+    //     there means the blind positional pre-population still runs for an
+    //     imported base whose `base(...)` binds a convenience constructor —
+    //     i.e. the cross-module face of #3562 is UNFIXED, and this answer
+    //     preserves that behaviour rather than making it inert.
+    // If the chain form is ever carried across the wire, this read must be
+    // routed through the new channel rather than kept, and the `base(...)`
+    // site's cross-module face closes with it.
     // SEAM-DEBT: #3625 no symbol-side channel for a constructor body's chain form
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd || cd->body.empty() || !cd->body[0]) return false;
@@ -4517,7 +4754,39 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
         const std::vector<ast::CallArgument>& args) {
     BaseClauseExplicitCtor r;
     if (!base || args.empty()) return r;
+    bool clauseAllPositional = true;
+    for (const auto& a : args)
+        if (!a.name.empty()) { clauseAllPositional = false; break; }
     r.cs = ctorForArgs(base, args);
+    // fix #4520 (§22.5 / §22.8 step 1 / §22.10, v0.306): a NAMED clause is
+    // resolved by SEMA, not by `ctorForArgs`.
+    //
+    // `ctorForArgs`'s `ctorTypeMatches` compares `args[i]`'s type class with
+    // parameter `i`'s — a POSITIONAL pairing, and therefore a second §22.5
+    // binding rule sitting beside the real one. It rejects every clause whose
+    // names are correct but whose order is not: measured on 6c05b4cf,
+    // `class D(v: int) : B(b := "e", a := v)` over
+    // `constructor(a: int, b: string)` compared the string `"e"` against
+    // `a: int`, returned null, and `emitImplicitBase` fell through to its
+    // arity-0 fallback — so the base constructor was NEVER CALLED and the
+    // clause's values were dropped entirely (the program printed `0` and a
+    // blank line where `4` / `e` is correct). Re-keying the argument loop
+    // alone would not have moved that program one byte.
+    //
+    // Sema published the §22.5 binding for this clause against this
+    // constructor's own formal list, through the ONE binder body every
+    // construction site runs; when `ctorForArgs` finds nothing for a NAMED
+    // clause, that answer is adopted. Deliberately only when it finds
+    // NOTHING, and only for a clause carrying a name: an all-positional
+    // clause keeps `ctorForArgs` as its sole authority (including its #3760
+    // type-class rejection, which is what stops a chain from binding a
+    // wrongly-typed same-arity sibling), so no program that resolves today
+    // can resolve differently here.
+    if (!r.cs && !clauseAllPositional) {
+        if (const sema::SemaContext::InheritanceClauseCtorBinding* pub =
+                ctx_.inheritanceClauseCtorBinding(&args))
+            r.cs = pub->ctor;
+    }
     if (!r.cs) return r;
     auto it = ctorFns_.find(r.cs);
     // Declaring an imported constructor on demand is idempotent and is what
@@ -4540,23 +4809,47 @@ Emitter::BaseClauseExplicitCtor Emitter::baseClauseExplicitCtor(
     // now fills the omitted tail from the parameters' §22.5 defaults, exactly
     // as `emitChainCall` and every `new` site do.
     //
-    // A NAMED clause argument keeps the pre-#3777 exact-arity rule, and the
-    // test lives HERE rather than at the caller so that both readers of this
-    // predicate — `emitImplicitBase`, which evaluates the clause arguments, and
-    // `prePopulateBasePositionalFields`, which declines to evaluate them a
-    // second time — keep answering identically (the #3742 contract). The
-    // caller's fill loop pairs clause argument `i` with formal `i`
-    // POSITIONALLY, so it can only complete a TRAILING omitted tail; declaring
-    // a named short clause callable would make the evaluator skip it and the
-    // caller emit nothing.
-    bool clauseAllPositional = true;
-    for (const auto& a : args)
-        if (!a.name.empty()) { clauseAllPositional = false; break; }
+    // The test lives HERE rather than at the caller so that both readers of
+    // this predicate — `emitImplicitBase`, which evaluates the clause
+    // arguments, and `prePopulateBasePositionalFields`, which declines to
+    // evaluate them a second time — keep answering identically (the #3742
+    // contract).
+    //
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): a NAMED SHORT clause
+    // is callable when sema published a §22.5 binding for THIS constructor.
+    //
+    // #3777 restricted the omitted-tail admission to an ALL-POSITIONAL clause,
+    // and its reason was true at the time: "The caller's fill loop pairs clause
+    // argument `i` with formal `i` POSITIONALLY, so it can only complete a
+    // TRAILING omitted tail; declaring a named short clause callable would make
+    // the evaluator skip it and the caller emit nothing." #4520 re-keyed that
+    // loop by the §22.5 binding, and this commit gives it a PER-SLOT default
+    // fill (`fillOmittedCtorSlots`), so both halves of the premise are gone —
+    // but only for a clause sema actually bound. Without a binding the caller
+    // still pairs by position, so the restriction stands for that case and a
+    // named short clause simply stays "resolved, but NOT callable".
+    //
+    // MEASURED ON fcb4dbd5: `class D(v: int) : B(a := v)` over
+    // `constructor(a: int, b: string := "zz")` compiled at exit 0 with no
+    // diagnostic and printed `0` and a blank line where `4` / `zz` is correct
+    // — `r.cs` resolved, this test failed it, and `emitImplicitBase` fell
+    // through to its arity-0 fallback, which found nothing, so the base
+    // subobject was NEVER CONSTRUCTED. The all-positional twin of the same
+    // program prints `4` / `zz` (that is #3777's own fix), so the plumbing
+    // works and it was the exact-arity rule that dropped it.
+    //
+    // The binding is checked for CONSTRUCTOR IDENTITY and for covering every
+    // formal, the same discipline `emitImplicitBase` applies before reading it
+    // — a disagreement costs the fix, never a wrong-slot store.
     const std::size_t nFormals = sema::formalParamCount(*r.cs);
-    if (it == ctorFns_.end() ||
-        it->second->arg_size() != nFormals + 1 ||
-        (!clauseAllPositional && nFormals != args.size()))
+    if (it == ctorFns_.end() || it->second->arg_size() != nFormals + 1)
         return r;  // resolved, but NOT callable: the caller still owes the args
+    if (!clauseAllPositional && nFormals != args.size()) {
+        const sema::SemaContext::InheritanceClauseCtorBinding* pub =
+            ctx_.inheritanceClauseCtorBinding(&args);
+        if (!pub || pub->ctor != r.cs || pub->paramToArg.size() != nFormals)
+            return r;  // resolved, but NOT callable
+    }
     r.fn = it->second;
     return r;
 }
@@ -4605,6 +4898,80 @@ void Emitter::prePopulateBasePositionalFields(
 
     std::vector<llvm::Value*> baseArgVals;
 
+    // fix #3562 (§22.8 step 0 / §22.5 / §22.10, v0.306): set when the explicit
+    // `base(...)` arm below declines to fill `baseArgVals` because the call
+    // binds a §22.10 convenience constructor whose chained-to primary runs
+    // §22.8 step 0 for these slots. It suppresses the §22.5 DEFAULT loop as
+    // well as the argument stores, because step 0 owns a slot's default
+    // exactly as it owns its argument: §22.5 says the value an omitted
+    // defaulted parameter is passed IS its default, so the default is part of
+    // the one store step 0 makes, not a separate obligation this function
+    // still owes. Without it, suppressing the argument fill leaves
+    // `numToStore == 0` and the unconditional #3777 loop below reaches slots
+    // it had never touched before — evaluating a non-constant default a
+    // SECOND time and keeping the second value.
+    bool chainedPrimaryOwnsSlots = false;
+
+    // fix #4484 / fix #4491 (§22.5 "Optional parameters and named arguments"
+    // / §22.8 step 0 / §22.10, v0.306): the §22.5 BINDING of the base call's
+    // arguments to the base's positional slots, as sema published it. BOTH
+    // arms of this function now have a channel, and they are different ones
+    // because the two shapes have different identities:
+    //
+    //   case (b), the `base(...)` chain — `ExprTC::publishBaseChainPrimary
+    //     Binding` → `SemaContext::setPositionalBinding`, keyed on the chain
+    //     `CallExpr` (#4484, on the table #3583 widened to
+    //     `const ast::Expr*`).
+    //   case (a), the §22.10 inheritance clause — `ExprTC::visitTopDecl`'s
+    //     primary-base-ctor-args walk → `SemaContext::
+    //     setInheritanceClauseBinding`, keyed on the declaring
+    //     `ast::TypeDecl` (#4491), because the clause's arguments are a bare
+    //     `std::vector<ast::CallArgument>` with no `ast::Expr` node of their
+    //     own to key on.
+    //
+    // Both are computed by the ONE binder body every other construction site
+    // runs (`bindArgsToParams` over
+    // `FormalsView::of(recordPositionalFieldSymbols(base))`) — the same one
+    // the `new` site reads through `storePrimaryCtorPositionalArgs`.
+    // Entry `pi` holds the index into `baseArgVals` — which is the base call's
+    // SOURCE argument index, because the fill loops below push one value per
+    // argument in source order — that supplies base positional field `pi`, or
+    // -1 when the call omits that slot.
+    //
+    // EMPTY means "no binding published": every loop below then falls back to
+    // the textual-order pairing `argument i ↔ field i` this function has
+    // always used, which is bit-identical for an all-positional call and is
+    // the pre-fix behaviour for every shape sema declines to bind. Since fix
+    // #4496 the CHAIN arm's binder runs with `emit=true`, and since fix #4518
+    // the CLAUSE arm's does too, so an over- or under-supplied, doubly-bound
+    // or misnamed `base(...)` OR §22.10 inheritance clause is a §22.5 compile
+    // error and never reaches this fallback. What still reaches it is the
+    // shapes sema DECLINES TO BIND AT ALL rather than rejects: an imported
+    // clause (no entry under the replayed vector's address), a call binding an
+    // explicit base constructor (neither publisher runs there), and an
+    // all-positional call, for which the fallback is the same answer.
+    std::vector<int> baseFieldToArg;
+    // The base positional field a given SOURCE argument index binds to, and
+    // its inverse. Stated once because three places below need them: the §4.7
+    // unit rescue (which must know the slot's TYPE), the argument store loop,
+    // and the §22.5 default-fill loop (which must know which slots the call
+    // did NOT supply — with named arguments that is no longer a trailing run).
+    auto fieldForArg = [&](std::size_t ai) -> std::size_t {
+        if (baseFieldToArg.empty()) return ai;
+        for (std::size_t pi = 0; pi < baseFieldToArg.size(); ++pi)
+            if (baseFieldToArg[pi] == static_cast<int>(ai)) return pi;
+        return basePosFields.size();
+    };
+    auto argForField = [&](std::size_t pi) -> int {
+        if (baseFieldToArg.empty())
+            return pi < baseArgVals.size() ? static_cast<int>(pi) : -1;
+        if (pi >= baseFieldToArg.size()) return -1;
+        const int ai = baseFieldToArg[pi];
+        return (ai >= 0 && static_cast<std::size_t>(ai) < baseArgVals.size())
+                   ? ai
+                   : -1;
+    };
+
     // §22.8 step 1 / §22.10 / §11.1 (#3911/#3916): read the inheritance-
     // clause argument EXPRESSIONS via `primaryBaseCtorArgsOf`, NOT a raw
     // `dynamic_cast<ast::TypeDecl*>(t->decl)` — the latter is null for
@@ -4632,9 +4999,68 @@ void Emitter::prePopulateBasePositionalFields(
     // `.fn`, not `.cs`: a resolved-but-not-callable constructor makes
     // `emitImplicitBase` fall through WITHOUT lowering anything, so the
     // pre-population still owes the arguments there.
-    if (t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty() &&
-        !baseClauseExplicitCtor(baseTs, *baseArgs).fn) {
-        for (const auto& arg : *baseArgs) {
+    //
+    // fix #4485 (§22.5 "Evaluation timing" / §22.8 step 0 / §22.10, v0.306):
+    // computed ONCE, and its `.fn` truth also sets `chainedPrimaryOwnsSlots` —
+    // this arm suppressed the ARGUMENT stores on the #3742 predicate but never
+    // told the #3777 default-fill loop below, which is unconditional. A base
+    // clause `: B(v)` binding a §22.10 convenience constructor of `B` (arity
+    // matching the clause, chaining via `this(...)` into `B`'s primary) left
+    // `baseArgVals` empty exactly as intended, but the fill loop then read
+    // "every slot unsupplied" and materialized EVERY one of `B`'s primary
+    // positional defaults here — a second evaluation of the one §22.8 step 0
+    // already ran inside the call `emitImplicitBase` makes to that convenience
+    // constructor. Same defect, same predicate, same repair as fix #3562 made
+    // for case (b)'s `base(...)`-chain arm on these very lines — this is that
+    // arm's case-(a) twin the #3562 commit deliberately left unfixed (scope
+    // note). Measured on a tree with fix #3562 but not this one, `class
+    // B(n: int, k: int := Counter.Next())` with `constructor(a: int)
+    // this(a);` reached from `class D(v: int) : B(v)`: `k=2 cnt=2` where
+    // §22.8 step 1 admits one evaluation (`k=1 cnt=1`); the `owned`-factory
+    // form of the same default left the first instance's destructor never
+    // run — LeakSanitizer reported the leaked allocation.
+    const bool baseClauseHasArgs =
+        t->kind == ast::TypeDeclKind::Class && baseArgs && !baseArgs->empty();
+    const BaseClauseExplicitCtor baseClauseBce =
+        baseClauseHasArgs ? baseClauseExplicitCtor(baseTs, *baseArgs)
+                           : BaseClauseExplicitCtor{};
+    if (baseClauseHasArgs && baseClauseBce.fn) chainedPrimaryOwnsSlots = true;
+    if (baseClauseHasArgs && !baseClauseBce.fn) {
+        // fix #4491 (§22.5 / §22.8 step 0 / §22.10, v0.306): install the
+        // §22.5 binding sema published for THIS inheritance clause, before
+        // anything below reads `fieldForArg` / `argForField`. This is case
+        // (a) — the `: B(s := "c", n := v)` spelling — the twin of the
+        // `base(...)` arm #4484 closed, and it mispaired identically:
+        // measured on e9239ab4, `class D(v: int) : B(s := "clause", n := v)`
+        // over `class B(n: int, s: string)` printed `5811392` for `n` (the
+        // string pointer's low 32 bits) and then SEGVed at `0x11` inside
+        // `bz_string_to_utf8z`.
+        //
+        // The channel is `SemaContext::inheritanceClauseBinding`, keyed on
+        // the ADDRESS of the clause's argument vector, because the clause has
+        // no `ast::Expr` node to key on (see SemaContext.hpp for why a third
+        // key on the `const ast::Expr*` table would collide with a clause
+        // argument that is itself a `new` expression).
+        //
+        // `baseArgs` is exactly that key: it is what
+        // `sema::primaryBaseCtorArgsOf(t)` returned a few lines above, which
+        // is `&td->primaryBaseCtorArgs` for a LOCAL class and the
+        // ModuleLoader-replayed `&t->importedPrimaryBaseCtorArgs` (#3911) for
+        // an imported one. Sema publishes only for the local vector, so the
+        // local/imported split here is POINTER IDENTITY — an imported class
+        // finds no entry and keeps the textual-order fallback — with no
+        // `dynamic_cast<const ast::TypeDecl*>(t->decl)` to add a #3152 seam
+        // read, and no second guard to keep in sync with the accessor.
+        if (const std::vector<int>* pub =
+                ctx_.inheritanceClauseBinding(baseArgs))
+            baseFieldToArg = *pub;
+        // §22.5 "Evaluation order": the supplied arguments run in call-site
+        // TEXTUAL order "for positional and named arguments alike", so this
+        // loop stays source-indexed and `baseArgVals` stays source-indexed;
+        // only the STORE below is re-keyed by the binding (fix #4491, the
+        // same split #4484 made on the `base(...)` arm).
+        for (std::size_t ai = 0; ai < baseArgs->size(); ++ai) {
+            const auto& arg = (*baseArgs)[ai];
             if (!arg.value) { baseArgVals.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);
             // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause
@@ -4642,14 +5068,20 @@ void Emitter::prePopulateBasePositionalFields(
             // site above. A null `v` here used to ABANDON the whole
             // pre-population (`clear(); break;`), so `class D(): B(C.Nothing())`
             // left EVERY one of B's positional fields at its calloc zero.
-            // `baseArgVals.size()` is the index of the slot this argument is
-            // about to occupy — the store loop below pairs `baseArgVals[i]` with
-            // `basePosFields[i]` — so the rescue asks about the field this
-            // argument actually lands in, not an unrelated one.
-            if (!v && baseArgVals.size() < basePosFields.size())
-                v = unitValueForTarget(
-                    v, recordMemberTypeResolved(basePosFields[baseArgVals.size()]),
-                    arg.value.get());
+            // fix #4491: the slot whose TYPE the §4.7 rescue must read is the
+            // one §22.5 BINDS this argument to, not the one at its source
+            // position — `: B(u := C.Nothing(), n := 1)` must rescue against
+            // the `u` slot's unit type. `fieldForArg` degenerates to the
+            // source index when no binding was published, which is the
+            // pre-#4491 `baseArgVals.size()` this replaced (every iteration
+            // either pushes or breaks, so the two agree exactly).
+            if (!v) {
+                const std::size_t fi = fieldForArg(ai);
+                if (fi < basePosFields.size())
+                    v = unitValueForTarget(
+                        v, recordMemberTypeResolved(basePosFields[fi]),
+                        arg.value.get());
+            }
             if (!v) { baseArgVals.clear(); break; }
             baseArgVals.push_back(v);
         }
@@ -4678,7 +5110,80 @@ void Emitter::prePopulateBasePositionalFields(
         if (cd && !cd->body.empty()) {
             bool isThis = false;
             const ast::CallExpr* chainCall = chainCallOf(*cd->body[0], isThis);
-            if (chainCall && !isThis && !chainCall->args.empty()) {
+            // fix #3562 (§22.8 step 0 / §22.10 / §12.8, v0.306): ...but NOT
+            // when the `base(...)` call binds to an explicit constructor of
+            // the base that chains via `this(...)`. This is case (a)'s #3742
+            // question — "is `emitChainCall` about to lower these very
+            // expressions and CALL a constructor whose own §22.8 step 0 writes
+            // the same positional slots?" — asked on the arm that never asked
+            // it. The fill loop below pairs chain argument `i` with the base's
+            // positional field `i`, which describes the base's PRIMARY
+            // parameter list; a §22.10 convenience constructor's parameter
+            // list is a DIFFERENT list, so position `i` does not name field
+            // `i` at all. §22.8 puts step 0 for such a call inside the
+            // chained-to primary ("a constructor that chains via `this(...)`
+            // skips steps 0 and 2 … primary-parameter capture happens inside
+            // the chained-to primary"), which `emitChainCall` reaches through
+            // the ctor call, so this pre-population is redundant there as well
+            // as wrong.
+            //
+            // Measured on 7f29b8ce: `class B(x: int, y: int)` +
+            // `constructor(a: int, d: decimal) this(a, 42);` reached from
+            // `class D : B` with `constructor() base(1, 7.5m);` emitted
+            // `store %bz.decimal …, ptr <GEP y>` — a 16-byte store into the
+            // 4-byte `y` slot at offset 16 of a 24-byte object, i.e. an
+            // 8-byte heap-buffer-overflow that ASan reports as
+            // "WRITE of size 16 … 7 bytes after 24-byte region". The narrower
+            // ptr-into-int form of the same store (`s: string` in that
+            // position) corrupts the trailing padding silently — ASan's
+            // 8-byte fast path reads the granule the misaligned store starts
+            // in and misses it — which is why the oracle for this is the
+            // 16-byte one.
+            //
+            // The predicate is §22.8's own, the one #3583 put at the `new`
+            // site, over the SAME constructor `emitChainCall` will select
+            // (`ctorForArgs(targetCls, call->args)` there for a positional
+            // chain). It answers false for a null target (the call goes
+            // straight to the primary — the #3523 shape, where this
+            // pre-population is still owed) and false for an imported base
+            // constructor (SEAM-DEBT #3625: no symbol-side channel carries a
+            // constructor body's chain form), so both keep today's behaviour.
+            //
+            // WHY `.fn` IS NOT ASKED HERE, unlike case (a)'s #3742 guard.
+            // That guard declines only for a resolved AND CALLABLE base
+            // constructor, because a resolved-but-not-callable one makes
+            // `emitImplicitBase` fall through without lowering anything and
+            // the pre-population still owes the arguments. This predicate has
+            // no such hole to cover: `ctorForArgs` is the SAME selector
+            // `emitChainCall` uses for a positional chain, and `emitChainCall`
+            // — unlike `emitImplicitBase` — has no callability precondition to
+            // fail; on a `ctorFns_` miss or a false `fillOmittedCtorArgs` it
+            // abandons the call, which would leave these slots calloc-zero.
+            // No program reaching that state was constructible: the target
+            // here is a LOCAL constructor (`ctorChainsViaThis` needs an
+            // `ast::ConstructorDecl` body), and a local constructor's function
+            // is declared for every class codegen emits. Recorded rather than
+            // guarded, because adding `.fn`'s callability test would re-admit
+            // the mispairing for exactly the shapes it is meant to exclude.
+            const bool baseCallChainsThis =
+                chainCall && !isThis && !chainCall->args.empty() &&
+                ctorChainsViaThis(ctorForArgs(baseTs, chainCall->args));
+            if (baseCallChainsThis) chainedPrimaryOwnsSlots = true;
+            if (chainCall && !isThis && !chainCall->args.empty() &&
+                !baseCallChainsThis) {
+                // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): install
+                // the §22.5 binding sema published for THIS `base(...)` call
+                // before anything below reads `fieldForArg` / `argForField`.
+                // This is the arm the issue names: the call binds the base's
+                // PRIMARY parameter list (the `ctorChainsViaThis` arm above
+                // has already taken every call that binds an explicit base
+                // constructor out of this path), and those parameters are
+                // exactly `basePosFields` — so a named argument names one of
+                // them and §22.5 binds it there, wherever it sits in the
+                // argument list.
+                if (const std::vector<int>* pub =
+                        ctx_.positionalBinding(*chainCall))
+                    baseFieldToArg = *pub;
                 // Temporarily bind ctor params to their values so that the
                 // chain-call arg expressions (which reference ctor params) can
                 // be evaluated correctly. Save and restore paramSlots_.
@@ -4708,18 +5213,30 @@ void Emitter::prePopulateBasePositionalFields(
                         paramSlots_[cs->params[pi]] = slot;
                     }
                 }
-                for (const auto& arg : chainCall->args) {
+                // §22.5 "Evaluation order": the SUPPLIED arguments are
+                // evaluated in call-site TEXTUAL order, "for positional and
+                // named arguments alike; naming an argument changes which
+                // parameter it binds to, never when it runs". So this loop
+                // stays in source order and `baseArgVals` stays source-
+                // indexed; only the STORE below is re-keyed by the binding.
+                for (std::size_t ai = 0; ai < chainCall->args.size(); ++ai) {
+                    const auto& arg = chainCall->args[ai];
                     if (!arg.value) { baseArgVals.clear(); break; }
                     llvm::Value* v = lowerExpr(*arg.value);
                     // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the explicit
                     // `base(...)`-chain face of the same gap — same reasoning
                     // and same pairing as the primaryBaseCtorArgs loop above.
-                    if (!v && baseArgVals.size() < basePosFields.size())
-                        v = unitValueForTarget(
-                            v,
-                            recordMemberTypeResolved(
-                                basePosFields[baseArgVals.size()]),
-                            arg.value.get());
+                    // fix #4484: the slot whose TYPE the §4.7 rescue must
+                    // read is the one §22.5 BINDS this argument to, not the
+                    // one at its source position — `base(u := C.Nothing(),
+                    // n := 1)` must rescue against the `u` slot's unit type.
+                    if (!v) {
+                        const std::size_t fi = fieldForArg(ai);
+                        if (fi < basePosFields.size())
+                            v = unitValueForTarget(
+                                v, recordMemberTypeResolved(basePosFields[fi]),
+                                arg.value.get());
+                    }
                     if (!v) { baseArgVals.clear(); break; }
                     baseArgVals.push_back(v);
                 }
@@ -4730,13 +5247,20 @@ void Emitter::prePopulateBasePositionalFields(
     }
 
     // Store the base-call arg values into the base's positional-param field slots.
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the pairing is
+    // `argForField` — the §22.5 binding when sema published one for this base
+    // call, the textual-order `argument i ↔ field i` otherwise. This loop used
+    // to run `for i in [0, min(baseArgVals.size(), basePosFields.size()))` and
+    // store `baseArgVals[i]` into `basePosFields[i]`, which is the same thing
+    // for an all-positional call and a wrong-slot store for a named one.
     llvm::StructType* baseSt = classStruct(baseTs);
-    std::size_t numToStore = std::min(baseArgVals.size(), basePosFields.size());
-    for (std::size_t i = 0; i < numToStore; ++i) {
+    for (std::size_t i = 0; i < basePosFields.size(); ++i) {
+        const int ai = argForField(i);
+        if (ai < 0) continue;
         sema::FieldSymbol* fs = basePosFields[i];
         auto idxIt = fieldIndex_.find(fs);
         if (idxIt == fieldIndex_.end()) continue;
-        llvm::Value* v = baseArgVals[i];
+        llvm::Value* v = baseArgVals[static_cast<std::size_t>(ai)];
         if (!v) continue;
         llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
         v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
@@ -4761,20 +5285,55 @@ void Emitter::prePopulateBasePositionalFields(
     // The `int` twin was non-fatal and therefore worse — it read back 0 rather
     // than the declared default, compiling clean.
     //
-    // The two arms above supply slots `[0, numToStore)` and never a later one:
-    // both evaluate the base call's arguments left to right, and a base call
-    // with NAMED arguments publishes no binding at this site, so it produces no
-    // `baseArgVals` at all and reaches this loop with `numToStore == 0` — which
-    // is the correct conservative answer for it (a named base call that omits a
-    // default is the pre-existing named-arg chain-binding gap, filed separately;
-    // filling every slot from its default would be wrong there, and this loop
-    // does not, because a required slot has no default to fill from).
+    // WHICH SLOTS THIS LOOP OWES. Every slot the base call did not SUPPLY,
+    // which `argForField` answers per slot.
+    //
+    // ⚠ fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306) corrects what this
+    // paragraph used to assert. It said "a base call with NAMED arguments
+    // publishes no binding at this site, so it produces no `baseArgVals` at
+    // all and reaches this loop with `numToStore == 0`". That was FALSE of
+    // case (b): the explicit `base(...)` chain arm above lowers
+    // `chainCall->args` unconditionally, named or not, so a
+    // named base call arrived here with a FULL `baseArgVals` that the store
+    // loop then paired by textual position. ⚠ fix #4491 removes the other
+    // half of that sentence too: case (a) — the §22.10 inheritance clause —
+    // lowers ITS arguments unconditionally as well, and now publishes a
+    // binding of its own (`SemaContext::inheritanceClauseBinding`), so
+    // "no `SemaContext` binding at all" no longer describes it either.
+    // Measured on 4d9d186a, `base(s :=
+    // "x", n := 1)` against `class B(n: int, s: string)` printed `4627856`
+    // for `n` — the low 32 bits of the string pointer — and SIGSEGVed in
+    // `bz_string_to_utf8z` dereferencing the integer `1` as a string; with a
+    // `decimal` in the trailing slot the same mispairing is a clean
+    // "heap-buffer-overflow … WRITE of size 16 … 11 bytes after 32-byte
+    // region" (issue 4484). The comment described ONE arm as though it
+    // described the function, which is how the defect stayed hidden through
+    // #3562's work on the very same lines.
+    //
+    // Since #4484 the supplied slots are whatever §22.5 bound, so they are no
+    // longer necessarily a prefix `[0, numToStore)` — `base(s := "x")`
+    // against `class B(n: int := 1, s: string)` supplies slot 1 and owes slot
+    // 0 its default. This loop therefore asks `argForField` per slot instead
+    // of starting at a watermark. For a call sema declined to bind, or an
+    // all-positional one, `argForField` answers exactly the old watermark.
     //
     // Runs BEFORE the `baseArgVals.empty()` early return on purpose: a `base()`
     // with no arguments at all into a base whose positional parameters are ALL
     // defaulted is exactly the same defect (measured: SEGV), and it produces no
     // `baseArgVals`.
-    for (std::size_t i = numToStore; i < basePosFields.size(); ++i) {
+    // fix #3562 (§22.5 / §22.8 step 0 / §22.10, v0.306): ...but NOT for a
+    // base call whose chained-to primary runs step 0 for these slots — see
+    // `chainedPrimaryOwnsSlots` above. Measured on the intermediate state that
+    // suppressed only the argument stores, with `class B(n: int, k: int :=
+    // Counter.Next())` reached through `constructor(w: int, v: int) this(v);`
+    // from `base(9, 3)`: `k=2 cnt=2` where §22.8 step 1 admits one evaluation
+    // and `k=1 cnt=1`. The `owned` form of the same default (§22.5 admits a
+    // factory returning an owned instance) leaked the first object outright —
+    // "LeakSanitizer: 16 byte(s) in 1 object(s)" — because the second store
+    // overwrote it before any destructor could run.
+    for (std::size_t i = 0;
+         !chainedPrimaryOwnsSlots && i < basePosFields.size(); ++i) {
+        if (argForField(i) >= 0) continue;  // supplied — fix #4484
         sema::FieldSymbol* fs = basePosFields[i];
         auto idxIt = fieldIndex_.find(fs);
         if (idxIt == fieldIndex_.end()) continue;
@@ -4800,6 +5359,20 @@ void Emitter::prePopulateBasePositionalFields(
     // Recurse: the base class itself may also have a base with positional params
     // (e.g. C(z): B(z): A(z) — B's and A's params both need pre-population).
     // Find what ctor symbol the base class has (if any) for use in recursion.
+    //
+    // fix #4484 note: `baseArgVals` is handed down in SOURCE order, which the
+    // recursion's own case (b) would bind to `baseCs->params[pi]` by position.
+    // That is NOT re-keyed by the §22.5 binding above, deliberately: the shape
+    // is unreachable. `baseCs` is non-null only when the base declares an
+    // explicit non-static constructor of this arity, and sema publishes a
+    // binding for this call only when it declares NONE (see
+    // `publishBaseChainPrimaryBinding`) — so whenever `baseFieldToArg` is
+    // non-empty, `baseCs` is null and `ctorArgVals` goes unread one level
+    // down. Widening the pairing here on an unreachable path would be an
+    // untestable change. fix #4491 note: the clause arm's publication gate is
+    // the SAME arity question (no explicit non-static base constructor of the
+    // clause's arity, see `ExprTC::visitTopDecl`), so the argument holds
+    // unchanged now that case (a) can also fill `baseFieldToArg`.
     const sema::ConstructorSymbol* baseCs = nullptr;
     if (!baseArgVals.empty()) {
         baseCs = ctorByArity(baseTs, baseArgVals.size(), nullptr);
@@ -6397,6 +6970,24 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         if (!v->getType()->isIntegerTy(32))
                             v = builder_.CreateTrunc(v, i32());
                         maxCount = v;
+                        // fix #4445 (stdlib §6.3, v0.302): guard the two-arg
+                        // constructor's ArgumentException contract —
+                        //   max < 1 → ArgumentException
+                        //   initial > max → ArgumentException
+                        // (The one-arg form defaults max to INT_MAX, so both
+                        // conditions are inert and never reach here.) Thrown
+                        // BEFORE allocation, so no semaphore leaks on the
+                        // guard path. Mirrors the Channel(capacity) guard
+                        // (v0.174 / #809, just above in this block).
+                        emitGuardThrow(
+                            builder_.CreateOr(
+                                builder_.CreateICmpSLT(maxCount,
+                                                       builder_.getInt32(1),
+                                                       "sem.max.bad"),
+                                builder_.CreateICmpSGT(initCount, maxCount,
+                                                       "sem.init.bad"),
+                                "sem.bad"),
+                            "ArgumentException");
                     }
                 }
                 auto* allocFn = declareC("bz_semaphore_new",
@@ -10774,7 +11365,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 llvm::AllocaInst* slot = entryAlloca(inner->getType());
                 builder_.CreateStore(inner, slot);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
             // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
@@ -10814,13 +11405,13 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 builder_.CreateBr(ubContBB);
                 builder_.SetInsertPoint(ubContBB);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             } else {
                 llvm::AllocaInst* slot = entryAlloca(scrut->getType());
                 builder_.CreateStore(scrut, slot);
                 if (!disposeStack_.empty())
-                    declScopeDepth_[bp] = disposeStack_.size();
+                    recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
             }
         }
@@ -10862,7 +11453,63 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // mismatch — the same fix lowerConditional applies to `if` branches.
         bool armDiv = diverged_;
         if (!armDiv) {
-            if (!v) return nullptr;
+            // fix #4469 (§19.7, v0.306): a void/unit-typed arm body
+            // (`(case … of Inner.IOk(var c) => Console.WriteLine(...), …)`
+            // where every arm is a void-returning call) yields `v == nullptr`
+            // from lowerExpr — the void-result normalization at
+            // LlvmBackend_Exprs.cpp:90 collapses the call's `void` typed
+            // result to a sentinel null. Pre-fix the `if (!v) return nullptr`
+            // here bailed out of lowerCaseExpr BEFORE the deferred
+            // `CreateBr(endBB)` loop fired, leaving the inner `case.end`
+            // basic block empty (no terminator) AND the second-and-later
+            // arms never processed. The outer `lowerCaseStmt`'s
+            // `if (!armTerm) builder_.CreateBr(endBB)` then branched FROM
+            // wherever the void call's lowering had left the insert point
+            // (the cat.* machinery's last block, e.g. cat.done70) TO the
+            // outer `casestmt.end` — which is well-formed for the outer
+            // stmt, but the inner case.expression's `case.end` was left
+            // dangling and the IR verifier rejected it. Mirror
+            // lowerConditional's void handling (§17): let the arm be
+            // recorded in `incomings` with a void placeholder so the
+            // deferred branch fires, and skip PHI construction below
+            // (`void` is not a first-class type and cannot form a PHI).
+            if (!v) {
+                if (resultTy && resultTy->isVoidTy()) {
+                    // void result: record the arm's convergence block so
+                    // the deferred branch fires; v itself stays null.
+                    incomings.push_back(
+                        {nullptr, builder_.GetInsertBlock()});
+                    diverged_ = false;
+                    builder_.SetInsertPoint(nextBB);
+                    continue;
+                }
+                // fix #4469 (§19.7, v0.306): a case-expression used in
+                // statement position — its arm body is `Console.WriteLine(...)`
+                // or any other void-returning call — lowers to a null `v`
+                // (the void sentinel at LlvmBackend_Exprs.cpp:90). sema does
+                // not record an exprType on the case expression when every
+                // arm body is Unit/void (§19.2's "no common type, no
+                // recording" rule), so resultSemaTy is null and resultTy
+                // defaults to i32 above — `resultTy->isVoidTy()` is false.
+                // Without this path the `if (!v) return nullptr` here bails
+                // out of lowerCaseExpr BEFORE the deferred
+                // `CreateBr(endBB)` loop fires, leaving `case.end` with
+                // no predecessors and the second-and-later arms never
+                // processed — the IR verifier rejects `case.end` as
+                // unterminated. Promote `resultTy` to void for this case
+                // expression and proceed exactly like the explicit-void
+                // arm above. (The PHI construction is skipped at the end
+                // by the existing post-loop `resultTy->isVoidTy()` guard.)
+                if (!resultSemaTy && !resultTy->isVoidTy()) {
+                    resultTy = llvm::Type::getVoidTy(llvm_);
+                    incomings.push_back(
+                        {nullptr, builder_.GetInsertBlock()});
+                    diverged_ = false;
+                    builder_.SetInsertPoint(nextBB);
+                    continue;
+                }
+                return nullptr;
+            }
             if (resultTy)
                 v = coerceNumericToType(v, resultTy,
                                         isUnsignedTargetExpr(*arm.exprBody));
@@ -11072,6 +11719,11 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             bool hasNullPtr = false, hasNonPtr = false;
             llvm::Value* nonPtrSample = nullptr;
             for (auto& [v, bb] : incomings) {
+                // fix #4469: void-returning arms contribute a null `v` (the
+                // void sentinel); they have no LLVM type and skip the
+                // widen-vs-mismatch classification entirely. The void-IR
+                // branch at line 11213 below handles them.
+                if (!v) continue;
                 if (isNullPtr(v)) { hasNullPtr = true; }
                 else if (!v->getType()->isPointerTy()) {
                     // A genuine non-pointer VALUE arm (bare scalar/struct) — the
@@ -11123,6 +11775,51 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     }
 
     builder_.SetInsertPoint(endBB);
+    llvm::PHINode* phi = nullptr;
+    if (incomings.empty()) {
+        // CG40: every arm diverged — endBB has no predecessors and the caller
+        // emits nothing into it; an empty block is malformed IR. Cap with
+        // `unreachable` and report divergence, exactly as lowerConditional does.
+        builder_.CreateUnreachable();
+        diverged_ = true;
+        return llvm::PoisonValue::get(resultTy);
+    }
+    // fix #4469: a unit/void-typed case expression (§4.7) has every arm
+    // yielding a null `v` (the void sentinel from lowerExpr's
+    // normalization at LlvmBackend_Exprs.cpp:90) and the case's §20
+    // result type is `void` — void is NOT a first-class type and cannot
+    // form a PHI. Skip PHI construction AND the resultSlot/scrutEndBB
+    // dance (they assume a non-void PHI result to thread through a slot
+    // for the dispose-call register-clobber); emit the normal-edge
+    // scrut dispose and a fresh scrutEndBB terminator if there IS an
+    // owned scrutinee (the dispose still runs), then return nullptr.
+    // endBB has predecessors from the deferred-branch loop above, so the
+    // IR is well-formed — the case-expression-as-statement-position
+    // ExpressionStmt shape the issue measured.
+    if (resultTy && resultTy->isVoidTy()) {
+        if (ce.scrutinee && scrutOwnedSlot) {
+            llvm::Value* scrutVal = builder_.CreateLoad(
+                ptrTy(), scrutOwnedSlot, "casescrut.load");
+            if (!scrutOwnIsOwningCollection)
+                emitDisposeAndReclaim(scrutVal);
+            else
+                freeUnboundOwnedOwningCollectionTemp(scrutVal, scrutTy);
+            if (!disposeStack_.empty()) {
+                auto& scope = disposeStack_.back();
+                for (auto it = scope.begin(); it != scope.end(); ++it) {
+                    if (it->slot == scrutOwnedSlot) {
+                        scope.erase(it);
+                        break;
+                    }
+                }
+            }
+            auto* scrutEndBB = llvm::BasicBlock::Create(
+                llvm_, "casescrut.end", currentFn_);
+            builder_.CreateBr(scrutEndBB);
+            builder_.SetInsertPoint(scrutEndBB);
+        }
+        return nullptr;
+    }
     // K8 full-expression boundary (#1795): dispose the case-scrutinee owned
     // temporary on the normal edge. The scrut slot holds a fresh non-null
     // pointer (always populated by the store registered above) so the dispose
@@ -11141,16 +11838,6 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         resultSlot = entryAlloca(incomings[0].first->getType());
     }
 
-    builder_.SetInsertPoint(endBB);
-    llvm::PHINode* phi = nullptr;
-    if (incomings.empty()) {
-        // CG40: every arm diverged — endBB has no predecessors and the caller
-        // emits nothing into it; an empty block is malformed IR. Cap with
-        // `unreachable` and report divergence, exactly as lowerConditional does.
-        builder_.CreateUnreachable();
-        diverged_ = true;
-        return llvm::PoisonValue::get(resultTy);
-    }
     phi = builder_.CreatePHI(incomings[0].first->getType(),
                              incomings.size());
     for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);
@@ -11407,8 +12094,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 // capture-cell lifetime at the arm scope, not at
                                 // the nested block that first captures it.
                                 if (!disposeStack_.empty())
-                                    declScopeDepth_[sp.nakedAnchor.get()] =
-                                        disposeStack_.size();
+                                    recordDeclScopeDepth(  // fix #4523
+                                        sp.nakedAnchor.get());
                                 locals_[sp.nakedAnchor.get()] = slot;
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
@@ -11420,7 +12107,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 // capture-cell lifetime at the arm scope, not at
                                 // the nested block that first captures it.
                                 if (!disposeStack_.empty())
-                                    declScopeDepth_[vbp] = disposeStack_.size();
+                                    recordDeclScopeDepth(vbp);  // fix #4523
                                 locals_[vbp] = slot;
                             } else if (sp.pattern) {
                                 // fix #3902 / §35.5: a REFUTABLE payload slot
@@ -13079,8 +13766,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
                     builder_.CreateStore(fv, slot);
                     if (!disposeStack_.empty())
-                        declScopeDepth_[sp.nakedAnchor.get()] =
-                            disposeStack_.size();
+                        recordDeclScopeDepth(  // fix #4523
+                            sp.nakedAnchor.get());
                     locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {

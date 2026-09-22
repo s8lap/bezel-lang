@@ -153,6 +153,17 @@ public:
         const std::vector<const ast::Type*>& argAsts,
         const std::vector<TypeRef*>& argRefs, TypeSymbol* tsym);
 
+    // fix #4465: flush any deferred type-bound failures accumulated by the
+    // immediately preceding checkGenericConstraintsAtUseSite call on THIS
+    // Resolver. The deferred failures are normally reported by
+    // recheckDeferredTypeBounds on the resolveTypes-time Resolver after all
+    // base sets are populated, but when checkGenericConstraintsAtUseSite runs
+    // on a temporary Resolver in ExprTC (checkGenericConstraintsAtExpr), that
+    // Resolver is discarded without ever flushing — so the deferred failures
+    // are silently dropped. This public flush is called from the ExprTC path
+    // only, after all types are fully resolved, so rechecking now is safe.
+    void flushDeferredTypeBoundFailures();
+
     // §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
     // #3290): value-site pass for `static readonly` fields/auto-properties
     // whose declared type is a borrow-bearing record, a non-owning choice
@@ -523,6 +534,17 @@ private:
     // values" — the declaration-side premise of the positional-only index-
     // argument rule (A.4 IndexerDecl records the ParamList over-admission).
     void checkIndexerParamDefaults();
+    // fix #4494 (§22.5 "Defaults and modifiers", v0.306): "Every parameter
+    // after the first defaulted parameter must itself have a default." Runs
+    // over every LOCAL formal list that admits a default, reading the rule's
+    // two facts through `sema::FormalsView` — the same view the §22.5 binder
+    // runs on. See the definition in TypeResolution_Checks.cpp for what it
+    // covers and what it deliberately does not.
+    void checkParamDefaultOrdering();
+    void checkParamListDefaultOrdering(sema::FormalsView params,
+                                       const std::vector<SourceLocation>& locs,
+                                       const std::string& what,
+                                       SourceLocation fallback);
 
     // §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains enforcement.
     //   Rule 2: a mutable (non-readonly, non-const) static field or static
@@ -591,12 +613,46 @@ private:
     // this predicate is precisely the skew #1463 was about.
     static bool isBareGenericParamBinding(const TypeRef* bound,
                                           const ast::Type* boundAst);
+    // fix #2742 (§3.6 rule 2 / §14.1, v0.306) — the #2713 MISATTRIBUTION
+    // guard, as ONE predicate instead of three hand-inlined copies.
+    //
+    // Every deferred per-instantiation obligation is recorded as a bare
+    // parameter NAME plus `currentOuterType_`, and re-read in a Pass 2 that
+    // resolves that name against the ENCLOSING TYPE's `genericParams` and
+    // walks `instantiations_`. A generic METHOD may declare a type parameter
+    // that SHADOWS one of the enclosing type's — `class Box<T>` with
+    // `method M<T>()` — and nothing forbids it: Appendix A.3's
+    // `GenericParam ::= Variance? Identifier` imposes no uniqueness, and
+    // there is no shadowing diagnostic in sema or the parser. Inside such a
+    // method the name denotes the METHOD's parameter, whose bindings
+    // `instantiations_` knows nothing about, so recording the site validates
+    // the method's `T` against the TYPE's — a different binding entirely.
+    //
+    // A method parameter that does NOT shadow is skipped by the same test,
+    // which is correct for the same reason (generic-method bindings are not
+    // in `instantiations_` at all); that residual is #2736(a).
+    //
+    // Returns true when `name` is bound by the generic method currently being
+    // resolved, i.e. "do NOT record this site". False outside a method
+    // signature/body, and false for a method that declares no type parameters.
+    bool nameBoundByCurrentMethod(std::string_view name) const;
     // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): Pass 2 for the owning-
     // collection element check.  The declaration-site check in resolveType()
     // admits a bare generic parameter; this walks the recorded instantiations of
     // the enclosing generic type and re-checks the concrete binding, reporting
     // at the instantiation site per §3.6 rule 2.
     void checkOwningElementInstantiations();
+
+    // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735) — the CROSS-MODULE
+    // half of the recorder above. `owningElementSites_` is populated while
+    // resolving THIS compilation's own type bodies, so an IMPORTED generic
+    // (which has no AST here at all) never got a site and Pass 2 had nothing
+    // to walk. This synthesizes the missing sites from `tsym`'s reconstructed
+    // member surface — the #3147 channel, no new module metadata — so Pass 2
+    // answers the cross-module case with the SAME predicate and diagnostic.
+    // Scanned once per imported TypeSymbol (importedOwningElementScanned_).
+    void recordImportedOwningElementObligations(TypeSymbol* tsym,
+                                                const ast::Type& site);
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
     // degenerate-`as`-target rule at a TYPE-level generic parameter. The
@@ -698,6 +754,16 @@ private:
     static bool isOverloadable(Symbol* m);
 
     void checkTypeDuplicates(TypeSymbol* t);
+
+    // fix #4444 (§35.1, v0.302): walk a Choice's cases and reject any case
+    // whose name is `Equals`/`GetHashCode`/`ToString`. The reservation holds
+    // on every classification, independent of whether a member of that name
+    // is declared (the §35.7 remedy is to *declare* the member — only choices
+    // that need it can land on the name; keying on synthesis would reintroduce
+    // the defect). The duplicate-walk above already covers DECLARED-vs-CASE
+    // collisions (§11.3 / choice-cases-count-as-members); this reservation is
+    // its §35.1 sibling.
+    void checkChoiceCaseReservedNames(const TypeSymbol* t);
 
     // Slice S12: DFS over baseTypes; if we revisit a node already in
     // the current path, report a cycle anchored at the offending
@@ -888,8 +954,15 @@ private:
     // instantiation head per §26.4 — that head name (`Array`) must NOT be
     // bound as a free type parameter; instead we recurse into its own
     // generic args to find any nested bare identifiers.
+    //
+    // `functionSlotDiagReported` is threaded through the recursion
+    // (#4448, v0.303) so the §26.4 function-slot diagnostic fires
+    // EXACTLY ONCE per extension head, even when function-type slots
+    // are nested under multiple generic-instantiation heads
+    // (`extension IEnumerable<Array<(T) -> T>>`).
     void bindExtensionTargetTypeParams(const ast::Type& target,
-                                        Scope& extScope, Scope* parent);
+                                        Scope& extScope, Scope* parent,
+                                        bool& functionSlotDiagReported);
 
     // fix #4144 (§26.2, v0.295): reject an ExtensionDecl whose resolved
     // target kind is outside §26.2's closed extendable list (a nullable
@@ -1372,6 +1445,14 @@ private:
         TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
     };
     std::vector<OwningElementSite> owningElementSites_;
+
+    // fix #2735: imported generic TypeSymbols whose member surface has already
+    // been swept by recordImportedOwningElementObligations(). The sweep is a
+    // property of the TYPE, not of the instantiation site, so a dependency
+    // instantiated at twenty sites must not push twenty identical obligations
+    // (Pass 2 would collapse them via its `reported` key, but the quadratic
+    // site x instantiation walk would not).
+    std::set<TypeSymbol*> importedOwningElementScanned_;
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): one `x as T` in a
     // generic body whose target is a bare type parameter OF THE ENCLOSING TYPE.

@@ -58,9 +58,40 @@ SLICE=bezel-heavy.slice
 # base; overcommit caused kernel OOM). New envelope leaves ~9G headroom for
 # system + interactive + Claude, while still fitting 1 gate suite + 1 gate
 # build under the cap.
+# ManagedOOMMemoryPressure=auto opts this slice out of Fedora's per-slice default
+# (/usr/lib/systemd/user/slice.d/10-oomd-per-slice-defaults.conf sets kill@80% on
+# EVERY user slice). Without it systemd-oomd can kill the whole slice mid-gate and
+# the run reads it as a shard crash. MemoryMax below is the real bound: a runaway
+# is contained by the cgroup limit, which is more precise than an oomd slice kill.
 systemctl --user set-property "$SLICE" \
   CPUQuota=1800% CPUWeight=60 MemoryHigh=18G MemoryMax=22G IOWeight=50 \
+  ManagedOOMMemoryPressure=auto \
   >/dev/null 2>&1 || true
+
+# fix #4536: the suite crashes ON PURPOSE — SIGSEGV repro programs, ASan aborts,
+# the crash-isolation rows, and every `--full` shard that trips a sanitizer. Each
+# such crash was paying a core-dump write plus compression through
+# `kernel.core_pattern = |/usr/lib/systemd/systemd-coredump`, and on a KDE box
+# also spawning a `drkonqi-coredump` handler that never exits. Measured on
+# 2026-09-21: **335 dumps / 1.9 GB in one day**, and 16 resident handlers holding
+# 698 MB that had been alive 14 hours.
+#
+# RLIMIT_CORE is inherited, and `systemd-run --scope` EXECS the command as a child
+# of this shell (the manager does not fork it), so setting it here reaches the test
+# binary and every program it forks. Verified: `( ulimit -c 0; systemd-run --user
+# --scope -q -- sh -c 'ulimit -c' )` prints 0.
+#
+# NOT set for `build`: a compiler ICE is the one crash here whose core might be
+# worth having. And this only binds ops routed through THIS script — running a
+# test binary directly in your shell still dumps, which is what you want while
+# debugging. `BEZEL_KEEP_CORES=1` restores dumping without editing anything.
+#
+# systemd-run's `-p LimitCORE=0` does NOT work here: scopes reject exec-related
+# properties ("Unknown assignment: LimitCORE=0"), because the caller execs the
+# process rather than the manager. The ulimit is the mechanism that applies.
+if [ "$kind" != build ] && [ "${BEZEL_KEEP_CORES:-0}" != 1 ]; then
+  ulimit -c 0 2>/dev/null || true
+fi
 
 case "$kind" in
   build)
@@ -81,8 +112,16 @@ case "$kind" in
     # 10G has ample headroom for the page-cache file mapping.
     cw=10000; iw=800; mem="${BEZEL_SUITE_MEM:-10G}" ;;
   *)
-    # probe: tiny; outside the slice, its own small cage, no accounting overhead.
-    exec systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
+    # probe: tiny; its own small cage, separate accounting from the heavy ops.
+    # It must still NOT default into app.slice: that is where the interactive
+    # terminal and the Claude session live, and probe pressure there gets THEM
+    # killed by systemd-oomd rather than the probe (three konsole tabs died this
+    # way on 2026-09-20, one taking a running gate with it). Give probes their own
+    # slice, likewise opted out of the kill-on-pressure default.
+    systemctl --user set-property bezel-probe.slice \
+      MemoryMax=6G ManagedOOMMemoryPressure=auto >/dev/null 2>&1 || true
+    exec systemd-run --user --scope -q -p Slice=bezel-probe.slice \
+      -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
 esac
 
 exec systemd-run --user --scope -q \

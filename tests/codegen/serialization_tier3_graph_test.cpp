@@ -36,6 +36,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
 #include "support/aot_support.hpp"   // runAot (JIT->AOT migration, §9.8 graph tests)
+#include "support/run_under_asan.hpp"  // runUnderAsanValue (#3653 shared ASan leg)
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -67,56 +68,24 @@ bool compileFails(const std::string& src) {
     return r.diagnostics.hasErrors() && !r.ran;
 }
 
-// Compile `source` to a native object file, link with ASan runtime, run.
-// Returns 0 (clean), 1 (sanitizer triggered), or -1 (toolchain unavailable/skip).
-int runUnderLeakSanitizer550t3(const std::string& source, bool detectLeaks = true) {
-    namespace fs = std::filesystem;
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;
-
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_550t3_lsan_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=") +
-        (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -3;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
-    return 0;                                                       // clean
+// Compile `source` under -fsanitize=address, link, run with detect_leaks=1,
+// and check BOTH the sanitizer verdict AND the program's own exit value.
+// Returns 0 (clean and the expected value), 1 (sanitizer report / crash /
+// wrong value), -1 (toolchain unavailable: SKIP), or -2/-3/-4 (the leg's own
+// build/link/exec broke — reported loudly via `[ INFRA ]`, per #4563).
+//
+// Forwards to the ONE shared Family-A implementation (#3653). The hand-rolled
+// copy this replaces differed from it in two ways that both cost coverage:
+// it never looked at the program's exit value, so the §9.8 identity checks the
+// two rows below encode (`return 91` / `92` / `93`) could all have fired while
+// the row still reported ASan-clean; and it put the object file and the linked
+// executable under `fs::temp_directory_path()` — /tmp, the tmpfs CLAUDE.md
+// forbids for scratch (tests/support/scratch_dir.hpp records the EDQUOT pile
+// that produced that rule). `runUnderAsanValue` checks the value and uses
+// `wtScratchDir()`.
+int runUnderLeakSanitizer550t3(const std::string& source, int expectedExitCode) {
+    return bezel::test::runUnderAsanValue(source, expectedExitCode,
+                                          "bezel_550t3_lsan");
 }
 
 // Preamble for all BinarySerializer tests (§2.15: requires import).
@@ -322,6 +291,21 @@ BEZEL_TEST(codegen_serialization_t3_graph,
 // §9.8: graph round-trip with back-edge is ASan/LeakSanitizer clean.
 // Uses the native AOT path (runUnderLeakSanitizer550t3) to verify no leaks
 // from the tag-table allocations in bz_binser_t / bz_binder_t.
+//
+// Construction pattern (§28.3 / §28.5, v0.306) — the same reshape the two
+// round-trip rows above already carry: the back-edge is wired inside a
+// one-arg convenience constructor, where the borrow SOURCE is the receiver
+// (`this.Target`), which §28.3's holder-kind-conditioned borrowed-field store
+// rule admits with a recorded trust clause. The former serialize-side
+// `hub.Alias := hub.Target;` sourced the borrow from the scope-bound local
+// `hub`, which that rule rejects ("borrow of `hub` stored into a field would
+// outlive its source"), so this program did not build at all — and because the
+// leg's build failure returned the same silent -1 as "no ASan toolchain", the
+// row reported [ OK ] while running no sanitizer at all. #4563 gave that
+// outcome its own code (-2) and an `[ INFRA ]` marker, which is what surfaced
+// it. The two-arg ctor is kept for §9.8 Deserialize (it binds the plain-borrow
+// back-edge as a ctor arg from the tag table); the one-arg ctor is not a §9.8
+// selection match, so selection stays unambiguous. Wire form unchanged.
 BEZEL_TEST(codegen_serialization_t3_graph,
            graph_back_edge_asan_clean_spec_9_8) {
     const std::string src =
@@ -336,10 +320,12 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "  public constructor(owned target: Slot, alias: Slot?) "
         "    Target := move target; Alias := alias; "
         "  end constructor; "
+        "  public constructor(owned target: Slot) "
+        "    Target := move target; Alias := Target; "   // receiver-sourced (§28.5)
+        "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
-        "  using var hub := new Hub(new Slot(\"hello\"), null); "
-        "  hub.Alias := hub.Target; "
+        "  using var hub := new Hub(new Slot(\"hello\")); "
         "  using var s := new BinarySerializer(); "
         "  hub.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
@@ -347,10 +333,14 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "  using var hub2 := Hub.Deserialize(d); "
         "  if hub2.Target.Name <> \"hello\" then return 91; end; "
         "  if hub2.Alias = null then return 92; end; "
+        // Identity preserved across the round-trip through the back-edge: the
+        // $ref resolves to the SAME constructed Slot, not a duplicate (§9.8).
+        "  if hub2.Alias?.Name <> \"hello\" then return 93; end; "
         "  return 42; "
         "end Main; end C;";
-    int rc = runUnderLeakSanitizer550t3(src, /*detectLeaks=*/true);
-    // -1 = toolchain unavailable (skip); 0 = clean; 1 = sanitizer triggered.
+    int rc = runUnderLeakSanitizer550t3(src, /*expectedExitCode=*/42);
+    // -1 = toolchain unavailable (skip); 0 = clean AND returned 42; 1 =
+    // sanitizer report, crash, or a §9.8 identity check that fired.
     BEZEL_EXPECT_TRUE(rc == 0 || rc == -1);  // ASan verdict: clean (or skip)
 }
 
@@ -388,10 +378,16 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "  public constructor(owned target: Slot, alias: Slot?) "
         "    Target := move target; Alias := alias; "
         "  end constructor; "
+        // Same §28.3/§28.5 receiver-sourced reshape as the row above: the
+        // back-edge is wired where its borrow source is `this`, not a
+        // scope-bound local. The former `hub.Alias := hub.Target;` in Main did
+        // not compile, so this row's sanitizer leg never ran (#4563).
+        "  public constructor(owned target: Slot) "
+        "    Target := move target; Alias := Target; "
+        "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
-        "  using var hub := new Hub(new Slot(\"x\"), null); "
-        "  hub.Alias := hub.Target; "
+        "  using var hub := new Hub(new Slot(\"x\")); "
         "  using var s := new BinarySerializer(); "
         "  hub.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
@@ -399,11 +395,12 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var hub2 := Hub.Deserialize(d); "
         "  if hub2.Target.Name <> \"x\" then return 91; end; "
+        "  if hub2.Alias?.Name <> \"x\" then return 92; end; "
         "  return 42; "
         "end Main; end C;";
     // Run under ASan to verify clean memory behaviour on the success path.
     // The full truncated-input path is tested at the bz_binder_read_graph_marker
     // unit level (returns 0 on EOF, codegen raises SerializationException).
-    int rc = runUnderLeakSanitizer550t3(src, /*detectLeaks=*/true);
+    int rc = runUnderLeakSanitizer550t3(src, /*expectedExitCode=*/42);
     BEZEL_EXPECT_TRUE(rc == 0 || rc == -1);
 }

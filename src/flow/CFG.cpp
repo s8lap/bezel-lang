@@ -994,6 +994,37 @@ private:
 
 } // namespace
 
+// prep #4146 Stage 2-A (§28.3, v0.298): build a CFG for a lambda body.
+// Block-bodied lambdas: walks `lam->stmts` with the Builder, same as buildCFG.
+// Expression-bodied lambdas: creates a single Linear block that holds the
+// `exprBody` and connects it to the exit — the expression's value is the
+// lambda's implicit return value, and recording it in the block is sufficient
+// for ownership analysis to reach every sub-expression position.
+std::unique_ptr<CFG> CFG::buildLambdaBodyCFG(
+    const ast::LambdaExpr* lam,
+    const CFGBuildOptions& opts) {
+    auto cfg = std::make_unique<CFG>();
+    Builder builder(*cfg, opts.treatTryAsOpaque);
+    CFGBlock* end = nullptr;
+    if (lam->isBlockBody) {
+        end = builder.build(lam->stmts);
+    } else {
+        // Expression-bodied lambda: create a synthetic block that records the
+        // expression's await sites (if any) and links to exit. The expression
+        // is the implicit return value; ownership analysis reaches it through
+        // the block's stmt list exactly as it reaches every other expression
+        // position in a Linear block.
+        CFGBlock* block = cfg->makeBlock(CFGBlock::Kind::Linear);
+        cfg->addEdge(cfg->entry(), block);
+        recordAwaitsInExpr(*cfg, block, lam->exprBody.get());
+        end = block;
+    }
+    if (end) {
+        cfg->addEdge(end, cfg->exit());
+    }
+    return cfg;
+}
+
 std::unique_ptr<CFG> buildCFG(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     bool treatTryAsOpaque) {

@@ -1176,11 +1176,23 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     }
 
     // Dispatch: compare namePtr against each component's wire name.
-    // Use bz_string_compare (runtime ordinal comparison) to test equality.
-    // We need the wire-name string lengths too for the C comparison function:
-    //   bz_string_compare(a_data, a_len, b_data, b_len) → i32
-    auto* cmpFn = declareC("bz_string_compare", i32(),
-                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    // Use bz_str_compare_cp (the runtime's ordinal, code-point-wise string
+    // comparison) to test equality: bz_str_compare_cp(a, b, ignoreCase) → i32.
+    // fix #4487 (stdlib §9.6 + spec §9.8, v0.306): the wire-name dispatch is an
+    // EQUALITY test (`cmp == 0`) and `ignoreCase` is always 0 here — §9.8:
+    // "Names are compared ORDINALLY". It used to extract (data, len) from each
+    // side and call `bz_string_compare`, which walked `min(len)` BYTES over a
+    // CODE-POINT length (the #535 defect class), so two distinct non-ASCII
+    // names sharing their first `len` STORAGE bytes matched each other.
+    // `bz_binder_read_string` decodes the wire's UTF-8 into a width-aware
+    // bz_string, so both operands here really can be width 2/4. Measured on
+    // HEAD (4d9d186a): an enum with `serialized "日本"` and `serialized "日x"`
+    // round-tripped the SECOND constant back as the FIRST, because both are
+    // width 2 and share the storage bytes `E5 65`. `bz_str_compare_cp` takes
+    // the string OBJECTS, so each is decoded at its own width. Nothing changes
+    // for an ASCII wire name, which is every name this suite writes today.
+    auto* cmpFn = declareC("bz_str_compare_cp", i32(),
+                           {ptrTy(), ptrTy(), i32()});
 
     // Build dispatch blocks.
     auto* skipBB = llvm::BasicBlock::Create(llvm_, "deser.skip", currentFn_);
@@ -1199,21 +1211,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         llvm::Value* litStr = lowerStringLiteral(
             std::string("\"") + wn + "\"", false);
 
-        // For the comparison: bz_string_compare needs (data, len) for both sides.
-        // Extract data (field 0) and len (field 1) from both namePtr and litStr.
-        // bz_string layout (stringType()): {ptr data, i64 len, i8 width, i64 rc}.
-        auto* strTy = stringType();
-        llvm::Value* litData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, litStr, 0), "lit.data");
-        llvm::Value* litLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, litStr, 1), "lit.len");
-        llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, namePtr, 0), "name.data");
-        llvm::Value* nameLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, namePtr, 1), "name.len");
-
         llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
-            {nameData, nameLen, litData, litLen, builder_.getInt32(0)}, "deser.cmp");
+            {namePtr, litStr, builder_.getInt32(0)}, "deser.cmp");
         llvm::Value* isMatch = builder_.CreateICmpEQ(
             cmpRes, builder_.getInt32(0), "deser.match");
 
@@ -1774,8 +1773,21 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
     auto* endBB   = llvm::BasicBlock::Create(llvm_, "enum.deser.end",   currentFn_);
     auto* throwBB = llvm::BasicBlock::Create(llvm_, "enum.deser.throw", currentFn_);
 
-    auto* cmpFn = declareC("bz_string_compare", i32(),
-                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    // fix #4487 (stdlib §9.6 + spec §9.8, v0.306): the wire-name dispatch is an
+    // EQUALITY test (`cmp == 0`) and `ignoreCase` is always 0 here — §9.8:
+    // "Names are compared ORDINALLY". It used to extract (data, len) from each
+    // side and call `bz_string_compare`, which walked `min(len)` BYTES over a
+    // CODE-POINT length (the #535 defect class), so two distinct non-ASCII
+    // names sharing their first `len` STORAGE bytes matched each other.
+    // `bz_binder_read_string` decodes the wire's UTF-8 into a width-aware
+    // bz_string, so both operands here really can be width 2/4. Measured on
+    // HEAD (4d9d186a): an enum with `serialized "日本"` and `serialized "日x"`
+    // round-tripped the SECOND constant back as the FIRST, because both are
+    // width 2 and share the storage bytes `E5 65`. `bz_str_compare_cp` takes
+    // the string OBJECTS, so each is decoded at its own width. Nothing changes
+    // for an ASCII wire name, which is every name this suite writes today.
+    auto* cmpFn = declareC("bz_str_compare_cp", i32(),
+                           {ptrTy(), ptrTy(), i32()});
 
     for (const auto& [ec, wire] : sema::enumConstantWireNames(*ts)) {
         auto it = enumValue_.find(ec);
@@ -1786,20 +1798,8 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
         llvm::Value* litStr  = lowerStringLiteral(
             std::string("\"") + wireName + "\"", false);
 
-        // Extract data/len from both strings.
-        // bz_string layout (stringType()): {ptr data, i64 len, i8 width, i64 rc}.
-        auto* strTy2 = stringType();
-        llvm::Value* litData  = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy2, litStr, 0), "lit.data");
-        llvm::Value* litLen   = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy2, litStr, 1), "lit.len");
-        llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy2, namePtr, 0), "name.data");
-        llvm::Value* nameLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy2, namePtr, 1), "name.len");
-
         llvm::Value* cmpRes  = builder_.CreateCall(cmpFn,
-            {nameData, nameLen, litData, litLen, builder_.getInt32(0)}, "enum.cmp");
+            {namePtr, litStr, builder_.getInt32(0)}, "enum.cmp");
         llvm::Value* isMatch = builder_.CreateICmpEQ(
             cmpRes, builder_.getInt32(0), "enum.match");
 
@@ -2030,28 +2030,25 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
     auto* doneBB  = llvm::BasicBlock::Create(llvm_, "chdes.done",   currentFn_);
     auto* throwBB = llvm::BasicBlock::Create(llvm_, "chdes.badcase", currentFn_);
 
-    auto* cmpFn = declareC("bz_string_compare", i32(),
-                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    // fix #4487 (stdlib §9.6 + spec §9.8, v0.306): equality-only dispatch
+    // (`cmp == 0`, ignoreCase 0 — §9.8 compares names ORDINALLY). Moved off
+    // `bz_string_compare`, which walked min(len) BYTES over a CODE-POINT
+    // length (#535 class), so two distinct non-ASCII names sharing their
+    // leading storage bytes matched. See emitRecordDeserialize's note for the
+    // measurement; ASCII names are unaffected.
+    auto* cmpFn = declareC("bz_str_compare_cp", i32(),
+                           {ptrTy(), ptrTy(), i32()});
     auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
-    auto* strTy = stringType();
-
-    // Extract disc (data,len) once — valid until discPtr is released, which only
-    // happens inside a matched case block (terminal → doneBB).
-    llvm::Value* discData = builder_.CreateLoad(ptrTy(),
-        builder_.CreateStructGEP(strTy, discPtr, 0), "chdes.disc.data");
-    llvm::Value* discLen  = builder_.CreateLoad(i64(),
-        builder_.CreateStructGEP(strTy, discPtr, 1), "chdes.disc.len");
 
     for (std::size_t ci = 0; ci < cases.size(); ++ci) {
         const sema::ChoiceCaseSymbol* cc = cases[ci];
         std::string wire(choiceCaseWireName(cc));
         llvm::Value* litStr = lowerStringLiteral("\"" + wire + "\"", false);
-        llvm::Value* litData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, litStr, 0), "chdes.lit.data");
-        llvm::Value* litLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, litStr, 1), "chdes.lit.len");
+        // `discPtr` stays live until a matched case block releases it, and a
+        // matched block is terminal (→ doneBB), so it is valid at every
+        // comparison — the same premise the hoisted (data, len) loads rested on.
         llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
-            {discData, discLen, litData, litLen, builder_.getInt32(0)}, "chdes.cmp");
+            {discPtr, litStr, builder_.getInt32(0)}, "chdes.cmp");
         llvm::Value* isMatch = builder_.CreateICmpEQ(
             cmpRes, builder_.getInt32(0), "chdes.match");
         auto* caseBB = llvm::BasicBlock::Create(llvm_, "chdes.case", currentFn_);
@@ -2241,17 +2238,11 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 if (skip[pi] || !slots[pi]) continue;
                 llvm::Value* litStr2 = lowerStringLiteral(
                     "\"" + wireNames[pi] + "\"", false);
-                llvm::Value* litData2 = builder_.CreateLoad(ptrTy(),
-                    builder_.CreateStructGEP(strTy, litStr2, 0), "chdes.plit.data");
-                llvm::Value* litLen2  = builder_.CreateLoad(i64(),
-                    builder_.CreateStructGEP(strTy, litStr2, 1), "chdes.plit.len");
-                llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
-                    builder_.CreateStructGEP(strTy, namePtr, 0), "chdes.name.data");
-                llvm::Value* nameLen  = builder_.CreateLoad(i64(),
-                    builder_.CreateStructGEP(strTy, namePtr, 1), "chdes.name.len");
+                // fix #4487: the choice's PAYLOAD-field name dispatch, the
+                // second user of this function's `cmpFn` — same equality test
+                // on the same defect, moved with it.
                 llvm::Value* cmpR = builder_.CreateCall(cmpFn,
-                    {nameData, nameLen, litData2, litLen2, builder_.getInt32(0)},
-                    "chdes.pcmp");
+                    {namePtr, litStr2, builder_.getInt32(0)}, "chdes.pcmp");
                 llvm::Value* isM = builder_.CreateICmpEQ(
                     cmpR, builder_.getInt32(0), "chdes.pmatch");
                 auto* rdBB = llvm::BasicBlock::Create(llvm_, "chdes.rd", currentFn_);
@@ -2549,14 +2540,14 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
     auto* throwBB = llvm::BasicBlock::Create(llvm_, "poly.deser.throw", currentFn_);
 
     // Build comparison function for disc strings.
-    auto* cmpFn = declareC("bz_string_compare", i32(),
-                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
-    auto* strTy = stringType();
-
-    llvm::Value* discData = builder_.CreateLoad(ptrTy(),
-        builder_.CreateStructGEP(strTy, discPtr, 0), "poly.disc.data");
-    llvm::Value* discLen  = builder_.CreateLoad(i64(),
-        builder_.CreateStructGEP(strTy, discPtr, 1), "poly.disc.len");
+    // fix #4487 (stdlib §9.6 + spec §9.8, v0.306): equality-only dispatch
+    // (`cmp == 0`, ignoreCase 0 — §9.8 compares names ORDINALLY). Moved off
+    // `bz_string_compare`, which walked min(len) BYTES over a CODE-POINT
+    // length (#535 class), so two distinct non-ASCII names sharing their
+    // leading storage bytes matched. See emitRecordDeserialize's note for the
+    // measurement; ASCII names are unaffected.
+    auto* cmpFn = declareC("bz_str_compare_cp", i32(),
+                           {ptrTy(), ptrTy(), i32()});
 
     for (const auto& pc : polyCases) {
         // fix #3140 (family F2 of #3152): the registered case's resolved symbol
@@ -2567,12 +2558,8 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
         // Compare discriminator string with this case's literal.
         llvm::Value* litStr = lowerStringLiteral(
             "\"" + std::string(pc.discriminator) + "\"", false);
-        llvm::Value* litData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, litStr, 0), "poly.lit.data");
-        llvm::Value* litLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, litStr, 1), "poly.lit.len");
         llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
-            {discData, discLen, litData, litLen, builder_.getInt32(0)}, "poly.cmp");
+            {discPtr, litStr, builder_.getInt32(0)}, "poly.cmp");
         llvm::Value* isMatch = builder_.CreateICmpEQ(cmpRes, builder_.getInt32(0), "poly.match");
 
         auto* matchBB = llvm::BasicBlock::Create(llvm_, "poly.deser.case", currentFn_);
@@ -3502,9 +3489,14 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateStore(namePtr, namePtrSlot);
     }
 
-    auto* cmpFn = declareC("bz_string_compare", i32(),
-                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
-    auto* strTy = stringType();
+    // fix #4487 (stdlib §9.6 + spec §9.8, v0.306): equality-only dispatch
+    // (`cmp == 0`, ignoreCase 0 — §9.8 compares names ORDINALLY). Moved off
+    // `bz_string_compare`, which walked min(len) BYTES over a CODE-POINT
+    // length (#535 class), so two distinct non-ASCII names sharing their
+    // leading storage bytes matched. See emitRecordDeserialize's note for the
+    // measurement; ASCII names are unaffected.
+    auto* cmpFn = declareC("bz_str_compare_cp", i32(),
+                           {ptrTy(), ptrTy(), i32()});
 
     auto* skipBB  = llvm::BasicBlock::Create(llvm_, "cdeser.skip",  currentFn_);
     auto* afterBB = llvm::BasicBlock::Create(llvm_, "cdeser.after", currentFn_);
@@ -3516,17 +3508,8 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         const std::string& wn = comp.wireName;
         llvm::Value* litStr = lowerStringLiteral("\"" + wn + "\"", false);
 
-        llvm::Value* litData  = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, litStr, 0), "clit.data");
-        llvm::Value* litLen   = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, litStr, 1), "clit.len");
-        llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
-            builder_.CreateStructGEP(strTy, namePtr, 0), "cname.data");
-        llvm::Value* nameLen  = builder_.CreateLoad(i64(),
-            builder_.CreateStructGEP(strTy, namePtr, 1), "cname.len");
-
         llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
-            {nameData, nameLen, litData, litLen, builder_.getInt32(0)}, "cdeser.cmp");
+            {namePtr, litStr, builder_.getInt32(0)}, "cdeser.cmp");
         llvm::Value* isMatch = builder_.CreateICmpEQ(
             cmpRes, builder_.getInt32(0), "cdeser.match");
 
