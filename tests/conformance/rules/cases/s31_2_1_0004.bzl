@@ -8,6 +8,7 @@
 //! cites: 31.2.1
 //! expect: reject
 //! diagnostic: convert
+//! issue: 4644
 module Conf;
 
 public class SiblingA: Exception
