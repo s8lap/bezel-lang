@@ -6528,17 +6528,38 @@ void Emitter::collectInvariantChain(
     if (!classType) return;
     // Find source-defined invariants across the base chain. A class with no
     // invariants at any level is a no-op (the common case).
+    //
+    // fix #4598 (§22.16, v0.306): collected PER CLASS (`groups`, one vector
+    // per level, most-derived level pushed first) rather than into one flat
+    // vector. §22.16: "the class invariant of C is the conjunction of every
+    // invariant member of C and of every base class, evaluated base-first,
+    // declaration order within each class" — two independent axes. The prior
+    // code pushed every class's members (in declaration order) onto ONE flat
+    // vector while walking most-derived-to-base, then ran a SINGLE
+    // `std::reverse` over the whole thing to fix the base-first axis. For a
+    // concatenation of per-class blocks built most-derived-first,
+    // `reverse(blockD ++ blockB) == reverse(blockB) ++ reverse(blockD)`:
+    // reversing the whole vector does flip the BLOCK order to base-first
+    // (correct), but it ALSO reverses each block's own contents — so a class
+    // with two invariants had them evaluated in the WRONG order within that
+    // class. Reversing only the GROUP order below (never a group's own
+    // contents) gets both axes right: base-first across classes, declaration
+    // order within each class.
+    struct Inv { const sema::TypeSymbol* cls; const ast::Expr* expr; };
+    std::vector<std::vector<Inv>> groups;
     for (const sema::TypeSymbol* c = classType; c; c = baseClassOf(c)) {
+        std::vector<Inv> group;
         const auto* td = dynamic_cast<const ast::TypeDecl*>(c->decl);
         if (td) {
             for (const auto& m : td->members) {
                 if (auto* inv =
                         dynamic_cast<const ast::InvariantDecl*>(m.get())) {
                     if (inv->expr && !inv->isStatic) {
-                        out.push_back({c, inv->expr.get()});
+                        group.push_back({c, inv->expr.get()});
                     }
                 }
             }
+            groups.push_back(std::move(group));
             continue;
         }
         // fix #4592 (§22.16 / §2.8.2, v0.306): an IMPORTED class in the chain
@@ -6570,12 +6591,22 @@ void Emitter::collectInvariantChain(
         // base-first conjunction composes across any mix of local and
         // imported links.
         for (const ast::Expr* e : c->importedInvariantExprs)
-            if (e) out.push_back({c, e});
+            if (e) group.push_back({c, e});
+        groups.push_back(std::move(group));
     }
-    // §22.16 base-first → base at the END of the vector, most-derived at
-    // the FRONT (we built the chain most-derived-first above). Reverse so
-    // the iteration order is base-first.
-    std::reverse(out.begin(), out.end());
+    // fix #4598 (§22.16, v0.306): `groups` was built most-derived-first, and
+    // each group's OWN contents are already in declaration order and are never
+    // reversed. §22.16 states two INDEPENDENT axes -- "evaluated base-first,
+    // declaration order within each class". The prior code pushed every class's
+    // members onto ONE flat vector while walking most-derived-to-base and then
+    // ran a SINGLE std::reverse over the whole thing: for a concatenation of
+    // per-class blocks, reverse(blockD ++ blockB) == reverse(blockB) ++
+    // reverse(blockD), so it flipped the BLOCK order to base-first (correct)
+    // but ALSO reversed each block's own contents (wrong). Reversing only the
+    // GROUP order gets both axes right, then flatten into `out`.
+    std::reverse(groups.begin(), groups.end());
+    for (auto& g : groups)
+        for (auto& iv : g) out.push_back({iv.cls, iv.expr});
 }
 
 
