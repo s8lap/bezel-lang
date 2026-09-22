@@ -199,7 +199,9 @@ BEZEL_TEST(move_borrow_receiver_owned_field_2011,
 // §28.8.1: `return move this.f!` — the take-method pattern (this-receiver owned
 // field), the field reassigned to null before exit. The owner disposes nothing
 // (field nulled); the caller disposes the returned value once. Guards against the
-// fix mis-classifying a `this`-receiver owned-field move as a borrow.
+// fix mis-classifying a `this`-receiver owned-field move as a borrow. The
+// trailing `return r;` is marker-free per §28.3 K3.13 / K3.2 (v0.307); the
+// `move this.f!` owned-field read it pins keeps its marker.
 BEZEL_TEST(move_borrow_receiver_owned_field_2011,
            return_move_this_field_take_disposes_once_spec_28_8_1) {
     std::string src =
@@ -207,7 +209,7 @@ BEZEL_TEST(move_borrow_receiver_owned_field_2011,
         "class Box "
         "  public owned f: Cell? := null; "
         "  public constructor() this.f := new Cell(); end constructor; "
-        "  public method Take(): owned Cell var r := move this.f!; this.f := null; return move r; end Take; "
+        "  public method Take(): owned Cell var r := move this.f!; this.f := null; return r; end Take; "
         "  destructor end destructor; "
         "end Box; "
         "class C "

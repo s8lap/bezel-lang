@@ -154,7 +154,7 @@ BEZEL_TEST(assign_target_index_moved_from_1932,
         "var arr: [3]int := [10, 20, 30]; "
         "var s: Cell := new Cell(1); "
         "arr[s.V()] := 99; "
-        "_ := move s; "
+        "_ := s; "
         "return 0;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -183,7 +183,7 @@ BEZEL_TEST(assign_target_index_moved_from_1932,
         "using var m: Cell? := move a[0]; "
         "var s: Cell := new Cell(0); "
         "a[s.V()] := new Cell(9); "
-        "_ := move s; "
+        "_ := s; "
         "return 0;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
