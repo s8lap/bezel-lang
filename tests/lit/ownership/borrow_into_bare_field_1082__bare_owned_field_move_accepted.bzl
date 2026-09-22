@@ -5,12 +5,12 @@
 // NOT a borrow store — it must still be accepted (the owned-field move-on-read
 // skip recognises a bare-identifier owned field).
 //
-// Reject control: bezelc -c must reject and emit a §28.3 K3.13 redundant-move diagnostic.
+// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //
-// RUN: %not %bezelc -c -o %t.o %s
-// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %bezelc -c -o %t.o %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cfg public _v: int := 0; public constructor(v: int) _v := v; end constructor; end Cfg; class Holder public owned _c: Cfg?; public method Set() var c := new Cfg(5); _c := move c; end Set; end Holder;
+module M; class Cfg public _v: int := 0; public constructor(v: int) _v := v; end constructor; end Cfg; class Holder public owned _c: Cfg?; public method Set() var c := new Cfg(5); _c := c; end Set; end Holder;
 
-
-// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)
+// NODIAG-NOT: error
+// NODIAG-NOT: §

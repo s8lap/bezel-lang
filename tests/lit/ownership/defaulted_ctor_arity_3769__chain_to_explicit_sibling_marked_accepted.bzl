@@ -1,4 +1,4 @@
-// RUN: %not %bezelc -c -o %t.o %s
+// RUN: %bezelc -c -o %t.o %s
 //
 // Issue #3769 / #3777 — the ACCEPT half of the reversed `CtorSelect::ChainSite`
 // pin. The rejected twin is
@@ -27,7 +27,7 @@ class B
   private owned _f: Res;
   private _n: int;
   public constructor(owned a: Res, b: int := 3)
-    _f := move a;
+    _f := a;
     _n := b;
   end constructor;
   public constructor(owned x: Res, y: bool)
@@ -37,5 +37,3 @@ class B
     return _n;
   end Id;
 end B;
-
-// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)

@@ -1,12 +1,12 @@
 // Ported from tests/ownership/assignment_consumes_test.cpp
 //   (BEZEL_TEST own_assign_move, field_target_move_consumes_source).
 //
-// Reject control: bezelc -c must reject and emit a §28.3 K3.13 redundant-move diagnostic.
+// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //
-// RUN: %not %bezelc -c -o %t.o %s
-// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %bezelc -c -o %t.o %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class T end T; class C private owned _t: T := new T(); public method Replace() var fresh := new T(); this._t := move fresh; end Replace; end C;
+module M; class T end T; class C private owned _t: T := new T(); public method Replace() var fresh := new T(); this._t := fresh; end Replace; end C;
 
-
-// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)
+// NODIAG-NOT: error
+// NODIAG-NOT: §

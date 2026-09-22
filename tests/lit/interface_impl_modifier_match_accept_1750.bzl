@@ -1,4 +1,4 @@
-// Reject control for issue #1750.
+// Clean-compile ACCEPT control for issue #1750.
 //
 // Spec §11.2 (v0.184): an implementing method whose parameter modifiers
 // (`ref`, `out`, `owned`, `scoped`) match the interface member's exactly
@@ -20,8 +20,8 @@
 //     `--allow-empty` confirms neither "error" nor a § section-citation
 //     reject (nor an unrelated warning) appears.
 //
-// RUN: %not %bezelc -c -o %t.o %s
-// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %bezelc -c -o %t.o %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 module M;
 class T end T;
 interface IFactory
@@ -33,12 +33,12 @@ end ICounter;
 class Impl : IFactory, ICounter
   private owned _x: T? := null;
   public method Absorb(owned x: T)
-    _x := move x;
+    _x := x;
   end Absorb;
   public method Bump(ref n: int)
     n := n + 1;
   end Bump;
 end Impl;
 
-
-// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)
+// NODIAG-NOT: error
+// NODIAG-NOT: §

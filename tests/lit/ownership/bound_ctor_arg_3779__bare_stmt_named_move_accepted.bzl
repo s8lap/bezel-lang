@@ -1,4 +1,4 @@
-// RUN: %not %bezelc -c -o %t.o %s
+// RUN: %bezelc -c -o %t.o %s
 //
 // Issue #3779: the ACCEPT half. §22.5 admits the transfer marker inside a named
 // argument — "a transfer-marked argument carries no modifier — the marker is
@@ -24,7 +24,7 @@ class Two
   private _bid: int;
   private _c: int;
   public constructor(owned a: Res, b: Res, c: int := 1)
-    _a := move a;
+    _a := a;
     _bid := b.Id();
     _c := c;
   end constructor;
@@ -40,5 +40,3 @@ class C
     return 0;
   end Main;
 end C;
-
-// CHECK: the `move` marker is redundant on a {{.*}} (§28.3 K3.13 marker economy; K3.1)
