@@ -15355,6 +15355,31 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     return substituteReturnType(declared, classSubst);
 }
 
+// issue #391 / #4590 helper: is `t` a BARE type-parameter REFERENCE?
+//
+// One meaning, two spellings. A LOCALLY resolved one is a declaration-less
+// `Named` whose ast::Type name has a single part (TypeResolution leaves an
+// in-scope type-parameter name declaration-less). An IMPORTED one has no AST at
+// all — `ModuleLoader` builds TypeRefs straight from metadata — and carries the
+// name on `importedName` instead (`Loader::convert`, the `Named` arm). Reading
+// only the first spelling is a silent "this is not a type parameter" across a
+// module boundary, which is what #4590 measured.
+//
+// This is exactly the pair of arms `substituteReturnType` has carried since
+// #428 phase B; stating it once keeps the recognizer and the substituter from
+// drifting apart — they must agree, or a parameter is recognized and then not
+// substituted (or the reverse). `genericArgs.empty()` is what separates a bare
+// parameter from a null-declaration stdlib builtin (`Array<T>`); the caller
+// additionally checks the name against the method's own parameter list, which
+// is what separates it from a bare builtin such as `Task`.
+// per §14.1 / §14.5 "Target-typed completion" / §2.8.3 rule 2
+static bool bareTypeParamRef(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return false;
+    if (t->astNode)
+        return t->astNode->name && t->astNode->name->parts.size() == 1;
+    return !t->importedName.empty() && t->genericArgs.empty();
+}
+
 // issue #391 helper: collect the subset of `paramNames` that the declared
 // return TypeRef syntactically references (a bare declaration-less Named whose
 // single name part is the parameter name), recursing into generic arguments.
@@ -15363,12 +15388,33 @@ static void collectReturnParamNames(
     const std::unordered_set<std::string_view>& paramNames,
     std::unordered_set<std::string_view>& out) {
     if (!t) return;
-    if (t->kind == TypeRef::Kind::Named && !t->declaration && t->astNode &&
-        t->astNode->name && t->astNode->name->parts.size() == 1 &&
-        paramNames.count(t->headName()))
+    if (bareTypeParamRef(t) && paramNames.count(t->headName()))
         out.insert(t->headName());
     for (auto* ga : t->genericArgs)
         collectReturnParamNames(ga, paramNames, out);
+}
+
+// issue #4590 (§14.5 phase 1) — the IMPORTED-side twin of
+// `collectBoundParamNames` above. That one walks the declaring method's
+// `ast::Type` parameter nodes, which an imported method does not have; this one
+// walks the already-resolved `TypeRef` the loader reconstructed, reached through
+// the both-sources accessor `formalParamResolvedType`. Same question, same
+// recursion (generic arguments, array element, function slots), so the two
+// sources cannot answer "which type parameters does an argument bind?"
+// differently. // per §14.5 phase 1
+static void collectBoundParamNamesFromRef(
+    const TypeRef* pt,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_set<std::string_view>& boundByArg) {
+    if (!pt) return;
+    if (bareTypeParamRef(pt) && paramNames.count(pt->headName()))
+        boundByArg.insert(pt->headName());
+    for (const TypeRef* ga : pt->genericArgs)
+        collectBoundParamNamesFromRef(ga, paramNames, boundByArg);
+    collectBoundParamNamesFromRef(pt->arrayElement, paramNames, boundByArg);
+    collectBoundParamNamesFromRef(pt->funcReturn, paramNames, boundByArg);
+    for (const auto& fp : pt->funcParams)
+        collectBoundParamNamesFromRef(fp.type, paramNames, boundByArg);
 }
 
 // per §14.1/§14.2 + §A.7 (issue #391) — see the header comment on this
@@ -15382,10 +15428,10 @@ bool ExprTC::unifyReturnAgainstTarget(
     // A bare type-parameter reference resolves to a Named TypeRef with no
     // declaration whose single name part is the parameter name (the parameter
     // is an in-scope name with a null symbol; TypeResolution leaves it
-    // declaration-less). Binding it solves the parameter.
-    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
-        declared->astNode && declared->astNode->name &&
-        declared->astNode->name->parts.size() == 1) {
+    // declaration-less), or — for an IMPORTED signature, which has no AST —
+    // the same shape with the name on `importedName` (#4590; see
+    // `bareTypeParamRef`). Binding it solves the parameter.
+    if (bareTypeParamRef(declared)) {
         std::string_view nm = declared->headName();
         if (paramNames.count(nm)) {
             // `: T?` against a target T binds T to the target's non-nullable
@@ -15651,8 +15697,47 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
     // The callee must resolve to a generic method (its own `<T>` params).
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee));
     if (!ms) return false;
+    // fix #4590 (§14.5 "Target-typed completion" / §2.8.3 rule 2, v0.306):
+    // BOTH sources, AST first. This routine used to be gated end-to-end on
+    // `md`, and `ModuleLoader` never assigns `Symbol::decl` for an imported
+    // method (there is no AST for a dependency) — so it returned `false`
+    // unconditionally for EVERY imported generic method, `*outNeedsInfer`
+    // never even set. That is not "inference declined"; it is §14.5's whole
+    // phase 3 silently absent across a module boundary, measured on a real
+    // two-module build as the "a target type is required" diagnostic never
+    // firing where the byte-identical single-module program is rejected.
+    //
+    // Nothing new has to cross the wire: the metadata already carries a
+    // method's own type parameters (`MetaMember::genericParams`, reconstructed
+    // into `MethodSymbol::genericParams`), its return type
+    // (`SemaContext::importedReturnType`) and its formal types
+    // (`formalParamResolvedType`) — the same channels #2735 used rather than
+    // inventing a sixth loader side table.
+    // SEAM-ACCESSOR: the AST arm of this routine's both-sources read of "what
+    // are this method's type parameters, return type and formal types?".
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    if (!md || md->genericParams.empty() || !md->returnType) return false;
+
+    // The method's own `<T>` parameter names, in declaration order.
+    std::vector<std::string_view> genericParamNames;
+    if (md) {
+        for (const auto& gp : md->genericParams)
+            genericParamNames.push_back(gp.name);
+    } else {
+        for (const Symbol* gp : ms->genericParams)
+            if (gp && !gp->name.empty()) genericParamNames.push_back(gp->name);
+    }
+    if (genericParamNames.empty()) return false;
+
+    // The DECLARED return type. §14.5 phase 3 unifies against this, so a
+    // method with none (a unit return) has nothing to solve from a target.
+    TypeRef* retTy = nullptr;
+    if (md) {
+        if (!md->returnType) return false;
+        retTy = ctx_.resolvedType(*md->returnType);
+    } else {
+        retTy = ctx_.importedReturnType(ms);
+    }
+    if (!retTy) return false;
 
     // fix #747 R43 / §14.1: EXPLICIT call-site type arguments (`Swap<int,int>(p)`)
     // fully determine the method's type parameters — there is nothing to infer,
@@ -15673,33 +15758,40 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
     else if (auto* callId =
                  dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
         callTypeArgs = &callId->typeArgs;
-    if (callTypeArgs && callTypeArgs->size() >= md->genericParams.size())
+    if (callTypeArgs && callTypeArgs->size() >= genericParamNames.size())
         return false;
 
     // Determine which type parameters are already bound by an argument: a
     // value parameter whose declared type is exactly the bare parameter name
     // (mirrors codegen's argument-inference loop and §14.1). These never need
     // a target — the argument solves them.
-    std::unordered_set<std::string_view> paramNames;
-    for (const auto& gp : md->genericParams) paramNames.insert(gp.name);
+    std::unordered_set<std::string_view> paramNames(genericParamNames.begin(),
+                                                    genericParamNames.end());
     std::unordered_set<std::string_view> boundByArg;
-    for (const auto& p : md->params)
-        collectBoundParamNames(p.type.get(), paramNames, boundByArg);
+    if (md) {
+        for (const auto& p : md->params)
+            collectBoundParamNames(p.type.get(), paramNames, boundByArg);
+    } else {
+        // #4590: the imported twin — the loader's reconstructed formal types,
+        // read through the both-sources accessor rather than an AST node that
+        // does not exist. // per §14.5 phase 1
+        for (std::size_t pi = 0; pi < ms->params.size(); ++pi)
+            collectBoundParamNamesFromRef(formalParamResolvedType(*ms, pi),
+                                          paramNames, boundByArg);
+    }
 
     // The unbound parameters are those a target must solve. If every parameter
     // is bound by an argument, this is the ordinary argument-inferred case and
     // the return-target path does not apply.
     std::unordered_set<std::string_view> unbound;
-    for (const auto& gp : md->genericParams)
-        if (!boundByArg.count(gp.name)) unbound.insert(gp.name);
+    for (std::string_view nm : genericParamNames)
+        if (!boundByArg.count(nm)) unbound.insert(nm);
     if (unbound.empty()) return false;
 
     // The declared return type must actually mention an unbound parameter for
     // a target to be able to solve it; otherwise inference is neither possible
     // nor needed (e.g. an unbound parameter used only in a `where`-clause type
     // bound is out of scope here — deferred).
-    TypeRef* retTy = ctx_.resolvedType(*md->returnType);
-    if (!retTy) return false;
     std::unordered_set<std::string_view> mentioned;
     collectReturnParamNames(retTy, unbound, mentioned);
     if (mentioned.empty()) return false;
