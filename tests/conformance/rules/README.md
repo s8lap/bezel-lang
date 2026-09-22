@@ -136,7 +136,8 @@ keeping them apart is what makes the divergence count mean something.
 
 ## Gate wiring
 
-The **harness** is gated; the **corpus** is not, and the split is deliberate.
+The **harness** and the **corpus** are both gated now, in two separate
+phases, because they need different things to run.
 
 `scripts/gate_full_cycle.sh` runs a build-free `rule-corpus` phase beside the
 gate self-tests. It runs `test_rules.py` under `unittest discover` against a
@@ -147,8 +148,30 @@ does not lint. The floor is exact, not a ceiling, for the same reason
 `scripts/deprecated_jit_oracle.baseline` is: headroom that is not banked is
 indistinguishable from a drop somebody already spent.
 
-The corpus itself waits on the first classification. Before a baseline exists
-every case is UNCLASSIFIED, and a phase that can only be green is not a check.
+A separate, later `rule-corpus-baseline` phase (`scripts/
+gate_rule_corpus_baseline.py`, #4621) runs the corpus itself against
+`baseline.tsv`, once a `bezelc` exists in the cycle — beside the doc-example
+conformance sweep, for the same reason: `runner.py` needs a real compiler.
+It fails the cycle on any REGRESSION or UNBANKED row, and on a total case
+count below `manifest.tsv`'s row count (a collection failure or an
+over-narrow filter must not print a normal-looking summary over almost
+nothing). Its own `--self-test` runs first and is build-free: it proves
+`runner.py`'s `compare()` still classifies all five (banked, observed)
+combinations per the ratchet table above, and that the phase's summary-line
+parser fails closed on a vacuous or malformed run rather than passing by
+default. It is deliberately named `gate_*.py`, not `check_*.py`:
+`scripts/ratchet_sweep.sh` derives its build-free pre-gate list by grepping
+for `scripts/check_[a-z_]+\.py`, and this phase — needing a real `bezelc`
+and taking well over a minute — must not be swept into that build-free list.
+
+Until #4621, this second phase did not exist: the corpus could carry a
+REGRESSION or an UNCLASSIFIED-turned-stale row indefinitely with no cycle
+ever noticing, which is exactly what v0.307's own graduation did to its
+baseline (see "Record" below). The corpus itself still waits on the first
+classification before this phase means anything: before a baseline exists
+every case is UNCLASSIFIED, and a phase that can only be green is not a
+check. Classification has now happened once (v0.306) and the baseline has
+been kept current since (v0.307, #4621), so the phase has real teeth.
 
 ## Coverage
 

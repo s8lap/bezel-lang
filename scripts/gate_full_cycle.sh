@@ -1258,7 +1258,9 @@ say "src-citation phase: GREEN (every §-citation in src/ resolves)"
 #   3. `corpus.py lint` — the manifest/cases bijection and the case-header
 #      contract.
 # The corpus itself is not run here: it needs a bezelc and a classified
-# baseline (tests/conformance/rules/README.md, "Gate wiring").
+# baseline (tests/conformance/rules/README.md, "Gate wiring") — see the
+# RULE-CORPUS BASELINE PHASE below the doc-example conformance sweep, which
+# runs it against baseline.tsv once a bezelc exists (#4621).
 say "rule-corpus phase: tests/conformance/rules harness"
 _rc_log="$LOGDIR/${TAG}_rule_corpus.log"
 # Exact-not-a-ceiling, as the deprecated-JIT-oracle baseline is: the floor is
@@ -1510,6 +1512,54 @@ if [ "$_cf_skip" -gt "$_cf_skip_cap" ]; then
 fi
 say "conformance phase: GREEN"
 say "  PASS=$_cf_pass (floor $_cf_pass_floor), SKIP=$_cf_skip (cap $_cf_skip_cap), FAIL=${_cf_fail:-0}"
+
+# ── RULE-CORPUS BASELINE PHASE (#4621) ─────────────────────────────────────
+# The rule-corpus phase far above (tests/conformance/rules) only runs the
+# corpus HARNESS's own self-tests and `corpus.py check` (manifest currency) —
+# it never actually runs the corpus itself against baseline.tsv, so a
+# REGRESSION (banked pass, observed fail) or an UNBANKED row (banked fail,
+# observed pass) could sit red indefinitely with no cycle ever seeing it.
+# That is exactly what happened: v0.307 (#4608) changed 3 case files and
+# added 35 more without re-banking baseline.tsv, and nothing failed (#4621).
+# This phase is the missing half, run HERE rather than beside the build-free
+# harness phase because it needs a real bezelc — same reason the doc-example
+# conformance sweep just above needs one, and the corpus's own README.md
+# ("Gate wiring") says so explicitly: "a phase that can only be green [before
+# classification] is not a check." Classification has now happened (v0.306,
+# refreshed by #4621's banking pass), so REGRESSION/UNBANKED are real,
+# checkable failure conditions.
+#
+# --self-test runs FIRST and is not optional, exactly like every sibling
+# ratchet phase above: it proves, build-free, that runner.py's compare()
+# still classifies all five (banked, observed) combinations per README.md's
+# ratchet table, and that this checker's own summary-line parser and
+# floor/cap logic fail closed on a vacuous or malformed summary rather than
+# passing by default.
+say "rule-corpus-baseline phase: detector self-test + full-corpus ratchet (#4621)"
+_rcb_log="$LOGDIR/${TAG}_rule_corpus_baseline.log"
+if ! python3 scripts/gate_rule_corpus_baseline.py --self-test \
+      > "$_rcb_log" 2>&1; then
+  say "CYCLE FAILURE: gate_rule_corpus_baseline SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $_rcb_log"
+  sed -n '1,30p' "$_rcb_log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if [ ! -x "$REPO/build/bezelc" ]; then
+  say "CYCLE FAILURE: $REPO/build/bezelc not executable — the rule corpus"
+  say "  cannot run"
+  exit 1
+fi
+if ! python3 scripts/gate_rule_corpus_baseline.py --strict \
+      --bezelc "$REPO/build/bezelc" \
+      >> "$_rcb_log" 2>&1; then
+  say "CYCLE FAILURE: the rule corpus has a REGRESSION or UNBANKED row"
+  say "  against tests/conformance/rules/baseline.tsv, or ran an"
+  say "  unexpectedly small number of cases (#4621). See $_rcb_log"
+  tail -30 "$_rcb_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "rule-corpus-baseline phase: GREEN ($(tail -1 "$_rcb_log"))"
 
 # ── CLANG-TIDY PHASE (fix #3666) — ADVISORY, ONCE PER CYCLE ────────────────
 # The clang-tidy tier (scripts/check_tidy.sh, changed TUs only) used to be a
