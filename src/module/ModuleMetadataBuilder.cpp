@@ -447,6 +447,85 @@ bool hasModifier(const std::vector<std::string_view>& modifiers,
            modifiers.end();
 }
 
+// fix #4600 (§14.5 "Target-typed completion" / §14.1 / §2.8.3 rule 2, v0.307):
+// does the AST type `t` syntactically mention any name in `names` — as a bare
+// parameter reference, or nested inside a generic argument, an inline-array
+// element, or a function type's parameter/return slots? The AST-side twin of
+// sema's `collectBoundParamNamesFromRef` (ExprTypecheck_Calls.cpp), which asks
+// the same question of the loader's reconstructed `TypeRef`s; the two must
+// agree, because this routine decides what crosses the wire and that one
+// decides what the importer does with it. A bare parameter reference is a
+// single-part `QualifiedName` with no generic arguments of its own — the same
+// shape `bareTypeParamRef` recognizes on the TypeRef side.
+void astTypeMentionsNames(const ast::Type* t,
+                          const std::unordered_set<std::string_view>& names,
+                          std::unordered_set<std::string_view>& out) {
+    if (!t) return;
+    if (t->kind == ast::TypeKind::Named && t->name &&
+        t->name->parts.size() == 1 && t->genericArgs.empty() &&
+        names.count(t->name->parts.back()))
+        out.insert(t->name->parts.back());
+    for (const auto& ga : t->genericArgs)
+        astTypeMentionsNames(ga.get(), names, out);
+    astTypeMentionsNames(t->arrayElement.get(), names, out);
+    astTypeMentionsNames(t->funcReturn.get(), names, out);
+    for (const auto& fp : t->funcParams)
+        astTypeMentionsNames(fp.type.get(), names, out);
+}
+
+// fix #4600 (§14.5 phase 3 / §14.1 / §2.5 / §2.8.3 rule 2, v0.307): true when
+// `md` declares its OWN type parameters and its DECLARED RETURN TYPE mentions
+// at least one that NO formal parameter mentions — a RETURN-ONLY type
+// parameter, the shape §14.5 phase 3 ("target-typed completion") exists for.
+//
+// This is the exporter-side recognizer for the ONE generic-method shape whose
+// placeholder-compiled template is unsound cross-module AND is caught by no
+// existing gate. The argument-side gate (#1943, LlvmBackend_Calls2.cpp) fires
+// when a type-param-typed ARGUMENT reaches the i32-placeholder parameter at a
+// different width; a return-only parameter has no such argument, so that loop
+// never runs, and the call is emitted against the template whose return is the
+// i32 placeholder while the caller's slot is whatever the instantiation is.
+// MEASURED (#4600's two-module repro, `Factory.Create<T>(): owned T where T:
+// class, new()` called as `using var w: Widget := Factory.Create()`): exit 0
+// cross-module against exit 1 for the byte-identical single-module program —
+// the constructor never ran — and under generated-code AddressSanitizer a
+// `stack-buffer-overflow`, READ of size 8 at a 4-byte stack object.
+//
+// Shipping the body lets `ModuleLoader`'s existing re-parse attach a live
+// `ast::MethodDecl` (its non-generic-class widening already admits any class
+// with a non-empty `methodBodyText`) so codegen monomorphizes the call under
+// the concrete substitution, exactly as the single-module path does.
+//
+// DELIBERATELY NARROW — this is the #3645 scope-narrow re-opened for exactly
+// one shape, not lifted. A type parameter mentioned in ANY formal parameter is
+// excluded, which leaves in force:
+//   * #1937 (`Make<A, B>(a: A, b: B): Pair<A, B>`) — both parameters are
+//     argument-bound, nothing ships, the sema gate still rejects. Its body
+//     constructs a SIBLING generic record, which the single-class synthetic
+//     source the importer re-parses cannot resolve, so admitting it here would
+//     trade a clean reject for a reconstruction failure.
+//   * #1943 (`Count<T>(x: T): int`) — the return mentions no type parameter,
+//     nothing ships, the codegen argument-width gate still rejects.
+//   * `Echo<T>(x: T): T` — argument-bound, unchanged.
+// Verified by measurement, not by reading: with the gate widened to every
+// generic method both of those shapes newly COMPILE, which is the broader
+// #1937/#428 monomorphization work item and not this fix.
+bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
+    if (md.genericParams.empty() || !md.returnType) return false;
+    std::unordered_set<std::string_view> names;
+    for (const auto& gp : md.genericParams)
+        if (!gp.name.empty()) names.insert(gp.name);
+    if (names.empty()) return false;
+    std::unordered_set<std::string_view> boundByArg;
+    for (const auto& p : md.params)
+        astTypeMentionsNames(p.type.get(), names, boundByArg);
+    std::unordered_set<std::string_view> mentionedInReturn;
+    astTypeMentionsNames(md.returnType.get(), names, mentionedInReturn);
+    for (std::string_view nm : mentionedInReturn)
+        if (!boundByArg.count(nm)) return true;
+    return false;
+}
+
 std::string qualifiedSymbolName(const sema::Symbol* symbol,
                                 std::string_view moduleName) {
     if (!symbol) return {};
@@ -1304,7 +1383,15 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // non-parametric record) IS shipped.
             const bool isNonGenericClassRecordReturn =
                 methodReturnsRecord && md->genericParams.empty();
-            if ((isGenericType || isNonGenericClassRecordReturn) &&
+            // fix #4600 (§14.5 phase 3 / §14.1 / §2.8.3 rule 2, v0.307): the
+            // ONE generic-method shape the scope-narrow above leaves silently
+            // miscompiling — see `isReturnOnlyGenericMethod`'s header for the
+            // measurement and for why the #1937 and #1943 shapes are excluded
+            // rather than swept in. Ships for a generic method on a generic
+            // class too, where `isGenericType` already shipped it.
+            const bool isReturnOnlyGeneric = isReturnOnlyGenericMethod(*md);
+            if ((isGenericType || isNonGenericClassRecordReturn ||
+                 isReturnOnlyGeneric) &&
                 !source.empty() &&
                 md->span.begin.offset < md->span.end.offset &&
                 md->span.end.offset <= source.size()) {
