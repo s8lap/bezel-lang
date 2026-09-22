@@ -14158,6 +14158,37 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
     // arity-0 ctor (`ctorArityCount(b, 0, nullptr) == 1`), preserving every
     // pre-existing call: §22.6's order is preserved because it IS
     // `ctorForArgs`'s order.
+    // fix #4595 (§22.5 "Evaluation timing" / §22.8 step 0-1 / §22.10, v0.306):
+    // did `prePopulateBasePositionalFields`'s own walk, started once at the
+    // construction entry point, already materialize `b`'s §22.10 positional
+    // defaults? That walk begins at `mostDerived` and recurses into a base
+    // ONLY while each successive base declares positional fields of its own
+    // (its `if (!baseTs->hasPositionalFields) return;` top gate,
+    // LlvmBackend_Exprs2.cpp) — so it visits `cls`, and therefore fills `cls`'s
+    // direct base `b`, exactly when every class from `baseClassOf(mostDerived)`
+    // down to `cls` has `hasPositionalFields`.
+    //
+    // This replaces the plainer `cls != mostDerived` the #4574 arm below shipped
+    // with. That spelling answers the same question correctly for a
+    // pass-through ancestor — an intermediate class with NO primary list, which
+    // is exactly what stops the walk — but NOT for an intermediate class that
+    // HAS one, where the walk does reach `b` and the arm then materialized a
+    // default a SECOND time. MEASURED on this commit's parent (97718f8a), with
+    // `class B(n: int := 1, k: int := Counter.Next())`, `class D(m: int := 2) :
+    // B` and `class E : D`: `new E()` printed `k=2 cnt=2` where §22.5
+    // "Evaluation timing" admits one evaluation (`k=1 cnt=1`) — the #3562/#4485
+    // defect class, reintroduced one level up. Widening the arm's gate to reach
+    // a base with NO explicit constructor (this fix) would have extended that
+    // second evaluation to the no-ctor spelling as well, so the tighter
+    // predicate lands with it.
+    bool entryWalkFilledBase = (cls == mostDerived);
+    if (!entryWalkFilledBase) {
+        for (const sema::TypeSymbol* y = baseClassOf(mostDerived); y;
+             y = baseClassOf(y)) {
+            if (!y->hasPositionalFields) break;
+            if (y == cls) { entryWalkFilledBase = true; break; }
+        }
+    }
     std::vector<ast::CallArgument> emptyArgs;
     if (sema::ConstructorSymbol* target = ctorForArgs(b, emptyArgs, nullptr)) {
         // fix #2882 (§22.8 step 1 / §14.1 / §12, v0.240): when `b` is a generic
@@ -14206,8 +14237,44 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                 builder_.CreateCall(it->second, args);
             }
         }
-    } else if (b->hasPositionalFields && hasAnyConstructor(b) &&
-               cls != mostDerived) {
+    } else if (b->hasPositionalFields && !entryWalkFilledBase) {
+        // fix #4595 (§22.5 "Optional parameters and named arguments" /
+        // §22.8 step 0-1 / §22.10 "Primary constructors" / §12.8, v0.306):
+        // this gate also read `hasAnyConstructor(b)` until #4595. Dropping
+        // that conjunct is the whole of that fix: `b` reached through a
+        // PASS-THROUGH ancestor and declaring NO explicit constructor at all
+        // dropped its §22.10 defaults for exactly the same reason #4574's
+        // shape did, and for exactly as long. With `hasAnyConstructor(b)`
+        // false the arm below this one took the call
+        // (`!emitImportedBaseFieldInit(b, ...)` → `emitImplicitBase` +
+        // `emitLocalBaseFieldInit`), and NEITHER of those materializes a
+        // §22.10 POSITIONAL parameter's default — the same reason stated for
+        // the `hasAnyConstructor(b)` spelling further down this comment. So
+        // `b`'s positional fields stayed at their calloc zero, silently.
+        //
+        // MEASURED on this commit's parent (97718f8a = origin/main cafdfc52
+        // + #4574 + #4575), issue #4595's own repro:
+        //
+        //   class B(n: int := 1, s: string := "d") ... end B;   // NO ctor
+        //   class D : B end D;
+        //   class E : D end E;
+        //   new E()   // printed `0` and a blank line; `1` / `d` is correct
+        //
+        // The ONE-LEVEL spelling (`class D : B end D;`, `new D()`) printed
+        // `1` / `d` correctly both before and after — that is fix #3792's
+        // shape, where `B` IS the entry's direct base and
+        // `prePopulateBasePositionalFields` already reaches it. `cls !=
+        // mostDerived` is what keeps this arm off that already-correct path,
+        // exactly as it does for #4574's; see its own paragraph below.
+        //
+        // The ROUTING below is split on `hasAnyConstructor(b)` so that each
+        // half keeps byte-identical behaviour to the arm that used to own it:
+        // #4574's shape keeps the `primaryInitFn` / `emitImplicitBase` +
+        // `emitLocalBaseFieldInit` pair it introduced, and #4595's shape
+        // keeps the `emitImportedBaseFieldInit`-first sequence the
+        // no-explicit-ctor fallback below runs. Only the default
+        // materialization above them is now shared.
+        //
         // fix #4574 (§22.5 "Optional parameters and named arguments" /
         // §22.8 step 0-1 / §22.10 "Primary constructors" / §12.8
         // "Constructor chaining", v0.306): the "route to the primary" arm
@@ -14234,7 +14301,9 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
         // fields either — they stay at their calloc zero, with no
         // diagnostic at any severity.
         //
-        // `cls != mostDerived` is the guard against DOUBLE materialization,
+        // `entryWalkFilledBase` (fix #4595 — `cls != mostDerived` until then,
+        // see the predicate's own comment above for why that was too weak) is
+        // the guard against DOUBLE materialization,
         // not an incidental narrowing. Whenever THIS `emitImplicitBase`
         // call is the construction ENTRY POINT for the class whose
         // implicit `base()` reaches `b` DIRECTLY (`cls == mostDerived`),
@@ -14247,11 +14316,13 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
         // is exactly `b`'s. Filling them again here too would evaluate a
         // non-constant default (`Counter.Next()`, an `owned`-factory) a
         // SECOND time, the exact defect class fix #3562/#4485 exist to
-        // prevent. `cls != mostDerived` is false only when this recursion
-        // was reached through `emitImplicitBase`'s OWN "no-ctor
+        // prevent. `entryWalkFilledBase` is false only when the entry
+        // walk STOPPED before reaching `cls` — which happens exactly when
+        // some class between the construction entry and `cls` (inclusive)
+        // has NO primary parameter list of its own, i.e. when this
+        // recursion was reached through `emitImplicitBase`'s OWN "no-ctor
         // pass-through ancestor" recursion below (`b` becomes the NEXT
-        // `cls`) — an intermediate class with NO primary parameter list of
-        // its own sitting between the construction entry and `b`. That
+        // `cls`). That
         // intermediate class has no positional fields of ITS OWN, so
         // `prePopulateBasePositionalFields`'s top gate — keyed on the
         // ENTRY's DIRECT base, not on `b` — returns before ever examining
@@ -14307,9 +14378,20 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
             builder_.CreateStore(
                 v, builder_.CreateStructGEP(bst, obj, idxIt->second));
         }
-        if (ctx_.isImported(b) && b->genericParams.empty()) {
-            builder_.CreateCall(primaryInitFn(b), {obj});
-        } else {
+        if (hasAnyConstructor(b)) {
+            if (ctx_.isImported(b) && b->genericParams.empty()) {
+                builder_.CreateCall(primaryInitFn(b), {obj});
+            } else {
+                emitImplicitBase(b, obj, mostDerived);
+                emitLocalBaseFieldInit(b, obj, mostDerived);
+            }
+        } else if (!emitImportedBaseFieldInit(b, obj, mostDerived)) {
+            // fix #4595: `b` declares no explicit constructor, so this is the
+            // no-explicit-ctor fallback below, verbatim — `emitImported
+            // BaseFieldInit` first (a no-op returning false for a LOCAL `b`),
+            // then `b`'s own base chain and field initializers. Its
+            // `if (!hasAnyConstructor(b))` guard on the field-init call is
+            // unconditionally true here, so the two are the same sequence.
             emitImplicitBase(b, obj, mostDerived);
             emitLocalBaseFieldInit(b, obj, mostDerived);
         }
