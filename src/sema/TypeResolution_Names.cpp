@@ -1967,6 +1967,27 @@ std::optional<long long> Resolver::resolveConstIdentInScope(
             }
         ts = nb;
     }
+    // #4591: AST-ONLY on purpose — unlike the currentOuterType_ walk above,
+    // this arm can never observe a `ConstMemberSymbol` at all (imported OR
+    // local), so it needs no `cms->intValue` fallback of its own. Per §2.7
+    // rule 1 (v0.306), a bare name reaches a `const` ONLY through "the
+    // enclosing type's accessible members, inherited included" — exactly the
+    // currentOuterType_ + class-base-chain walk above, which #3230 already
+    // covers. "The current module's declarations" and "imported bare names"
+    // that rule 1 reaches AFTER the enclosing type are never `const`:
+    // `ast::ConstDecl` is an A.4 Member production, reachable only inside a
+    // type body (A.2's `TopDecl` admits no bare `const`), so `lookupName`
+    // walking `scope` here — built from `Scope::names` insertions across
+    // TypeResolution_Names.cpp/Checks.cpp — only ever yields a `TypeSymbol` /
+    // `TypeAliasSymbol` / `NestedTypeSymbol` / a generic-param `nullptr`
+    // marker; grepped exhaustively, no insertion site ever stores a
+    // `ConstMemberSymbol`. Verified with a live two-module build (issue
+    // #4591): a bare reference to another class's const — same-module
+    // unrelated class, nested-type-to-enclosing-type, and cross-module
+    // unrelated importing class, local AND imported — is rejected at
+    // general expression resolution with "unresolved identifier `K`"
+    // *before* this arm would matter, for both a local and an imported `K`.
+    // The one live path (inheritance) is arm one, already fixed by #3230.
     if (Symbol* s = lookupName(name, scope))
         if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
             if (cd->value)
