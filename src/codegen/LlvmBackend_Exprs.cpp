@@ -9402,28 +9402,47 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // WITH an `Equals` override answered `False` against a same-typed local of
     // the concrete class, in both operand orders, while `.Equals` answered
     // `True` both ways — the identical root cause, not a separate defect).
-    // Interfaces are deliberately NOT widened here (`TypeDeclKind::Interface`
-    // is untouched) — measured to have the analogous bug via a different arm of
-    // this same predicate, but that is a distinct code path and out of #4560's
-    // scope; tracked separately as #4615.
+    // fix #4615 (§8.4/§25.2, v0.307): #4560 widened this predicate to accept
+    // `Object` but deliberately left `TypeDeclKind::Interface` untouched,
+    // filing the analogous bug separately. An INTERFACE-typed operand's
+    // runtime value is always a class instance (interfaces cannot be
+    // instantiated on their own, §11.2) — §8.4's "For classes, `=` always
+    // invokes `Equals`" (§25.2) applies to it exactly as it does to a
+    // concretely-typed or `Object`-typed operand; there is no carve-out keyed
+    // on the operand's *static* type, only on the runtime kind (class vs.
+    // record/enum/etc.). Pre-fix, `I = I` fell through this arm (Interface is
+    // `Kind::Named` but `declaration->kind != Class`) all the way to CG4's raw
+    // `ICmpEQ`/`ICmpNE` below — reference identity — while `.Equals()` on the
+    // identical pair already dispatched virtually through the SAME
+    // `lowerObjectEquals` helper (fix #4594 established this exact reasoning
+    // for an interface-typed *collection element*'s `Equals`: "every class's
+    // vtable slot 4 is unconditionally filled ... so routing an interface
+    // through `lowerObjectEquals` is total, not a fast path" — an interface
+    // element/operand with no override still answers identity, unchanged).
+    // Widen the per-operand predicate to also accept `Interface`, folded into
+    // the existing `isObjectOrInterfaceTarget` helper (already Object+
+    // Interface, used identically at the `.Equals()` dispatch site a few
+    // hundred lines above) rather than hand-rolling a second Object-only arm,
+    // which both simplifies this predicate and keeps the two call sites from
+    // drifting.
     if ((op == "=" || op == "<>") &&
         l->getType()->isPointerTy() && r->getType()->isPointerTy()) {
-        auto isUserClassOrObjectExpr = [&](const ast::Expr* e) -> bool {
+        auto isUserClassObjectOrInterfaceExpr = [&](const ast::Expr* e) -> bool {
             if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
             const sema::TypeRef* t = ctx_.exprType(*e);
             if (!t) return false;
             if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
                 t->declaration->kind == ast::TypeDeclKind::Class)
                 return true;
-            // §8.1: `Object` is itself a class, but its TypeRef is minted as
-            // Kind::Primitive/PrimitiveType::Object (see
-            // isObjectOrInterfaceTarget), not Kind::Named — so it needs its own
-            // arm rather than falling out of the Named/Class check above.
-            return t->kind == sema::TypeRef::Kind::Primitive &&
-                   t->primitive == sema::PrimitiveType::Object;
+            // §8.1/§11.2: `Object` (Kind::Primitive/PrimitiveType::Object) and
+            // interface types (Kind::Named/TypeDeclKind::Interface) are both
+            // always backed by a class instance at runtime;
+            // `isObjectOrInterfaceTarget` already recognizes exactly this pair
+            // (used identically by the `.Equals()` dispatch site above).
+            return isObjectOrInterfaceTarget(t);
         };
-        if (isUserClassOrObjectExpr(bin.left.get()) &&
-            isUserClassOrObjectExpr(bin.right.get())) {
+        if (isUserClassObjectOrInterfaceExpr(bin.left.get()) &&
+            isUserClassObjectOrInterfaceExpr(bin.right.get())) {
             if (llvm::Value* eq = lowerObjectEquals(l, r))
                 return op == "=" ? eq : builder_.CreateNot(eq);
         }
