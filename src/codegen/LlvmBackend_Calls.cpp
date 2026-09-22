@@ -1635,48 +1635,96 @@ sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
 }
 
 
-// issue #400 / §25.2: the per-element comparison `Array<T>`/`OwningArray<T>`'s
-// `.Remove(item)` uses to match `el` (a stored element, borrowed) against
-// `target` (the query, a pure borrow — neither operand is consumed). The spec
-// requires collections to use the element type's `Equals` (§25.2: "which use
-// `Equals` rather than `=`"), defaulting per §8.3:
-//   - class WITH a user `Equals` override → virtual `el.Equals(target)` (§8.4),
-//     guarded so a null slot or null query falls back to reference identity
-//     (matching §8.4's null-safe `=`: null = null is true; null = nonNull false);
-//   - class WITHOUT an override → reference identity (§8.3 default);
-//   - record → structural field-by-field equality (§8.3, emitStructEquality —
-//     consistent with the record's auto `Equals`/`GetHashCode`);
-//   - string → content equality (§4.6);
-//   - primitive/enum (value type) → `==`.
+// issue #400 / §25.2: the per-element comparison every membership lowering
+// shares — `Array<T>`/`OwningArray<T>`'s `.Contains`/`.IndexOf`/`.Remove`, the
+// `x in coll` of §17.5, the span scans, the `LinkedList<T>` node walk, and the
+// array-backed `Set<T>`/`OwningSet<T>` dedup insert — matching `el` (a stored
+// element, borrowed) against `target` (the query, a pure borrow — neither
+// operand is consumed). The spec requires collections to use the element type's
+// `Equals` (§25.2: "which use `Equals` rather than `=`"), defaulting per §8.3.
+//
+// fix #4573 (§8.3/§8.4/§4.3.1/§25.2, v0.306): this function used to be a list
+// of arms each guarded on the OPERANDS' CURRENT LLVM SHAPE, ending in a scalar
+// `ICmpEQ`/`FCmpOEQ` tail. That shape is what made it an OPEN arm list: when an
+// element's shape matched no arm the control fell through to the scalar tail,
+// which `ICmpInst` rejects for a struct/array operand — so a missing arm was
+// not a compile-time gap but a **runtime IR-verification crash**, found only
+// once somebody wrote that spelling. Four arms were hand-added in as many weeks
+// on exactly that discovery path (#4553 nullable-value, #4571 decimal, #4579
+// the insert-side sibling, #4580 the bare query operand), and three of the four
+// were ultimately fixed by routing to a helper that already knew the answer.
+//
+// It now dispatches on the element's **sema type**, resolved once, and coerces
+// both operands up front; the value family is handed WHOLE to `emitValueEquality`
+// (LlvmBackend_Layout.cpp), the single canonical per-value equality helper that
+// `=`, record-field equality, the dictionary/set key trampolines (#1464) and
+// `lowerValueSemMethodOn` (#4562) already share. `emitValueEquality` is a strict
+// superset of the retired tail: struct recursion (`emitStructEquality`), the
+// memoized nested-record helper (#4234), inline arrays (§15.1.2), choices
+// (§35.7), scale-invariant `decimal` (§4.4, `bz_decimal_cmp`), the §8.4
+// null-safe nullable-value rule (#364) and — the one silent divergence the old
+// tail carried — §4.3.1's NaN-REFLEXIVE float equality ("NaN = NaN is true"),
+// which the old `FCmpOEQ` tail answered `false` for.
+//
+// The ordering below is by SEMA KIND, and each branch coerces rather than
+// declines, so "a new element kind" is a visible hole in this enumeration
+// instead of malformed IR:
+//
+//   1. class / interface — the one caller-supplied discriminator (`elemIsClass`,
+//      the §28.11 owned/borrow column): a user `Equals` override dispatches
+//      virtually (§8.4), else reference identity (§8.3's Class row);
+//   2. nullable VALUE (`int?`, `enum?`, `record?`, `choice?`, `decimal?`,
+//      `Guid?`, a monomorphized `T?`) — both operands coerced up to the tagged
+//      `{i8 hasValue, T}` struct, then §8.4's null-safe rule;
+//   3. `string` / `string?` — content equality (§4.6), null-safe;
+//   4. `Object` / `Object?` — §8.4's `a.Equals(b)` through the box/class vtable
+//      (`lowerObjectEquals`, the §9.6 helper an `o.Equals(x)` call already uses);
+//   5. any OTHER reference-shaped element (a function value, a builtin heap
+//      collection such as the inner `Array<int>` of an `Array<Array<int>>`, a
+//      `Shared<T>` handle) — §8.3's reference-type default, identity;
+//   6. every VALUE element — `emitValueEquality`.
+//
+// Step 2 MUST precede any record handling: a nullable record is a nullable
+// VALUE, not a bare record. The retired arm order asked `recordTypeOfRef` first,
+// and that predicate ignores `nullable`, so `Array<P?>` took the record arm and
+// `emitStructEquality` compared the tagged struct's field 0 (the `i8 hasValue`
+// tag) against the record's own field 0 — `Array<P?>{P(1)}.Contains(P(99))`
+// answered TRUE (measured), and `.Contains(null)` built `icmp eq i8 %t, i32 %x`
+// and died in IR verification.
 llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
                                                 llvm::Value* target,
                                                 const sema::TypeRef* elemTy,
                                                 bool elemIsClass) {
-    // Record element: structural value equality (§8.3). The Remove loop loads
-    // `el` from the slot and lowers `target` as the record's struct value; an
-    // ICmp on a struct is invalid, so this path is mandatory (not an extension).
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(elemTy)) {
-        // issue #462 / §14.1: a GENERIC record element (`Array<Box<string>>`)
-        // must use the specialized struct (load size + field offsets) and resolve
-        // each `T`-typed field to its concrete type for per-field equality. A
-        // no-op for a non-generic record element.
-        RecordSubstGuard elemSubst(this, elemTy);
-        llvm::StructType* st = recordStruct(rec);
-        llvm::Value* l = el, *r = target;
-        if (l->getType()->isPointerTy()) l = builder_.CreateLoad(st, l);
-        if (r->getType()->isPointerTy()) r = builder_.CreateLoad(st, r);
-        if (l->getType()->isStructTy() && r->getType()->isStructTy())
-            return emitStructEquality(l, r, st, rec);  // §8.3 structural
-        // Shape mismatch (defensive): no match rather than an invalid compare.
-        return builder_.getFalse();
-    }
+    using K = sema::TypeRef::Kind;
+    if (!el || !target) return nullptr;
 
-    // Class element: dispatch through a user `Equals` override when present.
-    if (elemIsClass && el->getType()->isPointerTy() &&
-        target->getType()->isPointerTy()) {
+    // ── 0. The element's SEMA type, resolved ONCE (§14.1) ──────────────────
+    // Inside a monomorphized generic body a collection's `genericArgs[0]` is
+    // still the placeholder parameter (`T`), so every kind test below would
+    // answer "unknown" and the function would be shape-driven again. Resolve it
+    // through the active substitution, in the two shapes it takes: a bare `T`
+    // (resolveTypeParamRef) and a nullable `T?` (nullableTypeParamConcrete —
+    // resolveTypeParamRef alone STRIPS the `?`, see its own comment).
+    sema::TypeRef nvBuf;
+    const sema::TypeRef* ty = elemTy;
+    if (ty && ty->nullable && ty->kind == K::Named && !ty->declaration &&
+        nullableTypeParamConcrete(ty, nvBuf))
+        ty = &nvBuf;
+    else
+        ty = resolveTypeParamRef(ty);
+
+    const bool bothPtr =
+        el->getType()->isPointerTy() && target->getType()->isPointerTy();
+
+    // ── 1. CLASS / INTERFACE element ───────────────────────────────────────
+    // The one discriminator this function cannot read off the element type
+    // alone: `elemIsClass` is the caller's §28.11 owned/borrow classification
+    // (`elementPolicyFor`, widened to Class|Interface by #619), and the
+    // array-backed set insert passes it unconditionally because its backing
+    // slot is a pointer by construction. Kept as the named parameter it is.
+    if (elemIsClass && bothPtr) {
         const sema::TypeSymbol* cls =
-            (elemTy && elemTy->kind == sema::TypeRef::Kind::Named)
-                ? elemTy->declaration : nullptr;
+            (ty && ty->kind == K::Named) ? ty->declaration : nullptr;
         if (sema::MethodSymbol* eqm = classEqualsOverride(cls)) {
             // §8.4: `el.Equals(target)`. Guard against a null element slot or a
             // null query: dispatching through a null `el` would load a null
@@ -1719,96 +1767,106 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         return builder_.CreateICmpEQ(el, target);
     }
 
-    // fix #4553 (§17.5 / §8.4, v0.306): a NULLABLE VALUE element — `Array<int?>`,
-    // `Set<Color?>`, a `T?` span slot — lowers to the tagged
-    // `{i8 hasValue, T value}` struct, and NO arm above claims it:
-    // `recordTypeOfRef` declines a primitive, the class arm needs two pointers,
-    // the string arm needs two pointers. It therefore fell through to the scalar
-    // comparison below, which emitted `icmp eq { i8, i32 } %el, %tgt` — an
-    // operand shape `ICmp` rejects outright, so the whole compile died in IR
-    // verification ("Invalid operand types for ICmp instruction").
+    // ── 2. NULLABLE VALUE element (§17.5 / §8.4) ───────────────────────────
+    // `Array<int?>`, `Set<Color?>`, `Array<P?>`, `Array<Guid?>`, a `T?` span
+    // slot: the tagged `{i8 hasValue, T value}` struct. §17.5: "Where the
+    // selected `Contains` parameter is **itself** nullable … a nullable left
+    // operand is **admitted**: the test performed is the null-safe equality of
+    // §8.4, total over an absent operand" — which `emitValueEquality`'s
+    // nullable-value branch implements (#364).
     //
-    // §17.5 fixes what the comparison must be: "Where the selected `Contains`
-    // parameter is **itself** nullable — `Array<int?>`'s `Contains(item: int?)`
-    // … — a nullable left operand is **admitted**: the test performed is the
-    // null-safe equality of §8.4, total over an absent operand". §8.4's rule is
-    // both-null → equal, exactly-one-null → not-equal, both-present → the inner
-    // type's equality — which `emitValueEquality`'s nullable-value branch
-    // already implements (issue #364), so route to it rather than re-deriving
-    // it here and risking a second spelling of one rule.
-    //
-    // fix #4580 (§17.5/§8.4/§5.1, v0.306): the arm above only fired when BOTH
-    // operands already arrived as the tagged struct. `el` (the stored element,
-    // loaded at the element stride) always does — but `target`, the QUERY
-    // operand, may instead be a NON-nullable value: `3 in xs` over
-    // `Array<int?>` lowers the literal `3` straight from its `int` type
-    // (`lowerExpr`'s IntLiteralExpr arm reads `rt->primitive` and ignores
-    // `rt->nullable`), so it arrives as a bare `i32`. §5.1 admits this — `T`
-    // converts to `T?` implicitly (the "present-value wrapping" of §7.2) —
-    // before §17.5's own admissibility rule even engages. Coerce EACH operand
-    // up to the tagged struct with `ensureNullableElementValue` (the same
-    // helper fix #4579 uses to spill a bare value into a nullable-value slot)
-    // before dispatching, so a bare inner value on either side is admitted
-    // rather than declined into the invalid-IR fallback below.
-    // `ensureNullableElementValue` is a no-op on a value that is already the
-    // tagged struct, so the pre-existing both-tagged case is unaffected.
-    //
-    // Every caller of this helper gets the fix at once: `x in coll` (the §17.5
-    // lowering), `.Contains`, `.Remove`, `.IndexOf`, and the array-backed
-    // `Set<T>` dedup insert all compare elements through here.
-    if (isNullableValueTy(elemTy)) {
-        llvm::Value* l = ensureNullableElementValue(elemTy, el);
-        llvm::Value* r = ensureNullableElementValue(elemTy, target);
+    // BOTH operands are coerced, not merely checked (#4580): `el` always
+    // arrives tagged (it is loaded at the element stride) but the QUERY need
+    // not — `3 in xs` over `Array<int?>` lowers the literal from its `int` type
+    // and arrives as a bare `i32`, and §5.1 admits that (`T` converts to `T?`,
+    // §7.2's present-value wrapping) before §17.5's admissibility rule even
+    // engages. `ensureNullableElementValue` (the helper #4579 extracted for the
+    // insert side) is a no-op on an already-tagged value and maps a null
+    // pointer to the all-zero tagged null.
+    if (isNullableValueTy(ty)) {
+        llvm::Value* l = ensureNullableElementValue(ty, el);
+        llvm::Value* r = ensureNullableElementValue(ty, target);
         if (l->getType()->isStructTy() && r->getType()->isStructTy())
-            return emitValueEquality(l, r, elemTy);
+            return emitValueEquality(l, r, ty);
     }
 
-    // fix #4571 (§4.4/§8.3, v0.306): a non-nullable DECIMAL element —
-    // `Array<decimal>`, `LinkedList<decimal>`, the array-backed `Set<decimal>`
-    // dedup insert — lowers to the 16-byte `%bz.decimal` struct
-    // (decimalStructType(), `{i32×4}`). No arm above claims it: `recordTypeOfRef`
-    // declines a primitive, the class arm needs two pointers, and the
-    // nullable-value arm just above declines it too (a bare `decimal` is not a
-    // nullable-value SHAPE — `isNullableValueTy` is false for it; only `decimal?`
-    // would match, and that already routes correctly through the arm above). It
-    // therefore fell through to the scalar fallback at the bottom of this
-    // function, which built `icmp eq %bz.decimal %el, %tgt` — an operand shape
-    // `ICmpInst` rejects outright (int/ptr/vector-of-int-or-ptr only), so the
-    // whole compile died in IR verification ("Invalid operand types for ICmp
-    // instruction").
-    //
-    // `emitValueEquality` already has a non-nullable-decimal arm
-    // (LlvmBackend_Layout.cpp, fix #663) implementing the correct comparison —
-    // `bz_decimal_cmp`, scale-invariant per §4.4 (`3.0m == 3.00m` despite
-    // differing scale bits) — and fix #4562 routed the sibling
-    // `lowerValueSemMethodOn` dispatch (`decimal.Equals`) through that SAME
-    // helper for that SAME reason. Route here too rather than re-deriving a
-    // third spelling of one rule: narrow #4553, immediately above, made exactly
-    // this argument for the nullable-value shape ("route to it rather than
-    // spelling one rule twice").
-    if (elemTy && elemTy->kind == sema::TypeRef::Kind::Primitive &&
-        elemTy->primitive == sema::PrimitiveType::Decimal && !elemTy->nullable &&
-        el->getType() == decimalStructType() &&
-        target->getType() == decimalStructType())
-        return emitValueEquality(el, target, elemTy);
-
-    // String element: content equality (§4.6).
-    if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
+    // ── 3. STRING element: content equality (§4.6) ─────────────────────────
+    // `string` and `string?` alike — `emitStringEq` opens with a same-pointer
+    // test and an either-null guard, so it is already the §8.4 null-safe rule
+    // for the nullable spelling. Gated on the DECLARED type: the retired arm
+    // gated on "both operands are pointers", which content-compared every
+    // OTHER pointer-shaped element as if it were a `%bz.string` (see step 5).
+    if (bothPtr && ty && ty->kind == K::Primitive &&
+        ty->primitive == sema::PrimitiveType::String)
         return emitStringEq(el, target);
 
-    // Value type (primitive/enum): `==`. Widen mismatched integer widths.
-    llvm::Value* elN = el, *tN = target;
-    if (el->getType() != target->getType() &&
-        el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
-        unsigned ew = el->getType()->getIntegerBitWidth();
-        unsigned tw = target->getType()->getIntegerBitWidth();
-        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
-        elN = builder_.CreateSExt(el, wide);
-        tN  = builder_.CreateSExt(target, wide);
+    // ── 4. `Object` / `Object?` element: §8.4 through the vtable ───────────
+    // §8.4 is "`a = b` invokes `a.Equals(b)`" and §8.3's Primitive row gives a
+    // boxed primitive's `Equals` as "Value comparison", so `Array<Object>`
+    // holding boxed `1`/`2` must answer `Contains(2)` true and `Contains(5)`
+    // false. `lowerObjectEquals` (the §9.6 helper #946/#947 built for
+    // `o.Equals(x)` at an `Object`/interface receiver) is exactly that
+    // dispatch: null → identity, a bare `bz_string*` → content equality when
+    // the other side is also a string, a class/box → `vtable[kEqualsSlot]`,
+    // which for a box is the `bz$boxeq$<T>` value comparison. The retired arm
+    // instead read word 1 of each operand as a `%bz.string` length
+    // (`loadStringLen`) and memcmp'd on it: measured NON-DETERMINISTICALLY
+    // WRONG — `Array<Object>{1,2}.Contains(5)` answered `true` on the default
+    // build and `false` under ASan, the allocator changing the garbage.
+    if (bothPtr && ty && ty->kind == K::Primitive &&
+        ty->primitive == sema::PrimitiveType::Object)
+        if (llvm::Value* objEq = lowerObjectEquals(el, target)) return objEq;
+
+    // ── 5. Any OTHER reference-shaped element: §8.3 identity ───────────────
+    // A function value, a builtin heap collection (the inner `Array<int>` of an
+    // `Array<Array<int>>`, a `StringBuilder`, a `Task`), a `Shared<T>` handle:
+    // none is a class DECLARATION, so `collectionElemIsClass` answers false and
+    // step 1 declines — but each is a reference type, whose §8.3 default
+    // `Equals` is reference equality. None has a `%bz.string` header, so the
+    // retired arm's `emitStringEq` read two unrelated heap words as a length
+    // and a data pointer (measured: `Array<(int) -> int>{f}.Contains(g)`
+    // answered `true` for a DIFFERENT function on the default build).
+    if (bothPtr) return builder_.CreateICmpEQ(el, target);
+
+    // ── 6. Every VALUE element: the one authority ──────────────────────────
+    // Primitive (incl. §4.3.1-reflexive float and §4.4 scale-invariant
+    // decimal), enum, record (§8.3 field-by-field, via #4234's memoized
+    // per-instantiation helper), choice (§35.7 active-case-then-payload),
+    // inline array (§15.1.2 element-by-element) and the struct-shaped value
+    // builtins (`Guid` {i64,i64}, `Range` {i64,i64,i64,i8}, the {ptr,i32,i32}
+    // spans, `JsonOptions`) — `emitValueEquality` covers all of them, the last
+    // group through its struct fallback (`emitStructEquality`, field-wise).
+    // Coerce first, so the authority is never handed operands it would build
+    // invalid IR from:
+    llvm::Value* l = el, *r = target;
+    //  (a) a SPILLED aggregate operand (a record materialized into an alloca):
+    //      load it at the other side's type. The retired record arm did this
+    //      with `recordStruct(rec)`; the other side's type is that same struct.
+    if (l->getType()->isPointerTy() && !r->getType()->isPointerTy())
+        l = builder_.CreateLoad(r->getType(), l);
+    else if (r->getType()->isPointerTy() && !l->getType()->isPointerTy())
+        r = builder_.CreateLoad(l->getType(), r);
+    //  (b) mismatched INTEGER widths (`Array<short>.Contains(1)` — the literal
+    //      lowers at its own `int` width). Widen both to the wider type, the
+    //      retired tail's rule kept verbatim so no narrowing/sign change is
+    //      introduced by this refactor.
+    if (l->getType() != r->getType() &&
+        l->getType()->isIntegerTy() && r->getType()->isIntegerTy()) {
+        unsigned lw = l->getType()->getIntegerBitWidth();
+        unsigned rw = r->getType()->getIntegerBitWidth();
+        llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
+        l = builder_.CreateSExt(l, wide);
+        r = builder_.CreateSExt(r, wide);
     }
-    if (elN->getType()->isFloatingPointTy())
-        return builder_.CreateFCmpOEQ(elN, tN);
-    return builder_.CreateICmpEQ(elN, tN);
+    //  (c) a residual AGGREGATE shape mismatch is not comparable — answer "no
+    //      match" rather than emit an `extractvalue`/`icmp` pair over two
+    //      different layouts. This is the retired record arm's own defensive
+    //      `getFalse()`, kept and widened to every aggregate.
+    if (l->getType() != r->getType() &&
+        (l->getType()->isStructTy() || l->getType()->isArrayTy() ||
+         r->getType()->isStructTy() || r->getType()->isArrayTy()))
+        return builder_.getFalse();
+    return emitValueEquality(l, r, ty);
 }
 
 
