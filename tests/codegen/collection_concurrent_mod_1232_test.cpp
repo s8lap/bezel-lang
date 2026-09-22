@@ -302,3 +302,44 @@ BEZEL_TEST(collection_concurrent_mod_1232,
         "  return caught * 100 + R._n; "
         "end Main; end C;"), 1);
 }
+
+// bz_dict_set_gen_disposing: OwningDictionary<int, R>'s owned-taking
+// indexer-set on a PRESENT key — the GENERIC-key twin of the string-key row
+// above (#4606's fix touched four runtime entry points but the commit shipped
+// only three rows; this is the missing fourth). Reachable from real code:
+// LlvmBackend_Assign.cpp's lowerCollectionIndexerSet takes the `keyTy`
+// (non-null / non-string) branch for any non-string-keyed owning dictionary,
+// which falls into the `dictIsOwning2 && valDisp` arm and calls
+// bz_dict_set_gen_disposing — stdlib §4.9 documents `OwningDictionary<K, V>`
+// keys as "any type with the standard equality contract" ("typically string,
+// int, or a record"), so `OwningDictionary<int, R>` is ordinary, sanctioned
+// usage, not a corner case. Same shape as the string-key row: §4.9's default
+// entry-for is not provided on OwningDictionary, so iteration uses the
+// key-iteration pattern (`.Keys`). Pre-fix (bz_dict_set_gen_disposing bumping
+// mod_count on the present-key branch): the update on key 2 (not yet
+// visited) bumps mod_count, and the loop's next advance throws
+// InvalidOperationException, converted by the catch to `caught := 1` — result
+// 100 + R._n. Post-fix: no throw (caught stays 0), and the disposing
+// indexer-set disposes the value it displaced under key 2 exactly once
+// (R._n == 1) — expected result 1.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           owning_dict_gen_key_indexer_set_existing_key_no_throw_4606) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class R "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  using var d := new OwningDictionary<int, R>(); "
+        "  d.Add(1, move (new R())); "
+        "  d.Add(2, move (new R())); "
+        "  var caught := 0; "
+        "  try "
+        "    for var k in d.Keys do "
+        "      if k = 1 then d[2] := move (new R()); end; "
+        "    end; "
+        "  catch InvalidOperationException => caught := 1; "
+        "  end; "
+        "  return caught * 100 + R._n; "
+        "end Main; end C;"), 1);
+}
