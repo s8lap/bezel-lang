@@ -13,6 +13,7 @@
 //! expect: run
 //! output: box
 //!   source
+//! issue: 4601
 module Conf;
 
 public class Source

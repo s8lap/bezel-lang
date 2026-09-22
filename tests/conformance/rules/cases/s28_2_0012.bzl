@@ -10,6 +10,7 @@
 //! cites: 28.2, 28.10
 //! expect: accept
 //! flags: --unchecked-disposal
+//! issue: 4602
 module Conf;
 
 public class Widget

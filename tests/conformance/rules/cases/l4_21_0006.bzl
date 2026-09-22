@@ -12,6 +12,7 @@
 //!   drained b
 //!   disposed b
 //!   left 0
+//! issue: 4604
 module Conf;
 
 public class Widget

@@ -9,6 +9,7 @@
 //! cites: 29.12, 29.2
 //! expect: warn
 //! diagnostic: structural
+//! issue: 4603
 module Conf;
 
 public class Program

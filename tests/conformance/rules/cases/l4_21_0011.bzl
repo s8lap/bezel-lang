@@ -10,6 +10,7 @@
 //! expect: run
 //! output: foreign
 //!   disposed a
+//! issue: 4604
 module Conf;
 
 public class Widget

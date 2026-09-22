@@ -11,6 +11,7 @@
 //! output: disposed a
 //!   False True False True
 //!   disposed b
+//! issue: 4604
 module Conf;
 
 public class Widget

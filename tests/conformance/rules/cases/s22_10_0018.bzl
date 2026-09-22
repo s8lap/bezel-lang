@@ -7,6 +7,7 @@
 //!   field, and the call site freezes its source all the same, harmlessly.
 //! cites: 22.10, 28.14
 //! expect: accept
+//! issue: 4601
 module Conf;
 
 public class Source

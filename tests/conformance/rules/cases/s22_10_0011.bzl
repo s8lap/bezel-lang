@@ -13,6 +13,7 @@
 //!   declared before the holder.
 //! cites: 22.10, 28.14, 22.3
 //! expect: accept
+//! issue: 4601
 module Conf;
 
 public class Source

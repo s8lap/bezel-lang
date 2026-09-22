@@ -10,6 +10,7 @@
 //! cites: 28.2, 31.4, 28.10
 //! expect: run
 //! stdout: faulted
+//! issue: 4602
 module Conf;
 
 public class Widget

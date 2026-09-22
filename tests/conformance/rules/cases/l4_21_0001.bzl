@@ -9,6 +9,7 @@
 //! expect: run
 //! output: a
 //!   disposed a
+//! issue: 4604
 module Conf;
 
 public class Widget

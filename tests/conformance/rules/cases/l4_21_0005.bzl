@@ -11,6 +11,7 @@
 //!   disposed b
 //!   disposed a
 //!   after
+//! issue: 4604
 module Conf;
 
 public class Widget

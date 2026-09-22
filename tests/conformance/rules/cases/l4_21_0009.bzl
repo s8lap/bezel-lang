@@ -6,6 +6,7 @@
 //!   binding is admitted, and the moved binding needs no other discharge.
 //! cites: 4.21, 28.3
 //! expect: quiet
+//! issue: 4604
 module Conf;
 
 public class Widget

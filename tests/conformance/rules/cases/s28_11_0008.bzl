@@ -11,6 +11,7 @@
 //! cites: 28.11, 28.2, 28.3
 //! expect: warn
 //! diagnostic: removal
+//! issue: 4603
 module Conf;
 
 public class Widget

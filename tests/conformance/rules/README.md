@@ -278,3 +278,37 @@ cleanup that runs twice (`s28_12_0006`), and disposal-ordering violations
 
 Per the triage rule above these are class (1) — the compiler has not caught up —
 until a case is shown wrong. None were edited to match the compiler.
+
+### v0.307 re-sync — 2026-09-23 (issue #4621)
+
+v0.307 (#4608, `8bfdd889`) changed 3 case files and added 35 more (proposals
+0127, 0128, 0129, 0130 and 0131 graduating) without re-banking
+`baseline.tsv`, leaving 3 REGRESSION + 35 UNCLASSIFIED rows that no gate
+cycle had any way to notice — the `rule-corpus-baseline` phase below did not
+exist yet (#4621's second finding). This entry re-classifies all 38 against
+`build/bezelc` at commit `bf7a7515`, spec v0.307, and closes both gaps: the
+missing phase (added this same batch) and the stale rows.
+
+Each row was checked individually, per the triage rule — **not** bulk-banked
+as `fail`: 13 of the 35 new cases already pass (the compiler's existing,
+more general checks happen to satisfy them, sometimes for the "wrong" narrow
+reason a `diagnostic:` mismatch flags separately, e.g. `l4_21_0010` rejects
+on the not-yet-existing `OwningSlotMap` type rather than the double-dispose
+rule it means to pin — a known limit of the format, not a new one). The
+remaining 25 are class (1), compiler-has-not-caught-up, and are now banked
+`fail` with an `issue:` header naming their proposal's tracker — turning the
+docket into something `coverage.py`/`runner.py` can enumerate:
+
+| proposal | tracker | section(s) | fail rows |
+|---|---|---|---|
+| 0127 (scoped primary-ctor params) | #4601 | 22.10 | `s22_10_0011`, `0018`, `0019` |
+| 0128 (checked-disposal default) | #4602 | 28.2 | `s28_2_0011`, `0012` |
+| 0129 (iteration-mutation lints) | #4603 | 29.12, 28.11 | `s29_12_0001`, `0004`, `0005`; `s28_11_0008`, `0009` |
+| 0130 (`OwningSlotMap<T>`) | #4604 | 4.21 (stdlib) | `l4_21_0001`–`0007`, `0009`, `0011` |
+| 0131 (trust-admission report mode) | #4605 | 28.3 | `s28_3_0090`–`0093`, `0095`, `0096` |
+
+None of the 3 REGRESSION rows turned out to be a real compiler regression —
+each is v0.307 outrunning the implementation, confirmed by re-deriving the
+observed behaviour on this batch's own `bezelc` rather than trusting the
+issue's numbers. Re-run after banking: `2184 cases: 1758 ok, 426
+known-divergent, 0 unclassified, 0 REGRESSION, 0 UNBANKED`.

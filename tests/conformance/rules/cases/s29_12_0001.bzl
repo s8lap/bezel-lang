@@ -14,6 +14,7 @@
 //! expect: run
 //! warns: yes
 //! stdout: caught
+//! issue: 4603
 module Conf;
 
 public class Program

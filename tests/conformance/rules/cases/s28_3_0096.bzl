@@ -9,6 +9,7 @@
 //! cites: 28.3, 30.1
 //! expect: quiet
 //! flags: --report-trust-admissions
+//! issue: 4605
 module Conf;
 
 import System.Threading;

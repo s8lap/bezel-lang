@@ -9,6 +9,7 @@
 //! cites: 28.3, 28.14
 //! expect: quiet
 //! flags: --report-trust-admissions
+//! issue: 4605
 module Conf;
 
 public class Customer

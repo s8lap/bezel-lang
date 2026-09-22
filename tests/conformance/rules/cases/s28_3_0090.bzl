@@ -11,6 +11,7 @@
 //! expect: warn
 //! diagnostic: trust
 //! flags: --report-trust-admissions
+//! issue: 4605
 module Conf;
 
 public class Customer

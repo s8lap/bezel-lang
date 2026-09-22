@@ -10,6 +10,7 @@
 //! output: foreign
 //!   disposed b
 //!   disposed a
+//! issue: 4604
 module Conf;
 
 public class Widget
