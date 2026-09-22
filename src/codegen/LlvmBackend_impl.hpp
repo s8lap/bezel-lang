@@ -17264,15 +17264,40 @@ private:
     // excluded scrutinee shapes and why this gate is codegen-side.
     bool unboundOwningChoiceTemp(const ast::Expr* e, const sema::TypeRef* rt);
 
+    // fix #4609 / §35.5 *The owning match* form 2 (v0.306): §35.5's OTHER
+    // announcing scrutinee form — "a named owned binding under an explicit
+    // scrutinee transfer marker — `case move outcome of …`". Returns the
+    // source identifier's storage when `e` is `move <identifier>` and `rt`
+    // classifies owning, and null otherwise. §35.5 makes this form a CONSUME:
+    // "the consumed binding is left moved-from when the construct completes".
+    // The returned slot is what the caller zero-stores to record that — the
+    // #4566 mark, at the third site #4566's own SCOPE note left open.
+    //
+    // The storage-type equality check is the safety gate: the slot must hold
+    // exactly the storage `rt` implies (§35.9's `{ i8 hasValue, <choice> }`
+    // for a `C?`, the choice struct otherwise), so a §27.5 capture-boxed local
+    // — whose alloca has been rewritten to a pointer-sized cell holder — is
+    // declined rather than having its cell pointer zeroed. Declining keeps the
+    // pre-fix behaviour, which is the sound direction here: the caller then
+    // registers no replacement disposal either, so nothing can double-free.
+    llvm::AllocaInst* markedOwningChoiceScrutineeSlot(const ast::Expr* e,
+                                                      const sema::TypeRef* rt);
+
     // fix #4552 / §35.5 (v0.306): does `p` (or any pattern nested in it) bind
     // a slot? An owning match's selected arm TRANSFERS the case's owned
     // payloads into its bindings (§35.5), and `using var u := move r;` in a
-    // `do … end` arm is the spec's own adoption spelling — so a construct
-    // whose arms bind anything may not have its scrutinee temporary disposed
-    // wholesale at completion. Deliberately COARSE: a binding on a
-    // payload-free or value-payload case cannot take ownership of anything,
-    // but declining there only leaks (the sound direction), while getting it
-    // wrong the other way is a double free.
+    // `do … end` arm is the spec's own adoption spelling — so an arm that
+    // binds anything may not also have the scrutinee disposed wholesale at
+    // construct completion. Deliberately COARSE: a binding on a payload-free
+    // or value-payload case cannot take ownership of anything, but declining
+    // there only leaks (the sound direction), while getting it wrong the other
+    // way is a double free.
+    //
+    // fix #4609 (§35.5, v0.306): read PER ARM, at the top of the selected
+    // arm's body, not once for the whole construct. The whole-construct
+    // reading disabled the reclaim on every arm of a mixed construct
+    // (`A(var x) => …, B(_) => …`), so selecting the discarding arm leaked a
+    // payload §35.5 disposes at completion.
     static bool patternBindsAnySlot(const ast::Pattern* p);
 
     // Lower a statement list into the current block; returns true if the

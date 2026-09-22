@@ -10323,38 +10323,77 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // completes, by the same unbound-temporary pass that disposes the
         // container."
         //
-        // EXACTLY-ONCE — and the gate that buys it is `armsBind` below.
-        // §35.5's owning match TRANSFERS the selected case's owned payloads
-        // into the arm's bindings, and its own adoption spelling
-        // (`using var u := move r;` in a `do … end` arm) then disposes the
-        // payload at the arm's scope end. Disposing the container wholesale at
-        // construct completion would double-free exactly that shape — MEASURED
-        // as a SIGSEGV on rule-corpus case s35_5_0002, which is written from
-        // the spec and was passing before the gate was added. So this reclaim
-        // is confined to the constructs §35.5 describes as disposing at
-        // completion: the ones whose arms bind NOTHING — "discarded slots like
-        // `Fetched(_)`, and the payloads of the value when a `_` or
-        // non-destructuring arm is selected". For a construct that DOES bind,
-        // the payload keeps the pre-existing behaviour (the arm adopts it, or
-        // it leaks because arm-selection transfer is not implemented) — the
-        // sound direction, and #4552's own follow-up.
-        const bool armsBind = [&] {
-            for (const auto& arm : cs.arms)
-                if (patternBindsAnySlot(arm.pattern.get())) return true;
-            return false;
-        }();
-        if (!scrutOwnedSlot && scrut && !armsBind &&
-            unboundOwningChoiceTemp(cs.scrutinee.get(), scrutTy) &&
+        // EXACTLY-ONCE. §35.5's owning match TRANSFERS the selected case's
+        // owned payloads into the arm's bindings, and its own adoption
+        // spelling (`using var u := move r;` in a `do … end` arm) then
+        // disposes the payload at the arm's scope end. Disposing the container
+        // wholesale at construct completion double-frees exactly that shape —
+        // MEASURED as a SIGSEGV on rule-corpus case s35_5_0002, which is
+        // written from the spec and was passing before the reclaim was added.
+        //
+        // fix #4609 (§35.5, v0.306): the discharge is now PER ARM, at the top
+        // of the selected arm's body, instead of #4552's whole-construct
+        // `armsBind` gate. Same safety, strictly more precision: a construct
+        // that mixes a binding arm with a discarding one (`A(var x) => …,
+        // B(_) => …`) had its reclaim disabled on EVERY arm by the coarse
+        // gate, so selecting `B(_)` leaked a payload §35.5 says is "disposed
+        // at construct completion". The discharge is a runtime zero-store over
+        // the temp slot, so it also covers the UNWIND edge (an exception out
+        // of a binding arm must not re-dispose what the arm's `using var`
+        // already owns) with no second mechanism — the same #4566 moved-from
+        // encoding used everywhere else for a choice. What remains open is
+        // unchanged from #4552: arm-selection transfer is not implemented, so
+        // a binding arm's UN-transferred siblings (`Fetched(var w, _)`) still
+        // leak rather than double-free — the sound direction.
+        //
+        // fix #4609: §35.5's SECOND announcing scrutinee form — `case move o
+        // of …` over a named owned binding — is admitted here alongside the
+        // unbound temporary. The two are one construct in §35.5; only the
+        // announcement differs. The marked form additionally CONSUMES its
+        // source ("the consumed binding is left moved-from when the construct
+        // completes"), which `markedOwningChoiceScrutineeSlot` records with
+        // the same zero-store, so the source's own scope-end active-case pass
+        // becomes a no-op instead of disposing payloads the arms already took.
+        llvm::AllocaInst* markedSrcSlot =
+            markedOwningChoiceScrutineeSlot(cs.scrutinee.get(), scrutTy);
+        if (!scrutOwnedSlot && scrut &&
+            (unboundOwningChoiceTemp(cs.scrutinee.get(), scrutTy) ||
+             markedSrcSlot) &&
             !scrut->getType()->isPointerTy() && !disposeStack_.empty()) {
             scrutChoiceSlot = entryAlloca(scrut->getType());
             builder_.CreateStore(scrut, scrutChoiceSlot);
             scrutChoiceRef = scrutTy;
             Disposal d{scrutChoiceSlot, nullptr};
-            d.unwindOnly = true;   // arm-body throw disposes the temp
+            // fix #4609 (§35.5, v0.306): NOT `unwindOnly`. #4552 registered
+            // this entry for the throw edge only, because the normal edge is
+            // the reclaim at endBB — but a `return` (or `break`/`continue`)
+            // out of an arm body takes neither: `emitDisposals` skips an
+            // `unwindOnly` entry when `dropUndischarged` is false, and endBB
+            // is never reached. MEASURED on
+            // `case move o of W(_) => do Console.WriteLine("hit");
+            // return 5; end, X => () end case;` — `LeakSanitizer: 16 byte(s)
+            // leaked in 1 allocation(s)`, where the pre-#4609 compiler printed
+            // `widget disposed` (the source local's scope-end pass covered the
+            // return path). A plain entry covers every edge, and the two
+            // runtime zero-stores keep it exactly-once: endBB zeroes after its
+            // reclaim (so a later traversal is a no-op) and a BINDING arm
+            // zeroes at its body top (so a return out of an adopting arm does
+            // not re-dispose what the arm's `using var` owns).
+            d.unwindOnly = false;
             d.owningChoice = true;
             d.owningChoiceTy = scrutTy->declaration;
             d.owningChoiceRef = scrutTy;
             disposeStack_.back().push_back(d);
+            // §35.5 form 2 is a CONSUME of the named binding: mark it
+            // moved-from now that the value is captured in the temp above,
+            // which is the only owner from here on. Emitted at the consume
+            // site — not at construct completion — so a `return` or `throw`
+            // out of an arm body finds the source already discharged.
+            if (markedSrcSlot)
+                builder_.CreateStore(
+                    llvm::Constant::getNullValue(
+                        markedSrcSlot->getAllocatedType()),
+                    markedSrcSlot);
         }
     }
     auto* endBB =
@@ -10417,6 +10456,24 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             builder_.CreateCondBr(pm, bodyBB, nextBB);
         }
         builder_.SetInsertPoint(bodyBB);
+        // fix #4609 / §35.5 *The owning match* (v0.306): the per-arm discharge
+        // of the owning-choice scrutinee's construct-completion reclaim.
+        // §35.5 disposes at completion only what was "not transferred into
+        // bindings"; an arm that BINDS takes the payloads (its `using var u :=
+        // move r;` adoption then owns them), so for THAT arm the reclaim must
+        // decline. `bodyBB` is reached only on selection — a guard-declined
+        // arm branches to `nextBB` and "transfers nothing" (§35.5 *Guards*) —
+        // so zeroing here is exactly the §35.5 boundary. The zero-store is
+        // #4566's moved-from encoding, so ONE store discharges every reclaim
+        // the value has — the one at endBB, and the dispose-stack entry that
+        // covers a `throw`, `return` or `break` out of this arm body; the
+        // bindings were filled from the scrutinee VALUE above, not re-read
+        // from this slot, so nothing in the arm observes the zeros.
+        if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
+            builder_.CreateStore(
+                llvm::Constant::getNullValue(
+                    scrutChoiceSlot->getAllocatedType()),
+                scrutChoiceSlot);
         bool armTerm = lowerScopedBlock(arm.stmts);
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);

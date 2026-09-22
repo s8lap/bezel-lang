@@ -6671,10 +6671,17 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
 // double free:
 //   • a bare identifier (`case o of …`) — a named local, disposed by
 //     `registerOwningChoiceDisposal`'s scope-end active-case pass;
-//   • `case move o of …` — the §35.5 marked scrutinee transfer, which codegen
-//     does not yet implement (the source local's slot is left populated and
-//     its scope-end pass still disposes it; #4552's follow-up);
 //   • a field / property / indexer read — a borrow of its storage (K1.5).
+//
+// `case move o of …` — §35.5's OTHER announcing scrutinee form — is NOT in
+// either list: it was excluded here as "#4552's follow-up" until fix #4609
+// implemented the marked scrutinee transfer, and it now reaches the same
+// construct-completion reclaim through the sibling gate
+// `markedOwningChoiceScrutineeSlot`, which additionally marks the source
+// binding moved-from. The old exclusion's stated consequence — "the source
+// local's slot is left populated and its scope-end pass still disposes it" —
+// was not the leak it reads as but a DOUBLE FREE, since the arm had already
+// adopted the payload; see that helper for the measurement.
 //
 // This gate is deliberately NOT the ownership pass's `disposeOwnedScrutinee`
 // flag: that flag's own predicate is `producerState == Owned` restricted to a
@@ -6715,6 +6722,77 @@ bool Emitter::unboundOwningChoiceTemp(const ast::Expr* e,
     return verdict && *verdict == common::ChoiceClassification::Owning;
 }
 
+
+// fix #4609 / §35.5 *The owning match* (v0.306): the SECOND announcing
+// scrutinee form — "a named owned binding under an explicit scrutinee
+// transfer marker — `case move outcome of …`, the scrutinee an
+// identifier-operand `move` expression (§28.8.1)".
+//
+// §35.5 makes this form a consume with a stated end state: "the consumed
+// binding is left **moved-from** when the construct completes". Codegen never
+// recorded that. `unboundOwningChoiceTemp`'s own exclusion list said so — "`case
+// move o of …` — the §35.5 marked scrutinee transfer, which codegen does not
+// yet implement (the source local's slot is left populated and its scope-end
+// pass still disposes it; #4552's follow-up)" — and the consequence was not a
+// leak but a DOUBLE FREE: the arm's `using var u := move w;` adoption disposes
+// the transferred payload, and the source local's scope-end active-case pass
+// then disposes the same block again. MEASURED on the rule corpus' own
+// s35_5_0003 (which is written from §35.5 and was passing): `adopted` /
+// `widget disposed` / `after` then SIGSEGV, and `AddressSanitizer:
+// heap-use-after-free ... READ of size 8` under `--sanitize=address`. The
+// nested spelling in #4609 (an owning choice inside an owning choice) is the
+// same defect one level in.
+//
+// THE MARK IS #4566's, at the third site its SCOPE note left open: a runtime
+// zero-store over the source slot. See `markOwningChoiceLocalMovedFrom` for
+// why zero is the right moved-from encoding for a choice (tag 0, null payload
+// pointers, every downstream walk already null-guarded) and why a runtime
+// store rather than a static set (exact on every control-flow path).
+//
+// The gate here is the STORAGE TYPE, not the declaration kind, and it is
+// deliberately wider than #4566's `ast::LocalDecl` gate in one direction and
+// narrower in another. Wider: an arm binding of nested owning-choice type
+// (`case move o of W(var i) => … case move i of …`, #4609's own repro) and a
+// by-value-move parameter (§15.3: "parameter passing is by value-move") both
+// reach here and both must be marked, because the caller registers a
+// replacement disposal for the value it took. Narrower: the slot must hold
+// EXACTLY the storage `rt` implies, so a §27.5 capture-boxed local — whose
+// alloca is a pointer-sized cell holder — is declined, and a decline is safe
+// because the caller then registers nothing and the pre-fix path stands.
+llvm::AllocaInst* Emitter::markedOwningChoiceScrutineeSlot(
+        const ast::Expr* e, const sema::TypeRef* rt) {
+    if (!e || !rt) return nullptr;
+    auto* un = dynamic_cast<const ast::UnaryExpr*>(e);
+    if (!un || un->op != "move" || !un->operand) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
+    if (!id) return nullptr;   // `move this._f` / `move a[i]` — §35.5 rejects a
+                               // borrowed scrutinee, and neither has a slot
+                               // this backend owns.
+    if (rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return nullptr;
+    const sema::TypeRef* res = resolveTypeParamRef(rt);
+    if (!res || res->kind != sema::TypeRef::Kind::Named || !res->declaration)
+        return nullptr;
+    if (res->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    // §3.6 rule 2 + §35.4 / §35.11: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(res, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning)
+        return nullptr;
+    llvm::AllocaInst* slot = localSlot(*id);
+    if (!slot) return nullptr;
+    // The expected storage, derived exactly as the DISPOSAL derives it —
+    // §35.9's `C?` is `{ i8 hasValue, <choice struct> }`, a bare `C` is the
+    // choice struct under its own instantiation's substitution (#2047).
+    llvm::Type* want = nullptr;
+    if (res->nullable) {
+        want = nullableValueStructTy(res);
+    } else {
+        RecordSubstGuard choiceSubst(this, res);
+        want = choiceStruct(res->declaration);
+    }
+    if (!want || slot->getAllocatedType() != want) return nullptr;
+    return slot;
+}
 
 
 // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306). See the declarations
