@@ -1712,7 +1712,7 @@ s35_4_0011	pass
 s35_4_0012	pass	
 s35_5_0001	pass	
 s35_5_0002	pass	
-s35_5_0003	fail	divergence
+s35_5_0003	pass	
 s35_5_0004	fail	divergence
 s35_5_0005	pass	
 s35_5_0006	pass	
