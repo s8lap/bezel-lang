@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — owner-directed 2026-09-22: drafted for graduation in the v0.307 train; adversarial critique pending |
+| **Status** | under-review — owner-directed 2026-09-22: drafted for graduation in the v0.307 train; adversarial critique received 2026-09-22 and resolved (`scratch/finalize-B/resolutions.md`: N-8, N-9, N-10, N-11, N-12) |
 | **Tracking issue** | to be filed at landing |
 | **Target module(s)** | **stdlib** — new §4.21 `OwningSlotMap<T>` and `SlotHandle` (after §4.20 `Counter<K>`); §4.3's `Clear()`-order paragraph (one family added). **spec** — §2.3's `System.Collections.Generic` auto-import row (the bare-name list and its count); §28.11's owning-family list, its disposal-order paragraph, and its no-indexer paragraph; §28.9's non-trivial-dispose list. **rationale** — §5.4 (one dated sentence: the handle-and-table pattern it names is now a library type). **code-generation reference** — §4.5's family table, the §5.4 index (one new block), §5.11's collection absences, and the pin. **Guide 05** — §8's table (one row). No grammar change. |
 | **Written against** | spec **v0.306** (`cafdfc5`); stdlib companion v0.306 |
@@ -80,13 +80,19 @@ A compiler-known **value record**, on the `CancellationToken`/`Guid` pattern (st
 
 ```bezel
 /// Compiler-intrinsic value record. Sendable (§30.14); hashable (§3.6) — usable as a
-/// Dictionary<K, V> key or Set<T> element; not serialization-eligible (§9.8).
+/// Dictionary<K, V> key or Set<T> element. Declares neither ISerializable nor IDeserializable: no
+/// serialization is synthesized for it, and it is not an admissible serialized component of any
+/// other type (§9.8).
 public record SlotHandle
   public readonly property Index: int;         // the slot's position in its map; stable for the handle's life
   public readonly property Generation: int;    // the slot's generation when the handle was minted
   // =, <>, Equals, GetHashCode and ToString are compiler-provided. Two handles are equal
   // iff they were minted by the same map for the same slot at the same generation.
-  // ToString renders `SlotHandle(Index: i, Generation: g)` (the §9.1 positional shape).
+  // No public constructor. default(SlotHandle) (§17.11) is the one handle no map minted: it
+  // denotes a slot of no map and faults like a foreign handle (this proposal's §2.4).
+  // ToString renders `SlotHandle(Index: i, Generation: g)` — the auto-hashable body-record
+  // rendering of §8.5/§9.2 over the two public auto-properties; the hidden component is not
+  // rendered, so two handles may print alike and compare unequal.
 end SlotHandle;
 ```
 
@@ -95,8 +101,9 @@ Design points, each decided:
 - **A record, not a compiler-known opaque scalar.** A record is what §9 already gives the language for "a small value with components and value equality"; §30.14's value-type rule makes it sendable for free (all components primitive); §3.6's hashable property makes it a `Dictionary`/`Set` key for free. An opaque scalar would need every one of those stated by hand.
 - **Why `Index` and `Generation` are public.** `Index` is the *dense side-table* affordance — the reason slot maps exist in game engines and compilers: `Array<Meta>` indexed by `h.Index`, kept beside the map. `Generation` is the debugging affordance (a stale handle is visibly stale). Neither confers authority: a handle is a key, not a capability, so exposing its components costs no soundness (this proposal's §2.4).
 - **Why no public constructor.** A handle denotes a slot of one map; a user-constructed one would denote nothing. The compiler-known record has no constructor spelling, exactly as `CancellationToken` has none beyond `None`.
+- **`default(SlotHandle)` exists, and is a foreign handle.** The record is defaultable (§3.6, §17.11: every component defaultable, not constructor-only), so `var h: SlotHandle;`, a `SlotHandle`-typed field with no initializer and a default-initialized `Array<SlotHandle>` slot all hold it — the one handle a program can write without a map. It is a handle no map minted (`Index 0`, `Generation 0`, and an owner tag the runtime's counter never assigns), and this proposal's §2.4 rule covers it: every handle-taking member raises `ArgumentException`. Faulting was chosen over reading absent because a default handle reaching a map is the same bug class as a handle from another map — a side table read before it was filled — and an absent-reading default would be the silent form of it.
 - **The hidden owner tag.** The record carries a third, non-public component: the identity of the map that minted it — a process-unique `long` the runtime assigns to each `OwningSlotMap<T>` at construction from a monotonic counter (the same class of runtime bookkeeping as §8.3's identity hashes, rationale §12.11; not an intercept point, stdlib §1). It participates in equality and hashing and is never observable except through them and through this proposal's §2.4 fault. It is what lets a handle from another map be a *fault* rather than a *miss*.
-- **Not serialization-eligible.** A handle is meaningful only against the live map that minted it in the process that minted it; a serialized handle would be a forged one on arrival. `Index`/`Generation` may be read out and stored by a program that knows what it is doing; the record itself declares no `ISerializable` conformance and §9.8 synthesizes none for a compiler-known type that opts out.
+- **No serialization conformance.** A handle is meaningful only against the live map that minted it in the process that minted it; a serialized handle would be a forged one on arrival. `Index`/`Generation` may be read out and stored by a program that knows what it is doing; the record itself declares neither `ISerializable` nor `IDeserializable`, so §9.8 synthesizes nothing for it, and — the rule that keeps it out of other types' serialized sets — a record shaped eligibly that declares neither interface *"is not an admissible component"* of any serializable type (§9.8's component rule). (Two `int` auto-properties make the declared shape eligible by §9.8's letter; it is the absent conformance, not eligibility, that keeps the handle inert.)
 
 ### 2.3 `OwningSlotMap<T>` ▲ — the collection
 
@@ -140,7 +147,7 @@ The normative usage notes (the stdlib §4.21 text in `scratch/train-B/edits.md` 
 
 A `SlotHandle` is a value of primitive components. Stored in a field it is a copy slot (§28.11's value column) — not a borrow, so §28.3's borrowed-field store rule, its K4.3 residual and its domain clause do not attach. Stored in a borrowing collection it is a copy (§28.11 copy slots). Captured by a closure, sent across a domain, returned from a static method: a value everywhere. Nothing about the *handle* ever needs the checked-disposal backstop; what the backstop still covers is the *borrow a read produces* (`Get`/`GetOrNull`), whose life is the same as any owning-collection element borrow's — bounded by the map and by the next mutation of the slot.
 
-Forging (`Index`/`Generation` read out and reassembled) is impossible at the surface — there is no constructor — and would be harmless if it were: a handle confers no ownership and no access the map does not already check. The one thing a handle *does* carry is the owner tag, and that is checked, not trusted (this proposal's §2.3 item 3).
+Forging (`Index`/`Generation` read out and reassembled) is impossible at the surface — there is no constructor, and `default(SlotHandle)`, the one handle writable without a map, is a foreign handle by the rule above (this proposal's §2.2) — and would be harmless if it were: a handle confers no ownership and no access the map does not already check. The one thing a handle *does* carry is the owner tag, and that is checked, not trusted (this proposal's §2.3 item 3).
 
 ### 2.5 The idiom, in full
 
@@ -161,7 +168,7 @@ public class Graph
   end Link;
 
   public method RemoveNode(h: SlotHandle)
-    _nodes.Remove(h);                            // disposes the node; every Edge naming h now reads absent
+    _ := _nodes.Remove(h);                       // disposes the node; every Edge naming h now reads absent
   end RemoveNode;
 
   public method Neighbours(h: SlotHandle): owned Array<SlotHandle>
@@ -252,6 +259,7 @@ New cases under `tests/conformance/rules/cases/`, `doc: stdlib`, `section: 4.21`
 | `l4_21_0005` | `run`, `output:` | `Dispose()` disposes in descending `Index` (`disposed c` / `disposed b` / `disposed a` / `after`) |
 | `l4_21_0006` | `run`, `output:` | `Drain()` yields owned values in ascending `Index` and vacates as it goes |
 | `l4_21_0007` | `run`, `output:` | a handle from another map raises `ArgumentException` |
+| `l4_21_0011` | `run`, `output:` | `default(SlotHandle)` denotes a slot of no map and raises `ArgumentException` like a foreign handle |
 | `l4_21_0008` | `reject`, `diagnostic: move` | an unmarked read of an owned binding at `Insert`'s `owned` position is rejected (K3.3) |
 | `l4_21_0009` | `quiet` | the `move`d twin of 0008 compiles warning-free |
 | `l4_21_0010` | `reject`, `diagnostic: borrow` | `Dispose()` through the borrow `GetOrNull` returns is §28.6's compile error; its accepting twin is 0002's `Remove` |
