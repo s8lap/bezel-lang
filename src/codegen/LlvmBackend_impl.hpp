@@ -9301,6 +9301,15 @@ private:
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
 
+    // fix #4619 (§8.6 / §25.2 / §8.4, v0.307): §8.6-box a collection
+    // MEMBERSHIP QUERY into the element slot's type. Every caller that feeds
+    // `emitRemoveElementEquality` a caller-supplied query expression must run
+    // it through this, ONCE, outside the per-element loop. Definition and the
+    // full warrant (including why the box is deliberately not discharged) live
+    // beside `boxForTarget` in LlvmBackend_Layout.cpp.
+    llvm::Value* boxMembershipQuery(llvm::Value* v, const sema::TypeRef* elemTy,
+                                    const ast::Expr* queryExpr);
+
     // fix #3443 (§8.1 / §8.6 / §5.1, v0.283): §8.1's universal
     // `public virtual method Equals(other: Object?): bool` FORMAL, as a sema
     // TypeRef. `boxForTarget` decides §8.6 boxing by asking whether the TARGET

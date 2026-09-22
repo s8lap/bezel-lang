@@ -3484,6 +3484,82 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
 }
 
 
+// fix #4619 (§8.6 / §25.2 / §8.4 / §28.9, v0.307): §8.6-box a collection
+// MEMBERSHIP QUERY — the `x` of `.Contains(x)` / `.IndexOf(x)` / `.Remove(x)` /
+// `x in coll` — into the element slot's type, before it reaches
+// `emitRemoveElementEquality`.
+//
+// THE DEFECT THIS CLOSES. Every membership lowering used to hand the query to
+// `emitRemoveElementEquality` exactly as `lowerExpr` produced it, at the
+// query's OWN type. Against an `Object`/interface element that is a raw scalar
+// facing a boxed pointer, so `bothPtr` is false and the Object arm (step 4,
+// #4573) never fires; control reaches the value-family tail, whose "one side
+// is a spilled aggregate" coercion then LOADS THROUGH THE ELEMENT POINTER at
+// the query's type — i.e. it reads the box's `{ vtable*, i64 rc, payload }`
+// HEADER as if it were the payload at offset 16. MEASURED on
+// `var a: Array<Object> := [1, 2];`: the emitted body was
+// `%el = load ptr …; %h = load i32, ptr %el; %eq = icmp eq i32 %h, 1`, so
+// `a.Contains(1)`/`a.Contains(2)` answered `false` for a PRESENT element and
+// `a.IndexOf(2)` answered -1, while the same query spelled through a pre-boxed
+// `var o: Object := 1;` answered correctly. With a `bool` query the load was
+// `load i1, ptr %el` — one bit of the box's vtable address — and
+// `a.Contains(true)` answered TRUE on an array holding only `1` and `2`.
+//
+// §8.6 ("when a value type is used where `Object` … is expected, the value is
+// boxed") is what makes the pre-boxed spelling work; this applies the same rule
+// to the argument position, so both spellings reach §8.4's `Equals` dispatch.
+// `boxForTarget` already IS that rule and is a no-op for a reference source or
+// a non-Object/interface element, so wrapping a call site cannot disturb a
+// shape that was already correct (a pre-boxed `Object` query, a class element,
+// a string/record/primitive element).
+//
+// ⚠ THE BOX IS DELIBERATELY NOT DISCHARGED, and the mint is NOT published in
+// `lastBoxMint_` — a leak, taken knowingly in place of a use-after-free. The
+// box is passed as the `other` ARGUMENT of a vtable dispatch
+// (`lowerObjectEquals` → `vtable[kEqualsSlot]`) on an element loaded at runtime
+// out of a heterogeneous `Object` slot, so the callee is not statically known:
+// it may be a compiler box thunk (`bz$boxeq$<T>`, which never stores `other`)
+// or a user class's `Equals` override, which §28.3's *deliberate asymmetry*
+// admits storing a parameter-sourced borrow into a field. #3480 measured
+// exactly that shape as a heap-use-after-free when the release was made
+// unconditional, and #3447's `knownBoxReceiverShape` — the predicate that
+// licenses the discharge for `<knownBox>.Equals(x)` — cannot be satisfied here
+// because the receiver is the ELEMENT. #2952's stated conservative direction
+// ("the compiler's escape analysis conservatively leaks rather than guessing")
+// therefore applies, and the residual is the one #3480 already accepted, once
+// per membership CALL and NOT per element.
+//
+// MEASURED, both sides, `var a: Array<Object> := [1, 2];` with
+// `a.Contains(1)` in a 500-iteration loop, compiled `--sanitize=address`:
+//
+//   pre-fix   0 B / 0 allocations leaked, and the program answered 0 matches
+//             out of 500 (the defect: no box is minted on that path at all).
+//   post-fix  12,000 B / 500 allocations leaked, 500 matches out of 500.
+//
+// i.e. exactly 24 B (one `int` box) per membership CALL. The same loop over
+// `1 in a` plus `a.IndexOf(2)` leaked 24,000 B / 1,000 allocations — two
+// operations, still one box each, which is what pins "per call, not per
+// element" (the array holds two elements). The trade is therefore a bounded
+// per-call leak bought against an unconditionally WRONG answer, on a path
+// where the correct spelling (a pre-boxed `Object` local) already carries a
+// one-off 24 B residual of its own. Recorded as a decline-with-reasons on
+// #4619 rather than taken silently; the way out is a runtime box-vtable guard
+// that discharges the box when the scan provably reached no user `Equals`.
+llvm::Value* Emitter::boxMembershipQuery(llvm::Value* v,
+                                         const sema::TypeRef* elemTy,
+                                         const ast::Expr* queryExpr) {
+    // #2952's save/clear/restore discipline: a sibling's mint must not leak
+    // into this one, and — the load-bearing half here — THIS mint must not
+    // leak OUT. Publishing it would offer a downstream consumer the very
+    // discharge the paragraph above rules out.
+    llvm::Value* saved = lastBoxMint_;
+    lastBoxMint_ = nullptr;
+    v = boxForTarget(v, elemTy, queryExpr);
+    lastBoxMint_ = saved;
+    return v;
+}
+
+
 // fix #3090 (§12.7 / §8.6, v0.252). See the declaration comment in
 // LlvmBackend_impl.hpp for the mechanism and why the gate is a positive
 // conjunction.

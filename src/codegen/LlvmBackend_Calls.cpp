@@ -1691,6 +1691,15 @@ sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
 // tag) against the record's own field 0 — `Array<P?>{P(1)}.Contains(P(99))`
 // answered TRUE (measured), and `.Contains(null)` built `icmp eq i8 %t, i32 %x`
 // and died in IR verification.
+//
+// ⚠ CALLER PRECONDITION (fix #4619, §8.6, v0.307): a caller-supplied QUERY must
+// already have been §8.6-boxed into the element slot's type — call
+// `boxMembershipQuery` (LlvmBackend_Layout.cpp) ONCE, outside the per-element
+// loop, on the value `lowerExpr` produced. Without it a bare-value query against
+// an `Object`/interface element reaches neither the Object arm (step 4 needs
+// BOTH operands to be pointers) nor a correct value comparison, and the guard
+// that opens step 6 refuses the shape rather than reading the element's box
+// header.
 llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
                                                 llvm::Value* target,
                                                 const sema::TypeRef* elemTy,
@@ -1869,6 +1878,36 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
     // Coerce first, so the authority is never handed operands it would build
     // invalid IR from:
     llvm::Value* l = el, *r = target;
+    //  fix #4619 (§8.6/§25.2/§8.4, v0.307) — a PRECONDITION, stated as code.
+    //      Coercion (a) below is only meaningful when the pointer operand is a
+    //      SPILLED VALUE (a record materialized into an alloca). When the
+    //      element's sema type is a REFERENCE — `Object`/interface/class — the
+    //      pointer IS the object, and loading through it reads the §8.6 box's
+    //      `{ vtable*, i64 rc, payload }` HEADER as if it were the other side's
+    //      own value. MEASURED on `var a: Array<Object> := [1, 2];`:
+    //      `%h = load i32, ptr %el; icmp eq i32 %h, 1` — the low half of the
+    //      box vtable's address — so `.Contains(1)` answered false for a
+    //      PRESENT element, and with a `bool` query (`load i1`)
+    //      `.Contains(true)` answered TRUE on an array holding only ints.
+    //
+    //      Every membership caller now §8.6-boxes its query first
+    //      (`boxMembershipQuery`), so both operands are pointers for a
+    //      reference element and step 4/5 answer above. Refusing the shape here
+    //      keeps a caller added later WITHOUT that step deterministic
+    //      ("no match") instead of garbage-dependent; it is step (c)'s own
+    //      "not comparable" answer, applied one coercion earlier.
+    {
+        const bool refElem =
+            ty && ((ty->kind == K::Primitive &&
+                    (ty->primitive == sema::PrimitiveType::Object ||
+                     ty->primitive == sema::PrimitiveType::String)) ||
+                   (ty->kind == K::Named && ty->declaration &&
+                    (ty->declaration->kind == ast::TypeDeclKind::Class ||
+                     ty->declaration->kind == ast::TypeDeclKind::Interface)));
+        if (refElem &&
+            l->getType()->isPointerTy() != r->getType()->isPointerTy())
+            return builder_.getFalse();
+    }
     //  (a) a SPILLED aggregate operand (a record materialized into an alloca):
     //      load it at the other side's type. The retired record arm did this
     //      with `recordStruct(rec)`; the other side's type is that same struct.
@@ -5510,6 +5549,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass from arrElemPol (hoisted above)
             // instead of calling collectionElemIsClass(recvTy, 0) per-handler.
@@ -6518,6 +6565,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol
             // (hoisted above) instead of per-handler collectionElemIsClass calls.
@@ -6988,6 +7043,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol.
             const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist

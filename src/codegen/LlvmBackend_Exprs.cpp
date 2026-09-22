@@ -8115,6 +8115,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* elem = lowerExpr(*bin.left);
                 llvm::Value* coll = lowerExpr(*bin.right);
                 if (!elem || !coll) return nullptr;
+                // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
+                // bare-value-typed LHS into the Object/interface element
+                // slot ONCE, before either scan — see `boxMembershipQuery`
+                // (LlvmBackend_Layout.cpp). Placed above the LinkedList
+                // arm's `entryAlloca(elem->getType())` spill so both arms
+                // see the boxed shape.
+                elem = boxMembershipQuery(elem, elemRef, bin.left.get());
 
                 if (isLL) {
                     // fix #560 / §17.5/§4.6/§8.3: walk the linked list applying
@@ -8253,6 +8260,11 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
 
                 llvm::Value* target = lowerExpr(*bin.left);
                 if (!target) return nullptr;
+                // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
+                // bare-value-typed LHS into the Object/interface element
+                // slot ONCE, before the scan — see `boxMembershipQuery`
+                // (LlvmBackend_Layout.cpp).
+                target = boxMembershipQuery(target, elemRef, bin.left.get());
 
                 if (N == 0) return builder_.getFalse();
 

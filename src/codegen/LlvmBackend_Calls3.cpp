@@ -3593,6 +3593,10 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         if (!v) return nullptr;
         // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
         const sema::TypeRef* elemRef = llElemRef;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the walk —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
         builder_.CreateStore(v, tgtSlot);
@@ -3689,6 +3693,10 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         if (!v) return nullptr;
         // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
         const sema::TypeRef* elemRef = llElemRef;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the walk —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
         builder_.CreateStore(v, tgtSlot);
@@ -3768,6 +3776,10 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         if (!v) return nullptr;
         // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
         const sema::TypeRef* elemRef = llElemRef;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the walk —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot (same pattern as the
         // `in` operator LinkedList path in LlvmBackend_Exprs.cpp #2764).
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
@@ -4301,6 +4313,10 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the scan —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        v = boxMembershipQuery(v, spanElemRef, call.args[0].value.get());
         int64_t esz = spanElemSize();
         llvm::Type* ety = spanElemTy();
         llvm::Value* src  = loadSource();
@@ -4356,6 +4372,10 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         // (This means two code-size copies, but both are inlined; acceptable.)
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the scan —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        v = boxMembershipQuery(v, spanElemRef, call.args[0].value.get());
         int64_t esz = spanElemSize();
         llvm::Type* ety = spanElemTy();
         llvm::Value* src  = loadSource();
@@ -6934,6 +6954,10 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* target = lowerExpr(*call.args[0].value);
         if (!target) return nullptr;
+        // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+        // query into the Object/interface element slot ONCE, before the scan —
+        // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        target = boxMembershipQuery(target, elemRef, call.args[0].value.get());
 
         // Empty array always returns false.
         if (N == 0) return builder_.getFalse();
