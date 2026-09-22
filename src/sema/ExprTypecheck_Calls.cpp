@@ -3888,13 +3888,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 TypeRef* callTy = rt;
                 if (!ms->genericParams.empty()) {
                     // §14.5: "When a full explicit list is supplied, no
-                    // inference runs." Phase 1 is the no-explicit-list case,
-                    // so stand down whenever the call spelled one (the
-                    // arity of such a list is #4589's check, just above).
-                    // The explicit list's own BINDING is likewise absent on
-                    // this imported arm — filed as #4622 rather than folded
-                    // in here, since §14.5 puts it outside phase 1 and no
-                    // row of #4611's repro spells a list.
+                    // inference runs." Phase 1 (just below) is the
+                    // no-explicit-list case, so it stands down whenever the
+                    // call spelled one; the `else` arm just after it is
+                    // fix #4622's explicit-list BINDING for this same
+                    // imported channel (the arity of such a list is #4589's
+                    // check, just above, on BOTH sources already).
                     const std::vector<std::unique_ptr<ast::Type>>*
                         callTypeArgs = nullptr;
                     if (auto* iMa = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -3952,6 +3951,74 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         if (consistent && !argSubst.empty())
                             callTy = substituteReturnType(rt, argSubst);
+                    } else {
+                        // fix #4622 (§14.5 "An explicit type-argument list
+                        // ... binds the declared type parameters in
+                        // declaration order"; "When a full explicit list is
+                        // supplied, no inference runs", v0.307): the sibling
+                        // of #4611 on this exact imported channel. #4611
+                        // fixed phase-1 ARGUMENT-driven inference for an
+                        // imported generic method but deliberately left this
+                        // arm alone — when the call spelled `<T, ...>`, this
+                        // branch simply fell through with `callTy` still the
+                        // raw, unsubstituted `rt`, so the call's result type
+                        // carried the still-unbound declared type parameter,
+                        // rendered `?`. The failure surfaced at the first USE
+                        // of the value ("operator `+` is not defined for
+                        // type `?`"), while the byte-identical single-module
+                        // program compiled and ran. Mirrors the LOCAL arm's
+                        // own explicit-list substitution (~L3564 above,
+                        // `explicitSubst[md->genericParams[gi].name] = ...`)
+                        // except reading the symbol-side `ms->genericParams`
+                        // (`GenericParamSymbol`, populated by
+                        // `ModuleLoader::convertGenericParams` from
+                        // `MetaGenericParam` — the same both-sources channel
+                        // #4611/#4590/#4589 established) since `md` is null
+                        // for every imported method.
+                        //
+                        // Clipped to min(genericParams.size(),
+                        // callTypeArgs.size()), exactly like the local arm:
+                        // a mismatched count has ALREADY been reported by
+                        // #4589's arity check just above (~L2790, which
+                        // reads both sources and does not `return`), so this
+                        // loop only avoids reading out of bounds rather than
+                        // re-diagnosing.
+                        //
+                        // Scope decline, recorded rather than silent: the
+                        // local arm additionally runs
+                        // `checkMethodGenericConstraints` and
+                        // `checkAsyncInstantiationBorrowBearing` against the
+                        // explicit substitution (~L3583/3586). Both read
+                        // `md->genericConstraints` — an AST-only list
+                        // `ModuleLoader` never populates for an imported
+                        // method (constraint payloads for an imported
+                        // generic PARAMETER instead live on the differently-
+                        // shaped `GenericParamSymbol::constraints`, #3146) —
+                        // so reusing either closure here would dereference
+                        // the null `md`. #4611 left the identical check
+                        // unrun on the phase-1 arm for the same reason; this
+                        // fix keeps that scope rather than widening it, so
+                        // an imported generic method's `where`-constraints
+                        // and async borrow-bearing rules stay UNCHECKED
+                        // against an explicit list — the pre-existing state,
+                        // not a regression this fix introduces. Filed as a
+                        // follow-up rather than folded in here.
+                        std::unordered_map<std::string_view, TypeRef*>
+                            explicitSubstImported;
+                        for (std::size_t gi = 0;
+                             gi < ms->genericParams.size() &&
+                             gi < callTypeArgs->size(); ++gi) {
+                            if (!(*callTypeArgs)[gi]) continue;
+                            const Symbol* gp = ms->genericParams[gi];
+                            if (!gp || gp->name.empty()) continue;
+                            TypeRef* concreteArg =
+                                ctx_.resolvedType(*(*callTypeArgs)[gi]);
+                            if (concreteArg)
+                                explicitSubstImported[gp->name] = concreteArg;
+                        }
+                        if (!explicitSubstImported.empty())
+                            callTy =
+                                substituteReturnType(rt, explicitSubstImported);
                     }
                 }
                 // The #783 and #1937 declines below deliberately read the
