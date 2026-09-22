@@ -3751,8 +3751,8 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
                         ctx_.diagnostics().report(
                             Severity::Warning, re->span.begin,
                             std::string(
-                                "warning: open-ended range literal cannot be "
-                                "iterated (\xC2\xA7""16.5)"));
+                                "open-ended range literal cannot be iterated "
+                                "(\xC2\xA7""16.5)"));
                     }
                 }
             }
@@ -3847,32 +3847,14 @@ void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
             if (m) resolveTypesInPattern(*m, scope);
         return;
     }
-    // fix #4554 (§16.6, v0.307): a constant stepless range pattern whose bounds
-    // are reversed (lo > hi on a `lo..hi`, lo >= hi on a `lo..<hi`) can never
-    // match — §16.6 mirrors the §16.4 step-sign check, same constant-fold
-    // discipline. Recurse into the range expression first so its bounds are
-    // type-resolved, then constant-fold and emit the spec's "never matches"
-    // warning if the bound comparison reverses the default ascending order.
-    auto checkReversedRangePattern =
-        [this, scope](const ast::RangePattern& rp) {
-            auto* re = dynamic_cast<const ast::RangeExpr*>(rp.rangeExpr.get());
-            if (!re || !re->lo || !re->hi || re->step) return;
-            auto loV = foldIntConstExpr(*re->lo, scope, 0);
-            auto hiV = foldIntConstExpr(*re->hi, scope, 0);
-            if (!loV || !hiV) return;
-            bool neverMatches = re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
-            if (neverMatches) {
-                ctx_.diagnostics().report(
-                    Severity::Warning, rp.span.begin,
-                    "warning: this pattern never matches — bounds are "
-                    "reversed (\xC2\xA7""16.6)");
-            }
-        };
-    if (auto* rp = dynamic_cast<const ast::RangePattern*>(&p)) {
-        if (rp->rangeExpr) resolveTypesInExpr(*rp->rangeExpr, scope);
-        checkReversedRangePattern(*rp);
-        return;
-    }
+    // fix #4554 (§16.6, v0.307) is handled by the pre-existing emission at
+    // src/sema/ExprTypecheck.cpp:9759 (the `checkRangePattern` lambda inside
+    // the arm-resolution loop) — that site covers BOTH top-level RangePattern
+    // AND members of an AltPattern, while this pass only sees top-level
+    // RangePattern. Adding a parallel emission here caused s16_6_0004 to
+    // emit the warning twice. The pre-existing site is the canonical one;
+    // s16_6_0004 stays KNOWN divergent as a #4626 instance until the
+    // runner gains a severity-rendering channel (#4626 ruling, 2026-09-23).
 }
 
 // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): see the declarations in
@@ -4002,7 +3984,7 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
                 if (empty) {
                     ctx_.diagnostics().report(
                         Severity::Warning, re->span.begin,
-                        "warning: this range produces an empty iteration — "
+                        "this range produces an empty iteration — "
                         "the range's direction (lo " +
                             std::string(*loV <= *hiV ? "<=" : ">=") +
                             " hi) disagrees with the step's sign "
