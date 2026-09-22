@@ -968,6 +968,54 @@ if ! python3 scripts/check_null_guard_vacuous.py --strict \
 fi
 say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))"
 
+# ── LEAK-EXEMPT STATUS PHASE (#4557) ───────────────────────────────────────
+# scripts/gate/sanitizer_leak_exempt.txt declares every test whose
+# generated-code sanitizer LEAK report is a deliberate assertion (#4537), not
+# a defect. Measured 2026-09-21: 38 rows, 19 citing no issue at all, and of
+# 15 distinct issues cited, 13 CLOSED — a fix had landed on the CENTRAL case
+# and left a residual axis leaking, with the axis's own tracker lost the
+# moment the issue closed. The file had become the project's only record of
+# a set of known, unfixed leaks, with no owner and no way to tell a
+# deliberate, permanent leak-vs-crash/leak-vs-UAF trade from a fix nobody has
+# scoped out yet.
+#
+# Every row's reason now must open with a required status:{defect,trade,
+# residue} token (sanitizer_leak_exempt.txt's own header has the full
+# contract); defect/residue rows also require issue:NNNN naming their OPEN
+# tracker, cross-checked against the committed snapshot
+# scripts/gate/leak_exempt_issue_state.tsv (refreshed by the separate,
+# explicitly-manual scripts/check_leak_exempt_issue_state.sh — the gate stays
+# hermetic; see that snapshot's own header for why the state check cannot be
+# a live `gh` call here).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched nothing is
+# worth nothing, and this detector's own self-test proves both the structural
+# half and the snapshot cross-check fail closed on synthetic fixtures,
+# including the exact #4557 shape (a status:defect/residue row citing an
+# issue the snapshot marks CLOSED).
+say "leak-exempt-status phase: detector self-test + status ratchet (#4557)"
+if ! python3 scripts/check_leak_exempt_status.py --self-test \
+      > "$LOGDIR/${TAG}_leakexempt.log" 2>&1; then
+  say "CYCLE FAILURE: check_leak_exempt_status SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_leakexempt.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_leakexempt.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_leak_exempt_status.py --strict \
+      >> "$LOGDIR/${TAG}_leakexempt.log" 2>&1; then
+  say "CYCLE FAILURE: a sanitizer_leak_exempt.txt row has no status: token, an"
+  say "  invalid one, a defect/residue row with no issue: tracker, or a"
+  say "  defect/residue row citing an issue the committed snapshot marks"
+  say "  CLOSED (#4557) — a known leak has lost its owner again. See"
+  say "  $LOGDIR/${TAG}_leakexempt.log"
+  sed -n '/check_leak_exempt_status:/,$p' "$LOGDIR/${TAG}_leakexempt.log" 2>/dev/null \
+    | head -60 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "leak-exempt-status phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_leakexempt.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own

@@ -6,6 +6,46 @@
 # MISSING file is an empty set, so losing this file makes the gate stricter,
 # never looser.
 #
+# ── STATUS FIELD (#4557) ────────────────────────────────────────────────────
+# This file had quietly become the project's only record of a set of known,
+# unfixed leaks with no owner: measured 2026-09-21, 19 of then-38 rows cited
+# no issue at all, and of 15 distinct issues cited, 13 were CLOSED — rows
+# whose fix landed on the CENTRAL case but left a residual axis leaking, with
+# the residual axis's own tracker lost when the issue closed. See #4557.
+#
+# Every data row's reason therefore starts with a REQUIRED `status:` token,
+# one of three values, read (and gate-enforced, scripts/check_leak_exempt_
+# status.py) as the leading word(s) right after the `#`:
+#
+#   status:trade    — a DELIBERATE, permanent boundary: the leak is the safe
+#                      side of leak-vs-crash/leak-vs-UAF, a proof-soundness
+#                      control ("stays rejected", "not armed", "boundary/
+#                      negative control"), or a spec-mandated exclusion. No
+#                      `issue:` required — the row's own prose is the record.
+#   status:residue   — scoped OUT of an already-landed fix, a fix is still
+#                       owed, tracked by its OWN issue (which may differ from
+#                       the issue the row's prose otherwise mentions, e.g. the
+#                       fix issue that closed leaving this residue behind).
+#                       REQUIRES `issue:NNNN` naming that OPEN tracker.
+#   status:defect    — a leak nobody has scoped out on purpose; a fix is
+#                       owed and no residue tracker exists yet for it.
+#                       REQUIRES `issue:NNNN` naming that OPEN tracker.
+#
+# `issue:NNNN` is a single open-vs-closed source of truth per row — it is
+# deliberately NOT re-derived from every `#NNNN` mentioned in the free-text
+# reason, several of which are typically present (the fix that produced the
+# control, a sibling issue, etc.) and are not all open trackers of THIS leak.
+#
+# check_leak_exempt_status.py enforces the STRUCTURE (every row has a valid
+# status; defect/residue rows have a well-formed issue:) at every gate, fully
+# offline. Enforcing the OPEN/CLOSED state of a cited issue needs GitHub, and
+# the gate is deliberately hermetic (no network call in gate_full_cycle.sh
+# anywhere) — so that half is a SEPARATE, explicitly-manual companion,
+# scripts/check_leak_exempt_issue_state.sh (same non-gated-audit shape as the
+# pre-existing scripts/check_issue_refs.sh), which is what actually catches a
+# defect/residue row whose tracker has since closed. Run it periodically; it
+# is not part of scripts/ratchet_sweep.sh by design.
+#
 # THIS IS THE LEAK SIBLING OF sanitizer_exempt.txt, WITH A DIFFERENT
 # RATIONALE — read that file first. sanitizer_exempt.txt declares rows whose
 # CORRUPTION is undefined behaviour the spec itself allows; that reasoning
@@ -87,51 +127,51 @@
 # (unlike sanitizer_exempt.txt's UB rows) does not cover this file — see the
 # RESIDUAL RISK note above.
 
-class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed  # #4253: a non-sealed class's readonly record-typed property still leaks the record's owned string field on scope-end disposal. tests/codegen/class_field_record_string_release_4253_test.cpp:235
-class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor  # #4253: presence of an unrelated user constructor does not change the leak. tests/codegen/class_field_record_string_release_4253_test.cpp:273
-class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly  # #4253: a non-readonly record-typed property still leaks. tests/codegen/class_field_record_string_release_4253_test.cpp:296
-inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_factory_control_still_leaks_not_uaf  # #4265: the safe (no-UAF) control case still leaks rather than releasing cleanly. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:310
-record_declare_then_assign_call_result_release_4266.multi_assignment_site_stays_safe_no_uaf  # #4266: the multi-assignment site is safe from use-after-free but still leaks. tests/codegen/record_declare_then_assign_call_result_release_4266_test.cpp:455
-record_factory_unbound_temporary_argument_uaf_4322.unrelated_second_argument_no_longer_uaf_but_leaks_call_wide  # #4322: fixing the UAF on the unrelated second argument left a call-wide leak. tests/codegen/record_factory_unbound_temporary_argument_uaf_4322_test.cpp:245
-nested_record_string_field_leak_4237.nested_field_is_borrowed_identifier_not_admitted_no_uaf  # #4237: a borrowed-identifier nested field is not UAF-admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:298
-nested_record_string_field_leak_4237.nested_construction_borrowed_string_arg_not_admitted_no_uaf  # #4237: a borrowed string argument to nested construction is not admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:337
-record_factory_call_wide_release_suppression_scope_4342.bound_call_result_unrelated_arg_still_leaks_call_wide  # #4342: a bound call result's unrelated argument still leaks call-wide. tests/codegen/record_factory_call_wide_release_suppression_scope_4342_test.cpp:160
-record_factory_param_passthrough_admitted_4295.double_embed_same_parameter_stays_rejected_no_uaf  # #4295: double-embedding the same parameter stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:402
-record_factory_param_passthrough_admitted_4295.ref_parameter_passthrough_stays_rejected_no_uaf  # #4295: ref-parameter passthrough stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:408
+class_field_record_string_release_4253.non_sealed_class_still_leaks_axis_sealed  # status:residue issue:4277 #4253: a non-sealed class's readonly record-typed property still leaks the record's owned string field on scope-end disposal. tests/codegen/class_field_record_string_release_4253_test.cpp:235
+class_field_record_string_release_4253.class_with_unrelated_constructor_still_leaks_axis_no_ctor  # status:residue issue:4277 #4253: presence of an unrelated user constructor does not change the leak. tests/codegen/class_field_record_string_release_4253_test.cpp:273
+class_field_record_string_release_4253.non_readonly_property_still_leaks_axis_readonly  # status:residue issue:4277 #4253: a non-readonly record-typed property still leaks. tests/codegen/class_field_record_string_release_4253_test.cpp:296
+inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_factory_control_still_leaks_not_uaf  # status:trade #4265: the safe (no-UAF) control case still leaks rather than releasing cleanly. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:310
+record_declare_then_assign_call_result_release_4266.multi_assignment_site_stays_safe_no_uaf  # status:trade #4266: the multi-assignment site is safe from use-after-free but still leaks. tests/codegen/record_declare_then_assign_call_result_release_4266_test.cpp:455
+record_factory_unbound_temporary_argument_uaf_4322.unrelated_second_argument_no_longer_uaf_but_leaks_call_wide  # status:trade #4322: fixing the UAF on the unrelated second argument left a call-wide leak. tests/codegen/record_factory_unbound_temporary_argument_uaf_4322_test.cpp:245
+nested_record_string_field_leak_4237.nested_field_is_borrowed_identifier_not_admitted_no_uaf  # status:trade #4237: a borrowed-identifier nested field is not UAF-admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:298
+nested_record_string_field_leak_4237.nested_construction_borrowed_string_arg_not_admitted_no_uaf  # status:trade #4237: a borrowed string argument to nested construction is not admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:337
+record_factory_call_wide_release_suppression_scope_4342.bound_call_result_unrelated_arg_still_leaks_call_wide  # status:trade #4342: a bound call result's unrelated argument still leaks call-wide. tests/codegen/record_factory_call_wide_release_suppression_scope_4342_test.cpp:160
+record_factory_param_passthrough_admitted_4295.double_embed_same_parameter_stays_rejected_no_uaf  # status:trade #4295: double-embedding the same parameter stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:402
+record_factory_param_passthrough_admitted_4295.ref_parameter_passthrough_stays_rejected_no_uaf  # status:trade #4295: ref-parameter passthrough stays rejected (no UAF) but still leaks. tests/codegen/record_factory_param_passthrough_admitted_4295_test.cpp:408
 
 # ── pattern (b): expectLeakButNoMemoryError(r) — 19 rows, 5 files ──────────
-codegen_async_generic_string_local_release_2807.async_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: an async-assigned string param deliberately does not free the caller's copy; expectLeakButNoMemoryError pins leak-not-corruption. tests/codegen/async_generic_string_local_release_2807_test.cpp:604
-codegen_async_generic_string_local_release_2807.generic_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: same for the generic-assigned case. tests/codegen/async_generic_string_local_release_2807_test.cpp:618
-codegen_iterator_lambda_ctor_string_local_release_2817.lambda_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: a lambda-assigned string param does not free the caller's copy. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:986
-codegen_iterator_lambda_ctor_string_local_release_2817.async_lambda_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: async-lambda variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1000
-codegen_iterator_lambda_ctor_string_local_release_2817.sync_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: sync-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1014
-codegen_iterator_lambda_ctor_string_local_release_2817.async_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: async-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1028
-codegen_iterator_lambda_ctor_string_local_release_2817.constructor_assigned_string_param_does_not_free_caller_spec_28_1  # spec §28.1: constructor variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1042
-codegen_string_index_arg_release_2717.record_receiver_index_is_deliberately_not_released_spec_9_7  # spec §9.7: a record receiver's string-index argument is deliberately not released. tests/codegen/string_index_arg_release_2717_test.cpp:960
-codegen_string_index_arg_release_2717.interface_receiver_index_is_deliberately_not_released_spec_11  # spec §11: interface-receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:976
-codegen_string_index_arg_release_2717.string_element_getter_index_is_deliberately_not_released_spec_23_4  # spec §23.4: string-element getter index variant. tests/codegen/string_index_arg_release_2717_test.cpp:992
-codegen_string_index_arg_release_2717.object_element_index_is_not_released_spec_23_4  # spec §23.4: object-element index variant. tests/codegen/string_index_arg_release_2717_test.cpp:1040
-codegen_string_index_arg_release_2717.bare_generic_element_via_this_receiver_is_not_released_spec_14_1  # spec §14.1: bare generic element via `this` receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:1060
-codegen_string_index_arg_release_2717.named_local_index_with_string_element_is_not_armed_spec_4_6  # spec §4.6: named-local index, string element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1081
-codegen_string_index_arg_release_2717.named_local_index_with_object_element_is_not_armed_spec_4_6  # spec §4.6: named-local index, object element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1095
-codegen_string_local_copy_release_2764.alias_stored_into_class_field_still_leaks_spec_28_9  # spec §28.9: an alias stored into a class field still leaks. tests/codegen/string_local_copy_release_2764_test.cpp:692
-codegen_string_local_copy_release_2764.nullable_copy_target_is_deliberately_excluded_spec_7  # spec §7: a nullable copy target is deliberately excluded from the release fix. tests/codegen/string_local_copy_release_2764_test.cpp:726
-codegen_string_local_copy_release_2764.using_var_copy_target_is_deliberately_excluded_spec_28_10  # spec §28.10: a `using var` copy target is deliberately excluded. tests/codegen/string_local_copy_release_2764_test.cpp:740
-dict_shadow_class_string_key_guard_3897.shadow_dict_indexer_aliasing_getter_not_armed_spec_23_4  # spec §23.4: a shadowed-dict indexer aliasing getter is not armed by the guard. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:235
-dict_shadow_class_string_key_guard_3897.shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9  # spec §28.9: a shadowed-dict generic method aliasing its return is not armed. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:253
+codegen_async_generic_string_local_release_2807.async_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: an async-assigned string param deliberately does not free the caller's copy; expectLeakButNoMemoryError pins leak-not-corruption. tests/codegen/async_generic_string_local_release_2807_test.cpp:604
+codegen_async_generic_string_local_release_2807.generic_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: same for the generic-assigned case. tests/codegen/async_generic_string_local_release_2807_test.cpp:618
+codegen_iterator_lambda_ctor_string_local_release_2817.lambda_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: a lambda-assigned string param does not free the caller's copy. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:986
+codegen_iterator_lambda_ctor_string_local_release_2817.async_lambda_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: async-lambda variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1000
+codegen_iterator_lambda_ctor_string_local_release_2817.sync_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: sync-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1014
+codegen_iterator_lambda_ctor_string_local_release_2817.async_iterator_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: async-iterator variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1028
+codegen_iterator_lambda_ctor_string_local_release_2817.constructor_assigned_string_param_does_not_free_caller_spec_28_1  # status:trade spec §28.1: constructor variant. tests/codegen/iterator_lambda_ctor_string_local_release_2817_test.cpp:1042
+codegen_string_index_arg_release_2717.record_receiver_index_is_deliberately_not_released_spec_9_7  # status:trade spec §9.7: a record receiver's string-index argument is deliberately not released. tests/codegen/string_index_arg_release_2717_test.cpp:960
+codegen_string_index_arg_release_2717.interface_receiver_index_is_deliberately_not_released_spec_11  # status:trade spec §11: interface-receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:976
+codegen_string_index_arg_release_2717.string_element_getter_index_is_deliberately_not_released_spec_23_4  # status:trade spec §23.4: string-element getter index variant. tests/codegen/string_index_arg_release_2717_test.cpp:992
+codegen_string_index_arg_release_2717.object_element_index_is_not_released_spec_23_4  # status:trade spec §23.4: object-element index variant. tests/codegen/string_index_arg_release_2717_test.cpp:1040
+codegen_string_index_arg_release_2717.bare_generic_element_via_this_receiver_is_not_released_spec_14_1  # status:trade spec §14.1: bare generic element via `this` receiver variant. tests/codegen/string_index_arg_release_2717_test.cpp:1060
+codegen_string_index_arg_release_2717.named_local_index_with_string_element_is_not_armed_spec_4_6  # status:trade spec §4.6: named-local index, string element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1081
+codegen_string_index_arg_release_2717.named_local_index_with_object_element_is_not_armed_spec_4_6  # status:trade spec §4.6: named-local index, object element, variant. tests/codegen/string_index_arg_release_2717_test.cpp:1095
+codegen_string_local_copy_release_2764.alias_stored_into_class_field_still_leaks_spec_28_9  # status:trade spec §28.9: an alias stored into a class field still leaks. tests/codegen/string_local_copy_release_2764_test.cpp:692
+codegen_string_local_copy_release_2764.nullable_copy_target_is_deliberately_excluded_spec_7  # status:trade spec §7: a nullable copy target is deliberately excluded from the release fix. tests/codegen/string_local_copy_release_2764_test.cpp:726
+codegen_string_local_copy_release_2764.using_var_copy_target_is_deliberately_excluded_spec_28_10  # status:trade spec §28.10: a `using var` copy target is deliberately excluded. tests/codegen/string_local_copy_release_2764_test.cpp:740
+dict_shadow_class_string_key_guard_3897.shadow_dict_indexer_aliasing_getter_not_armed_spec_23_4  # status:trade spec §23.4: a shadowed-dict indexer aliasing getter is not armed by the guard. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:235
+dict_shadow_class_string_key_guard_3897.shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9  # status:trade spec §28.9: a shadowed-dict generic method aliasing its return is not armed. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:253
 
 # ── pattern (c): expectLeakNotCrash(prog) — 4 rows, 1 file ─────────────────
-using_var_discard_vtableless_builtin_4224.shared_using_var_discard_looped_leaks_not_crashes  # #4224: a discarded `using var Shared<T>` builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes) under repetition. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:180
-using_var_discard_vtableless_builtin_4224.weak_using_var_discard_looped_leaks_not_crashes  # #4224: Weak<T> variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:213
-using_var_discard_vtableless_builtin_4224.jsonserializer_using_var_discard_looped_leaks_not_crashes  # #4224: JsonSerializer variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:239
-using_var_discard_vtableless_builtin_4224.sharedeventsource_using_var_discard_looped_leaks_not_crashes  # #4224: SharedEventSource variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:265
+using_var_discard_vtableless_builtin_4224.shared_using_var_discard_looped_leaks_not_crashes  # status:trade #4224: a discarded `using var Shared<T>` builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes) under repetition. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:180
+using_var_discard_vtableless_builtin_4224.weak_using_var_discard_looped_leaks_not_crashes  # status:trade #4224: Weak<T> variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:213
+using_var_discard_vtableless_builtin_4224.jsonserializer_using_var_discard_looped_leaks_not_crashes  # status:trade #4224: JsonSerializer variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:239
+using_var_discard_vtableless_builtin_4224.sharedeventsource_using_var_discard_looped_leaks_not_crashes  # status:trade #4224: SharedEventSource variant. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:265
 
 # ── pattern (d): inline sawLeakReport shape (same as (c)) — 1 row ─────────
-plain_var_vtableless_builtin_discard_leak_4185.shared_uncovered_builtin_still_leaks_not_crashes  # #4185: a discarded plain-var Shared<Widget> builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes); the control row #4224's review round 1 asked for. tests/codegen/plain_var_vtableless_builtin_discard_leak_4185_test.cpp:244
+plain_var_vtableless_builtin_discard_leak_4185.shared_uncovered_builtin_still_leaks_not_crashes  # status:trade #4185: a discarded plain-var Shared<Widget> builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes); the control row #4224's review round 1 asked for. tests/codegen/plain_var_vtableless_builtin_discard_leak_4185_test.cpp:244
 
 # ── pattern (e): diagnosticMessageContains(r, "LSan/ASan at exit") — 2 rows, 2 files ──
-codegen_narrowed_value_op_arg_release_3116.unnarrowed_object_call_argument_still_leaks_as_expected  # #3892/#3895: an unnarrowed Object-typed call argument still leaks, as expected — not a compiler crash or unrelated signal. tests/codegen/narrowed_value_op_arg_release_3116_test.cpp:290
-dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_28_9  # spec §28.9: the dict VALUE-position argument is deliberately NOT claimed by the #3887/#3888 fix, so it must still trip LeakSanitizer on both sides of that commit — the inverse control of the rows above it in the same file. tests/codegen/dict_sorted_key_local_release_3887_3888_test.cpp:388
+codegen_narrowed_value_op_arg_release_3116.unnarrowed_object_call_argument_still_leaks_as_expected  # status:trade #3892/#3895: an unnarrowed Object-typed call argument still leaks, as expected — not a compiler crash or unrelated signal. tests/codegen/narrowed_value_op_arg_release_3116_test.cpp:290
+dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_28_9  # status:trade spec §28.9: the dict VALUE-position argument is deliberately NOT claimed by the #3887/#3888 fix, so it must still trip LeakSanitizer on both sides of that commit — the inverse control of the rows above it in the same file. tests/codegen/dict_sorted_key_local_release_3887_3888_test.cpp:388
 
 # ── pattern (f): BEZEL_EXPECT_FALSE(r.ran) + an allocation-COUNT assertion — 1 row ──
 # Found by the first full cycle that actually enforced this file (#4537). The
@@ -141,7 +181,7 @@ dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_2
 # STRONGER oracle than any of the above — a crash lands in the same
 # `ran == false` shape but names no allocation count, so it fails rather than
 # passing. Worth keeping in mind if this file is ever repopulated by scan.
-async_iterator_lambda_param_capture_cell_3567.abandoned_async_iterator_leak_is_only_the_3541_residue_spec_29_7  # #3541/#3567, spec §29.7: an abandoned async iterator leaks exactly the §27.5 capture-cell residue — three allocations per abandoned round over 200 rounds. The row asserts the leak is PRESENT and is EXACTLY "in 600 allocation(s)", which is what distinguishes the residue from the over-release this arming could have become. tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp:157
+async_iterator_lambda_param_capture_cell_3567.abandoned_async_iterator_leak_is_only_the_3541_residue_spec_29_7  # status:residue issue:3541 #3541/#3567, spec §29.7: an abandoned async iterator leaks exactly the §27.5 capture-cell residue — three allocations per abandoned round over 200 rounds. The row asserts the leak is PRESENT and is EXACTLY "in 600 allocation(s)", which is what distinguishes the residue from the over-release this arming could have become. tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp:157
 
 # ── pattern (g): expectValueAndOnlyThe3541Residue(r, out, kResidue3541) — 5 rows ──
 # A per-file helper that asserts BOTH the program's stdout AND that the leak is
@@ -156,8 +196,8 @@ async_iterator_lambda_param_capture_cell_3567.abandoned_async_iterator_leak_is_o
 # `in 600 allocation(s)`; their `fully_drained` siblings use expectRanCleanly
 # and are leak-FREE, which is what makes this a scoped residue and not a
 # blanket tolerance.
-iter_lambda_captured_iter_format_local_unbox_3603.var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: abandoned captured `var seq` leaks exactly the three-allocation-per-round §27.5 residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:367
-iter_lambda_captured_iter_format_local_unbox_3603.using_var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: the `using var` spelling of the same abandoned-iterator residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:385
-iter_lambda_captured_iter_format_local_unbox_3603.using_var_class_local_captured_by_lambda_abandoned_3539  # #3541/#3539, spec §27.5: a captured `using var` over a plain class, abandoned — same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:400
-iter_lambda_captured_iter_format_local_unbox_3603.async_var_seq_captured_by_lambda_abandoned_29_7  # #3541, spec §29.7: the ASYNC iterator half of the same defect, same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:415
-iter_lambda_captured_iter_format_local_unbox_3603.issue_3539_repro_disposes_captured_using_var_exactly_once_27_5  # #3541/#3539, spec §27.5: the #3539 repro. The name refers to the CELL destructor count (the "0" in its expected stdout — every Cell destructed, i.e. disposed exactly once on all 200 abandoned rounds); the leak it still carries is the separate #3541 residue, which is why it is here and not a contradiction. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:435
+iter_lambda_captured_iter_format_local_unbox_3603.var_seq_captured_by_lambda_abandoned_29_7  # status:residue issue:3541 #3541, spec §29.7: abandoned captured `var seq` leaks exactly the three-allocation-per-round §27.5 residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:367
+iter_lambda_captured_iter_format_local_unbox_3603.using_var_seq_captured_by_lambda_abandoned_29_7  # status:residue issue:3541 #3541, spec §29.7: the `using var` spelling of the same abandoned-iterator residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:385
+iter_lambda_captured_iter_format_local_unbox_3603.using_var_class_local_captured_by_lambda_abandoned_3539  # status:residue issue:3541 #3541/#3539, spec §27.5: a captured `using var` over a plain class, abandoned — same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:400
+iter_lambda_captured_iter_format_local_unbox_3603.async_var_seq_captured_by_lambda_abandoned_29_7  # status:residue issue:3541 #3541, spec §29.7: the ASYNC iterator half of the same defect, same residue. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:415
+iter_lambda_captured_iter_format_local_unbox_3603.issue_3539_repro_disposes_captured_using_var_exactly_once_27_5  # status:residue issue:3541 #3541/#3539, spec §27.5: the #3539 repro. The name refers to the CELL destructor count (the "0" in its expected stdout — every Cell destructed, i.e. disposed exactly once on all 200 abandoned rounds); the leak it still carries is the separate #3541 residue, which is why it is here and not a contradiction. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:435
