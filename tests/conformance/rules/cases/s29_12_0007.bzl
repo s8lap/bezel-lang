@@ -3,8 +3,8 @@
 //! section: 29.12
 //! title: a structural call followed on every path by an exit from the loop draws no warning
 //! rule: A structural call followed on every path by an exit from the loop —
-//!   `break`, `return`, `throw`, or a labeled jump out of it — is exempt, no
-//!   advance following it.
+//!   `break`, `return`, a `throw` no `catch` within the loop body handles, or
+//!   a labeled jump out of it — is exempt, no advance following it.
 //! cites: 29.12
 //! expect: quiet
 module Conf;

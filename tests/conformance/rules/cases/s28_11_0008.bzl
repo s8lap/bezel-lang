@@ -5,7 +5,9 @@
 //! rule: The compiler must warn when a local holding such a borrow is used
 //!   after a call on the same collection binding that disposes the borrowed
 //!   element and dominates the use on every path — `RemoveAt(i)` where the
-//!   borrow was taken as `coll[i]` with the same index expression.
+//!   borrow was taken as `coll[i]` with the same index expression, and no
+//!   structural operation on the same collection binding between the borrow
+//!   and the kill.
 //! cites: 28.11, 28.2, 28.3
 //! expect: warn
 //! diagnostic: removal

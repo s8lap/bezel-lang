@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | under-review — owner-directed 2026-09-22: drafted for graduation in the v0.307 train; adversarial critique received 2026-09-22 and resolved (`scratch/finalize-B/resolutions.md`: F-1, F-2, F-3, F-6, N-13, N-14) |
-| **Tracking issue** | to be filed at landing |
+| **Status** | graduated-v0.307 — superseded — graduated v0.307 (owner-directed 2026-09-22; adversarial critique received 2026-09-22 and resolved (`scratch/finalize-B/resolutions.md`: F-1, F-2, F-3, F-6, N-13, N-14); landed with the v0.307 changelog entry) |
+| **Tracking issue** | [#4605](https://github.com/s8lap/bezel-lang/issues/4605) (spec-ahead-of-impl, filed at landing) |
 | **Target module(s)** | **spec** — §28.3 (*Diagnostics*: one new paragraph defining the mode, its report, and the claim it licenses; K4 clause 3: one sentence naming the mode as the register's enumerator). **rationale** — a new §5.31 decision record (why a mode, why a warning, why not always-on; §5.30 is proposal 0128's, in the same revision). **code-generation reference** — §4.6 (one sentence). **Guide 01** — §2's back-reference paragraph (one sentence naming the mode). Toolchain: the driver flag `--report-trust-admissions` (`src/main.cpp`, `src/driver/Driver.hpp`). No grammar change; no program's acceptance changes; the default build emits nothing new. |
 | **Written against** | spec **v0.306** (`cafdfc5`) |
 | **Origin** | The 2026-09-22 "path of least resistance" investigation: make the good memory-management pattern the shortest spelling; make the compiler say what it already knows. This is the second half — the compiler decides, at every field store, collection store and async call, whether the admission it is making rests on a recorded trust clause; today it says so only in a source comment (`Ownership_Checks.cpp:8073`: *"parameter- and receiver-sourced borrows are admissible with a recorded trust clause"*). |

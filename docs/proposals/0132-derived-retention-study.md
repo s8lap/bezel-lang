@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | study — owner-directed 2026-09-22; recommendation recorded, no normative change proposed |
-| **Tracking issue** | to be filed at landing |
+| **Tracking issue** | none — a study; an issue is filed if the owner takes it up (§7 names the evidence) |
 | **Target module(s)** | none now. If taken up as a proposal: **spec** — §3.6 (a derived *member* property, or a stated reason why the mechanism is not §3.6's), §2.8.2 clause 1 (a per-parameter retention record beside the purity modifier), §2.8.6 (one delta row), §28.3's *Diagnostics* (the warning), §28.14 (the bounding-object forms reused at plain call sites); **rationale** — §9.7 (the declared-not-derived record would need a stated carve for warning-only consumption); **code-generation reference** §4.6. |
 | **Written against** | spec **v0.306** (`cafdfc5`) |
 | **Origin** | The 2026-09-22 "path of least resistance" investigation, third item: the compiler knows, when it checks `Account`'s constructor, that the constructor stores `owner` in a field; the caller writing `new Account(c)` and then `c.Dispose()` while the account lives does not. Proposal 0131 makes the *callee* side loud; this study asks whether the *caller* side can be made loud without a declaration, without a freeze, and without repeating the mistake proposal 0048 retired. |

@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | under-review — owner-directed 2026-09-22: drafted for graduation in the v0.307 train; adversarial critique received 2026-09-22 and resolved (`scratch/finalize-B/resolutions.md`: N-8, N-9, N-10, N-11, N-12) |
-| **Tracking issue** | to be filed at landing |
+| **Status** | graduated-v0.307 — superseded — graduated v0.307 (owner-directed 2026-09-22; adversarial critique received 2026-09-22 and resolved (`scratch/finalize-B/resolutions.md`: N-8, N-9, N-10, N-11, N-12); landed with the v0.307 changelog entry) |
+| **Tracking issue** | [#4604](https://github.com/s8lap/bezel-lang/issues/4604) (spec-ahead-of-impl, filed at landing) |
 | **Target module(s)** | **stdlib** — new §4.21 `OwningSlotMap<T>` and `SlotHandle` (after §4.20 `Counter<K>`); §4.3's `Clear()`-order paragraph (one family added). **spec** — §2.3's `System.Collections.Generic` auto-import row (the bare-name list and its count); §28.11's owning-family list, its disposal-order paragraph, and its no-indexer paragraph; §28.9's non-trivial-dispose list. **rationale** — §5.4 (one dated sentence: the handle-and-table pattern it names is now a library type). **code-generation reference** — §4.5's family table, the §5.4 index (one new block), §5.11's collection absences, and the pin. **Guide 05** — §8's table (one row). No grammar change. |
 | **Written against** | spec **v0.306** (`cafdfc5`); stdlib companion v0.306 |
 | **Origin** | The 2026-09-22 "path of least resistance" investigation: make the good memory-management pattern the shortest spelling; make the compiler say what it already knows. This is the first half — a stored *key* instead of a stored *borrow* becomes the shortest spelling for graph-, cache- and registry-shaped code. |
