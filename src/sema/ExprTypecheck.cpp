@@ -11762,14 +11762,15 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 // reporting from a single candidate's decline would reject
                 // working code. It needs a scan over every candidate before
                 // it can say "no parameter of any candidate is named `zz`",
-                // which is a second change to a different shape; filed rather
-                // than folded in. Likewise "no constructor of this arity at
-                // all" is left to whatever diagnoses an unresolvable base
-                // call today — nothing is published or reported for it here.
+                // which is a second change to a different shape; filed as
+                // #4576 gap (a) rather than folded in. "No constructor of
+                // this arity at all" — #4576 gap (b) — is fix #4576 below,
+                // once the arity scans above and this fallback all agree no
+                // candidate survives.
                 //
                 // Also unchanged: §5.1 ASSIGNABILITY of each bound argument
                 // to its slot's type, the same outstanding item #4496 and
-                // #4518 record for their arms.
+                // #4518 record for their arms (and #4576 gap (c)).
                 const bool soleCandidate = nonStaticCtorCount == 1;
                 const bool clauseBindsPrimaryList =
                     baseTs->hasPositionalFields && !explicitCtorOfThisArity;
@@ -11788,6 +11789,64 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         clauseCtor = other;
                         break;
                     }
+                }
+                // fix #4576 gap (b) (§22.5 "Optional parameters and named
+                // arguments" / §22.10 "Primary constructors", v0.307): "no
+                // constructor of this arity at all" — the shape #4551's own
+                // header named and explicitly left open ("left to whatever
+                // diagnoses an unresolvable base call today — which,
+                // measured, is nothing").
+                //
+                // Reached when BOTH arity scans above (the exact-match loop
+                // and #4550's "more formals, possibly covered by defaults"
+                // fallback) found NO candidate, and the clause does not bind
+                // the base's §22.10 PRIMARY parameter list instead
+                // (`!clauseBindsPrimaryList`, the exact complement #4551 and
+                // #4518 already use — a clause binding the primary list is
+                // checked by the block above, at ~L11577, against the RIGHT
+                // formal list). Unlike #4551's own fallback just above, this
+                // is NOT restricted to `soleCandidate`: that fallback exists
+                // BECAUSE the sole-constructor case always resolves to a
+                // candidate (the one constructor there is), whose own binder
+                // call then reports the real reason. Here NO scan found
+                // anything — which covers both an OVERLOAD SET where no
+                // sibling's arity could ever admit this clause (this issue's
+                // own repro, `nonStaticCtorCount > 1`) and a base declaring
+                // ZERO non-static constructors (`nonStaticCtorCount == 0`) —
+                // two shapes #4551's `soleCandidate` gate does not reach.
+                //
+                // Every arity that could possibly have matched already had
+                // its chance in the two scans above, independent of which
+                // parameter names the clause used, so §22.5's "the error is
+                // reported only where no candidate survives" is satisfied
+                // unconditionally here — unlike gap (a) (a doubly-bound or
+                // unknown-named parameter against a SURVIVING sibling of an
+                // overload set), which #4551 declined for the opposite
+                // reason (the name might belong to a sibling) and which this
+                // fix does not attempt; nor does it attempt §5.1
+                // assignability of a bound argument, unreachable here since
+                // no candidate to check arguments against was ever found.
+                //
+                // MEASURED pre-fix (this lane's HEAD, `d488f37b`): `class
+                // D(v: int) : B(v, v, v)` against a base declaring
+                // `constructor(a: int)` (arity 1) and `constructor(a: int, b:
+                // int)` (arity 2) — neither of which can ever accept 3
+                // arguments, with or without defaults — compiled at exit 0
+                // with NO diagnostic; `d.Go()` printed the base's declared
+                // field initializers (`n=0 s=0`), not either constructor's
+                // work, because the base subobject was never constructed.
+                if (!clauseCtor && !ambiguousArity && !soleCandidate &&
+                    !clauseBindsPrimaryList) {
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        td->primaryBaseCtorArgs[0].value->span.begin,
+                        "inheritance-clause base call to `" +
+                            std::string(baseTs->name) + "` supplies " +
+                            std::to_string(nClauseArgs) +
+                            " argument(s), but no non-static constructor of "
+                            "`" +
+                            std::string(baseTs->name) +
+                            "` declares that many parameters (§22.5/§22.10)");
                 }
                 if (clauseCtor && !ambiguousArity) {
                     const std::string desc =
