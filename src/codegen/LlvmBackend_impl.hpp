@@ -4157,12 +4157,27 @@ private:
     // IndexOf, Contains, SequenceEqual, Length/IsEmpty, for-in); the owning
     // class-T behaviour (disposing set, `move`, Clear/MoveFrom/MoveTo) is gated
     // separately on isOwningSpanTypeName.
+    //
+    // fix #4583 (§27.8, v0.306): a type alias (`type Al := ArraySpan<int>`)
+    // resolves TRANSPARENTLY by copying the underlying TypeRef and then
+    // RESTORING astNode to the USE SITE (the alias name), so a raw
+    // `astNode->name->parts[0]` read here answered the ALIAS name ("Al"),
+    // never matched, and every member access on an alias-typed span local
+    // fell through to the generic path and failed to lower (ICE: "internal:
+    // return-value expression failed to lower to a value"). `headName()`
+    // (TypeRef.hpp) is documented as "the ONE read every builtin-collection/
+    // wrapper identity check should use instead of astNode->name->parts[0]"
+    // for exactly this reason — it prefers `aliasResolvedHead` (the
+    // underlying head, set at alias resolution) and falls back to the
+    // existing astNode/importedName reads otherwise, so a non-alias ref is
+    // unaffected. Same class of read fix #4570 applied one layer up, in sema's
+    // namedTypeSimpleName.
     static bool isSpanLikeTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
             return false;
-        auto n = rt->astNode->name->parts[0];
+        auto n = rt->headName();
         return n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
                n == "Span" || n == "ReadOnlySpan";
     }
@@ -4171,6 +4186,22 @@ private:
     // interface — a span boxed into { vtable, rc, bz.arrayspan } (arrayspan at
     // box+16). Recognised by the IReadOnlySpan TypeSymbol declaration or, for a
     // not-yet-resolved ref, the leading name part.
+    //
+    // #4583 investigation: this predicate's astNode-head leg has the SAME
+    // `astNode->name->parts[0]` shape as isSpanLikeTypeName/isOwningSpanTypeName
+    // below, but — unlike ArraySpan/Span, which are pure syntactic builtins
+    // with no TypeSymbol — IReadOnlySpan IS backed by a real TypeSymbol, so
+    // `ref = *underlying` (§27.8 alias resolution, TypeResolution_Names.cpp)
+    // copies `declaration` too and the FIRST branch above already answers
+    // correctly for an alias (`type Al := IReadOnlySpan<int>`); MEASURED via
+    // both a `for`-in loop (LlvmBackend_Stmts.cpp) and the boxed-SequenceEqual-
+    // argument path (LlvmBackend_Calls3.cpp), both alias-typed, both correct
+    // pre-fix. The astNode leg below is therefore reached only when
+    // `declaration` is null (the "not-yet-resolved ref" the comment above
+    // names), a shape no surface alias program was found to produce — left
+    // as `astNode->name->parts[0]` rather than switched to `headName()`,
+    // since a change with no FAIL-WITHOUT repro is not a provable fix (see
+    // #4583's discussion of this exact predicate).
     static bool isIReadOnlySpanType(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         if (rt->declaration && rt->declaration->name == "IReadOnlySpan")
@@ -4185,12 +4216,15 @@ private:
     // §4.14 (#779): test whether a TypeRef is the OWNING `Span<T>` over an
     // OwningBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
     // is a read-only view (no set/move/clear), so it is NOT matched here.
+    //
+    // fix #4583 (§27.8, v0.306): same alias-blind read as isSpanLikeTypeName
+    // above — see that comment.
     static bool isOwningSpanTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
             return false;
-        return rt->astNode->name->parts[0] == "Span";
+        return rt->headName() == "Span";
     }
 
     // §4.15: extract the `Source` array pointer (field 0) from a lowered span struct value.
