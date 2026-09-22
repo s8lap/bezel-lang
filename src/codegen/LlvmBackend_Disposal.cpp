@@ -6709,6 +6709,152 @@ bool Emitter::patternBindsAnySlot(const ast::Pattern* p) {
 }
 
 
+// fix #4617 / §35.5 *The owning match* (v0.307): the PER-SLOT discharge of an
+// owning-choice scrutinee temporary's construct-completion reclaim.
+//
+// §35.5 states both halves of arm selection at SLOT granularity: the selected
+// arm "transfers the case's `owned` and move-only value payloads into its
+// bindings", and "the un-transferred remainder — unlisted fields, unmarked
+// named slots, discarded siblings — is disposed at construct completion".
+// #4609's discharge was per ARM — `patternBindsAnySlot` gating one zero-store
+// over the whole temp — so an arm binding SOME slots of a multi-payload case
+// discharged the reclaim for ALL of them and the un-bound siblings were
+// reclaimed by nobody. MEASURED on §35.5's own shape, over
+// `W(owned a: Widget, owned b: Widget)`:
+//
+//   case move o of
+//     W(var w, _) => do using var live := move w; end,   // `b` reclaimed by nobody
+//     X           => ()
+//   end case;
+//
+// printed `dispose a` and never `dispose b` (a leak, amplified to 16 B and one
+// allocation per iteration under LSan).
+//
+// THE MARK IS #4566's moved-from encoding, applied at slot granularity rather
+// than to the whole value: `emitOwningChoiceActiveCaseDisposal` null-guards
+// every class/interface payload pointer explicitly, and a zeroed nested choice
+// struct reads tag 0 with null payload pointers, which its recursive walk
+// likewise skips. So nulling exactly the transferred slots leaves the
+// completion reclaim (and the dispose-stack entry covering a `return`/`throw`
+// out of the arm) disposing exactly the remainder — §35.5's four disposal
+// traces unchanged, now at the granularity the section states them at.
+//
+// THE TWO ERROR DIRECTIONS ARE NOT SYMMETRIC, and that asymmetry is the whole
+// design: failing to mark a slot the arm adopted is a DOUBLE FREE, while
+// marking one it did not is a leak. Every shape whose transfer set cannot be
+// computed per slot therefore falls back to the pre-#4617 whole-value mark —
+// the sound direction, and exactly the previous behaviour, so no shape that
+// works today can regress.
+void Emitter::dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
+                                            const sema::TypeRef* choiceRef,
+                                            const ast::Pattern* armPattern) {
+    if (!slot) return;
+    if (markOwningMatchTransferredSlots(slot, choiceRef, armPattern)) return;
+    // Fallback: #4609's whole-value mark.
+    builder_.CreateStore(
+        llvm::Constant::getNullValue(slot->getAllocatedType()), slot);
+}
+
+
+// The recursive core of the above. `choiceAddr` is the address of a choice
+// struct (the scrutinee temp's alloca at the top level, a nested payload
+// field's address one level in); returns false — "I could not decide this
+// shape, mark the whole value" — for every case listed in the caller's
+// asymmetry note.
+bool Emitter::markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
+                                              const sema::TypeRef* choiceRef,
+                                              const ast::Pattern* p) {
+    if (!choiceAddr || !choiceRef || !choiceRef->declaration || !p) return false;
+    if (choiceRef->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    // §35.9's `C?` storage is the §7.2 wrapper `{ i8 hasValue, <choice> }`, not
+    // a choice struct; decline rather than GEP a case payload out of the wrong
+    // layout. The caller's whole-value mark keeps the pre-fix behaviour.
+    if (choiceRef->nullable) return false;
+    // Only a case destructuring carries a per-slot transfer set. A whole-value
+    // `BindingPattern` arm (`case move o of var whole => …`) transfers the
+    // entire value, and an alternative list is binding-free by §35.5 — both
+    // take the whole-value mark.
+    auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p);
+    if (!dp || !dp->typeName || dp->typeName->parts.empty()) return false;
+    const sema::TypeSymbol* choiceTy = choiceRef->declaration;
+    std::size_t tag = 0;
+    const sema::ChoiceCaseSymbol* cc =
+        choiceCaseByName(choiceTy, dp->typeName->parts.back(), &tag);
+    if (!cc || !cc->caseDecl) return false;   // head names no case of this
+                                              // choice (a record destructure)
+    // §14.1 / §28.1 (#2047): the layout is per-instantiation, exactly as
+    // `emitOwningChoiceActiveCaseDisposal` and the match-side binding path
+    // derive it — the two must never disagree about where a payload lives.
+    RecordSubstGuard choiceSubst(this, choiceRef);
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return false;
+    // The storage gate, the same one `markedOwningChoiceScrutineeSlot` applies:
+    // the alloca must hold exactly the layout this instantiation implies.
+    if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(choiceAddr))
+        if (ai->getAllocatedType() != st) return false;
+    if (1 + tag >= st->getNumElements()) return false;
+    auto* payloadTy = llvm::dyn_cast<llvm::StructType>(
+        st->getElementType(static_cast<unsigned>(1 + tag)));
+    if (!payloadTy) return false;
+    llvm::Value* payloadAddr = builder_.CreateStructGEP(
+        st, choiceAddr, static_cast<unsigned>(1 + tag), "omt.payload");
+    for (std::size_t j = 0;
+         j < dp->subPatterns.size() && j < cc->caseDecl->payload.size(); ++j) {
+        if (j >= payloadTy->getNumElements()) break;
+        const auto& sp = dp->subPatterns[j];
+        // §35.5: a slot that binds nothing — `_`, a constant, a range — is
+        // "the un-transferred remainder"; leave it for the completion reclaim.
+        // THIS IS THE FIX: before #4617 the loop did not exist and every slot
+        // of a binding arm was marked.
+        bool slotBinds = !sp.nakedBinding.empty() ||
+                         patternBindsAnySlot(sp.pattern.get());
+        if (!slotBinds) continue;
+        llvm::Type* fieldTy =
+            payloadTy->getElementType(static_cast<unsigned>(j));
+        llvm::Value* fieldAddr = builder_.CreateStructGEP(
+            payloadTy, payloadAddr, static_cast<unsigned>(j), "omt.slot");
+        // A whole-slot binding — `W(var w, _)`'s `w`, or the naked `W(w, _)`
+        // spelling — transfers the payload into an owned local of the arm
+        // body's scope (§35.5). Mark just that slot.
+        bool wholeSlot =
+            !sp.nakedBinding.empty() ||
+            dynamic_cast<const ast::BindingPattern*>(sp.pattern.get()) !=
+                nullptr;
+        if (!wholeSlot) {
+            // A nested pattern that binds. §35.5 routes the recursion "exactly
+            // through the slots that transfer", and the one nested move-only
+            // shape with a pattern surface is a choice payload — recurse into
+            // it so ITS un-bound remainder survives to the completion reclaim
+            // too. Every other nested shape (a class-typed payload, whose
+            // nested slots are property-getter borrows) takes the conservative
+            // whole-slot mark: a leak, never a double free.
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                cc->caseDecl->payload[j], choiceTy, choiceRef, ctx_);
+            bool recursed = false;
+            if (ftInst && !ftInst->nullable &&
+                ftInst->kind == sema::TypeRef::Kind::Named &&
+                ftInst->declaration &&
+                ftInst->declaration->kind == ast::TypeDeclKind::Choice) {
+                // fix #4132's lesson: compute the nested layout under the
+                // NESTED instantiation's substitution and require it to be the
+                // field's actual storage before GEPing through it.
+                llvm::StructType* nestedSt = nullptr;
+                {
+                    RecordSubstGuard nestedSubst(this, ftInst);
+                    nestedSt = choiceStruct(ftInst->declaration);
+                }
+                if (nestedSt && nestedSt == fieldTy)
+                    recursed = markOwningMatchTransferredSlots(
+                        fieldAddr, ftInst, sp.pattern.get());
+            }
+            if (recursed) continue;
+        }
+        builder_.CreateStore(llvm::Constant::getNullValue(fieldTy), fieldAddr);
+    }
+    return true;
+}
+
+
 bool Emitter::unboundOwningChoiceTemp(const ast::Expr* e,
                                       const sema::TypeRef* rt) {
     if (!e || !rt) return false;

@@ -10469,11 +10469,20 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // covers a `throw`, `return` or `break` out of this arm body; the
         // bindings were filled from the scrutinee VALUE above, not re-read
         // from this slot, so nothing in the arm observes the zeros.
+        //
+        // fix #4617 / §35.5 (v0.307): the discharge is now PER SLOT. §35.5
+        // states BOTH halves at slot granularity — the arm "transfers the
+        // case's `owned` and move-only value payloads into its bindings" and
+        // "the un-transferred remainder — unlisted fields, unmarked named
+        // slots, discarded siblings — is disposed at construct completion" —
+        // but #4609 marked the WHOLE value as soon as the arm bound anything,
+        // so `W(var w, _)` over `W(owned a: Widget, owned b: Widget)` adopted
+        // `a` and left `b` reclaimed by nobody. `dischargeOwningMatchTransfers`
+        // marks exactly the transferred slots and falls back to this same
+        // whole-value store for any shape it cannot decide per slot.
         if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
-            builder_.CreateStore(
-                llvm::Constant::getNullValue(
-                    scrutChoiceSlot->getAllocatedType()),
-                scrutChoiceSlot);
+            dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
+                                          arm.pattern.get());
         bool armTerm = lowerScopedBlock(arm.stmts);
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);

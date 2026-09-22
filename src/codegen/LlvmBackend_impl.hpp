@@ -17304,6 +17304,25 @@ private:
     // payload §35.5 disposes at completion.
     static bool patternBindsAnySlot(const ast::Pattern* p);
 
+    // fix #4617 / §35.5 *The owning match* (v0.307): emit the moved-from marks
+    // for exactly the payload slots the selected arm TRANSFERS into its
+    // bindings, leaving §35.5's "un-transferred remainder" in `slot` for the
+    // construct-completion reclaim to dispose. #4609's discharge was per ARM
+    // (one zero-store over the whole value as soon as the arm bound anything),
+    // so a partial binding — `W(var w, _)` over `W(owned a, owned b)` — leaked
+    // every un-bound sibling. Falls back to that whole-value mark for any
+    // pattern shape whose transfer set is not decidable per slot; see the
+    // definition for why that direction is the safe one.
+    void dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
+                                       const sema::TypeRef* choiceRef,
+                                       const ast::Pattern* armPattern);
+    // The recursive core: false means "shape not decidable — mark the whole
+    // value". `choiceAddr` addresses a choice struct (never a §35.9 `C?`
+    // wrapper, which is declined).
+    bool markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
+                                         const sema::TypeRef* choiceRef,
+                                         const ast::Pattern* p);
+
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
     bool lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body);
