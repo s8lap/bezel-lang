@@ -47,21 +47,30 @@
 //     extent, so the shape fails loudly at compile time instead of crashing.
 //
 // Fixing (1) alone would have left (2) as a latent crash for every FUTURE
-// reconstruction gap, which is why both ship. T3 is what pins (2) on its own:
-// a PRIVATE `const` extent, which the metadata does not carry at all (the
-// generic-class widenings cover private METHODS (#695) and private FIELDS
-// (#1224), not consts), so it still cannot reconstruct — and must now produce
-// that diagnostic rather than a SIGSEGV.
+// reconstruction gap, which is why both ship. T3 originally pinned (2) on its
+// own: a PRIVATE `const` extent, which this commit's metadata did not carry
+// at all (the generic-class widenings covered private METHODS (#695) and
+// private FIELDS (#1224), not consts), so it still could not reconstruct —
+// and had to produce that diagnostic rather than a SIGSEGV.
+//
+// ⚠ UPDATED BY #4572 (§15.1 / §2.8.3 rule 3, v0.306): the private-const
+// reconstruction gap T3 exercised is now CLOSED — `ModuleMetadataBuilder`
+// gained a third widening (`includeForConst`) so a generic class/record's
+// private/internal consts reach `td.members` exactly as private methods/
+// fields already did, and `buildConstStubs` (unchanged) picks them up. T3 is
+// flipped to an ACCEPTANCE row (see its own comment below); it no longer
+// asserts diagnostic text, because there is no longer a diagnostic to assert.
 //
 // ── THE ORACLE ─────────────────────────────────────────────────────────────
 //
 // The importing COMPILE is fork-isolated here, so "the compiler died on a
 // signal" is an observable value (`kCompilerCrashed`) instead of taking the
 // test binary down with it. That matters twice over: it makes the pre-fix
-// behaviour a FAILING assertion rather than a crashed shard, and it lets T3
-// assert the EXACT diagnostic text — per CLAUDE.md's vacuous-oracle catalogue,
-// `failedAtCompileTime`-shaped helpers pass on BOTH sides of a crash fix
-// because the crash's own backstop diagnostic carries a real location.
+// behaviour a FAILING assertion rather than a crashed shard, and (pre-#4572)
+// it let T3 assert the EXACT diagnostic text — per CLAUDE.md's vacuous-oracle
+// catalogue, `failedAtCompileTime`-shaped helpers pass on BOTH sides of a
+// crash fix because the crash's own backstop diagnostic carries a real
+// location.
 
 #include <cstdio>
 #include <cstdlib>
@@ -278,10 +287,12 @@ std::string declsMethodConst4514(const std::string& tag) {
            "end McC" + tag + ";";
 }
 
-// A PRIVATE const extent. The wire carries no private const (the generic-class
-// widenings cover private methods and private fields only), so this shape
-// cannot reconstruct even with the loader fix — and is therefore the row that
-// pins the CODEGEN guard on its own.
+// A PRIVATE const extent. Before #4572 the wire carried no private const (the
+// generic-class widenings covered private methods and private fields only),
+// so this shape could not reconstruct even with the loader fix in place — it
+// pinned the CODEGEN guard on its own. #4572 added the matching widening for
+// consts, so this shape now reconstructs and builds identically to the
+// PUBLIC-const case above (see T3's own comment).
 std::string declsPrivateConst4514(const std::string& tag) {
     return "public class MxP" + tag + "<T> "
            "  private const MAX: int := 2; "
@@ -375,43 +386,45 @@ BEZEL_TEST(xmod_generic_ctor_const_extent_4514,
 }
 
 // ===========================================================================
-// T3 ★ THE CODEGEN-GUARD ROW — §15.1 / §2.8.3 rule 3. A PRIVATE const extent
-// is not on the wire at all, so the parameter's extent STILL cannot be
-// reconstructed with the loader fix in place. That is exactly the residual
-// shape the uninitialized `llvm::Value* v` turned into a SIGSEGV.
+// T3 ★ FLIPPED BY #4572 (§15.1 / §2.8.3 rule 3, v0.306). This row originally
+// pinned #4514's CODEGEN GUARD: a PRIVATE const extent was not on the wire at
+// all (the generic-class widenings covered private METHODS (#695) and private
+// FIELDS (#1224), not consts), so the parameter's extent still could not be
+// reconstructed with #4514's loader fix in place, and the row asserted the
+// clean §15.1 diagnostic that guard produces instead of the pre-#4514 SIGSEGV.
 //
-// The oracle is deliberately the SPECIFIC diagnostic, not "it failed at compile
-// time": the crash's own backstop line carries a real location, so a generic
-// "did it fail?" check passes on BOTH sides of this fix (CLAUDE.md's
-// vacuous-oracle catalogue).
+// #4572 closed that residual reconstruction gap: `ModuleMetadataBuilder` now
+// widens `out.members` a third time (`includeForConst`, mirroring
+// `includeForCtorBody`/`includeForMethodBody`) so a generic class/record's
+// private/internal CONST members reach `td.members`, and `buildConstStubs`
+// (unchanged since #4514) picks them up automatically. This exact shape now
+// RECONSTRUCTS, so per CLAUDE.md's "a fix that reverses behaviour... must
+// update the tests that pinned the old behaviour": this row is flipped from
+// "rejects with a specific diagnostic" to "accepts and matches the twin",
+// exactly as T1 already does for the PUBLIC-const case. Deeper, exact-value
+// coverage of the private-const shape (a differently-numbered extent, a body
+// that also reads the const) lives in
+// tests/module/xmod_generic_ctor_private_const_extent_4572_test.cpp T1/T2;
+// this row's job is narrower — confirm the specific shape that used to pin
+// the codegen guard no longer needs it.
 //
-//   pre-fix : kCompilerCrashed4514 (SIGSEGV in Emitter::buildOrderedArgs)
-//   post-fix: -1, with the §15.1 / #4514 diagnostic naming the parameter
+//   pre-#4572 : -1, with the §15.1 / #4514 diagnostic naming the parameter
+//   post-#4572: 7, exactly like the PUBLIC-const T1 row above
 // ===========================================================================
 BEZEL_TEST(xmod_generic_ctor_const_extent_4514,
-           t3_unreconstructable_extent_diagnoses_instead_of_crashing_15_1) {
+           t3_private_const_extent_now_reconstructs_15_1_4572) {
     const std::string body =
         "  public static method Main(): int "
         "    using var c := new MxPT3<int>([7, 8]); "
         "    return c.Tag; "
         "  end Main;";
-    std::string err;
     int r = runImported4514(lib4514("T3", declsPrivateConst4514("T3")),
-                            app4514("T3", body), "T3", &err);
+                            app4514("T3", body), "T3");
     if (r == kDepUnavailable4514) return;
-    // The compiler must not die on a signal.
+    // The compiler must not die on a signal — #4572 must not reopen #4514's
+    // crash while closing the reconstruction gap.
     BEZEL_EXPECT_TRUE(r != kCompilerCrashed4514);
-    // It must reject, and it must say WHY — naming the parameter, §15.1, and
-    // the issue. Each substring is load-bearing: the generic `#1386`
-    // "lowerExpr returned null" line the null `v` would otherwise reach carries
-    // none of them.
-    BEZEL_EXPECT_EQ(r, -1);
-    BEZEL_EXPECT_TRUE(err.find("inline-array parameter `a`") !=
-                      std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("not a compile-time constant") !=
-                      std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("\xC2\xA7""15.1") != std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("#4514") != std::string::npos);
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
 // ===========================================================================

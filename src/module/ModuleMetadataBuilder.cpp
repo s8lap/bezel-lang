@@ -2036,6 +2036,43 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
+        // fix #4572 (§15.1 / §2.8.3 rule 3, v0.306): for a generic class or
+        // record, also include private/internal CONST members. #4514 taught
+        // `buildConstStubs` (ModuleLoader.cpp) to declare every `MetaMemberKind
+        // ::Const` entry of `td.members` in each synthetic reconstruction
+        // source, so a verbatim body/signature text carried across the wire
+        // can resolve a const NAME — but that only helps a const that already
+        // reached `out.members`, which before this fix meant `exported`
+        // (public/protected) only. §15.1 makes an inline-array EXTENT part of
+        // the type, and an extent can be spelled as a const name on a
+        // PUBLIC constructor signature —
+        //   public class MxC<T>
+        //     private const MAX: int := 2;
+        //     public constructor(a: [MAX]int) … end constructor;
+        // — where `constructor(a: [MAX]int)` is unambiguously part of the
+        // exported surface (§13.1) even though `MAX` itself is `private`: the
+        // VISIBILITY of the const that names an extent is an implementation
+        // detail of the exporter, not a property of the signature it appears
+        // in (§2.8.3 rule 3: "the artifact interface must carry enough to
+        // reconstruct every public signature"). Without this widening,
+        // `ctorBodyText` carries `[MAX]int` verbatim but no reconstruction
+        // source declares `MAX`, so it re-parses unbound, TypeResolution
+        // leaves `arraySizeValue` at -1, and codegen's `lowerTypeRef` answers
+        // the unfoldable-extent placeholder — the #4514 guard now reports a
+        // clean §15.1 diagnostic instead of reading an unset `llvm::Value*`,
+        // but the construction is still rejected where the single-module twin
+        // compiles. Only name + type + valueText cross (via `convertMember`,
+        // identical to an exported const) — no storage, no ABI change, since
+        // §22.12 emits no global for a const. Mirrors `includeForCtorBody`
+        // (#695) / `includeForMethodBody` (#1224): the const stays
+        // inaccessible outside the class; the stub exists solely for sema
+        // name-resolution inside a re-parsed body or signature.
+        bool isConst = !isMethod && !isField && !isAutoPropStorage &&
+            dynamic_cast<const sema::ConstMemberSymbol*>(ms) != nullptr;
+        bool includeForConst = isGenericMonomorphized && isConst &&
+            !exported &&
+            (member->visibility == ast::Visibility::Private ||
+             member->visibility == ast::Visibility::Internal);
         // fix #2456 (§22.8 / §2.8.2-§2.8.3, v0.235): a non-static instance
         // field occupies a slot in the class's PHYSICAL layout regardless of
         // its §13 visibility — declaration order, not exported-surface
@@ -2123,7 +2160,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             (t.kind == ast::TypeDeclKind::Class ||
              t.kind == ast::TypeDeclKind::Record);
         if (!exported && !includeForCtorBody && !includeForMethodBody &&
-            !includeForLayout)
+            !includeForConst && !includeForLayout)
             continue;
         MetaMember mm;
         if (convertMember(*member, inInterface, ctx, mm, isGenericMonomorphized, source)) {
