@@ -109,11 +109,33 @@ struct GenericParam {
 // Slice 6 introduces FieldDecl only; other kinds arrive with their slices.
 struct Member : Node {};
 
-// A.4: `FieldDecl ::= Visibility "static"? "owned"? "readonly"?
-//                     Identifier ":" Type (":=" Expression)? ";"`.
+// §9.2 EqualityClause (v0.298+). `equality` is a contextual keyword
+// (App. B.2) lexed as Identifier; `skip` is also contextual. The grammar
+// admits this on the same storage-bearing sites as `serialized` —
+// PositionalField, CaseField (choice payload), explicit FieldDecl, and
+// auto-property PropertyBody — but NOT on EnumConstant or ChoiceCase
+// (those are §9.2 inert-annotation rejects). Only `skip` exists: rename
+// and `optional` have no equality analogue, so the vocabulary is one word,
+// closed (spec §9.2, line 1385). Sema enforces the inert-annotation
+// rejection on statics, computed properties, methods, enum constants, and
+// choice cases — see fix #4643 / spec §9.2.
+//
+// Defined BEFORE FieldDecl (line 114 below) and Param (line 597 below)
+// because both embed `std::unique_ptr<EqualityClause>` and the compiler
+// needs the complete type to instantiate the unique_ptr.
+struct EqualityClause {
+    bool isSkip = false;            // `equality skip` — the only form
+};
+
+// A.4: `FieldDecl ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
+//                     EqualityClause? Identifier ":" Type (":=" Expression)? ";"`.
 struct FieldDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // "static", "owned", "readonly"
+    // §9.2 EqualityClause on an explicit field declaration. Grammar places
+    // it BEFORE the Identifier (A.4 FieldDecl, v0.298). Sema rejects the
+    // clause on a `static` field as an inert annotation (§9.2 line 1419).
+    std::unique_ptr<EqualityClause> equality;
     std::string_view name;
     std::unique_ptr<Type> type;
     std::unique_ptr<Expr> initializer; // null if no `:= Expr` was written
@@ -594,6 +616,10 @@ struct Param {
     // A.4 PositionalField's SerializedClause. Only populated for record
     // positional fields — other Param uses leave this null.
     std::unique_ptr<SerializedClause> serialized;
+    // §9.2 EqualityClause on a PositionalField or CaseField (§35.7).
+    // Only populated for record positional fields and choice payload
+    // fields — other Param uses leave this null.
+    std::unique_ptr<EqualityClause> equality;
     // §27.4 (v0.183, #1408) / A.7 `LambdaDestructure`: non-null when this
     // LambdaParam was written as a record-destructuring pattern
     // (`(Entry(k, v)) => ...`) instead of a plain identifier. When set,
@@ -846,6 +872,8 @@ struct PropertyDecl : Member {
     bool autoAccessorIsSet = false; // true=set, false=get
     // Slice 41: SerializedClause on the auto-property form.
     std::unique_ptr<SerializedClause> serialized;
+    // §9.2 EqualityClause on the auto-property form (after `serialized`).
+    std::unique_ptr<EqualityClause> equality;
     std::vector<PropertyAccessor> accessors; // Block-body case
     std::string_view blockEndLabel;          // optional Identifier after `end`
     // Indexer form (A.4 IndexerDecl): the index parameter list appears as

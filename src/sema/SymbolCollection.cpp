@@ -1738,7 +1738,18 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         // components and returned `true`. A body record whose auto-property is
         // class-typed then got `=` across a module boundary that §9.2 rejects
         // in a single module.
+        //
+        // §9.2 (v0.307) / fix #4643: an auto-property marked `equality skip`
+        // is removed from the auto-equality membership computation before the
+        // admissibility check — that is the clause's rescue purpose for
+        // otherwise-inadmissible auto-property storage (e.g. a class-typed
+        // cache field whose address identity must not enter auto-`=`).
         if (isAutoPropertyStorageSymbol(m, ctx)) {
+            if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    if (pd->equality && pd->equality->isSkip) continue;
+                }
+            }
             if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
                 return false;
             continue;
@@ -1750,10 +1761,21 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
             // §9.2 v0.182: a `static` field (e.g. `static readonly`) carries no
             // instance storage and is ignored. A non-static explicit field IS
             // storage that is not an auto-property → still disqualifies.
+            //
+            // §9.2 (v0.307) / fix #4643: a non-static field marked
+            // `equality skip` is also removed from the auto-equality
+            // membership computation — that is precisely the clause's purpose
+            // (it rescues otherwise-ineligible auto-properties / fields by
+            // declaring they are not part of the equality synthesis). The
+            // static-field check above still rejects such a field as an
+            // inert annotation; the (mutable) skip arm is the rescue path.
             bool isStatic = false;
             for (auto mod : fs->modifiers)
                 if (mod == "static") { isStatic = true; break; }
             if (isStatic) continue;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                if (fd->equality && fd->equality->isSkip) continue;
+            }
             return false;
         }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
@@ -1818,6 +1840,17 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
     for (const Symbol* m : rec->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
             if (fs->posParam) {
+                // §9.2 (v0.307) / fix #4643: a positional field marked
+                // `equality skip` is removed from the auto-equality
+                // membership computation. The clause is the rescue path for
+                // an otherwise-inadmissible positional field — caching /
+                // auxiliary storage that the auto-`=`/`<>` synthesis would
+                // otherwise reject as a class-typed / move-only / reference
+                // component. Checked BEFORE the admissibility test below so
+                // the field's declared type is not consulted.
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                    if (fd->equality && fd->equality->isSkip) continue;
+                }
                 // Positional field: type must be admissible (§9.3 → §9.2 rule).
                 if (!isAdmissibleComponentType(
                         storageComponentType(m, ctx), ctx, 0))

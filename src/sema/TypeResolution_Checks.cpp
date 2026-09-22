@@ -601,6 +601,88 @@ void Resolver::checkTypeStaticNotVirtual(TypeSymbol* t) {
     }
 }
 
+// §9.2 / fix #4643 (v0.298): reject `equality skip` on a static member.
+// Spec §9.2 line 1419 — "On a computed (expression-bodied) property, a
+// method, a static member, an enum constant, or a choice case (the case
+// is the discriminant — skipping it is incoherent), `equality skip` is a
+// compile error, mirroring §9.8's inert-annotation rule." The other
+// inert-annotation arms (computed property / method / enum constant /
+// choice case) are caught at parse time — the parser does not admit
+// `equality` at those grammar positions, so the user gets the parser's
+// own "expected ..." diagnostic. Only the static-member arm of the rule
+// needs sema: a static FIELD is a fully valid declaration, the parser
+// must accept it (its grammar admits the clause on FieldDecl), and
+// dropping the clause silently would be the inert-looking-but-load-
+// bearing failure mode spec §18 warns against.
+//
+// Mirroring §9.8's existing static-skip discipline (§9.8 line 1419
+// itself cites §9.8), the diagnostic carries the clause's spelling so
+// the user can grep for it: the substring `equality skip` is the load-
+// bearing identifier the lane's regression test pins against.
+void Resolver::checkEqualitySkipInert() {
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeEqualitySkipInert(t); });
+}
+
+void Resolver::checkTypeEqualitySkipInert(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        // The grammar admits `equality skip` on the four storage-bearing
+        // sites per §9.2 line 1385; the static-member arm is the inert-
+        // annotation case from §9.2 line 1419. We walk every FieldDecl
+        // (regular + imported) and every auto-property with an
+        // `equality` slot. The PropertySymbol-side slot is filled by
+        // SymbolCollection only on the LOCAL side; imported members ride
+        // MetaProperty::equalitySkip — out of scope for this fix, which is
+        // the local-static-only arm of the rule.
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        //
+        // First arm: an explicit FieldDecl with `equality skip`.
+        auto* fs = dynamic_cast<FieldSymbol*>(m);
+        if (fs && fs->decl) {
+            const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (fd && fd->equality) {
+                const bool isStatic = hasMod(mem, "static");
+                if (isStatic) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("static field `") +
+                        std::string(m->name) +
+                        "` may not carry the `equality skip` clause — "
+                        "static members never participate in equality "
+                        "(§9.2 inert-annotation rule, mirroring §9.8; "
+                        "the clause is meaningless on a static and is "
+                        "rejected to avoid an inert-looking-but-load-"
+                        "bearing annotation, §18)");
+                }
+            }
+            continue;
+        }
+        // Second arm: an auto-property (PropertySymbol) with `equality
+        // skip`. A static PROPERTY is similarly inert.
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (ps && ps->decl) {
+            const auto* pd =
+                dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (pd && pd->equality) {
+                const bool isStatic = hasMod(mem, "static");
+                if (isStatic) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("static property `") +
+                        std::string(m->name) +
+                        "` may not carry the `equality skip` clause — "
+                        "static members never participate in equality "
+                        "(§9.2 inert-annotation rule, mirroring §9.8; "
+                        "the clause is meaningless on a static and is "
+                        "rejected to avoid an inert-looking-but-load-"
+                        "bearing annotation, §18)");
+                }
+            }
+        }
+    }
+}
+
 void Resolver::checkMethodBodies() {
     // fix #3574: routed through the ONE recursive nested-type walk
     // (§11.6, v0.286) -- this rule applies at every nesting depth.

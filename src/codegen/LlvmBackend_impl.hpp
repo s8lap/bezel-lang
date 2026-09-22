@@ -3892,6 +3892,65 @@ private:
         return false;
     }
 
+    // §9.2 (v0.307) / fix #4643: true when the record-storage member carries
+    // an `equality skip` clause on its AST declaration. Covers the three
+    // host-AST shapes that admit the clause: explicit field (FieldDecl),
+    // auto-property (PropertyDecl), and positional field (Param, via the
+    // record's `positionalFields`). Used by collectRecordStorage to drop the
+    // member from the auto-equality / auto-hash synthesis while leaving it
+    // laid out (so ToString, serialization, and explicit field reads still
+    // see it).
+    static bool memberHasEqualitySkip(const sema::Symbol* m) {
+        if (!m) return false;
+        if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m)) {
+            // Auto-property: equality skip lives on PropertyDecl.
+            if (ps->decl) {
+                if (auto* pd =
+                        dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    return pd->equality && pd->equality->isSkip;
+                }
+            }
+            return false;
+        }
+        if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+            // Positional records: the field symbol's `decl` is the OWNING
+            // TypeDecl (not a FieldDecl) and the equality clause lives on
+            // the Param at `fs->posParam` — set by SymbolCollection to
+            // `&td.positionalFields[i]` (line 488). Pointer arithmetic
+            // against the vector's data() recovers the layout index.
+            if (fs->posParam) {
+                const sema::TypeSymbol* parent = fs->parent;
+                if (parent && parent->decl) {
+                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                            parent->decl)) {
+                        auto* tdMut = const_cast<ast::TypeDecl*>(td);
+                        if (!tdMut->positionalFields.empty()) {
+                            const size_t idx = static_cast<size_t>(
+                                fs->posParam - tdMut->positionalFields.data());
+                            if (idx < tdMut->positionalFields.size()) {
+                                const auto& pf =
+                                    tdMut->positionalFields[idx];
+                                return pf.equality && pf.equality->isSkip;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            // Body field: equality skip lives on FieldDecl. (A positional
+            // field's `decl` is the parent TypeDecl, so this arm is only
+            // reached when `posParam` is null above.)
+            if (fs->decl) {
+                if (auto* fd =
+                        dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                    return fd->equality && fd->equality->isSkip;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
     // CG17: a method participates in virtual dispatch if it is `virtual`,
     // `override`, or `abstract` (all imply a vtable slot; §12.1/§12.5).
     static bool isVirtual(const sema::MethodSymbol* ms) {
@@ -6750,7 +6809,12 @@ private:
     // non-static FieldSymbols (positional + explicit body fields) and
     // auto-property PropertySymbols (body-record storage). The same ordering
     // recordStruct lays out, and the order the value-semantics synthesis
-    // (Equals / GetHashCode / ToString) iterates.
+    // (Equals / GetHashCode / ToString) iterates. The struct LAYOUT must
+    // include every storage member — `equality skip` does NOT remove a
+    // member from the record's layout (the spec keeps it accessible for
+    // reads / ToString / serialization; it only opts it OUT of auto-`=`
+    // synthesis). Auto-equality uses the narrower
+    // `collectRecordStorageForEquality` helper below.
     void collectRecordStorage(const sema::TypeSymbol* t,
                               std::vector<const sema::Symbol*>& out) {
         for (const sema::Symbol* m : t->members) {
@@ -6763,6 +6827,28 @@ private:
             // confirmed memory-safety hazard this closes.
             if (sema::isAutoPropertyStorageSymbol(m, ctx_)) out.push_back(m);
         }
+    }
+
+    // §9.2 (v0.307) / fix #4643: the narrower storage order used by the
+    // synthesized Equals / GetHashCode. Like `collectRecordStorage`, but
+    // drops every member marked `equality skip` — those members are
+    // present in the record's layout but excluded from auto-equality.
+    // Iterates alongside the layout order so the index used in
+    // `emitStructEquality` (which `extractvalue`s layout slots by their
+    // physical index) lines up with the layout even after skips: we
+    // advance the storage index alongside the layout index by emitting a
+    // placeholder for skipped slots. The caller (`emitStructEquality` /
+    // `emitRecordHashCode`) does this bookkeeping itself, so this helper
+    // returns the kept members in layout order — same physical index as
+    // recordStruct would assign them.
+    void collectRecordStorageForEquality(const sema::TypeSymbol* t,
+                                         std::vector<const sema::Symbol*>& out) {
+        collectRecordStorage(t, out);
+        out.erase(std::remove_if(out.begin(), out.end(),
+                                 [](const sema::Symbol* m) {
+                                     return memberHasEqualitySkip(m);
+                                 }),
+                  out.end());
     }
 
     // §27.4 (v0.183, #1408): lambda-parameter record destructuring prologue.

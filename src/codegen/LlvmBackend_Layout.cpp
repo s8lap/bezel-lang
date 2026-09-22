@@ -6672,19 +6672,35 @@ llvm::Value* Emitter::emitStructEquality(llvm::Value* l, llvm::Value* r,
     // storage member's declared Bezel type (the same order recordStruct lays
     // out, and the same collectRecordStorage / recordMemberType machinery the
     // synthesized GetHashCode uses) so string fields compare by content.
+    //
+    // §9.2 (v0.307) / fix #4643: `equality skip` removes the member from
+    // auto-equality synthesis but NOT from the record layout, so the
+    // physical extractvalue index (the `i` below) MUST advance on every
+    // layout slot — even the equality-skipped ones, which we then skip
+    // emitting a comparison for. `collectRecordStorageForEquality` returns
+    // the kept members in layout order; we advance `i` once per kept
+    // member AND once per skipped member, using the full layout order to
+    // keep the extractvalue indices aligned with `recordStruct`.
     if (rec) {
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(rec, storage);
+        std::vector<const sema::Symbol*> equalityStorage;
+        collectRecordStorageForEquality(rec, equalityStorage);
         unsigned i = 0;
+        size_t eqIdx = 0;
         for (const sema::Symbol* m : storage) {
             if (i >= st->getNumElements()) break;
+            if (memberHasEqualitySkip(m)) { ++i; continue; }
             llvm::Value* li = builder_.CreateExtractValue(l, {i});
             llvm::Value* ri = builder_.CreateExtractValue(r, {i});
+            const sema::Symbol* eqM = (eqIdx < equalityStorage.size())
+                                          ? equalityStorage[eqIdx++]
+                                          : m;
             // issue #462 / §14.1: resolve a generic record's `T`-typed field to
             // its concrete type under the active substitution so a string field
             // compares by CONTENT (not pointer bits) and a record field recurses.
             acc = builder_.CreateAnd(
-                acc, emitValueEquality(li, ri, recordMemberTypeResolved(m)));
+                acc, emitValueEquality(li, ri, recordMemberTypeResolved(eqM)));
             ++i;
         }
         return acc;

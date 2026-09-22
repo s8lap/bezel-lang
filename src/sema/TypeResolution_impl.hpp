@@ -304,6 +304,19 @@ private:
 
     void checkTypeStaticNotVirtual(TypeSymbol* t);
 
+    // §9.2 / fix #4643 (v0.298): the inert-annotation rejection for
+    // `equality skip` on a static member. Spec line 1419 — mirrors §9.8's
+    // inert-annotation rule. The grammar admits the clause on explicit
+    // FieldDecl/PositionalField/CaseField/auto-property; sema rejects it
+    // on a `static` field (a static field carries no instance storage and
+    // never participates in equality, so silently dropping the clause
+    // would be the inert-looking-but-load-bearing failure mode §18 warns
+    // against). Other reject positions (computed property, method, enum
+    // constant, choice case) are caught at parse time or by their own
+    // grammar absence; only the static-member arm needs this checker.
+    void checkEqualitySkipInert();
+    void checkTypeEqualitySkipInert(TypeSymbol* t);
+
     // Slice S33: a method's body presence must match its kind.
     //  - In a class: a method marked `abstract` must have no body, and
     //    a non-abstract method must have one (§12.5).

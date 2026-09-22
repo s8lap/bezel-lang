@@ -1420,6 +1420,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 if (isSerializedClauseStart()) {
                     pd->serialized = parseSerializedClause();
                 }
+                if (isEqualityClauseStart()) {
+                    pd->equality = parseEqualityClause();
+                }
                 if (!consumePunctuator(";")) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
@@ -1454,6 +1457,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 }
                 if (isSerializedClauseStart()) {
                     pd->serialized = parseSerializedClause();
+                }
+                if (isEqualityClauseStart()) {
+                    pd->equality = parseEqualityClause();
                 }
                 if (!consumePunctuator(";")) {
                     diagnostics_.report(
@@ -1702,16 +1708,39 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         reportDiscardNotDeclarable("field");
         return nullptr;
     }
-    if (current_.kind != TokenKind::Identifier) {
-        diagnostics_.report(
-            Severity::Error, current_.location,
-            "expected field name or member kind keyword");
-        return nullptr;
-    }
+    // §9.2 / A.4 FieldDecl grammar (v0.298): the visibility+modifiers are
+    // followed by an optional EqualityClause BEFORE the Identifier. The
+    // `equality` contextual keyword is itself lexed as an Identifier, so a
+    // first-glance "is this an Identifier" check would happily read it as
+    // a (wrong) field name. We pre-recognize `equality` and consume it
+    // here; the Identifier check that follows validates the next token as
+    // the field name in either branch.
+    const bool hadEqualityClause = isEqualityClauseStart();
 
     auto field = std::make_unique<ast::FieldDecl>();
     field->visibility = visibility;
     field->modifiers = std::move(modifiers);
+    // §9.2 / A.4 FieldDecl: EqualityClause appears BEFORE the Identifier
+    // (the unusual placement — `serialized` is never on an explicit
+    // FieldDecl, so this slot is reserved for the equality package only).
+    // Grammar: `Visibility "static"? ("owned" | "scoped")? "readonly"?
+    //            EqualityClause? Identifier ":" Type (":=" Expression)? ";"`.
+    if (hadEqualityClause) {
+        field->equality = parseEqualityClause();
+    }
+    if (current_.kind != TokenKind::Identifier) {
+        if (hadEqualityClause) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected field name after `equality skip` clause "
+                "(A.4 FieldDecl)");
+        } else {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected field name or member kind keyword");
+        }
+        return nullptr;
+    }
     field->name = current_.text;
     advance();
 
@@ -2288,6 +2317,34 @@ std::unique_ptr<ast::SerializedClause> Parser::parseSerializedClause() {
             "(A.4 SerializedClause)");
     }
     return sc;
+}
+
+// §9.2 / fix #4643 (v0.298): EqualityClause. Mirrors `serialized skip`'s
+// grammar (App. A.3/A.4), but only the `skip` form exists — rename and
+// `optional` have no equality analogue, so the clause is one word, closed
+// (spec §9.2 line 1385). The caller checks `isEqualityClauseStart()`
+// first (`equality` is contextual, App. B.2, lexed as Identifier; we
+// identify by text exactly the way `serialized` does above).
+bool Parser::isEqualityClauseStart() const {
+    return current_.kind == TokenKind::Identifier &&
+           current_.text == "equality";
+}
+
+std::unique_ptr<ast::EqualityClause> Parser::parseEqualityClause() {
+    advance(); // past `equality`
+    auto ec = std::make_unique<ast::EqualityClause>();
+    // Only `skip` is admitted (line 1385); anything else is an error.
+    if (current_.kind == TokenKind::Identifier && current_.text == "skip") {
+        ec->isSkip = true;
+        advance();
+        return ec;
+    }
+    diagnostics_.report(
+        Severity::Error, current_.location,
+        "`equality` requires `skip` — rename and `optional` have no "
+        "equality analogue (§9.2, A.3/A.4 EqualityClause; vocabulary is "
+        "one word, closed)");
+    return ec;
 }
 
 // §9.8 v0.141 (P6): class-body member clause
@@ -3017,6 +3074,9 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
         if (isSerializedClauseStart()) {
             p.serialized = parseSerializedClause();
         }
+        if (isEqualityClauseStart()) {
+            p.equality = parseEqualityClause();
+        }
         return p;
     };
     fields.push_back(parseOne());
@@ -3030,7 +3090,7 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
 
 // §A.3 / §35.1 (v0.200, #2044):
 //   CasePayload ::= "(" CaseField ("," CaseField)* ")"
-//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause?
+//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause? EqualityClause?
 // CaseField is PositionalField plus the optional leading `owned` payload
 // marker; the marker is stored in `Param::modifier` (semantically the same
 // slot `owned` parameters use, per §35.3 / §28.3).
@@ -3066,6 +3126,9 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
         p.type = parseType();
         if (isSerializedClauseStart()) {
             p.serialized = parseSerializedClause();
+        }
+        if (isEqualityClauseStart()) {
+            p.equality = parseEqualityClause();
         }
         return p;
     };

@@ -453,6 +453,13 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
+    // §9.2 / fix #4643 (v0.298): `equality skip` on a static member is
+    // an inert annotation (§9.2 line 1419, mirroring §9.8). The
+    // grammar admits the clause on FieldDecl/PropertyDecl; sema rejects
+    // it on the `static` modifier of either. Other reject positions
+    // (computed property, method, enum constant, choice case) are caught
+    // at parse time.
+    checkEqualitySkipInert();
     // Slice S35: `async abstract` is a compile error (§12.6).
     checkAsyncModifiers();
     // §22.15 (v0.202, #2052): `pure` placement + signature restrictions.

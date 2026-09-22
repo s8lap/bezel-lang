@@ -4406,17 +4406,33 @@ llvm::Value* Emitter::emitRecordHashCode(llvm::Value* recVal,
     builder_.CreateStore(builder_.getInt32(17), hashSlot);   // non-zero seed
     std::vector<const sema::Symbol*> storage;
     collectRecordStorage(rec, storage);
+    // §9.2 (v0.307) / fix #4643: skip equality-skip members in the hash the
+    // same way emitStructEquality does — the invariant that equal records
+    // hash equal must hold for content-only equality, so a skipped field is
+    // not folded into the hash either. The physical extractvalue index
+    // (`idx`) advances on every layout slot; only non-skipped members
+    // contribute to the accumulator.
+    std::vector<const sema::Symbol*> equalityStorage;
+    collectRecordStorageForEquality(rec, equalityStorage);
     unsigned idx = 0;
+    size_t eqIdx = 0;
     for (const sema::Symbol* m : storage) {
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
-        // issue #462 / §14.1: a generic record's `T`-typed field hashes by its
-        // CONCRETE type under the active subst (a string hashes by CONTENT, so
-        // the hash-equality invariant holds for content-equal values) — not by
-        // pointer bits via the type-erased shape fallback.
-        llvm::Value* fh = emitValueHashCode(fieldVal, recordMemberTypeResolved(m));
-        llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
-        h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)), fh);
-        builder_.CreateStore(h, hashSlot);
+        if (!memberHasEqualitySkip(m)) {
+            const sema::Symbol* eqM = (eqIdx < equalityStorage.size())
+                                          ? equalityStorage[eqIdx++]
+                                          : m;
+            // issue #462 / §14.1: a generic record's `T`-typed field hashes by
+            // its CONCRETE type under the active subst (a string hashes by
+            // CONTENT, so the hash-equality invariant holds for content-equal
+            // values) — not by pointer bits via the type-erased shape fallback.
+            llvm::Value* fh = emitValueHashCode(
+                fieldVal, recordMemberTypeResolved(eqM));
+            llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
+            h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)),
+                                   fh);
+            builder_.CreateStore(h, hashSlot);
+        }
         ++idx;
     }
     // §9.2: zero-storage record keeps the fixed seed constant.
