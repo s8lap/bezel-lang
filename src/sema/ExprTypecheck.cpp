@@ -5255,6 +5255,21 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
         nn->nullable = true;
         return nn;
     };
+    // §20: an all-`null` arm set has no type and is a compile error. A bare
+    // `null` branch target-types to the nullable form of the OTHER branches'
+    // common type — if every arm is bare `null` there is no other branch and
+    // no type to lift. The pre-fix code fell through to the bottom-typed rule
+    // below, where both `tt` and `et` are null, no type was recorded, and no
+    // diagnostic was emitted: the construct compiled silently with a value
+    // that had no type, defeating downstream member-access resolution.
+    // Per §20: "an all-`null` arm set has no type and is a compile error."
+    if (thenNull && elseNull) {
+        ctx_.diagnostics().report(
+            Severity::Error, cnd.span.begin,
+            "the `if` expression has no type: all branches are bare `null` "
+            "(§20)");
+        return;
+    }
     if (elseNull && !thenNull && tt) {
         ctx_.setExprType(&e, nullableOf(tt));
         return;
