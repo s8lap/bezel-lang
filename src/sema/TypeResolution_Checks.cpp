@@ -2747,20 +2747,98 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
             if (ps->isIndexer) indexers.push_back({&ps->indexerParams, m});
         }
     }
+    // fix #4733 (§22.16, v0.307, corpus row s22_16_0026): a pair of
+    // methods whose parameters match signaturesIndistinguishable but
+    // whose ONLY distinguishing attribute is their contract-clause list
+    // (§22.16 "Clauses never distinguish overloads and are not part of
+    // §22.6 resolution; two members differing only in clauses are the
+    // same signature and clash") surfaces here through the §22.6/§11.3
+    // overload-resolution machinery, but the §22.6/§11.3 wording
+    // (`indistinguishable … `owned`/`scoped`') is the WRONG diagnosis —
+    // it names the parameter-modifier rule for a case where the modifier
+    // lists are identical. The two reasons for the clash are distinct
+    // (`owned`/`scoped` collapses in §11.3 vs clauses excluded in
+    // §22.16) and the diagnostic must name each. Detect the clause-only
+    // case at the same site and emit a §22.16-specific message naming
+    // the rule's mechanism ("same signature") — the substring the
+    // corpus row s22_16_0026's `//! diagnostic:` pin requires.
+    auto clauseOnlyDifference = [this](const Symbol* aSym,
+                                   const Symbol* bSym) -> bool {
+        auto* msA = dynamic_cast<const MethodSymbol*>(aSym);
+        auto* msB = dynamic_cast<const MethodSymbol*>(bSym);
+        if (!msA || !msB) return false;
+        if (msA->isOperator || msB->isOperator) return false;
+        auto* mdA = dynamic_cast<const ast::MethodDecl*>(msA->decl);
+        auto* mdB = dynamic_cast<const ast::MethodDecl*>(msB->decl);
+        if (!mdA || !mdB) return false;
+        // Return type must match — the parameter signature is already
+        // covered by signaturesIndistinguishable; only the return-type
+        // (resolved TypeRef) remains. Two methods declared in the same
+        // source have DISTINCT AST pointers for `returnType` (each
+        // declaration parses to its own Type AST), so AST-identity is
+        // the wrong comparison here — we need resolved-TypeRef equality
+        // via typeRefEqual (the §22.6 overload-resolution helper). A
+        // null returnType on either side fails the gate (unit-typed
+        // members are checked separately and not on this path).
+        if ((mdA->returnType == nullptr) != (mdB->returnType == nullptr))
+            return false;
+        if (mdA->returnType && mdB->returnType) {
+            const TypeRef* ra = ctx_.resolvedType(*mdA->returnType);
+            const TypeRef* rb = ctx_.resolvedType(*mdB->returnType);
+            if (!typeRefEqual(ra, rb)) return false;
+        }
+        if (mdA->returnOwned != mdB->returnOwned) return false;
+        if (mdA->modifiers != mdB->modifiers) return false;
+        // The clause lists must NOT be equal — a pair with no clauses
+        // and a pair with identical clauses are NOT the clause-only
+        // difference case (they are the genuine §22.6/§11.3 path,
+        // modifier-only).
+        if (mdA->contractClauses.size() != mdB->contractClauses.size())
+            return mdA->contractClauses.size() > 0 ||
+                   mdB->contractClauses.size() > 0;
+        // Same number of clauses: textually compare via the clause's
+        // source-spellable kind+expr identity. A simple structural
+        // comparison is enough — two clauses are "the same" only when
+        // they parsed the same source range; an expr identity mismatch
+        // is the clause-only-difference signal.
+        for (std::size_t k = 0; k < mdA->contractClauses.size(); ++k) {
+            const auto& caA = mdA->contractClauses[k];
+            const auto& caB = mdB->contractClauses[k];
+            if (caA.kind != caB.kind) return true;
+            if (caA.isStatic != caB.isStatic) return true;
+            if (caA.expr.get() != caB.expr.get()) return true;
+        }
+        return false;
+    };
     auto checkGroup = [&](std::vector<Overload>& overloads,
                           const std::string& label) {
         for (std::size_t i = 0; i < overloads.size(); ++i) {
             for (std::size_t j = i + 1; j < overloads.size(); ++j) {
                 if (signaturesIndistinguishable(*overloads[i].first,
                                                 *overloads[j].first)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, overloads[j].second->declLoc,
-                        std::string("overload of ") + label +
-                        " is indistinguishable from another overload "
-                        "— overloads must differ in parameter count, "
-                        "types, or `ref`/`out` modifiers; neither `owned` "
-                        "(ordinary or on an `out` parameter) nor `scoped` "
-                        "distinguishes (§22.6/§11.3, v0.181)");
+                    if (clauseOnlyDifference(overloads[i].second,
+                                             overloads[j].second)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, overloads[j].second->declLoc,
+                            std::string("overload of ") + label +
+                            " is the same signature as another overload "
+                            "\xe2\x80\x94 contract clauses (`requires`, "
+                            "`ensures`) do not distinguish overloads and "
+                            "are not part of \xc2\xa7""22.6 resolution; "
+                            "two members differing only in clauses "
+                            "clash (\xc2\xa7""22.16, v0.250, #3038)");
+                    } else {
+                        ctx_.diagnostics().report(
+                            Severity::Error, overloads[j].second->declLoc,
+                            std::string("overload of ") + label +
+                            " is indistinguishable from another overload "
+                            "\xe2\x80\x94 overloads must differ in "
+                            "parameter count, types, or `ref`/`out` "
+                            "modifiers; neither `owned` (ordinary or "
+                            "on an `out` parameter) nor `scoped` "
+                            "distinguishes (\xc2\xa7""22.6/\xc2\xa7"
+                            "11.3, v0.181)");
+                    }
                 }
             }
         }
