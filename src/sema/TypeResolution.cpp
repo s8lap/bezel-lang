@@ -417,6 +417,10 @@ void Resolver::run(const ast::SourceFile& src) {
     checkTopLevelVisibility();
     // Slice S23: record restrictions (§9.7).
     checkRecordRestrictions();
+    // fix #4702 (§9.3/§9.9, v0.307): a combined-form body constructor
+    // carrying a contract clause (see the declaration's comment for the
+    // rule this does NOT yet implement, and why).
+    checkRecordCombinedFormContractClauseConstructors();
     // #2208 (§35.1, v0.226): choice self-containment through value-typed
     // payload components (record↔choice by-value cycles, mutable mutual pairs
     // of choices, etc.). Walks the same value-containment graph as the
@@ -560,6 +564,78 @@ void Resolver::run(const ast::SourceFile& src) {
     // Immediately after its sibling so the two §14.6 verdicts are adjacent in
     // both the source and the diagnostic order.
     checkExpandingGenericMemberEdges();
+}
+
+// fix #4702 (§9.3 "Combined form" / §9.9 "Constructor-only records",
+// v0.307): see the declaration comment (TypeResolution_impl.hpp).
+//
+// §9.3 states TWO body-constructor disqualifiers for a positional-or-
+// combined-form record. Only the SECOND is implemented here:
+//
+//   (a) "The body may not declare a constructor with the same parameter
+//       list as the auto-generated primary constructor." NOT IMPLEMENTED —
+//       see issue #4702 for why: the rule-corpus's own hand-authored case
+//       (s9_3_0002) and a pre-existing, apparently deliberate lit test
+//       (sema/sema_serialization_550__record_combined_form_explicit_ctor_
+//       match_accepted_spec_9_8_v0182.bzl, exercising §9.8's "Constructor
+//       selection ... matched by name ... compared case-insensitively")
+//       disagree on the SAME shape — a body constructor whose parameter
+//       TYPES match the primary's but whose NAMES differ only in case
+//       (`constructor(x: int, y: int)` against positional fields `X, Y`).
+//       Reading "parameter list" as types-only (matching every other
+//       signature-shape rule in this codebase — overload conflicts,
+//       override matching) rejects the §9.8 test's Vec2, which the lit
+//       suite has accepted since before this fix. Reading it as an exact
+//       name match makes the rule nearly vacuous (records name positional
+//       fields PascalCase by convention; body constructor parameters
+//       essentially never collide case-for-case) and does not match the
+//       corpus case's OWN lowercase-name repro. Both readings have real
+//       evidence behind them; this is a genuine spec-vs-existing-test
+//       conflict, not a case to silently edit either side of (CLAUDE.md
+//       rule 1) — filed as #4702 rather than guessed at.
+//   (b) "The body may not declare a constructor carrying a contract
+//       clause" (§9.9's constructor-only trigger: "A record declaring
+//       positional fields may not declare such a constructor: a compile
+//       error at the record declaration"). IMPLEMENTED below — independent
+//       of (a)'s shape question, and no existing test (corpus or lit)
+//       conflicts with it (confirmed: no accepted test anywhere in the
+//       tree pairs a positional-or-combined-form record with a body
+//       constructor carrying `requires`/`ensures`).
+//
+// Reads the constructor's own `ast::ConstructorDecl` (via
+// `ConstructorSymbol::decl`), which is null only for an IMPORTED symbol —
+// an imported record's body constructors were already checked in the
+// declaring module, so skipping them here is not a gap, it is the same
+// once-per-declaration posture every other TypeResolution_Checks.cpp
+// per-member walk in this file takes.
+void Resolver::checkRecordCombinedFormContractClauseConstructors() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+        if (!recordIsPositional(t)) continue;
+
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs) continue;
+            const auto* cd =
+                dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;  // imported — nothing local to check
+
+            // §9.9 "on any constructor of the record, of any visibility, in
+            // any recorded tier".
+            if (!cd->contractClauses.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "`'s body may not declare a constructor carrying a "
+                    "contract clause (\xC2\xA7""22.16) — the auto-generated "
+                    "primary constructor can carry none, so no record "
+                    "declaring positional fields is constructor-only "
+                    "(\xC2\xA7""9.9, \xC2\xA7""9.3)");
+            }
+        }
+    }
 }
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {

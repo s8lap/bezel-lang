@@ -488,6 +488,20 @@ private:
     // only and never own a resource.
     void checkRecordRestrictions();
 
+    // fix #4702 (§9.3 "Combined form" / §9.9, v0.307): a record declaring
+    // positional fields whose BODY declares a constructor carrying a
+    // `requires`/`ensures` contract clause (§9.9's constructor-only
+    // trigger, which the auto-generated primary constructor can never
+    // satisfy — `RecordDecl` admits no clause on it, Appendix A.3) is a
+    // compile error at the declared constructor. §9.3 states a SECOND
+    // disqualifier (same parameter list as the primary) this function does
+    // NOT implement — see its definition's comment (TypeResolution.cpp) for
+    // the spec-vs-existing-test conflict that blocks it (issue #4702). Lives
+    // here rather than alongside checkRecordRestrictions (§9.7, a disjoint
+    // rule set) because it is implemented in this TU (see the call site in
+    // `run()`).
+    void checkRecordCombinedFormContractClauseConstructors();
+
     // #2208 (§35.1, v0.226): a choice may not transitively contain itself
     // through value-typed components (case payloads, including payload records
     // and nested/nullable/inline forms). The walker is recordValueContainsSelf;
