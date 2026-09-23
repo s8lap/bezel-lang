@@ -3728,6 +3728,19 @@ private:
     // hazard is that the closure may read the referent after the CALLER's
     // own borrow ends — no stack frame is at risk, but the source's
     // lifetime is equally bounded by the call.
+    //
+    // fix #4757 (§28.3, v0.307): restricted to a parameter of the BODY BEING
+    // ANALYSED (`methodParamSet_`). A lambda's OWN parameter is a
+    // `ParameterSymbol` with an empty modifier and (often) a class-typed
+    // declared type, so without that gate `oa.Where(lambda(p) => p.Tag > 4)`
+    // — `p` bound BY the lambda, nothing captured at all — was rejected as
+    // an escaping capture. §28.3's closure bullet counts only "the free
+    // bindings of every lambda nested in its body THAT RESOLVE OUTSIDE THAT
+    // BODY"; a self-bound parameter resolves inside it and is re-bound per
+    // invocation. `collectLambdaIdentifiers` is a raw identifier walk (its
+    // own declaration says consumers disambiguate by resolving against
+    // `states_`), so this predicate must do its own filtering — as
+    // #2342/#2527 already settled for the §28.14 capture walk.
     bool isPlainBorrowParam(sema::Symbol* sym);
 
     // §27.5 / §28.6 (#1217): reject a lambda stored to a FIELD or OUT-PARAM

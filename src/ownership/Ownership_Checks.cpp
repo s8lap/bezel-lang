@@ -6025,6 +6025,24 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
     if (!sym) return false;
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
     if (!ps || !ps->modifier.empty()) return false;
+    // fix #4757 (§28.3 closure bullet, v0.307): a lambda's OWN parameter is
+    // NOT a capture. §28.3 defines the contributing set as "the sources of
+    // the borrows it captures … where a lambda's captures include the free
+    // bindings of every lambda nested in its body THAT RESOLVE OUTSIDE THAT
+    // BODY" — a parameter the lambda itself binds resolves *inside* it, is
+    // re-bound per invocation, and carries no source from the enclosing
+    // frame at all. `collectLambdaIdentifiers` is a raw identifier walk, not
+    // a free-variable walk (see its declaration): it returns the lambda's own
+    // parameter reads too, and every other consumer disambiguates by
+    // resolving against `states_` (method-scope locals only) or against
+    // `isRefOutParam` (a lambda parameter never carries `ref`/`out`). The
+    // #4709 leg had neither guard, so `oa.Where(lambda(p) => p.Tag > 4)` —
+    // the ordinary §5 LINQ selector, with `p` bound BY the lambda — was
+    // rejected as an escaping capture. `methodParamSet_` is the parameter
+    // set of the body actually being analysed (Ownership.cpp's `run`), which
+    // is exactly the "resolves outside this lambda" test, and is the same
+    // predicate #2342/#2527 settled for the §28.14 capture walk. // per §28.3
+    if (!methodParamSet_.count(sym)) return false;
     const sema::TypeRef* declTy =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
     return isBorrowableType(declTy);

@@ -32,6 +32,7 @@
 // once the caller's own borrow ends, not a stack pointer — reached none of
 // them.
 
+#include "support/aot_support.hpp"   // runAot — the #4757 end-to-end row
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -161,4 +162,91 @@ BEZEL_TEST(plain_borrow_param_closure_escape_4709,
         "end Make;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "#1217"));
+}
+
+// =============================================================================
+// #4757 — a LAMBDA'S OWN parameter is NOT a capture (§28.3, v0.307).
+//
+// `ac2c7c6e`'s `isPlainBorrowParam` accepted any `ParameterSymbol` with an
+// empty modifier and a borrowable declared type. A lambda's own parameter is
+// exactly that, and `collectLambdaIdentifiers` is a RAW identifier walk (its
+// declaration says consumers disambiguate by resolving against `states_`), so
+// every lambda whose parameter is class- or interface-typed was rejected as an
+// escaping capture at all three escape legs — including the ordinary stdlib §5
+// LINQ selector `oa.Where(lambda(p) => p.Tag > 4)`, where nothing is captured
+// at all.
+//
+// §28.3's closure bullet counts only "the free bindings of every lambda nested
+// in its body THAT RESOLVE OUTSIDE THAT BODY". A parameter the lambda itself
+// binds resolves inside it and is re-bound per invocation, so it contributes
+// no source. The predicate is now gated on `methodParamSet_` — the parameter
+// set of the body being analysed — which is the same predicate #2342/#2527
+// settled for the §28.14 capture walk.
+//
+// Each row below is an ACCEPTANCE row for an over-rejection, so per the
+// "a fix that makes something newly ACCEPTED must be RUN" rule the LINQ row
+// asserts the program's exit value, not merely `compile_rc == 0`.
+// =============================================================================
+
+// A `Widget`-typed lambda parameter at the RETURN leg — the same escape site
+// as `return_lambda_capturing_plain_param_rejected_s27_5_0007` above, with the
+// binding moved INTO the lambda. Nothing is captured; must be accepted.
+BEZEL_TEST(plain_borrow_param_closure_escape_4709,
+           return_lambda_whose_own_param_is_class_typed_clean_4757) {
+    auto r = parseAndCheckOwnership(wrapMethod(
+        "public method Make(): (Widget) -> () "
+        "  return lambda(w) => w.Greet(); "
+        "end Make;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The FIELD-STORE leg, same shape. This leg is not gated on a return position,
+// so its reach was the wider of the two: storing a class-typed predicate in a
+// field is ordinary code.
+BEZEL_TEST(plain_borrow_param_closure_escape_4709,
+           store_lambda_whose_own_param_is_class_typed_clean_4757) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Widget "
+        "  public constructor() end constructor; "
+        "  public method Greet() Console.WriteLine(\"hi\"); end Greet; "
+        "end Widget; "
+        "class C "
+        "  private _cb: (Widget) -> () := lambda(w) => w.Greet(); "
+        "  public method Set() "
+        "    _cb := lambda(w) => w.Greet(); "
+        "  end Set; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The write-through-out-param leg, same shape.
+BEZEL_TEST(plain_borrow_param_closure_escape_4709,
+           write_lambda_whose_own_param_is_class_typed_clean_4757) {
+    auto r = parseAndCheckOwnership(wrapMethod(
+        "public method Give(out cb: (Widget) -> ()) "
+        "  cb := lambda(w) => w.Greet(); "
+        "end Give;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// #4757's actual repro, END TO END: the stdlib §5 `Where`/`Sum` chain over an
+// `OwningArray<Res>` in RETURN position. `p` is each selector lambda's own
+// parameter. Verbatim the body of
+// `linq_operator_chains_unify_3670.owning_array_where_sum_admitted_stdlib_5`,
+// which is the gate row this defect turned red. 5 + 8 = 13.
+BEZEL_TEST(plain_borrow_param_closure_escape_4709,
+           linq_selector_over_class_element_runs_4757) {
+    auto r = bezel::test::runAot(
+        "module M; "
+        "class Res public Tag: int; "
+        "  public constructor(t: int) Tag := t; end constructor; "
+        "end Res; "
+        "class C public static method Main(): int "
+        "  using var oa := new OwningArray<Res>(); "
+        "  oa.Add(new Res(5)); oa.Add(new Res(3)); oa.Add(new Res(8)); oa.Add(new Res(1)); "
+        "  return oa.Where(lambda(p) => p.Tag > 4).Sum(lambda(p) => p.Tag); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 13);
 }
