@@ -485,11 +485,27 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     // the FieldSymbol's `decl` is the owning TypeDecl and its type is read
     // from `posParam->type` (resolved by TypeResolution, which already walks
     // td.positionalFields).
+    //
+    // §22.10: a CLASS's primary-constructor parameters are NOT automatically
+    // promoted to public members — the §9.1 rule is record-specific, and a
+    // captured primary-ctor parameter (the body-position case) is private
+    // per the §22.10 capture rule. The original code promoted both uniformly,
+    // exposing `p.x` outside the declaring class on the bare primary-ctor
+    // parameter — the case s22_10_0012 pins this. Split: records get public
+    // positional fields (§9.1), classes get private positional fields. The
+    // private class case still allows field initializers (`_x := x`) to read
+    // the parameter as `this.x` (a private member access is admitted inside
+    // the declaring class); it rejects external reads (`p.x` from another
+    // class) per the visibility check, exactly the §22.10 wording.
+    const bool isRecord =
+        td.kind == ast::TypeDeclKind::Record;
+    const auto fieldVisibility = isRecord ? ast::Visibility::Public
+                                          : ast::Visibility::Private;
     if (td.hasPositionalFields) {
         for (const auto& pf : td.positionalFields) {
             auto* fs = ctx.makeSymbol<FieldSymbol>();
             fs->name = pf.name;
-            fs->visibility = ast::Visibility::Public;
+            fs->visibility = fieldVisibility;
             fs->parent = sym;
             fs->decl = &td;
             // fix #2482 (follow-up to #2418): ast::Param now carries its own

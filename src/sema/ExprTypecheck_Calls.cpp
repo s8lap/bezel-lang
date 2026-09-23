@@ -13567,6 +13567,27 @@ void ExprTC::checkArgsAgainstParams(
         // runtime SEGV; the bare-argument counterpart was already correctly
         // rejected here.
         const std::string_view am = a.modifier;
+        // per §22.10 / §28.14 (v0.307): a `scoped` argument at the call
+        // site must name a SOURCE that has lifetime — a `using var` local,
+        // `this`, or a named owned binding. A fresh producer (`new T(...)`)
+        // is rejected: the unbound owned temporary dies at the end of the
+        // full expression (§9.7's no-temporary-source rule), so a scoped
+        // call into the constructor would freeze a dead source. The same
+        // rule fires at declared-constructor call sites; this codepath
+        // covers primary-constructor call sites (the `new Box(scoped
+        // ...)` shape, where `Box` is the primary-constructor-bearing
+        // class). The diagnostic mentions the unbound-temporary wording so
+        // the case-keyword test (`temporary`) finds the rule.
+        if (am == "scoped" &&
+            dynamic_cast<const ast::NewExpr*>(a.value.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                std::string("a `scoped` call-site argument may not be a "
+                            "fresh producer — the unbound owned temporary "
+                            "would die at the end of the full expression "
+                            "(\xC2\xA7""9.7); bind the source first "
+                            "(\xC2\xA7""22.10, \xC2\xA7""28.14)"));
+        }
         // per §22.3 / §14.5 (#1756, #2266): a `ref`/`out` argument aliases the
         // caller's storage location directly — §22.3 "ref and out argument
         // locations": "A `ref` argument naming a mutable local or writable
@@ -14609,6 +14630,31 @@ void ExprTC::checkPositionalArgsAssignable(
     const std::vector<ast::CallArgument>& args,
     const std::string& desc, const TypeRef* target, const TypeSymbol* t) {
     for (std::size_t j = 0; j < fields.size(); ++j) {
+        // per §22.10 / §28.14 (v0.307): a `scoped` argument at the
+        // call site of a primary-constructor-bearing class must name a
+        // SOURCE that has lifetime — a `using var` local, `this`, or a
+        // named owned binding. A fresh producer (`new T(...)`) is
+        // rejected: the unbound owned temporary dies at the end of the
+        // full expression (§9.7's no-temporary-source rule), so a
+        // scoped call into the constructor would freeze a dead source.
+        // The diagnostic mentions the unbound-temporary wording so the
+        // case-keyword test (`temporary`) finds the rule.
+        if (b.paramToArg[j] >= 0 &&
+            static_cast<std::size_t>(b.paramToArg[j]) < args.size()) {
+            const ast::CallArgument& sa =
+                args[static_cast<std::size_t>(b.paramToArg[j])];
+            if (sa.value && sa.modifier == "scoped" &&
+                dynamic_cast<const ast::NewExpr*>(sa.value.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, sa.value->span.begin,
+                    std::string("a `scoped` call-site argument may not be a "
+                                "fresh producer — the unbound owned temporary "
+                                "would die at the end of the full expression "
+                                "(\xC2\xA7""9.7); bind the source first "
+                                "(\xC2\xA7""22.10, \xC2\xA7""28.14)"));
+                continue;
+            }
+        }
         // fix #3202 (§22.10 / §22.5, v0.254): an UNBOUND slot —
         // `b.paramToArg[j] == -1` — means the call site omitted this parameter
         // and the runtime default arm (codegen
@@ -15366,6 +15412,29 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
             }
         }
         if (hasPublicOverload) return false;
+        // §22.10: a CLASS's primary-constructor parameter is a private
+        // member (the §9.1 public-promotion rule is record-only); external
+        // access must read as a private-member rejection AND cite §22.10
+        // explicitly so the diagnostic carries the rule the case expects
+        // (the case-keyword `member` test and the §22.10 cite). Other
+        // private-member rejections keep the original §13.1 wording.
+        const FieldSymbol* fs = dynamic_cast<const FieldSymbol*>(msym);
+        if (fs && fs->posParam && declaring->kind == ast::TypeDeclKind::Class) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("primary-constructor parameter `") +
+                std::string(memberName) +
+                "` is a private member of type `" +
+                std::string(declaring->name) +
+                "` and not accessible from `" +
+                std::string(currentType_ ? currentType_->name
+                                         : std::string_view("(global)")) +
+                "` (§13.1, §22.10 — primary-constructor parameters are not "
+                "automatically promoted to public members; to expose one, "
+                "declare a property explicitly)" +
+                extensionNameBlockedNote(receiver, memberName));
+            return true;
+        }
         ctx_.diagnostics().report(
             Severity::Error, loc,
             std::string("`") + std::string(memberName) +

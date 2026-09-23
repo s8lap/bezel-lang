@@ -259,15 +259,17 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                         : parseParamList();
             }
             // §22.10 (v0.160 `ref`/`out`; v0.180 `scoped`) / #1594: a primary-
-            // constructor parameter list admits plain and `owned` parameters
-            // only — `ref`/`out` are rejected because a constructor parameter
-            // initializes object state and a by-reference alias or caller-out
-            // slot has no meaning in that role; `scoped` is rejected because
-            // its storage contract (§28.14) needs an explicitly declared
-            // field. The shared Param production over-admits all of these
-            // syntactically (Appendix A.4's over-admit-and-reject-
-            // semantically pattern, used identically by the extern-
-            // declaration `scoped` check above); reject them here. Records
+            // per §22.10: a primary-constructor parameter list admits
+            // plain, `owned`, and class- or interface-typed `scoped`
+            // parameters; `ref`/`out` are rejected because a constructor
+            // parameter initializes object state and a by-reference alias
+            // or caller-out slot has no meaning in that role. The shared
+            // Param production over-admits all of these syntactically
+            // (Appendix A.4's over-admit-and-reject-semantically pattern,
+            // used identically by the extern-declaration `scoped` check
+            // above); `ref`/`out` are decided here (parser-side), and
+            // `scoped` and function-typed `scoped` are decided in sema
+            // (§22.10, v0.307) once type information is available. Records
             // parse through parsePositionalFieldList (no modifiers at all),
             // so this loop is a no-op for records.
             if (decl->kind == ast::TypeDeclKind::Class) {
@@ -282,15 +284,6 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             "initializes object state, and a by-reference "
                             "alias or caller-out slot has no meaning in that "
                             "role; parameter `" + std::string(p.name) + "`");
-                    } else if (p.modifier == "scoped") {
-                        diagnostics_.report(
-                            Severity::Error, primaryCtorParamListLoc,
-                            std::string("`scoped` is not permitted on a "
-                            "primary-constructor parameter (§22.10) — the "
-                            "scoped-storage contract (§28.14) needs an "
-                            "explicitly declared field; use a regular "
-                            "constructor instead; parameter `") +
-                            std::string(p.name) + "`");
                     }
                 }
             }
@@ -1593,6 +1586,18 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 "`async` is not admitted on a destructor — `async` is a "
                 "method/lambda modifier (A.4 admits it in MethodDecl and "
                 "LambdaExpr only; §30.1, v0.300)");
+        }
+        // per §22.15 (v0.307): `pure` is rejected on destructors —
+        // disposal is the effect context purity fences off (the
+        // same over-admit-and-reject-at-parse pattern as the `async`
+        // check above; the DestructorDecl AST does not preserve the
+        // modifiers vector).
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("pure")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`pure` is not admitted on a destructor — disposal is "
+                "the effect context purity fences off (§22.15)");
         }
         auto dtor = std::make_unique<ast::DestructorDecl>();
         advance(); // past `destructor`
