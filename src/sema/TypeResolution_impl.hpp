@@ -304,6 +304,17 @@ private:
 
     void checkTypeStaticNotVirtual(TypeSymbol* t);
 
+    // §9.2 (v0.297): a record member may not declare `virtual`, `abstract`,
+    // or `sealed override` — records are implicitly sealed (§9.6) and have no
+    // virtual-dispatch surface of their own. `override` IS admitted on the
+    // three Object-slot names `Equals` / `GetHashCode` / `ToString` (the same
+    // admission §10.5 cites for enums and §35.2 carries for choices) and is
+    // rejected on every other record member, whatever its kind: method,
+    // property, or indexer. The rule is at the declaration; the spec carries
+    // the inert-modifier rationale for a record (`virtual` etc. would mislead
+    // every reader of the declaration).
+    void checkRecordMemberModifiers();
+
     // §9.2 / fix #4643 (v0.298): the inert-annotation rejection for
     // `equality skip` on a static member. Spec line 1419 — mirrors §9.8's
     // inert-annotation rule. The grammar admits the clause on explicit

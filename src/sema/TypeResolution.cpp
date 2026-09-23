@@ -453,6 +453,14 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
+    // §9.2 (v0.297): a record member may not declare `virtual`, `abstract`,
+    // or `sealed override`; `override` is rejected on any record member other
+    // than `Equals` / `GetHashCode` / `ToString`. Records are implicitly
+    // sealed and have no virtual-dispatch surface (§9.6), so the modifiers
+    // would be inert; admitting them would mislead every reader of the
+    // declaration. The three-name admission is the Object-slot fill §10.5
+    // grants enums and §35.2 grants choices.
+    checkRecordMemberModifiers();
     // §9.2 / fix #4643 (v0.298): `equality skip` on a static member is
     // an inert annotation (§9.2 line 1419, mirroring §9.8). The
     // grammar admits the clause on FieldDecl/PropertyDecl; sema rejects

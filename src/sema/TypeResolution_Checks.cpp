@@ -556,6 +556,67 @@ void Resolver::checkStaticNotVirtual() {
     forEachTypeAndNested([&](TypeSymbol* t) { checkTypeStaticNotVirtual(t); });
 }
 
+// §9.2 (v0.297): reject `virtual`, `abstract`, and `sealed override` on
+// record members, and `override` on any record member other than the three
+// Object-slot names `Equals` / `GetHashCode` / `ToString`. Records are
+// implicitly sealed (§9.6) and have no virtual-dispatch surface, so the
+// modifiers carry no meaning; `override` is admitted on the three Object-slot
+// names because those names fill the `Object` slot (§10.5's admission for
+// enums applies here verbatim, the spec's own footnote) and "imply no chain"
+// — see §9.2 line 1376. The check is at the declaration per §9.2:
+// record members are always dispatched statically, and a load-bearing-looking
+// modifier that is inert would mislead every reader of the declaration.
+void Resolver::checkRecordMemberModifiers() {
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Record) return;
+        for (Symbol* m : t->members) {
+            auto* mem = dynamic_cast<MemberSymbol*>(m);
+            if (!mem) continue;
+            // The rule covers method, property, and indexer members — §9.2
+            // line 1376: "what its kind: method, property, or indexer".
+            if (!dynamic_cast<MethodSymbol*>(m) &&
+                !dynamic_cast<PropertySymbol*>(m)) {
+                continue;
+            }
+            const bool hasVirtual = hasMod(mem, "virtual");
+            const bool hasAbstract = hasMod(mem, "abstract");
+            const bool hasOverride = hasMod(mem, "override");
+            const bool hasSealed = hasMod(mem, "sealed");
+            if (hasVirtual) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record member `") + std::string(mem->name) +
+                    "` may not be declared `virtual` — record members are "
+                    "always dispatched statically (§9.2)");
+            }
+            if (hasAbstract) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record member `") + std::string(mem->name) +
+                    "` may not be declared `abstract` — record members are "
+                    "always dispatched statically (§9.2)");
+            }
+            if (hasSealed && hasOverride) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record member `") + std::string(mem->name) +
+                    "` may not be declared `sealed override` — record "
+                    "members are always dispatched statically (§9.2)");
+            }
+            if (hasOverride && !hasSealed &&
+                mem->name != "Equals" && mem->name != "GetHashCode" &&
+                mem->name != "ToString") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record member `") + std::string(mem->name) +
+                    "` may not be declared `override` — `override` is "
+                    "admitted on a record only on the Object-slot names "
+                    "`Equals`, `GetHashCode`, or `ToString` (§9.2)");
+            }
+        }
+    });
+}
+
 void Resolver::checkTypeStaticNotVirtual(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* mem = dynamic_cast<MemberSymbol*>(m);
