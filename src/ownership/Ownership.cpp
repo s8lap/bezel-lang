@@ -813,7 +813,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // adoption idiom `using var … := owned …` is the
                         // warning-free spelling. Diagnostic-only: the frame
                         // disposal itself is unchanged. // per §28.3/§29.8/§30.1
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
@@ -855,7 +855,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // The same §28.3 must-use warning the never-discharged
                         // branch above emits: on the branch that does NOT adopt,
                         // the frame's teardown is an implicit drop.
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
@@ -901,7 +901,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // NOT the must-use warning — the await IS the discharge, exactly
                         // as for a warning-free plain-local await. // per §30.5
                         if (awaitDischargedIterVars_.count(sym) == 0)
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
@@ -1009,7 +1009,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // the instance's memory, which §28.9 still requires be
                         // reclaimed.)
                         if (!localIsTrivialDisposeNewBinding(*ld)) {
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
@@ -1033,7 +1033,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (dynamic_cast<const ast::IdentifierExpr*>(ls->decl) &&
                         loopCondOutOwnedSyms_.count(sym) == 0) {
                         ls->autoDropAtScopeEnd = true;
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             st.obligationOrigin ? st.obligationOrigin->span.begin
                                                 : SourceLocation{},
@@ -1058,19 +1058,40 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     // disposal obligation; a borrow parameter is never Owned here.
                     if (ps->modifier == "owned") {
                         ps->autoDropAtScopeEnd = true;
-                        // fix #3033 / §28.10 (v0.240): the fourth remedy used to
-                        // read "rebind it with `using var`", naming a spelling
-                        // that is NOT a discharge. §28.10 *Adopting a named owned
-                        // binding*, verbatim: "An **unmarked** `using var y := x;`
-                        // where `x` is a named owned binding does *not* adopt: it
-                        // is a borrow, pinned per the subsection below, and `x`
-                        // retains the obligation." Only the MARKED form adopts —
-                        // "`using var y := owned x;` transfers a named owned local
-                        // or `owned` parameter into a scope-bound binding: `y`
-                        // takes over the disposal obligation". So a user who
-                        // followed the old text verbatim got this same warning
-                        // again and no discharge; name the marker.
-                        ctx_.diagnostics().report(
+                        // §28.9 + Appendix C.3 item 14, v0.307 / fix #4743:
+                        // trivial-dispose exemption, mirror of the owned-LOCAL
+                        // gate at L1011. An undischarged `owned` parameter of
+                        // trivial-dispose type carries no user-visible disposal
+                        // obligation (the compiler still auto-drops it, line
+                        // above), so the §28.3 must-use warning is suppressed —
+                        // C.3 item 14 names BOTH holder forms in one breath
+                        // ("a plain-`var` local OR undischarged `owned`
+                        // parameter carries the must-use warning ... not at a
+                        // trivial-dispose value"), closing the §28.9-only
+                        // reading that #4400 left at the owned-parameter site.
+                        // The fix is WARNING-only; the auto-drop stays set so the
+                        // emitted scope-end free is unchanged (suppressing the
+                        // free instead would leak the instance's memory, which
+                        // §28.9 still requires be reclaimed). Same exemption
+                        // table as L1011 / L6927, sourced from
+                        // `common::isNonTrivialDisposeClass`.
+                        const sema::TypeRef* pt = ps->declType
+                            ? ctx_.resolvedType(*ps->declType)
+                            : ps->resolvedDeclType;
+                        if (common::isNonTrivialDisposeClass(pt, ctx_)) {
+                            // fix #3033 / §28.10 (v0.240): the fourth remedy used to
+                            // read "rebind it with `using var`", naming a spelling
+                            // that is NOT a discharge. §28.10 *Adopting a named owned
+                            // binding*, verbatim: "An **unmarked** `using var y := x;`
+                            // where `x` is a named owned binding does *not* adopt: it
+                            // is a borrow, pinned per the subsection below, and `x`
+                            // retains the obligation." Only the MARKED form adopts —
+                            // "`using var y := owned x;` transfers a named owned local
+                            // or `owned` parameter into a scope-bound binding: `y`
+                            // takes over the disposal obligation". So a user who
+                            // followed the old text verbatim got this same warning
+                            // again and no discharge; name the marker.
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
@@ -1083,6 +1104,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             ";` (the `owned` marker is required — an unmarked "
                             "`using var` rebind is a borrow-pin, §28.10), to "
                             "discharge it explicitly");
+                        }
                         continue;
                     }
                 }
@@ -1197,7 +1219,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             taskElementBorrowingCollectionSuspendLocal) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
