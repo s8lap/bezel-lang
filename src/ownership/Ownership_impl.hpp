@@ -3930,35 +3930,6 @@ private:
     // obj.f`); otherwise the non-`owned`-parameter-position wording.
     void reportSpuriousOwnedMarker(SourceLocation loc, bool onFreshProducer);
 
-    // fix #4721 (§22.3, v0.307): the move-EXPRESSION twin of
-    // reportSpuriousOwnedMarker. Proposal 0090 moved the call-site transfer
-    // marker out of the (now-removed) `owned` ArgModifiers alternative and
-    // into the argument EXPRESSION — an identifier-operand MoveExpr (A.7/A.4)
-    // — but the admission rule is unchanged: "writing it on a borrow, a fresh
-    // producer, or a non-`owned` parameter position is likewise an error."
-    // `reportSpuriousOwnedMarker`'s call sites gate on `a.modifier == "owned"`,
-    // which the current grammar can no longer produce, so a `move`-wrapped
-    // argument at either forbidden position went unchecked; this is that
-    // check's diagnostic. `onFreshProducer` selects the fresh-producer wording
-    // (`new`/owned-returning call); otherwise the non-`owned`-parameter-
-    // position wording, which names the borrow default per §22.3's own
-    // parenthetical ("an owned expression may not feed a borrow slot").
-    void reportSpuriousMoveMarker(SourceLocation loc, bool onFreshProducer);
-
-    // fix #4721 (§22.3 / §28.1 clause 1 / §15.3, v0.307): is the parameter
-    // BOUND at `formals[boundPos]` a MOVE-ONLY VALUE TYPE (an owning inline
-    // array or an owning-classified choice)? Such a parameter's bare `move`
-    // at a PLAIN (non-`owned`) spelling is the ordinary, only meaningful way
-    // to transfer it — "the type's own move semantics already transfer the
-    // obligation" — so the new non-owned-position `move`-marker check must
-    // not reject it. Mirrors `recordMovesIn`'s identical exemption for the
-    // reverse (binding-position) direction (this file, ~line 933) — one
-    // predicate, read from the DESTINATION formal's type here because a call
-    // argument's own SOURCE need not itself be a parameter (it commonly is a
-    // local, as in both corpus repros this fix targets).
-    bool moveMarkerExemptMoveOnlySink(const CalleeFormals& formals,
-                                      std::size_t boundPos);
-
     // §28.3 / §28.10 (v0.180, #1962): validate and record the binding-position
     // `owned` transfer marker — `var y := owned x;` / `using var y := owned x;`.
     // The marked initializer must be a NAMED OWNED BINDING (an owned local or

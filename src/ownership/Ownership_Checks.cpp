@@ -1722,34 +1722,6 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             recordMovesIn(*a.value);
             ++pos; continue;
         }
-        // fix #4721 (§22.3, v0.307): the move-EXPRESSION twin of the check
-        // just above — see handleDischarge's identical addition (this file)
-        // for the full rationale. This is the LocalDecl-initializer /
-        // assignment-RHS path (`var ok := r.Check(move w);`), measured to
-        // carry the same gap as the bare-statement path: `a.modifier` can
-        // never be `"owned"` under the current grammar (proposal 0090), so
-        // a `move`-wrapped argument's POSITION went unchecked here too. Do
-        // NOT `recordMovesIn` the rejected move — it must not consume a
-        // source at a position that takes no ownership; `checkRead` reads
-        // through to the operand without marking anything moved-from.
-        //
-        // review fix (§22.3, v0.307): gated on `formals.valid()` — CONFIRMED
-        // non-owned — for the identical reason as handleDischarge's twin
-        // (this file): `ownedSink` reads false for a call through a
-        // FUNCTION-TYPED VALUE too, not because the slot is non-owned but
-        // because `isImplicitOwned`/`builtinOwnedSinkArg` never resolve one.
-        if (!ownedSink && formals.valid()) {
-            if (auto* mv =
-                    dynamic_cast<const ast::UnaryExpr*>(a.value.get());
-                mv && mv->op == "move") {
-                if (!moveMarkerExemptMoveOnlySink(formals, boundPos)) {
-                    reportSpuriousMoveMarker(mv->span.begin,
-                                             /*onFreshProducer=*/false);
-                    checkRead(*a.value, /*selfTarget=*/false);
-                    ++pos; continue;
-                }
-            }
-        }
         // §28.8 owned-sink argument. The `owned`/`move`/borrow/fresh-producer
         // classification is exactly the pre-v0.169 one; the call-site `owned`
         // marker (§22.3, v0.169) is layered on top of the SAME classification.
@@ -1802,21 +1774,6 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                         // owned receiver, an owned producer) is accepted and falls
                         // through to recordMovesIn. // per §28.8, §28.8.1, §28.6
                         ++pos; continue;  // reported; skip the bogus move
-                    } else if (dynamic_cast<const ast::NewExpr*>(
-                                   un->operand.get()) ||
-                               dynamic_cast<const ast::CallExpr*>(
-                                   un->operand.get())) {
-                        // fix #4721 (§22.3, v0.307): `move` wrapping a FRESH
-                        // PRODUCER (`new`/a call) — see handleDischarge's
-                        // identical addition for the full rationale.
-                        // `checkOwnedArgMoveSource` above only recognises the
-                        // owned-field-read and borrow-source PLACE shapes
-                        // (its `exprIsOwnedFieldRead` / `checkOwnedArgSource`
-                        // legs); a NewExpr/CallExpr operand is neither, falls
-                        // through it silently, and reached
-                        // `recordMovesIn` below unrejected.
-                        reportSpuriousMoveMarker(un->span.begin,
-                                                 /*onFreshProducer=*/true);
                     }
                 }
             }
@@ -2221,57 +2178,6 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 checkRead(*a.value, /*selfTarget=*/false);
                 ++pos; continue;
             }
-            // fix #4721 (§22.3, v0.307): the move-EXPRESSION twin of the
-            // check just above. Proposal 0090 moved the call-site transfer
-            // marker off the (removed) `owned` ArgModifiers alternative and
-            // into the argument EXPRESSION (`M(move x)`, an identifier-
-            // operand MoveExpr, A.7/A.4), so `a.modifier` can no longer BE
-            // `"owned"` for any grammatically-legal program — the check
-            // above is a dead letter against current syntax, and nothing
-            // else here validated a `move`-wrapped argument's POSITION.
-            // Measured (s22_3_0009): `r.Inspect(move w)` against a PLAIN
-            // parameter compiled clean, silently accepting an ownership
-            // transfer marker at a position that takes no ownership.
-            // Move-only value types are exempt — their bare `move` at a
-            // plain parameter position is the ordinary, only meaningful
-            // spelling (§28.1 clause 1 / §15.3), not this marker.
-            //
-            // review fix (§22.3, v0.307): gated on `discFormals.valid()` —
-            // CONFIRMED non-owned, not merely `!ownedSink` — because
-            // `isImplicitOwned`/`builtinOwnedSinkArg` (`ownedSink`'s two
-            // legs) resolve only a MethodSymbol/ConstructorSymbol/
-            // ChoiceCaseSymbol callee (`calleeOrChainFormals`) or a curated
-            // builtin-method list; a call through a FUNCTION-TYPED VALUE
-            // (`_reclaim(move w)` against a field `(owned Widget) -> ()`,
-            // §27.1) resolves neither, so `ownedSink` reads false there too
-            // — not because the slot is non-owned, but because this
-            // pre-existing classifier does not look at a function value's
-            // OWN declared parameter modifiers at all. MEASURED regressions
-            // this gate fixes: corpus s27_1_0003 / s28_1_0006 (`_reclaim`/
-            // `_consume(move w)` through an `(owned Widget) -> ()` field —
-            // §27.1/§28.1, both `expect: accept`) and l4_19_0001
-            // (`FrozenArray<int>.From(move buf)`, stdlib §4.19, a builtin
-            // static generic method `builtinOwnedSinkArg` does not name)
-            // all compiled clean pre-fix and were wrongly rejected by an
-            // earlier draft of this check that gated on plain `!ownedSink`.
-            // Requiring a RESOLVED formal list narrows this check to
-            // exactly the positions §22.3's marker rule can be answered
-            // for with certainty; an unresolvable callee is left to the
-            // pre-existing (separately-scoped) gap rather than guessed at.
-            if (!ownedSink && discFormals.valid()) {
-                if (auto* mv =
-                        dynamic_cast<const ast::UnaryExpr*>(a.value.get());
-                    mv && mv->op == "move") {
-                    const std::size_t boundPos =
-                        boundParamIndex(call->args, pos, discFormals);
-                    if (!moveMarkerExemptMoveOnlySink(discFormals, boundPos)) {
-                        reportSpuriousMoveMarker(mv->span.begin,
-                                                 /*onFreshProducer=*/false);
-                        checkRead(*a.value, /*selfTarget=*/false);
-                        ++pos; continue;
-                    }
-                }
-            }
             if (ownedSink) {
                 const bool namedBinding = isNamedOwnedBinding(*a.value);
                 if (a.modifier == "owned") {
@@ -2281,46 +2187,6 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     if (!namedBinding && !ownedArgSourceIsBorrow(*a.value))
                         reportSpuriousOwnedMarker(a.value->span.begin,
                                                   /*onFreshProducer=*/true);
-                } else if (auto* mv = dynamic_cast<const ast::UnaryExpr*>(
-                               a.value.get());
-                           mv && mv->op == "move" &&
-                           !dynamic_cast<const ast::IdentifierExpr*>(
-                               mv->operand.get()) &&
-                           !dynamic_cast<const ast::MemberAccessExpr*>(
-                               mv->operand.get()) &&
-                           !dynamic_cast<const ast::PostfixBangExpr*>(
-                               mv->operand.get()) &&
-                           !dynamic_cast<const ast::IndexExpr*>(
-                               mv->operand.get())) {
-                    // fix #4721 (§22.3, v0.307): `move` wrapping a FRESH
-                    // PRODUCER — a `new` expression or a call — is the
-                    // move-expression twin of the `owned`-on-fresh-producer
-                    // arm below: "A fresh producer ... stays unmarked: no
-                    // live binding is invalidated, so there is nothing to
-                    // announce." Measured (s22_3_0007):
-                    // `r.Append(move new Widget())` compiled clean. The
-                    // FOUR excluded operand shapes (identifier, field
-                    // access, `!`-unwrapped place, INDEXER slot) are
-                    // legitimate NAMED PLACES with their own validity
-                    // handling further below in this same loop — this arm
-                    // targets exactly the shape none of those recognise.
-                    //
-                    // review fix (§28.8.1 / §28.11, v0.307): IndexExpr was
-                    // missing from the first draft's exclusion list.
-                    // MEASURED regression: `b.Add(move a[0]);` where `a` is
-                    // an `OwningArray<R>` — the §28.8.1 owned-slot-take
-                    // producer (`move coll[i]` on an OWNING collection is
-                    // the ONLY way to read its element as owned, exactly
-                    // like `move obj.f`) — was wrongly flagged as a
-                    // redundant fresh-producer marker
-                    // (owned_sink_sources.move_indexer_into_owned_arg_
-                    // accepted_28_8_1). Excluding it restores the existing
-                    // (unchanged) fallthrough handling: an owning
-                    // collection's slot-move is accepted, a borrowing
-                    // collection's is rejected by its own §28.11 check
-                    // elsewhere in this file.
-                    reportSpuriousMoveMarker(mv->span.begin,
-                                             /*onFreshProducer=*/true);
                 } else if (a.modifier.empty() && namedBinding) {
                     // Missing marker on a named owned binding left moved-from.
                     const auto* id =
@@ -11998,36 +11864,6 @@ void MethodOwnership::reportSpuriousOwnedMarker(SourceLocation loc,
                "the `owned` call-site marker is only valid on an argument to an "
                "`owned` parameter; this parameter position does not take "
                "ownership — remove `owned` (§22.3, v0.169)");
-}
-
-// fix #4721 (§22.3, v0.307): see the declaration in Ownership_impl.hpp.
-void MethodOwnership::reportSpuriousMoveMarker(SourceLocation loc,
-                                               bool onFreshProducer) {
-    if (onFreshProducer)
-        report(Severity::Error, loc,
-               "the `move` transfer marker is not written on a fresh producer "
-               "(a `new` expression or a call returning `owned T`) — no live "
-               "binding is invalidated, so there is nothing to announce; "
-               "remove `move` (§22.3, v0.307)");
-    else
-        report(Severity::Error, loc,
-               "the `move` transfer marker is only valid on an argument to an "
-               "`owned` parameter; this parameter position does not take "
-               "ownership and defaults to a borrow — an owned expression may "
-               "not feed a borrow slot; remove `move` (§22.3, v0.307)");
-}
-
-// fix #4721 (§22.3 / §28.1 clause 1 / §15.3, v0.307): see the declaration.
-bool MethodOwnership::moveMarkerExemptMoveOnlySink(const CalleeFormals& formals,
-                                                   std::size_t boundPos) {
-    if (!formals.valid() || boundPos >= formals.size()) return false;
-    const sema::TypeRef* pt = nullptr;
-    if (const ast::Type* dt = formals.declType(boundPos))
-        pt = ctx_.resolvedType(*dt);
-    else
-        pt = formals.resolvedType(boundPos);
-    const char* kind = nullptr;
-    return common::isMoveOnlyValueType(pt, ctx_, kind);
 }
 
 void MethodOwnership::reportBindingOwnedMarkerRejected(SourceLocation loc,
