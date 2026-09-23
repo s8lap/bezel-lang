@@ -3020,9 +3020,77 @@ private:
     // record cases — rather than a second, hand-rolled lambda-body walk.
     // Returns the first captured transferring-binding identifier found, or
     // null. // per §28.3 K8.4, §35.5, v0.307
+    // fix #4715 extends this with `aliases` — the same same-arm alias map
+    // `owningMatchEscapeRoot` traces, so an ALIASED capture (`const c := w;
+    // f := lambda(): int => c.Ping();`) is caught exactly as the direct one
+    // is, rather than the two routes disagreeing about what roots at a
+    // transferred binding.
     const ast::IdentifierExpr* findOwningMatchCaptureInLambdas(
         const ast::Expr& e,
-        const std::vector<const sema::Symbol*>& transferred);
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+
+    // fix #4715 (§28.3 K8.4, §35.5, v0.307): the SAME-ARM local aliases a K8.4
+    // escape candidate may be routed THROUGH. #4635's and #4663's checks both
+    // resolved a candidate with `identifierRoot`, which is a ONE-HOP peel: for
+    // a bare identifier it returns that identifier. So `const c := w; outer :=
+    // c;` rooted at `c` — never in the arm's `transferred` set, only `w` is —
+    // and the store passed. Maps each such alias's DECL NODE (the identity
+    // `sema::LocalSymbol::decl` carries) to the initializer the trace must
+    // continue into.
+    //
+    // Collected from the arm's own statements, both `ast::LocalDecl` and
+    // `ast::LocalConstDecl` — unlike the assignment-TARGET exemption set in
+    // `checkOwningMatchArmStmtEscape`, which is LocalDecl-only for a
+    // structural reason (§21.1: a `const` is not an assignable location).
+    // Both spellings alias identically on the VALUE side, measured.
+    //
+    // An arm-local that is ASSIGNED anywhere in the arm is deliberately NOT
+    // recorded: its value at the escaping store is not its initializer's, so
+    // tracing it would reject `var c := w; c := alt; outer := c;` — a program
+    // that stores `alt` and is sound (measured accepted, and it must stay
+    // accepted). The converse shape (`var c := alt; c := w; outer := c;`) is
+    // therefore still admitted; that is an assignment-sourced residual this
+    // fix does not close, recorded rather than silently absorbed, because
+    // closing it needs a real per-arm dataflow rather than a syntactic trace.
+    // // per §28.3 K8.4, §35.5, v0.307
+    void collectOwningMatchArmAliasInits(
+        const ast::CaseArm& arm,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& out);
+
+    // fix #4715: peel `e` to its root identifier EXACTLY as `identifierRoot`
+    // does — by delegating to it, so the two can never disagree about the
+    // root — while registering every §17.15 binding-atom clause met on the
+    // peel path into `aliases`. The binding atom `(var c := w; c)` is the
+    // EXPRESSION-position spelling of the same indirection an arm-body
+    // `const`/`var` is in statement position, and `identifierRoot` peels a
+    // `BindExpr` straight to its body, so without this the trace stops dead
+    // at `c`. // per §17.15, §28.3 K8.4, v0.307
+    const ast::IdentifierExpr* owningMatchAliasPeel(
+        const ast::Expr& e,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+
+    // fix #4715: `identifierRoot`'s one-hop resolution, extended into a
+    // BOUNDED trace through same-arm local aliases. Returns the identifier
+    // naming a member of `transferred` that `value` ultimately roots at —
+    // directly, or through any chain of arm-local aliases — or null.
+    //
+    // THE BOUND, which #4715 asks for explicitly, is two-layered:
+    //   * `seen` — each symbol is traced through AT MOST ONCE, so a cycle is
+    //     structurally impossible even on a malformed AST. A straight-line arm
+    //     body cannot cycle (an initializer may only name locals declared
+    //     earlier), but sema mis-resolving a shadowing `var c := c;` to the
+    //     inner symbol would otherwise spin, and one set insert removes the
+    //     question rather than arguing it.
+    //   * `kMaxOwningMatchAliasHops` — a hard cap on top, because `seen` bounds
+    //     the walk by the arm's local COUNT, which machine-generated code can
+    //     make large. 32 is far past any real chain (the deepest shape
+    //     measured for #4715 is 2) while keeping the walk constant-time.
+    // // per §28.3 K8.4, §35.5, v0.307
+    const ast::IdentifierExpr* owningMatchEscapeRoot(
+        const ast::Expr& value,
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
 
     // fix #4635: the symbols `arm`'s pattern binds to a TRANSFERRING slot of
     // `chDecl`'s named case — a whole-slot binding (`W(var w, _)`, or the

@@ -6953,17 +6953,20 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
         // (`W(var w, _) => w.Ping()` yields an `int` and is fine).
         const sema::TypeRef* art = ctx_.exprType(*arm.exprBody);
         const ast::IdentifierExpr* root = nullptr;
+        // fix #4715: the arm's own single-assignment local aliases. An
+        // expression-position arm declares no statements, so this starts
+        // empty and fills from the §17.15 binding-atom clauses each peel
+        // registers — but it is built the same way as the statement-position
+        // check's so the two positions cannot drift.
+        std::unordered_map<const ast::Node*, const ast::Expr*> aliases;
+        collectOwningMatchArmAliasInits(arm, aliases);
         if (isBorrowableType(art) ||
             common::isBorrowBearingRecordOrSpan(art, ctx_)) {
-            root = identifierRoot(*arm.exprBody);
-            if (root) {
-                sema::Symbol* rootSym = ctx_.exprSymbol(*root);
-                bool matches = false;
-                if (rootSym)
-                    for (const sema::Symbol* b : transferred)
-                        if (b == rootSym) { matches = true; break; }
-                if (!matches) root = nullptr;
-            }
+            // fix #4715: `owningMatchEscapeRoot` is `identifierRoot` plus a
+            // bounded trace through same-arm aliases, so `(var c := w; c)` —
+            // §17.15's binding atom, the expression-position spelling of
+            // `const c := w;` — no longer roots at `c` and slips through.
+            root = owningMatchEscapeRoot(*arm.exprBody, transferred, aliases);
         }
         // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE that is the arm's own
         // result (directly, or through a conditional) and CAPTURES a
@@ -6972,7 +6975,8 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
         // this is a genuinely separate check, not a redundant one.
         bool viaCapture = false;
         if (!root) {
-            root = findOwningMatchCaptureInLambdas(*arm.exprBody, transferred);
+            root = findOwningMatchCaptureInLambdas(*arm.exprBody, transferred,
+                                                   aliases);
             viaCapture = root != nullptr;
         }
         if (!root) continue;
@@ -7010,7 +7014,8 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
 // never needed.
 const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
         const ast::Expr& e,
-        const std::vector<const sema::Symbol*>& transferred) {
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
     std::vector<const ast::LambdaExpr*> lambdas;
     std::function<void(const ast::Expr&)> findLambdas =
         [&](const ast::Expr& x) {
@@ -7028,11 +7033,139 @@ const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
         for (const ast::IdentifierExpr* id : ids) {
-            sema::Symbol* sym = ctx_.exprSymbol(*id);
-            if (!sym) continue;
-            for (const sema::Symbol* b : transferred)
-                if (b == sym) return id;
+            // fix #4715: an ALIASED capture is the same escape — `const c :=
+            // w; f := lambda(): int => c.Ping();` captures `c`, whose symbol
+            // is never in `transferred`. Route the captured identifier
+            // through the same bounded alias trace the direct store side
+            // uses, so the two routes agree on what "roots at a transferred
+            // binding" means instead of drifting apart. A capture with no
+            // alias behind it costs exactly the pre-#4715 comparison — the
+            // trace's first hop IS that comparison. // per §28.3 K8.4, v0.307
+            if (const ast::IdentifierExpr* hit =
+                    owningMatchEscapeRoot(*id, transferred, aliases))
+                return hit;
         }
+    }
+    return nullptr;
+}
+
+// fix #4715 (§28.3 K8.4, §35.5, v0.307): see the declaration in
+// Ownership_impl.hpp.
+//
+// MEASURED on r19-c23 (`92f2f29e`, #4635 and #4663 both landed): every one of
+//
+//   W(var w, _) => do const c := w;  outer := c;   end   // 24 B LSan leak
+//   W(var w, _) => do var   c := w;  outer := c;   end   // 24 B LSan leak
+//   W(var w, _) => do const c := w;  h.F   := c;   end   // 24 B LSan leak
+//   W(var w, _) => do const c := w.Self(); outer := c; end // 24 B LSan leak
+//   W(var w, _) => do const a := w; const b := a; outer := b; end
+//   W(var w, _) => do const c := w;  f := lambda(): int => c.Ping(); end
+//   W(var w, _) => (var c := w; c)                        // 24 B LSan leak
+//   W(var w, _) => do const c := w;  return c;     end    // `owned` return
+//
+// compiled CLEAN, while the direct spellings of all of them are rejected by
+// #4635/#4663. The last two rows in that list printed no LSan report on a
+// one-shot run and never printed `dispose a` either — the payload is held by
+// a live stack slot / capture cell at exit, which is exactly CLAUDE.md's
+// "one-shot leak repros pass vacuously" case, so the ORACLE for this fix is
+// the diagnostic, not the leak.
+//
+// The `return c;` row is the worst of them: the payload is handed to a caller
+// that adopts it with `using var`, so it is disposed by an owner that never
+// received ownership. It balances today only because #4634's leak means the
+// arm never drops it — the instant #4634 lands it is a double-free.
+void MethodOwnership::collectOwningMatchArmAliasInits(
+        const ast::CaseArm& arm,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& out) {
+    // Pass 1: arm-locals whose value is NOT their initializer's at every
+    // point in the arm. See the declaration for why these are excluded.
+    std::set<const ast::Node*> reassigned;
+    for (const auto& top : arm.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+            auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur);
+            if (!as || !as->target) return;
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (auto* ls =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid)))
+                    if (ls->decl) reassigned.insert(ls->decl);
+        });
+    }
+    // Pass 2: the single-assignment arm-locals, both declaration spellings.
+    for (const auto& top : arm.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+            if (reassigned.count(&cur)) return;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+                if (ld->initializer) out.emplace(&cur, ld->initializer.get());
+            } else if (auto* lc =
+                           dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+                // §21.1 makes a `const` single-assignment, so it can never be
+                // in `reassigned` — the guard above is uniform, not needed.
+                if (lc->value) out.emplace(&cur, lc->value.get());
+            }
+        });
+    }
+}
+
+// fix #4715 (§17.15, §28.3 K8.4, v0.307): see the declaration.
+const ast::IdentifierExpr* MethodOwnership::owningMatchAliasPeel(
+        const ast::Expr& e,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
+    // Register the binding-atom clauses on the peel path. This mirrors
+    // `identifierRoot`'s own peel arms rather than sharing them, because it
+    // needs the BindExpr nodes themselves; the ROOT, though, still comes from
+    // `identifierRoot` below, so a future arm added there cannot make the two
+    // disagree about where a value roots — at worst a clause under a newly
+    // peelable node goes unregistered, which under-rejects rather than
+    // mis-rejects.
+    std::function<void(const ast::Expr&)> registerClauses =
+        [&](const ast::Expr& x) {
+            if (auto* bx = dynamic_cast<const ast::BindExpr*>(&x)) {
+                for (const auto& cl : bx->clauses)
+                    if (cl && cl->initializer)
+                        aliases.emplace(cl.get(), cl->initializer.get());
+                if (bx->body) registerClauses(*bx->body);
+                return;
+            }
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&x)) {
+                if (ma->target) registerClauses(*ma->target);
+            } else if (auto* nm =
+                           dynamic_cast<const ast::NullCondMemberExpr*>(&x)) {
+                if (nm->target) registerClauses(*nm->target);
+            } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&x)) {
+                if (ce->callee) registerClauses(*ce->callee);
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&x)) {
+                if (ix->target) registerClauses(*ix->target);
+            }
+        };
+    registerClauses(e);
+    return identifierRoot(e);
+}
+
+// fix #4715 (§28.3 K8.4, §35.5, v0.307): see the declaration.
+const ast::IdentifierExpr* MethodOwnership::owningMatchEscapeRoot(
+        const ast::Expr& value,
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
+    constexpr int kMaxOwningMatchAliasHops = 32;  // see the declaration
+    std::set<const sema::Symbol*> seen;
+    const ast::Expr* cur = &value;
+    for (int hop = 0; hop < kMaxOwningMatchAliasHops; ++hop) {
+        const ast::IdentifierExpr* root = owningMatchAliasPeel(*cur, aliases);
+        if (!root) return nullptr;
+        sema::Symbol* rootSym = ctx_.exprSymbol(*root);
+        if (!rootSym) return nullptr;
+        for (const sema::Symbol* b : transferred)
+            if (b == rootSym) return root;  // the escape, named as the author
+                                            // must spell the `move` (§35.5)
+        if (!seen.insert(rootSym).second) return nullptr;
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(rootSym);
+        if (!ls || !ls->decl) return nullptr;
+        auto it = aliases.find(ls->decl);
+        if (it == aliases.end() || !it->second) return nullptr;
+        cur = it->second;  // trace into the alias's own initializer
     }
     return nullptr;
 }
@@ -7099,6 +7232,17 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
         // #4635's expression-position check and this statement-position
         // one) as a residual on top of #4663, not a defect #4663
         // introduced.
+        // fix #4715: the VALUE-side companion to `localDeclsInArm` — the
+        // arm's own single-assignment local aliases, keyed by decl node, that
+        // `owningMatchEscapeRoot` traces through. Built once per arm because
+        // every store in the arm shares it (and the binding-atom clauses each
+        // peel registers accumulate into it harmlessly — the keys are unique
+        // AST nodes). Deliberately NOT the same set as `localDeclsInArm`:
+        // that one exempts an assignment's TARGET and is LocalDecl-only for a
+        // structural reason; this one is consulted on the VALUE side and must
+        // carry `LocalConstDecl` too.
+        std::unordered_map<const ast::Node*, const ast::Expr*> aliases;
+        collectOwningMatchArmAliasInits(arm, aliases);
         std::set<const ast::Node*> localDeclsInArm;
         for (const auto& top : arm.stmts)
             if (top)
@@ -7148,15 +7292,13 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
                 const ast::IdentifierExpr* root = nullptr;
                 if (isBorrowableType(vt) ||
                     common::isBorrowBearingRecordOrSpan(vt, ctx_)) {
-                    root = identifierRoot(*value);
-                    if (root) {
-                        sema::Symbol* rootSym = ctx_.exprSymbol(*root);
-                        bool matches = false;
-                        if (rootSym)
-                            for (const sema::Symbol* b : transferred)
-                                if (b == rootSym) { matches = true; break; }
-                        if (!matches) root = nullptr;
-                    }
+                    // fix #4715: `owningMatchEscapeRoot` is `identifierRoot`
+                    // plus a bounded trace through this arm's own
+                    // single-assignment local aliases, so `const c := w;
+                    // outer := c;` (and its `var`, multi-hop,
+                    // borrow-returning-chain and field-store spellings) no
+                    // longer roots at `c` and slips through.
+                    root = owningMatchEscapeRoot(*value, transferred, aliases);
                 }
                 // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE stored/returned
                 // out of the arm that CAPTURES a transferring binding is
@@ -7166,7 +7308,8 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
                 // `identifierRoot` gate above.
                 bool viaCapture = false;
                 if (!root) {
-                    root = findOwningMatchCaptureInLambdas(*value, transferred);
+                    root = findOwningMatchCaptureInLambdas(*value, transferred,
+                                                           aliases);
                     viaCapture = root != nullptr;
                 }
                 if (!root) return;
