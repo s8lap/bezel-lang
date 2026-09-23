@@ -5534,6 +5534,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (elemTy) tr->genericArgs.push_back(elemTy);
                     return tr;
                 };
+                // fix #4747 (stdlib §4.19, v0.307): `FrozenArray<T>.ToArray():
+                // owned Array<T>` — the "fresh mutable copy back out" member.
+                // The `colName` lambda above deliberately reads ONLY the
+                // declaration-LESS Named shape (`!recvTy->declaration &&
+                // recvTy->astNode`), which is what `Array<T>` and every other
+                // §4 heap collection carry. `FrozenArray<T>` is the odd one
+                // out: the `FrozenArray<T>.From(...)` static factory stamps
+                // its result with the builtinClassSym shape (`declaration =
+                // builtinClassSym("FrozenArray")`, NO astNode — see the #3249
+                // block in this file), so `colName` is empty for that receiver
+                // and NO arm in this block ever types `fa.ToArray()`.
+                //
+                // The measured consequence is the #2434/#3079 silent-degrade
+                // class, not a rejection: `using var back := fa.ToArray();`
+                // compiles, the local's slot degrades to a zero-initialized
+                // value, and every later read of `back` emits NOTHING at all
+                // (`Console.WriteLine(back[0])` drops the whole statement, not
+                // even a line terminator). With an explicit `: Array<int>`
+                // annotation the identical call lowers and runs correctly, so
+                // codegen is NOT the gap — only the typing is.
+                //
+                // Kept as a dedicated arm rather than widening `colName`: the
+                // widening would put "FrozenArray" into ~3,000 lines of arms
+                // written for the mutable families (whose surfaces §4.19 does
+                // not declare), whereas this guard can only ever turn a
+                // currently-UNTYPED expression into a typed one.
+                if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    recvTy->declaration && !recvTy->declaration->decl &&
+                    recvTy->declaration->moduleName.empty() &&
+                    recvTy->declaration->name == "FrozenArray" &&
+                    m == "ToArray" && ce.args.empty() &&
+                    !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                    ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                        "Array", recvTy->genericArgs[0]));
+                    return;
+                }
                 // stdlib §5: type a deferred LINQ operator `m` whose source
                 // element type is `srcElem`. ToArray materializes to Array<T>
                 // (typed as a concrete Array<T> so inferred locals resolve
