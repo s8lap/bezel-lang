@@ -11132,35 +11132,14 @@ bool ExprTC::isKnownNonNull(Symbol* sym) {
 // binding-site symbol may not yet be recorded on it, and the lexical lookup is
 // what `isKnownNonNull`'s own callers (resolveMemberAccess, the #1575 guard)
 // already use.
-//
-// §7.11 narrows over `initNarrowed_` membership deliberately. Although the
-// local IS in the broader `nullNarrowed_` (which `isKnownNonNull(s)` would
-// consult), §7.11 reads the operand's STATIC type: a `var a: int? := 5;`
-// declaration with a non-null initializer is *known* non-null in the DFA
-// sense but its static type at the use site is still `int?`, and the C.1
-// invariant — "no operator lifts over a nullable operand" — plus the
-// corpus cases `s7_11_0001` (int? + int), `s7_11_0003` (int? < int),
-// `s7_11_0005` (string? < string) require the operator gate to fire. The
-// §7.11 exemption clause is for §7.4's explicit null-test / early-exit
-// forms; an initializer is a DFA fact, not a §7.11 exemption. (The
-// separate `isKnownNonNull(s)` predicate — used by member access — keeps
-// consulting `nullNarrowed_`, so `if w <> null then w.Name end`
-// (s7_4_0002) keeps admitting the access on the explicit-narrow branch.)
 bool ExprTC::isNarrowedNonNullRead(const ast::Expr* e) {
     if (!e) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (id && id->name != "this" && id->name != "base") {
         if (Symbol* s = lookupName(id->name))
             if (dynamic_cast<LocalSymbol*>(s) ||
-                dynamic_cast<ParameterSymbol*>(s)) {
-                // Init-narrowed locals (§7.4 declaration-form narrowing
-                // recorded in `initNarrowed_`): the static type is still
-                // nullable, so §7.11's operator gate fires. The §7.4 member-
-                // access gate uses the broader `isKnownNonNull` predicate and
-                // is unaffected (see `isKnownNonNull` below).
-                if (initNarrowed_.count(s)) return false;
+                dynamic_cast<ParameterSymbol*>(s))
                 return isKnownNonNull(s);
-            }
     }
     // §7.4 (v0.214, #2085/#2116): a nullable `readonly` FIELD narrows too — it
     // has no writer after construction, so there is no TOCTOU hazard, and
@@ -11544,14 +11523,6 @@ void ExprTC::recordLoopEdgeNarrowing(int targetOffset) {
 // true iff a narrowing was recorded. Unlike §12.7 type-narrowing this does NOT
 // rewrite the variable's exprType (codegen relies on the declared nullable type
 // to locate the tagged-optional payload).
-//
-// §7.11 (corpus cases s7_11_0006, s7_11_0010): when a local was previously
-// init-narrowed (§7.4 declaration-form narrowing recorded in `initNarrowed_`)
-// AND later the same local is explicitly tested with `<> null` / `= null`,
-// §7.11's exemption clause APPLIES — the static-type read at the use site
-// after the explicit check is a non-nullable operand. Promote the narrowing
-// by erasing the init-only mark: subsequent reads cross the
-// `isNarrowedNonNullRead` gate and admit the operator.
 bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
     auto* be = dynamic_cast<const ast::BinaryExpr*>(cond);
     if (!be) return false;
@@ -11577,10 +11548,6 @@ bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
         !dynamic_cast<ParameterSymbol*>(sym))
         return false;
     nullNarrowed_.insert(sym);
-    // Explicit null test supersedes init-only narrowing: the local now
-    // satisfies §7.11's exemption clause in addition to §7.4's general
-    // init-rule, so any further §7.11 operator use on it is admitted.
-    initNarrowed_.erase(sym);
     return true;
 }
 
@@ -15902,23 +15869,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // type, which made `var a: byte? := 3;` fail to narrow while
                 // `var a: int? := 3;` narrowed.
                 if (valueProvesNonNull(ld->initializer.get(),
-                                       ctx_.exprType(*ld->initializer))) {
+                                       ctx_.exprType(*ld->initializer)))
                     nullNarrowed_.insert(lsym);
-                    // §7.11 ("Operators over nullable operands") reads the
-                    // operand's STATIC type and the §7.4 exemption clause is
-                    // for an explicit null test / early exit — init-narrowed
-                    // locals like `var a: int? := 5;` keep their `int?`
-                    // static type at the use site and DO NOT exempt arithmetic
-                    // / bitwise / shift / relational operators, even though
-                    // §7.4 also lists "assignment" as a narrowing form. Track
-                    // them in a dedicated set so `isNarrowedNonNullRead`'s §7.11
-                    // consumers (and any sibling narrow-driven rejection that
-                    // should ignore init) can ignore them while member-access
-                    // gates keep admitting via `nullNarrowed_`. (See
-                    // s7_11_0001/0003/0005/0006 — the init-only-narrow form is
-                    // rejected, the `if x <> null` after init form is admitted.)
-                    initNarrowed_.insert(lsym);
-                }
             }
         }
     } else if (auto* lc =
@@ -16079,13 +16031,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (lc->value && lsym->declType && lsym->declType->nullable) {
                 // §7.4 / #3298: same predicate as the `var` site above.
                 if (valueProvesNonNull(lc->value.get(),
-                                       ctx_.exprType(*lc->value))) {
+                                       ctx_.exprType(*lc->value)))
                     nullNarrowed_.insert(lsym);
-                    // §7.11 — see the matching comment in the LocalDecl arm
-                    // above. Const forms have the same static-type semantics
-                    // for the operator gates.
-                    initNarrowed_.insert(lsym);
-                }
             }
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
