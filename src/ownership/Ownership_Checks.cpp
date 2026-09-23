@@ -16891,14 +16891,131 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
     return isBorrowBearingRecord(rt);
 }
 
-// §35.4 / §9.7 (v0.220, #2180): a BORROW-BEARING choice — §35.4 classification.
-// The single §35.4 authority is common::classifyChoiceType (shared with the
-// sendability / disposal-codegen / lint paths); a null type, a non-choice type,
-// or a value-like / owning choice is correctly NOT flagged. // per §35.4, §9.7
+// Forward declaration: choiceHoldsBorrows (defined just below
+// isBorrowBearingChoice) reads the §35.4 "holds borrows" derived property — see
+// the comment header on the predicate below for the full split. Static, file-
+// local (mirrors the existing isBorrowBearingRecord family of file-locals).
+static bool choiceHoldsBorrows(const sema::TypeRef* rt,
+                               sema::SemaContext& ctx);
+
+// §35.4 / §9.7 (v0.307, #4708): a choice that "HOLDS BORROWS" — per §35.4's
+// own header text (the derived type property distinct from classification):
+// "Every choice that holds borrows — whatever its classification — is subject
+// to §28.3's borrow-lifetime rules through §9.7's bullet list, applied verbatim
+// with 'record' read as 'record or choice'." Two cases hold borrows:
+//   (a) `BorrowBearing`-classified choices — §35.4 rule 2's construction is
+//       exactly "any case has a borrow-carrying payload", so they always hold
+//       borrows. classifyChoiceType's verdict is sufficient.
+//   (b) `Owning`-classified choices with a borrow-carrying payload BESIDE their
+//       `owned` ones — §35.4's `Loaded(owned response: Response, log: Logger)`
+//       example: rule 1 fires on `owned response`, returning Owning, BUT the
+//       unmarked `log: Logger` is a held borrow. Without the walk this case was
+//       silently admitted at every §9.7 site (class-field store, async
+//       param/result, closure capture, collection store, ...) and the field's
+//       runtime value carried the `log` borrow past its source's auto-drop —
+//       the #4708 `s35_4_0003` repro. ValueLike choices never hold borrows
+//       (rule 3's construction excludes them).
+//
+// The pre-#4708 `cls && *cls == BorrowBearing` predicate was correct for the
+// BorrowBearing leg but a documented gap for (b): a SHALLOW `cls` only is
+// too coarse — `classifyChoiceType` short-circuits to Owning on the first
+// `owned` marker and never consults the rest of the cases' unmarked payloads.
+// `choiceHoldsBorrows` (file-local, just below) reads the §35.4 derived
+// property directly: classify once for the short-circuit, then walk Owning
+// choices' case payloads under §9.7's field-level predicate (the same one
+// `recordFieldIsBorrowCarrying` applies), recursing `holds-borrows` into any
+// nested choice payload per §35.4's "this property at a nested choice payload"
+// transitivity clause. PATH-style cycle guard mirrors isBorrowBearingRecordImpl.
+// // per §35.4 / §9.7 (v0.307)
 bool MethodOwnership::isBorrowBearingChoice(const sema::TypeRef* rt) const {
     if (!rt) return false;
-    auto cls = common::classifyChoiceType(rt, ctx_);
-    return cls && *cls == common::ChoiceClassification::BorrowBearing;
+    return choiceHoldsBorrows(rt, ctx_);
+}
+
+// §35.4 / §9.7 (v0.307, #4708): see header on isBorrowBearingChoice. Static
+// (no MethodOwnership state needed beyond `ctx`) — same pattern as the
+// file-local static helpers isBorrowBearingRecord et al. (Ownership_Checks.cpp
+// has its own static helpers throughout; does not require widening the grant
+// to src/common/OwnershipFacts.{hpp,cpp}). The Owning-walk uses §9.7's
+// field-level definition (class/interface, inline-array-of-references,
+// borrow-bearing record), with §35.4's transitivity reading `holds-borrows`
+// at any nested choice payload — guarded against record↔choice mutual
+// recursion via a path set (mirror of isBorrowBearingRecordImpl's #1611).
+static bool choiceHoldsBorrows(const sema::TypeRef* rt,
+                               sema::SemaContext& ctx) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    auto verdict = common::classifyChoiceType(rt, ctx);
+    if (!verdict) return false;
+    if (*verdict == common::ChoiceClassification::BorrowBearing) return true;
+    if (*verdict == common::ChoiceClassification::ValueLike) return false;
+    // Owning: any case has a plain (non-`owned`) borrow-carrying payload
+    // under §9.7's field-level definition + §35.4's holds-borrows transitivity.
+    std::unordered_set<const sema::TypeRef*> seen;
+    if (!seen.insert(rt).second) return false;  // cycle (PATH guard).
+    bool result = false;
+    for (const sema::ChoiceCaseSymbol* ccs :
+         sema::choiceCasesOf(rt->declaration)) {
+        if (!ccs || !ccs->caseDecl) continue;
+        for (const auto& pf : ccs->caseDecl->payload) {
+            if (!pf.type) continue;
+            if (pf.modifier == "owned") continue;  // erased → value slot
+                                                 //   (§35.4 + §28.1 erasure).
+            const sema::TypeRef* ft = ctx.resolvedType(*pf.type);
+            if (!ft) continue;
+            switch (ft->kind) {
+                case sema::TypeRef::Kind::Named: {
+                    if (!ft->declaration) continue;  // uninstantiated bare param.
+                    if (ft->declaration->isValueBuiltin) continue;
+                    if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                        ft->declaration->kind == ast::TypeDeclKind::Interface) {
+                        result = true;
+                    } else if (ft->declaration->kind ==
+                               ast::TypeDeclKind::Record) {
+                        // Record transitive: rely on the shared predicate,
+                        // which walks fields through §9.7 + §35.4 transitivity.
+                        // The shared record-walk's own Choice-leg only keys
+                        // on `cls == BorrowBearing`, but records cannot hold
+                        // owning choices (sema's checkRecordRestrictions
+                        // rejects an Owning-classified choice field at line
+                        // 2205 of TypeResolution_Checks.cpp), so the record's
+                        // own nested-choice leg reaches only BorrowBearing-
+                        // classified choices — the OLD predicate is correct
+                        // for that sub-walk.
+                        if (common::isBorrowBearingRecordOrSpan(ft, ctx))
+                            result = true;
+                    } else if (ft->declaration->kind ==
+                               ast::TypeDeclKind::Choice) {
+                        // §35.4 transitivity: nested choice reads THIS property.
+                        if (choiceHoldsBorrows(ft, ctx)) result = true;
+                    }
+                    break;
+                }
+                case sema::TypeRef::Kind::InlineArray: {
+                    if (ft->arrayOwned || !ft->arrayElement) continue;
+                    const sema::TypeRef* el = ft->arrayElement;
+                    if (el && el->kind == sema::TypeRef::Kind::Named &&
+                        el->declaration &&
+                        (el->declaration->kind == ast::TypeDeclKind::Class ||
+                         el->declaration->kind ==
+                             ast::TypeDeclKind::Interface))
+                        result = true;
+                    break;
+                }
+                case sema::TypeRef::Kind::Error:
+                    // unresolved → conservative; treat as borrow.
+                    result = true;
+                    break;
+                default:
+                    break;
+            }
+            if (result) break;
+        }
+        if (result) break;
+    }
+    seen.erase(rt);
+    return result;
 }
 
 void MethodOwnership::checkAsyncSignatureBorrowBearing(
