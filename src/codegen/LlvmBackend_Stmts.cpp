@@ -156,20 +156,57 @@ const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
     const ast::Expr& target) const {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
     if (!ps || ps->isIndexer) return nullptr;
-    // An IMPORTED property carries no `ast::PropertyDecl` (#2414); a null `pd`
-    // means "no §13.6 accessor-level refinement", which is what
-    // `setterInstrumentationClass` already documents its null-`pd` arm as. An
-    // imported property does not reach this path anyway — `lowerImportedProperty
-    // Set` claims that store first, and #4651's exported stub is its checked
-    // face.
-    // An imported property never reaches here: `lowerImportedPropertySet`
-    // claims that store first (:443), before the generic `lvalueAddr`
-    // fall-through this guards, and #4651's exported stub is its checked face.
-    // The decl is an OPTIONAL §13.6 refinement input, not a classification
-    // read - `instrumentedSetterClass` documents its null-`pd` arm as "no
-    // accessor-level refinement". Re-derive from the sema::TypeSymbol
-    // (imported-symbol-audit-2026-08-13.md §4) if either premise moves.
-    // SEAM-DEBT: #4686 ps->decl is null for an imported property (#2414)
+    // fix #4682 (§22.16 / §2.8.2, v0.307): decline for an IMPORTED property,
+    // and RETIRE the SEAM-DEBT #4686 marker that stood here. That marker
+    // asserted "an imported property never reaches this predicate" as a
+    // premise about the ORDER of the sibling arms. The premise is TRUE for
+    // the `:=` arm and FALSE for the two arms #4682 adds — MEASURED on this
+    // HEAD with a real two-module build (`--import`) of a class carrying
+    // `invariant(k > 0);` and a public auto-property `P`, by reading the
+    // importer object's undefined symbols (`nm -u`):
+    //
+    //     c.P := 7   ->  U bz$<Lib>.CX$P$propset   (#4651's checked face)
+    //     c.P += 1   ->  no propset reference
+    //     c.P++      ->  no propset reference
+    //
+    // `lowerImportedPropertySet` claims the `:=` store before the generic
+    // `lvalueAddr` fall-through, but `lowerImportedPropertyCompound` and
+    // `lowerImportedPropertyIncrDecr` both DECLINE for an imported
+    // AUTO-property (neither has an accessor body to call), so those two
+    // spellings reach `lvalueAddr` and store straight into the backing field.
+    //
+    // Declining here is a deliberate SCOPE choice, not an oversight. §22.16
+    // requires the check for all three spellings; what differs is WHOSE
+    // `--checked-contracts` governs it. #4651 settled that for the setter row
+    // with a measured 2x2 mode grid — the check lives in the EXPORTER's
+    // object, so the exporter's flag governs, exactly as §22.16's
+    // public-METHOD row has behaved since #2941. Instrumenting the imported
+    // compound/increment HERE would put it in the IMPORTER's object instead,
+    // so one property would answer to two different build flags depending on
+    // which spelling the caller used. The coherent fix routes the imported
+    // compound/increment through the exported checked stub, which lives in
+    // the imported-property lowering rather than in these arms; it is
+    // recorded as #4705. Until then the imported spellings keep their
+    // pre-existing unchecked behaviour instead of acquiring a second,
+    // contradictory mode policy.
+    //
+    // `ctx_.isImported` is the repo's settled spelling of this question
+    // (SemaContext.hpp): an imported `PropertySymbol` is minted by
+    // `makeImportedSymbol`, which inserts it into `imported_`. Preferred over
+    // a `ps->decl == nullptr` test, which conflates "externally defined" with
+    // "carries no local AST" (imported-symbol-audit-2026-08-13.md §4).
+    if (ctx_.isImported(ps)) return nullptr;
+    // `pd` is the OPTIONAL §13.6 accessor-visibility refinement input, not a
+    // classification read; `setterInstrumentationClass` documents its
+    // null-`pd` arm as "no accessor-level refinement". With the guard above,
+    // every property that reaches here carries one.
+    //
+    // SEAM-DEBT: #4686 ps->decl read — now guarded unreachable-for-imports by
+    // the `ctx_.isImported(ps)` decline immediately above, MEASURED with a
+    // two-module program (see the `nm -u` table in the block above), rather
+    // than relying on the ordering of the sibling `lowerImported*` arms as the
+    // retired marker did. Same posture as DefiniteAssignment.cpp's #4030
+    // marker. The read stays a class-3 AST-gated read and keeps its marker.
     const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     return instrumentedSetterClass(target, ps, pd);
 }
@@ -1950,6 +1987,57 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // arrives already correctly shaped for `emitCompoundOp`'s
                 // existing line-370 nullable-VALUE-LEFT-OPERAND arm).
                 rhs = unwrapNarrowedNullableOperand(rhs, as->value.get());
+                // fix #4682 (§22.16 / §6.6, v0.307): the §22.16 AUTO-PROPERTY
+                // setter boundaries for a COMPOUND store `obj.P OP= v`.
+                //
+                // §6.6 makes `x op= e` a read-modify-write "equivalent to
+                // `x := x op e`", so the store half is a setter invocation and
+                // sits on the same §22.16 boundary #4646 instrumented for the
+                // plain `:=`: "Entry and normal exit of every `public` setter
+                // — block-form, auto-property, indexer, `set(owned)` alike."
+                // The READ half is a getter, which §22.16 exempts by name.
+                // MEASURED on this HEAD before this fix, with
+                // `--checked-contracts`, on the issue's own repro
+                // (`invariant(P > 0);`, `c.P -= 4;` from P == 1): 42, where
+                // §22.16 requires ContractViolationException (99) — the same
+                // SILENT UNDER-CHECK #4646 closed one arm over.
+                //
+                // `invRecv4646` is the receiver `lvalueAddr` already lowered
+                // for the field store (the shared preamble threads the
+                // out-parameter for BOTH the `:=` and the compound arm), so
+                // the receiver expression of an `f().P -= 1` is evaluated
+                // exactly ONCE — the specific hazard a read-modify-write adds
+                // over a plain store, and pinned by its own row.
+                //
+                // WHY TWO LAMBDAS AND NOT ONE HOISTED PAIR. This arm has FOUR
+                // store paths — the §25.1/§25.2 user-operator desugaring, the
+                // §4.6 string concat, the §6.4 decimal helper, and the CG31
+                // built-in numeric one — each with its own `return false`, and
+                // an auto-property can be typed to reach any of them. The
+                // ENTRY check belongs after the operand is computed, not
+                // before: §22.16's evaluation table binds arguments before any
+                // clause runs, §6.6's desugared argument IS `x op e`, and
+                // #4646 placed the `:=` entry check after the RHS is lowered
+                // and coerced for exactly that reason. So the pair cannot be
+                // hoisted out of the four paths without changing which
+                // exception a compound assignment that BOTH overflows and
+                // violates the invariant raises (§6.1's overflow must win, as
+                // it does pre-fix).
+                const sema::TypeSymbol* invCls4682 =
+                    invRecv4646 ? instrumentedAutoPropertyStoreClass(*as->target)
+                                : nullptr;
+                auto invEntry4682 = [&] {
+                    if (invCls4682) emitInvariantCheck(invRecv4646, invCls4682);
+                };
+                // The terminator guard is §22.16's "throw exits check
+                // nothing": a store path that left the current block
+                // terminated (an unwind edge) must not have an exit check
+                // appended to it, and appending one to a terminated block is
+                // malformed IR besides. Mirrors #4646's `:=` exit guard.
+                auto invExit4682 = [&] {
+                    if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                        emitInvariantCheck(invRecv4646, invCls4682);
+                };
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
                 sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
@@ -1987,6 +2075,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // Borrow / value / ref / static / record / indexer
                         // targets keep the plain store (no drop-on-overwrite
                         // entry — no double-free).
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         if (!lowerOwnedClassFieldStore(*as->target, addr, res)) {
                             // fix #3950 — ⚠ STILL UNREACHABLE, for a DIFFERENT
                             // reason since fix #3969; kept deliberately.
@@ -2036,6 +2125,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // null for a non-local).
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                     return false;
                 }
@@ -2090,11 +2180,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                        !tgtTy->nullable &&
                                        currentFn_ == stringReleaseEligibleFn_;
                         bool isField = isStringFieldLvalue(*as->target);
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (isLocal || isField)
                             emitStringRelease(curS);  // release the old value
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                         return false;
                     }
                 }
@@ -2122,9 +2214,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                               isUnsignedTargetExpr(*as->value));
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     if (llvm::Value* res = emitDecimalArith(op, cur, rhs)) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                     return false;
                 }
@@ -2154,10 +2248,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
                     isUnsignedTargetExpr(*as->value));  // §6.2/§6.6 #2140 rUns
                 if (res) {
+                    invEntry4682();  // §22.16 setter ENTRY (#4682)
                     builder_.CreateStore(res, addr);
                     // §27.5 / #673: sync back to original alloca.
                     if (llvm::AllocaInst* ns = localSlot(*as->target))
                         syncCellToOrigSlot(ns, res);
+                    invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                 }
             }
         }
@@ -2205,7 +2301,48 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // MEASURED as a silently dropped write (0 where 1 is correct).
             if (lowerVirtualPropertyIncrDecr(*inc)) return false;
             llvm::Type* elemTy = nullptr;
-            llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
+            // fix #4682 (§22.16 / §17.6, v0.307): the §22.16 AUTO-PROPERTY
+            // setter boundaries for `obj.P++` / `obj.P--`.
+            //
+            // §17.6 does not merely liken the increment to the compound form,
+            // it DEFINES it as one: "`expr[i]++` desugars to a
+            // read-modify-write", and for the named-property spelling `x++` is
+            // "`x := x + 1`" (this file's own #4109 note). The store half is
+            // therefore a setter invocation on §22.16's boundary — "Entry and
+            // normal exit of every `public` setter — block-form,
+            // auto-property, indexer, `set(owned)` alike" — and the read half
+            // is a getter, which §22.16 exempts by name. MEASURED on this HEAD
+            // before this fix, with `--checked-contracts`, on the issue's own
+            // repro (`invariant(P < 10);`, `c.P++` from P == 9): 42, where
+            // §22.16 requires ContractViolationException (99).
+            //
+            // The receiver out-parameter is threaded for the same reason
+            // #4646 threaded it on the `:=` arm: `fieldAddr` lowers
+            // `ma->target` exactly once and hands back that pointer, so
+            // `f().P++` evaluates its receiver ONCE and the boundary check
+            // lands AFTER §28.2's disposed guard (which `fieldAddr` emits
+            // internally), keeping DisposedAccessException ahead of
+            // ContractViolationException on a disposed instance.
+            llvm::Value* invRecv4682 = nullptr;
+            llvm::Value* addr = lvalueAddr(*inc->target, elemTy, &invRecv4682);
+            // Resolved only when `lvalueAddr` produced a receiver pointer; a
+            // shape whose receiver never materialised (an implicit-`this`
+            // `P++`, which reaches `implicitFieldAddr` and is §22.16-exempt
+            // anyway) degrades to the pre-fix behaviour rather than checking
+            // over a null pointer.
+            const sema::TypeSymbol* invCls4682 =
+                (addr && invRecv4682)
+                    ? instrumentedAutoPropertyStoreClass(*inc->target)
+                    : nullptr;
+            auto invEntry4682 = [&] {
+                if (invCls4682) emitInvariantCheck(invRecv4682, invCls4682);
+            };
+            // §22.16's "throw exits check nothing" — see the compound arm's
+            // twin for the full note.
+            auto invExit4682 = [&] {
+                if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4682, invCls4682);
+            };
             if (addr) {
                 if (elemTy == decimalStructType()) {
                     // §6.4 (sweep #6): decimal `d++` / `d--`. decimal is a
@@ -2216,9 +2353,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     if (llvm::Value* res = emitDecimalArith(
                             inc->op == "++" ? "+" : "-", cur, emitDecimalOne())) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                 } else {
                     // Built-in numeric increment/decrement.
@@ -2238,10 +2377,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         isCharTargetExpr(*inc->target))  // §6.6/§5.2 #1961
                         : nullptr;
                     if (res) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                 }
             } else {
