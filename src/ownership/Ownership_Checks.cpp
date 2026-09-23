@@ -5129,6 +5129,33 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     std::string(sym->name) + "; () => snap`)");
                 return;  // one diagnostic per return is enough
             }
+            // fix #4709 (§27.5 / §28.3, v0.298/v0.307): a captured PLAIN
+            // (non-`owned`/`ref`/`out`/`scoped`) class/interface-typed
+            // parameter's borrow has exactly one source — this call — with
+            // no route to escape it (§28.14's `scoped` admission is the
+            // only such route, and `isPlainBorrowParam` excludes it). A
+            // closure that captures one and is returned necessarily
+            // outlives the call. MEASURED (s27_5_0007, corpus): `return
+            // lambda() => w.Greet();` over a plain `w: Widget` parameter
+            // compiled with zero diagnostics before this fix — none of the
+            // ref/out leg above (not ref/out), the §9.7 record/span/choice
+            // leg below (a plain class, not a record), or the §28.3 owned-
+            // capture leg further below (never Owned in `states_` — it is
+            // a borrow, not an owned local) recognise it.
+            if (scope == EscapeScope::Method && isPlainBorrowParam(sym)) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned closure captures `") +
+                    std::string(sym->name) +
+                    "`, a plain (borrowing) parameter — its source is this "
+                    "call, which the returned closure necessarily outlives; "
+                    "a function type announces no source set, so no caller "
+                    "could bound the escaping borrow (§27.5 closure-capture "
+                    "rule / §28.3, v0.298; copy the data you need into an "
+                    "owned value the closure can capture, or restructure so "
+                    "the closure does not escape)");
+                return;  // one diagnostic per return is enough
+            }
             // §9.7 (#2144): "A borrow-bearing record may not be captured by a
             // closure that escapes its source's scope." A captured local of
             // borrow-bearing record / builtin-span type is a VALUE — never
@@ -6126,6 +6153,17 @@ bool MethodOwnership::isRefOutParam(sema::Symbol* sym) const {
     return ps && (ps->modifier == "ref" || ps->modifier == "out");
 }
 
+// fix #4709 (§27.5 / §28.3, v0.298/v0.307): see the declaration in
+// Ownership_impl.hpp.
+bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
+    if (!sym) return false;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+    if (!ps || !ps->modifier.empty()) return false;
+    const sema::TypeRef* declTy =
+        ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
+    return isBorrowableType(declTy);
+}
+
 // §27.5 / §28.6 (#1217): when a lambda is stored into a FIELD or written
 // through an OUT-PARAM assignment target, and the lambda captures a ref/out
 // parameter, the captured pointer lives on the caller's stack; the field or
@@ -6189,33 +6227,71 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
         collectLambdaIdentifiers(*lam, ids);
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
-            if (!isRefOutParam(sym)) continue;
+            const bool refOut = isRefOutParam(sym);
+            // fix #4709 (§27.5 / §28.3, v0.298/v0.307): the plain-borrow-
+            // parameter twin of the ref/out leg above — see
+            // `isPlainBorrowParam`'s declaration for the full rationale.
+            // MEASURED (s27_5_0006, corpus): `_cb := lambda() => w.Greet();`
+            // over a plain `w: Widget` parameter compiled with zero
+            // diagnostics before this fix.
+            const bool plainBorrow = !refOut && isPlainBorrowParam(sym);
+            if (!refOut && !plainBorrow) continue;
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
             if (dest == Dest::Field) {
-                report(
-                    Severity::Error, id->span.begin,
-                    std::string("closure stored in field `") +
-                    std::string(destName) +
-                    "` captures `" + std::string(sym->name) +
-                    "` which is a `" + std::string(ps->modifier) + "` parameter"
-                    " — a ref/out parameter is a pointer into the caller's stack"
-                    " frame; storing the closure in a field lets it outlive the"
-                    " call and dereference a dangling pointer (use-after-free)."
-                    " (§27.5 / §28.6 / #1217; pass the value by copy into the"
-                    " closure instead, e.g. `var snap := " +
-                    std::string(sym->name) + "; () => snap`)");
+                if (plainBorrow) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("closure stored in a field (`") +
+                        std::string(destName) +
+                        "`) captures `" + std::string(sym->name) +
+                        "`, a plain (borrowing) parameter — its source is "
+                        "this call, which the field necessarily outlives; a "
+                        "function type announces no source set, so no "
+                        "caller could bound the escaping borrow (§27.5 "
+                        "closure-capture rule / §28.3, v0.298; copy the "
+                        "data you need into an owned value the closure can "
+                        "capture, or keep the closure from escaping)");
+                } else {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("closure stored in field `") +
+                        std::string(destName) +
+                        "` captures `" + std::string(sym->name) +
+                        "` which is a `" + std::string(ps->modifier) + "` parameter"
+                        " — a ref/out parameter is a pointer into the caller's stack"
+                        " frame; storing the closure in a field lets it outlive the"
+                        " call and dereference a dangling pointer (use-after-free)."
+                        " (§27.5 / §28.6 / #1217; pass the value by copy into the"
+                        " closure instead, e.g. `var snap := " +
+                        std::string(sym->name) + "; () => snap`)");
+                }
             } else {
-                report(
-                    Severity::Error, id->span.begin,
-                    std::string("closure written through `") +
-                    std::string(destName) +
-                    "` captures `" + std::string(sym->name) +
-                    "` which is a `" + std::string(ps->modifier) + "` parameter"
-                    " — a ref/out parameter is a pointer into the caller's stack"
-                    " frame; writing the closure through an out/ref parameter"
-                    " lets it outlive the call and dereference a dangling pointer"
-                    " (use-after-free)."
-                    " (§27.5 / §28.6 / #1217; pass the value by copy instead)");
+                if (plainBorrow) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("closure written through `") +
+                        std::string(destName) +
+                        "` captures `" + std::string(sym->name) +
+                        "`, a plain (borrowing) parameter — its source is "
+                        "this call, which the out/ref recipient necessarily "
+                        "outlives; a function type announces no source set, "
+                        "so no caller could bound the escaping borrow "
+                        "(§27.5 closure-capture rule / §28.3, v0.298; copy "
+                        "the data you need into an owned value the closure "
+                        "can capture, or keep the closure from escaping)");
+                } else {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("closure written through `") +
+                        std::string(destName) +
+                        "` captures `" + std::string(sym->name) +
+                        "` which is a `" + std::string(ps->modifier) + "` parameter"
+                        " — a ref/out parameter is a pointer into the caller's stack"
+                        " frame; writing the closure through an out/ref parameter"
+                        " lets it outlive the call and dereference a dangling pointer"
+                        " (use-after-free)."
+                        " (§27.5 / §28.6 / #1217; pass the value by copy instead)");
+                }
             }
             return;  // one diagnostic per assignment is enough
         }

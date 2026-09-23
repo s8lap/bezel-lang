@@ -3613,6 +3613,28 @@ private:
     // closure that escapes the method produces a dangling pointer. // per §27.5
     bool isRefOutParam(sema::Symbol* sym) const;
 
+    // fix #4709 (§27.5 / §28.3, v0.298/v0.307): true when `sym` is a PLAIN
+    // (no `owned`/`ref`/`out`/`out owned`/`scoped` modifier — an EMPTY
+    // ParameterSymbol::modifier) class/interface-typed PARAMETER of the
+    // enclosing method. §28.3's closure-source-set rule: "a captured
+    // borrowed local or parameter contributes that binding's source" — a
+    // plain parameter's own source is "this call" (§22.3: "a plain
+    // [function-typed] parameter ... is call-bounded"; the same call-bound
+    // premise, applied here to a class/interface-typed borrow parameter
+    // rather than a function-typed one), which a returned or field-stored
+    // closure necessarily outlives. `scoped` is excluded because it is the
+    // ONE route §28.14 admits for a captured borrow to outlive a call (a
+    // `scoped` field store, under §28.14's own storage-bounded admission);
+    // `owned`/`out`/`out owned` are excluded because they name a different
+    // obligation, handled by the owned-capture leg
+    // (`checkClosureEscapesOnReturn`'s §28.3 Owned leg) and `isRefOutParam`
+    // respectively. Distinct from `isRefOutParam`: a ref/out param is a
+    // dangling STACK pointer once the call returns; a plain borrow param's
+    // hazard is that the closure may read the referent after the CALLER's
+    // own borrow ends — no stack frame is at risk, but the source's
+    // lifetime is equally bounded by the call.
+    bool isPlainBorrowParam(sema::Symbol* sym);
+
     // §27.5 / §28.6 (#1217): reject a lambda stored to a FIELD or OUT-PARAM
     // (both escaping locations that outlive the method call) when the lambda
     // captures a ref/out parameter. The captured pointer is to the caller's
