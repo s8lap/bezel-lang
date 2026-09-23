@@ -553,3 +553,118 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
         "end C;"),
         6);  // "custom".Length = 6
 }
+
+// ── #4644 / §31.2.1 + §5.1: the NCB binding must not be silently re-narrowed ─
+//
+// The three tests below pin the fix for corpus row `s31_2_1_0004`
+// (tests/conformance/rules/cases/s31_2_1_0004.bzl, "a binding over unrelated
+// types types at Exception, not either listed type").
+//
+// §31.2.1 (v0.307): "When binding, `name` has the static type of the **nearest
+// common base** of the listed types … for alternatives sharing nothing more
+// specific, it is `Exception`."
+//
+// `catchArmNcb` already computed that correctly — the tests earlier in this
+// file prove it — but the RESULT was not load-bearing, because a built-in
+// exception's TypeRef carries `declaration == nullptr` (built-ins have no
+// TypeSymbol) and so fell through EVERY branch of `checkAssignable` into its
+// terminal "Mixed / generic-parameter / null-literal cases: skip." So
+//
+//     catch var ex: SiblingA | SiblingB => var narrow: SiblingA := ex;
+//
+// was ACCEPTED, and with `throw new SiblingB("boom")` a `SiblingB` instance was
+// reachable through a `SiblingA`-typed slot — an unchecked downcast that makes
+// the NCB rule unobservable. The sibling shape `var n: int := ex` was worse
+// still: it compiled and printed the exception object's ADDRESS.
+//
+// The pins assert the SPECIFIC diagnostic, not merely "was rejected": the arm
+// types here are `Exception`-derived, so §31.2.1's provably-dead arm-type rule
+// does NOT fire, and a bare "is rejected" oracle would pass on any future
+// unrelated rejection of the same input (the #4716 vacuous-pass shape).
+
+namespace {
+// True iff `src` was rejected with the diagnostic carrying `needle`.
+bool rejectedWith(const std::string& src, const std::string& needle) {
+    auto r = runAot(src);
+    if (r.ran) return false;   // it compiled and ran: not a rejection at all
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+}  // namespace
+
+// (b) #4644 / §31.2.1 + §5.1 — THE ROW. `SiblingA` and `SiblingB` share nothing
+// more specific than `Exception`, so the binding's static type IS `Exception`;
+// assigning it to a `SiblingA` slot is a narrowing reference conversion and
+// §5.1 has none implicitly. Pre-fix this compiled and ran to exit 0.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           ncb_binding_not_implicitly_narrowed_to_listed_type_spec_31_2_1_4644) {
+    const std::string src =
+        "module M; "
+        "class SiblingA: Exception "
+        "  public constructor(message: string) base(message); end constructor; "
+        "end SiblingA; "
+        "class SiblingB: Exception "
+        "  public constructor(message: string) base(message); end constructor; "
+        "end SiblingB; "
+        "class C public static method Main(): int "
+        "  try throw new SiblingB(\"boom\"); "
+        "  catch var ex: SiblingA | SiblingB => do "
+        "    var narrow: SiblingA := ex; "
+        "    return narrow.Message.Length; "
+        "  end "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        src, "the built-in exception type `Exception` is not a `SiblingA`"));
+}
+
+// (b) #4644 / §5.1 + §4.6 — the same fall-through, with SILENT WRONG CODE as
+// the pre-fix behaviour rather than an unchecked downcast: `var n: int := ex`
+// compiled and printed the exception object's address (probe-measured
+// 864801568), a class reference reinterpreted as an `int`. §5.1 has no implicit
+// conversion between a class reference and a value type.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           exception_binding_not_implicitly_converted_to_primitive_spec_5_1_4644) {
+    const std::string src =
+        "module M; class C public static method Main(): int "
+        "  try throw new ArgumentException(\"boom\"); "
+        "  catch var ex: Exception => do "
+        "    var n: int := ex; "
+        "    return n; "
+        "  end "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        src, "is a class reference and the target is a value type"));
+}
+
+// (a) #4644 POSITIVE CONTROL — the UPCAST direction must stay accepted and must
+// still RUN. §5.1's reference conversion from a derived class to its base is
+// implicit, and the arm binding at `Exception` is exactly what makes
+// `e.Message` resolve. Asserting the exit VALUE (not `compile_rc == 0`) is
+// deliberate: a fix that makes something newly rejected can just as easily make
+// the neighbouring accept lower to nothing.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           exception_upcast_from_user_derived_still_runs_spec_5_1_4644) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class SiblingA: Exception "
+        "  public constructor(message: string) base(message); end constructor; "
+        "end SiblingA; "
+        "class SiblingB: Exception "
+        "  public constructor(message: string) base(message); end constructor; "
+        "end SiblingB; "
+        "class C public static method Main(): int "
+        "  try throw new SiblingB(\"boom\"); "
+        "  catch var ex: SiblingA | SiblingB => do "
+        "    var wide: Exception := ex; "
+        "    return wide.Message.Length; "
+        "  end "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        4);  // "boom".Length = 4, through the Exception-typed slot
+}
