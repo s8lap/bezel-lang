@@ -3438,7 +3438,31 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         return r;
     }
     // --- AddLast(item): LinkedListNode<T> ---
-    if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
+    //
+    // fix #4745 (stdlib §4.6/§4.7, v0.307): `Add` is the SAME operation.
+    // §4.6's `LinkedList<T>` declaration ends "Plus the standard ICollection<T>
+    // operations: Add (appends at the tail, = AddLast), Clear, Contains,
+    // Remove, IsReadOnly", and §4.7's `OwningLinkedList<T>` ends "Plus the
+    // remaining IOwningCollection<T> operations … Add(owned item) — appends at
+    // the tail, = AddLast — and IsReadOnly". Both spellings therefore lower to
+    // `bz_llist_add_last`. Every other layer already agreed: sema's argument
+    // check names `Add` on both families (nullability/conformance at position
+    // 0) and the ownership pass's owned-argument table maps
+    // `OwningLinkedList.Add` to argument 0 exactly as it maps `AddLast`, so
+    // the transfer accounting below is the one those passes already assume.
+    // Only this dispatch was missing, which made `l.Add(30)` a hard "no
+    // dispatch arm emitted any code for this call" (#2457) on a member the
+    // document declares.
+    //
+    // The one difference is the RESULT: `AddLast` returns the new
+    // `LinkedListNode<T>`, while `ICollection<T>.Add` / `IOwningCollection<T>
+    // .Add` return unit — and sema types only the `AddLast` spelling as a
+    // node. `Add` therefore yields the unit placeholder the sibling
+    // unit-returning arms use (`RemoveFirst`/`RemoveLast` below) rather than
+    // handing out a node value for a call whose static type is not one.
+    if ((m == "AddLast" || m == "Add") && call.args.size() == 1 &&
+        call.args[0].value) {
+        const bool isUnitAddSpelling = (m == "Add");
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
         // fix #4639 (§8.6, v0.307): see the AddFirst note above — the #819
@@ -3457,6 +3481,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // gets exactly-once disposal. Borrowing LinkedList<T>.AddLast stays
         // caller-owned and is NOT nulled.
         if (isOwning) nullTransferredOwnedLocalSlot(call.args[0].value.get());
+        if (isUnitAddSpelling) return llvm::ConstantInt::get(i32(), 0);
         return r;
     }
     // --- AddBefore(node, item): LinkedListNode<T> ---
