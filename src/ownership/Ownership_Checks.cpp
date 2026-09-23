@@ -8836,6 +8836,43 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // the lambda-body form compiled rc=0 and SEGV'd at runtime once the
     // backing buffer was disposed; the byte-identical method-level twin is
     // rejected on the same compiler. // per §9.7, §28.3
+    // §4.16 + §9.7 (v0.307, issue #4751): the `IReadOnlySpan<TElement>`
+    // INTERFACE-parameter face of the §9.7 instance-field storage rule.
+    // stdlib §4.16 says a method declaring `IReadOnlySpan<TElement>` cannot
+    // store the parameter in a field that outlives the call — explicitly
+    // stating that "these are the standard borrow-bearing-record constraints;
+    // nothing new is added by the interface." The interface is the unifying
+    // read-only surface for every concrete span type (Span / ReadOnlySpan /
+    // ArraySpan / ReadOnlyArraySpan, §4.14/§4.15), so any value it references
+    // is a borrow-bearing span at runtime — the canonical case §9.7 names in
+    // its own bullet. The pre-fix predicates (`isBorrowBearingRecord`,
+    // `isBorrowBearingRecordOrSpan`, `isBorrowBearingChoice`) classify by
+    // declaration and never reach an interface type, so a method
+    // `Remember(s: IReadOnlySpan<int>) { _s := s; }` over
+    // `class Holder { private _s: IReadOnlySpan<int>?; … }` compiled clean
+    // and the field would carry a borrow-bearing record at runtime — the
+    // canonical escape §9.7 rejects.
+    //
+    // The fix extends the §9.7 type rule with a fourth carrier — the
+    // `IReadOnlySpan<TElement>` interface — and a §4.16-specific diagnostic
+    // (distinct wording from the record / builtin-span / choice messages so a
+    // row that pins the interface rule does not match an unrelated
+    // rejection). Scoped inside the same `storeTargetIsClassField` gate as the
+    // other three carriers and the same method/lambda-body scope pair as #3701,
+    // so the lambda-body widening #3701 took care of reaches this leg for
+    // free. The null-source DECLARATION form (`_s: IReadOnlySpan<int>?`) is
+    // admitted by §9.7 — only the STORE of a parameter whose runtime value
+    // carries a borrow is rejected, exactly as the existing record / span /
+    // choice legs do (`isNullSourceRecordExpr` / `isNullSourceChoiceExpr`).
+    // An `IReadOnlySpan<TElement>?` RHS whose value carries a non-null span
+    // is also rejected here — the existing record leg's null-source skip
+    // requires a user `new Rec(...)` of a user Record TypeDecl, which an
+    // interface-typed RHS never has; mirroring that discipline, an
+    // interface-typed `null` literal (the only null-source shape the
+    // interface admits — an interface has no constructor) is the one the
+    // rule declines on. The fix's measured pre-fix behaviour: l4_16_0004 (the
+    // rule-corpus repro) compiled rc=0 with no diagnostic; post-fix it
+    // rejects with the §4.16 / §9.7 diagnostic. // per §4.16 + §9.7, v0.307
     if ((scope == EscapeScope::Method ||
          scope == EscapeScope::LambdaBody) &&
         dest == Dest::Field && storeTargetIsClassField(*as.target)) {
@@ -8845,6 +8882,15 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             !rhsIsRecord && isBorrowBearingRecordOrSpan(rhsType);
         const bool rhsIsChoice =
             !rhsIsRecord && !rhsIsSpan && isBorrowBearingChoice(rhsType);
+        // §4.16 + §9.7 (v0.307, #4751): fourth carrier — the
+        // `IReadOnlySpan<TElement>` interface. Computed LAST so a concrete
+        // span (which `isBorrowBearingRecordOrSpan` already covers with the
+        // record-typed `span` wording) keeps its existing diagnostic; an
+        // alias-target of the interface (`type Al := IReadOnlySpan<int>`)
+        // reaches the interface leg through `common::isIReadOnlySpanType`.
+        const bool rhsIsInterfaceSpan =
+            !rhsIsRecord && !rhsIsSpan && !rhsIsChoice &&
+            common::isIReadOnlySpanType(rhsType);
         if (rhsIsSpan) {
             report(
                 Severity::Error, as.span.begin,
@@ -8893,6 +8939,49 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                           "store a value whose borrow-carrying components "
                           "are all `null`)"));
             return true;
+        }
+        // §4.16 + §9.7 (v0.307, #4751): the INTERFACE carrier. Mirrors the
+        // record leg's null-source skip: the only null-source shape an
+        // `IReadOnlySpan<TElement>` RHS admits is a bare `null` literal
+        // (an interface has no constructor, so the record leg's
+        // `isNullSourceRecordExpr` predicate — which requires a user
+        // `new Rec(...)` of a user Record TypeDecl — never applies). A
+        // non-null interface-typed RHS — including a parameter, a value
+        // derived from a parameter, or a span-typed RHS already covered by
+        // the `rhsIsSpan` leg above via `isBorrowBearingRecordOrSpan`'s
+        // concrete-span name match — is rejected. The diagnostic carries
+        // §4.16 + §9.7 wording distinct from the record/span/choice
+        // messages above so a row that pins the interface rule does not
+        // match an unrelated rejection.
+        if (rhsIsInterfaceSpan) {
+            const bool rhsIsNullLiteral = [&as]() {
+                if (!as.value) return false;
+                if (const auto* il = dynamic_cast<const ast::IdentifierExpr*>(
+                        as.value.get())) {
+                    return il->name == "null";
+                }
+                return false;
+            }();
+            if (!rhsIsNullLiteral) {
+                report(
+                    Severity::Error, as.span.begin,
+                    std::string(
+                        "an IReadOnlySpan<TElement> parameter value may not "
+                        "be stored in an instance field of a class — the "
+                        "interface is the unifying read-only surface of the "
+                        "borrow-bearing span family (§4.14/§4.15), so any "
+                        "value it references carries a borrow of its backing "
+                        "Array / OwningBuffer at runtime; a class instance's "
+                        "lifetime is not bounded by that backing store's "
+                        "scope, and the borrow's window is read with no "
+                        "per-access disposed-flag check (the §9.7 canonical "
+                        "case) — the checked-mode trust regime that covers a "
+                        "direct class-typed borrow field does not apply here "
+                        "(§4.16 + §9.7; store the backing store instead — "
+                        "e.g. an `owned OwningBuffer<T>` or `owned Array<T>` "
+                        "field — and re-derive the span at the use site)"));
+                return true;
+            }
         }
     }
 

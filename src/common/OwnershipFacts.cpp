@@ -1603,6 +1603,32 @@ bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
     return isBorrowBearingRecordCommon(rt, ctx, seen, /*env=*/nullptr);
 }
 
+// §4.16 + §9.7 (v0.307, issue #4751): classify a TypeRef as the
+// `IReadOnlySpan<TElement>` interface. The interface is an alias-target
+// for the borrowing span family (Span / ReadOnlySpan / ArraySpan /
+// ReadOnlyArraySpan); an alias declaration (`type Al := IReadOnlySpan<int>`)
+// must read the same as the bare interface, mirroring `isIReadOnlySpanType`
+// in `LlvmBackend_impl.hpp` (#4583 alias-blind read). The branch checks
+// `declaration` first (the §27.8 alias-resolution result) and falls through
+// to `astNode->name->parts[0]` only when `declaration` is null (the
+// not-yet-resolved shape). Both legs read identically for a bare
+// `IReadOnlySpan<int>` (the alias-tail is read off `headName()` after
+// resolution), so a non-aliased program reaches the `declaration` leg;
+// aliased programs reach the `astNode` leg until resolution populates
+// `declaration`. The spelling "IReadOnlySpan" is reserved for the stdlib's
+// read-only span interface (§4.16) — no user code can name its own type
+// with that head.
+bool isIReadOnlySpanType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration && rt->declaration->name == "IReadOnlySpan")
+        return true;
+    if (rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty() &&
+        rt->astNode->name->parts[0] == "IReadOnlySpan")
+        return true;
+    return false;
+}
+
 // §35.4 (v0.200, #2045): the choice classification — see the header comment
 // on `classifyChoiceType` for the full contract. The file-local `classifyChoice
 // Core` recursion helper takes the cycle-guard `choiceSeen` set the public

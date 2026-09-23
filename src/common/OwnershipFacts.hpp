@@ -766,6 +766,26 @@ bool instanceFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
                                  sema::SemaContext& ctx);
 
+// §4.16 (v0.307, issue #4751): the `IReadOnlySpan<TElement>` INTERFACE — the
+// unifying read-only surface for every concrete span type (stdlib §4.16).
+// `isBorrowBearingRecordOrSpan` is a declaration-based predicate and does not
+// classify an interface type: an `IReadOnlySpan<TElement>` reference carries
+// a borrow of its backing Array/OwningBuffer at runtime (the same canonical
+// shape §9.7 names), but the interface has no fields and is not a record, so
+// the existing record/span/choice legs never reach it. §4.16's textual rule
+// ("a method declaring IReadOnlySpan<TElement> cannot store the parameter in
+// a field that outlives the call … These are the standard borrow-bearing-
+// record constraints; nothing new is added by the interface") IS the §9.7
+// umbrella rule — the interface is borrow-bearing by being the unifying type
+// of borrow-bearing concrete spans, and the field-store rejection applies
+// to it the same way. This predicate closes the gap. Mirrors
+// `isIReadOnlySpanType` in `LlvmBackend_impl.hpp` (#4583 alias-blind read,
+// `headName()` after §27.8 alias resolution copies `declaration`) so a
+// surface alias program (`type Al := IReadOnlySpan<int>`) is classified
+// correctly without depending on whether resolution has populated `declaration`
+// yet. // per §4.16 + §9.7, v0.307
+bool isIReadOnlySpanType(const sema::TypeRef* rt);
+
 // §9.7 / §30.1 (v0.220, #2145): the INSTANTIATION-SITE substitution
 // environment for the borrow-bearing-record field walk. A generic record's
 // field type resolves to the UNINSTANTIATED bare type parameter (`V: T` in
