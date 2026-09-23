@@ -162,8 +162,16 @@ const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
     // imported property does not reach this path anyway — `lowerImportedProperty
     // Set` claims that store first, and #4651's exported stub is its checked
     // face.
-    return instrumentedSetterClass(
-        target, ps, dynamic_cast<const ast::PropertyDecl*>(ps->decl));
+    // An imported property never reaches here: `lowerImportedPropertySet`
+    // claims that store first (:443), before the generic `lvalueAddr`
+    // fall-through this guards, and #4651's exported stub is its checked face.
+    // The decl is an OPTIONAL §13.6 refinement input, not a classification
+    // read - `instrumentedSetterClass` documents its null-`pd` arm as "no
+    // accessor-level refinement". Re-derive from the sema::TypeSymbol
+    // (imported-symbol-audit-2026-08-13.md §4) if either premise moves.
+    // SEAM-DEBT: #4686 ps->decl is null for an imported property (#2414)
+    const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    return instrumentedSetterClass(target, ps, pd);
 }
 
 
