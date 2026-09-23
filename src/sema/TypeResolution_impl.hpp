@@ -579,6 +579,13 @@ private:
     // A static constructor, static members, class-level consts (which
     // are implicitly static), and nested types are permitted.
     void checkStaticClassMembers();
+    // §11.7 (static class inheritance — `static class X: Base` /
+    // `static class X: IFoo` are rejected): a static class may not be
+    // inherited from another class and does not implement interfaces.
+    // The parser admits any `Modifier*` set and any `:`-list of base
+    // types per A.3 / A.4; sema rejects the static-class+base-shape
+    // combination here.
+    void checkStaticClassInheritance();
     void checkStaticIndexers();  // §23.5: static indexers are not supported
     // fix #2758 (§23.5, v0.241): "Indexer parameters may not declare default
     // values" — the declaration-side premise of the positional-only index-

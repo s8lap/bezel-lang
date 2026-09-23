@@ -3050,6 +3050,68 @@ void Resolver::checkStaticClassMembers() {
     }
 }
 
+// §11.7 (Static classes — inheritance and interface implementation):
+// "A static class may not be inherited from and does not implement
+// interfaces." The parser admits any `Modifier*` set and any `:`-list
+// of base types per A.3 / A.4 (the grammar over-admits, sema
+// narrows), so `public static class Utils: Base` and `public static
+// class Utils: IMarker` both parse and would compile to an executable
+// before this check. Reject each base type at the use site: a CLASS
+// base reads as `inherited from another class`; an INTERFACE base reads
+// as `implements an interface`. A static class is uninstantiable
+// (§11.7's `new`-rejection arm at ExprTypecheck_Exprs.cpp:1208), so an
+// inherited slot or interface contract has nothing to dispatch into.
+//
+// Walks this module's own local declaration tree only — same reach as
+// every other §11.7-shaped check (`checkStaticClassMembers` and the
+// #3574 recursive walker), so an imported type's shape is whatever its
+// exporting module's compile produced.
+//
+// `t->baseTypes` is the resolved list (parallel to `t->baseTypeRefs`,
+// one entry per InheritItem). When a base resolved (a built-in like
+// `Object` does), its declaration may be null — but the use site
+// location is the position the diagnostic wants anyway, and that comes
+// from `baseTypeRefs[i]->astNode->span.begin` when present (set by the
+// parser; reconstructable metadata would surface a synthetic location
+// but `astNode` is only populated for locally-parsed bases).
+void Resolver::checkStaticClassInheritance() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Class) return;
+        bool isStatic = false;
+        for (auto mod : t->modifiers) {
+            if (mod == "static") { isStatic = true; break; }
+        }
+        if (!isStatic) return;
+        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+            TypeSymbol* base = t->baseTypes[bi];
+            if (!base) continue;  // built-in / unresolved — already reported
+            const SourceLocation useSite =
+                (bi < t->baseTypeRefs.size() && t->baseTypeRefs[bi] &&
+                 t->baseTypeRefs[bi]->astNode)
+                    ? t->baseTypeRefs[bi]->astNode->span.begin
+                    : t->declLoc;
+            if (base->kind == ast::TypeDeclKind::Interface) {
+                ctx_.diagnostics().report(
+                    Severity::Error, useSite,
+                    std::string("static class `") + std::string(t->name) +
+                    "` may not implement interface `" +
+                    std::string(base->name) +
+                    "` — a static class may not be inherited from and does "
+                    "not implement interfaces (§11.7)");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, useSite,
+                    std::string("static class `") + std::string(t->name) +
+                    "` may not be inherited from `" +
+                    std::string(base->name) +
+                    "` — a static class may not be inherited from and does "
+                    "not implement interfaces (§11.7)");
+            }
+        }
+    });
+}
+
 // §23.5 (#747 R42): static indexers are not supported — in ANY class or record,
 // not only static classes. A `static` indexer was silently accepted and then
 // miscompiled (the access lowered to garbage). Reject it at the declaration.

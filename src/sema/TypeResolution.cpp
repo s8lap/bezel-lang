@@ -403,6 +403,11 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAsTargetInstantiations();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
+    // §11.7 (static class inheritance and interface implementation).
+    // Walks the resolved base type list (`t->baseTypes`), so it must run
+    // after type resolution populates it (it does — every preceding
+    // type-resolution pass has finished by here).
+    checkStaticClassInheritance();
     // fix #3100 (§19.6 / §11.7, v0.254): a `closed` class whose hierarchy
     // has a non-public concrete subclass makes the cross-module
     // exhaustiveness guarantee unsound (the leaf is invisible to importers
