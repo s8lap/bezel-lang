@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var d := new OwningDictionary<string, Cell>(); d.Add("a", move (new Cell(1))); var ok := d.TryPopValue("a", out owned var v); v?.Dispose(); end; return 0; end Main; end C;
+module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var d := new OwningDictionary<string, Cell>(); d.Add("a", (new Cell(1))); var ok := d.TryPopValue("a", out owned var v); v?.Dispose(); end; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

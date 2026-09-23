@@ -14,7 +14,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class R public static n: int := 0; destructor R.n := R.n + 1; end destructor; end R; class C public static method Main(): int using var a := new OwningArray<R>(); a.Add(move (new R())); a.Get(0); return 0; end Main; end C;
+module M; class R public static n: int := 0; destructor R.n := R.n + 1; end destructor; end R; class C public static method Main(): int using var a := new OwningArray<R>(); a.Add((new R())); a.Get(0); return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

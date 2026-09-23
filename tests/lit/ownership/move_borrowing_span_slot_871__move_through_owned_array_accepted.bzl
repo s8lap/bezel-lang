@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cell public constructor() end; destructor end; end Cell; class C public static method Main(): int using var owner := new OwningArray<Cell>(); owner.Add(move (new Cell())); using var x := move owner[0]; return 0; end Main; end C;
+module M; class Cell public constructor() end; destructor end; end Cell; class C public static method Main(): int using var owner := new OwningArray<Cell>(); owner.Add((new Cell())); using var x := move owner[0]; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §
