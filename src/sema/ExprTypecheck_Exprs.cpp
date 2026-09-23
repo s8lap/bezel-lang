@@ -8288,6 +8288,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // resolves member access on the element (e.g. `p.x` over Array<Point>).
         TypeRef* linqElem = ce->callee
             ? linqLambdaElementType(ce->callee.get()) : nullptr;
+        // stdlib §2.20 / spec §35.2 (v0.307): the same seeding for the
+        // compiler-provided `Result<T, E>` combinators, whose formals no
+        // MethodSymbol carries — `Map`/`AndThen` take `(T) -> …`,
+        // `MapError` takes `(E) -> …`. Without it an un-annotated lambda
+        // argument (stdlib §2.20's own spelling) had no target type and the
+        // combinator arm rejected the call outright. See
+        // `resultCombinatorLambdaParamType` for why the formal lookup misses.
+        TypeRef* resultCombParam = ce->callee
+            ? resultCombinatorLambdaParamType(ce->callee.get()) : nullptr;
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
@@ -8891,6 +8900,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     pendingLambdaArgContext_ = true;
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
                     else if (linqElem)    pendingLambdaParamType_ = linqElem;
+                    // stdlib §2.20 / spec §35.2 (v0.307): the Result<T, E>
+                    // combinators' `(T) -> …` / `(E) -> …` argument. Same
+                    // singular thread as the two above — all three take one
+                    // parameter — and, like them, an explicit annotation on
+                    // the parameter still wins (the lambda visitor checks
+                    // `p.type` first).
+                    else if (resultCombParam)
+                        pendingLambdaParamType_ = resultCombParam;
                     // stdlib §5 (#1124): an `Aggregate(seed, (acc, x) => …)` fold
                     // lambda is `(TAccum, T) -> TAccum`. Seed BOTH parameters — acc
                     // from the seed's type, x from the source element — so an

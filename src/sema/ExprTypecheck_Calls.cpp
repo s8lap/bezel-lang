@@ -15610,6 +15610,51 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     return linqSourceElementType(ctx_.exprType(*ma->target));
 }
 
+// stdlib §2.20 / spec §35.2 (v0.307): the parameter type
+// of a `Result<T, E>` value-payload combinator's function argument.
+//
+// The four combinators (Map / MapError / AndThen / UnwrapOr) are
+// COMPILER-PROVIDED — the stdlib declares them but there is no `MethodDecl`
+// and no `MethodSymbol`, so `formalFnParamType2` (fix #829/#4510), which
+// reads the matched formal's declared slot, finds nothing. The result was
+// that an un-annotated lambda argument — the spelling stdlib §2.20's own
+// examples use (`ParsePort(raw).Map(lambda(p) => $"listening on {p}")`) —
+// got NO target type at all: the lambda's parameter stayed untyped, its
+// inferred function TypeRef never materialised, and the combinator arm in
+// `visitCallExpr` rejected the call with "`Result.Map` requires a
+// function-typed argument (§35.2)". §27.4 admits the omitted annotation
+// "whenever the target type is known from context", and §35.2 fixes that
+// context exactly: `Map(f: (T) -> U)` and `AndThen(f: (T) -> Result<U, E>)`
+// take the receiver's T; `MapError(f: (E) -> F)` takes the receiver's E.
+//
+// `UnwrapOr(fallback: T)` takes a plain value, not a function (§35.2: "there
+// is no lazy UnwrapOrElse"), so it is deliberately absent here — seeding a
+// lambda parameter for it would invent a callback the spec declines.
+//
+// Returns null for anything that is not one of the three function-taking
+// combinators on a `Result<T, E>` receiver, so no other call is affected.
+// The §35.4 rule-3 value-like admissibility gate is unchanged and still runs
+// in `visitCallExpr`: this only supplies the parameter type a lambda needs to
+// be typed at all — a non-value-like receiver is rejected exactly as before.
+TypeRef* ExprTC::resultCombinatorLambdaParamType(const ast::Expr* callee) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+    const bool takesT = (m == "Map" || m == "AndThen");
+    const bool takesE = (m == "MapError");
+    if (!takesT && !takesE) return nullptr;
+    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    // The same receiver shape the combinator arm in `visitCallExpr` keys on
+    // (§35.2): the stdlib's own `Result` choice, instantiated at two args.
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration->kind != ast::TypeDeclKind::Choice ||
+        recvTy->declaration->name != "Result" ||
+        recvTy->genericArgs.size() != 2)
+        return nullptr;
+    return takesT ? recvTy->genericArgs[0] : recvTy->genericArgs[1];
+}
+
 // stdlib §5 / §9.6: the element type T of a LINQ *source* TypeRef — the
 // receiver of a LINQ operator, or the `other` argument of a set-like/Zip
 // operator. A collection (Array/Set/… — Named with astNode, no declaration),

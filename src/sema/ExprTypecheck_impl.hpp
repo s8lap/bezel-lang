@@ -873,6 +873,14 @@ private:
     // is typed as the element type (its body can then resolve `p.x`).
     TypeRef* linqLambdaElementType(const ast::Expr* callee);
 
+    // stdlib §2.20 / spec §35.2: the parameter type of the function argument
+    // of a compiler-provided `Result<T, E>` value-payload combinator —
+    // `Map(f: (T) -> U)` / `AndThen(f: (T) -> Result<U, E>)` take T,
+    // `MapError(f: (E) -> F)` takes E. Used to set pendingLambdaParamType_
+    // before visiting the lambda argument, exactly as the LINQ/event-handler
+    // threads above do. Null when the call is not such a combinator.
+    TypeRef* resultCombinatorLambdaParamType(const ast::Expr* callee);
+
     // stdlib §5 / §9.6: the element type T of a LINQ *source* TypeRef (a
     // collection, lazy IEnumerable sentinel, Range<T>, or string). Factored out
     // of linqLambdaElementType so both a LINQ operator's receiver element and a
