@@ -1313,6 +1313,92 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                                            "field", fd->span.begin);
             }
         }
+        // §28.5 / §28.1 (v0.300, #4685): validate the declared type of an
+        // `owned` FIELD at the declaration site. §28.5 restricts the
+        // declared type of an `owned` slot to class, interface, or bare type
+        // parameter — runtime-managed reference types (`string`,
+        // `Type`, function types) and value types carry no disposal
+        // obligation to transfer (§28.9). Two inline-array shapes are
+        // distinct cases:
+        //   - non-owning `[N]T` / `[N]T?` (no slot marker): slots hold
+        //     borrows; the field-level `owned` is meaningless — reject
+        //     (the spec calls this "the array's slots hold borrows; there
+        //     is no per-slot ownership to manage").
+        //   - owning `[N owned]T` / `[N owned]T?`: the type-level `owned`
+        //     slot marker already conveys the obligation (the class's
+        //     generated Dispose disposes each slot, §28.4 step 2). A
+        //     separate field-level `owned` is a double-marking error
+        //     (§28.5 bullet 6: "Writing `private owned slots: [N owned]
+        //     Connection?;` is rejected as a double-marking error").
+        //
+        // The equivalent check for parameters/returns lives in
+        // checkOwnedDeclType (§28.1 "Type requirement", v0.193). Field
+        // declarations were never wired through that check, so the
+        // class-side admission silently accepted runtime-managed and
+        // value-typed fields (s28_5_0002 string / s28_5_0004 function /
+        // s28_5_0006 non-owning inline-array / s28_5_0009 owning inline-
+        // array field-modifier cases).
+        //
+        // Records already have their own restriction at
+        // TypeResolution_Checks.cpp's checkRecordRestrictions (~line
+        // 2072), which rejects any `owned` field on a record outright
+        // before this check would fire — so this branch is class-side.
+        bool isOwnedField = false;
+        for (std::string_view mod : fd->modifiers) {
+            if (mod == "owned") { isOwnedField = true; break; }
+        }
+        if (isOwnedField && fd->type) {
+            const TypeRef* rt = ctx_.resolvedType(*fd->type);
+            if (rt) {
+                if (rt->kind == TypeRef::Kind::InlineArray) {
+                    if (rt->arrayOwned) {
+                        // §28.5 bullet 6: owning-inline-array field with the
+                        // `owned` field modifier is a double-marking error.
+                        // The type-level marker already enrolls the field in
+                        // §28.4 step 2's per-slot dispose pass.
+                        ctx_.diagnostics().report(
+                            Severity::Error, fd->span.begin,
+                            std::string("field `") + std::string(fd->name) +
+                            "` of class declares both the `owned` field "
+                            "modifier and an owning-inline-array type "
+                            "`[N owned]T?` — the type-level `owned` slot "
+                            "marker already conveys the obligation "
+                            "(§28.4 step 2 disposes each non-null slot), so "
+                            "the field-level `owned` is a double-marking "
+                            "error (§28.5). Drop the field modifier; the "
+                            "inline-array's slot marker is the only "
+                            "marker the field needs");
+                    } else {
+                        // §28.5 bullet 5: inline-array without the slot
+                        // marker may not be `owned` — slots hold borrows
+                        // (or value-typed copies), no per-slot obligation.
+                        ctx_.diagnostics().report(
+                            Severity::Error, fd->span.begin,
+                            std::string("field `") + std::string(fd->name) +
+                            "` of class is `owned` but its inline-array "
+                            "type `[N]T` / `[N]T?` lacks the `owned` slot "
+                            "marker — an inline-array field without the "
+                            "slot marker holds borrows in its slots, so "
+                            "the field-level `owned` has no slot "
+                            "obligation to manage (§28.5). Either add the "
+                            "`owned` slot marker to make the slots own "
+                            "their contents (`[N owned]T?`), or drop the "
+                            "field-level `owned` modifier");
+                    }
+                } else {
+                    // Non-inline-array case: defer to checkOwnedDeclType's
+                    // §28.1 type-requirement machinery for `string`,
+                    // `Type`, function types, value-type builtins, enum,
+                    // record, non-class-or-interface Named, and bare-type-
+                    // parameter with a `where T: value` constraint. The
+                    // existing check renders a "owned is not admissible on
+                    // field `f` of type …" diagnostic citing §28.1.
+                    checkOwnedDeclType(
+                        rt, fd->span.begin,
+                        std::string("field `") + std::string(fd->name) + "`");
+                }
+            }
+        }
         // Issue #163: resolve types embedded in the initializer
         // expression (e.g. `new T()`), so a class-typed field
         // initializer is fully typed — mirrors what ctor/method
@@ -1783,7 +1869,12 @@ void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
         badDesc = "the unit type `()`";
         break;
     case TypeRef::Kind::Function:
-        badDesc = "a function type";
+        // §28.5 / §28.9: function values are runtime-managed, so a
+        // function-typed field carries no disposal obligation to
+        // transfer (§28.5 bullet 4). Spec text says "Function-typed
+        // fields may not be `owned`" — the "function-typed" wording is
+        // what corpus cases (`diagnostic:` substring) pin.
+        badDesc = "a function-typed value (a runtime-managed reference type, §28.9)";
         break;
     case TypeRef::Kind::Primitive:
         // `string` is a runtime-managed reference type (§28.9) and every other
