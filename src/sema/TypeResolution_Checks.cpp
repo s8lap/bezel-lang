@@ -10059,6 +10059,24 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
                 "(\xC2\xA7""32.5)");
         return false;
     }
+    // §32.5 (fix #4660) — "Not admitted, with reasons": `out owned` parameters
+    // are not admitted at the FFI boundary. The diagnostic must carry the rule's
+    // own spec term (`out owned`). Runs BEFORE `isFfiCompatibleType` because
+    // the latter would otherwise admit the bare type (`CString`, etc.) and
+    // silently return true.
+    if (!returnPosition && paramModifier == "out owned") {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("extern method ") + declSpelling +
+                " declares an `out owned` parameter of type `" +
+                spellExternType(t) +
+                "`, which is not admitted at the FFI boundary — ownership "
+                "transfer through an out-slot has no defined native contract "
+                "(who allocated, who frees?); the `owned CString` return "
+                "contract of \xC2\xA7""32.6 covers the owning case "
+                "(\xC2\xA7""32.5)");
+        return false;
+    }
     if (isFfiCompatibleType(t, returnPosition, scope)) return true;
     // per §32.13 clause 3 (v0.306): "Admission — by address (§32.5): as
     // `ref`/`out` extern parameters (C sees `R*`; §32.5's rules) and as
