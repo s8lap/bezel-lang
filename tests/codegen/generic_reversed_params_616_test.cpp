@@ -1,6 +1,23 @@
 // Codegen — generic method returning a NEW GENERIC INSTANCE with REVERSED type
 // parameters (issue #616; §14 generics, §22.4 constructor calls).
 //
+// ── §28.3 row 4 (v0.307) note ────────────────────────────────────────────
+// The four `Swap()` declarations below read `: owned Pair<...>`, not
+// `: Pair<...>`. That is REQUIRED, not incidental: each returns
+// `new Pair<...>(...)` — a fresh owned value — and §28.3's announcement
+// table row 4 admits only a receiver-sourced borrow through a plain
+// concrete class return ("a fresh owned value is rejected here; declare
+// the return type `owned` to transfer ownership to the caller"), which
+// §28.6's fresh-value rule states independently.
+//
+// The rows originally spelled the plain return and were admitted by a
+// pre-v0.307 compiler. `fe95b173` implemented row 4 and they became
+// compile errors — the tests pinned behaviour the spec does not have.
+// The marker is added rather than the rule relaxed; every call site
+// already binds with `using var`, so the adopted ownership is what the
+// tests always meant. Nothing about the generic-monomorphization defect
+// these rows exist for (#616) changes.
+//
 // HIGH miscompile: `Pair<string,int>.Swap()` returned the wrong values —
 // `GetFirst()` on the result returned garbage instead of the int (42), and
 // `GetSecond()` returned garbage instead of the string ("hello").  The root
@@ -44,7 +61,7 @@ BEZEL_TEST(generic_reversed_params_616, single_param_swap_control) {
         "class Pair<T> "
         "  public _first: T; public _second: T; "
         "  public constructor(a: T, b: T) _first := a; _second := b; end constructor; "
-        "  public method Swap(): Pair<T> return new Pair<T>(_second, _first); end Swap; "
+        "  public method Swap(): owned Pair<T> return new Pair<T>(_second, _first); end Swap; "
         "  destructor end destructor; "
         "end Pair; "
         "class C public static method Main(): int "
@@ -74,7 +91,7 @@ BEZEL_TEST(generic_reversed_params_616, swap_two_params_first_field) {
         "  public constructor(a: A, b: B) _first := a; _second := b; end constructor; "
         "  public method GetFirst(): A => _first; "
         "  public method GetSecond(): B => _second; "
-        "  public method Swap(): Pair<B, A> "
+        "  public method Swap(): owned Pair<B, A> "
         "    return new Pair<B, A>(_second, _first); "
         "  end Swap; "
         "  destructor end destructor; "
@@ -103,7 +120,7 @@ BEZEL_TEST(generic_reversed_params_616, swap_both_fields_correct) {
         "  public constructor(a: A, b: B) _first := a; _second := b; end constructor; "
         "  public method GetFirst(): A => _first; "
         "  public method GetSecond(): B => _second; "
-        "  public method Swap(): Pair<B, A> "
+        "  public method Swap(): owned Pair<B, A> "
         "    return new Pair<B, A>(_second, _first); "
         "  end Swap; "
         "  destructor end destructor; "
@@ -129,7 +146,7 @@ BEZEL_TEST(generic_reversed_params_616, swap_int_string_second_field_value) {
         "  public constructor(a: A, b: B) _first := a; _second := b; end constructor; "
         "  public method GetFirst(): A => _first; "
         "  public method GetSecond(): B => _second; "
-        "  public method Swap(): Pair<B, A> "
+        "  public method Swap(): owned Pair<B, A> "
         "    return new Pair<B, A>(_second, _first); "
         "  end Swap; "
         "  destructor end destructor; "
