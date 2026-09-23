@@ -618,8 +618,15 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
         for (Symbol* m : t->members) {
             auto* cs = dynamic_cast<ConstructorSymbol*>(m);
             if (!cs) continue;
+            // SEAM-DEBT: #4714 the caller walks `ctx_.module()->children`, so
+            // no imported TypeSymbol reaches this loop; and this is a
+            // DECLARATION-site rule, so the null branch is the right answer
+            // even if one did (an imported record's ctors were checked in its
+            // own module). Re-derive from the sema::Symbol
+            // (imported-symbol-audit-2026-08-13.md §4) if either premise moves.
+            const auto* rawCtorDecl = cs->decl;
             const auto* cd =
-                dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                dynamic_cast<const ast::ConstructorDecl*>(rawCtorDecl);
             if (!cd) continue;  // imported — nothing local to check
 
             // §9.9 "on any constructor of the record, of any visibility, in
