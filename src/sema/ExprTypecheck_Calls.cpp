@@ -85,6 +85,70 @@ std::string typeNameForDiag(const TypeRef* t) {
     return s;
 }
 
+// fix #4660 commit 5 (s32_5_0018, §32.5 line 9706, v0.309): "A temporary or
+// otherwise non-assignable inline-array argument is a compile error." The
+// declaration-side check (`checkExternType` in TypeResolution_Checks.cpp,
+// the prior #4660 commits) gates the FORMAL parameter's type; this gates
+// the call-site ARGUMENT — the only place the by-address marshalling can
+// fail, since the spec mandates the address of the CALLER's storage cross
+// the boundary (§22.3 location categories). Skips `ref`/`out` positions:
+// those reach the stricter §22.3 `checkRefOutOperandCategory` arm on the
+// same argument and reject non-storage-locations with a more specific
+// message; doubling up would noise up well-typed `ref` inline-array args.
+// Skips a parameter whose resolved type isn't an InlineArray, so the rule
+// doesn't double-report with the declaration-side catch-all on a
+// different reject row. File-local (not a member) so the fix is contained
+// to this TU — no header changes (per the c22 addendum's file-isolation
+// rule).
+void checkCallSiteInlineArrayArg(
+    SemaContext& ctx, const std::vector<ast::Param>& fparams,
+    const std::vector<ast::CallArgument>& args) {
+    const std::size_t nArgs = args.size();
+    for (std::size_t i = 0; i < fparams.size() && i < nArgs; ++i) {
+        const ast::Param& fp = fparams[i];
+        if (!fp.type) continue;
+        TypeRef* pt = ctx.resolvedType(*fp.type);
+        if (!pt || pt->kind != TypeRef::Kind::InlineArray) continue;
+        const ast::CallArgument& a = args[i];
+        if (!a.value) continue;             // discard: out of scope
+        if (!a.modifier.empty()) continue;  // ref/out: §22.3 path
+        // §22.3 / §32.5: the §22.3 location categories are the assignable-
+        // storage-location set — an Identifier (local / parameter / static
+        // member / field base), a MemberAccessExpr (a `.field` / `.property`
+        // hop), or an IndexExpr (an `[idx]` hop), with postfix `!` and chain
+        // hops stripped, terminating at the base. Anything else (a CallExpr
+        // result, a binary/unary expression, a literal, a `new` expression,
+        // a parenthesized expression whose inner is not a storage location,
+        // …) is a temporary and is rejected.
+        const ast::Expr* base = a.value.get();
+        while (base) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(base))
+                base = ma->target.get();
+            else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(base))
+                base = ix->target.get();
+            else if (auto* pb =
+                         dynamic_cast<const ast::PostfixBangExpr*>(base))
+                base = pb->operand.get();
+            else
+                break;
+        }
+        const bool isStorageLoc =
+            base && dynamic_cast<const ast::IdentifierExpr*>(base);
+        if (!isStorageLoc) {
+            ctx.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                std::string("extern call argument ") +
+                    std::to_string(i + 1) + " (`" + typeNameForDiag(pt) +
+                    "`) is a temporary / non-assignable expression — an "
+                    "inline-array argument at the FFI boundary must be an "
+                    "assignable storage location (a local, parameter, "
+                    "field, indexer, or property slot), since the call "
+                    "passes the address of the caller's storage "
+                    "(\xC2\xA7""32.5 / \xC2\xA7""22.3)");
+        }
+    }
+}
+
 const char* classificationName(common::ChoiceClassification c) {
     switch (c) {
         case common::ChoiceClassification::ValueLike:     return "value-like";
@@ -4163,6 +4227,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             unit->kind = TypeRef::Kind::Unit;
             ctx_.setExprType(&ce, unit);
         }
+        // fix #4660 commit 5 (s32_5_0018, §32.5 line 9706): reject a
+        // temporary or otherwise non-assignable inline-array argument at
+        // an extern call site. Sibling helper — kept out of the general
+        // dispatch path on peer directive, mirroring L3 commit 11b5fa1e's
+        // `scoped`/`NewExpr` add to `checkArgsAgainstParams`.
+        if (xd->externDecl)
+            checkCallSiteInlineArrayArg(ctx_, xd->externDecl->params, ce.args);
     }
     // CG60: call through a function-typed local/parameter — propagate the
     // function's declared return type to the CallExpr so that downstream
