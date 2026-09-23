@@ -5338,12 +5338,33 @@ bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // Widening to Class|Interface fixes the Class-only check that caused
     // OwningDictionary<K,IFoo> indexer-set and move-out to skip disposal for
     // interface-valued slots.
+    //
+    // fix #4642 (§8.6 / §8.3 / §28.11, v0.307): further widened to admit
+    // `Object`. A §8.6 box IS reference-shaped at the slot — a heap pointer
+    // carrying the §8.3 object header (vtable at word 0), exactly like a class
+    // or interface element — but it is `Kind::Primitive` with no `TypeSymbol`
+    // declaration, so it fell past the `Kind::Named && declaration` guard. The
+    // authority used is `hasObjectHeaderEquality`, the SAME named predicate
+    // `genericBackingType`'s dictionary row and `lowerNew`'s SortedSet
+    // rejection already use for "carries the §8.3 object header: a class, an
+    // interface, or `Object`", rather than a fourth hand-rolled spelling of it
+    // — and it is exactly this function's old test plus the `Object` row.
+    //
+    // WHY IT MATTERS (issue #4642): `materializeArrayBackedSetLiteral`'s opening
+    // `if (!collectionElemIsClass(setTy, 0)) return nullptr;` is the reason
+    // `var s: Set<Object> := [];` never materialised AT ALL — `genericBackingType`
+    // declines `Object` for a set (deliberately: a class/interface/Object set is
+    // array-backed, #1070), both materialisers returned null, and
+    // `lowerLocalDecl`'s #559 "materialisation failed; sema already diagnosed
+    // it" guard then dropped the local's storage with NO diagnostic, so every
+    // later read of `s` missed `locals_` and degraded to the #2434 zero-init
+    // fallback. `new Set<Object>()` already allocated a `bz_array_t` (lowerNew's
+    // array arm lists `Set`/`OwningSet`) and `registerCollectionDisposal`
+    // already classified such a set array-backed via the same
+    // `genericBackingType` test, so this closes the literal half of a split the
+    // rest of the backend had already made.
     if (!collTy || collTy->genericArgs.size() <= idx) return false;
-    const sema::TypeRef* el = collTy->genericArgs[idx];
-    if (!el || el->kind != sema::TypeRef::Kind::Named || !el->declaration)
-        return false;
-    return el->declaration->kind == ast::TypeDeclKind::Class ||
-           el->declaration->kind == ast::TypeDeclKind::Interface;
+    return hasObjectHeaderEquality(collTy->genericArgs[idx]);
 }
 
 

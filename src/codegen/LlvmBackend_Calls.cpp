@@ -1734,6 +1734,33 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
     if (elemIsClass && bothPtr) {
         const sema::TypeSymbol* cls =
             (ty && ty->kind == K::Named) ? ty->declaration : nullptr;
+        // fix #4642 (§8.6/§8.4/§28.11, v0.307): an `Object` element reaches
+        // this arm whenever the CALLER classified it class-shaped — which is
+        // now every array-backed `Set<Object>` operation (`arrElemIsClass`,
+        // widened below) and `emitArrayBackedSetInsert`, whose `elemIsClass`
+        // argument is hardcoded `true` because its backing slot is a pointer
+        // by construction. `cls` is ALWAYS null for `Object` (`Kind::Primitive`,
+        // never `Kind::Named`), so without this arm `classEqualsOverride(null)`
+        // answers "no override" and control falls to the class default at the
+        // bottom of this block — `CreateICmpEQ(el, target)`, RAW BOX-POINTER
+        // IDENTITY. Two §8.6 boxes of the same `int` are distinct heap
+        // allocations, so `s.TryAdd(1)` twice would both insert and
+        // `s.Contains(1)` would answer false against a freshly boxed query:
+        // #4619's `Array<Object>.Contains` defect reproduced one level up, and
+        // the reason the two gate widenings are NOT separable from this arm.
+        //
+        // The dispatch is step 4's, verbatim (`lowerObjectEquals` — null →
+        // identity, `bz_string*` → content equality, class/box →
+        // `vtable[kEqualsSlot]`, which for a box is `bz$boxeq$<T>`'s value
+        // comparison). It is placed here rather than left to step 4 because
+        // step 1 RETURNS on every path once entered; the two arms must agree,
+        // and they do — the same helper, reached from callers that differ only
+        // in how they classified the slot. Same reasoning as the Interface arm
+        // immediately below (fix #4594): the runtime `Equals` is not knowable
+        // from the declared element type, so it is read off the object itself.
+        if (ty && ty->kind == K::Primitive &&
+            ty->primitive == sema::PrimitiveType::Object)
+            if (llvm::Value* objEq = lowerObjectEquals(el, target)) return objEq;
         // fix #4594 (§8.4/§25.2, v0.306): an INTERFACE-typed element's
         // `Equals` override lives on the RUNTIME implementing class, which is
         // not statically knowable at the element type — `classEqualsOverride`
@@ -1962,6 +1989,20 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
                                        llvm::Function* dupDisposer,
                                        int64_t esz) {
     if (!setArr || !item) return false;
+    // fix #4642 (§8.6/§4.10, v0.307): the array-backed set's slot is a POINTER
+    // by construction — this function loads each element as `ptrTy()` and
+    // `collectionElemSize` gives 8 for every element type that reaches here —
+    // so a non-pointer `item` is never storable. Before `Object` was admitted
+    // as an element type the shape could not arise (a class/interface value is
+    // already a pointer); now a caller that has NOT §8.6-boxed a bare value
+    // element would reach `bz_array_add` with, say, a 4-byte `i32` alloca and
+    // an 8-byte stride — a stack-buffer-overflow READ of the slot's redzone,
+    // then a garbage pointer stored as an element and dereferenced by the next
+    // `lowerObjectEquals`. Refuse instead: the caller reports its own
+    // internal-failure diagnostic and no unsafe IR is emitted. Every correct
+    // caller boxes first (`boxForTarget`, the three `.Add`/`.TryAdd` arms
+    // below), so this is an assertion of their precondition, not a live arm.
+    if (!item->getType()->isPointerTy()) return false;
     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
     llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
     auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
@@ -5536,9 +5577,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // reference identity (for emitRemoveElementEquality).  Per §28.11 v0.135
         // fix #619: Interface is now included (elementPolicyFor returns ClassOwned/
         // ClassBorrow for interface elements, collectionElemIsClass widened).
+        // fix #4642 (§8.6/§8.3/§4.10, v0.307): `Object` joins the row. A §8.6
+        // box is reference-shaped at the slot (a heap pointer bearing the §8.3
+        // object header) exactly like a class or interface element, but
+        // `elementPolicyFor` classifies it `Value` — §28.11 v0.135's table has
+        // no "boxed value" row, and deciding what its OWNING column should be
+        // (which disposer discharges a box?) is a §28.11 question this fix does
+        // not answer, so the policy table is deliberately left alone and the
+        // widening is made HERE, at the one predicate that asks the narrower
+        // question this dispatcher actually needs: "is this element slot a
+        // §8.3-object-header-bearing pointer?". `hasObjectHeaderEquality` is
+        // the existing named authority for exactly that property (the same one
+        // `genericBackingType`'s dictionary row and `collectionElemIsClass`
+        // use), not a new spelling of it.
+        //
+        // Leaving the policy table alone is safe here because the OWNING column
+        // is unreachable for `Object` regardless: sema rejects `OwningSet<Object>`
+        // / `OwningArray<Object>` at instantiation ("requires a class or
+        // interface element type … a primitive value type has no disposal
+        // obligation", stdlib §4.2/§14.4, #1327 — VERIFIED by probe, not
+        // assumed), so every `arrIsOwning && arrElemIsClass` gate below stays
+        // dead for `Object` and only the BORROWING `Set<Object>` arms and the
+        // shared membership scans (`Contains`/`IndexOf`/`Remove`) change. For
+        // those three the policy row is `ClassBorrow`-equivalent anyway: a null
+        // disposer and a pointer slot.
         bool arrElemIsClass =
             arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
-            arrElemPol.cat == ElementPolicy::Category::ClassBorrow;
+            arrElemPol.cat == ElementPolicy::Category::ClassBorrow ||
+            hasObjectHeaderEquality(arrElemRef);
 
         // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
         // found. Match semantics (issue #424 / §25.2): dispatched per element
@@ -5677,6 +5743,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): §8.6-box a bare value into an
+            // `Object`/interface element slot before the dedup scan and the
+            // append — `boxForTarget` is a byte-identical no-op for a class
+            // element or an already-reference source, so `OwningSet<C>` is
+            // unchanged. UNREACHABLE for `Object` today (sema rejects
+            // `OwningSet<Object>`, #1327); written for symmetry with the two
+            // borrowing arms below so the three set-insert sites cannot drift.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
             if (!emitSetDedupInsert(item)) return nullptr;
             // fix #1970 / §28.4 / §28.6: OwningSet<T>.Add takes `owned item`
             // (the dup branch disposes `item`, the non-dup branch transfers
@@ -5718,6 +5792,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             isBorrowingSetRecv && arrElemIsClass && !arrIsOwning) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): see the OwningSet.Add arm above.
+            // This is the reachable half — `Set<Object>.Add(1)` must store the
+            // §8.6 box, not the raw `i32`, or the dedup scan compares a value
+            // against a pointer and `bz_array_add` copies 8 bytes out of a
+            // 4-byte slot.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
             if (!emitSetDedupInsert(item)) return nullptr;
             if (isFreshOwnedClassProducer(call.args[0].value.get()))
                 emitDisposeAndReclaim(item);
@@ -6137,6 +6217,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): §8.6-box a bare value into an
+            // `Object`/interface element slot before this handler's own dedup
+            // scan and append (it does not route through
+            // `emitArrayBackedSetInsert`, so it needs the box in its own right).
+            // THE arm the issue's repro reaches: `s.TryAdd(1)` on a
+            // `Set<Object>`. A no-op for a class element or a reference source.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
+            if (!item->getType()->isPointerTy()) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "ta.len");
             // Create all BBs upfront to avoid CFG wiring errors.
