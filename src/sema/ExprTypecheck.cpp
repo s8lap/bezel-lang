@@ -5279,12 +5279,15 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
     }
     // No common type: report and adopt the then-branch type so member
     // access on the (already-erroneous) result still resolves downstream.
+    // §20: "the expression is a compile error directing to an explicit
+    // conversion or upcast" — the diagnostic names both remedies so a reader
+    // sees the path forward without consulting the spec.
     ctx_.setExprType(&e, tt);
     ctx_.diagnostics().report(
         Severity::Error, cnd.span.begin,
         "the two branches of an `if` expression have no common type: "
-        "neither branch's type is implicitly convertible to the other "
-        "(§20)");
+        "neither branch's type is implicitly convertible to the other — "
+        "introduce an explicit conversion or upcast (§20)");
 }
 
 // §19 + §20: type a `case` EXPRESSION with the COMMON type of its
