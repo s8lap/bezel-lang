@@ -297,16 +297,6 @@ private:
     void checkTypeReadonlyPropertyForms(TypeSymbol* t);
     void checkTypeReadonlyPropertyFormsMember(PropertySymbol* ps);
 
-    // §22.10: a primary-constructor parameter list admits plain, `owned`,
-    // and class- or interface-typed `scoped` parameters; `scoped` on a
-    // value-typed parameter (a primitive, a record, an inline array, a
-    // function type, ...) is rejected semantically. The parser admits
-    // `scoped` syntactically (the same over-admit-and-reject-semantically
-    // pattern the `ref`/`out` checks use); sema names the rule once the
-    // parameter type is resolved.
-    void checkPrimaryCtorParamModifiers();
-    void checkTypePrimaryCtorParamModifiers(TypeSymbol* t);
-
     // Slice S34 (§12.1): "Fields, constructors, destructors, and static
     // members may not be virtual." A static method or property carrying
     // `virtual` / `abstract` / `override` is rejected.
@@ -547,22 +537,7 @@ private:
     void checkTypeOverloads(TypeSymbol* t);
 
     bool signaturesIndistinguishable(const std::vector<Symbol*>& a,
-                                     const std::vector<Symbol*>& b,
-                                     const TypeSymbol* ownerType);
-
-    // per §22.6 (v0.307, fix #4631): declaration-guard predicate — does
-    // `t`'s declared parameter type qualify for the "ordinary owned"
-    // overload-pair carve-out? Returns true for class, interface, choice
-    // (any reference-carrying kind) and for a generic parameter
-    // constrained to a reference type (`where T : class` or
-    // `where T : IFoo`/`where T : CBar`). Returns false for primitives,
-    // records, enums, value types, and unconstrained type parameters.
-    // `ownerType` is the enclosing TypeSymbol; it lets the predicate
-    // resolve a bare `T` (unresolved Named TypeRef whose declaration
-    // slot is still null at the parameter-declaration site) to the
-    // GenericParamSymbol declared on the owner.
-    bool ownsPairTypeQualifies(const TypeRef* t,
-                               const TypeSymbol* ownerType);
+                                     const std::vector<Symbol*>& b);
 
     // Slice S17 (§11.7): `abstract` and `static` are mutually exclusive;
     // `sealed` and `static` are mutually exclusive. v0.242 (#3052): the

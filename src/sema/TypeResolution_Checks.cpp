@@ -2690,8 +2690,7 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
         for (std::size_t i = 0; i < overloads.size(); ++i) {
             for (std::size_t j = i + 1; j < overloads.size(); ++j) {
                 if (signaturesIndistinguishable(*overloads[i].first,
-                                                *overloads[j].first,
-                                                t)) {
+                                                *overloads[j].first)) {
                     ctx_.diagnostics().report(
                         Severity::Error, overloads[j].second->declLoc,
                         std::string("overload of ") + label +
@@ -2711,212 +2710,13 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
     checkGroup(indexers, "indexer");  // §23.4 (#774)
 }
 
-// is `b` the resolved bound of a §14.2 `where T: X` constraint, and is X
-// a reference-typed type? Recognises both the import-side shape (a real
-// interface / class TypeSymbol declaration) and the special builtin-
-// interface names (`IDisposable`, `IAsyncDisposable`, `IFormattable`,
-// `IEnumerable<T>`, …) — those resolve via `Resolver::builtinTypeArity`
-// to a Named TypeRef with `declaration == nullptr`, not to a synth
-// TypeSymbol. §8.7 makes the implemented-interface question name-based
-// for several builtins; the same accommodation applies here so a
-// `where T : IDisposable` constraint carries the reference-type force
-// the spec's §22.6 declaration guard relies on, even though IDisposable
-// is a recognised name rather than a declared type.
-static bool constraintBoundQualifies(const TypeRef* b) {
-    if (!b || b->kind != TypeRef::Kind::Named) return false;
-    if (b->declaration) {
-        const auto k = b->declaration->kind;
-        return k == ast::TypeDeclKind::Interface ||
-               k == ast::TypeDeclKind::Class;
-    }
-    // Null-declaration: the bound is a recognised builtin interface /
-    // class name. Identify by `importedName` (imported side) or
-    // `astNode->name->parts.front()` (local-side resolution of a builtin
-    // interface name like `IDisposable` whose declaration is never
-    // minted on the local side either).
-    if (!b->importedName.empty()) {
-        return isBuiltinTypeName(b->importedName);
-    }
-    if (b->astNode && b->astNode->name &&
-        b->astNode->name->parts.size() == 1) {
-        return isBuiltinTypeName(
-            b->astNode->name->parts.front());
-    }
-    return false;
-}
-
-// per §22.6 (v0.307, fix #4631): does `t`'s declared parameter type
-// qualify for the "ordinary owned" overload-pair declaration guard? The
-// rule (§22.6) carves out exactly the types whose borrowing semantics
-// differ from their consuming semantics — class, interface, choice
-// (always reference-carried, by-value brings the borrow), and a type
-// parameter constrained to a reference type (interface or class bound,
-// or the explicit `class` special constraint, or one whose substitutions
-// all implement IDisposable / another reference interface). For a value
-// type (struct, primitive, enum, array) the borrow IS the consume on a
-// known-shape slot, so the pair genuinely collapses; an unconstrained
-// `T` (no class/interface bound) likewise admits value-type
-// substitutions and collapses. A pair differing only in the owned/value
-// modifier at any NON-qualifying position is still the ordinary §22.6
-// collision; the helpers it sits beside reflect the §11.3 / v0.181
-// wording the diagnostic carries.
-//
-// TypeRef for a class/interface/choice/record is `Kind::Named` with a
-// non-null `declaration` whose `kind` field answers the question; the
-// record case is intentionally excluded (a record is value-typed by its
-// positional fields, even when those fields are themselves classes).
-bool Resolver::ownsPairTypeQualifies(const TypeRef* t,
-                                       const TypeSymbol* ownerType) {
-    if (!t) return false;
-    if (t->kind != TypeRef::Kind::Named) return false;
-    // A bare type-parameter reference (`item: T` inside the body of
-    // `class Box<T> where T : IDisposable`) resolves to a Named TypeRef
-    // whose `declaration` IS the GenericParamSymbol. Detect it FIRST,
-    // before the switch on `t->declaration->kind` — a GenericParamSymbol
-    // has no `ast::TypeDeclKind`, so the switch would fall through to
-    // default and reject it. The constraint walker below answers the
-    // qualifying question for the parameter. (GenericParams walker in
-    // ExprTypecheck_Exprs.cpp:12186 documents the same shape; the order
-    // here matches it.)
-    if (auto* gp = dynamic_cast<GenericParamSymbol*>(t->declaration)) {
-        // §22.6 declaration guard, strict reading: a `where T: X` constraint
-        // qualifies ONLY when X is a class or interface type. The bare
-        // `where T : class` special constraint does NOT qualify — it
-        // admits `string` and function-typed substitutions, on which §28.1
-        // erases the owned marker (the runtime cannot take a value type
-        // by owned-marker; the marker is meaningless for copy-by-value
-        // and for runtime-managed reference types) and the pair
-        // collapses to identical signatures. The interface/class TYPE
-        // bound, in contrast, forces the substitution to be a named
-        // reference type whose runtime carrying is a heap pointer and on
-        // which the marker carries (§28.1 keeps it). The cases pin this
-        // distinction: 0018 (`where T : IDisposable`) declares; 0017
-        // (`where T : class`) rejects.
-        for (const auto& c : gp->constraints) {
-            if (c.kind == "type" && c.importedBound) {
-                if (constraintBoundQualifies(c.importedBound)) return true;
-            }
-            if (c.kind == "type" && c.astBound) {
-                // Re-resolve the bound on demand so an unresolved §14.2
-                // clause (collected at SymbolCollection time before the
-                // enclosing type's symbols finished resolving) is still
-                // judged. match `argSatisfiesTypeBound`'s conv: an
-                // unresolved bound falls through and we don't qualify.
-                if (const TypeRef* rb = ctx_.resolvedType(*c.astBound)) {
-                    if (constraintBoundQualifies(rb)) return true;
-                }
-            }
-        }
-        return false;
-    }
-    // Real type declaration: class, interface, or choice — the ordinary
-    // "reference-carried" types whose borrow semantics differ from their
-    // consume semantics. Records, enums, primitives, and value builtins
-    // fall through to default and DO NOT qualify (a record's positional
-    // fields are by-value, even when the fields are themselves classes).
-    if (t->declaration) {
-        switch (t->declaration->kind) {
-            case ast::TypeDeclKind::Class:
-            case ast::TypeDeclKind::Interface:
-            case ast::TypeDeclKind::Choice:
-                return true;
-            default:
-                return false;
-        }
-    }
-    // A bare type-parameter reference inside a generic class body
-    // (e.g. `item: T` inside `class Box<T> where T : IDisposable`) does
-    // not always build a TypeRef whose `declaration` field is the
-    // GenericParamSymbol — at the parameter-declaration site the type
-    // resolver has not yet bound T, so the TypeRef is `Kind::Named`
-    // with `declaration == nullptr` and `astNode` pointing at the
-    // unresolved `Identifier("T")` AST node. Walk up to the enclosing
-    // type's genericParams, find the GenericParamSymbol by NAME, and
-    // judge it via its constraints. The owner's genericParams are
-    // populated by `collectGenericParams` (SymbolCollection pass) before
-    // `checkOverloadSignatures` runs, so the lookup is reliable. If
-    // `ownerType` is null (lambda, top-level method), or T is not a
-    // declared parameter there, the pair can't be declared under the
-    // guard and we don't qualify — the cluster fixes the §22.6
-    // DECLARATION carve-out for genuine class/interface type parameters.
-    if (ownerType && t->astNode && t->astNode->name &&
-        t->astNode->name->parts.size() == 1) {
-        const std::string_view wantedName =
-            t->astNode->name->parts.front();
-        for (Symbol* gpSym : ownerType->genericParams) {
-            if (auto* gp = dynamic_cast<GenericParamSymbol*>(gpSym)) {
-                if (gp->name != wantedName) continue;
-                // per §22.6 (mirroring the dynamic_cast arm above): a
-                // `where T : class` (the bare special constraint) does
-                // NOT qualify — the cases pin this: 0017 rejects, 0018
-                // (`where T : IDisposable`) accepts.
-                for (const auto& c : gp->constraints) {
-                    if (c.kind == "type" && c.importedBound) {
-                        if (constraintBoundQualifies(c.importedBound))
-                            return true;
-                    }
-                    if (c.kind == "type" && c.astBound) {
-                        if (const TypeRef* rb =
-                                ctx_.resolvedType(*c.astBound)) {
-                            if (constraintBoundQualifies(rb))
-                                return true;
-                        }
-                    }
-                }
-                return false;
-            }
-        }
-    }
-    return false;
-}
-
-// at position i, are `pa`'s and `pb`'s ORIGINAL modifiers a member of the
-// "ordinary owned" pair — both collapse to "value" but at least one is the
-// unowned form and at least one is an owned-style marker? This is the
-// exact pair spec §22.6 carves out: ("" vs "owned"), ("owned" vs ""),
-// ("" vs "owned var"), ("owned" vs "scoped"), etc. — i.e., one or more
-// of the modifiers is from {"owned","owned var","scoped","scoped var"}
-// AND they are not textually identical (which is the "both unowned"
-// trivial-collision path, requiring a separate collapse here).
-static bool ownedPairModifierMismatch(std::string_view ma,
-                                      std::string_view mb) {
-    auto isOwnedStyle = [](std::string_view m) {
-        return m == "owned" || m == "owned var" ||
-               m == "scoped" || m == "scoped var";
-    };
-    const bool aOwn = isOwnedStyle(ma);
-    const bool bOwn = isOwnedStyle(mb);
-    // both unowned: no "owned pair" — this is the symmetric-identity arm.
-    if (!aOwn && !bOwn) return false;
-    // exactly one is owned-style: ordinary owned-pair.
-    if (aOwn != bOwn) return true;
-    // both owned-style — same textual marker collapses to the EXACT SAME
-    // overload form, indistinguishable in this rule; e.g. both `owned`
-    // collides, but `owned` vs `scoped` does not (they still name the
-    // same shape at runtime but the SOURCE distinguishes the borrowed
-    // semantics the pair is targeting per §22.6 examples like
-    // `Append(scoped r)` vs `Append(owned r)`, which the overload
-    // resolution has to rank — but here, at declaration, they are still
-    // DECLARABLE as a pair under the §22.6 carve-out when the type
-    // qualifies). The spec's "differing only by ordinary owned" admits
-    // both owned-style sides: treat the pair as needing qualification.
-    return true;
-}
-
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
-                                           const std::vector<Symbol*>& b,
-                                           const TypeSymbol* ownerType) {
+                                           const std::vector<Symbol*>& b) {
     if (a.size() != b.size()) return false;
-    bool sawOwnedPair = false;
-    bool allOwnedPairQualify = true;
     for (std::size_t i = 0; i < a.size(); ++i) {
         auto* pa = dynamic_cast<ParameterSymbol*>(a[i]);
         auto* pb = dynamic_cast<ParameterSymbol*>(b[i]);
         if (!pa || !pb) return false;
-        // The collapsed-modifier check below catches `ref`/`out`/`value`
-        // differences the COLLAPSE erases; an `out`-own vs `out`
-        // distinction collapses identically, so this is the load-bearing
-        // guard, not the textual identity check.
         if (overloadModifier(pa->modifier) !=
             overloadModifier(pb->modifier)) {
             return false;
@@ -2926,25 +2726,6 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
         TypeRef* tb = pb->declType ? ctx_.resolvedType(*pb->declType)
                                    : nullptr;
         if (!typeRefEqual(ta, tb)) return false;
-        // §22.6 carve-out: same collapsed modifier, same type — was this
-        // an "ordinary owned pair" disagreement? If yes, the type at this
-        // position must qualify for the pair to be DECLARABLE; one
-        // unqualified position collapses the pair to a §22.6 collision.
-        if (overloadModifier(pa->modifier) == std::string_view("value") &&
-            ownedPairModifierMismatch(pa->modifier, pb->modifier)) {
-            sawOwnedPair = true;
-            if (!ownsPairTypeQualifies(ta, ownerType)) allOwnedPairQualify = false;
-        }
-    }
-    if (sawOwnedPair && allOwnedPairQualify) {
-        // §22.6: an "owned-pair" with every differing position on a
-        // qualifying type IS distinguishable. The pair is DECLARABLE;
-        // overload resolution at call sites (§22.6) still ranks the
-        // candidates via the §28.3 / v0.181 sequence the rest of the
-        // compiler implements (move-marking + borrowed-arg shapers, see
-        // matchesOwnedCall semantics at the ExprTypecheck_Calls.cpp
-        // overload-resolution sites).
-        return false;
     }
     return true;
 }
@@ -15199,29 +14980,6 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
                         std::string(ps->name) + "` carries modifier `" +
                         std::string(ps->modifier) + "` (\xC2\xA7""22.15)");
                 }
-                // §22.15 (v0.307) "Parameters and result": a move-only value
-                // parameter (an owning-choice instantiation, §35.4 rule 1,
-                // or an owning inline array, §15.1.1) is likewise rejected
-                // — the plain spelling is identical to the `owned` spelling
-                // for such a type, so admitting it would readmit exactly
-                // what the `owned`-parameter rejection excludes.
-                const TypeRef* pt = nullptr;
-                if (ps->resolvedDeclType) {
-                    pt = ps->resolvedDeclType;
-                } else if (ps->declType) {
-                    pt = ctx_.resolvedType(*ps->declType);
-                }
-                const char* moveOnlyKind = nullptr;
-                if (pt && common::isMoveOnlyValueType(pt, ctx_, moveOnlyKind)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("a `pure` member declares no move-only "
-                                    "value parameter (") +
-                        moveOnlyKind + "); method `" +
-                        std::string(ms->name) + "` parameter `" +
-                        std::string(ps->name) + "` carries one "
-                        "(\xC2\xA7""22.15)");
-                }
             }
             // §22.15 "Parameters and result": no `owned` class-typed return.
             bool retOwned = opDecl ? opDecl->returnOwned : false;
@@ -15241,24 +14999,6 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
                                     "class-typed return; method `") +
                         std::string(ms->name) +
                         "` returns an owned class instance "
-                        "(\xC2\xA7""22.15)");
-                }
-            }
-            // §22.15 (v0.307) "Parameters and result": a move-only value
-            // return is likewise rejected — no pure body can produce a
-            // move-only value. Unchecked on the path above (the `owned`
-            // class-typed arm is the wrong shape: an owning choice is not
-            // class-typed), so this is the move-only arm of the same rule.
-            if (retTy) {
-                const TypeRef* rt = ctx_.resolvedType(*retTy);
-                const char* moveOnlyKind = nullptr;
-                if (rt && common::isMoveOnlyValueType(rt, ctx_, moveOnlyKind)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("a `pure` member declares no move-only "
-                                    "value return (") +
-                        moveOnlyKind + "); method `" +
-                        std::string(ms->name) + "` returns one "
                         "(\xC2\xA7""22.15)");
                 }
             }
@@ -15479,67 +15219,6 @@ void Resolver::checkTypePureDispatch(TypeSymbol* t) {
 // Reject (redundant or contradictory): bodyKind == Expression any depth;
 //                                      bodyKind == Block regardless of
 //                                      accessors, AND indexer with body.
-void Resolver::checkPrimaryCtorParamModifiers() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
-            visitTypeAndNested(t, [&](TypeSymbol* ty) {
-                checkTypePrimaryCtorParamModifiers(ty);
-            });
-            continue;
-        }
-    }
-}
-
-void Resolver::checkTypePrimaryCtorParamModifiers(TypeSymbol* t) {
-    // §22.10 (v0.307): a primary-constructor parameter's `scoped`
-    // modifier is admitted only on class- or interface-typed
-    // parameters — the §28.14 bounded-storage contract has no shape
-    // for a value-typed source (no call-site marker discipline, no
-    // bounding-object form). Other modifier shapes (plain, `owned`)
-    // are admitted as before. The check fires once per offending
-    // positional field, naming the parameter and its declared type so
-    // the case-keyword test can find the rule. `scoped` on a
-    // function-typed parameter is also rejected here (no captured-
-    // field storage exists for the function case either; §28.14 names
-    // this arm separately).
-    // SEAM-DEBT: #4703 the only caller walks `ctx_.module()->children`, so no
-    // IMPORTED TypeSymbol reaches this site and `t->decl` is never null here.
-    // Independently, this is a DECLARATION-site rule: an imported type's
-    // primary-ctor params were validated when its own module compiled, so the
-    // early return would be the right answer even if one did arrive. Re-derive
-    // from the sema::TypeSymbol (imported-symbol-audit-2026-08-13.md §4) if the
-    // caller ever walks imported scopes or this becomes a use-site check.
-    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-    if (!td || !td->hasPositionalFields) return;
-    for (const auto& pf : td->positionalFields) {
-        if (pf.modifier != "scoped") continue;
-        if (!pf.type) continue;
-        const TypeRef* pt = ctx_.resolvedType(*pf.type);
-        if (!pt) continue;
-        // Admitted iff the declared type is a class, an interface, or a
-        // bare type parameter whose constraint set admits class /
-        // interface substitutions (the spec's class-or-interface-typed
-        // face). Value types of any kind — primitives, records, enums,
-        // inline arrays, function types — REJECT.
-        const bool isClassOrInterface =
-            (pt->kind == sema::TypeRef::Kind::Named && pt->declaration &&
-             (pt->declaration->kind == ast::TypeDeclKind::Class ||
-              pt->declaration->kind == ast::TypeDeclKind::Interface));
-        const bool isFunctionType =
-            pt->kind == sema::TypeRef::Kind::Function;
-        if (!isClassOrInterface || isFunctionType) {
-            ctx_.diagnostics().report(
-                Severity::Error, t->declLoc,
-                std::string("`scoped` on a primary-constructor parameter is "
-                            "admitted only on class- or interface-typed "
-                            "parameters (§22.10); parameter `") +
-                std::string(pf.name) +
-                "` carries a non-class-or-interface type");
-        }
-    }
-}
-
 void Resolver::checkReadonlyPropertyForms() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {

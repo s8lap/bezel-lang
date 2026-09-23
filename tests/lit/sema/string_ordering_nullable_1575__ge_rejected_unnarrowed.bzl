@@ -5,5 +5,5 @@
 
 module M; class C public static method Main(): int var a: string? := null; var b: string? := "x"; if a >= b then return 1; end; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: operator `>=` requires non-nullable operands (`string`)
-// CHECK-SAME: (§4.6 / §7.11)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: operator `>=` requires non-nullable `string` operands
+// CHECK-SAME: (§4.6)

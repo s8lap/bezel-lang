@@ -553,24 +553,14 @@ void PureBodyWalker::checkPureCtorChainPurity(
 
 bool PureBodyWalker::isEnumeratorConstructingSource(
     const TypeRef* rt) const {
-    // §22.15 rule 5 (v0.307, normative-elision rewrite): ONLY interface
-    // and other non-elision-receiver sources construct an enumerator here.
-    // The §22.15 normative-elision list — `Array<T>`, `OwningArray<T>`,
-    // class-typed `OwningBuffer<T>`, and `string` — is ADMITTED at this
-    // body's own check site: the compiler emits the direct indexed loop
-    // (§29.2's protocol elision) and constructs no enumerator. Range<T>
-    // over primitive steppable type, inline arrays, spans, ReadOnlyString-
-    // Span, and value-typed `OwningBuffer<T>` are also admitted via the
-    // existing direct-indexed lowering. What REJECTs here is the
-    // remaining family — IEnumerable<T> (the source-level canonical
-    // enumerator), the stdlib mutable/owning collection wrappers, the
-    // non-elision interface-typed sources, and a generic type-parameter
-    // source (which the spec calls out: even at a concrete sequence type
-    // the parameter's static surface is its constraint interfaces).
+    // §22.15 rule 5: IEnumerable<T> sources construct an enumerator class
+    // instance — Array<T>, string, IEnumerable<T>, and the stdlib
+    // collection wrappers. Range<T>, inline arrays, spans, and value-typed
+    // OwningBuffer<T> use direct counted loops.
     if (!rt) return false;
     std::string_view head = rt->headName();
-    if (head == "IEnumerable" ||
-        head == "List" || head == "OwningList" ||
+    if (head == "IEnumerable" || head == "Array" || head == "string" ||
+        head == "List" || head == "OwningList" || head == "OwningArray" ||
         head == "OwningDictionary" || head == "OwningSet" ||
         head == "Dictionary" || head == "Set" || head == "Stack" ||
         head == "Queue" || head == "LinkedList" || head == "OwningStack" ||
@@ -935,21 +925,15 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
         // §22.15 rule 5: a `for` loop's source must not construct an
-        // enumerator. The normative elision admits Array<T>, OwningArray<T>,
-        // class-typed OwningBuffer<T>, and string at this body's own check
-        // site; what remains rejected is an interface / generic-type-parameter
-        // / collection-wrapper source whose protocol requires a fresh
         // enumerator. The awaited form is excluded by `pure`+`async`
         // already.
         if (fs->iterable &&
             !forSourceAdmitsEnumerator(*fs->iterable)) {
             reportPureViolation(
                 fs->span.begin, "`for` loop source",
-                "a non-concrete source type at this body's check site "
-                "(an IEnumerable<T>-typed source, a generic type parameter, "
-                "or a collection wrapper) constructs an enumerator; "
-                "declare the source at a concrete sequence type, or use "
-                "an index loop `for var i in 0..<xs.Count`");
+                "the source constructs an enumerator (an "
+                "IEnumerable<T>-typed source including Array<T> and "
+                "string); use an index loop `for var i in 0..<xs.Count`");
         }
         if (fs->iterable) checkExpr(fs->iterable.get());
         if (fs->withExpr) checkExpr(fs->withExpr.get());

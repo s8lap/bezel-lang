@@ -497,14 +497,6 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAsyncModifiers();
     // §22.15 (v0.202, #2052): `pure` placement + signature restrictions.
     checkPureModifiers();
-    // §22.10: a primary-constructor parameter's `scoped` modifier is
-    // admitted only on class- or interface-typed parameters (§28.14's
-    // scoped-storage contract needs a class- or interface-typed source for
-    // the bounding-object forms). Reject the value-typed arm in sema
-    // (the parser over-admits `scoped` syntactically, matching the
-    // over-admit-and-reject-semantically pattern the §22.10 `ref`/`out`
-    // check uses at parse time).
-    checkPrimaryCtorParamModifiers();
     // §22.15 (v0.202, #2052): `pure` dispatch matching (override + iface
     // implementation). Rule-1 checks run inline in checkHidingAndOverride
     // and checkAbstractImplementations (which ran earlier above); this
