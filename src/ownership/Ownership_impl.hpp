@@ -2992,9 +2992,28 @@ private:
     // which §35.5 transfers into the binding at arm selection. A discard, a
     // constant, a nested pattern, and a plain (borrowing) payload slot are
     // NOT transferring and are excluded. // per §35.5, v0.307
+    // `classPayloadsOnly` narrows the result to CLASS/INTERFACE-typed payload
+    // slots. #4635's escape check wants the full set (over-collecting there
+    // only rejects more, the safe direction); #4633's transfer ADMISSION wants
+    // the narrow one, because admitting more is the unsafe direction and the
+    // class/interface bound is exactly `consumeMarkedArmTransfer`'s own
+    // first-landing operand bound.
     void collectOwningMatchTransferBindings(
         const ast::CaseArm& arm, const sema::TypeRef* scrutRef,
-        std::vector<const sema::Symbol*>& out);
+        std::vector<const sema::Symbol*>& out,
+        bool classPayloadsOnly = false);
+
+    // fix #4633 (§35.5 *The owning match* + §28.3 K3.4, v0.307): is `sym` a
+    // TRANSFERRING payload binding of `arm`'s pattern, in an owning match over
+    // `scrutinee`? §35.5 makes such a binding "an **owned local of the arm
+    // body's scope**", so §35.5's transfer out of the arm (`move w` /
+    // `owned w`) names a named owned binding exactly as K3.4 requires — which
+    // `consumeMarkedArmTransfer` could not see, because the ownership dataflow
+    // tracks no `states_` entry for a pattern binding and its LOCALDECL-ONLY
+    // operand bound excludes one besides. // per §35.5, §28.3 K3.4, v0.307
+    bool isOwningMatchTransferBinding(const ast::CaseArm& arm,
+                                      const ast::Expr* scrutinee,
+                                      sema::Symbol* sym);
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.

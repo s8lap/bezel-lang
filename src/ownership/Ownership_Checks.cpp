@@ -6597,7 +6597,7 @@ bool MethodOwnership::owningMatchScrutineeForm(const ast::Expr* scrutinee) {
 // fix #4635 (§35.5, v0.307): see the declaration in Ownership_impl.hpp.
 void MethodOwnership::collectOwningMatchTransferBindings(
         const ast::CaseArm& arm, const sema::TypeRef* scrutRef,
-        std::vector<const sema::Symbol*>& out) {
+        std::vector<const sema::Symbol*>& out, bool classPayloadsOnly) {
     if (!scrutRef || !scrutRef->declaration) return;
     const auto* dp =
         dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
@@ -6645,6 +6645,20 @@ void MethodOwnership::collectOwningMatchTransferBindings(
                 ftInst ? ftInst : ctx_.resolvedType(*pf.type), ctx_, kind);
         }
         if (!transfers) continue;
+        // See the declaration: the #4633 transfer ADMISSION narrows to a
+        // class/interface payload, `consumeMarkedArmTransfer`'s own
+        // first-landing operand bound. A move-only value payload (an owning
+        // inline array, a nested owning choice) transfers per §35.5 too, but
+        // its per-path discharge machinery is separate and untested here —
+        // keep it rejected rather than admit a lowering nobody has measured.
+        if (classPayloadsOnly) {
+            if (!ftInst || ftInst->kind != sema::TypeRef::Kind::Named ||
+                !ftInst->declaration ||
+                (ftInst->declaration->kind != ast::TypeDeclKind::Class &&
+                 ftInst->declaration->kind != ast::TypeDeclKind::Interface) ||
+                ftInst->declaration->isValueBuiltin)
+                continue;
+        }
         for (const auto& sym : ctx_.symbols()) {
             if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get()))
                 if (ls->decl == anchor) { out.push_back(ls); break; }
@@ -6713,6 +6727,22 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
             "`, \xc2\xa7""35.5), or match in statement position and adopt it "
             "with a `using var` (\xc2\xa7""28.10)");
     }
+}
+
+// fix #4633 (§35.5 *The owning match* + §28.3 K3.4, v0.307): see the
+// declaration in Ownership_impl.hpp.
+bool MethodOwnership::isOwningMatchTransferBinding(const ast::CaseArm& arm,
+                                                   const ast::Expr* scrutinee,
+                                                   sema::Symbol* sym) {
+    if (!sym || !scrutinee) return false;
+    if (!owningMatchScrutineeForm(scrutinee)) return false;
+    std::vector<const sema::Symbol*> transferred;
+    collectOwningMatchTransferBindings(arm, ctx_.exprType(*scrutinee),
+                                       transferred,
+                                       /*classPayloadsOnly=*/true);
+    for (const sema::Symbol* b : transferred)
+        if (b == sym) return true;
+    return false;
 }
 
 void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
@@ -21007,16 +21037,25 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
     const ast::Expr* head = nullptr;             // condition or scrutinee
     std::vector<const ast::Expr*> guards;
     std::vector<const ast::Expr*> arms;          // value-arm expressions
+    // fix #4633 (§35.5, v0.307): the CaseArm each value arm came from, so the
+    // marked-arm dispatch below can ask whether the marked name is one of THAT
+    // arm's own §35.5 payload bindings. Null for an if-expression (no pattern)
+    // and index-aligned with `arms`. // per §35.5, v0.307
+    std::vector<const ast::CaseArm*> armNodes;
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         head = cd->condition.get();
         arms.push_back(cd->thenValue.get());
+        armNodes.push_back(nullptr);
         arms.push_back(cd->elseValue.get());
+        armNodes.push_back(nullptr);
     } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         head = ce->scrutinee.get();
         for (const auto& arm : ce->arms) {
             if (arm.guard) guards.push_back(arm.guard.get());
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
                 arms.push_back(arm.exprBody.get());
+                armNodes.push_back(&arm);
+            }
         }
     } else {
         return;
@@ -21038,7 +21077,10 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
     BlockState saved = states_;
     std::vector<std::vector<sema::Symbol*>> perArm;
     std::size_t nonAbsorbingArms = 0;
-    for (const ast::Expr* arm : arms) {
+    for (std::size_t ai = 0; ai < arms.size(); ++ai) {
+        const ast::Expr* arm = arms[ai];
+        const ast::CaseArm* armNode = ai < armNodes.size() ? armNodes[ai]
+                                                           : nullptr;
         if (!arm) continue;
         const bool absorbing =
             dynamic_cast<const ast::ThrowExpr*>(arm) != nullptr ||
@@ -21060,9 +21102,33 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
                 "`) — the scrutinee borrow is live through the selected "
                 "arm's completion (K8.3 / \xc2\xa7""28.3 K5.1, v0.209)");
         };
+        // fix #4633 (§35.5 *The owning match*, v0.307): §35.5 states the
+        // transfer out of an owning-match arm for BOTH positions — the arm
+        // "transfers the case's `owned` and move-only value payloads into its
+        // bindings", and the binding is then "an owned local of the arm body's
+        // scope" whose §28.3 discharges include an owned-consuming call and, in
+        // expression position, the K3.4 arm transfer. §28.3 applies the K8.3
+        // boundary "in statement position exactly as in expression position".
+        // The dataflow keeps no `states_` entry for a pattern binding, so
+        // `consumeMarkedArmTransfer` answered "`w` is not an owned binding at
+        // this point" and EVERY transfer spelling out of an expression arm was
+        // falsely rejected — code the spec admits that could not be written.
+        //
+        // There is no `states_` obligation to consume here, and that is the
+        // point: the payload's construct-completion reclaim is already
+        // discharged per slot by #4617's mark (codegen's
+        // `dischargeOwningMatchTransfers`), and the arm's value carries the
+        // payload to whoever receives the construct's result — which the
+        // arm-meet classifies OWNED for both spellings
+        // (`common::armIsOwnedProducer`), so the receiver's own §28.3 rules
+        // discharge it exactly once. // per §35.5, §28.3 K3.4/K8.3, v0.307
         if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(arm)) {
             if (!scrutRootName.empty() && mt->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("owned", mt->name, mt->span.begin);
+            } else if (armNode &&
+                       isOwningMatchTransferBinding(*armNode, head,
+                                                    ctx_.exprSymbol(*mt))) {
+                // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmTransfer(*mt);
             }
@@ -21072,6 +21138,10 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
                 dynamic_cast<const ast::IdentifierExpr*>(mv->operand.get());
             if (!scrutRootName.empty() && id->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("move", id->name, mv->span.begin);
+            } else if (armNode &&
+                       isOwningMatchTransferBinding(*armNode, head,
+                                                    ctx_.exprSymbol(*id))) {
+                // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmMoveTransfer(*mv);
             }
