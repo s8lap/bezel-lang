@@ -6905,39 +6905,246 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
     for (const ast::CaseArm& arm : ce.arms) {
         if (arm.bodyKind != ast::CaseArmBodyKind::Expression || !arm.exprBody)
             continue;
-        // Only a borrow-CARRYING arm result can dangle; a value result is a
-        // copy (`W(var w, _) => w.Ping()` yields an `int` and is fine).
-        const sema::TypeRef* art = ctx_.exprType(*arm.exprBody);
-        if (!isBorrowableType(art) &&
-            !common::isBorrowBearingRecordOrSpan(art, ctx_))
-            continue;
+        std::vector<const sema::Symbol*> transferred;
+        collectOwningMatchTransferBindings(arm, scrutRef, transferred);
+        if (transferred.empty()) continue;
         // The arm's own borrow root. A MARKED transfer (`move w`, `owned w`)
         // is not an identifier chain and roots to nothing — which is exactly
         // right: §35.5 states the transfer as the admitted spelling, and a
-        // transferred payload does not dangle.
-        const ast::IdentifierExpr* root = identifierRoot(*arm.exprBody);
+        // transferred payload does not dangle. Only a borrow-CARRYING arm
+        // result can dangle this way; a value result is a copy
+        // (`W(var w, _) => w.Ping()` yields an `int` and is fine).
+        const sema::TypeRef* art = ctx_.exprType(*arm.exprBody);
+        const ast::IdentifierExpr* root = nullptr;
+        if (isBorrowableType(art) ||
+            common::isBorrowBearingRecordOrSpan(art, ctx_)) {
+            root = identifierRoot(*arm.exprBody);
+            if (root) {
+                sema::Symbol* rootSym = ctx_.exprSymbol(*root);
+                bool matches = false;
+                if (rootSym)
+                    for (const sema::Symbol* b : transferred)
+                        if (b == rootSym) { matches = true; break; }
+                if (!matches) root = nullptr;
+            }
+        }
+        // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE that is the arm's own
+        // result (directly, or through a conditional) and CAPTURES a
+        // transferring binding escapes the same way — the arm's value has
+        // a FUNCTION type here, which `isBorrowableType` never admits, so
+        // this is a genuinely separate check, not a redundant one.
+        bool viaCapture = false;
+        if (!root) {
+            root = findOwningMatchCaptureInLambdas(*arm.exprBody, transferred);
+            viaCapture = root != nullptr;
+        }
         if (!root) continue;
-        sema::Symbol* rootSym = ctx_.exprSymbol(*root);
-        if (!rootSym) continue;
-        std::vector<const sema::Symbol*> transferred;
-        collectOwningMatchTransferBindings(arm, scrutRef, transferred);
-        bool escapes = false;
-        for (const sema::Symbol* b : transferred)
-            if (b == rootSym) { escapes = true; break; }
-        if (!escapes) continue;
         report(
             Severity::Error, arm.exprBody->span.begin,
-            std::string("this arm's value borrows owning-match payload "
-            "binding `") + std::string(root->name) +
+            std::string(viaCapture
+                ? "this arm's value captures owning-match payload binding `"
+                : "this arm's value borrows owning-match payload binding `") +
+            std::string(root->name) +
             "`, whose payload does not outlive the `case` construct — the "
             "scrutinee is consumed and its un-transferred remainder is "
             "disposed at construct completion (\xc2\xa7""35.5, K8.3), and an "
-            "UNMARKED named owned binding written as an arm is a BORROW arm "
+            "UNMARKED named owned binding " +
+            (viaCapture ? "captured by a closure" :
+                          "written as an arm") +
+            " is a BORROW " + (viaCapture ? "" : "arm ") +
             "(\xc2\xa7""28.3), so the borrow would escape its boundary — "
             "rejected, never lifetime-extended (K8.4, v0.307). Transfer the "
             "payload out of the arm instead (`move " + std::string(root->name) +
             "`, \xc2\xa7""35.5), or match in statement position and adopt it "
             "with a `using var` (\xc2\xa7""28.10)");
+    }
+}
+
+// fix #4663 (§28.3 K8.4, §35.5, v0.307): see the declaration in
+// Ownership_impl.hpp. Mirrors `checkClosureEscapesOnReturn`'s own
+// "find every lambda literal reachable from the expression, then walk each
+// one's free variables" shape (that function's `findLambdas` + the
+// `collectLambdaIdentifiers` loop over `lambdas`) — narrowed to the two
+// syntactic positions actually reachable from a case arm's result or a
+// statement-position store: a bare lambda literal, or one behind a
+// conditional. `checkClosureEscapesOnReturn`'s own CallExpr-argument /
+// callee-indirection legs (#3702's "DOES NOT simply push onto lambdas"
+// residual) answer a materially larger question this fix's measured shapes
+// never needed.
+const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
+        const ast::Expr& e,
+        const std::vector<const sema::Symbol*>& transferred) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    std::function<void(const ast::Expr&)> findLambdas =
+        [&](const ast::Expr& x) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&x)) {
+                lambdas.push_back(lam);
+                return;
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&x)) {
+                if (cd->thenValue) findLambdas(*cd->thenValue);
+                if (cd->elseValue) findLambdas(*cd->elseValue);
+            }
+        };
+    findLambdas(e);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            for (const sema::Symbol* b : transferred)
+                if (b == sym) return id;
+        }
+    }
+    return nullptr;
+}
+
+// fix #4663 (§28.3 K8.3/K8.4, §35.5, v0.307): see the declaration in
+// Ownership_impl.hpp.
+//
+// MEASURED on this lane's base, the issue's own repro:
+//
+//   using var seed := new Widget("seed");
+//   var outer := seed;
+//   var o := Outer.W(new Widget("a"), new Widget("b"));
+//   case move o of
+//     W(var w, _) => do outer := w; end,
+//     X => ()
+//   end case;
+//   Console.WriteLine($"outer={outer.Ping()}");   // reads payload `a` AFTER
+//
+// compiled clean and printed `dispose b / outer=7 / dispose seed` — payload
+// `a` was never disposed at all (a direct LSan leak, not yet a crash), which
+// is precisely why the ordering in #4663/#4634 matters: the read only
+// SURVIVES because #4617's per-slot discharge leaves the bound slot out of
+// the construct-completion reclaim. Give that binding its §28.3 auto-drop
+// (#4634) while this hole is open and the identical program becomes a
+// genuine heap-use-after-free.
+void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
+    if (suppressDiag_) return;
+    if (!cs.scrutinee) return;
+    if (!owningMatchScrutineeForm(cs.scrutinee.get())) return;
+    const sema::TypeRef* scrutRef = ctx_.exprType(*cs.scrutinee);
+    for (const ast::CaseArm& arm : cs.arms) {
+        if (arm.bodyKind != ast::CaseArmBodyKind::Block) continue;
+        std::vector<const sema::Symbol*> transferred;
+        collectOwningMatchTransferBindings(arm, scrutRef, transferred);
+        if (transferred.empty()) continue;
+        // Locals DECLARED WITHIN this arm's own block — a store INTO one of
+        // these does not escape the construct's boundary: the local dies at
+        // the arm's own `end`, which is inside K8.3's boundary. Identity is
+        // by AST NODE (a LocalSymbol's `decl`), not by name, so a same-named
+        // outer local is never mistaken for one of these.
+        std::set<const ast::Node*> localDeclsInArm;
+        for (const auto& top : arm.stmts)
+            if (top)
+                forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+                    if (dynamic_cast<const ast::LocalDecl*>(&cur))
+                        localDeclsInArm.insert(&cur);
+                });
+        for (const auto& top : arm.stmts) {
+            if (!top) continue;
+            forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+                // The two STORE shapes that hand a value to a location
+                // outliving the arm: an assignment (to a pre-existing
+                // local, a field, a property, or an indexer slot — every
+                // one of those outlives the arm's own block) and a
+                // `return` (which leaves the enclosing method entirely).
+                // `LocalDecl`'s own initializer is deliberately NOT a
+                // store here: the newly-declared local is itself scoped to
+                // the arm (or a nested block within it), so it cannot
+                // outlive the construct by virtue of being declared — only
+                // a FURTHER store out of THAT local could, and that store
+                // is caught in its own right when this same walk reaches
+                // it, unless its target resolves into `localDeclsInArm`.
+                const ast::Expr* value = nullptr;
+                const ast::Expr* target = nullptr;
+                bool isReturn = false;
+                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+                    value = as->value.get();
+                    target = as->target.get();
+                } else if (auto* rs =
+                               dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+                    value = rs->value.get();
+                    isReturn = true;
+                } else {
+                    return;
+                }
+                if (!value) return;
+                // Only a borrow-CARRYING value can dangle; a value result
+                // (e.g. `outer := w.Ping();`, an `int`) is a copy and is
+                // fine — mirrors #4635's identical gate on the arm's own
+                // result type. A CLOSURE's type is a FUNCTION type, which
+                // this gate never admits, so the capture check below runs
+                // independently of it rather than being skipped by it.
+                const sema::TypeRef* vt = ctx_.exprType(*value);
+                const ast::IdentifierExpr* root = nullptr;
+                if (isBorrowableType(vt) ||
+                    common::isBorrowBearingRecordOrSpan(vt, ctx_)) {
+                    root = identifierRoot(*value);
+                    if (root) {
+                        sema::Symbol* rootSym = ctx_.exprSymbol(*root);
+                        bool matches = false;
+                        if (rootSym)
+                            for (const sema::Symbol* b : transferred)
+                                if (b == rootSym) { matches = true; break; }
+                        if (!matches) root = nullptr;
+                    }
+                }
+                // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE stored/returned
+                // out of the arm that CAPTURES a transferring binding is
+                // the same escape by a third route — see
+                // `findOwningMatchCaptureInLambdas`'s declaration for why
+                // this needs its own check rather than falling out of the
+                // `identifierRoot` gate above.
+                bool viaCapture = false;
+                if (!root) {
+                    root = findOwningMatchCaptureInLambdas(*value, transferred);
+                    viaCapture = root != nullptr;
+                }
+                if (!root) return;
+                if (!isReturn && target) {
+                    if (auto* tid =
+                            dynamic_cast<const ast::IdentifierExpr*>(target)) {
+                        if (auto* tls = dynamic_cast<sema::LocalSymbol*>(
+                                ctx_.exprSymbol(*tid)))
+                            if (tls->decl &&
+                                localDeclsInArm.count(tls->decl))
+                                return;  // arm-scoped target: does not escape
+                    }
+                }
+                const std::string why =
+                    isReturn
+                        ? "a `return` leaves the enclosing method entirely"
+                        : "the assignment target outlives the arm's own "
+                          "block";
+                const std::string verb =
+                    isReturn ? (viaCapture ? "this `return` captures"
+                                           : "this `return` borrows")
+                             : (viaCapture ? "this assignment's closure "
+                                             "captures"
+                                           : "this assignment stores");
+                const std::string readShape =
+                    viaCapture ? "captured by a closure" : "read here";
+                report(
+                    Severity::Error, cur.span.begin,
+                    verb + " owning-match payload binding `" +
+                        std::string(root->name) +
+                        "`, whose payload does not outlive the `case` "
+                        "construct — the scrutinee is consumed and its "
+                        "un-transferred remainder is disposed at construct "
+                        "completion (\xc2\xa7""35.5, K8.3), and an UNMARKED "
+                        "named owned binding " + readShape + " is a BORROW "
+                        "(\xc2\xa7""28.3), so " + why +
+                        ": the borrow would escape its boundary — rejected, "
+                        "never lifetime-extended (K8.4, v0.307). Transfer "
+                        "the payload out of the arm instead (`move " +
+                        std::string(root->name) +
+                        "`, \xc2\xa7""35.5), or read it only within the "
+                        "arm's own block.");
+            });
+        }
     }
 }
 
@@ -7227,6 +7434,12 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
             // the parent first), so a `move` inside an arm sees its own
             // binding's ban. // per §35.5, §28.3 K3.1, v0.307
             registerBorrowOnlyArmBindings(cs->arms, cs->scrutinee.get());
+            // fix #4663 (§28.3 K8.4, v0.307): the STATEMENT-position twin of
+            // #4635's `checkOwningMatchArmEscape` call below in the CaseExpr
+            // branch — same reasoning, applied to a STORE written out of a
+            // block-form arm's body instead of the construct's own value.
+            // // per §28.3 K8.4, §35.5, v0.307
+            checkOwningMatchArmStmtEscape(*cs);
             if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
             for (const auto& arm : cs->arms) {
                 if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);

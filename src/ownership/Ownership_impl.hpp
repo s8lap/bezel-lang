@@ -2986,6 +2986,44 @@ private:
     // in the fixpoint. // per §28.3 K8.4, §35.5, v0.307
     void checkOwningMatchArmEscape(const ast::CaseExpr& ce);
 
+    // fix #4663 (§28.3 K8.3/K8.4 + §35.5, v0.307): the STATEMENT-position twin
+    // of #4635's `checkOwningMatchArmEscape` — #4635 closed the construct's
+    // own VALUE (an expression-position arm's result); this closes a STORE
+    // written out of a BLOCK-form arm's body (`do outer := w; end`), which is
+    // the identical K8.4 escape by a different spelling: `outer` (or any
+    // pre-existing local/field/slot, or a `return`) outlives the construct,
+    // so writing a borrow of the payload into it hands out exactly the
+    // dangling reference K8.4 forbids. Syntactic and flow-insensitive, one
+    // hop (the store's own value, `identifierRoot`-peeled) — matching #4635's
+    // shape rather than a second, drifting escape analysis. A store whose
+    // TARGET is itself a local declared WITHIN this same arm does not escape
+    // (it dies with the arm's own block, inside the construct's boundary) —
+    // `var tmp := w; ... ` reading `tmp` inside the arm stays admitted.
+    void checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs);
+
+    // fix #4663 (§28.3 K8.4, §35.5, v0.307): a CLOSURE literal reachable from
+    // `e` (an arm's own result value, or a statement-position store's value)
+    // that CAPTURES one of `transferred`'s bindings is the SAME K8.4 escape
+    // by a THIRD route, on top of #4635/#4663's own direct `identifierRoot`
+    // shape: `lambda(): int => w.Ping()` assigned out of the arm, or
+    // returned as the arm's own value, hands the captured borrow to
+    // whatever the closure escapes into. #4664's own investigation
+    // established that `collectCaseArmBorrowSourcesExpr`'s walker never
+    // descends into a `LambdaExpr` body at all (deliberately, for an
+    // unrelated reason — a `case` NESTED INSIDE a closure has its own,
+    // closure-scoped obligations, not this method's) — so neither
+    // `checkOwningMatchArmEscape` nor `checkOwningMatchArmStmtEscape` had
+    // ever looked inside a lambda literal that is ITSELF the escaping
+    // value. Reuses `collectLambdaIdentifiers` — the SAME free-variable
+    // walk `checkClosureEscapesOnReturn`'s own capture-rejection arms
+    // already consult for the catch-borrow / ref-out-param / borrow-bearing-
+    // record cases — rather than a second, hand-rolled lambda-body walk.
+    // Returns the first captured transferring-binding identifier found, or
+    // null. // per §28.3 K8.4, §35.5, v0.307
+    const ast::IdentifierExpr* findOwningMatchCaptureInLambdas(
+        const ast::Expr& e,
+        const std::vector<const sema::Symbol*>& transferred);
+
     // fix #4635: the symbols `arm`'s pattern binds to a TRANSFERRING slot of
     // `chDecl`'s named case — a whole-slot binding (`W(var w, _)`, or the
     // naked `W(w, _)` spelling) of an `owned`-marked or move-only payload,
