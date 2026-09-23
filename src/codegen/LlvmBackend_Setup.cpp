@@ -32149,6 +32149,85 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
 }
 
 
+// fix #4653 (§28.3 K1.5 "Calls lend by default", §21.1 *Runtime `const` locals*
+// "Ownership", v0.307): the four materializer recognizers below
+// (`isFreshBorrowingArrayMaterializerLocal`, `isFreshGroupByToArrayLocal`,
+// `isFreshOwnerlessArrayMaterializerExpr`,
+// `isFreshOwnerlessDictMaterializerExpr`) recognize the stdlib
+// intrinsics `ToArray` / `Sorted` / `Reversed` / `Split` / `ToDictionary`
+// STRUCTURALLY, by member NAME, because those builtins have no resolved
+// MethodSymbol. Each of their soundness comments already states that premise —
+// "these are stdlib builtins with no resolved user MethodSymbol", "excluding …
+// any user type with a same-named method" — but nothing enforced it, and the
+// premise is FALSE for a user method that merely shares the name:
+//
+//     class Box
+//       private owned _items: Array<int>;
+//       public method ToArray(): Array<int> return _items; end ToArray;
+//     end Box;
+//     using var b := new Box();
+//     const t := b.ToArray();          // <- recognized as a FRESH materializer
+//
+// `ToArray` here is a user instance method with a PLAIN (non-`owned`) class-
+// typed return, so per K1.5 its result is a **borrow whose source is the
+// receiver** — `b._items`, which `b` still owns and disposes. §21.1's runtime-
+// `const` ownership clause admits the binding for exactly that reason: "the
+// binding never takes a disposal obligation … and **borrows** — the binding is
+// then a borrow carrying the initializer's source-liveness constraints". The
+// recognizers nevertheless emitted a scope-end `bz_array_free` over it, so the
+// field's backing was freed once per such binding AND once by `b`'s disposal:
+// measured on the pre-fix compiler, `free(): invalid pointer` / SIGABRT (134)
+// for the bound form and SIGSEGV (139) for the unbound-receiver form
+// (`b.ToArray().Length`), with ASan reporting the fault inside
+// `__asan::Allocator::Deallocate` <- `free` <- `bz_array_free` <- `main`.
+// Renaming the method to `Grab` made the identical program exit cleanly — the
+// signature of a name-keyed check.
+//
+// This restores the missing half of the premise: a callee that resolves to a
+// `sema::MethodSymbol` is a USER method (declared here or imported — the symbol
+// exists for both, only its `decl` is null for a non-generic imported type, see
+// `common::calleeMethodDecl`), never one of the intrinsics, so the structural
+// name match must not fire. The stdlib LINQ/`Array` materializers stay
+// recognized: they are compiler intrinsics with no `MethodSymbol` at all (sema
+// types them in `ExprTypecheck_Calls.cpp`'s builtin arms; `LinqStdlibOverloads
+// .hpp` is a *diagnostic* name table, not a symbol table), so this predicate is
+// false for them and every existing reclaim is unchanged.
+//
+// A user method that genuinely DOES mint — `method ToArray(): owned Array<int>`
+// — is unaffected in substance: its unbound temporaries are reclaimed by
+// `isUnboundOwnedBorrowingArrayCallExpr` (which reads the `owned` marker through
+// `common::calleeReturnsOwned`, the K1.5-sanctioned authority), and a plain
+// `var` binding of it carries a §28.3 owned-local discharge obligation the
+// ordinary owned-local disposal path discharges. The marker, not the name, is
+// the sound discriminator — exactly the argument `isFreshOwnedClassProducer`
+// records in `common/OwnershipFacts.cpp`.
+//
+// ⚠ THE TEST IS "SEMA RESOLVED *NOTHING*", NOT "NO MethodSymbol", and the
+// difference is a second measured double-free rather than a style preference.
+// `common::isBuiltinOwnedMaterializerCall` (OwnershipFacts.cpp, #2709/#2749)
+// already states and justifies exactly this gate for the SAME member-name set
+// on the sema/ownership channels: "The builtin member-call typing path in sema
+// lives entirely inside `if (!calleeSym)` … so every one of the eight above
+// reaches its declaration-less collection return type with NOTHING attached to
+// the callee. Anything sema DID resolve is therefore, by construction, not one
+// of these builtins." It records why the narrower cast is wrong: "A
+// `MethodSymbol`-only cast … is too weak: it lets a FUNCTION-TYPED FIELD
+// through. `public Split: (string) -> Array<string>;` attaches a `FieldSymbol`
+// — not a MethodSymbol — and the call is typed from the field's `funcReturn`,
+// whose plain `Array<string>` slot is declaration-less, so the result-head gate
+// below passes too." Measured here on a `MethodSymbol`-only build of this fix:
+// a `public Split: (Src) -> Array<string>` field whose lambda returns a borrow
+// of a `Src`'s `owned` field still SEGV'd in `bz_array_free` <- `Src$DisposeCore`.
+// Using the same gate as OwnershipFacts keeps the three channels — sema's
+// §21.1 rejection, the ownership pass, and this codegen reclaim — answering
+// one question the same way, which is the property #2749 was closed to get.
+static bool calleeResolvedBySema(const ast::CallExpr& call,
+                                 const sema::SemaContext& ctx) {
+    if (!call.callee) return false;
+    return ctx.exprSymbol(*call.callee) != nullptr;
+}
+
+
 // #1003 / stdlib §5 / §28: is `ld` a plain `var` binding a FRESHLY-MATERIALIZED
 // borrowing `Array<T>` from a LINQ/copy materializer call (`ToArray` / `Sorted`
 // / `Reversed`) or a §28.3 range-slice INDEX (`arr[r]` per #2753)? These are
@@ -32189,6 +32268,12 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     // with no resolved user MethodSymbol; recognized structurally by member name.)
     if (auto* call = dynamic_cast<const ast::CallExpr*>(view.init)) {
         if (!call->callee) return false;
+        // fix #4653 (§28.3 K1.5, §21.1, v0.307): a USER method that happens to
+        // be named `ToArray`/`Sorted`/`Reversed`/`Split` is not the intrinsic —
+        // its plain (non-`owned`) return is a BORROW of the receiver, and
+        // freeing it double-frees whatever the receiver owns. See
+        // `calleeResolvedBySema` above.
+        if (calleeResolvedBySema(*call, ctx_)) return false;
         auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
         if (!ma) return false;
         std::string_view mm = ma->member;
@@ -32266,8 +32351,22 @@ bool Emitter::isFreshGroupByToArrayLocal(const LocalDeclInitView& view) const {
     if (builtinTypeName(rt) != "Array") return false;
     auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
     if (!call || !call->callee) return false;
+    // fix #4653 (§28.3 K1.5, §21.1, v0.307): the GroupBy twin has the SAME
+    // name-keyed hole as its borrowing sibling — and a worse consequence,
+    // because this predicate registers the OWNING disposal (elementPolicyFor(el,
+    // true) + groupingFreeThunk). Both halves of the shape are matched by name
+    // (`ToArray` here, `GroupBy` inside `isGroupByCall`), so a user class
+    // declaring both had its borrowed field array freed here and again at the
+    // receiver's disposal: measured SEGV inside `bz_array_free` <-
+    // `G$DisposeCore`. Neither half may carry a sema-resolved callee symbol.
+    // See `calleeResolvedBySema` above. The genuine #4308 shape
+    // (`xs.GroupBy(sel).ToArray()` over builtins) resolves no symbol on either
+    // call, so its reclaim is unchanged.
+    if (calleeResolvedBySema(*call, ctx_)) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma || ma->member != "ToArray" || !ma->target) return false;
+    if (auto* inner = dynamic_cast<const ast::CallExpr*>(ma->target.get()))
+        if (calleeResolvedBySema(*inner, ctx_)) return false;
     return isGroupByCall(ma->target.get());
 }
 
@@ -32544,6 +32643,16 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
     // `recv.ToArray()`, `recv.Sorted(...)`, `recv.Reversed()`, or `s.Split(...)`.
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee) return false;
+    // fix #4653 (§28.3 K1.5, §21.1, v0.307): the comment above claims this
+    // recognizer excludes "any user type with a same-named method", but the
+    // result-type gate it relies on does not do that — a user
+    // `method ToArray(): Array<int> return _items; end` has a builtin,
+    // declaration-less `Array<int>` RESULT type and matched. Its plain return
+    // is a K1.5 borrow of the receiver, so the end-of-full-expression
+    // `bz_array_free` freed a field the receiver still owns (measured: SIGSEGV
+    // on `b.ToArray().Length`). Only the intrinsics, which carry no
+    // symbol at all, may match. See `calleeResolvedBySema` above.
+    if (calleeResolvedBySema(*call, ctx_)) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma) return false;
     std::string_view mm = ma->member;
@@ -32578,6 +32687,12 @@ bool Emitter::isFreshOwnerlessDictMaterializerExpr(const ast::Expr* e) const {
     if (builtinTypeName(rt) != "Dictionary") return false;
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee) return false;
+    // fix #4653 (§28.3 K1.5, §21.1, v0.307): the Array sibling's defect, same
+    // shape — a user `method ToDictionary(...): Dictionary<K,V>` returning a
+    // borrowed field dict matched this name-keyed recognizer and had its
+    // backing `bz_dict_free`d while the receiver still owned it. See
+    // `calleeResolvedBySema` above.
+    if (calleeResolvedBySema(*call, ctx_)) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma) return false;
     return ma->member == "ToDictionary";
