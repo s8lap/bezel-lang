@@ -12,4 +12,4 @@
 module M; class Cn public method Use(): int => 1; end Cn; class Pool public method TryTakeNonNull(out owned conn: Cn): bool conn := new Cn(); return true; end TryTakeNonNull; public static method Run(): int var p := new Pool(); var ok := p.TryTakeNonNull(out owned var c); return c.Use(); end Run; end Pool;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `c` is implicitly disposed at the end of its scope
-// CHECK-SAME: (§28.3 auto-drop)
+// CHECK-SAME: (§28.3 must-use / auto-drop)

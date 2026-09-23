@@ -11,4 +11,4 @@
 module M; class Box<T> public _v: int := 0; destructor end destructor; end Box; class C public static method Main(): int var b := new Box<int>(); return b._v; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `b` is implicitly disposed at the end of its scope
-// CHECK-SAME: (§28.3 auto-drop)
+// CHECK-SAME: (§28.3 must-use / auto-drop)

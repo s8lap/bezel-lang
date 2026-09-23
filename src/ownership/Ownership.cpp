@@ -771,7 +771,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         std::string("owned value in `") +
                         std::string(sym->name) +
                         "` is implicitly disposed at the end of its scope "
-                        "(§28.3 auto-drop); use `item?.Dispose()`, `move`, "
+                        "(§28.3 must-use / auto-drop); use `item?.Dispose()`, `move`, "
                         "`using var _ := owned item`, or `return` to discharge "
                         "it explicitly (§28.3/§28.11)");
                     continue;
@@ -819,7 +819,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
-                            "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                            "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
                             "`.Dispose()` it, or adopt it with `using var _ := "
                             "owned " + std::string(sym->name) +
                             "`, to discharge it explicitly");
@@ -862,7 +862,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
                             "on the path that does not adopt it "
-                            "(§28.3/§29.8/§30.1 auto-drop); adopt it on every "
+                            "(§28.3/§29.8/§30.1 must-use / auto-drop); adopt it on every "
                             "path with `using var _ := owned " +
                             std::string(sym->name) +
                             "`, to discharge it explicitly");
@@ -908,7 +908,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of each loop "
-                                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                                "iteration (§29.2/§28.3 must-use / auto-drop); use `.Dispose()`, "
                                 "`move`, `using var`, or `return` to discharge it "
                                 "explicitly");
                         continue;
@@ -1016,7 +1016,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of its scope "
-                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "(§28.3 must-use / auto-drop); declare it `using var` to make "
                                 "the scope-bound disposal explicit, or `move` / "
                                 "`return` / `.Dispose()` / `_ := …` to discharge it");
                         }
@@ -1040,7 +1040,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string("owned value in `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of its scope "
-                            "(§28.3 auto-drop); use `item?.Dispose()`, "
+                            "(§28.3 must-use / auto-drop); use `item?.Dispose()`, "
                             "`_ := item`, `move`, or `return` to discharge it "
                             "explicitly (§28.3/§28.11)");
                         continue;
@@ -1097,7 +1097,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of the method "
-                            "(§28.3 auto-drop); `move` / `return` / `.Dispose()` "
+                            "(§28.3 must-use / auto-drop); `move` / `return` / `.Dispose()` "
                             "it, or adopt it with `using var " +
                             std::string(sym->name) + "2 := owned " +
                             std::string(sym->name) +
@@ -1226,7 +1226,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of its scope "
-                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "(§28.3 must-use / auto-drop); declare it `using var` to make "
                                 "the scope-bound disposal explicit, or `move` / "
                                 "`return` / `.Dispose()` / `_ := …` to discharge it");
                             continue;
@@ -1303,7 +1303,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 Severity::Warning, fs->span.begin,
                 std::string("owned value in `") + std::string(ls->name) +
                 "` is implicitly disposed at the end of each loop "
-                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                "iteration (§29.2/§28.3 must-use / auto-drop); use `.Dispose()`, "
                 "`move`, `using var`, or `return` to discharge it "
                 "explicitly");
     }
@@ -1344,7 +1344,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 ps->decl ? ps->decl->span.begin : SourceLocation{},
                 std::string("owned parameter `") + std::string(sym->name) +
                 "` is implicitly disposed by the frame at teardown "
-                "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
                 "`.Dispose()` it, or adopt it with `using var _ := owned " +
                 std::string(sym->name) + "`, to discharge it explicitly");
         }
@@ -1400,7 +1400,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     Severity::Warning, ld->span.begin,
                     std::string("owned value in `") + std::string(sym->name) +
                     "` is implicitly disposed at the end of its scope "
-                    "(§28.3 auto-drop); declare it `using var` to make the scope-bound "
+                    "(§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound "
                     "disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` "
                     "to discharge it");
                 continue;
@@ -1420,7 +1420,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     ls->decl ? ls->decl->span.begin : SourceLocation{},
                     std::string("owned value in `") + std::string(sym->name) +
                     "` is implicitly disposed at the end of its scope "
-                    "(§28.3 auto-drop); use `item?.Dispose()`, "
+                    "(§28.3 must-use / auto-drop); use `item?.Dispose()`, "
                     "`_ := item`, `move`, or `return` to discharge it "
                     "explicitly (§28.3/§28.11)");
             }
