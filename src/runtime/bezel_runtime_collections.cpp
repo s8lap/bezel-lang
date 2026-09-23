@@ -337,8 +337,10 @@ int8_t bz_array_is_disposed(void* arrp) {
 void bz_array_sort(void* arrp, int64_t elem_size,
                    int (*cmp)(const void*, const void*)) {
     auto* arr = (bz_array_t*)arrp;
-    if (arr && arr->count > 1)
+    if (arr && arr->count > 1) {
         qsort(arr->data, (size_t)arr->count, (size_t)elem_size, cmp);
+        arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort repositions)
+    }
 }
 
 // stdlib §3 / #472: Sort with a closure-bearing comparator.
@@ -363,6 +365,7 @@ void bz_array_sort_closure(void* arrp, int64_t elem_size,
     qsort(arr->data, (size_t)arr->count, (size_t)elem_size, bz_sort_cl_shim);
     bz_sort_cl_closure = nullptr;
     bz_sort_cl_fn      = nullptr;
+    arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort(comparer) repositions)
 }
 
 // stdlib §3 / #472: Shallow-copy `arr` — allocate a new bz_array_t with the

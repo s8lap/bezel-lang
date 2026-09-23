@@ -388,3 +388,47 @@ BEZEL_TEST(collection_concurrent_mod_1232, set_string_clear_during_for_throws_46
         "  return 0; "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// fix #4631 / §29.12 — Array<T>.Sort() / Sort(comparer) never bump mod_count.
+// Spec §29.12 lists the in-place Sort()/Reverse() as structural operations
+// (they reposition entries), so they must bump mod_count exactly like
+// Add/Remove/Insert/Clear do. bz_array_sort and bz_array_sort_closure in
+// src/runtime/bezel_runtime_collections.cpp ran qsort but returned without
+// arr->mod_count++, so a `for` over an Array<T> that called Sort() (either
+// form) inside the loop body did NOT raise InvalidOperationException at the
+// next MoveNext() — the FALSE-NEGATIVE direction. These two rows pin each
+// form; pre-fix both return 0 (no exception caught).
+// ===========================================================================
+
+// §29.12 / #4631 — Array<int>: Sort() during for-in must throw.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_sort_during_for_throws_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); "
+        "  xs.Add(3); xs.Add(1); xs.Add(2); "
+        "  try "
+        "    for var x in xs do xs.Sort(); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #4631 — Array<int>: Sort(comparer) during for-in must throw.
+// The comparer-form routes through bz_array_sort_closure (closure-bearing
+// shim around qsort); pre-fix the closure path also skipped mod_count++.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_sort_comparer_during_for_throws_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); "
+        "  xs.Add(3); xs.Add(1); xs.Add(2); "
+        "  try "
+        "    for var x in xs do xs.Sort(lambda(a: int, b: int) => a - b); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
