@@ -5120,6 +5120,78 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #4760 (§5.1, v0.307): a BUILT-IN HEAP-REFERENCE type is not
+    // implicitly convertible to a concrete primitive either. This is the exact
+    // sibling of #4644's second arm directly above, on the exact same
+    // fall-through, and the rule is #1178's, stated in its own comment: "There
+    // is no implicit conversion between a class reference and a primitive
+    // (§4.6 forbids implicit to-string)". #1178's gate is deliberately
+    // restricted to `declaration != nullptr`, and the §4 heap collections
+    // carry `declaration == nullptr` (the spec types are synthesized, there is
+    // no TypeSymbol), so they reached the catch-all and were SILENTLY ACCEPTED.
+    //
+    // MEASURED on 6f1bfc4a with the real `bezelc`, one probe per head. The
+    // failure mode is worse than #4644's: not merely a wrong value but an
+    // UNINITIALIZED read, which is UB and differs between runs.
+    //
+    //   var x: int := a;   // a: Array<int>
+    //   -> compiles clean, exit 0, no diagnostic, not even an `internal:` note
+    //   -> printed 349225760, then 908358432, then 1068782368 on three runs
+    //
+    // `Dictionary<K,V>`, `Set<T>` and `LinkedList<T>` behaved identically;
+    // `Stack<T>` into a `bool` target reached codegen and aborted the IR
+    // verifier instead ("Trunc only operates on integer / %7 = trunc ptr %6 to
+    // i1") — the same missing rejection, a different downstream symptom.
+    // For comparison the shapes that DO carry a `declaration` were already
+    // rejected correctly by #1178's gate: a user class, and `FrozenArray<T>`
+    // (whose `From(...)` factory stamps `builtinClassSym("FrozenArray")`).
+    //
+    // Scope, deliberately narrow — it fires only on shapes that are silently
+    // accepted today:
+    //   * `from` is a declaration-less Named whose head names a built-in
+    //     HEAP-POINTER REFERENCE type. `common::isHeapPointerReferenceBuiltin`
+    //     is the shared authority for that set (the same table codegen's two
+    //     rep paths read), never a hand-listed copy; reading it through
+    //     `headName()` rather than the raw AST head keeps a transparent type
+    //     alias (#1462 / §27.8) from slipping past. Membership in that table
+    //     is exactly "this value is a heap pointer to a runtime object", i.e.
+    //     a reference — which is the premise the rule needs.
+    //   * a bare TYPE VARIABLE is also Named-with-null-declaration, so a type
+    //     parameter — including one that shadows a built-in name — is
+    //     excluded explicitly (as #4644 does); its well-formedness is
+    //     per-instantiation and must keep flowing through. (`var x: int := v;`
+    //     for a bare `v: T` is silently accepted today too; that is the
+    //     generic-deferral hole, a separate defect, and is left untouched.)
+    //   * `to` is a CONCRETE primitive, `Object` excluded — boxing is handled
+    //     by the `Object` branch far above.
+    // The VALUE-shaped reserved builtins (`ArraySpan<T>`, `Range<T>`,
+    // `DateTime`, `ReadOnlyStringSpan`, … — `kNonHeapReservedBuiltins`) are
+    // deliberately OUT: they are not class references, so #1178's rule as
+    // stated does not reach them, and their own conversion questions (§5.2
+    // explicit forms) are a separate measurement. Probe-confirmed still
+    // accepted after this fix, and filed rather than swept in here.
+    {
+        std::string_view fromHead = from->headName();
+        bool fromIsTypeVar =
+            refMentionsTypeVariable(from) ||
+            (freeTypeParamNames && !fromHead.empty() &&
+             freeTypeParamNames->count(fromHead));
+        bool fromBuiltinHeapReference =
+            from->kind == TypeRef::Kind::Named && !from->declaration &&
+            !fromHead.empty() && !fromIsTypeVar &&
+            common::isHeapPointerReferenceBuiltin(fromHead);
+        bool toConcretePrimitive = to->kind == TypeRef::Kind::Primitive &&
+                                   to->primitive != PrimitiveType::Object;
+        if (fromBuiltinHeapReference && toConcretePrimitive) {
+            reportNotConvertible(
+                std::string("the built-in type `") + std::string(fromHead) +
+                "` is a heap reference and the target is a value type — "
+                "§5.1 has no implicit conversion between them, and §4.6 "
+                "forbids an implicit conversion to `string`; read a member of "
+                "the value instead (e.g. its `Count`/`Length`), or index it");
+            return;
+        }
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
