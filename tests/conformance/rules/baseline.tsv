@@ -363,7 +363,7 @@ s10_4_0001	pass
 s10_4_0002	fail	divergence
 s10_4_0003	fail	divergence
 s10_4_0004	fail	divergence
-s10_4_0005	fail	divergence
+s10_4_0005	pass	
 s10_4_0006	pass	
 s10_4_0031	pass	
 s10_4_0032	fail	divergence

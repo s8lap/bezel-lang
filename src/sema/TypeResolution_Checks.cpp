@@ -957,6 +957,30 @@ void Resolver::checkEnumRestrictions() {
                     "it (§10.4)");
                 continue;
             }
+            // fix #3862 (§10.4, v0.293): `FromNameOrNull`/`NameOf` are the
+            // other two members of the compiler-provided tier — "Every enum
+            // `E` … carries three compiler-provided static members …
+            // FromUnderlyingOrNull, FromNameOrNull, NameOf … no user
+            // declaration, a member or a declared constant, may override or
+            // overload any of them." The check runs on `m` directly, before
+            // any dynamic_cast, so it reaches both a user MEMBER (this case,
+            // a redeclared static method) and a user CONSTANT of either name
+            // — the same reach `FromUnderlyingOrNull`'s sibling arm above
+            // already has. MEASURED on this HEAD (pre-fix): `enum Priority
+            // Low, Medium, High; public static method FromNameOrNull(name:
+            // string): Priority? => Low; end Priority;` compiled at exit 0,
+            // zero diagnostics — this loop had no `FromNameOrNull`/`NameOf`
+            // arm at all (only `FromUnderlyingOrNull`'s, fix #3044).
+            if (m->name == "FromNameOrNull" || m->name == "NameOf") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("enum `") + std::string(t->name) +
+                    "` may not declare a member named `" +
+                    std::string(m->name) + "` — it is the compiler-provided "
+                    "static member every enum carries, and no user "
+                    "declaration may override or overload it (§10.4)");
+                continue;
+            }
             // fix #4121 (§10.4, §8.7, v0.298): §10.4's positive list of what
             // an enum "may declare exactly" — instance methods, expression-
             // bodied read-only instance properties, static methods,
