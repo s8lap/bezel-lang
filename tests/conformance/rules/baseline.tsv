@@ -1747,7 +1747,7 @@ s35_5_0009	pass
 s35_5_0010	pass	
 s35_5_0031	fail	divergence
 s35_5_0032	pass	
-s35_5_0033	fail	divergence
+s35_5_0033	pass	
 s35_6_0001	pass	
 s35_6_0002	pass	
 s35_7_0001	pass	
@@ -1789,9 +1789,9 @@ l2_3_0001	pass
 l2_3_0002	pass	
 l2_3_0003	fail	divergence
 l2_3_0004	pass	
-l2_4_0001	fail	divergence
-l2_4_0002	fail	divergence
-l2_4_0003	fail	divergence
+l2_4_0001	pass	
+l2_4_0002	pass	
+l2_4_0003	pass	
 l2_4_0004	fail	divergence
 l2_5_0001	pass	
 l2_5_0002	fail	divergence
@@ -1895,7 +1895,7 @@ l3_3_0004	pass
 l3_3_0005	pass	
 l4_1_0001	pass	
 l4_1_0002	pass	
-l4_1_0003	fail	divergence
+l4_1_0003	pass	
 l4_1_0004	pass	
 l4_2_0001	fail	divergence
 l4_2_0002	fail	divergence
@@ -1934,7 +1934,7 @@ l4_5_0009	pass
 l4_5_0010	pass	
 l4_5_0011	pass	
 l4_5_0012	pass	
-l4_5_0013	fail	divergence
+l4_5_0013	pass	
 l4_6_0001	pass	
 l4_6_0002	pass	
 l4_6_0003	pass	
@@ -2004,7 +2004,7 @@ l4_15_0006	pass
 l4_16_0001	pass	
 l4_16_0002	pass	
 l4_16_0003	pass	
-l4_16_0004	fail	divergence
+l4_16_0004	pass	
 l4_17_0001	pass	
 l4_17_0002	pass	
 l4_17_0003	pass	
@@ -2019,7 +2019,7 @@ l4_19_0001	pass
 l4_19_0002	pass	
 l4_19_0003	pass	
 l4_19_0004	pass	
-l4_19_0005	fail	divergence
+l4_19_0005	pass	
 l4_19_0006	pass	
 l4_20_0001	fail	divergence
 l4_20_0002	fail	divergence
