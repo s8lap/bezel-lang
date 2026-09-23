@@ -13448,6 +13448,21 @@ void ExprTC::runMethodBody(
                     pendingLambdaParamTypes_.push_back(fp.type);
             }
         }
+        // fix s17_7_0008 (§17.7, v0.307): the expression-body half of the
+        // exclusion clause `rejectNewShorthandAtLambdaReturn` (#4249)
+        // closes for a lambda's ascribed return — see
+        // `rejectNewShorthandAtExpressionBody`'s declaration for the full
+        // rationale. A member's `=> new()` body is a typeless NewExpr the
+        // shorthand's written-declared-type family does not reach (only
+        // the `return e;` STATEMENT of the same declared-result member is
+        // granted), so without this call `visitExpr` below types nothing
+        // and reports nothing, and the shorthand falls through to
+        // codegen's #2491 zero/null backstop. Runs before the body visit,
+        // mirroring the lambda-body sibling call site.
+        if (auto* shNe = dynamic_cast<const ast::NewExpr*>(exprBody)) {
+            if (!shNe->type)
+                rejectNewShorthandAtExpressionBody(*shNe, currentReturnType_);
+        }
         visitExpr(*exprBody);
         pendingLambdaTargetReturn_ = savedLamTargetRet;
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;

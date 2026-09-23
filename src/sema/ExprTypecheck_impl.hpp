@@ -3019,6 +3019,26 @@ private:
     void rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
                                            const TypeRef* rt);
 
+    // fix s17_7_0008 (§17.7, v0.307; fourth sibling of
+    // `rejectNewShorthandAtLambdaReturn` just above, same shape — the OTHER
+    // half of the SAME exclusion clause it closes): "It is **not** permitted
+    // at an expression body (`=> new()`) or at a lambda's ascribed return."
+    // #4249 closed the lambda's-ascribed-return half (both its block-form
+    // `do return new(); end` and bare-arrow spellings); this closes the
+    // expression-body half — a member (method/operator/property-getter/
+    // accessor) whose body is `=> new()` with no target-type wiring at this
+    // position (§17.7's written-declared-type family (v) grants the
+    // shorthand only the `return e;` STATEMENT, not the expression-body
+    // spelling of the same declared-result member). Runs in
+    // `runMethodBody`'s `exprBody` branch (ExprTypecheck.cpp), BEFORE the
+    // body visit — for a typeless NewExpr the visit types nothing and
+    // reports nothing on its own, so without this call the shorthand fell
+    // straight through to codegen's #2491 zero/null backstop exactly as the
+    // two #4249 spellings did pre-fix. `rt` is the member's declared return
+    // type (may be null; handled like the lambda sibling).
+    void rejectNewShorthandAtExpressionBody(const ast::NewExpr& ne,
+                                             const TypeRef* rt);
+
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the
     // silent-zero-fill defect shape). Returns true when the record

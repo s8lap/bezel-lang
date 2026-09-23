@@ -1132,6 +1132,25 @@ void ExprTC::rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
         "altogether.) Name the type explicitly (`" + named + "`) (§17.7)");
 }
 
+// fix s17_7_0008 (§17.7, v0.307): see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale — the OTHER half of the
+// exclusion clause `rejectNewShorthandAtLambdaReturn` just above closes.
+void ExprTC::rejectNewShorthandAtExpressionBody(const ast::NewExpr& ne,
+                                                 const TypeRef* rt) {
+    std::string named = "new T(...)";
+    if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration)
+        named = "new " + std::string(rt->declaration->name) + "(...)";
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "the `new()` shorthand is not permitted at an expression body. "
+        "§17.7 grants the shorthand exactly four positions — field "
+        "initializers, typed local-variable declarations, default "
+        "parameter values, and a `return` statement of a method with a "
+        "declared return type — and excludes this one: \"It is not "
+        "permitted at an expression body or at a lambda's ascribed "
+        "return\". Name the type explicitly (`" + named + "`) (§17.7)");
+}
+
 // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298; sibling to
 // `rejectNewOnEnumOrChoice` above, same shape as #4170's own fix): the
 // single authority for "does `new` construct a value of this NAMED
