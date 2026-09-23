@@ -556,6 +556,68 @@ void Resolver::checkStaticNotVirtual() {
     forEachTypeAndNested([&](TypeSymbol* t) { checkTypeStaticNotVirtual(t); });
 }
 
+// §11.5 (v0.307, #4719): slot assignment for the canonical modifier
+// sequence
+//   visibility static (async|pure) (abstract|virtual|override|sealed override)
+//                (owned|scoped) readonly member-kind Name ...
+// Visibility is slot 1 and is consumed before the modifier prefix
+// (`Parser::parseMember` lines ~1138-1198) so it never appears in
+// `MemberSymbol::modifiers`; `static` is slot 2, etc. Returns -1 for
+// keywords outside §11.5 (e.g. `closed`, a class-level modifier that the
+// parser admits into the shared member-modifier prefix but is checked
+// separately by checkClassModifierCombinations). The walk skips those
+// rather than treating them as slot 1; ordering them against §11.5
+// modifiers is not the concern of this check.
+namespace {
+int memberModifierSlot(std::string_view mod) {
+    if (mod == "static") return 2;
+    if (mod == "async" || mod == "pure") return 3;
+    if (mod == "abstract" || mod == "virtual" ||
+        mod == "override" || mod == "sealed") return 4;
+    if (mod == "owned" || mod == "scoped") return 5;
+    if (mod == "readonly") return 6;
+    return -1;
+}
+}  // namespace
+
+void Resolver::checkMemberModifierOrder() {
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeMemberModifierOrder(t); });
+}
+
+void Resolver::checkTypeMemberModifierOrder(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        // Nested types are passed through `parseTypeOrInterfaceDecl`; their
+        // own type-level modifiers are checked by
+        // `checkTypeModifierCombinations` and the §11.5 member list is
+        // not their concern.
+        if (dynamic_cast<NestedTypeSymbol*>(m)) continue;
+        // Visibility is parsed before the modifier prefix (slot 1), so
+        // seed `prevSlot` at 1; the first member-modifier slot encountered
+        // is always >= 2 and therefore non-decreasing.
+        int prevSlot = 1;
+        for (std::string_view mod : mem->modifiers) {
+            const int slot = memberModifierSlot(mod);
+            if (slot == -1) continue;
+            if (slot < prevSlot) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("member `") + std::string(mem->name) +
+                    "` declares modifier `" + std::string(mod) +
+                    "` out of order; the canonical §11.5 modifier order "
+                    "is `static (async|pure) (abstract|virtual|override|"
+                    "sealed override) (owned|scoped) readonly`");
+                break;
+            }
+            prevSlot = slot;
+        }
+    }
+}
+
 // §9.2 (v0.297): reject `virtual`, `abstract`, and `sealed override` on
 // record members, and `override` on any record member other than the three
 // Object-slot names `Equals` / `GetHashCode` / `ToString`. Records are

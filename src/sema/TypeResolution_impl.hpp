@@ -304,6 +304,18 @@ private:
 
     void checkTypeStaticNotVirtual(TypeSymbol* t);
 
+    // §11.5 (v0.307, #4719): "The compiler rejects out-of-order modifiers."
+    // Per-member slot walk; each modifier's slot is the position it
+    // occupies in the canonical sequence
+    //   static (async|pure) (abstract|virtual|override|sealed override)
+    //   (owned|scoped) readonly
+    // Visibility is parsed before the modifier prefix, so it never appears
+    // in `MemberSymbol::modifiers`; the walk seeds `prevSlot` at 1 (slot of
+    // visibility) and emits one diagnostic per out-of-order member on the
+    // first decreasing pair.
+    void checkMemberModifierOrder();
+    void checkTypeMemberModifierOrder(TypeSymbol* t);
+
     // §9.2 (v0.297): a record member may not declare `virtual`, `abstract`,
     // or `sealed override` — records are implicitly sealed (§9.6) and have no
     // virtual-dispatch surface of their own. `override` IS admitted on the

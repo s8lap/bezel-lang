@@ -478,6 +478,10 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
+    // §11.5 (v0.307, #4719): out-of-order modifiers are rejected. Runs
+    // after the dispatch-modifier checks so an out-of-order modifier
+    // surfaces a single diagnostic rather than cascading false positives.
+    checkMemberModifierOrder();
     // §9.2 (v0.297): a record member may not declare `virtual`, `abstract`,
     // or `sealed override`; `override` is rejected on any record member other
     // than `Equals` / `GetHashCode` / `ToString`. Records are implicitly
