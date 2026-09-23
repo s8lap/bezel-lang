@@ -2259,6 +2259,28 @@ bool ExprTC::caseArmsExhaustive(
         }
     }
 
+    // §35.6 / §19.6 (fix #4674, v0.307): a destructuring slot is irrefutable
+    // when it is a naked binding, a `var x` BindingPattern, or a `_`
+    // DiscardPattern. Anything else (a constant, a relational, a nested
+    // destructuring whose inner slots are refutable) makes the arm
+    // contribute nothing to the static proof. Hoisted to function scope
+    // (was local to the Choice branch below) so the Record branch can reuse
+    // the identical rule rather than a second hand-rolled copy (§35.6's
+    // choice-case slot rule and §19.6's record-slot rule are stated as the
+    // same rule — "exactly as a refutable choice-case slot does").
+    auto slotsIrrefutable = [](const ast::DestructuringPattern& dp) -> bool {
+        for (const auto& sp : dp.subPatterns) {
+            if (!sp.nakedBinding.empty()) continue;  // naked binding
+            if (!sp.pattern) return false;  // defensive
+            if (dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get()))
+                continue;
+            if (dynamic_cast<const ast::BindingPattern*>(sp.pattern.get()))
+                continue;  // `var x` (an untyped binding is irrefutable)
+            return false;  // any other slot shape is refutable
+        }
+        return true;
+    };
+
     if (sub && sub->kind == ast::TypeDeclKind::Enum) {
         // §19.6: every declared enum constant must have a matching pattern.
         std::unordered_set<std::string_view> covered;
@@ -2333,23 +2355,8 @@ bool ExprTC::caseArmsExhaustive(
         }
         // Gather covered case names per §35.6.
         std::unordered_set<std::string_view> covered;
-        // §35.6: a destructuring slot is irrefutable when it is a naked
-        // binding, a `var x` BindingPattern, or a `_` DiscardPattern.
-        // Anything else (a constant, a relational, a nested destructuring
-        // whose inner slots are refutable) makes the arm contribute
-        // nothing to the static proof.
-        auto slotsIrrefutable = [](const ast::DestructuringPattern& dp) -> bool {
-            for (const auto& sp : dp.subPatterns) {
-                if (!sp.nakedBinding.empty()) continue;  // naked binding
-                if (!sp.pattern) return false;  // defensive
-                if (dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get()))
-                    continue;
-                if (dynamic_cast<const ast::BindingPattern*>(sp.pattern.get()))
-                    continue;  // `var x` (an untyped binding is irrefutable)
-                return false;  // any other slot shape is refutable
-            }
-            return true;
-        };
+        // §35.6: a destructuring slot is irrefutable per `slotsIrrefutable`
+        // (hoisted above, function scope).
         for (const auto& arm : arms) {
             // §19.6 / §35.6: a guarded arm contributes nothing.
             if (arm.guard) continue;
@@ -2757,6 +2764,49 @@ bool ExprTC::caseArmsExhaustive(
             return false;
         }
         return true;
+    }
+
+    // §19.6 "Record scrutinee" (fix #4674, v0.307; ruling #4372): a
+    // NON-NULLABLE record scrutinee is exhaustive when some unguarded arm
+    // is a positional destructuring pattern whose head names this exact
+    // record type and every slot is irrefutable (a binding or `_`) — "a
+    // record has exactly one shape and is implicitly sealed (§9.6), so
+    // covering that shape covers every value; no `_` arm is required."
+    // Coverage is one level deep with no per-slot value-space analysis —
+    // a refutable slot (`slotsIrrefutable` above) makes the arm contribute
+    // nothing, exactly as a refutable choice-case slot does. An exact-type
+    // pattern (`var p: Point`) is already handled by the typed-binding
+    // check above (it does not gate on `sub->kind`), so only the
+    // destructuring form needs a dedicated check here. A named
+    // destructuring pattern (`Point(X = var x, …)`) contributes under the
+    // identical rule per the "Named-destructure arms" paragraph, but the
+    // named-slot FORM is not yet parsed by this compiler (#2197, spec-
+    // ahead-of-impl) — every DestructuringPattern reaching sema today is
+    // positional, so the check below covers the full parseable surface.
+    if (sub && sub->kind == ast::TypeDeclKind::Record) {
+        for (const auto& arm : arms) {
+            // §19.6 / §19.4: a guarded arm contributes nothing.
+            if (arm.guard) continue;
+            auto* dp = dynamic_cast<const ast::DestructuringPattern*>(
+                arm.pattern.get());
+            if (!dp || !dp->typeName || dp->typeName->parts.empty()) continue;
+            // The pattern's head must name the scrutinee's own record type —
+            // a record has no subtypes, so this is a name match against the
+            // scrutinee's declaration, exactly as the Choice branch above
+            // matches a destructure's head against `sub->members` by name.
+            if (dp->typeName->parts.back() != sub->name) continue;
+            if (!slotsIrrefutable(*dp)) continue;  // refutable slot: no coverage
+            if (!scrutTy->nullable || armsCoverNull(arms)) return true;
+            // Non-null fully covered by the destructure, but null is not
+            // (§19.6 nullable rule: "the rules above plus an explicit
+            // `null` pattern").
+            warn("the nullable scrutinee's non-null values are covered by "
+                 "a record destructure, but `null` is not");
+            return false;
+        }
+        warn("record `" + std::string(sub->name) +
+             "` has no all-slots-irrefutable destructure or exact-type arm");
+        return false;
     }
 
     // --- The scrutinee-less boolean-condition form (§19.1) has no value

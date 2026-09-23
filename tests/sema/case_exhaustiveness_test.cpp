@@ -1930,3 +1930,161 @@ BEZEL_TEST(sema_case_exhaust, narrower_typed_binding_still_warns_spec_19_5) {
         "end M; end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
 }
+
+// --- Record scrutinee (§19.6 "Record scrutinee" bullet, ruling #4372, fixed
+// by #4674) -------------------------------------------------------------
+//
+// Through fix #4674, `caseArmsExhaustive` had NO branch at all for a Record
+// scrutinee: an all-slots-irrefutable positional destructure fell through to
+// the generic "cannot prove exhaustive" catch-all and drew a spurious
+// warning, even though §19.6 states a record has exactly one shape and is
+// implicitly sealed (§9.6), so covering that shape covers every value and no
+// `_` arm is required. These tests pin THE BUG (#4674's own repro) and its
+// companion (a refutable slot must still warn, so the fix is not a blanket
+// suppression — the generic catch-all only happened to agree with the spec
+// there by accident, per #4674's own diagnosis).
+
+// #4674's own repro: `Point(x, y) => x + y` — a positional destructure whose
+// two naked-binding slots are both irrefutable — must be silently exhaustive.
+BEZEL_TEST(sema_case_exhaust, record_positional_naked_bindings_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point): int "
+        "    return (case p of "
+        "      Point(x, y) => x + y); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Same shape with explicit `var` bindings (`Point(var x, var y)`) — an
+// untyped `var` binding is irrefutable exactly as a naked binding is
+// (§19.6: "every of whose slots is irrefutable (a binding or `_`)").
+// Corpus twin: s19_6_0010 / s19_6_0031.
+BEZEL_TEST(sema_case_exhaust, record_positional_var_bindings_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point): int "
+        "    return (case p of "
+        "      Point(var x, var y) => x + y); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A `_` discard slot is irrefutable too — `Point(_, y)` still covers every
+// value of `Point`.
+BEZEL_TEST(sema_case_exhaust, record_positional_discard_slot_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point): int "
+        "    return (case p of "
+        "      Point(_, y) => y); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// COMPANION (the fix must not become a blanket suppression): a REFUTABLE
+// slot — a constant `0` — makes the arm contribute nothing, exactly as a
+// refutable choice-case slot does (§19.6: "Coverage is one level deep with
+// no per-slot value-space analysis"). Corpus twin: s19_6_0011 / s19_6_0033
+// (blocked on the separate #4626 diagnostic-wording issue, not this fix).
+BEZEL_TEST(sema_case_exhaust, record_positional_refutable_slot_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method YOf(p: Point): int "
+        "    return (case p of "
+        "      Point(0, var y) => y); "
+        "  end YOf; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// An exact-type pattern (`var q: Point`) over a non-nullable record scrutinee
+// is itself total (§19.3: over a non-nullable value scrutinee a type pattern
+// naming its exact type always matches) — this path is handled by the
+// pre-existing typed-binding check (it does not gate on the scrutinee's
+// TypeDeclKind), so this test pins that the new Record branch does not
+// disturb it. Corpus twin: s19_6_0032.
+BEZEL_TEST(sema_case_exhaust, record_exact_type_pattern_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public method FirstOf(p: Point): int "
+        "    return (case p of "
+        "      var q: Point => q.X); "
+        "  end FirstOf; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A DESTRUCTURE whose head names a DIFFERENT record than the scrutinee does
+// NOT cover it — records have no subtyping (§9.6), so a differently-headed
+// destructure must not falsely satisfy exhaustiveness.
+BEZEL_TEST(sema_case_exhaust,
+           record_positional_wrong_type_head_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "record Other(A: int, B: int); "
+        "class C "
+        "  public static method Sum(p: Point): int "
+        "    return (case p of "
+        "      Other(a, b) => a); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+}
+
+// --- Nullable record scrutinee (§19.6: "the rules above plus an explicit
+// `null` pattern") --------------------------------------------------------
+
+// An all-slots-irrefutable destructure plus an explicit `null` arm covers a
+// nullable record scrutinee.
+BEZEL_TEST(sema_case_exhaust, nullable_record_with_null_arm_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point?): int "
+        "    return (case p of "
+        "      Point(x, y) => x + y, "
+        "      null => 0); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The same destructure WITHOUT a `null` arm leaves a nullable record
+// scrutinee non-exhaustive — the destructure covers only the non-null
+// values.
+BEZEL_TEST(sema_case_exhaust,
+           nullable_record_no_null_arm_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point?): int "
+        "    return (case p of "
+        "      Point(x, y) => x + y); "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
