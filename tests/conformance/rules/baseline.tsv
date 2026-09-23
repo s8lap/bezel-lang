@@ -1982,22 +1982,22 @@ l4_13_0003	pass
 l4_13_0004	fail	divergence
 l4_13_0005	pass	
 l4_13_0006	pass	
-l4_14_0001	fail	divergence
+l4_14_0001	pass	
 l4_14_0002	pass	
-l4_14_0003	fail	divergence
+l4_14_0003	pass	
 l4_14_0004	pass	
 l4_14_0005	pass	
-l4_14_0006	fail	divergence
+l4_14_0006	pass	
 l4_14_0007	pass	
 l4_14_0008	fail	divergence
 l4_14_0009	pass	
 l4_14_0010	pass	
 l4_14_0011	pass	
 l4_14_0012	pass	
-l4_14_0013	fail	divergence
+l4_14_0013	pass	
 l4_15_0001	pass	
 l4_15_0002	pass	
-l4_15_0003	fail	divergence
+l4_15_0003	pass	
 l4_15_0004	pass	
 l4_15_0005	pass	
 l4_15_0006	pass	
