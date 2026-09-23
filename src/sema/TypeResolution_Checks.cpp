@@ -10041,6 +10041,24 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition,
 bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
                                const std::string& declSpelling, Scope* scope,
                                std::string_view paramModifier) {
+    // §32.5 (fix #4660): an inline array `[N]T` as an extern RETURN type is
+    // rejected — C functions do not return arrays. The diagnostic carries the
+    // rule's term ("return type") and names the honest C contract (a `Ptr<U>`
+    // return or a C-compatible record with an inline-array field). This check
+    // runs BEFORE `isFfiCompatibleType` — the latter does not know that an
+    // inline array's return-position rejection is the §32.5 carve-out, and
+    // would otherwise admit `[4]int` and silently return true at every call.
+    if (returnPosition && t.kind == ast::TypeKind::InlineArray) {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("extern method ") + declSpelling +
+                " has an inline array return type `" + spellExternType(t) +
+                "`, which is rejected at the FFI boundary — a C function does "
+                "not return arrays; declare `Ptr<U>`, or a C-compatible record "
+                "with an inline-array field, per the actual C signature "
+                "(\xC2\xA7""32.5)");
+        return false;
+    }
     if (isFfiCompatibleType(t, returnPosition, scope)) return true;
     // per §32.13 clause 3 (v0.306): "Admission — by address (§32.5): as
     // `ref`/`out` extern parameters (C sees `R*`; §32.5's rules) and as
