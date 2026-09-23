@@ -13997,6 +13997,49 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // such as `Box<T>(value: T)` are checked against the instantiated T
         // while phantom parameters leave unrelated fields unchanged.
         if (t->kind == ast::TypeDeclKind::Record) {
+            // fix #4712 (§9.3 "Combined form" / §22.5 / §22.6, v0.307): a
+            // combined-form record (positional fields + a body that declares an
+            // explicit constructor of a DIFFERENT parameter list, §9.3: "A body
+            // constructor with a different parameter list is not required to
+            // chain to the primary") was never considered as a candidate by
+            // `new T(...)` resolution. Pre-fix this branch unconditionally
+            // routed the call through the auto-generated primary's parameter
+            // list — `new Point2(5)` against
+            // `record Point2(X: int, Y: int) { constructor(scale: int) { X :=
+            // scale; Y := scale; } }` reported
+            // "required parameter `Y` is not supplied (§22.5)" because the
+            // 1-arg body ctor never entered candidate selection. Defer to
+            // codegen, the same posture the LOCAL class combined-form path
+            // ~70 lines below already takes (fix #3196, then narrowed by
+            // #3625): `buildRecordValue` (src/codegen/LlvmBackend_Exprs2.cpp
+            // ~line 10255) runs `ctorForArgs(t, args)` first and falls
+            // through to its positional fast path (line 10715's
+            // `args.size() == recPosFieldCount && explicitCs == nullptr`)
+            // when no explicit ctor matches the call — so the primary still
+            // wins on the primary-shape call, and the body ctor wins on its
+            // own-shape call. Sema can't disambiguate an overload set against
+            // positional fields (§22.6 ranking needs the candidate set the
+            // class-side ~70-arm also defers to codegen for); the codegen
+            // `ctorTypeMatches` (LlvmBackend_impl.hpp ~line 14565) runs §5.1
+            // arity + type-class filtering that matches what a sema-side
+            // probe would do for §22.5/§22.6, and `buildOrderedArgs` keeps the
+            // existing per-argument §22.3 / §5.1 numeric-coerce envelope.
+            //
+            // The body-only-record arm and the imported-body-ctor arm keep
+            // their existing checks below; this gate fires ONLY for the
+            // combined-form shape (primary fields AND a non-static
+            // ConstructorSymbol). The IMPORTED combined-form shape routes
+            // through `checkImportedNewExprArgs` further down (line 14802),
+            // which already probes an imported explicit ctor against
+            // `bindArgsToParams` per fix #3625 — the LOCAL widening here is
+            // its symmetric counterpart.
+            bool hasExplicitCtor = false;
+            for (Symbol* m : t->members) {
+                if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                    if (!cs->isStatic) { hasExplicitCtor = true; break; }
+                }
+            }
+            if (hasExplicitCtor) return;
             // The positional fields are the constructor's parameter list
             // (one per field, declaration order). Reuse the same arity +
             // named-argument binding + per-argument assignability check the
