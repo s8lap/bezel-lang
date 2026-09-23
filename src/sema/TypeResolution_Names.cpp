@@ -1580,6 +1580,40 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                     ref->arrayElement->kind == TypeRef::Kind::InlineArray) {
                     reportNestedInlineArrayError(t.span.begin);
                 }
+                // fix (§15.1.1 v0.307, rule-corpus case s15_1_1_0002): "The
+                // form `[N owned]T` ... T must be a class or interface type;
+                // value types and
+                // runtime-managed reference types are not admitted with the
+                // `owned` marker." No check enforced this at all for a
+                // CONCRETE element type (`[3 owned]int`, `[2 owned]Connection`
+                // where Connection is a record, …) — it compiled cleanly.
+                // Reuse the shared owning-collection element predicate
+                // (`owningElementBadDesc`, stdlib §4.2 / spec §14.4): it
+                // already classifies Primitive/Function/Unit/InlineArray/
+                // Record/Enum/Choice/value-builtin as bad and Class/
+                // Interface as admitted, matching this rule's "class or
+                // interface" restriction exactly (§14.4's own restricted-
+                // list note cites this very rule as its parallel). A BARE
+                // GENERIC TYPE PARAMETER also returns "" (admitted) from
+                // that predicate — correct here too, but only provisionally:
+                // §15.1.1 says the restriction is checked "at instantiation"
+                // for that case (paralleling §28.5's generic-owned-field
+                // check), which is a deferred site-tracking check this fix
+                // does not add (tracked: issue filed on the corpus row for
+                // the generic-instantiation half, s15_1_1_0003).
+                if (t.arrayOwned) {
+                    std::string badDesc = owningElementBadDesc(ref->arrayElement);
+                    if (!badDesc.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`[N owned]T` requires T to be a "
+                                        "class or interface type (\xC2\xA7"
+                                        "15.1.1) \xE2\x80\x94 here T is ") +
+                            badDesc +
+                            ", which has no disposal obligation and cannot "
+                            "be owned by an inline array's slots");
+                    }
+                }
             }
             // §15.1 (issue #734): N must be a compile-time integer expression
             // (integer literals, `const` declarations, and arithmetic on these).
