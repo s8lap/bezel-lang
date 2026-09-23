@@ -1133,7 +1133,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         lowerAccessorNullCoalescingAssign(*as))
                         return false;
                 }
-                addr = lvalueAddr(*as->target, elemTy);
+                // fix #4732 (§22.16 / §6.6, v0.307): ask for the receiver
+                // pointer here too. This is the `??=` twin of the #4646 request
+                // on the `:=` arm's `lvalueAddr` a few dozen lines below, and it
+                // exists for the same reason: an auto-property `??=` has no
+                // setter body, so the store falls through to the generic
+                // backing-field path and the §22.16 boundary has to be emitted
+                // around it. Threading the out-parameter keeps the receiver
+                // expression evaluated exactly once and puts the boundary check
+                // AFTER §28.2's disposed guard, which `fieldAddr` emits
+                // internally.
+                addr = lvalueAddr(*as->target, elemTy, &invRecv4646);
                 // fix #2905 (§7.7/§6.6/§23.3/§23.4, v0.240): no address means
                 // an ACCESSOR-MEDIATED target — a property or an indexer, which
                 // has no backing slot and is reachable only through its
@@ -1344,6 +1354,73 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // fix #4732 (§22.16 / §6.6, v0.307): the §22.16 AUTO-PROPERTY
+                // setter boundary for `obj.P ??= e`.
+                //
+                // §22.16 instruments "Entry and normal exit of every `public`
+                // setter — block-form, auto-property, indexer, `set(owned)`
+                // alike", and §6.6 says of this very spelling: "`??=` is not a
+                // read-modify-write: `x ??= e` assigns `e` only when `x`'s
+                // current value is null … `e` is evaluated — and THE SETTER
+                // INVOKED — only when the assignment actually occurs." So when
+                // control reaches here (inside `coaleq.do`, the LHS-was-null
+                // branch) a setter invocation is happening and both boundaries
+                // are owed. #4646 emitted them on the `:=` arm and #4682 on the
+                // compound / `++` arms; this arm returns before either, so it
+                // evaluated nothing at all.
+                //
+                // MEASURED on 6221ed38 with `--checked-contracts`, on a class
+                // with `public property P: int? := null; invariant(P = null);`:
+                // `c.P ??= 7;` gave 42 where §22.16 requires
+                // ContractViolationException (99), while the byte-identical
+                // `c.P := 7;` on the same class already gave 99. That is a
+                // SILENT UNDER-CHECK — the direction §22.16's
+                // observable-boundary property exists to prevent — and it is
+                // the ONLY write form §6.6 admits on a nullable target
+                // ("Rejected … every compound-assignment form; and `++`/`--`.
+                // Retained: … `??=`"), so for a `T?` auto-property this arm was
+                // the whole of §22.16's setter row.
+                //
+                // Both checks sit INSIDE the null branch, never on the
+                // short-circuit path: §6.6 makes a non-null LHS no setter
+                // invocation at all, so instrumenting it would be an OVER-check
+                // (and would fault on an instance a caller is legitimately
+                // mid-repair on). The ENTRY check is emitted after the RHS has
+                // been lowered and coerced — §22.16 binds arguments before any
+                // clause runs — and before the whole store sequence, so a
+                // violating entry state throws before the `+1` retain below
+                // rather than after it (a retained string that is never stored
+                // would leak).
+                //
+                // `invRecv4646` is non-null only when `lvalueAddr` resolved an
+                // `obj.f`-shaped target through `fieldAddr`; a shape whose
+                // receiver pointer never materialised (an implicit-`this`
+                // `P ??= e`, §22.16-exempt anyway) degrades to the pre-fix
+                // behaviour rather than checking over a null pointer.
+                //
+                // WHAT DOES NOT REACH HERE, AND WHAT DOES. A BLOCK-FORM,
+                // VIRTUAL or INTERFACE property is claimed above by
+                // `lowerAccessorNullCoalescingAssign` — by the virtual/
+                // interface gate for the dispatching shapes, by the `!addr`
+                // fallback for the rest — and its store routes through
+                // `lowerPropertySetValue` (#4614(b)), already instrumented.
+                // An IMPORTED AUTO-property, by contrast, DOES reach here:
+                // #2478 made it real storage in the importer's layout, so
+                // `lvalueAddr` succeeds and the accessor path is never taken.
+                // `instrumentedAutoPropertyStoreClass` then declines for it on
+                // `ctx_.isImported` (#4682), so the imported spelling keeps its
+                // pre-existing unchecked behaviour — MEASURED on a real
+                // two-module build with BOTH halves `--checked-contracts`:
+                // `c.P ??= 7` gives 42 where `c.P := 7` on the identical
+                // imported property gives 99. That divergence is #4705's, and
+                // the same measurement shows it covers `OP=` and `++` too; it
+                // is deliberately unchanged here, because closing it belongs in
+                // the exporter's checked stub (§22.16's checked face, #4651),
+                // not in this arm.
+                const sema::TypeSymbol* invCls4732 =
+                    invRecv4646 ? instrumentedAutoPropertyStoreClass(*as->target)
+                                : nullptr;
+                if (invCls4732) emitInvariantCheck(invRecv4646, invCls4732);
                 // #429 / §4.6 / §28.9: `field ??= e` stores into a (currently
                 // null) CLASS string field/auto-property only when null, so
                 // there is no old value to release — but the field still takes
@@ -1356,7 +1433,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     !isPlusOneStringProducer(as->value.get()))
                     emitStringRetain(rhs);
                 builder_.CreateStore(rhs, addr);
-                builder_.CreateBr(endBB);
+                // §22.16's "throw exits check nothing": a store sequence that
+                // left the current block terminated (an unwind edge) must not
+                // have an exit check appended, and appending one to a
+                // terminated block is malformed IR besides. Mirrors #4646's
+                // `:=` exit guard and #4682's compound one.
+                if (invCls4732 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4646, invCls4732);
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
                 return false;
             }
