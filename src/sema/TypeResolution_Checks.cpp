@@ -14406,6 +14406,68 @@ void Resolver::checkStaticReadonlyNullSource() {
                 continue;
             }
             if (!rt) continue;
+            // fix #4679 / §9.7 / §4.14 / §4.15 (v0.307, the §9.7 static-
+            // field bullet's third §4.14-family reject from the issue's
+            // enumeration — `l4_14_0006` "Span<> stored in a static
+            // field"): the four builtin span views (Span<T>,
+            // ReadOnlySpan<T>, ArraySpan<T>, ReadOnlyArraySpan<T>) declare
+            // a NON-NULLABLE Buffer/Source field — so the §9.7 null-source
+            // escape clause (every reference-typed component is null) is
+            // unreachable for any Span<T>-typed static readonly initialiser,
+            // because there is no value of the type whose Buffer/Source is
+            // null. The general-purpose checks below — which recognise
+            // `new Tok(...)` and `Tok.Case(...)` forms — fall through to
+            // "any other initializer (call result, captured variable,
+            // method reference, etc.) … accept" for the common
+            // `_buf.AsSpan()` spelling: the analysis cannot prove
+            // non-null-source against a fresh borrow, but for a span view
+            // the spell is FORBIDDEN by construction, not just
+            // possibly-non-null. The Span family is named here (rather
+            // than buried in the general path) because the diagnostic
+            // word "static field" reads as the §9.7 static-field bullet
+            // the rule enforces, and the ruling needs the four span-view
+            // names to be unmistakable to the reader. No further pass on
+            // `init` is attempted: every initializer of a Span<T>-typed
+            // static readonly is rejected, including `default(...)`
+            // (which a Span<T> lacks, by §17.11) and a literal-null
+            // (which would fail span construction).
+            //
+            // Mirror OwnershipFacts.cpp's anonymous-namespace
+            // `borrowSpanNameHead` inline (that helper is file-local, so
+            // a header export would drag `common/` into `sema/`'s public
+            // surface for one private three-fallback name read). Use the
+            // project-wide `headName()` accessor (TypeRef.hpp:80) instead
+            // of `declaration->name` directly: `rt->declaration` is null
+            // for §3.4 synthetic value-type builtins (Span<T>,
+            // ReadOnlySpan<T>, ArraySpan<T>, ReadOnlyArraySpan<T> are in
+            // that set, #1463) so the direct read skips every builtin
+            // span view and the rule silently accepts. `headName()` falls
+            // back to `aliasResolvedHead` / use-site head / `importedName`
+            // in that order and reliably returns "Span" / "ReadOnlySpan"
+            // / "ArraySpan" / "ReadOnlyArraySpan" for the four builtin
+            // span views.
+            {
+                std::string_view sn = rt->headName();
+                if (sn == "Span" || sn == "ReadOnlySpan" ||
+                    sn == "ArraySpan" || sn == "ReadOnlyArraySpan") {
+                    const std::string specRef =
+                        (sn == "ArraySpan" || sn == "ReadOnlyArraySpan")
+                            ? "§4.15" : "§4.14";
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("a `") + std::string(sn) +
+                        "` value may not be stored in a static "
+                        "field (" + specRef + " / §9.7) — a "
+                        "span view's backing-storage field is "
+                        "non-nullable, so no value of the type "
+                        "satisfies the §9.7 null-source escape "
+                        "clause; expose the backing storage (an "
+                        "`owned OwningBuffer<T>` / `owned Array<T>` "
+                        "field) and re-derive the span with "
+                        "`AsSpan()` at the use site instead");
+                    continue;
+                }
+            }
             // §9.7-deferred kinds only: borrow-bearing record,
             // non-owning choice that holds borrows, plain inline array
             // carrying borrows. The other §22.12 residual kinds (owning

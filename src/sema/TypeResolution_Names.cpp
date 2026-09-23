@@ -125,6 +125,31 @@ static std::string_view ownedBareTypeParamOfField(const FieldSymbol& fs,
 // the call site (`c.slot < ref.genericArgs.size()`) would otherwise
 // silently stop firing for it — no crash, no failing test, just a quietly
 // disarmed §14.2/§14.4 check. This makes that failure mode loud instead.
+// fix #4679 / §4.14 / §14.4 / §28.9 (v0.307, last §4.14/§14.4 reject case
+// from the issue's enumeration — `l4_14_0013` "OwningBuffer<string> is
+// admitted"): the OwningBuffer/Span/ArraySpan family REJECTS the runtime-
+// managed reference types as T (string, function types). Helper for the
+// inline annotation-site check below — encapsulates the two-shape
+// detection (Kind::Primitive + PrimitiveType::String for the `string`
+// keyword, Kind::Function for the function type) so the rejection arm
+// has one predicate rather than two inline tests that would have to be
+// kept coherent. Returns false on a null ref, an Error ref, or any kind
+// that is neither — caller should treat a false answer as "not rejected
+// at this site; defer to other checks".
+static bool isRuntimeManagedReferenceType(const TypeRef* el) {
+    if (!el) return false;
+    if (el->kind == TypeRef::Kind::Error) return false;
+    // `string` is the §4.6 keyword-spelled, §28.9-runtime-managed primitive.
+    if (el->kind == TypeRef::Kind::Primitive &&
+        el->primitive == PrimitiveType::String) {
+        return true;
+    }
+    // Function types (§27.1) — every spelling produces a Kind::Function
+    // TypeRef — are the §28.9 second runtime-managed family.
+    if (el->kind == TypeRef::Kind::Function) return true;
+    return false;
+}
+
 [[noreturn]] static void unhandledNullDeclClassConstraintSlot(
     std::string_view name, std::size_t slot, int arity) {
     std::fprintf(stderr,
@@ -3047,7 +3072,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // the same guard; reusing its shape keeps the two sites
                 // consistent.
                 if (first == "OwningBuffer" || first == "Span" ||
-                    first == "ReadOnlySpan") {
+                    first == "ReadOnlySpan" ||
+                    first == "ArraySpan" || first == "ReadOnlyArraySpan") {
                     if (!ref.genericArgs.empty()) {
                         TypeRef* el = ref.genericArgs[0];
                         const char* moveOnlyKind = nullptr;
@@ -3078,6 +3104,49 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 "kinds of \xC2\xA7""15.3: the owning inline "
                                 "arrays and the owning-classified choices "
                                 "(\xC2\xA7""35.4)");
+                        } else if (isRuntimeManagedReferenceType(el)) {
+                            // fix #4679 / §4.14 / §4.15 (v0.307, last §4.14/
+                            // §14.4 reject case from the issue's enumeration —
+                            // `l4_14_0013` "OwningBuffer<string> is
+                            // admitted"): the OwningBuffer/Span/ReadOnlySpan/
+                            // ArraySpan/ReadOnlyArraySpan exception admits T
+                            // as either class-typed (with ownership
+                            // semantics) or value-typed (with plain value
+                            // semantics) — but the exception's own first
+                            // clause EXCLUDES the runtime-managed reference
+                            // types (`string`, function types, §28.9). Those
+                            // types have no disposal obligation, so the
+                            // "owning" semantics add nothing; collections of
+                            // them belong in borrowing form (`Array<string>`,
+                            // `Array<T -> R>`), not in OwningBuffer. Reject
+                            // inline with `not admitted` wording per the
+                            // spec's phrasing at §4.14 *What is not admitted*.
+                            // Same source-location preference as the move-only
+                            // arm.
+                            SourceLocation diagLoc;
+                            if (el && el->astNode &&
+                                el->astNode->span.begin.line != 0)
+                                diagLoc = el->astNode->span.begin;
+                            else
+                                diagLoc = t.span.begin;
+                            std::string_view what =
+                                (el->kind == TypeRef::Kind::Function)
+                                    ? std::string_view(
+                                          "a function type")
+                                    : std::string_view("`string`");
+                            ctx_.diagnostics().report(
+                                Severity::Error, diagLoc,
+                                std::string("`") + std::string(first) +
+                                "` does not admit " +
+                                std::string(what) +
+                                " as its T type argument (\xC2\xA7""4.14"
+                                " / \xC2\xA7""14.4 \xE2\x80\x94 What is not "
+                                "admitted, v0.307) \xE2\x80\x94 runtime-managed"
+                                " reference types have no disposal obligation"
+                                " (§28.9), so the OwningBuffer/Span/ArraySpan"
+                                " owning semantics add nothing; collect them"
+                                " in borrowing form (`Array<string>`, "
+                                "`Array<T -> R>`) instead");
                         } else if (el && !el->declaration &&
                                    el->kind == TypeRef::Kind::Named &&
                                    el->astNode && el->astNode->name &&
