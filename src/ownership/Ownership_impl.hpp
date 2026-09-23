@@ -2468,6 +2468,31 @@ private:
     sema::Symbol* carriedEscapeBoundSourceLiveAt(const sema::Symbol* holder,
                                                  std::uint32_t atOffset) const;
 
+    // §9.7 / stdlib §4.14 / §4.15 (v0.307): given an expression whose STATIC
+    // TYPE is a borrow-bearing record or a builtin span view, return the live
+    // escape-bound binding (`isEscapeBoundLocal` — an owned scope-bound local
+    // still Owned, or a §31.1 catch binding) whose scope the carried borrow is
+    // rooted at, or null.
+    //
+    // This is the value-carried sibling of `ownedLocalBorrowSource`, which
+    // DECLINES this shape on purpose ("those keep their existing type-based
+    // store handling untouched"). It recognizes the same three forms
+    // `checkRecordBorrowEscapesOnReturn` does at the return site:
+    //   (a) construction — `new Span<T>(buf, 0, n)` / `new Rec(local)`: the
+    //       first argument whose `identifierRoot` is escape-bound. Every
+    //       argument is scanned, which is safe at this precision because a
+    //       record may not have `owned` fields (§9.7's first paragraph), so a
+    //       class-typed argument is necessarily bound to a borrow-carrying
+    //       field;
+    //   (b) projection — `buf.AsSpan()`, `sp.Slice(1)`, `rec.Field`: the
+    //       receiver root;
+    //   (c) alias — a bare span/record local whose carried provenance the
+    //       §28.3 freeze pre-pass recorded in `recordBorrowLocalSource_`,
+    //       resolved through `carriedEscapeBoundSourceLiveAt`.
+    // Conservative throughout: an unrecognized shape returns null rather than
+    // guessing a source. // per §9.7, stdlib §4.14, §4.15
+    sema::Symbol* carriedBorrowSourceOfValueExpr(const ast::Expr& e);
+
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). The
     // unified CALLER-side classification of a call whose result is an
     // argument-source-union borrow of a bare type parameter — covering:

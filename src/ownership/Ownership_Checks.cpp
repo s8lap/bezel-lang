@@ -6771,6 +6771,36 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs,
     return nullptr;
 }
 
+// §9.7 / stdlib §4.14 / §4.15 (v0.307): see the declaration in
+// Ownership_impl.hpp for the contract and the three recognized forms.
+sema::Symbol* MethodOwnership::carriedBorrowSourceOfValueExpr(
+        const ast::Expr& e) {
+    // A `new` carries its type on the annotation, exactly as
+    // checkRecordBorrowEscapesOnReturn reads it.
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
+    const sema::TypeRef* rt =
+        ne && ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
+    if (!isBorrowBearingRecordOrSpan(rt)) return nullptr;
+    if (ne) {
+        for (const ast::CallArgument& a : ne->args) {
+            if (!a.value) continue;
+            const ast::IdentifierExpr* argRoot = identifierRoot(*a.value);
+            if (!argRoot) continue;
+            sema::Symbol* s = ctx_.exprSymbol(*argRoot);
+            if (s && isEscapeBoundLocal(s)) return s;
+        }
+        return nullptr;
+    }
+    const ast::IdentifierExpr* root = identifierRoot(e);
+    if (!root) return nullptr;
+    sema::Symbol* sym = ctx_.exprSymbol(*root);
+    if (!sym) return nullptr;
+    // (b) the root IS the backing store (`buf.AsSpan()`).
+    if (isEscapeBoundLocal(sym)) return sym;
+    // (c) the root is another span/record holder — follow its provenance.
+    return carriedEscapeBoundSourceLiveAt(sym, root->span.begin.offset);
+}
+
 sema::Symbol* MethodOwnership::carriedEscapeBoundSourceLiveAt(
     const sema::Symbol* holder, std::uint32_t atOffset) const {
     // §28.3 (v0.194, #1801 S2). DFS over recordBorrowLocalSource_ following each
@@ -8894,6 +8924,89 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                 "literal directly as the field's own value instead of "
                 "through an intermediate local");
             return true;
+        }
+    }
+
+    // §9.7 / §4.14 / §4.15 (v0.307): the OUTER-LOCAL face of the borrow-
+    // bearing-record / builtin-span store escape. §9.7's FIRST borrow-lifetime
+    // bullet — "a borrow-bearing record value may not outlive the source of
+    // any borrow it contains" — is enforced today at the three destinations
+    // that outlive the frame (an instance field, #1251; a collection reachable
+    // from one, #2308; a return, #1966) but NOT at the plain-local channel
+    // just below, because that channel decides through `ownedLocalBorrowSource`
+    // and that function DELIBERATELY declines a borrow-bearing record / span
+    // RHS ("those keep their existing type-based store handling untouched" —
+    // its own bare-T leg says so). For a field target the type-based leg
+    // above is that handling; for a plain local there was none, so the
+    // assignment fell through every leg of this function.
+    //
+    // MEASURED on the parent (2313ba78, `--sanitize=address`):
+    //   `using var seed := new OwningBuffer<int>(3, lambda(i: int): int => 0);`
+    //   `var s := seed.AsSpan();`
+    //   `if true then`
+    //   `  using var buf := new OwningBuffer<int>(3, lambda(i: int): int => i);`
+    //   `  s := buf.AsSpan();`
+    //   `end;`
+    //   `Console.WriteLine(s[1]);`
+    // compiles rc=0 with NO diagnostic and dies with
+    // `AddressSanitizer: SEGV ... READ memory access` in the span read — `buf`
+    // is disposed at the end of the inner block while `s`, declared in the
+    // enclosing one, still views it. The byte-identical CLOSURE spelling
+    // (`f := lambda(): int => r.V();`) has been rejected since #861 through
+    // the very depth comparison this leg reuses.
+    //
+    // The verdict is the same structural scope comparison #861 makes and §9.7's
+    // collection bullet names ("whose binding's scope strictly encloses a
+    // carried source's scope"): reject only when the target local's declaring
+    // block STRICTLY encloses the carried source's. A target at the same or a
+    // deeper depth dies no later than the source, which is what keeps the
+    // ordinary `var sp := a.AsSpan(); sp := a.AsSpan(1);` rebind (pinned by
+    // own_span_field_store_1251 and own_consume_site_freeze_span_reassign)
+    // admitted. An unknown depth on either side declines, exactly as the
+    // #861 arm does. // per §9.7, stdlib §4.14, §4.15, v0.307
+    if (dest == Dest::None && targetLocal && scope == EscapeScope::Method) {
+        if (sema::Symbol* viewSrc = carriedBorrowSourceOfValueExpr(*as.value)) {
+            auto depthOfDecl = [&](const ast::Node* declNode) -> int {
+                auto it = localDepth_.find(declNode);
+                return it == localDepth_.end() ? -1 : it->second;
+            };
+            const int td = targetLocal->decl ? depthOfDecl(targetLocal->decl) : -1;
+            const int sd = viewSrc->decl ? depthOfDecl(viewSrc->decl) : -1;
+            if (td >= 0 && sd >= 0 && td < sd) {
+                const bool spanForm = !isBorrowBearingRecord(
+                    ctx_.exprType(*as.value));
+                report(
+                    Severity::Error, as.span.begin,
+                    spanForm
+                        ? (std::string("span assigned to `") +
+                           std::string(targetLocal->name) +
+                           "` views `" + std::string(viewSrc->name) +
+                           "`, which is disposed first — `" +
+                           std::string(viewSrc->name) +
+                           "` is an owned scope-bound local disposed at the end "
+                           "of its block, while `" +
+                           std::string(targetLocal->name) +
+                           "` lives in an enclosing block, so the span would "
+                           "outlive the backing store it views and every later "
+                           "read of it is a use-after-free (§9.7 borrow-"
+                           "lifetime rule; stdlib §4.14 / §4.15 — bind the "
+                           "backing Array / OwningBuffer in a block that "
+                           "outlives `" + std::string(targetLocal->name) +
+                           "`, or re-derive the span where it is used)")
+                        : (std::string("borrow-bearing record assigned to `") +
+                           std::string(targetLocal->name) +
+                           "` carries a borrow of `" +
+                           std::string(viewSrc->name) +
+                           "`, which is disposed first — a borrow-bearing "
+                           "record may not outlive the source of any borrow it "
+                           "contains, and `" + std::string(targetLocal->name) +
+                           "` lives in a block that encloses `" +
+                           std::string(viewSrc->name) +
+                           "`'s (§9.7 record borrow-lifetime rule; bind the "
+                           "source in a block that outlives the record, or "
+                           "rebuild the record where it is used)"));
+                return true;
+            }
         }
     }
 
@@ -14202,7 +14315,73 @@ bool MethodOwnership::exprIsTemporary(const ast::Expr& e) const {
 void MethodOwnership::checkRecordFromTemporary(const ast::NewExpr& ne) {
     const sema::TypeRef* rt =
         ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+    if (!rt) return;
+    // §9.7 / §4.14 / §4.15 (v0.307): the BUILTIN SPAN face of the same rule.
+    // §9.7's second borrow-lifetime bullet — "a borrow-bearing record may not
+    // be constructed from a temporary bound to one of its borrow-carrying
+    // fields ... a fresh call result that is not bound to a named location has
+    // a lifetime that ends at the construction expression" — applies verbatim
+    // to `Span<T>` / `ReadOnlySpan<T>` (stdlib §4.14) and `ArraySpan<T>` /
+    // `ReadOnlyArraySpan<T>` (stdlib §4.15): each declares a non-nullable
+    // `Buffer: OwningBuffer<T>` / `Source: Array<T>` field that carries a
+    // borrow of its backing store. But a builtin span view has no user Record
+    // `TypeDecl`, so the `rt->declaration` / `TypeDeclKind::Record` gate below
+    // returned before checking anything and `new Span<int>(new OwningBuffer<
+    // int>(3), 0, 3)` compiled clean — the same declaration-less blind spot
+    // #1251 (field store), #2308 (collection store) and #1966 (return escape)
+    // each had to close on this family, here for the construction site.
+    // MEASURED on the parent: the case compiles rc=0 while the byte-identical
+    // user-record spelling (`record Bag(Items: Array<int>)`,
+    // `new Bag([10, 20, 30])` — §9.7's own worked example) is rejected.
+    //
+    // The argument is classified by the ARGUMENT'S OWN static type, not by a
+    // positional convention: a builtin span carries no `recordPositionalField
+    // Symbols` to pair against, §22.5 admits the named spelling
+    // (`new Span<int>(Buffer := buf, Start := 0, Length := 4)` — pinned by
+    // own_named_args_method_arm_gate_3785) and §22.10 admits reordering, so
+    // "argument 0 is the buffer" is wrong for both. Reading the argument's
+    // type instead answers the question the rule actually asks — is a
+    // borrow-carrying value being bound from an unbound temporary — in every
+    // argument order, and leaves the offset arguments (`Start`, `Length`:
+    // primitives, never borrow-carrying) untouched, which is what keeps
+    // `new ArraySpan<int>(0, 0, 0)` (own_value_builtin_new_3134) admitted.
+    // // per §9.7, stdlib §4.14, §4.15, v0.307
+    if (isBorrowBearingRecordOrSpan(rt) && !isBorrowBearingRecord(rt)) {
+        for (const ast::CallArgument& a : ne.args) {
+            const ast::Expr* arg = a.value.get();
+            if (!arg || !exprIsTemporary(*arg)) continue;
+            // §9.7 null-source form — inapplicable to a span (both backing
+            // fields are non-nullable, stdlib §4.14/§4.15), but skipped for
+            // the same reason the record leg skips it: a `null` argument
+            // stores no borrow, so it is never a dangling one.
+            if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
+            // A collection literal is §9.7's own named temporary ("a
+            // collection or array literal"). It is recognized structurally as
+            // well as by type because §15.4 gives a literal no standalone
+            // type, so `exprType` on one in an unannotated position can be
+            // absent — the §4.15 `new ArraySpan<int>([1, 2, 3], 0, 3)` shape.
+            const bool literalSource =
+                dynamic_cast<const ast::CollectionLiteralExpr*>(arg) != nullptr;
+            if (!literalSource &&
+                !fieldTypeIsBorrowCarrying(ctx_.exprType(*arg)))
+                continue;
+            report(
+                Severity::Error, ne.span.begin,
+                std::string("a span may not be constructed from a temporary "
+                            "backing store — the temporary's lifetime ends at "
+                            "this construction expression, so the span would "
+                            "immediately outlive the source it views (a "
+                            "dangling borrow); bind the backing "
+                            "Array / OwningBuffer to a named local whose scope "
+                            "outlives the span and pass that, or use the "
+                            "`AsSpan()` / `AsReadOnlySpan()` factory on it "
+                            "(§9.7 no-temporary-source rule; stdlib §4.14 / "
+                            "§4.15)"));
+            return;  // one diagnostic per construction is enough
+        }
+        return;
+    }
+    if (rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return;
     // fix #3145 (§9.7 / §2.8.3 rule 4, v0.252): THE reject this family exists
     // for. Reading the field list through `->decl` made it null for every
