@@ -60,7 +60,7 @@
 // other 7 are ACCEPT-arm/control rows that correctly pass on BOTH sides of
 // the fix BY DESIGN, not because the fix reaches them:
 // `instance_method_call_after_field_assigned_accepted_spec_22_7` and
-// `virtual_record_method_after_assignment_accepted` (field already assigned
+// `override_record_method_after_assignment_accepted` (field already assigned
 // — the gate was never going to fire either way);
 // `lambda_capture_of_this_before_field_assigned_accepted_spec_22_7` (rule 3:
 // capture is never gated by rule 1, pre- or post-fix);
@@ -370,24 +370,58 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
     BEZEL_EXPECT_FALSE(diagContains(r, "virtual`/`override`/`abstract`"));
 }
 
-// The same `virtual` record method, called AFTER the field is assigned, must
-// be ACCEPTED and run — confirming rule 2 truly never fires for a record
-// (not merely that rule 1 masks it in the reject case above).
+// A DISPATCH-MODIFIER-BEARING record method, called AFTER the field is
+// assigned, must be ACCEPTED and run — confirming rule 2 truly never fires
+// for a record (not merely that rule 1 masks it in the reject case above).
+//
+// The modifier is `override` on `ToString`, not `virtual`. §9.2 (v0.307):
+// "A record member may not be declared `virtual`, `abstract`, or
+// `sealed override`; `override` is admitted only on `Equals` ...
+// `GetHashCode`, and `ToString`" — "Records are implicitly sealed (§9.6)
+// and have no virtual-dispatch surface of their own, so the dispatch
+// modifiers carry no meaning on record members; record members are always
+// dispatched statically ... The rejection is at the declaration". So the
+// original spelling of this row — a `virtual` record method — is not
+// writable at all any more, and the row cannot be repaired by keeping it.
+//
+// It is repaired by taking the one dispatch modifier §9.2 DOES admit on a
+// record member, which preserves the control's actual content: a record
+// member bearing a dispatch modifier, invoked on `this` from the
+// constructor after the observed field is assigned, is admitted. Dropping
+// the modifier instead would make this row a duplicate of
+// `instance_method_call_after_field_assigned_accepted_spec_22_7` above —
+// coverage in appearance only.
+//
+// MEASURED that the control is not vacuous (bezelc, this tree): moving
+// `var s := this.ToString();` ABOVE `Extra := w;` in the program below is
+// REJECTED — "cannot observe `this` (instance call `ToString`) before
+// non-nullable field `Extra` is definitely assigned on every path ...
+// (§22.7, v0.184)". So rule 1 does reach an `override`-bearing record
+// member, and this row's acceptance is the after-assignment fact, not an
+// artifact of the member being invisible to the gate. That REJECT half is
+// pinned by `virtual_record_method_before_assignment_rejected_by_rule1_not_rule2`
+// above, which is untouched.
+//
+// The `override ToString` declaration costs the record only its auto-
+// `ToString` (§9.2: "An `override` of `ToString` alone suppresses only the
+// auto-`ToString`; auto-`Equals`/auto-`GetHashCode`/`=` remain"), which
+// this row never uses. The assertion and expected value are unchanged.
 BEZEL_TEST(sema_record_ctor_observation_gate_4014,
-           virtual_record_method_after_assignment_accepted) {
+           override_record_method_after_assignment_accepted) {
     BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
-        "public record RecordObsVirtualOk4014 "
+        "public record RecordObsOverrideOk4014 "
         "  public readonly property Extra: Widget4014; "
-        "  public virtual method Peek(): int return Extra.Render(); end Peek; "
+        "  public override method ToString(): string "
+        "    return Extra.Render().ToString(); end ToString; "
         "  public constructor(w: Widget4014) "
         "    Extra := w; "
-        "    var x := this.Peek(); "
+        "    var s := this.ToString(); "
         "  end constructor; "
-        "end RecordObsVirtualOk4014; "
+        "end RecordObsOverrideOk4014; "
         "class C "
         "  public static method Main(): int "
         "    var w := new Widget4014(42); "
-        "    var c := new RecordObsVirtualOk4014(w); "
+        "    var c := new RecordObsOverrideOk4014(w); "
         "    return c.Extra.Render(); "
         "  end Main; "
         "end C;"),
