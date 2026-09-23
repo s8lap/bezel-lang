@@ -1066,6 +1066,108 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // four routes converge on this one `recordMovesIn` fallthrough,
             // so fixing it here closes all four at once. // per §28.2,
             // §28.3, §28.4 K9, v0.294, #4023, #4063
+            //
+            // fix #4683 (§28.8.1, §28.3 K3.1/K3.6, v0.307): §28.8.1's own
+            // enumeration of `move`'s admitted operand shapes is closed —
+            // "the identifier-operand form `move x`... `move x.f`... `move
+            // coll[i]`... elsewhere it is rejected" — and every one of those
+            // is a NAMED PLACE with real storage. A CALL (`move
+            // other.Self()`), or a MemberAccessExpr/IndexExpr that resolves
+            // through a user PROPERTY rather than a field (`move
+            // h.Current` / `move h[0]`), is none of them: §23's own
+            // "accessor read faces are lend-only; transfer-out is a
+            // method" rule (rationale axiom A4) means a property/indexer
+            // getter can NEVER be declared `owned` (PropertyDecl's grammar
+            // admits no `owned` on its Type, unlike MethodDecl) — its read
+            // is unconditionally a borrow, so `move` through one is always
+            // illegal, exactly like `move` of a plain non-`owned` field
+            // (`moveOnNonOwnedFieldName`, ExprTypecheck_Exprs.cpp, the
+            // sibling sema-side check this mirrors for a getter instead of
+            // a field). A CALL is different: a method call CAN legitimately
+            // be a fresh owned producer (`Take(): owned Cell return move
+            // C.Fresh();`, move_borrow_owned_return_1995_test.cpp's pinned
+            // ACCEPT — K3.13's "redundant marker on a fresh producer" is
+            // harmless, not an error), so a call is rejected only when it is
+            // NOT already an owned producer in its own right. `producerState`
+            // is the single authority for that question (the LANE_RULES
+            // duplicated-classification-predicate discipline — its
+            // CallExpr-Owned cascade, factory heuristics included, is not
+            // re-derived here); a bare identifier and `this.field` never
+            // reach this point (both `return` above), so this cannot
+            // reclassify either of those.
+            //
+            // MEASURED (issue's own repro, on HEAD before this fix):
+            // `using var live := move other.Self();` (`Self(): Widget
+            // return this; end Self;` — a plain, non-`owned` return)
+            // compiled with ZERO diagnostics and heap-use-after-freed under
+            // `--sanitize=address`: `producerState`'s own `move`-handling
+            // arm (Ownership.cpp) classifies ANY `move <class-typed-expr>`
+            // Owned by STATIC TYPE ALONE — the "plain-class fallback" — so
+            // `live` and `other` both disposed the same `Widget`. The same
+            // shape was independently measured through a user-defined
+            // property indexer (`move h[0]`, a `property [i: int]: Widget`
+            // getter), a plain property getter (`move h.Current`), and a
+            // borrow-ending chain (`move other.Self().Self()`) — all four
+            // reach this exact fallthrough with no prior check anywhere in
+            // the pipeline, sema included.
+            if (auto* callOp = dynamic_cast<const ast::CallExpr*>(mop)) {
+                if (producerState(*callOp) != OwnershipState::Owned) {
+                    report(Severity::Error, un->span.begin,
+                           "`move` is not admitted on this call: its result "
+                           "is a borrow, not an owning place — `move` "
+                           "transfers only a named binding (a local, an "
+                           "`owned` parameter, or an `owned` field/"
+                           "collection slot, §28.8.1) or a call that is "
+                           "itself a fresh owned producer (a call returning "
+                           "`owned T`). This call returns a plain "
+                           "(non-`owned`) type, so its result has no "
+                           "ownership to transfer; moving it would give the "
+                           "result a SECOND owner over a value its real "
+                           "owner still disposes (§28.3 K3.1/K3.6). Read it "
+                           "without `move` (it is already a borrow for the "
+                           "use site).");
+                    return;
+                }
+            } else if (auto* maOp =
+                           dynamic_cast<const ast::MemberAccessExpr*>(mop)) {
+                if (dynamic_cast<sema::PropertySymbol*>(
+                        ctx_.exprSymbol(*maOp))) {
+                    report(Severity::Error, un->span.begin,
+                           "`move` is not admitted on a property: its "
+                           "getter is lend-only (§23 — a property/indexer "
+                           "declaration admits no `owned` on its type, "
+                           "unlike a method's return type), so the read is "
+                           "always a borrow with no storage to transfer. "
+                           "`move` transfers only a named binding or an "
+                           "`owned` field/collection slot (§28.8.1); moving "
+                           "a property read would give the result a SECOND "
+                           "owner over a value its real owner still "
+                           "disposes (§28.3 K3.1/K3.6). Read the property "
+                           "plainly instead.");
+                    return;
+                }
+            } else if (auto* ixOp = dynamic_cast<const ast::IndexExpr*>(mop)) {
+                if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
+                        ctx_.exprSymbol(*ixOp)))
+                    if (ps->isIndexer) {
+                        report(
+                            Severity::Error, un->span.begin,
+                            "`move` is not admitted on a user-defined "
+                            "indexer: its getter is lend-only (§23 — a "
+                            "property/indexer declaration admits no `owned` "
+                            "on its type, unlike a method's return type), so "
+                            "the read is always a borrow with no storage to "
+                            "transfer. `move coll[i]` transfers only a raw "
+                            "owned-element collection slot (§28.8.1 / "
+                            "§28.11 — `OwningArray<T>`, class-typed "
+                            "`OwningBuffer<T>`/`Span<T>`, and owning inline "
+                            "arrays); moving an indexer read would give the "
+                            "result a SECOND owner over a value its real "
+                            "owner still disposes (§28.3 K3.1/K3.6). Read "
+                            "the indexer plainly instead.");
+                        return;
+                    }
+            }
             checkRead(*un->operand, /*selfTarget=*/false);
         }
         if (un->operand) recordMovesIn(*un->operand);
