@@ -352,6 +352,20 @@ BEZEL_TEST(bare_type_param_returns,
 // transfer, not a borrow: no bare-T holder, no carried source, nothing to
 // escape. Must be ACCEPTED. Guards the return-escape scan against firing on
 // ordinary owned returns.
+//
+// The return type is `owned C`, not `C`. That is REQUIRED as of v0.307 and is
+// not incidental to this row: §28.3's announcement table row 4 admits only a
+// receiver-sourced borrow through a PLAIN concrete class return, and §28.6's
+// fresh-value rule rejects a freshly-produced owned value there. `owned` is
+// how a transfer is spelled.
+//
+// The row originally declared `: C` and asserted `!hasErrors()`. `fe95b173`
+// implemented row 4 and it went red — but the row's AXIS never changed: it
+// guards the BORROW-ESCAPE SCAN, a different rule, and `!hasErrors()` is an
+// over-broad oracle that catches every rule including ones the row is not
+// about. Spelling the transfer correctly keeps this a genuine over-reject
+// guard for the scan it exists to guard, instead of turning it into a row
+// about row 4. // per §28.3 row 4, §28.6, v0.307
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(bare_type_param_returns,
@@ -365,7 +379,7 @@ BEZEL_TEST(bare_type_param_returns,
         "class Prog "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
-        "  public method MakeFresh(): C "
+        "  public method MakeFresh(): owned C "
         "    var c := new C(); "
         "    return c; "                        // fresh owned transfer — OK
         "  end MakeFresh; "
