@@ -11396,6 +11396,49 @@ static bool positionalFieldIsSkip(const ast::Param& pf) {
     return pf.serialized && pf.serialized->isSkip;
 }
 
+// fix #4688 (s9_8_0004) (§9.8 / §17.11): the same rule as
+// `skipComponentEnumLacksZero` above, for `serialized optional` instead of
+// `serialized skip`. §9.8: "A `serialized optional` component whose type is
+// not defaultable (§17.11) is a compile error at the conformance declaration
+// (a missing field would have no value to supply) ... exactly as for
+// `serialized skip` below" — on read, a missing optional field is supplied
+// `default(T)` exactly like a skip component's reconstruction, so the same
+// §17.11 enum-lacks-a-zero-constant defect applies verbatim.
+//
+// Scoped identically to `skipComponentEnumLacksZero` (fix #3044): the ENUM
+// row only. The other non-defaultable rows for `serialized optional` (a
+// non-nullable reference type, a record carrying one, a choice) are the same
+// pre-existing gap #3072 already records for `skip`; this predicate does not
+// widen past what it answers for. Returns the reason, or "" when fine.
+static std::string optionalComponentEnumLacksZero(const TypeRef* ty) {
+    if (!ty || ty->nullable) return {};  // `T?` reconstructs as null — fine
+    if (ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
+    if (ty->declaration->kind != ast::TypeDeclKind::Enum) return {};
+    std::optional<bool> hasZero = enumHasZeroConstant(*ty->declaration);
+    if (!hasZero || *hasZero) return {};
+    return std::string("enum `") + std::string(ty->declaration->name) +
+           "` declares no constant of underlying value 0, so it is not "
+           "defaultable (§17.11) and `default(" +
+           std::string(ty->declaration->name) + ")` — which `serialized "
+           "optional` supplies for a missing field — is a compile error "
+           "(§9.8/§17.11); declare a zero-valued constant, make the "
+           "component nullable, or drop `optional`";
+}
+
+// fix #4688 (s9_8_0007) (§9.8, v0.182): "[a serialized name] must be
+// unique among the serialized names of the type's components ... a member's
+// serialized name is its rename where one is declared and its declared
+// identifier otherwise, so a rename equal to another member's identifier
+// collides too." Computes that effective serialized name for a positional
+// field or auto-property: the `serialized "X"` rename when one is declared
+// and non-empty, else the declared identifier. Comparison is ordinal (the
+// wire's own comparison, §9.8), so a plain `std::string` set suffices.
+static std::string effectiveSerializedName(const ast::SerializedClause* sc,
+                                            std::string_view declaredName) {
+    if (sc && !sc->name.empty()) return std::string(sc->name);
+    return std::string(declaredName);
+}
+
 // #3152: the `hasAstAutoPropertyDecl` calls in this function and in
 // `checkClassSerializationEligibilityLate` below are the AST-ONLY predicate on
 // purpose. Both walk `ctx_.module()->children` and both skip any `t` with no
@@ -11742,6 +11785,14 @@ void Resolver::checkSerializationEligibility() {
 
         bool foundError = false;
 
+        // fix #4688 (s9_8_0007) (§9.8 v0.182): the serialized-name
+        // uniqueness set for THIS record's components — one or the other
+        // branch below populates it, never both (a record is either
+        // positional or body-form). Skip-marked components are excluded:
+        // §9.8 "the component is excluded from both directions entirely",
+        // so it never occupies a wire name.
+        std::unordered_set<std::string> seenSerializedNames;
+
         // Positional record: check positional fields.
         if (td->hasPositionalFields) {
             for (const auto& pf : td->positionalFields) {
@@ -11777,6 +11828,45 @@ void Resolver::checkSerializationEligibility() {
                         "that does not start with `$`");
                     foundError = true;
                     break;
+                }
+                // fix #4688 (s9_8_0007) (§9.8 v0.182): the serialized
+                // name — the rename where declared, the identifier otherwise —
+                // must be unique among the type's components; a rename equal
+                // to another member's plain identifier collides too.
+                {
+                    std::string serName =
+                        effectiveSerializedName(pf.serialized.get(), pf.name);
+                    if (!seenSerializedNames.insert(serName).second) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "record `" + std::string(t->name) +
+                            "`: serialized name `" + serName +
+                            "` for field `" + std::string(pf.name) +
+                            "` is not unique among the type's components "
+                            "(§9.8 v0.182) — a `serialized \"" + serName +
+                            "\"` rename collides with another component's "
+                            "serialized name or declared identifier; choose "
+                            "a distinct name");
+                        foundError = true;
+                        break;
+                    }
+                }
+                // §9.8 v0.182 (case s9_8_0004): `serialized optional` on a
+                // component whose type is not defaultable is a compile error
+                // — the same §17.11 reconstruction rule `serialized skip`
+                // obeys above.
+                if (pf.serialized && pf.serialized->isOptional && pf.type) {
+                    std::string whyE =
+                        optionalComponentEnumLacksZero(ctx_.resolvedType(*pf.type));
+                    if (!whyE.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "record `" + std::string(t->name) +
+                            "`: `serialized optional` on field `" +
+                            std::string(pf.name) + "` — " + whyE);
+                        foundError = true;
+                        break;
+                    }
                 }
                 if (!pf.type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pf.type);
@@ -11834,6 +11924,41 @@ void Resolver::checkSerializationEligibility() {
                         "that does not start with `$`");
                     foundError = true;
                     break;
+                }
+                // fix #4688 (s9_8_0007) (§9.8 v0.182): same
+                // serialized-name uniqueness rule, auto-property form.
+                {
+                    std::string serName =
+                        effectiveSerializedName(pd->serialized.get(), m->name);
+                    if (!seenSerializedNames.insert(serName).second) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "record `" + std::string(t->name) +
+                            "`: serialized name `" + serName +
+                            "` for property `" + std::string(m->name) +
+                            "` is not unique among the type's components "
+                            "(§9.8 v0.182) — a `serialized \"" + serName +
+                            "\"` rename collides with another component's "
+                            "serialized name or declared identifier; choose "
+                            "a distinct name");
+                        foundError = true;
+                        break;
+                    }
+                }
+                // §9.8 v0.182 (case s9_8_0004): same `serialized optional`
+                // defaultability rule, auto-property form.
+                if (pd->serialized && pd->serialized->isOptional && pd->type) {
+                    std::string whyE =
+                        optionalComponentEnumLacksZero(ctx_.resolvedType(*pd->type));
+                    if (!whyE.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "record `" + std::string(t->name) +
+                            "`: `serialized optional` on property `" +
+                            std::string(m->name) + "` — " + whyE);
+                        foundError = true;
+                        break;
+                    }
                 }
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
