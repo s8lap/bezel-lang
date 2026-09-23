@@ -10627,8 +10627,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.SetInsertPoint(deadBB);
             return llvm::ConstantInt::get(i32(), 0);  // nominal value, never reached
         }
-        // Environment.GetEnvironmentVariable(name): string? — getenv
-        if (m == "GetEnvironmentVariable" && call.args.size() == 1 &&
+        // fix #2348 (stdlib §2.4, v0.307): `Environment.Get(name): string?`.
+        // The member was renamed at v0.231 (`GetEnvironmentVariable` → `Get`,
+        // the BREAKING item of that revision's migration note, whose in-tree
+        // exposure it counts as exactly this one codegen dispatch site). Only
+        // the pre-rename spelling was matched here, so the CURRENT spelling
+        // reached no arm at all: `var v := Environment.Get("HOME");` compiled,
+        // exited 0, and degraded its local to a zero-initialized slot behind
+        // `internal: … #2434` — measured printing `<null>` for a variable that
+        // is set. The long spelling is gone, not aliased: §2.4 declares `Get`.
+        if (m == "Get" && call.args.size() == 1 &&
             call.args[0].value) {
             llvm::Value* nameStr = lowerExpr(*call.args[0].value);
             if (!nameStr) return nullptr;
@@ -10681,6 +10689,53 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             phi->addIncoming(nullPtr, entBB);
             phi->addIncoming(strObj, okEnd);
             return phi;
+        }
+        // fix #2348 (stdlib §2.4, v0.307): `Set(name: string, value: string?)`
+        // — "value = null removes the variable; an empty name, or one
+        // containing \"=\", raises ArgumentException". Never implemented under
+        // any spelling, and a UNIT-returning statement call that reaches no arm
+        // is the SILENT end of the #3079 family: it leaves no local to degrade,
+        // so not even the `#2434` note fires. Measured pre-fix:
+        // `Environment.Set("K", "v"); Console.WriteLine(Environment.Get("K"))`
+        // compiled clean and wrote nothing.
+        if (m == "Set" && call.args.size() == 2 && call.args[0].value &&
+            call.args[1].value) {
+            llvm::Value* nameStr = lowerExpr(*call.args[0].value);
+            llvm::Value* valStr  = lowerExpr(*call.args[1].value);
+            if (!nameStr || !valStr) return nullptr;
+            llvm::Value* nameData = loadStringData(nameStr);
+            auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+            // §2.4 band-1 argument defects: empty name, or a name containing
+            // '='. `strchr(name, '=') != null` is the containment test.
+            llvm::Value* emptyName = builder_.CreateICmpEQ(
+                builder_.CreateLoad(i8Ty3, nameData),
+                llvm::ConstantInt::get(i8Ty3, 0), "envs.empty");
+            auto* strchrFn = declareC("strchr", ptrTy(), {ptrTy(), i32()});
+            llvm::Value* eqPos = builder_.CreateCall(
+                strchrFn, {nameData, builder_.getInt32('=')}, "envs.eq");
+            llvm::Value* hasEq = builder_.CreateICmpNE(
+                eqPos, llvm::ConstantPointerNull::get(ptrTy()), "envs.hasEq");
+            emitGuardThrow(builder_.CreateOr(emptyName, hasEq, "envs.bad"),
+                           "ArgumentException");
+            // value = null → unsetenv(name); otherwise setenv(name, value, 1).
+            auto* setBB   = llvm::BasicBlock::Create(llvm_, "envs.set",   currentFn_);
+            auto* unsetBB = llvm::BasicBlock::Create(llvm_, "envs.unset", currentFn_);
+            auto* joinBB  = llvm::BasicBlock::Create(llvm_, "envs.join",  currentFn_);
+            llvm::Value* isNullVal = builder_.CreateICmpEQ(
+                valStr, llvm::ConstantPointerNull::get(ptrTy()), "envs.isNull");
+            builder_.CreateCondBr(isNullVal, unsetBB, setBB);
+            builder_.SetInsertPoint(setBB);
+            auto* setenvFn =
+                declareC("setenv", i32(), {ptrTy(), ptrTy(), i32()});
+            builder_.CreateCall(setenvFn, {nameData, loadStringData(valStr),
+                                           builder_.getInt32(1)});
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(unsetBB);
+            auto* unsetenvFn = declareC("unsetenv", i32(), {ptrTy()});
+            builder_.CreateCall(unsetenvFn, {nameData});
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            return llvm::ConstantInt::get(i32(), 0);  // unit
         }
     }
 
