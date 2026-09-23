@@ -12946,9 +12946,34 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
     if (returnIsBareTypeParam_) return; // bare-T: checkBareTypeParamReturn's job
     if (!returnType_) return;
     if (returnType_->kind == ast::TypeKind::Named && returnType_->name &&
-        !returnType_->name->parts.empty() &&
-        isOwningTypeNameHead(returnType_->name->parts.front()))
-        return;  // owning-type return: checkBorrowReturnedThroughOwningType
+        !returnType_->name->parts.empty()) {
+        std::string_view retHead = returnType_->name->parts.front();
+        if (isOwningTypeNameHead(retHead))
+            return;  // owning-type return: checkBorrowReturnedThroughOwningType
+        // §28.3 announcement table rows 2-3 (v0.307): a MINT-ANNOUNCING
+        // return type — the non-owning half of the iterable/enumerator
+        // family (`IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`,
+        // `IAsyncEnumerator<T>`; the owning four are already excluded above
+        // via `isOwningTypeNameHead`) or a `Task`-family type — is "claimed
+        // by no other row" EXCLUDES it from row 4 outright: "the unmarked
+        // mint-announcing return type transfers the container like an
+        // `owned` return" (row 2's own text), so a fresh production through
+        // one is the NORMAL, expected shape — `GetEnumerator(): IEnumerator
+        // <T> => new IntRangeEnum(...);` is admitted precisely because
+        // `IEnumerator<T>` announces the transfer itself, exactly as
+        // `§29.1`'s own worked example spells it unmarked. MEASURED
+        // regression (found reviewing this fix's own blast radius): before
+        // this guard, `GetEnumerator(): IEnumerator<T> => new E();` was
+        // newly and wrongly rejected by the block below — an existing,
+        // heavily-used iterator-protocol idiom across many codegen/module
+        // tests (§29.1). `checkBorrowReturnedThroughOwningType` (the
+        // sibling function) already governs what THIS family disallows
+        // returning (a stored-view re-exposure of a receiver-owned field);
+        // it does not, and should not, reject a fresh production, so no
+        // corresponding guard was needed there. // per §28.3, v0.307
+        if (common::isIterableInterfaceHead(retHead)) return;
+        if (common::isTaskFamilyHead(retHead)) return;
+    }
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
     if (!ownedArgSourceIsBorrow(e)) {
         // §28.3 announcement table row 4 (v0.307): an instance method's

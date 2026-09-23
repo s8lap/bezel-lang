@@ -6,8 +6,25 @@
 // leaked silently at every call site (24 B/call + payload).
 //
 // Tests 1-4: AOT runtime tests verifying clean execution.
-// Test 5: mechanical compile-only test asserting the producerState classification
-// changed: before fix Borrowed (no auto-drop), after fix Owned (auto-drop fires).
+//
+// UPDATE (§28.3 announcement table row 4, v0.307): test 5 originally asserted
+// that `method Make(): C return new C(); end` — the unmarked shape #4360
+// fixed the CALLER-side leak for — still COMPILES, merely producing a
+// runtime auto-drop warning once correctly classified Owned. A later fix
+// closed the matching DECLARATION-site half of row 4 this file's own #4360
+// comment already quotes the spec for ("an instance method that produces a
+// fresh value must declare `owned` — §28.6 rejects a freshly-produced owned
+// value returned through a non-`owned` return"): that shape is now a
+// COMPILE ERROR at its own declaration, not merely a warned-about leak risk.
+// #4360's fix is not wrong — every accepted call site it re-classifies
+// (an EXPLICITLY `owned`-returning factory, tests 1-2; a receiver-sourced
+// borrow, tests 3-4) remains exactly as it was — but the ONE shape test 5
+// exercised (an UNMARKED instance factory) is now structurally unreachable:
+// the program that would trigger the leak this file was written to catch no
+// longer compiles at all, which is a strictly stronger guarantee than a
+// runtime warning. Test 5 now asserts the REJECTION instead of the warning;
+// the anti-vacuity `this`-return control is unchanged (a receiver-sourced
+// borrow was and remains legal). // per §28.3, v0.307
 
 #include <string>
 #include <cstdio>
@@ -188,13 +205,19 @@ BEZEL_TEST(instance_method_owned_return_annotation_gap_4360,
 }
 
 // 5th test — mechanical compile-only assertion that the fix changed producerState
-// classification. Before fix: `d.Make()` is Borrowed → no auto-drop warning.
-// After fix: `d.Make()` is Owned → §28.3 auto-drop warning fires at call site.
+// classification. UPDATED (§28.3 announcement table row 4, v0.307): the
+// unmarked shape below — `method Make(): C return new C(); end` — is now
+// REJECTED at its own declaration (a later, stricter fix than #4360's own;
+// see the file header). It can therefore no longer demonstrate a Borrowed-
+// vs-Owned CALLER-side classification difference at all — the call site is
+// unreachable because the callee never compiles. This test now asserts the
+// rejection directly, citing the row-4 diagnostic.
 //
 // Anti-vacuity twin (bare `this` return) compiles WITHOUT auto-drop warning,
-// proving the warning is specific to the factory classification.
+// proving #4360's classification fix still stands for the shapes it must
+// (a receiver-sourced borrow is not, and was never, an instance factory).
 BEZEL_TEST(instance_method_owned_return_annotation_gap_4360,
-            auto_drop_warning_fires_after_fix) {
+            unmarked_instance_factory_rejected_at_declaration) {
     // The program under test: instance method returning `new C()` without `: owned`.
     std::string srcFactory =
         "module M; "
@@ -218,15 +241,13 @@ BEZEL_TEST(instance_method_owned_return_annotation_gap_4360,
     std::string captured;
     int ret = compileAndCapture(srcFactory, &captured);
 
-    // The source is valid Bezel — compilation must succeed.
-    BEZEL_EXPECT_EQ(ret, 0);
-
-    // After the fix, the call is classified Owned and the §28.3 auto-drop
-    // warning fires at the `var c := d.Make()` call site.
-    bool hasAutoDrop = captured.find("auto-drop") != std::string::npos;
-    bool hasImplicitDispose = captured.find("is implicitly disposed") != std::string::npos;
-    BEZEL_EXPECT_TRUE(hasAutoDrop);
-    BEZEL_EXPECT_TRUE(hasImplicitDispose);
+    // §28.3 announcement table row 4 (v0.307): an unmarked instance-method
+    // return admits only a receiver-sourced borrow; `Make()`'s fresh `new
+    // C()` has no announced transfer and is rejected at its own declaration.
+    BEZEL_EXPECT_EQ(ret, -1);
+    bool hasRow4Rejection =
+        captured.find("announcement table row 4") != std::string::npos;
+    BEZEL_EXPECT_TRUE(hasRow4Rejection);
 
     // Anti-vacuity: bare `this` return must NOT produce an auto-drop warning
     // (it is a borrow, not an owned factory).

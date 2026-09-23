@@ -329,8 +329,17 @@ const char* kObjectExprCurrentInUserEnumerator =
     "  end MoveNext; "
     "  public property Current: Object => 7; "
     "end E; "
+    // §28.3 announcement table row 4 (v0.307): a duck-typed `GetEnumerator()`
+    // returning a plain CONCRETE class (not the `IEnumerator<T>` interface)
+    // is outside the mint-announcing family (that family is keyed on the
+    // DECLARED type being one of the eight canonical interface heads or a
+    // Task-family type, §29.3/§30.7) — so it is an ordinary row-4 instance
+    // return, and a fresh `new E()` through it requires `owned` like any
+    // other. Declaring it `owned` here changes nothing this test exercises
+    // (the `for` loop's structural dispatch to `MoveNext`/`Current` is
+    // unaffected by the return type's ownership marker).
     "class Src "
-    "  public method GetEnumerator(): E => new E(); "
+    "  public method GetEnumerator(): owned E => new E(); "
     "end Src; "
     "class P "
     "  public static method Main(): int "

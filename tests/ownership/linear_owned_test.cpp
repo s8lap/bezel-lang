@@ -26,11 +26,28 @@ namespace {
 // must-use assertion below would silently test the exemption instead of the
 // discharge analysis it was written for. The destructors keep the obligation
 // real and these fixtures on their intended subject.
+//
+// §28.3 announcement table row 4 (v0.307): `Source.Read()` must classify as
+// a BORROW at the caller (the `borrowed_var_not_diagnosed` test's own
+// subject) — but `Read(): T => new T();`, a plain (non-`owned`) instance
+// return handing back a FRESH production, is itself now correctly rejected
+// at its OWN declaration by that same rule (the fresh-owned-value-through-a-
+// non-owned-instance-return check this file's preamble had silently violated
+// since it was written — nothing tested `Source` itself, so the violation
+// was invisible until that check existed). Give `Source` a genuine
+// receiver-sourced borrow instead — an owned field read back unmarked — so
+// `Read()` stays legally Borrowed-classified at every call site exactly as
+// this file's tests need, without tripping the declaration-site rule.
+// // per §28.3, v0.307
 std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
         "class T destructor end destructor; end T; "
         "class U destructor end destructor; end U; "
-        "class Source public method Read(): T => new T(); end Source; "
+        "class Source "
+        "  public owned _t: T; "
+        "  public constructor() _t := new T(); end constructor; "
+        "  public method Read(): T => _t; "
+        "end Source; "
         "class C(source: Source) "
         "  public method ") + sig + " " + body + " end; "
         "end C;";
@@ -118,9 +135,17 @@ BEZEL_TEST(own_linear, plain_var_with_move_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// §28.3 announcement table row 4 (v0.307): a plain (non-`owned`) instance
+// return admits only a receiver-sourced borrow, so `return x;` of a FRESH
+// owned local through `Make(): T` is itself now rejected at the declaration
+// (the exact s28_3_0029 corpus shape). This test's actual subject —
+// returning a plain owned local discharges it, no auto-drop warning needed
+// — needs an `owned` return type to admit the transfer in the first place;
+// `owned` is the announcement `move x`'s sibling test just above this one
+// implicitly relies on too. // per §28.3, v0.307
 BEZEL_TEST(own_linear, plain_var_with_return_clean) {
     auto r = parseAndCheckOwnership(wrap(
-        "var x := new T(); return x;", "Make(): T"));
+        "var x := new T(); return x;", "Make(): owned T"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
