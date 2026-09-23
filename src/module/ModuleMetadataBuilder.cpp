@@ -1903,6 +1903,12 @@ void appendChoiceCases(const sema::TypeSymbol& t, sema::SemaContext& ctx,
                 mp.serializedOptional = pf.serialized->isOptional;
                 mp.serializedName = std::string(pf.serialized->name);
             }
+            // §35.7 / §9.2 "The `equality skip` clause" (v0.307, #4652):
+            // export the SAME way `serialized` above is — from the AST, which
+            // is always real on THIS side (the exporter's `caseDecl` is never
+            // an imported reconstruction; it is the module's own
+            // `ast::ChoiceCase`, per this function's header comment).
+            if (pf.equality) mp.equalitySkip = pf.equality->isSkip;
             mc.payload.push_back(std::move(mp));
         }
         out.choiceCases.push_back(std::move(mc));

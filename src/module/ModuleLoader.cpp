@@ -544,6 +544,23 @@ struct Loader {
                     p.serialized->isOptional = mp.serializedOptional;
                     p.serialized->name = ctx.internString(mp.serializedName);
                 }
+                // §35.7 / §9.2 "The `equality skip` clause" (v0.307, #4652;
+                // follow-up to fix #4643/#3152 family F9): reconstruct the
+                // SAME `ast::EqualityClause` shape the parser attaches to a
+                // local `ast::Param` (Parser_Decls.cpp's `parseCasePayloadList`),
+                // so every consumer that reads `pf.equality` off a
+                // `ChoiceCaseSymbol::caseDecl` payload — this function's own
+                // header comment explains why `caseDecl` is a FAITHFUL
+                // reconstruction rather than a sixth loader side table —
+                // answers identically for a local and an imported case. A
+                // field omitted here would repeat exactly the #4643 record-
+                // side defect (0892d092): the clause invisible across the
+                // module boundary while very much in effect inside the
+                // declaring module.
+                if (mp.equalitySkip) {
+                    p.equality = std::make_unique<ast::EqualityClause>();
+                    p.equality->isSkip = true;
+                }
                 cd->payload.push_back(std::move(p));
             }
             auto* cs = ctx.makeImportedSymbol<sema::ChoiceCaseSymbol>();

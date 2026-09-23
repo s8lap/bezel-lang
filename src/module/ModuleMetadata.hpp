@@ -505,6 +505,35 @@ struct MetaChoicePayloadField {
     bool serializedOptional = false;
     std::string serializedName;
 
+    // §35.7 "Equality, hashing, ToString" / §9.2 "The `equality skip` clause"
+    // (v0.307; issue #4652, follow-up to fix #4643/#3152 family F9): this
+    // payload field's `equality skip` clause (A.3 `CaseField`'s trailing
+    // `EqualityClause?`).
+    //
+    // §35.7 states the clause reads per §9.2's skip-model table — "excluded
+    // from its case's payload comparison and hash, exempt from admissibility"
+    // — and §9.2 states the artifact interface carries the clause "exactly as
+    // it carries `serialized` clauses": adding or removing it on a public
+    // choice's payload is a breaking change (§3.6 rule 3), because it flips
+    // `=`/`GetHashCode` results for clients and can flip the choice's §35.7
+    // auto-hashable / §3.6 hashable derived properties (the ELIGIBILITY GATE
+    // direction — a class-typed payload marked `equality skip` rescues an
+    // otherwise-inadmissible case from disqualifying the whole choice).
+    // #4643 landed the record-side sibling field but explicitly declared the
+    // choice site out of scope (tests/parser/equality_skip_clause_test.cpp);
+    // this is the wire-carriage half of closing that gap, following the
+    // `MetaMember::equalitySkip` (fix #3152/0892d092) template: a symbol/AST
+    // field, one record code, hash+operator==+emit+read.
+    //
+    // Emitted under its own record code (REC_CHOICE_EQ_CLAUSE) and only when
+    // TRUE, so a module using no `equality skip` on a choice payload is
+    // byte-identical to a pre-#4652 build. Absent (a pre-#4652 blob) reads as
+    // `false`, i.e. "participates in equality" — the reading every
+    // dependency's own compiler already produced, since no compiler before
+    // this fix read the clause for a choice payload at all (in-module or
+    // across an import).
+    bool equalitySkip = false;
+
     bool operator==(const MetaChoicePayloadField&) const;
 };
 

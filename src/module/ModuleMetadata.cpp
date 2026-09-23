@@ -183,7 +183,20 @@ enum RecordCode : unsigned {
     // blob) reads as `false` = "participates in equality", which is exactly
     // what that dependency's own compiler produced.
     REC_EQ_CLAUSE = 17,
-    // 18.. additive; unknown codes are skipRecord()'d by the reader
+    // §35.7 / §9.2 "The `equality skip` clause" (v0.307, additive within v7;
+    // issue #4652, follow-up to fix #4643/#3152 family F9): CHOICE_PAYLOAD_BLOCK
+    // — a choice payload field's `equality skip` clause as a single scalar
+    // under its OWN code, the CHOICE_PAYLOAD_BLOCK twin of REC_EQ_CLAUSE above
+    // (a distinct code because it lives in a different block's record-code
+    // namespace, and CHOICE_PAYLOAD_BLOCK's own scalars are read as a fixed
+    // sequence — see readChoicePayloadFieldBody). Emitted only when TRUE, so a
+    // module using no `equality skip` on a choice payload is byte-identical to
+    // a pre-#4652 build. Absent (a pre-#4652 blob, or ANY blob written before
+    // this fix, since no compiler ever wrote this clause for a choice payload)
+    // reads as `false` = "participates in equality", exactly what every
+    // dependency's own compiler produced.
+    REC_CHOICE_EQ_CLAUSE = 18,
+    // 19.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -487,6 +500,15 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
                 hashBool(h, pf.serializedOptional);
                 hashStr(h, pf.serializedName);
                 hashType(h, pf.type);
+                // §35.7 / §9.2 (v0.307, #4652): `equality skip` on a choice
+                // payload flips `=`/`GetHashCode` results and can flip the
+                // choice's §35.7 auto-hashable / §3.6 hashable derived
+                // properties, so §9.2 names adding or removing it a BREAKING
+                // change (§3.6 rule 3) — it must fold into the semantic hash.
+                // GUARDED BY THE SAME PREDICATE AS THE EMISSION (see
+                // emitChoicePayloadField), the reason hashMember's REC_EQ_CLAUSE
+                // fold directly above gives for the record-side sibling.
+                if (pf.equalitySkip) hashBool(h, pf.equalitySkip);
             }
         }
     }
@@ -611,7 +633,11 @@ bool MetaChoicePayloadField::operator==(const MetaChoicePayloadField& o) const {
            hasSerialized == o.hasSerialized &&
            serializedSkip == o.serializedSkip &&
            serializedOptional == o.serializedOptional &&
-           serializedName == o.serializedName;
+           serializedName == o.serializedName &&
+           // §35.7 / §9.2 (v0.307, #4652): the `equality skip` clause is part
+           // of a choice payload field's identity — see hashTypeDeclContent's
+           // choiceCases loop and the field's comment in ModuleMetadata.hpp.
+           equalitySkip == o.equalitySkip;
 }
 
 bool MetaChoiceCase::operator==(const MetaChoiceCase& o) const {
@@ -906,10 +932,17 @@ void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
     w.ExitBlock();
 }
 
-// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. Everything
-// inside this block is UNCONDITIONAL — the block itself only exists for a
-// choice, so no non-choice module pays a byte for it (the conditionality that
-// matters lives at the TYPE_BLOCK level, see emitTypeDecl).
+// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. The
+// scalars/strings/type below are UNCONDITIONAL — the block itself only exists
+// for a choice, so no non-choice module pays a byte for it (the
+// conditionality that matters lives at the TYPE_BLOCK level, see
+// emitTypeDecl). The `equality skip` clause (#4652) is the one CONDITIONAL
+// piece of this block's content: it did not exist before this fix, so it
+// rides its own coded record — REC_CHOICE_EQ_CLAUSE, not a 4th positional
+// scalar in `sc` below, for the reason REC_EQ_CLAUSE is coded rather than a
+// 3rd REC_SER_CLAUSE scalar on the record side (RecordCode enum comment): an
+// unconditional 4th scalar would perturb every choice payload's bytes and
+// header hash whether or not it uses the clause.
 void emitChoicePayloadField(llvm::BitstreamWriter& w,
                             const MetaChoicePayloadField& pf) {
     w.EnterSubblock(CHOICE_PAYLOAD_BLOCK, 4);
@@ -923,6 +956,13 @@ void emitChoicePayloadField(llvm::BitstreamWriter& w,
     emitString(w, pf.modifier);
     emitString(w, pf.serializedName);
     emitType(w, pf.type);
+    // §35.7 / §9.2 (v0.307, #4652): emitted ONLY when true, so a module using
+    // no `equality skip` on a choice payload is byte-identical to a pre-#4652
+    // build — `hashTypeDeclContent` is guarded by the SAME predicate.
+    if (pf.equalitySkip) {
+        llvm::SmallVector<std::uint64_t, 1> ev{1u};
+        w.EmitRecord(REC_CHOICE_EQ_CLAUSE, ev);
+    }
     w.ExitBlock();
 }
 
@@ -1867,6 +1907,15 @@ bool readParam(Reader& r, MetaParam& p) {
 
 // §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. The caller
 // has already entered CHOICE_PAYLOAD_BLOCK.
+//
+// §35.7 / §9.2 (v0.307, #4652): the trailing scan below (in place of a plain
+// `finishBlock(r)`) captures REC_CHOICE_EQ_CLAUSE BY CODE — a coded record is
+// self-describing and skipRecord()'d by every reader this format has had, so
+// it is read whatever its position relative to the fixed scalar/string/type
+// sequence above, and its absence (a pre-#4652 blob, or any blob no compiler
+// before this fix ever wrote the clause into) simply leaves `equalitySkip`
+// false — "participates in equality", the reading every such dependency's
+// own compiler already produced. Mirrors readMemberBody's REC_EQ_CLAUSE arm.
 bool readChoicePayloadFieldBody(Reader& r, MetaChoicePayloadField& pf) {
     llvm::SmallVector<std::uint64_t, 4> sc;
     if (!expectScalars(r, sc) || sc.size() < 3) return false;
@@ -1877,7 +1926,28 @@ bool readChoicePayloadFieldBody(Reader& r, MetaChoicePayloadField& pf) {
     if (!expectString(r, pf.modifier)) return false;
     if (!expectString(r, pf.serializedName)) return false;
     if (!readType(r, pf.type)) return false;
-    return finishBlock(r);
+    while (true) {
+        unsigned id = 0;
+        Next n = nextEntry(r, id);
+        if (n == Next::EndBlock) {
+            if (r.cursor.ReadBlockEnd()) return false;
+            return true;
+        }
+        if (n == Next::Record) {
+            llvm::SmallVector<std::uint64_t, 8> vals;
+            auto got = r.cursor.readRecord(id, vals);
+            if (!got) { llvm::consumeError(got.takeError()); return false; }
+            if (got.get() == REC_CHOICE_EQ_CLAUSE && !vals.empty()) {
+                pf.equalitySkip = vals[0] != 0;
+            }
+            continue;
+        }
+        if (n == Next::SubBlock) {
+            if (r.cursor.SkipBlock()) return false;
+            continue;
+        }
+        return false;  // Error
+    }
 }
 
 // §35.1 (#3144): one choice case. The caller has already entered
