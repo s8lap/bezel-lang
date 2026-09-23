@@ -1687,6 +1687,48 @@ private:
         }
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             if (ue->operand) visitExpr(*ue->operand);
+            // §28.8.1 / §7.9 (v0.300, #4686): the bare in-scope spelling of an
+            // `owned` field of the enclosing instance as the operand of a
+            // `move` — `move _resource` is `move this._resource` per §28.8.1 —
+            // is a definite-assignment violation when the field has not yet
+            // been assigned on the reaching path. The case (s28_8_1_0009) is
+            // a constructor whose only `owned` field has no initializer, so
+            // the body's first statement is `var old := move _resource;` and
+            // the field has no value to move. §7.9 / §28.8.1: "Inside a
+            // constructor body, the field has no value to move until it has
+            // been assigned; a `move x.f` before the field's first assignment
+            // is a definite-assignment violation, the same rule as for any
+            // other read of an unassigned non-nullable slot."
+            //
+            // The plain `visitExpr(operand)` above does not catch this:
+            // checkRead (line ~2131) only flags unassigned locals, not
+            // fields. Detect the bare-identifier-move pattern here and gate
+            // on the ctor-mode field-assignment state. We deliberately do
+            // NOT extend this to `this.f` member-access form — the case
+            // corpus spells the bare identifier and the spec names that
+            // form, and widening to member-access would require resolving
+            // the receiver expression's `this` kind and confirming `f` is
+            // an `owned` instance field of the enclosing type (a wider
+            // change with more fallout risk on existing tests).
+            if (ctorMode_ && ue->op == "move" && ue->operand) {
+                if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get())) {
+                    if (id->name != "this" && id->name != "base" &&
+                        std::find(fieldsNeedingInit_.begin(),
+                                  fieldsNeedingInit_.end(),
+                                  id->name) != fieldsNeedingInit_.end() &&
+                        !assignedFields_.count(id->name)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ue->span.begin,
+                            std::string("`move` of field `") +
+                            std::string(id->name) +
+                            "` before its first constructor assignment — "
+                            "the field has no value to move until it is "
+                            "assigned (definite-assignment rule, §7.9, "
+                            "§28.8.1)");
+                    }
+                }
+            }
             return;
         }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
