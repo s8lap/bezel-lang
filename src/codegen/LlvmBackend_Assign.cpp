@@ -9892,26 +9892,80 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     }
 
-    // --- TakeCurrent(self) -> ptr — move pending out, null slot, return. ---
+    // --- TakeCurrent(self) -> ptr — guard null pending → IOE; else transfer. ---
+    // fix #4750 (§4.13 / §29.1 / §29.2, v0.307): the previous TakeCurrent
+    // handed back the pending value as-is — null in, null out — deferring the
+    // §29.1 IOE check to "the caller's `if en.MoveNext() then ...` guard".
+    // Spec §29.1 v0.307 names the take protocol precisely: `a second take
+    // without an intervening advance, or a take before the first advance /
+    // after exhaustion, raises InvalidOperationException`. This wrapper IS a
+    // compiler-generated enumerator frame for the built-in collection
+    // families (OwningArray/OwningSet/OwningQueue/OwningBuffer via `pool.Drain()`
+    // and friends, §4.13's `Drain()`-view), so the raise is normative HERE.
+    // Mirrors the iterator-method-generated TakeCurrent in
+    // `LlvmBackend_Iterators.cpp:1863-1909` (per #1349, §29.1 v0.161) — same
+    // calloc / vtable-store / bz_exc_addr signal, same tc.ok branch that
+    // nulls the slot and returns the value. The §29.2 for-loop desugaring
+    // only calls TakeCurrent once per successful MoveNext (the pending
+    // slot is non-null at that point), so the IOE branch is unreachable
+    // on the for-loop path — the change is silent there. Manual-protocol
+    // callers (test cases l4_13_0001/0002 exercising the §29.1 "second take
+    // raises IOE" / "take before first advance raises IOE" rules) now
+    // observe the spec's behaviour. See also #4750 in the issue tracker
+    // for the related slot-init fix in `lowerLocalDecl`.
     auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
     if (!tcFn) {
         tcFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = tcFn->arg_begin();
-        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
-        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
-        // Null the slot before returning so a subsequent TakeCurrent / Dispose
-        // / MoveNext sees an empty pending. (The IOE check on a null pending
-        // is raised by the iterator-frame's TakeCurrent wrapper when the
-        // enumerator is a yield-iterator frame; for THIS manual-protocol
-        // wrapper we just hand back the pointer as-is — null in, null out —
-        // and let the caller's `if en.MoveNext() then ...` guard the take.)
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
-        b.CreateRet(pend);
+        auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
+        auto* tcOkBB = llvm::BasicBlock::Create(llvm_, "tc.ok", tcFn);
+        auto* ioeErrBB = llvm::BasicBlock::Create(llvm_, "tc.ioe", tcFn);
+        {
+            llvm::IRBuilder<> b(entryBB);
+            llvm::Value* self = tcFn->arg_begin();
+            llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
+            llvm::Value* isNull = b.CreateICmpEQ(
+                pend, llvm::ConstantPointerNull::get(ptrTy()), "oaetc.pend.null");
+            b.CreateCondBr(isNull, ioeErrBB, tcOkBB);
+        }
+        // IOE path: raise InvalidOperationException (§31.4 uniform exception
+        // block — kExcObjSize, see also Iterators.cpp:1884-1904).
+        {
+            llvm::IRBuilder<> b(ioeErrBB);
+            auto* callocTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocCallee = module_->getOrInsertFunction("calloc", callocTy)
+                                       .getCallee();
+            llvm::Value* excObj = b.CreateCall(
+                callocTy, callocCallee,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), kExcObjSize)},
+                "oaetc.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end())
+                b.CreateStore(vit->second, excObj);
+            auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrCallee = module_->getOrInsertFunction(
+                                       "bz_exc_addr", excAddrTy).getCallee();
+            llvm::Value* excSlot = b.CreateCall(
+                excAddrTy, excAddrCallee, {}, "oaetc.exc");
+            b.CreateStore(excObj, excSlot);
+            b.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+        }
+        // OK path: null the slot (transfer ownership), return value.
+        {
+            llvm::IRBuilder<> b(tcOkBB);
+            llvm::Value* self = tcFn->arg_begin();
+            llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
+            // Null the slot BEFORE the return so a subsequent TakeCurrent /
+            // Dispose / MoveNext sees an empty pending — §29.1 single-
+            // consumption discipline.
+            b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+            b.CreateRet(pend);
+        }
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same

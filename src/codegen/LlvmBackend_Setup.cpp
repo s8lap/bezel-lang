@@ -16147,6 +16147,64 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // drift from it — a new wrap helper is covered the day it is added, and a
     // new decline path is covered the day it is added.
     llvm::Value* preIterWrap = v;
+    // fix #4750 (§4.13 / §29.1 / §29.2, v0.307): an init of static type
+    // `IOwningEnumerable<T>` whose source is a `coll.Drain()` call on an
+    // OwningArray/OwningSet/OwningQueue/OwningBuffer — `pool.Drain()` returns
+    // the underlying bz_array_t* but the call-form goes through the generic
+    // member-call dispatch which has no specific Drain handler and falls
+    // through, leaving `v` null and the slot zero-initialized. Detect this
+    // shape, lower the underlying collection, and mint a vtable-backed
+    // `IOwningEnumerable<T>` wrapper frame into the slot. Mirrors the
+    // `(Owning)Array → IEnumerable<T>` slot-coercion above (also a member-
+    // call-init shape that needs a wrapper), but on the owning side of the
+    // iterator-format family — `wrapArrayAsIOwningEnumerator` IS the slot
+    // shape this branch of the local-decl flow has always needed (it is the
+    // same helper `tryBuildOwningEnumeratorForBuiltinSource`'s Shape 1/2/3
+    // produces for for-in over `pool.Drain()`). The `for var x in
+    // pool.Drain() do` form works today because `lowerOwnedSeqDrainFor`
+    // routes through `wrapArrayAsIOwningEnumerator` directly; the named-
+    // local binding form was the missing arm. The §29.1 IOE guard on
+    // `TakeCurrent` is in `wrapArrayAsIOwningEnumerator` itself (the
+    // calloc / InvalidOperationException path added in this commit);
+    // both halves are needed for the `second take raises IOE` /
+    // `take before first advance raises IOE` rules (`l4_13_0001` /
+    // `l4_13_0002`).
+    if (v && declType && init) {
+        (void)0;  // existing slot-coercion block follows below
+    } else if (init && declType) {
+        const sema::TypeRef* dtr = ctx_.resolvedType(*declType);
+        const sema::TypeRef* itr = ctx_.exprType(*init);
+        bool declIsIOwningEnumerable =
+            dtr && dtr->kind == sema::TypeRef::Kind::Named &&
+            !dtr->declaration &&
+            dtr->astNode && dtr->astNode->name &&
+            !dtr->astNode->name->parts.empty() &&
+            dtr->headName() == "IOwningEnumerable";
+        if (declIsIOwningEnumerable && itr &&
+            itr->kind == sema::TypeRef::Kind::Named &&
+            !itr->declaration &&
+            itr->astNode && itr->astNode->name &&
+            !itr->astNode->name->parts.empty() &&
+            itr->headName() == "IOwningEnumerable") {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(init)) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())) {
+                    if (ma->member == "Drain" && ma->target) {
+                        const sema::TypeRef* ct = ctx_.exprType(*ma->target);
+                        if (ct && ct->kind == sema::TypeRef::Kind::Named &&
+                            (ct->headName() == "OwningArray" ||
+                             ct->headName() == "OwningSet" ||
+                             ct->headName() == "OwningQueue" ||
+                             ct->headName() == "OwningBuffer")) {
+                            llvm::Value* arr = lowerExpr(*ma->target);
+                            if (arr && arr->getType()->isPointerTy()) {
+                                v = wrapArrayAsIOwningEnumerator(arr, dtr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (v && declType && init) {
         const sema::TypeRef* declTR = ctx_.resolvedType(*declType);
         // fix #3419 (§29.2 / stdlib §4.12–§4.13, v0.283): the local-decl MINT
