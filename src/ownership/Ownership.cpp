@@ -1059,26 +1059,37 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (ps->modifier == "owned") {
                         ps->autoDropAtScopeEnd = true;
                         // §28.9 + Appendix C.3 item 14, v0.307 / fix #4743:
-                        // trivial-dispose exemption, mirror of the owned-LOCAL
-                        // gate at L1011. An undischarged `owned` parameter of
-                        // trivial-dispose type carries no user-visible disposal
-                        // obligation (the compiler still auto-drops it, line
-                        // above), so the §28.3 must-use warning is suppressed —
-                        // C.3 item 14 names BOTH holder forms in one breath
-                        // ("a plain-`var` local OR undischarged `owned`
-                        // parameter carries the must-use warning ... not at a
-                        // trivial-dispose value"), closing the §28.9-only
-                        // reading that #4400 left at the owned-parameter site.
-                        // The fix is WARNING-only; the auto-drop stays set so the
-                        // emitted scope-end free is unchanged (suppressing the
-                        // free instead would leak the instance's memory, which
-                        // §28.9 still requires be reclaimed). Same exemption
-                        // table as L1011 / L6927, sourced from
-                        // `common::isNonTrivialDisposeClass`.
+                        // the trivial-dispose exemption reaches this holder
+                        // form. §28.9 says so verbatim — the §28.3 must-use
+                        // warning "is not emitted at the implicit-drop site of
+                        // a plain-`var` owned local, of an undischarged
+                        // `owned` parameter … whose type is trivial-dispose".
+                        // The fix is WARNING-only; `autoDropAtScopeEnd` stays
+                        // set above so the emitted scope-end free is unchanged
+                        // (suppressing the free instead would leak the
+                        // instance's memory, which §28.9 still requires be
+                        // reclaimed).
+                        //
+                        // narrow #4743: the gate is the POSITIVE predicate, the
+                        // one the owned-LOCAL twin at L1011 already reaches
+                        // through `localIsTrivialDisposeNewBinding`. #4743
+                        // spelled it `if (common::isNonTrivialDisposeClass(pt,
+                        // ctx_))`, which is NOT the same question: that
+                        // predicate answers `false` for a declaration-less
+                        // builtin head, an uninstantiated bare type parameter
+                        // and every non-`Class` declaration kind, so an
+                        // `owned OwningArray<Cell>`, an `owned x: T` inside a
+                        // generic, and an `owned` interface parameter all lost
+                        // a warning §28.9 requires — "the owned-element
+                        // variants … are **not** trivial-dispose at any
+                        // instantiation", "an interface type is never
+                        // trivial-dispose". Read the declared type here: a
+                        // parameter has no statically-known producer, which is
+                        // the arm §28.9's classification key selects.
                         const sema::TypeRef* pt = ps->declType
                             ? ctx_.resolvedType(*ps->declType)
                             : ps->resolvedDeclType;
-                        if (common::isNonTrivialDisposeClass(pt, ctx_)) {
+                        if (!typeIsProvablyTrivialDisposeClass(pt)) {
                             // fix #3033 / §28.10 (v0.240): the fourth remedy used to
                             // read "rebind it with `using var`", naming a spelling
                             // that is NOT a discharge. §28.10 *Adopting a named owned
@@ -6945,6 +6956,16 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     // (error recovery).  // per §28.9, v0.237, #2654
     const sema::TypeRef* t = ctx_.exprType(*ne);
     if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+    return typeIsProvablyTrivialDisposeClass(t);
+}
+
+// The TYPE half of the §28.9 exemption, shared by the owned-LOCAL `new`
+// binding above and the owned-PARAMETER must-use gate (~L1080). See the
+// declaration in Ownership_impl.hpp for why this is a POSITIVE predicate and
+// why `!common::isNonTrivialDisposeClass(...)` is not a substitute for it.
+//   // per §28.9, v0.307
+bool MethodOwnership::typeIsProvablyTrivialDisposeClass(
+        const sema::TypeRef* t) {
     if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
     // fix #2667 (§28.9, v0.268): §28.9's "Trivial-dispose for generic class
     // instantiations" names the standard borrowing-collection types (Array<T>,
@@ -6960,10 +6981,20 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     // the codegen auto-drop chain both already consult — same 13 names, no
     // hand-list to drift. The Owning* heads are NOT on that table. // per
     // §28.9, fix #2667
+    //
+    // narrow #4743: this arm is ALSO what keeps an uninstantiated bare type
+    // parameter (`method Bad(owned x: T)` inside `class Wrap<T>` — a `Named`
+    // TypeRef with a null `declaration` and a head naming no builtin) and a
+    // compiler-synthesized FRAME type unexempt, per §28.9's "not defined for
+    // a compiler-synthesized frame" sentence and §3.6 rule 2's "uninstan-
+    // tiated-still-generic stays rejecting" posture.
     if (!t->declaration) {
         return common::isChainClaimedBuiltinHeadName(t->headName());
     }
     sema::TypeSymbol* d = t->declaration;
+    // §28.9: "an interface type is never trivial-dispose, its conformance set
+    // being open across modules" — and a record/enum/choice declaration is not
+    // a class, so it has no trivial-dispose verdict to read either.
     if (d->kind != ast::TypeDeclKind::Class) return false;
     // fix #3647 (§28.9 / §3.6 rule 2, v0.286): the TypeRef+SemaContext
     // overload — `t` is already the resolved TypeRef this arm classified,

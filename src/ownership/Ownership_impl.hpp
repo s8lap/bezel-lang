@@ -700,6 +700,28 @@ public:
     // header comment for the rationale and the #2666 walk-through.
     bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
 
+    // narrow #4743: the TYPE-classification half of `localIsTrivialDisposeNewBinding`,
+    // factored out so the owned-PARAMETER must-use gate reads the same
+    // authority as the owned-LOCAL one instead of a second, looser spelling.
+    //
+    // POSITIVE predicate: true only when `t` is PROVABLY a trivial-dispose
+    // class. That polarity is the whole point. `common::isNonTrivialDispose
+    // Class` asks the opposite question and its `false` is NOT a
+    // trivial-dispose certificate — it is also `false` for a null TypeRef, a
+    // non-`Named` kind, a declaration-less builtin head (`OwningArray<T>`, an
+    // iterator/async FRAME), an uninstantiated bare type parameter, and every
+    // non-`Class` declaration kind (an INTERFACE above all). §28.9 names
+    // those as NEVER trivial-dispose in so many words — "an interface type is
+    // never trivial-dispose, its conformance set being open across modules",
+    // "it is therefore not defined for a compiler-synthesized frame", and
+    // "the owned-element variants of the standard collection types … are
+    // **not** trivial-dispose at any instantiation" — so negating the
+    // non-trivial predicate to drive an EXEMPTION suppresses obligations the
+    // spec still requires be announced. A wrong answer here is a retained
+    // (noisy) warning rather than a hidden obligation, the same direction
+    // `localIsTrivialDisposeNewBinding`'s header commits to. // per §28.9
+    bool typeIsProvablyTrivialDisposeClass(const sema::TypeRef* t);
+
     // §28.8.1 / fix #3586 — test-only accessor: true when `s` was recorded
     // as lexically inside a `try` by collectStmtsInsideTry. Exposed so the
     // walker-coverage regression tests for fix #3586 can verify the CaseStmt

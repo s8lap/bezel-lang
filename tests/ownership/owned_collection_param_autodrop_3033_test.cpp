@@ -465,8 +465,19 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     bool warned = false;
     for (const auto& d : r.diagnostics.diagnostics())
+        // narrow #4743: the second conjunct read `"§28.3 auto-drop"`, which stopped
+        // occurring in the message when fix #4735 (af645679, this same batch)
+        // renamed it to `"§28.3 must-use / auto-drop"` to match the spec's own
+        // name for the lint. #4735 did not update this needle, and the omission
+        // was invisible because #4743 (03c1c2bd, one hour earlier in the same
+        // batch) had already suppressed the warning here outright — the row was
+        // red for the other reason, so the stale needle never got its own
+        // failure. Both defects have to be fixed for the row to go green: the
+        // §28.9 gate narrowing restores the warning, and this needle now spells
+        // the current name. Pinning the FULL current phrase rather than the
+        // shorter `"auto-drop"` keeps this a rename detector.
         if (d.message.find("owned parameter `elements`") != std::string::npos &&
-            d.message.find("§28.3 auto-drop") != std::string::npos)
+            d.message.find("§28.3 must-use / auto-drop") != std::string::npos)
             warned = true;
     BEZEL_EXPECT_TRUE(warned);
 }
