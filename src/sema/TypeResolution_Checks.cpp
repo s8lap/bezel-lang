@@ -4076,9 +4076,31 @@ std::string Resolver::owningElementBadDesc(const TypeRef* el) {
         // PROVISIONAL — checkOwningElementInstantiations() re-runs this same
         // predicate on the type each instantiation actually binds (#2713).
         if (el->astNode && el->astNode->name &&
-            el->astNode->name->parts.size() == 1 &&
-            isValueBuiltinByName(el->headName()))
-            return "a value-type builtin";
+            el->astNode->name->parts.size() == 1) {
+            std::string_view nm = el->headName();
+            // §28.9 / §28.11 (v0.300 ruling #4393; this fix v0.307): `Type`
+            // is runtime-managed — the runtime holds exactly one instance
+            // per type for the process's life and user code never
+            // allocates one, so an OWNED element slot has nothing to own.
+            // `isValueBuiltinByName` deliberately does NOT list `Type` (it
+            // is not a value-type builtin — it is the named-but-
+            // declaration=null member of §28.9's runtime-managed family,
+            // the same family `string` and function values belong to,
+            // both already rejected by this function's `Primitive` and
+            // `Function` arms above), so this predicate never saw it and
+            // `OwningArray<Type>` / `OwningDictionary<K, Type>` / etc. were
+            // admitted at instantiation with no diagnostic — the exact gap
+            // #4393's own ruling named: "the gate was caught missing `Type`
+            // from its runtime-managed row" in §28.11's element-category
+            // table. Mirrors the `nm == "Type"` test the owned-marker-
+            // admission check already runs at TypeResolution_Names.cpp
+            // (also #4393) — the owning-collection-element twin of that
+            // check. // per §28.9, §28.11, v0.300/v0.307, #4393
+            if (nm == "Type")
+                return "the runtime `Type` token (a runtime-managed "
+                       "reference type, §28.9)";
+            if (isValueBuiltinByName(nm)) return "a value-type builtin";
+        }
         return {};
     }
     default:  // Kind::Error — suppress cascade diagnostics
