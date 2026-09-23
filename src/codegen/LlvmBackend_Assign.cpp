@@ -13343,8 +13343,22 @@ bool Emitter::fillOmittedParamDefaults(
             // value type — exactly the zero value `default(T)` denotes, already
             // in the parameter's representation.
             if (dynamic_cast<const ast::DefaultExpr*>(dv)) {
+                // fix #4665 (§17.11 + §4.7, v0.307): asked through
+                // `unitStorageTy`, the ONE spelling of "the storage form of a
+                // lowered type". A UNIT-typed parameter with an omitted
+                // `default(())` argument lowered its own `: ()` annotation to
+                // LLVM `void`, and `Constant::getNullValue(void)` is an
+                // `llvm_unreachable` this release libLLVM compiles to `ud2` —
+                // `bezelc` died of SIGILL with no diagnostic (measured rc=132
+                // on 572f5fc5 for `Take(p: () := default(()))` called as
+                // `Take()`). Unlike the value-position `DefaultExpr` arm, this
+                // site owes a REAL operand: `lowerParamType` substitutes the
+                // §4.7 placeholder byte in the callee's signature, so the
+                // caller must pass one byte to keep the call's types matching
+                // — the same `i8 0` the explicit-argument rescue in
+                // `buildOrderedArgs` substitutes for a null `v`.
                 ordered[j] = llvm::Constant::getNullValue(
-                    lowerType(params[j].type.get()));
+                    unitStorageTy(lowerType(params[j].type.get())));
             } else {
                 ordered[j] = lowerExpr(*dv);
                 // fix #1235 / §22.5 / §22.7: a bare `null` literal default

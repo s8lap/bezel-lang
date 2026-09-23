@@ -2619,8 +2619,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // lowerLocalDecl so that whoever does extend it changes ONE predicate,
         // not a fifth copy of it — #2924's four-way-mirror finding about this
         // very diagnostic.
+        // fix #4665 (§14.2 *Constraints* + §4.7 / §17.11, v0.307): resolve the
+        // returned expression's type through the ACTIVE monomorphization before
+        // the unit test. A bare type parameter substituted at `()` arrives here
+        // as a `Named T` with no declaration — its `kind` is `Named`, NOT
+        // `Unit` — so exemption (a) below missed it and a *correct* unit return
+        // inside a specialized generic body drew the #2491 "failed to lower"
+        // internal warning. Measured on 572f5fc5 + the `default(())` fix, for
+        // the issue's `class Factory<T> … Make(): T return default(T);` at
+        // `Factory<()>`: `Factory$Make$spec` emits a correct `ret void` and the
+        // program runs, while the compile prints an internal note about it.
+        // `resolveTypeParamRef` is the predicate the repo already settled for
+        // exactly this shape — `buildOrderedArgs`' #3137 unit-argument rescue
+        // resolves a `Named T`→`()` formal through it before its own
+        // `Kind::Unit` test — so this is that one predicate, not a second
+        // spelling of it. It is a no-op outside a specialization
+        // (`genericSubstSemaTy_` empty) and for every non-type-parameter ref.
         const sema::TypeRef* retValTy =
-            rs->value ? ctx_.exprType(*rs->value) : nullptr;
+            rs->value ? resolveTypeParamRef(ctx_.exprType(*rs->value))
+                      : nullptr;
         const bool unitReturnValue =
             retValTy && retValTy->kind == sema::TypeRef::Kind::Unit;
         std::string retMember, retAppliedMember;

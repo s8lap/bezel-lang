@@ -980,7 +980,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     }
     // CG37: `default(T)` is the zero value of T (0 / false / 0.0 / null).
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
-        return llvm::Constant::getNullValue(lowerType(de->type.get()));
+        llvm::Type* dty = lowerType(de->type.get());
+        // fix #4665 (§17.11 *The default operator* + §4.7 *The unit type*,
+        // v0.307): the UNIT row of §17.11's defaultable table. §17.11 lists the
+        // unit type among the defaultable types and states the row explicitly —
+        // "this row is reached by writing `default(())` … `var u: () :=
+        // default(());` and `var u: () := ();` bind the same value" — so the
+        // operator is admitted here and must lower to what `()` lowers to.
+        //
+        // `lowerType` answers LLVM `void` for exactly one thing, the unit
+        // type's `Kind::Unit` arm, and `Constant::getNullValue(void)` executes
+        // an `llvm_unreachable` that this release libLLVM compiles to `ud2`:
+        // `bezelc` died of SIGILL with NO DIAGNOSTIC (measured rc=132 on
+        // 572f5fc5 for `var u: () := default(());`, for the inferred
+        // `var u := default(());`, and for the issue's original
+        // `class Factory<T> … Make(): T return default(T);` at `Factory<()>`,
+        // where the generic substitution resolves T to `()` correctly and
+        // hands the concrete unit type to THIS arm).
+        //
+        // `nullptr` — not `unitPlaceholderTy()`'s inert byte — is the answer,
+        // because `nullptr` is the backend's ONE representation of "this
+        // expression produced no lowered value" (see `lowerExpr`'s #3421
+        // normalization above): the `()` literal (`ast::UnitExpr`) already
+        // lowers to null here, and every downstream unit rescue keys on `!v`
+        // (`boxForTarget`'s #2915 arm, its #3095 `()?` sibling,
+        // `unitValueForTarget`, `buildOrderedArgs`' placeholder-byte rescue,
+        // `lowerLocalDecl`'s #2434 zero-init fallback). Answering the byte here
+        // instead would put a real `i8` where those consumers expect nothing
+        // and re-open the mismatch #3105 closed. A STORAGE position that needs
+        // a sized slot asks `unitStorageTy` for it; a value position asks for
+        // nothing.
+        //
+        // `()?` is unaffected: `isNullableValueTy` claims it first and
+        // `lowerType` answers the tagged `{i8, i8}` optional, whose null value
+        // `{0, 0}` is exactly §17.11's "every nullable type `T?`" row.
+        if (dty && dty->isVoidTy()) return nullptr;
+        return llvm::Constant::getNullValue(dty);
     }
     // fix #499 / §9.8: RangeExpr in value position (e.g. `var r := a..b`).
     // Builds a Range struct { i64 start, i64 end, i64 step, i8 flags } so the

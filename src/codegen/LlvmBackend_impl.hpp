@@ -5480,6 +5480,14 @@ private:
     //   down, at the element, which is why the top-level
     //   `entryAlloca`/`bindParameters` guards never caught `[N]()` on their
     //   own.
+    //   `fillOmittedParamDefaults`' `default(T)` arm (LlvmBackend_Assign.cpp,
+    //   fix #4665) — the OMITTED-argument default for a unit-typed parameter.
+    //   That arm deliberately lowers the PARAMETER's own annotation rather
+    //   than the `DefaultExpr`'s inner type (#1163), so it inherits the same
+    //   `void` and fed it to `Constant::getNullValue`, whose
+    //   `llvm_unreachable` is a `ud2` here. It is a storage-shaped position
+    //   for the usual reason: `lowerParamType` already put the placeholder
+    //   byte in the callee's signature, so the caller owes that byte.
     //
     // The four #3537 sites are ONE decision at four faces, not four decisions:
     // the element type becomes the frame's `current_val` field, `Current`'s
@@ -19783,13 +19791,34 @@ private:
     // An ascription that FAILED to resolve answers "produces a value", so the
     // note still fires on a broken program rather than being suppressed by the
     // absence of a type.
+    //
+    // fix #4665 (§17.11 *The `default` operator* + §4.7, v0.307): the
+    // ASCRIPTION test is asked FIRST, for any body shape. #3434 already made
+    // `: ()` answer "yields nothing" — but only along the CallExpr path, and
+    // the call-shape gate below short-circuits before the question is put, so
+    // the answer was unreachable for every other body. `=> default(())` is
+    // such a body: §17.11's unit row, which with the `DefaultExpr` arm fixed
+    // lowers correctly to nothing and then drew the very #2491 note #2963 and
+    // #3434 exist to keep off a working program (measured on the `DefaultExpr`
+    // fix alone: `public static method Give(): () => default(());` compiled,
+    // ran, and printed the internal note). The call-shape gate remains for the
+    // NO-ascription case, where `lastCallHandledWithoutValue_` is the only
+    // evidence available about whether anything was emitted.
+    //
+    // The widening is exactly "the ascription is the unit type", which §4.7
+    // makes the same contract as writing no ascription at all; `()?` answers
+    // "produces a value" (#3095's `!nullable` conjunct) and a value-typed or
+    // unresolved ascription answers the same as before, so
+    // tests/lit/call_lowered_as_unit_declared_return_still_warns_2963.bzl
+    // (`: int`) and tests/lit/arrow_body_nullable_unit_return_still_warns_3434.bzl
+    // (`: ()?`) keep their notes.
     bool arrowBodyLoweredAsUnit(const ast::Expr* body,
                                 const ast::Type* declRet) const {
+        if (declRet)
+            return !sema::ascribedReturnTypeProducesValue(
+                resolveTypeParamRef(ctx_.resolvedType(*declRet)));
         if (!dynamic_cast<const ast::CallExpr*>(body)) return false;
-        if (!lastCallHandledWithoutValue_) return false;
-        if (!declRet) return true;
-        return !sema::ascribedReturnTypeProducesValue(
-            resolveTypeParamRef(ctx_.resolvedType(*declRet)));
+        return lastCallHandledWithoutValue_;
     }
 
     // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's
