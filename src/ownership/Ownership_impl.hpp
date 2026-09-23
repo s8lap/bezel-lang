@@ -3014,6 +3014,47 @@ private:
     bool isOwningMatchTransferBinding(const ast::CaseArm& arm,
                                       const ast::Expr* scrutinee,
                                       sema::Symbol* sym);
+
+    // fix #4664 (§35.5 *The borrowing match* + §28.3 K8.3/K3.1, §19.3,
+    // v0.307): the class/interface-typed arm pattern bindings that the `case`
+    // construct does NOT transfer ownership into — every binding of a
+    // BORROWING match ("the construct never moves from the scrutinee",
+    // §35.5), and the non-transferring slots of an owning one. §19.3 makes
+    // each one "a borrow whose source is the scrutinee's source", so `move`
+    // on it is K3.1's forbidden move of a borrow: the scrutinee's owner
+    // still disposes the payload and the transfer's new holder disposes it a
+    // second time (MEASURED heap-use-after-free, issue #4664).
+    //
+    // The map is keyed by SYMBOL, so a same-named local in another scope is
+    // untouched, and it is populated by `registerBorrowOnlyArmBindings` from
+    // the same once-only pre-pass (`collectCaseArmBorrowSources`) that
+    // registers the arm borrow sources — which visits a `case` construct
+    // BEFORE descending into its arm bodies, so every binding is registered
+    // before any `move` inside its own arm is read.
+    // // per §35.5, §19.3, §28.3 K8.3/K3.1, v0.307
+    struct BorrowOnlyArmBinding {
+        std::string_view name;
+        // True when the SCRUTINEE announced a consume (§35.5's owning match)
+        // but THIS slot is not one the match transfers — a nested pattern, an
+        // unmarked named slot, a non-`owned` payload, or a non-destructuring
+        // arm. The two cases differ only in the diagnostic's explanation.
+        bool owningMatch = false;
+    };
+    std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
+        borrowOnlyArmBindings_;
+    void registerBorrowOnlyArmBindings(const std::vector<ast::CaseArm>& arms,
+                                       const ast::Expr* scrutinee);
+    // fix #4664: every binding `p` introduces, at every nesting level, as the
+    // dynamic_cast-safe anchor Node the arm binding's LocalSymbol carries as
+    // its `decl` (the `var x` BindingPattern, or #1271's synthesized anchor
+    // for the naked `W(w, _)` spelling). // per §19.3, v0.307
+    static void collectArmBindingAnchors(const ast::Pattern* p,
+                                         std::vector<const ast::Node*>& out);
+    // fix #4664: the check point — one `move` the pre-pass walk reached.
+    // Reports iff its operand is a bare identifier resolving to a
+    // `borrowOnlyArmBindings_` entry. // per §35.5, §28.3 K3.1, v0.307
+    void reportIfBorrowOnlyArmBindingMove(const ast::UnaryExpr& mv);
+
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.

@@ -6855,9 +6855,190 @@ bool MethodOwnership::isOwningMatchTransferBinding(const ast::CaseArm& arm,
     return false;
 }
 
+// fix #4664 (§19.3, v0.307): see the declaration in Ownership_impl.hpp.
+void MethodOwnership::collectArmBindingAnchors(
+        const ast::Pattern* p, std::vector<const ast::Node*>& out) {
+    if (!p) return;
+    // `var x` / `var x: T`, and the naked `W(w, _)` spelling's synthesized
+    // anchor, are the same node kind — both are what the arm binding's
+    // LocalSymbol carries as its `decl` (#1271).
+    if (const auto* bp = dynamic_cast<const ast::BindingPattern*>(p)) {
+        out.push_back(bp);
+        return;
+    }
+    if (const auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+        // Source-order over the positional vector — no pointer-keyed
+        // iteration on a decision path (#2116). A nested pattern recurses:
+        // §19.3 makes a binding beneath one a borrow at every level.
+        for (const ast::PositionalPattern& sp : dp->subPatterns) {
+            if (!sp.nakedBinding.empty()) {
+                if (sp.nakedAnchor) out.push_back(sp.nakedAnchor.get());
+            } else {
+                collectArmBindingAnchors(sp.pattern.get(), out);
+            }
+        }
+        return;
+    }
+    if (const auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+        // A `|` alternative list is binding-free by admission (§19.3); the
+        // recursion costs nothing and keeps the walker total.
+        for (const auto& m : ap->members) collectArmBindingAnchors(m.get(), out);
+        return;
+    }
+    // Discard / constant / null / named / range / relational / type patterns
+    // introduce no binding.
+}
+
+// fix #4664 (§35.5 *The borrowing match*, §19.3, §28.3 K8.3/K3.1, v0.307):
+// see the declaration in Ownership_impl.hpp.
+//
+// MEASURED on HEAD e71f9644, §35.5's own owning-choice shape:
+//
+//   using var o := Outer.W(new Widget("a"), new Widget("b"));
+//   case o of                                   // BORROWING match (§35.5)
+//     W(var w, _) => do using var stolen := move w; … end,
+//     X => ()
+//   end case;
+//
+// compiled clean and ran as a heap-use-after-free under ASan: the arm's
+// `using var` disposed payload `a` at arm exit, and `o`'s own scope-end
+// active-case pass (§35.4) disposed it again. The same fault was measured for
+// the plain-`var` scrutinee, the naked `W(w, _)` binding spelling, a
+// `var live := move w` adoption, an assignment RHS, a borrowed (parameter)
+// scrutinee, a record destructure, and a class type-test arm binding — every
+// shape in which a pattern binding reaches a `move`.
+//
+// The hole is that the ownership dataflow keeps no `states_` entry for a
+// pattern binding, so `markMovedByName`'s `if (!st) return;` accepted the
+// consume silently, and `producerState` then classified the `move` result
+// Owned through its plain-class fallback — a second owner for a value the
+// scrutinee still owns. Expression-position arms were already rejected by
+// `consumeMarkedArmTransfer`'s "not an owned binding at this point", and an
+// `owned`-argument transfer by §28.8's borrow-into-owned-sink check; only the
+// binding/assignment positions were open.
+void MethodOwnership::registerBorrowOnlyArmBindings(
+        const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee) {
+    if (!scrutinee) return;
+    // §35.5's two ANNOUNCING scrutinee forms are the only ones that transfer
+    // anything into an arm binding; every other scrutinee — an unmarked named
+    // owned binding, a borrow of any provenance, a record, a class under a
+    // type test — leaves the construct "never moves from the scrutinee".
+    const bool owning = owningMatchScrutineeForm(scrutinee);
+    const sema::TypeRef* scrutRef = ctx_.exprType(*scrutinee);
+    for (const ast::CaseArm& arm : arms) {
+        std::vector<const ast::Node*> anchors;
+        collectArmBindingAnchors(arm.pattern.get(), anchors);
+        if (anchors.empty()) continue;
+        // The exemption set. Over-collecting here only admits more, so the
+        // BROAD form (class and move-only value payloads alike) is the right
+        // one: a slot §35.5 genuinely transfers must never be rejected.
+        std::vector<const sema::Symbol*> transferred;
+        if (owning)
+            collectOwningMatchTransferBindings(arm, scrutRef, transferred);
+        for (const ast::Node* anchor : anchors) {
+            sema::LocalSymbol* bindSym = nullptr;
+            for (const auto& s : ctx_.symbols()) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get()))
+                    if (ls->decl == anchor) { bindSym = ls; break; }
+            }
+            if (!bindSym) continue;
+            // Which binding TYPES can carry a disposal obligation to double.
+            // A copyable value payload "binds as a copy" (§35.5) and a
+            // `string`/runtime-managed one a shared reference — neither can.
+            const sema::TypeRef* bt = bindSym->declType;
+            if (!bt || bt->kind != sema::TypeRef::Kind::Named ||
+                !bt->declaration)
+                continue;
+            const bool classValued =
+                (bt->declaration->kind == ast::TypeDeclKind::Class ||
+                 bt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !bt->declaration->isValueBuiltin;
+            // §35.5 *The borrowing match*: "a binding of a payload of
+            // move-only value type (§15.3 — an owning inline array, or a
+            // nested owning choice) is likewise a BORROW … reads through the
+            // binding are admitted, and consuming operations through it are
+            // rejected — the binding does not own." The owning inline ARRAY
+            // half is #1665/#1745's sema rule and never reaches here (its
+            // TypeRef kind is InlineArray, not Named); the owning-CHOICE half
+            // had no check anywhere, and `case move i of` through such a
+            // binding was MEASURED as the same heap-use-after-free as the
+            // class-payload shape.
+            const char* moKind = nullptr;
+            const bool moveOnlyChoice =
+                bt->declaration->kind == ast::TypeDeclKind::Choice &&
+                common::isMoveOnlyValueType(bt, ctx_, moKind);
+            if (!classValued && !moveOnlyChoice) continue;
+            bool transfers = false;
+            for (const sema::Symbol* t : transferred)
+                if (t == bindSym) { transfers = true; break; }
+            if (transfers) continue;
+            borrowOnlyArmBindings_[bindSym] =
+                BorrowOnlyArmBinding{bindSym->name, owning};
+        }
+    }
+}
+
+// fix #4664: see the declaration in Ownership_impl.hpp.
+void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
+        const ast::UnaryExpr& mv) {
+    if (suppressDiag_) return;
+    if (borrowOnlyArmBindings_.empty() || !mv.operand) return;
+    // Only the BARE identifier spelling. `move w[i]` through a pattern
+    // binding is §19.3/§15.3's own rule (sema, #1665), and `move w.f` is the
+    // non-`owned`-field rule (#4284); neither is this one's business.
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(mv.operand.get());
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    auto it = borrowOnlyArmBindings_.find(sym);
+    if (it == borrowOnlyArmBindings_.end()) return;
+    const std::string name(it->second.name);
+    const std::string why =
+        it->second.owningMatch
+            ? std::string(
+                  "this slot is not one the owning match transfers \xe2\x80\x94 "
+                  "only a whole-slot binding of an `owned` or move-only value "
+                  "payload receives the transfer at arm selection")
+            : std::string(
+                  "an unmarked named owned binding, or a borrowed scrutinee of "
+                  "any provenance, in scrutinee position stays a BORROWING "
+                  "match, which transfers nothing");
+    const std::string remedy =
+        it->second.owningMatch
+            ? std::string(
+                  "Read through the binding without transferring, or write the "
+                  "positional destructure / marked named slot that does "
+                  "transfer it (\xc2\xa7""35.5).")
+            : std::string(
+                  "Announce the consume at the SCRUTINEE instead (`case move "
+                  "<scrutinee> of \xe2\x80\xa6`, \xc2\xa7""35.5's owning "
+                  "match), or read through the binding without transferring.");
+    report(Severity::Error, mv.span.begin,
+           "cannot `move` the `case` arm binding `" + name +
+               "`: a pattern binding is a BORROW whose source is the "
+               "scrutinee's source (\xc2\xa7""19.3) and " + why +
+               ", so the scrutinee's owner still disposes the value \xe2\x80\x94 "
+               "the transfer would give it a second owner and dispose it twice "
+               "(\xc2\xa7""28.3 K8.3/K3.1, \xc2\xa7""35.5, v0.307). " + remedy);
+}
+
 void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
+    // fix #4664 (§35.5 / §28.3 K3.1, v0.307): the `move`-of-a-borrowed-arm-
+    // binding check rides this walker for the same reason #4635's escape
+    // check does — it is the ownership pass's ONE syntactic walk that reaches
+    // every expression position a `move` can occupy (initializer, assignment
+    // RHS, return / throw / yield / discard operand, condition, guard,
+    // argument), and it runs once in the pre-pass, so the diagnostic fires
+    // exactly once and never inside the O3b fixpoint. The ban set is complete
+    // for an arm by the time the walk descends into it: a `case` construct
+    // registers its bindings before its arms are visited, in both the
+    // expression walk below and the statement walk's CaseStmt action.
+    // // per §35.5, §28.3 K3.1, v0.307
+    if (const auto* mv = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (mv->op == "move") reportIfBorrowOnlyArmBindingMove(*mv);
     if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
         registerCaseArmBorrowSources(cx->arms, cx->scrutinee.get());
+        registerBorrowOnlyArmBindings(cx->arms, cx->scrutinee.get());
         // fix #4635 (§28.3 K8.4, v0.307): the K8.4 escape check rides this
         // walker — the ownership pass's ONE syntactic walk that reaches every
         // CaseExpr in every expression position (initializer, assignment RHS,
@@ -6939,6 +7120,11 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
     forEachNestedStmt(s, [&](const ast::Stmt& cur) {
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
             registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
+            // fix #4664: register BEFORE the walker descends into this
+            // statement's arm bodies (`forEachNestedStmt` calls this action on
+            // the parent first), so a `move` inside an arm sees its own
+            // binding's ban. // per §35.5, §28.3 K3.1, v0.307
+            registerBorrowOnlyArmBindings(cs->arms, cs->scrutinee.get());
             if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
             for (const auto& arm : cs->arms) {
                 if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
@@ -7005,6 +7191,9 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
 
 void MethodOwnership::collectCaseArmBorrowSources(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // fix #4664: per-method side state, like pendingThrowableInTryChecks_ —
+    // the checker instance is reused across members. // per §35.5, v0.307
+    borrowOnlyArmBindings_.clear();
     for (const auto& s : body) if (s) collectCaseArmBorrowSourcesStmt(*s);
 }
 
