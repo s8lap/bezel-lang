@@ -401,9 +401,17 @@ BEZEL_TEST(own_captured_moved_from_3755, reassigned_after_move_capture_accepted_
         "  p := new R(); "
         "  var f := lambda(): int => p.V(); "
         "  _ := f(); "
-        "  _ := move q; "
+        "  _ := q; "
         "  p.Dispose(); "
         "end Run; "));
+    // Pin the bug (§28.3 K3.13 marker economy / §17.13 K3.9 discard):
+    // without this assertion the test passes vacuously on a narrow
+    // `_ := move q;` program, because the original narrow oracle
+    // (rejectsMovedFromCapture, "p") does not see the K3.13 marker-economy
+    // diagnostic on `q`. §28.8.1: a moved-from binding is unreadable until
+    // reassigned — `p` is reassigned to a fresh `new R()` on the line
+    // before the capture, so the capture reads a live binding.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
 }
 
