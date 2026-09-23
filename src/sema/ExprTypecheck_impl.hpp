@@ -232,6 +232,22 @@ private:
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
 
+    // §7.11 (spec §7.11 / §7.4 interaction): locally-declared nullable
+    // variables whose initializer statically proves non-null
+    // (`var a: int? := 5;`, `using var x: T? := getT();`, const forms). The
+    // declaration form AND §7.4's assignment-narrowing clause admit these
+    // into the broader `nullNarrowed_` set, but the spec text C.1 — "no
+    // operator lifts over a nullable operand: an operand of nullable type
+    // at an arithmetic, bitwise, shift, or relational operator … is a
+    // compile error" — reads the operand's STATIC type, and §7.11's
+    // exemption clause is for §7.4 narrowing established by explicit null
+    // tests (`x <> null`, `x = null` else-branch, `is not null`, early
+    // exits), not for declaration-initializer assignment. Tracking these
+    // separately lets the §7.11 gates (and any future narrowing-driven
+    // rejection that should ignore init-narrowing) distinguish them, while
+    // keeping `nullNarrowed_` semantics intact for member access (§7.4).
+    std::unordered_set<Symbol*> initNarrowed_;
+
     // §7.4 (v0.214, #2085 redone per #2116): flow-narrowing facts for nullable
     // `readonly` fields. Spec §7.4 (v0.214): "A nullable `readonly` field —
     // instance or `static` — participates in flow narrowing … The tracked shape

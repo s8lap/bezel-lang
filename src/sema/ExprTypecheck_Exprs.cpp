@@ -6365,7 +6365,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
                     "operator `" + std::string(op) + "` requires non-nullable "
-                    "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
+                    "operands (`string`) (\xC2\xA7""4.6 / \xC2\xA7""7.11); a `string?` operand is a "
                     "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
                     "use-requires-narrowing discipline as member access on a "
                     "nullable reference. Equality (`=`/`<>`) stays null-safe "
@@ -6650,7 +6650,9 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 Severity::Error, be.span.begin,
                 "operator `" + std::string(op) +
                 "` requires non-nullable `bool` operands (§7.11); a `bool?`"
-                " operand is not permitted — there is no three-valued logic."
+                " operand is not permitted — there is no three-valued logic"
+                " and no `bool?` logical operators (`and`/`or`/`not` take only"
+                " `bool`, per §17.2)."
                 " Use `??` to coalesce the `bool?` to a `bool` first, or"
                 " narrow with an explicit null check.");
             ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
@@ -6725,7 +6727,8 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     "` is not defined on a nullable value type \xE2\x80\x94 narrow "
                     "first (`x <> null and \xE2\x80\xA6` (\xC2\xA7""7.4), `??` "
                     "(\xC2\xA7""7.7), or `!` (\xC2\xA7""7.8)); the relational "
-                    "operators do not lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                    "operators do not lift over `T?` (no operator lifts to `T?`, "
+                    "\xC2\xA7""7.11, v0.267)");
                 ctx_.setExprType(&be,
                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 return;
@@ -7045,7 +7048,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             // at this program point even though exprType keeps the nullable
             // flag; `isNarrowedNonNullRead` is the ONE predicate that decides
             // that (#3298) — mutable fields and properties never narrow (§7.4),
-            // and `this`/`base` are not narrowable operands.
+            // and `this`/`base` are not narrowable operands. Init-narrowed
+            // locals (`var a: int? := 5;`) are deliberately NOT considered
+            // narrowed here — see `isNarrowedNonNullRead`'s header for the
+            // §7.11 static-type reasoning (matches `s7_11_0001`/`0003`/
+            // `0005`/`0006`'s reject-after-init pattern).
             bool lNull = isNullablePrim(lt) &&
                          !isNarrowedNonNullRead(be.left.get());
             bool rNull = isNullablePrim(rt) &&
@@ -7075,7 +7082,8 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     "` is not defined on a nullable value type — narrow first "
                     "(`x <> null and …` (\xC2\xA7""7.4), `??` (\xC2\xA7""7.7), "
                     "or `!` (\xC2\xA7""7.8)); the " + opFamily +
-                    " operators do not lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                    " operators do not lift over `T?` (no operator lifts to `T?`, "
+                    "\xC2\xA7""7.11, v0.267)");
                 // Error recovery: type the result as the non-nullable T of the
                 // non-nullable operand (or `int` if both are nullable) so
                 // downstream uses do not cascade an untyped-expression error.
