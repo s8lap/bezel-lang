@@ -1,0 +1,37 @@
+# leak_census.baseline - generated programs whose LEAK is known and frozen
+# (#4638).  One row per `<suite>.<name>`; columns are TAB-separated:
+#
+#     <suite>.<name>  <bytes>  <allocations>
+#
+# The SET of rows is compared exactly by scripts/check_leak_census.py --strict;
+# the two numeric columns are triage only and are never compared.  A row that
+# stops leaking must be REMOVED with --update - unbanked headroom reads exactly
+# like a rise somebody already spent.
+#
+# These leaks were ALWAYS present.  Before #4638 nothing in the suite could
+# observe them, so an empty file here does not mean a leak-free tree: it means
+# nobody has run the census over that part of it yet.  `coverage:` lines below
+# record which filters HAVE been censused, so a reader can tell "clean" from
+# "unmeasured".
+#
+# The `leak_detection_4638.*` rows are the HARNESS'S OWN known-positive
+# fixture - the #4619 membership-boxing program, which leaks 24 B per call by
+# design and with the reasons recorded.  They are banked rather than excluded
+# so that nothing about this instrument is invisible; they are the rows that
+# prove the oracle can fire, and they must NOT be "fixed".
+#
+# HOW BIG IS THE UNMEASURED PART?  Measured 2026-09-23 at f644098f, outside the
+# harness, by extracting the 11,030 distinct Bezel programs embedded in
+# tests/codegen + tests/ownership and running a 1,200-program random sample
+# (seed 4638) through `bezelc --sanitize=address` with LSan on:
+#     923 clean / 55 LEAK / 221 rejected-at-compile / 1 AddressSanitizer error
+#     => 5.6% of the programs that compile and run LEAK (55 across 46 files).
+# The leaking files cluster on boxing and capture-cell lowering, and include
+# several whose whole subject is the property they leak on
+# (generic_record_string_field_leak_3945, class_field_record_string_release_4253,
+# array_string_literal_local_leak_2774, capture_cell_holder_validity_3484).
+# coverage: 2026-09-23 f644098f: bezel_tests_support, all 177 rows, BEZEL_AOT_DETECT_LEAKS=report (177 passed, 0 failed)
+#
+leak_detection_4638.report_mode_counts_without_changing_the_verdict	12000	500
+leak_detection_4638.strict_mode_fails_the_known_leak	12000	500
+leak_detection_4638.strict_trip_is_real_and_scoped_spec_28_2	24	1

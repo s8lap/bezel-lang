@@ -70,6 +70,27 @@ valid Bezel, don't work around the AOT check.**
   checking — distinct from checked-disposal *mode*, `bezelc --checked-disposal`
   §28.2, which inserts `DisposedAccessException` guards.)
 
+> ⚠ **`runAot` does NOT leak-check — not even under `gate.sh --full`** (#4638).
+> `BEZEL_AOT_FORCE_SANITIZE=address` links AddressSanitizer but pins
+> `detect_leaks=0` (#1822), deliberately: §28.2 checked-disposal quarantines
+> disposed objects *on purpose*, a negative test that exits via an uncaught
+> exception legitimately leaves heap live, and LSan's `exitcode` supersedes the
+> program's own (#4532). Consequence for test authors: **if your row's subject
+> is a leak, it must be on `runAotChecked`.** Loop-amplifying a leak on
+> `runAot` buys nothing — CLAUDE.md's 50–500× rule mitigates LSan's
+> *reachable-at-exit* hazard, not an oracle that is switched off, so a
+> correctly-amplified leak row on `runAot` passes on both sides of its fix.
+> Measured: the #4619 program leaks 12,000 B in 500 allocations; `runAotChecked`
+> fires, `runAot` under forced ASan reports nothing.
+>
+> To *measure* leaks on the `runAot` path there is an opt-in third oracle,
+> `BEZEL_AOT_DETECT_LEAKS` (`off` | `report` | `strict`; see
+> `tests/support/force_sanitize.hpp`). `report` prints a `[ LEAK ]` marker and
+> leaves the row's verdict untouched, so it is safe to switch on suite-wide;
+> `scripts/check_leak_census.py` turns such a run into the frozen docket in
+> `scripts/leak_census.baseline`. `strict` fails the row. Neither is on by
+> default, and neither replaces putting a leak row on `runAotChecked`.
+
 ### Diagnostic tests → lit + FileCheck (`tests/lit/*.bzl`)
 
 Reject/accept **diagnostic** tests live as `.bzl` files with `// RUN:` directives

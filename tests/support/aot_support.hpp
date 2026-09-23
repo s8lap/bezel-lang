@@ -561,6 +561,144 @@ using bezel::test::forceSanitizeAddress;
 // every AOT compile.
 using bezel::test::forceCheckedContracts;
 
+// issue #4638: re-export the opt-in leak oracle (defined beside the two sweeps
+// above in support/force_sanitize.hpp, for the same "one definition, N
+// consumers" reason #1822 moved forceSanitizeAddress there).
+using bezel::test::LeakDetectMode;
+using bezel::test::leakDetectMode;
+using bezel::test::aotLeakDetections;
+
+// True iff `text` carries a LeakSanitizer LEAK report and NO AddressSanitizer
+// memory-error report (issue #4638).
+//
+// The distinction is load-bearing. `hasSanitizerReport` above answers "did a
+// sanitizer say anything", which under `BEZEL_AOT_DETECT_LEAKS` is no longer
+// the same question as "is this program broken": in Report mode a leak must NOT
+// fail the row, while a use-after-free found in the same run still must. LSan's
+// leak report is headlined `ERROR: LeakSanitizer: detected memory leaks`;
+// ASan's memory-error reports are headlined `ERROR: AddressSanitizer: <kind>`.
+// A run that printed BOTH is a real memory error and is NOT leak-only, so the
+// #1822 check keeps its verdict.
+inline bool hasLeakOnlyReport(const std::string& text) {
+    if (text.find("ERROR: AddressSanitizer") != std::string::npos) return false;
+    return text.find("ERROR: LeakSanitizer") != std::string::npos ||
+           text.find("detected memory leaks") != std::string::npos;
+}
+
+// Pull "<bytes> byte(s) leaked in <allocations> allocation(s)" out of LSan's
+// SUMMARY line so the census records NUMBERS, not just "leaked". Returns false
+// (leaving the outputs untouched) when the line is absent or malformed — the
+// caller then reports the leak without a size rather than inventing one.
+inline bool parseLeakSummary(const std::string& text, unsigned long long& bytes,
+                             unsigned long long& allocs) {
+    const std::string key = "SUMMARY: AddressSanitizer: ";
+    const std::size_t at = text.find(key);
+    if (at == std::string::npos) return false;
+    const std::size_t lineEnd = text.find('\n', at);
+    const std::string line =
+        text.substr(at + key.size(),
+                    lineEnd == std::string::npos ? std::string::npos
+                                                 : lineEnd - at - key.size());
+    const std::size_t b = line.find(" byte(s) leaked in ");
+    if (b == std::string::npos) return false;
+    const std::size_t a = line.find(" allocation(s)", b);
+    if (a == std::string::npos) return false;
+    try {
+        bytes  = std::stoull(line.substr(0, b));
+        allocs = std::stoull(line.substr(b + std::strlen(" byte(s) leaked in "),
+                                         a - b - std::strlen(" byte(s) leaked in ")));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// The ONE place a leak observation is recorded (issue #4638). Counts at the
+// chokepoint and prints a `[ LEAK ]` marker on stdout — deliberately stdout,
+// not stderr, because tests/test_harness.hpp brackets every row with
+// `[ RUN  ] <suite>.<name>` / `[  OK  ]` on the same stream: the marker
+// therefore lands INSIDE its own row's bracket and scripts/check_leak_census.py
+// attributes it by position, with no change to the harness's row bookkeeping
+// (test_harness.hpp has no currentTestName() and adding one would invalidate
+// every test TU).
+struct LeakExpectation;
+inline LeakExpectation*& currentLeakExpectation() {
+    static LeakExpectation* p = nullptr;
+    return p;
+}
+
+// Record ONE leak observation (issue #4638) — see the definition below
+// LeakExpectation.
+inline void noteLeakDetection(const char* where, const std::string& report,
+                              bool failing);
+
+// Scoped interception, FOR THE HARNESS'S OWN SELF-TEST ONLY — the exact shape
+// of `InfraExpectation` above, and subject to the same ⚠ warning: it is a
+// process-global bypass of the strict-mode trip, so one that outlives its test
+// body disarms the oracle for the rest of the shard. Non-copyable, and the
+// destructor restores the PREVIOUS pointer rather than clearing to null, so
+// nesting cannot strand a stale one. The ONLY sanctioned use is a stack-scoped
+// local in tests/support/aot_leak_detection_4638_test.cpp, whose whole job is
+// to watch the strict oracle FAIL a row and still report green itself.
+struct LeakExpectation {
+    LeakExpectation() : prev_(currentLeakExpectation()) {
+        currentLeakExpectation() = this;
+    }
+    ~LeakExpectation() { currentLeakExpectation() = prev_; }
+    LeakExpectation(const LeakExpectation&) = delete;
+    LeakExpectation& operator=(const LeakExpectation&) = delete;
+
+    std::size_t count = 0;
+    bool lastFailing = false;
+    unsigned long long lastBytes = 0;
+    unsigned long long lastAllocs = 0;
+
+private:
+    LeakExpectation* prev_;
+};
+
+// The ONE place a leak observation is recorded (issue #4638). Counts at the
+// chokepoint and prints a `[ LEAK ]` marker on stdout — deliberately stdout,
+// not stderr, because tests/test_harness.hpp brackets every row with
+// `[ RUN  ] <suite>.<name>` / `[  OK  ]` on the same stream: the marker
+// therefore lands INSIDE its own row's bracket and scripts/check_leak_census.py
+// attributes it by position, with no change to the harness's row bookkeeping
+// (test_harness.hpp has no currentTestName() and adding one would invalidate
+// every test TU).
+//
+// In STRICT mode it also trips `currentTestFailed()`, for the #3007/#3682
+// reason: the caller's own diagnostic is `Severity::Error` with `ran == false`,
+// which is byte-for-byte the shape 272 `hasErrors()` and 205 `!ran` assertions
+// in this tree test FOR. Without the trip, a row that expects a rejection or a
+// crash would report `[  OK  ]` on a leak — a green tick for the wrong reason,
+// which is the family of defect this issue belongs to. With it, "strict mode
+// fails a leaking row" is a property of the harness rather than of what the
+// row happens to assert.
+inline void noteLeakDetection(const char* where, const std::string& report,
+                              bool failing) {
+    aotLeakDetections().fetch_add(1, std::memory_order_relaxed);
+    unsigned long long bytes = 0, allocs = 0;
+    const bool sized = parseLeakSummary(report, bytes, allocs);
+    std::cout << "    [ LEAK ] " << (where ? where : "runAot") << ": ";
+    if (sized)
+        std::cout << bytes << " byte(s) leaked in " << allocs
+                  << " allocation(s)";
+    else
+        std::cout << "LeakSanitizer reported a leak (no SUMMARY line)";
+    std::cout << (failing ? " — BEZEL_AOT_DETECT_LEAKS=strict, row FAILED"
+                          : " — BEZEL_AOT_DETECT_LEAKS=report, row NOT failed")
+              << " (#4638)\n";
+    std::cout.flush();
+    if (LeakExpectation* e = currentLeakExpectation()) {
+        ++e->count;
+        e->lastFailing = failing;
+        e->lastBytes = bytes;
+        e->lastAllocs = allocs;
+        return;   // self-test interception: observed, NOT a test failure
+    }
+    if (failing) ::bezel::test::currentTestFailed() = true;
+}
+
 // #1822: re-emit a fired sanitizer report to the harness's real stderr (fd 2) so
 // the whole-suite sweep (scripts/asan_sweep.sh) can grep the shard log for the
 // "ERROR: AddressSanitizer" / "ERROR: LeakSanitizer" headline. A clean suite
@@ -3069,6 +3207,13 @@ inline JitResult runAot(std::string_view source,
     // override (parallel to the ASan sweep above) so an external trigger can
     // flip every AOT program into checked-contracts mode uniformly.
     if (aot_detail::forceCheckedContracts()) opts.checkedContracts = true;
+    // issue #4638: the opt-in leak oracle. LeakSanitizer here IS the ASan
+    // runtime's exit-time check, so asking for it implies the ASan link — a
+    // plain build has no LSan to enable. Read once per call (the predicate is
+    // deliberately unmemoized; see force_sanitize.hpp) and threaded through to
+    // the run-environment and the post-run check below.
+    const LeakDetectMode leakMode = aot_detail::leakDetectMode();
+    if (leakMode != LeakDetectMode::Off) opts.sanitizeAddress = true;
 
     std::string infraWhy;
     aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
@@ -3123,8 +3268,23 @@ inline JitResult runAot(std::string_view source,
     // so the report text is captured intact.
     bool timedOut = false;
     std::vector<std::pair<std::string, std::string>> runEnv;
-    if (opts.sanitizeAddress)
-        runEnv.push_back({"ASAN_OPTIONS", "detect_leaks=0:abort_on_error=0"});
+    if (opts.sanitizeAddress) {
+        // issue #4638: with the opt-in leak oracle on, enable LSan AND pin
+        // `exitcode=0`. The second half is not cosmetic — it is what makes
+        // Report mode verdict-preserving: LeakSanitizer otherwise REPLACES the
+        // program's exit status with its own (#4532's measured defect, where 7
+        // rows asserting a value saw 1 and one row asserting 1 passed
+        // vacuously). VERIFIED 2026-09-23 on the #4619 leak500 program:
+        // `detect_leaks=1:abort_on_error=0` exited 1 where the program returns
+        // 2; adding `exitcode=0` exited 2 with the report still printed. The
+        // report TEXT stays the oracle either way (the qr1 M3 rule the
+        // runAotChecked sibling follows), so nothing keys on the exit status.
+        runEnv.push_back(
+            {"ASAN_OPTIONS",
+             leakMode == LeakDetectMode::Off
+                 ? std::string("detect_leaks=0:abort_on_error=0")
+                 : std::string("detect_leaks=1:exitcode=0:abort_on_error=0")});
+    }
     int execErrno = 0;
     int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
                                            aot_detail::aotTimeoutSec(), timedOut,
@@ -3177,6 +3337,33 @@ inline JitResult runAot(std::string_view source,
     // under sanitizeAddress (the forced sweep, or an explicit caller).
     if (opts.sanitizeAddress) {
         std::string errText = aot_detail::slurp(errPath);
+        // issue #4638: a LEAK-ONLY report is handled here, BEFORE the #1822
+        // check below, and consumed. Order matters twice over: (1) the #1822
+        // predicate `hasSanitizerReport` already matches "detected memory
+        // leaks", so without this arm Report mode would fail the very rows it
+        // exists to merely count; (2) a run that printed an AddressSanitizer
+        // memory-error headline as well is NOT leak-only, falls through, and
+        // keeps the #1822 verdict — turning the census on must never soften a
+        // use-after-free into a note.
+        if (leakMode != LeakDetectMode::Off &&
+            aot_detail::hasLeakOnlyReport(errText)) {
+            const bool failing = (leakMode == LeakDetectMode::Strict);
+            aot_detail::noteLeakDetection("runAot", errText, failing);
+            if (failing) {
+                aot_detail::emitSanitizerReportToStderr(errText);
+                r.exitCode = -1;
+                r.diagnostics.report(
+                    Severity::Error, SourceLocation{},
+                    "runAot: LeakSanitizer fired in the test program "
+                    "(BEZEL_AOT_DETECT_LEAKS=strict, #4638)\n" + errText);
+                return r;
+            }
+            // Report mode: counted, printed, and DELIBERATELY not a verdict.
+            // Fall through to the normal exit-status path with `errText`
+            // consumed, so `ran` and `exitCode` are byte-for-byte what the same
+            // program yields with the knob unset.
+            errText.clear();
+        }
         if (aot_detail::hasSanitizerReport(errText)) {
             aot_detail::emitSanitizerReportToStderr(errText);
             r.exitCode = -1;
