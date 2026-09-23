@@ -54,6 +54,7 @@
 #include "support/sema_support.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::parseAndTypecheckGated;
@@ -370,6 +371,13 @@ BEZEL_TEST(s5_2_constant_operand_overflow_4405,
         "end Program;");
     BEZEL_EXPECT_TRUE(!r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // #3892: `!r.ran` + `hasErrors()` alone cannot tell a genuine §5.2
+    // rejection from a crash, signal, timeout or ASan report. Pin the rule's
+    // own words so the row fails if the program stops compiling for some
+    // OTHER reason.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(
+            r, "the compile-time-constant operand"));
 }
 
 // #4405 (s5_2_0032): the unreachable-code posture, end-to-end.
@@ -388,6 +396,13 @@ BEZEL_TEST(s5_2_constant_operand_overflow_4405,
         "end Program;");
     BEZEL_EXPECT_TRUE(!r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // #3892: `!r.ran` + `hasErrors()` alone cannot tell a genuine §5.2
+    // rejection from a crash, signal, timeout or ASan report. Pin the rule's
+    // own words so the row fails if the program stops compiling for some
+    // OTHER reason.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(
+            r, "the compile-time-constant operand"));
 }
 
 // #4405 (s5_2_0033): the positive control, end-to-end. `byte(200)`

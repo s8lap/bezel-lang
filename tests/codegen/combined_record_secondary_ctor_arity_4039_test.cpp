@@ -407,11 +407,16 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
         "class C public static method Main(): int "
         "  var r := new Combo4039T10(4, 5); return r.x; "
         "end Main; end C;");
-    // #4017: rejected at SEMA ("supplies 2 argument(s) but the parameter
-    // list has 1 (§22.5)" as of this writing) rather than resolving to the
-    // matching 2-arg explicit constructor. Still a real, located compile
-    // rejection — not a crash.
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    // UPDATED by fix #4712 (§22.5, §9.1, v0.307) — and this is the update
+    // the row was WRITTEN to receive. Its own header said so: it asserted
+    // the CURRENT (buggy) sema behaviour "so a future #4017 fix updates
+    // this test deliberately rather than an unrelated change silently
+    // flipping it." #4712 is that fix: a combined-form record's explicit
+    // constructors are now `new` overload candidates, so `new
+    // Combo4039T10(4, 5)` resolves to `constructor(a, b)` instead of being
+    // rejected against the 1-arg implicit positional constructor.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(9, r.exitCode);  // 4 + 5, via the explicit constructor
 }
 
 // ===========================================================================
