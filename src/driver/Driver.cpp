@@ -36,6 +36,23 @@
 
 namespace bezel {
 
+// Renders a single diagnostic to stderr in the canonical
+// "path:line:col: <severity-prefix?> message" form. Warnings carry the
+// "warning: " prefix so the conformance runner's `\bwarn(?:ing)?\b` regex
+// (tests/conformance/rules/runner.py) matches spec-required warnings — the
+// warn tier under #4626 — without per-site emission edits. Errors and notes
+// remain unprefixed so their text reads as the prose it was authored as.
+// (Fix for #4626; see docs/Bezel_Language_Spec.md §Diagnostic identity,
+// which leaves the byte format implementation-defined.)
+static void renderDiagnostic(const std::string& path,
+                             const Diagnostic& diag) {
+    const char* sevPrefix = (diag.severity == Severity::Warning)
+                                ? "warning: " : "";
+    std::cerr << path << ":" << diag.location.line << ":"
+              << diag.location.column << ": " << sevPrefix << diag.message
+              << "\n";
+}
+
 namespace {
 
 // Reads an entire file into `out`. Returns false if the file cannot be opened.
@@ -629,9 +646,7 @@ CompileResult Driver::compileExecutableObject(
                 // Print any diagnostics recorded during codegen (e.g. "not yet
                 // implemented") before reporting the codegen failure (#628 pt 1).
                 for (const Diagnostic& diag : diagnostics.diagnostics()) {
-                    std::cerr << path << ":" << diag.location.line << ":"
-                              << diag.location.column << ": " << diag.message
-                              << "\n";
+                    renderDiagnostic(path, diag);
                 }
                 if (!err.empty())
                     std::cerr << "bezelc: codegen error: " << err << "\n";
@@ -641,8 +656,7 @@ CompileResult Driver::compileExecutableObject(
     }
 
     for (const Diagnostic& diag : diagnostics.diagnostics()) {
-        std::cerr << path << ":" << diag.location.line << ":"
-                  << diag.location.column << ": " << diag.message << "\n";
+        renderDiagnostic(path, diag);
     }
 
     CompileResult result;
@@ -804,9 +818,7 @@ CompileResult Driver::compileObject(const std::string& path,
                 // Print codegen diagnostics (e.g. "not yet implemented") before
                 // failing (#628 pt 1).
                 for (const Diagnostic& diag : diagnostics.diagnostics()) {
-                    std::cerr << path << ":" << diag.location.line << ":"
-                              << diag.location.column << ": " << diag.message
-                              << "\n";
+                    renderDiagnostic(path, diag);
                 }
                 if (!err.empty())
                     std::cerr << "bezelc: codegen error: " << err << "\n";
@@ -816,8 +828,7 @@ CompileResult Driver::compileObject(const std::string& path,
     }
 
     for (const Diagnostic& diag : diagnostics.diagnostics()) {
-        std::cerr << path << ":" << diag.location.line << ":"
-                  << diag.location.column << ": " << diag.message << "\n";
+        renderDiagnostic(path, diag);
     }
 
     CompileResult result;
