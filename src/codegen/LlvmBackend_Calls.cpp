@@ -5737,7 +5737,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // class user Equals/reference (§8.3/§8.4), string content (§4.6), value
         // type `==`. The query `target` is a PURE BORROW — not consumed or
         // disposed by IndexOf (§4.4/§4.5).
-        if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+        //
+        // fix #4744 (stdlib §4.4, v0.307): the declared signature is
+        // `IndexOf(item: T, startIndex: int := 0): int` — "first occurrence at
+        // or after startIndex, or -1; 0 <= startIndex <= Count required,
+        // IndexOutOfRangeException otherwise; startIndex = Count is legal and
+        // returns -1". This arm was gated on `args.size() == 1`, so the
+        // two-argument spelling typed as `int` in sema (ExprTypecheck_Calls'
+        // `m == "IndexOf"` arm types Array/OwningArray unconditionally) and
+        // then matched NO codegen arm — the #3079 "compiles, emits nothing"
+        // class: `Console.WriteLine(arr.IndexOf(7, 2))` printed nothing at all
+        // and `_ := arr.IndexOf(1, 4)` never raised. The scan below is
+        // unchanged; only the loop's start index and the §4.4 bounds guard are
+        // new.
+        //
+        // The two-argument form is `Array<T>`'s ALONE: stdlib §4.5 declares
+        // `OwningArray<T>.IndexOf(item: T): int` with no `startIndex`, and
+        // sema has already narrowed this head to exactly those two families
+        // (every other array-like head gets "no member `IndexOf`"), so
+        // `!arrIsOwning` is the `Array<T>`-only gate. An `OwningArray` receiver
+        // with two arguments keeps its existing behaviour rather than gaining
+        // surface the document does not declare.
+        if (m == "IndexOf" &&
+            (call.args.size() == 1 ||
+             (call.args.size() == 2 && call.args[1].value && !arrIsOwning)) &&
+            call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
@@ -5754,8 +5778,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // fix #4744 / stdlib §4.4 (v0.307): the optional `startIndex`.
+            // Evaluated AFTER `item` — §22.5 fixes a call's argument
+            // expressions in call-site textual order — so the guard lands
+            // after the query is materialized. The admissible
+            // range is the CLOSED interval [0, Count] — `startIndex = Count` is
+            // legal and falls straight out of the loop as -1, which is why the
+            // upper guard is `>` and not `>=`.
+            llvm::Value* startIdx = builder_.getInt64(0);
+            if (call.args.size() == 2) {
+                llvm::Value* s = lowerExpr(*call.args[1].value);
+                if (!s) return nullptr;
+                if (!s->getType()->isIntegerTy()) return nullptr;
+                if (!s->getType()->isIntegerTy(64))
+                    s = builder_.CreateSExt(s, i64(), "iof.st64");
+                emitGuardThrow(
+                    builder_.CreateOr(
+                        builder_.CreateICmpSLT(s, builder_.getInt64(0),
+                                               "iof.stneg"),
+                        builder_.CreateICmpSGT(s, len, "iof.stoob")),
+                    "IndexOutOfRangeException");
+                startIdx = s;
+            }
             auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(startIdx, idxSlot);
             auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
             auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
             auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
