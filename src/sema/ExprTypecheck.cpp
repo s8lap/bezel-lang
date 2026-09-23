@@ -5688,6 +5688,89 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
     return true;
 }
 
+// fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. Mirrors
+// `narrowFromTypeTest`'s own local `isBoxHoldingLocation` lambda so the two
+// agree by construction on what counts as a box-holding declared carrier.
+bool ExprTC::narrowedToBoxedValue(Symbol* sym) {
+    if (!sym) return false;
+    auto it = narrowings_.find(sym);
+    if (it == narrowings_.end() || !it->second) return false;
+    TypeRef* d = declaredTypeOf(sym);
+    const bool boxHolding =
+        d && ((d->kind == TypeRef::Kind::Primitive &&
+               d->primitive == PrimitiveType::Object) ||
+              (d->kind == TypeRef::Kind::Named && d->declaration &&
+               d->declaration->kind == ast::TypeDeclKind::Interface));
+    if (!boxHolding) return false;
+    TypeRef* nt = it->second;
+    switch (nt->kind) {
+        case TypeRef::Kind::Primitive:
+            // `string`/`Object` are runtime-managed reference types, never
+            // boxed (§8.6); every other primitive is a value type.
+            return nt->primitive != PrimitiveType::Object &&
+                   nt->primitive != PrimitiveType::String;
+        case TypeRef::Kind::InlineArray:
+            // narrowFromTypeTest's own InlineArray arm already excludes the
+            // move-only (`arrayOwned`) form — §8.6 forbids boxing those in
+            // the first place, so a plain (non-owned) inline array is the
+            // only shape that reaches `narrowings_` here, and it is always
+            // boxed value storage.
+            return true;
+        case TypeRef::Kind::Named:
+            // A class/interface narrowed type is an ORDINARY reference-type
+            // narrowing (§12.7: "Narrowing to a *reference* type is
+            // unaffected: no box is involved") — only Record/Enum are
+            // value-shaped Named kinds.
+            return nt->declaration &&
+                   (nt->declaration->kind == ast::TypeDeclKind::Record ||
+                    nt->declaration->kind == ast::TypeDeclKind::Enum);
+        default:
+            return false;
+    }
+}
+
+// fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale.
+bool ExprTC::checkNarrowedBoxWrite(const ast::Expr& target,
+                                   std::string_view verb,
+                                   const SourceLocation& loc) {
+    const ast::Expr* e = &target;
+    bool hadHop = false;
+    for (;;) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            hadHop = true;
+            e = ma->target.get();
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            hadHop = true;
+            e = ix->target.get();
+        } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = pb->operand.get();
+        } else {
+            break;
+        }
+        if (!e) return false;
+    }
+    if (!hadHop) return false;  // bare-binding form: not this rule's business
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id || id->name == "this" || id->name == "base") return false;
+    Symbol* sym = ctx_.exprSymbol(*e);
+    if (!sym) return false;
+    if (!narrowedToBoxedValue(sym)) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("cannot ") + std::string(verb) + " `" +
+        std::string(id->name) + "` — `" + std::string(id->name) +
+        "` is §12.7-narrowed to a value type at a declared `Object`/"
+        "interface location, so its storage is a §8.6 box: boxing copied "
+        "the value and the box is SHARED, so a store through the narrowed "
+        "chain would be aliased mutation of a value. Copy the value out "
+        "(`var b := " + std::string(id->name) + ";`), mutate the copy, and "
+        "store the whole value back through the declared location (`" +
+        std::string(id->name) + " := b;`) (§12.7, §8.6)");
+    return true;
+}
+
 // Slice S7: diagnose assignment to a readonly field outside the
 // declaring class's constructor. Tracks only the `this.<field>`
 // target shape; `other.f := X` would need cross-object readonly
@@ -5701,6 +5784,13 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // style site. (`Hits` here is a settable property, so the readonly arms
     // are silent; the receiver-storage check is the load-bearing one.)
     checkRecordReceiverStore(*as.target, as.op, as.span.begin);
+    // fix s12_7_0002 (§12.7, v0.307): position (i) of the box-write rule —
+    // "an assignment, compound assignment, or `++`/`--` whose target is an
+    // lvalue chain extending the binding with a `.` or `[...]` hop" —
+    // `o[0] := 9`, `o.X := 5`, `o[0] += 1`. This call covers `:=` and every
+    // compound form (both reach `checkReadonlyAssignment`); the `++`/`--`
+    // spelling is the IncrementStmt sibling call (visitStmt).
+    if (checkNarrowedBoxWrite(*as.target, "store", as.span.begin)) return;
     // §10 (#747 R42): a `const` member is a compile-time constant and is never
     // assignable — in any method OR constructor, through any receiver
     // (`this.K`, `c.K`, `Type.K`, or a bare `K`). Resolve the target's member
@@ -6358,6 +6448,15 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
             "local first (§22.3)");
         return;
     }
+    // fix s12_7_0003 (§12.7, v0.307): position (ii) of the box-write rule —
+    // "such a chain passed as a `ref` or `out` argument, which §22.3's
+    // assignable-storage-location categories admit ... and through which
+    // the callee's write reaches the payload" — `Swap(ref o[0], ref
+    // o[1])`. `checkNarrowedBoxWrite` re-walks the same chain (its own hop
+    // gate is what excludes a BARE `ref o`/`out o`, which is not this
+    // rule's business) and reports only when at least one `.`/`[...]` hop
+    // extends a §12.7-narrowed boxed-value binding.
+    if (checkNarrowedBoxWrite(target, kind, target.span.begin)) return;
 
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
         if (id->name == "this" || id->name == "base") return;
@@ -16697,6 +16796,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the declared target type, not the narrowed one). The map is restored
         // when the block ends. Only a bare-identifier target can match a
         // narrowed simple variable.
+        //
+        // NOTE (s12_7_0004, §12.7/§6.6, v0.307): a bare-binding COMPOUND form
+        // (`o += 1`) is supposed to read the target THROUGH this about-to-be-
+        // invalidated narrowing before boxing the result afresh — erasing up
+        // front here makes that read see the declared `Object` type instead,
+        // an over-reject. A sema-only fix (capture the pre-erasure narrowed
+        // type and feed it to the compound-assignment arithmetic block below)
+        // was tried and reverted: it made sema ACCEPT the program, but
+        // codegen's compound-assignment lowering (which independently
+        // consults `ctx_.exprType(*as->target)` — left at the declared type
+        // deliberately, unaffected by the sema-only capture) does not yet
+        // implement the box-write-back this admits, and crashed at IR
+        // verification (`Call parameter type does not match function
+        // signature! i32 1 / ptr`) instead of running — a WORSE outcome than
+        // today's clean (if mis-worded) reject. See the filed issue for the
+        // paired sema+codegen fix this needs.
         if (as->target) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
@@ -18866,6 +18981,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // consumes the same A.6 `LValue` production as AssignmentStmt — a
         // method-call result cannot serve as the chain's base here either.
         if (is->target) checkLValueChainNotCallBased(*is->target);
+        // fix s12_7_0002 (§12.7, v0.307): position (i) of the box-write
+        // rule, `++`/`--` spelling — `o.X++`, `o[0]--`. IncrementStmt
+        // sibling of the AssignmentStmt call in checkReadonlyAssignment.
+        if (is->target &&
+            checkNarrowedBoxWrite(*is->target, "increment/decrement",
+                                  is->span.begin))
+            return;
         // fix #913 / §28.10 / §17.6: `c++` / `c--` desugars to
         // `c := T.operator++(c)` — a reassignment. A `using var` local is
         // implicitly non-reassignable, so an increment/decrement on it is a

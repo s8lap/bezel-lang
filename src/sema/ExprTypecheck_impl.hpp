@@ -1992,6 +1992,36 @@ private:
     bool checkRecordReceiverStore(const ast::Expr& target,
                                   std::string_view op,
                                   const SourceLocation& loc);
+
+    // fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): true iff `sym` (a local
+    // or parameter) is CURRENTLY §12.7-narrowed (`narrowings_`), its
+    // DECLARED type is the box-holding `Object`/interface location
+    // (mirrors `narrowFromTypeTest`'s own `isBoxHoldingLocation` lambda so
+    // the two agree by construction), and the narrowed type is a VALUE
+    // type — i.e. narrowing put a §8.6 box in play, as opposed to an
+    // ordinary reference-type narrowing, which §12.7 states is unaffected
+    // ("Narrowing to a *reference* type is unaffected: no box is
+    // involved, and writes through the narrowed binding are ordinary
+    // reference-type writes").
+    bool narrowedToBoxedValue(Symbol* sym);
+
+    // fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): §12.7's box-write rule,
+    // positions (i) (assignment/compound-assignment/++/--) and (ii) (a
+    // `ref`/`out` argument) — "A write whose store would land in the box
+    // is a compile error ... an lvalue chain (grammar A.6 `LValue`)
+    // extending the binding with a `.` or `[...]` hop." Walks `target`
+    // exactly as `checkLValueChainNotCallBased` does (peeling
+    // `.member`/`[index]`/postfix-`!` hops down to the chain's base) and,
+    // when the base is a §12.7-narrowed-to-a-boxed-value binding AND at
+    // least one `.`/`[...]` hop was peeled, reports the box-write error
+    // and returns true. A hop count of zero (a bare `o := …` / `ref o`)
+    // is the admitted bare-binding form and is left untouched — position
+    // (i)'s bare-binding carve-out is `checkReadonlyAssignment`'s own
+    // business, and (ii) never passes a bare identifier through this
+    // function's hop gate in the first place.
+    bool checkNarrowedBoxWrite(const ast::Expr& target, std::string_view verb,
+                               const SourceLocation& loc);
+
     // Shared by the MemberAccess and Index cases of
     // checkRefOutOperandCategory: no-setter / readonly-auto-outside-context /
     // setter-visibility for a property (incl. indexer) operand — mirrors the
