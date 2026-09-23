@@ -2579,11 +2579,46 @@ static bool parseAndAttachCtorBody(
     // here is the same gate, observed one function call earlier.
     std::unordered_map<std::string_view, sema::Symbol*> importedAutoPropStorage;
     {
+        // fix #4650 (§9.2 "Records" / §2.5 "Cross-module symbols" /
+        // §2.8.3 rule 3, v0.307): the index must advance on EVERY member that
+        // produced a symbol, not only on the Property ones. This was the one
+        // sync-walk in this file that gated the ADVANCE on its own member KIND
+        // instead of `metaMemberProducesSymbol` — the discipline that
+        // predicate's own comment spells out ("every call site here sync-walks
+        // td.members against importedType.members position-by-position … a
+        // stale `false` here would desync that walk by one"). `continue`-ing
+        // past a non-Property member WITHOUT consuming its slot desynchronises
+        // the pairing by the number of non-Property members declared BEFORE
+        // the property.
+        //
+        // MEASURED (two-module AOT build, §9.2 body record):
+        //   public record Counter
+        //     private _count: int;                    -- declared FIRST
+        //     public readonly property Label: string;
+        //     public constructor(label: string, count: int)
+        //       Label := label; _count := count;
+        //     end constructor;
+        //   end Counter;
+        // The Field `_count` was skipped without advancing, so the Property
+        // `Label` paired against `importedType.members[0]` — the FieldSymbol
+        // `_count` — the `dynamic_cast<PropertySymbol*>` failed, and the map
+        // came out EMPTY. The remap arm below then found no imported twin for
+        // the fresh `Label`, so NO `mainCtx` exprSymbol entry was written at
+        // all: codegen's `implicitFieldAddr` got a null symbol back from
+        // `ctx_.exprSymbol`, `lvalueAddr` returned null, and the #4045 backstop
+        // DROPPED the store while letting the compile continue — a running
+        // binary whose `Label` was never initialised (empty string, or `0` for
+        // the `int` spelling), then a SIGSEGV the moment §8.3 content
+        // comparison or `+` dereferenced the never-stored `bz_string`.
+        // Declaring the property BEFORE the field masked it exactly (index 0
+        // then paired correctly), which is why the auto-property-only shape
+        // (#3207's own fixture) has always worked.
         std::size_t importedIdx = 0;
         for (const MetaMember& mmItem : td.members) {
-            if (mmItem.kind != MetaMemberKind::Property) continue;
+            if (!metaMemberProducesSymbol(mmItem)) continue;
             if (importedIdx >= importedType.members.size()) break;
             sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind != MetaMemberKind::Property) continue;
             auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
             if (!ps || ps->isIndexer || sym->name.empty()) continue;
             if (mmItem.isAutoProperty)
@@ -3846,11 +3881,21 @@ static bool parseAndAttachMethodBody(
     // the predicate #2478 already ships.
     std::unordered_map<std::string_view, sema::Symbol*> importedAutoPropStorage;
     {
+        // fix #4650 (§9.2 / §2.5 / §2.8.3 rule 3, v0.307): the identical
+        // desync #3207's ctor-path twin carried — this block is a copy of it.
+        // Advance on `metaMemberProducesSymbol`, exactly as this function's own
+        // `importedMethods` sync-walk a few lines above does; see the ctor-path
+        // copy in `parseAndAttachCtorBody` for the measured consequence. Here
+        // the fallout is #3994's own failure mode rather than a dropped store:
+        // with the map empty, a method body naming an auto-property declared
+        // AFTER any other member keeps its fresh PropertySymbol, `fieldIndex_`
+        // (keyed on the imported symbol) misses, and the body lowers to null.
         std::size_t importedIdx = 0;
         for (const MetaMember& mmItem : td.members) {
-            if (mmItem.kind != MetaMemberKind::Property) continue;
+            if (!metaMemberProducesSymbol(mmItem)) continue;
             if (importedIdx >= importedType.members.size()) break;
             sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind != MetaMemberKind::Property) continue;
             auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
             if (!ps || ps->isIndexer || sym->name.empty()) continue;
             if (mmItem.isAutoProperty)
