@@ -7268,29 +7268,121 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // keyed seven and left byte/sbyte/short/ushort on
                             // the `int` default, which codegen then tried to
                             // reach by `trunc i8 -> i32`.
-                            // fix #4731: char satisfies IComparable<char> per
-                            // §3.4 / §9.5 but is not an §2.19 INumber conformer
-                            // (the eleven primitives
-                            // `isNoSelectorAggregationElem` keys on). Including
-                            // char in the keyed set lets `Array<char>.Min()/
-                            // Max()` type the result as char, so
-                            // `Console.WriteLine` reaches `bz_char_to_string`
-                            // and prints "a" rather than the int code point
-                            // "97". The Sum() INumber<T> constraint gate is
-                            // handled by a separate fix (#4730).
+                            // fix #4730 (stdlib §5.1, v0.286 + spec §2.19):
+                            // REJECT Sum() over an element that does not
+                            // satisfy `T: INumber<T>`. The stdlib §5
+                            // `extension IEnumerable<T> where T: INumber<T>`
+                            // block names Sum(): owned T; spec §2.19 lists
+                            // the INumber conformers as byte, sbyte, short,
+                            // ushort, int, uint, long, ulong, float, double,
+                            // decimal — `bool` and `char` are NOT conformers
+                            // (`+` is not defined on either), and a nullable
+                            // `T?` does not satisfy `T: INumber<T>`. The
+                            // pre-fix compiler accepted all three shapes
+                            // silently: Sum() over `Array<bool>` → IR
+                            // verifier fault (`trunc i1 to i32`); over
+                            // `Array<char>` → silent wrong code (sum of code
+                            // points, e.g. 294); over `Array<int?>` → IR
+                            // verifier fault (`add i32, {i8, i32}`). The
+                            // constraint gate fires here at sema and emits a
+                            // diagnostic that names the constraint and the
+                            // offending element type, mirroring the IComparable
+                            // gate for Min/Max above. Class/interface elements
+                            // defer per §14.2 (the constraint is checked at
+                            // instantiation), so `class Meters: INumber<Meters>`
+                            // is admitted there.
                             bool noSelectorKeyed = false;
-                            if (ce.args.empty() && elem &&
-                                elem->kind == TypeRef::Kind::Primitive &&
-                                !elem->nullable) {
-                                P ep = elem->primitive;
-                                bool keyForThisOp =
-                                    isNoSelectorAggregationElem(ep) ||
-                                    ((m == "Min" || m == "Max") &&
-                                     ep == P::Char);
-                                if (keyForThisOp) {
-                                    ctx_.setExprType(&ce,
-                                        ctx_.primitiveTypeRef(ep));
-                                    noSelectorKeyed = true;
+                            if (ce.args.empty() && elem) {
+                                bool inumberAdmit = false;
+                                // Eleven §2.19 INumber conformer primitives.
+                                if (elem->kind == TypeRef::Kind::Primitive &&
+                                    !elem->nullable &&
+                                    isNoSelectorAggregationElem(elem->primitive))
+                                    inumberAdmit = true;
+                                // Class/interface: defer to instantiation (§14.2).
+                                else if (elem->kind == TypeRef::Kind::Named &&
+                                         elem->declaration &&
+                                         (elem->declaration->kind ==
+                                              ast::TypeDeclKind::Class ||
+                                          elem->declaration->kind ==
+                                              ast::TypeDeclKind::Interface))
+                                    inumberAdmit = true;
+                                // Generic-parameter placeholder — the TypeRef
+                                // is unresolved (no Declaration, no Kind::
+                                // Primitive / Named at the level the gate
+                                // would deny). Defer per §14.2.
+                                else if (elem->kind == TypeRef::Kind::Error ||
+                                         (elem->kind == TypeRef::Kind::Named &&
+                                          !elem->declaration))
+                                    inumberAdmit = true;
+                                if (m == "Sum" && !inumberAdmit) {
+                                    // fix #4730: report the INumber<T>
+                                    // constraint failure. The element spelling
+                                    // comes from `primitiveSpellingForDiag`
+                                    // for primitives (the same source the
+                                    // `IComparable` gate above uses) and from
+                                    // `declaration->name` for class/interface
+                                    // elements; the `nullable` flag appends
+                                    // `?` to the primitive spelling for
+                                    // `Array<int?>`. The constraint name
+                                    // (`INumber<T>`), stdlib §5.1 citation,
+                                    // and the user's offered replacement
+                                    // (`Sum(selector: ...)`) match the form
+                                    // the IComparable gate above uses.
+                                    std::string elemName;
+                                    if (elem->kind == TypeRef::Kind::Primitive) {
+                                        elemName =
+                                            primitiveSpellingForDiag(
+                                                elem->primitive);
+                                        if (elem->nullable) elemName += "?";
+                                    } else if (elem->kind ==
+                                                   TypeRef::Kind::Named &&
+                                               elem->declaration) {
+                                        elemName = elem->declaration->name;
+                                    } else {
+                                        elemName = "<element>";
+                                    }
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string("Sum() requires the "
+                                                    "element type to satisfy "
+                                                    "`T: INumber<T>` "
+                                                    "(stdlib §5.1 / spec "
+                                                    "§2.19 / #4730); `") +
+                                            elemName +
+                                            "` does not conform to `INumber<" +
+                                            elemName + ">`.");
+                                    return;
+                                }
+                                // No-selector result-type keying:
+                                //   * Sum()  — INumber conformers only;
+                                //     non-INumber primitives (bool/char) and
+                                //     nullables are caught by the gate above.
+                                //   * Min()/Max() — the IComparable<T> gate
+                                //     §5.1 imposes is satisfied by EVERY §3.4
+                                //     primitive (they all carry IComparable
+                                //     conformance), so the result is the
+                                //     element's own type. Without Char here
+                                //     (`isNoSelectorAggregationElem` excludes
+                                //     it — char is not INumber), `Array<char>.
+                                //     Min()` fell to the int default and the
+                                //     §9.5 char-rendering `bz_char_to_string`
+                                //     was bypassed, so `Console.WriteLine`
+                                //     printed "97" (the int code point of 'a')
+                                //     rather than "a" (#4731).
+                                if (ce.args.empty() && elem &&
+                                    elem->kind == TypeRef::Kind::Primitive &&
+                                    !elem->nullable) {
+                                    P ep = elem->primitive;
+                                    bool keyForThisOp =
+                                        isNoSelectorAggregationElem(ep) ||
+                                        ((m == "Min" || m == "Max") &&
+                                         ep == P::Char);
+                                    if (keyForThisOp) {
+                                        ctx_.setExprType(&ce,
+                                            ctx_.primitiveTypeRef(ep));
+                                        noSelectorKeyed = true;
+                                    }
                                 }
                             }
                             if (!noSelectorKeyed) {
