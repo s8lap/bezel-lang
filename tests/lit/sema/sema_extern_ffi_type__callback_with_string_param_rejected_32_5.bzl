@@ -8,5 +8,5 @@
 
 module M; extern "c" public method reg(cb: (string) -> int): int; end;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `cb` has type `(...) -> int`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `cb` has type `(...) -> int`, which is not FFI-compatible
 // CHECK-SAME: (§32.5)

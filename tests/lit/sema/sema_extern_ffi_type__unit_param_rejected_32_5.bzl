@@ -8,5 +8,5 @@
 
 module M; extern "c" public method bad(x: ()): int; end;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `()`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `()`, which is not FFI-compatible
 // CHECK-SAME: (§32.5)

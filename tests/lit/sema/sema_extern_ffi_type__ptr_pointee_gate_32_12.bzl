@@ -38,5 +38,5 @@ end;
 // CHECK-SAME: (§32.12)
 // §32.5 "Nullable value types are rejected: … `Ptr<T>?` …" — the nullable
 // form never reaches the pointee gate; it is rejected as a nullable value type.
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `p` has type `Ptr<int>?`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `p` has type `Ptr<int>?`, which is a nullable value type — nullable value types are rejected at the FFI boundary
 // CHECK-SAME: (§32.5)

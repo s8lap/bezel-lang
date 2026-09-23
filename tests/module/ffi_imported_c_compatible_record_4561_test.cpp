@@ -105,7 +105,7 @@ BEZEL_TEST(ffi_imported_c_record_4561,
     }
     // Pre-fix this compile FAILS outright: `isFfiCompatibleType` had no record
     // arm at all, so `out ts: TimeSpec` and `oldfd: Fd` were both rejected as
-    // "not permitted at the FFI boundary (§32.5)".
+    // "not FFI-compatible (§32.5)".
     bezel::CompileResult rb = driver.compileFile(bSrc, bExe, deps);
     BEZEL_EXPECT_TRUE(rb.success);
     if (!rb.success) return;

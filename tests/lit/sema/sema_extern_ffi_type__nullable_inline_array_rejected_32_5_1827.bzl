@@ -28,5 +28,5 @@ extern "c"
   public method takes_nullable_element(x: [4]int?): int;
 end;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `[N]int?`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `[N]int?`, which is a nullable value type — nullable value types are rejected at the FFI boundary
 // CHECK-SAME: (§32.5)

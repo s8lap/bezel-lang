@@ -10194,13 +10194,73 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
             "(§32.5)");
         return false;
     }
-    // per §32.5: report the offending type and signature site. Use the
-    // AST type's source span so the diagnostic points at the declaration.
+    // §32.5 (fix #4659) — "Nullable value types are rejected": a nullable
+    // primitive (`int?`, `bool?`), a nullable pointer-shaped scalar (`IntPtr?`,
+    // `UIntPtr?`), `Ptr<T>?`, and a nullable inline array (`[N]T?`, OR an inline
+    // array whose element type is itself nullable — `[N](int?)`, which the
+    // parser stores with `t.nullable=false` and `t.arrayElement->nullable=true`
+    // per the comment in Parser_Decls.cpp's parseType()) all have no C
+    // representation. The diagnostic must carry the rule's own spec term
+    // (`nullable`); it runs BEFORE the generic catch-all so a single condition
+    // owns one message. The companion pointer-carrier rule (`CString?`,
+    // `WString?`, `RawBytes?`) is nullable-by-design and is admitted above in
+    // `isFfiCompatibleType`'s Named case.
+    bool isNullableValueType = false;
+    if (t.nullable) {
+        if (t.kind == ast::TypeKind::Named && t.name &&
+            t.name->parts.size() == 1) {
+            const std::string_view nm = t.name->parts.front();
+            isNullableValueType =
+                primitiveFromName(nm) != PrimitiveType::None ||
+                nm == "Ptr" || nm == "IntPtr" || nm == "UIntPtr";
+        } else if (t.kind == ast::TypeKind::InlineArray) {
+            isNullableValueType = true;
+        }
+    } else if (t.kind == ast::TypeKind::InlineArray && t.arrayElement &&
+               t.arrayElement->nullable) {
+        isNullableValueType = true;
+    }
+    if (isNullableValueType) {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("extern method ") + declSpelling + " has type `" +
+                spellExternType(t) +
+                "`, which is a nullable value type — nullable value types are "
+                "rejected at the FFI boundary (§32.5)");
+        return false;
+    }
+    // §32.5 (fix #4659) — "Owning inline arrays and inline arrays of other
+    // element types are not admitted": `[N owned]T` (class-typed) and `[N]T`
+    // whose T is not an FFI-compatible primitive are not admitted. The
+    // diagnostic carries the rule's own spec term (`not admitted`); it runs
+    // BEFORE the generic catch-all. The element-shape rejection lives in
+    // `isFfiCompatibleType`'s InlineArray case above (returns false for
+    // non-primitive element types) — only the owning form needs its own
+    // diagnostic here because the catch-all's `not FFI-compatible` wording
+    // would name the rule's "Not allowed" set rather than the inline-array
+    // "not admitted" sub-rule.
+    if (t.kind == ast::TypeKind::InlineArray && t.arrayOwned) {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("extern method ") + declSpelling + " has type `" +
+                spellExternType(t) +
+                "`, which is an owning inline array — owning inline arrays are "
+                "not admitted at the FFI boundary (§32.5)");
+        return false;
+    }
+    // per §32.5: catch-all for the §32.5 "Not allowed" set (Bezel `string`,
+    // `char`, `decimal`, enums, choices, classes, interfaces, generic type
+    // parameters, `Array<T>`/`OwningArray<T>` and other collections, records
+    // other than the §32.13 forms, inline arrays of other element types).
+    // Use the section's own term — the section title is "FFI-compatible
+    // types" (line 9629), and §32.5 lists what is *not* admitted by stating
+    // what *is*. The diagnostic carries the substring `FFI-compatible` for
+    // any caller that pattern-matches the rule's term.
     std::string what = spellExternType(t);
     ctx_.diagnostics().report(
         Severity::Error, t.span.begin,
         std::string("extern method ") + declSpelling + " has type `" + what +
-            "`, which is not permitted at the FFI boundary (§32.5)");
+            "`, which is not FFI-compatible (§32.5)");
     return false;
 }
 
