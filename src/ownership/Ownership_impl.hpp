@@ -2961,6 +2961,40 @@ private:
     void collectCaseArmBorrowSourcesExpr(const ast::Expr& e);
     void registerCaseArmBorrowSources(const std::vector<ast::CaseArm>& arms,
                                       const ast::Expr* scrutinee);
+
+    // fix #4635 (§28.3 K8.3/K8.4 + §35.5 *The owning match*, v0.307): true
+    // when `scrutinee` is one of §35.5's two ANNOUNCING scrutinee forms over
+    // an OWNING-classified choice — "an unbound owned temporary of
+    // owning-choice classification" (a call: §35.3's case construction and an
+    // owning-choice-returning call both mint) or "a named owned binding under
+    // an explicit scrutinee transfer marker" (`case move o of …`). The sema-
+    // side twin of codegen's `unboundOwningChoiceTemp` /
+    // `markedOwningChoiceScrutineeSlot` pair, which gate the SAME two forms
+    // for the construct-completion reclaim. // per §35.5, v0.307
+    bool owningMatchScrutineeForm(const ast::Expr* scrutinee);
+
+    // fix #4635 (§28.3 K8.4, v0.307): reject an EXPRESSION-position owning
+    // match whose arm result is a borrow of a payload the arm's own pattern
+    // bound. §35.5 makes such a binding "an owned local of the arm body's
+    // scope", and §28.3's arm-meet row makes an UNMARKED named owned binding
+    // written as an arm a BORROW arm — so the construct's value is a borrow
+    // of a value whose owner (the arm scope, or the consumed scrutinee's
+    // construct-completion reclaim, K8.3) is gone when the construct
+    // completes. K8.4: "a borrow or frame that would escape it is rejected,
+    // never lifetime-extended". Syntactic and flow-insensitive, so it runs in
+    // the once-only pre-pass beside registerCaseArmBorrowSources rather than
+    // in the fixpoint. // per §28.3 K8.4, §35.5, v0.307
+    void checkOwningMatchArmEscape(const ast::CaseExpr& ce);
+
+    // fix #4635: the symbols `arm`'s pattern binds to a TRANSFERRING slot of
+    // `chDecl`'s named case — a whole-slot binding (`W(var w, _)`, or the
+    // naked `W(w, _)` spelling) of an `owned`-marked or move-only payload,
+    // which §35.5 transfers into the binding at arm selection. A discard, a
+    // constant, a nested pattern, and a plain (borrowing) payload slot are
+    // NOT transferring and are excluded. // per §35.5, v0.307
+    void collectOwningMatchTransferBindings(
+        const ast::CaseArm& arm, const sema::TypeRef* scrutRef,
+        std::vector<const sema::Symbol*>& out);
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.

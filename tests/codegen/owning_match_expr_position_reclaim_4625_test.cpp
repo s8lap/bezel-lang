@@ -38,7 +38,10 @@
 // must be the first instruction of its block, and the reclaim emits a tag
 // switch that terminates its block). The fix builds the PHI first, spills it to
 // an entry slot, emits the reclaim, and reloads — so a row whose result value
-// is derived from a payload (the borrow-escape row below) pins both halves.
+// is derived from a payload pins both halves: that is
+// `spec_35_5_reclaim_runs_after_an_arm_result_derived_from_a_payload` below.
+// (It used to be the borrow-escape row, whose program fix #4635 now rejects
+// outright — K8.4 forbids a borrow of a bound payload escaping the construct.)
 //
 // THE ORACLE is the exact disposal TEXT and ORDER, never "it did not crash": a
 // printing destructor gives one line per disposal, and the position of those
@@ -121,6 +124,18 @@ void expectRun(const bezel::test::JitResult& r, const std::string& out,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, exitCode);
     BEZEL_EXPECT_EQ(r.stdoutText, out);
+}
+
+// fix #4635 (§28.3 K8.4, v0.307): a row whose program is now REJECTED asserts
+// the SPECIFIC diagnostic. `r.ran == false` alone would not do — runAot
+// synthesizes an Error diagnostic for a runtime crash too (tests/README.md),
+// so the text is what distinguishes the intended rejection.
+bool rejectsWith(const bezel::test::JitResult& r, const char* needle) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(needle) != std::string::npos)
+            return true;
+    return false;
 }
 
 }  // namespace
@@ -334,38 +349,59 @@ BEZEL_TEST(codegen_owning_match_expr_position_reclaim_4625,
 }
 
 BEZEL_TEST(codegen_owning_match_expr_position_reclaim_4625,
-           control_arm_result_borrowing_a_bound_payload_is_not_freed_early) {
-    // WHY THE PER-SLOT DISCHARGE IS LOAD-BEARING HERE, not merely precise.
-    // §28.3: the boundary "is what keeps §19.3's pattern bindings — borrows
-    // whose source is the scrutinee — alive through the arm body". In
-    // EXPRESSION position such a borrow can be the arm's RESULT and outlive the
-    // construct; the checker admits this program today:
+           control_arm_result_borrowing_a_bound_payload_is_rejected_4635) {
+    // ⚠ FLIPPED BY fix #4635 (§28.3 K8.4, v0.307). This row USED to assert
+    // that the program below compiles and prints
+    // `dispose b / got=7 / after / dispose other` — i.e. that the per-slot
+    // discharge keeps payload `a` alive under an arm result that BORROWS it:
     //
     //     var got := (case move o of W(var w, _) => w, X => other);
     //     Console.WriteLine($"got={got.Ping()}");
     //
-    // A construct-completion reclaim with NO per-slot discharge would dispose
-    // payload `a` before that read — a use-after-free, i.e. the error direction
-    // that is worse than the leak. `dischargeOwningMatchTransfers` marks the
-    // slot the arm bound, so `a` stays out of the reclaim and the read is live;
-    // the discarded sibling `b` is still reclaimed at completion.
+    // The checker admitted that, and it should never have: `case move o`
+    // consumes `o`, an UNMARKED named owned binding written as an arm is a
+    // BORROW arm (§28.3), and K8.4 rejects a borrow that would escape its
+    // boundary "never lifetime-extended". #4635 closes the hole, so the
+    // program is now a COMPILE ERROR and this row asserts the diagnostic.
     //
-    // ⚠ This row is deliberately `runAot`, not `runAotChecked`: payload `a` is
-    // left owned by a pattern binding whose own disposal obligation (§28.3's
-    // auto-drop of an undischarged owned binding) is unimplemented in BOTH
-    // positions, so the program leaks 24 bytes here exactly as the statement
-    // spelling does. That residual is a separate, pre-existing defect; the
-    // property THIS row pins is that the read is not a use-after-free, and that
-    // `b` is still reclaimed at construct completion.
+    // The per-slot discharge stays load-bearing for the shapes that remain
+    // admitted — the statement-position adoption (#4617's own rows) and the
+    // value-result row below, whose sibling `b` must still be reclaimed at
+    // construct completion while the bound slot `a` is not.
+    auto r = run(kTwoPayloadDecls,
+                 "using var other := new Widget(\"other\"); "
+                 "var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
+                 "var got := (case move o of "
+                 "  W(var w, _) => w, "
+                 "  X           => other); "
+                 "Console.WriteLine($\"got={got.Ping()}\"); "
+                 "Console.WriteLine(\"after\"); "
+                 "return 0;");
+    BEZEL_EXPECT_TRUE(rejectsWith(r, "borrows owning-match payload binding"));
+}
+
+BEZEL_TEST(codegen_owning_match_expr_position_reclaim_4625,
+           spec_35_5_reclaim_runs_after_an_arm_result_derived_from_a_payload) {
+    // The ORDERING half of the fix, on a shape #4635 leaves admitted: the arm
+    // result is a VALUE computed FROM the bound payload (§35.5: "Copyable
+    // value payloads bind as copies"), so the result PHI is built from a read
+    // of payload `a` and the construct-completion reclaim must run AFTER it.
+    // A reclaim emitted before the PHI would free `a` under `w.Ping()`; a
+    // reclaim that could not follow the PHI at all is the LLVM constraint the
+    // fix's spill/reload works around.
+    //
+    // `b` is disposed at construct completion; `a` is marked out of the
+    // reclaim by #4617's per-slot discharge and is the sibling
+    // unadopted-binding leak (#4634) — which is why this row is `runAot`, not
+    // `runAotChecked`, exactly as the row it replaces was.
     expectRun(
         run(kTwoPayloadDecls,
-            "using var other := new Widget(\"other\"); "
             "var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
-            "var got := (case move o of "
-            "  W(var w, _) => w, "
-            "  X           => other); "
-            "Console.WriteLine($\"got={got.Ping()}\"); "
+            "var n := (case move o of "
+            "  W(var w, _) => w.Ping(), "
+            "  X           => 0); "
+            "Console.WriteLine($\"n={n}\"); "
             "Console.WriteLine(\"after\"); "
             "return 0;"),
-        std::string("dispose b\ngot=7\nafter\ndispose other\n"), 0);
+        std::string("dispose b\nn=7\nafter\n"), 0);
 }
