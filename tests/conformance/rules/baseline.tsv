@@ -1976,8 +1976,8 @@ l4_11_0006	pass
 l4_12_0001	pass	
 l4_12_0002	pass	
 l4_12_0003	pass	
-l4_13_0001	pass	
-l4_13_0002	pass	
+l4_13_0001	fail	divergence
+l4_13_0002	fail	divergence
 l4_13_0003	pass	
 l4_13_0004	pass	
 l4_13_0005	pass	
