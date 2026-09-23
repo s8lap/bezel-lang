@@ -2858,10 +2858,171 @@ void Emitter::emitExportedPropertySetters() {
             auto argIt = fn->args().begin();
             llvm::Value* thisArg = &*argIt++;
             llvm::Value* valueArg = &*argIt;
-            // Forward: call the (InternalLinkage) inner setter with (this, value).
-            builder_.CreateCall(innerFn->getFunctionType(), innerFn,
-                                {thisArg, valueArg});
-            builder_.CreateRetVoid();
+            // fix #4651 (§22.16 / §2.8.2, v0.307): THIS STUB IS THE SETTER'S
+            // §22.16 CHECKED FACE.
+            //
+            // §22.16: "Every instrumented public member compiles to a checked
+            // face (entry checks -> unchecked face -> exit checks) and an
+            // unchecked face (the body); call sites with syntactic receiver
+            // `this` bind to the unchecked face."
+            //
+            // #4614(b) emitted the setter row of the instrumentation set at
+            // the CALL SITE, around the setter body it inlines
+            // (`lowerPropertySetValue`). That is a checked face the call site
+            // synthesises for itself, and it exists only where the body is
+            // inlined — i.e. only inside the declaring module. For an IMPORTED
+            // property `computedSetterOf` returns null (an imported
+            // `PropertySymbol` has no `ast::PropertyDecl`), so the importer
+            // emits a call to THIS symbol instead — and the exporter compiled
+            // it as a bare forwarder. The instrumentation was therefore
+            // structurally invisible across a module boundary. MEASURED on
+            // f644098f with `--checked-contracts` on BOTH halves of a real
+            // two-module build, on the #4614(b) repro: the class defined in
+            // the app returned 99 (ContractViolationException, correct) and
+            // the identical class imported returned 42 — no check at all.
+            //
+            // WHY HERE AND NOT IN THE ACCESSOR FUNCTION. #4614(b)'s lane
+            // declined instrumenting `ensurePropertyAccessorFn`'s body, and
+            // that decline stands: the callee cannot see the receiver's
+            // syntax, so it would also check the `this`-receiver stores §22.16
+            // EXEMPTS ("A call whose receiver is `this` ... enters the
+            // member's unchecked face"), turning a silent under-check into a
+            // loud over-check. This stub is a different function: it is
+            // ExternalLinkage and NOTHING in the declaring module references
+            // it (local sets inline the body; vtable/itable slots hold
+            // `ensurePropertyAccessorFn`'s inner function — see
+            // `buildVtable`/the itable fill). Every caller is an importer, so
+            // the two faces already exist as two symbols and the split costs
+            // no new one: the stub is the checked face, the inner
+            // InternalLinkage accessor stays the unchecked face.
+            //
+            // NO ARTIFACT-INTERFACE MOVE, so #4613's mixed-mode hazard does
+            // not arise. The symbol, its name, its signature and every vtable
+            // layout are unchanged; only this function's BODY differs, and it
+            // differs exactly as a `public` instance method's body already
+            // does under `--checked-contracts` (`emitFunctionBody`'s entry
+            // check). So the accessor's checking is governed by the EXPORTER's
+            // mode, which is the same policy §22.16's public-method row has
+            // had since #2941 — a release-mode library exports uninstrumented
+            // members either way. Both mixed modes were measured.
+            //
+            // RECORDED RESIDUAL (filed on #4651, not closed by it): a derived
+            // class in the IMPORTING module writing `this.P := v`, where `P`
+            // is a public property inherited from the imported base, binds
+            // this checked face and so is checked where §22.16 exempts it.
+            // That is the identical residual #4597 recorded for the method row
+            // ("a `this`-receiver call to an imported instrumented method
+            // keeps its ... checked-face binding") — closing it needs an
+            // unchecked face exported under its own always-emitted symbol, so
+            // that a release-mode exporter still defines what a
+            // checked-contracts importer references.
+            const sema::TypeSymbol* invCls = setterInstrumentationClass(ps, pd);
+            if (invCls) {
+                // The check lowers a user expression and can throw, so this
+                // stub stops being a bare forwarder and becomes a real body:
+                // neutralise the per-body emitter state exactly as
+                // `ensurePropertyAccessorFn` does. `propagateBB_` in
+                // particular is memoised PER FUNCTION — inheriting the
+                // previous function's block would make `unwindBB()` branch
+                // across functions and fail `verifyModule`.
+                NestedBodyScope nested(*this);
+                auto savedLocals = locals_;
+                auto savedParams = paramSlots_;
+                auto savedRef = refParams_;
+                auto savedDispose = disposeStack_;
+                auto savedLoop = loopStack_;
+                auto savedFinally = finallyStack_;
+                auto savedFinBodies = finallyBodyStack_;
+                auto* savedUnwind = unwindTarget_;
+                auto* savedProp = propagateBB_;
+                auto* savedCaught = currentCaughtExc_;
+                auto savedUD = unwindScopeDepth_;
+                auto savedDiv = diverged_;
+                locals_.clear();
+                paramSlots_.clear();
+                refParams_.clear();
+                disposeStack_.clear();
+                loopStack_.clear();
+                finallyStack_.clear();
+                finallyBodyStack_.clear();
+                unwindTarget_ = nullptr;
+                propagateBB_ = nullptr;
+                currentCaughtExc_ = nullptr;
+                unwindScopeDepth_ = 0;
+                diverged_ = false;
+
+                // §28.2's checked-disposal guard comes FIRST, ahead of the
+                // §22.16 entry check, because that is the order the public-
+                // METHOD row uses (`emitFunctionBody` emits the disposed-flag
+                // test, then the `requires` prologue, then the invariant).
+                // The inner accessor emits this guard too — the duplicate is
+                // unreachable once this one fires — but it has to be HERE, or
+                // a torn-down instance (§22.16: "Dispose ... legitimately
+                // tears the state down", so its clause may well be false)
+                // raises ContractViolationException where §28.2 requires
+                // DisposedAccessException. MEASURED on a class whose
+                // `destructor` zeroes the field its own `invariant(k > 0);`
+                // reads, both modes on, across the boundary: the method row
+                // gives DisposedAccessException, and without this block the
+                // setter row gave ContractViolationException instead.
+                if (checkedDisposal_ && ts->kind == ast::TypeDeclKind::Class) {
+                    llvm::StructType* st = classStruct(ts);
+                    unsigned fi = disposedFlagIndex(ts);
+                    llvm::Value* flagAddr = builder_.CreateStructGEP(
+                        st, thisArg, fi, "cd.flag");
+                    llvm::Value* disposed = builder_.CreateICmpNE(
+                        builder_.CreateLoad(disposedFlagTy(), flagAddr),
+                        llvm::ConstantInt::get(disposedFlagTy(), 0),
+                        "cd.disposed");
+                    emitGuardThrow(disposed, "DisposedAccessException");
+                }
+                // §22.16's setter ENTRY boundary, then the unchecked face,
+                // then the NORMAL-EXIT boundary. `disposeAndFreeOnThrow` is
+                // false for both, exactly as the method-entry/exit checks pass
+                // it: `thisArg` is a borrow on the caller's owning slot
+                // (§22.16's construction-exit row is the only owner).
+                emitInvariantCheck(thisArg, invCls);
+                builder_.CreateCall(innerFn->getFunctionType(), innerFn,
+                                    {thisArg, valueArg});
+                // §22.16 "throw exits check nothing". The inner accessor
+                // reports a throw by leaving it in the `bz_exc` slot (a setter
+                // body may `throw` — §23.3's own example does — and §28.2's
+                // checked-disposal guard raises there too). Without this
+                // pending check the exit check below would run on the throw
+                // edge, evaluate the clause over the state the throw left, and
+                // — when that state is broken — store a SECOND exception over
+                // the first, losing the original and leaking it. The check
+                // routes a pending exception to this function's propagate
+                // block (a bare `ret void`, since `unwindTarget_` is null
+                // here), which is what every caller of this stub already
+                // expects: `lowerImportedPropertySetValue` re-checks the slot
+                // at its own `emitPendingCheck()` immediately after the call.
+                emitPendingCheck();
+                // §22.16's setter NORMAL-EXIT boundary — reached only on the
+                // fallthrough the pending check just isolated.
+                emitInvariantCheck(thisArg, invCls);
+                builder_.CreateRetVoid();
+
+                locals_ = std::move(savedLocals);
+                paramSlots_ = std::move(savedParams);
+                refParams_ = std::move(savedRef);
+                disposeStack_ = std::move(savedDispose);
+                loopStack_ = std::move(savedLoop);
+                finallyStack_ = std::move(savedFinally);
+                finallyBodyStack_ = std::move(savedFinBodies);
+                unwindTarget_ = savedUnwind;
+                propagateBB_ = savedProp;
+                currentCaughtExc_ = savedCaught;
+                unwindScopeDepth_ = savedUD;
+                diverged_ = savedDiv;
+            } else {
+                // Forward: call the (InternalLinkage) inner setter with
+                // (this, value). Byte-identical to the pre-#4651 body, which
+                // is what release mode and every uninstrumented property keep.
+                builder_.CreateCall(innerFn->getFunctionType(), innerFn,
+                                    {thisArg, valueArg});
+                builder_.CreateRetVoid();
+            }
             currentFn_ = savedFn;
             if (savedInsert) builder_.SetInsertPoint(savedInsert);
         }

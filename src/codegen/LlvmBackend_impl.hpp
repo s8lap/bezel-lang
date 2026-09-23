@@ -8777,6 +8777,17 @@ private:
         const ast::Expr& target, const sema::PropertySymbol* ps,
         const ast::PropertyDecl* pd) const;
 
+    // fix #4651 (§22.16 / §2.8.2, v0.307): the receiver-INDEPENDENT half of
+    // `instrumentedSetterClass` — the class whose invariant `ps`'s setter must
+    // evaluate on entry and normal exit, judged from the declaration alone
+    // (mode, class kind, `static`, §13.6 accessor visibility, and a non-empty
+    // conjunction), or null when §22.16 instruments nothing. The exporter-side
+    // §22.16 CHECKED FACE (`emitExportedPropertySetters`) asks exactly this,
+    // having no receiver expression to apply the `this`-reentrancy exemption
+    // to — and needing none, since every caller of that face is an importer.
+    const sema::TypeSymbol* setterInstrumentationClass(
+        const sema::PropertySymbol* ps, const ast::PropertyDecl* pd) const;
+
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
     // the exception global, dispose the unwound using-vars, and branch to

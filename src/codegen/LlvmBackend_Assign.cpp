@@ -6889,9 +6889,19 @@ bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) 
 // test is on the SYNTAX, character for character the one `emitMethodCall`
 // applies (#4597): `this.P := v`, `base.P := v`, a bare `P := v` inside an
 // instance member, and the indexer spellings of each.
-const sema::TypeSymbol* Emitter::instrumentedSetterClass(
-    const ast::Expr& target, const sema::PropertySymbol* ps,
-    const ast::PropertyDecl* pd) const {
+//
+// fix #4651 (§22.16 / §2.8.2, v0.307): the predicate is now two functions.
+// `setterInstrumentationClass` (immediately below) is its RECEIVER-INDEPENDENT
+// half — everything decided from the DECLARATION alone: mode, class kind,
+// `static`, §13.6 accessor visibility, and a non-empty conjunction. It is
+// split out because the exporter-side §22.16 checked face
+// (`emitExportedPropertySetters`) asks exactly that question and has no
+// `ast::Expr` target to ask the other one with — and needs none, since every
+// caller of that face is an importer, never a `this` receiver inside the
+// declaring class. `instrumentedSetterClass` keeps the `this`-reentrancy
+// exemption and is unchanged in behaviour.
+const sema::TypeSymbol* Emitter::setterInstrumentationClass(
+    const sema::PropertySymbol* ps, const ast::PropertyDecl* pd) const {
     // §22.16 / #4386: nothing is instrumented in release mode.
     if (!checkedContracts_ || !ps) return nullptr;
     // §22.16 "Never instrumented: non-public methods and setters, static
@@ -6905,17 +6915,19 @@ const sema::TypeSymbol* Emitter::instrumentedSetterClass(
     // public property with a NON-public setter, and §22.16's row is about the
     // setter.
     //
-    // `pd` is the declaration the SOLE caller (`lowerPropertySetValue`) has
-    // already resolved — it is on this path only because `computedSetterOf`
-    // returned a `pd->accessors` element, which requires `ps->decl` to be a
-    // block-form `ast::PropertyDecl`. Taking it as a parameter rather than
-    // re-deriving it with a second `dynamic_cast<…>(ps->decl)` keeps this
-    // predicate off the imported-symbol classification seam (umbrella #3152):
-    // there is no null-`decl` arm here to answer "no visibility refinement"
-    // for an imported property, because an imported property never reaches
-    // this function at all. Null-tolerant so a future caller that has no
-    // declaration degrades to "no accessor-level refinement" explicitly
-    // rather than by a silent cast failure.
+    // `pd` is the declaration the caller has already resolved. For
+    // `lowerPropertySetValue` it is on that path only because
+    // `computedSetterOf` returned a `pd->accessors` element, which requires
+    // `ps->decl` to be a block-form `ast::PropertyDecl`; for
+    // `emitExportedPropertySetters` it is that loop's own
+    // `dynamic_cast<…>(ps->decl)`, which it already requires to be non-null.
+    // Taking it as a parameter rather than re-deriving it with a second
+    // `dynamic_cast` keeps this predicate off the imported-symbol
+    // classification seam (umbrella #3152): there is no null-`decl` arm here
+    // to answer "no visibility refinement" for an imported property, because
+    // an imported property reaches neither caller. Null-tolerant so a future
+    // caller that has no declaration degrades to "no accessor-level
+    // refinement" explicitly rather than by a silent cast failure.
     if (pd) {
         if (pd->hasAutoAccessorVis && pd->autoAccessorIsSet &&
             pd->autoAccessorVis != ast::Visibility::Public)
@@ -6926,6 +6938,14 @@ const sema::TypeSymbol* Emitter::instrumentedSetterClass(
                 return nullptr;
     }
     if (!hasClassInvariant(ps->parent)) return nullptr;
+    return ps->parent;
+}
+
+
+const sema::TypeSymbol* Emitter::instrumentedSetterClass(
+    const ast::Expr& target, const sema::PropertySymbol* ps,
+    const ast::PropertyDecl* pd) const {
+    if (!setterInstrumentationClass(ps, pd)) return nullptr;
     // The §22.16 `this`-reentrancy exemption, decided from the receiver's own
     // SYNTAX (see the header). `currentThis_` guards the implicit spelling so
     // a bare name lowered outside any instance member is never mistaken for
