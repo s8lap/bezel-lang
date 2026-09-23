@@ -15503,6 +15503,13 @@ void Resolver::checkTypePrimaryCtorParamModifiers(TypeSymbol* t) {
     // function-typed parameter is also rejected here (no captured-
     // field storage exists for the function case either; §28.14 names
     // this arm separately).
+    // SEAM-DEBT: #4703 the only caller walks `ctx_.module()->children`, so no
+    // IMPORTED TypeSymbol reaches this site and `t->decl` is never null here.
+    // Independently, this is a DECLARATION-site rule: an imported type's
+    // primary-ctor params were validated when its own module compiled, so the
+    // early return would be the right answer even if one did arrive. Re-derive
+    // from the sema::TypeSymbol (imported-symbol-audit-2026-08-13.md §4) if the
+    // caller ever walks imported scopes or this becomes a use-site check.
     auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
     if (!td || !td->hasPositionalFields) return;
     for (const auto& pf : td->positionalFields) {

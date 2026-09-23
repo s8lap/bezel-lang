@@ -23,6 +23,7 @@
 1    src/sema/PureChecker.cpp
 1    src/sema/Symbol.hpp
 3    src/sema/SymbolCollection.cpp
+1    src/sema/TypeResolution_Checks.cpp
 1    src/sema/TypeResolution_Names.cpp
 
 # class2: a sema::TypeSymbol* cast straight to ast::TypeDecl* - ALWAYS null,
