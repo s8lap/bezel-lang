@@ -3245,6 +3245,50 @@ private:
         borrowOnlyArmBindings_;
     void registerBorrowOnlyArmBindings(const std::vector<ast::CaseArm>& arms,
                                        const ast::Expr* scrutinee);
+
+    // fix #4734 (§35.5 *The owning match*, §28.6 "Who may call Dispose()",
+    // §17.13, §28.8, v0.307): the COMPLEMENT of `borrowOnlyArmBindings_` —
+    // the class/interface-typed arm bindings an OWNING match genuinely
+    // transfers a payload into. §35.5 makes each one "an **owned local of
+    // the arm body's scope**", to which "§28.3's standard rules apply … on
+    // every arm-exit edge", and names four warning-free discharges:
+    //
+    //   `using var u := move r;`  an owned-consuming call  `r.Dispose()`  `_ := r;`
+    //
+    // Only the first worked. The other three each asked a predicate that
+    // keys on the binding's DECL kind — `decl` is a `BindingPattern` — and
+    // answered with §19.3's BORROWING-match rule, which §35.5 scopes to the
+    // borrowing match alone:
+    //
+    //   * `r.Dispose()`   — Ownership.cpp's dispose-receiver gate rejected
+    //     "a pattern binding is a non-destructive borrow" (§28.6's borrow-
+    //     receiver list names "a pattern binding (§19.3)", i.e. the §19.3
+    //     borrowing-match binding; the owner disposing its own value is the
+    //     very remedy §35.5 names).
+    //   * an owned-consuming call — `ownedArgSourceIsBorrow`'s #1280
+    //     record-destructuring branch flagged EVERY `BindingPattern`-decl
+    //     local as a borrow, so `Take(move r)` drew §28.8's borrow-into-an-
+    //     `owned`-sink error. This is the statement-position, call-argument
+    //     sibling of #4633, which fixed only the expression-position arm
+    //     RESULT spelling.
+    //   * `_ := r;`       — the §17.13 announced-consume path is gated on
+    //     `lookupState(name)->state == Owned`, and the dataflow keeps no
+    //     `states_` entry for a pattern binding, so `discardOutOwnedVar` was
+    //     never set and the discard emitted NOTHING. MEASURED: a silent
+    //     24-byte LeakSanitizer leak on an accepted program.
+    //
+    // Keyed by SYMBOL and populated by the same once-per-method pre-pass
+    // that fills `borrowOnlyArmBindings_`, which visits a `case` construct
+    // before descending into its arm bodies — so the set is complete before
+    // any statement of the arm is checked. Narrowed to CLASS/INTERFACE
+    // payloads, #4633's own admission bound: a move-only value payload
+    // transfers too (§35.5), but its per-path discharge machinery is
+    // separate and unmeasured here, and admitting more is the unsafe
+    // direction. // per §35.5, §28.6, §17.13, §28.8, v0.307
+    std::unordered_set<const sema::Symbol*> owningMatchTransferBindings_;
+    bool isOwningMatchTransferredArmBinding(const sema::Symbol* sym) const {
+        return sym != nullptr && owningMatchTransferBindings_.count(sym) != 0;
+    }
     // fix #4664: every binding `p` introduces, at every nesting level, as the
     // dynamic_cast-safe anchor Node the arm binding's LocalSymbol carries as
     // its `decl` (the `var x` BindingPattern, or #1271's synthesized anchor

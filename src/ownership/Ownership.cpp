@@ -3565,6 +3565,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     ds->value.get())) {
                 if (id->name != "this" && id->name != "base") {
                     auto* dstate = lookupState(id->name);
+                    // fix #4734 (§35.5 *The owning match*, §17.13, v0.307):
+                    // `_ := r;` where `r` is an arm binding an OWNING match
+                    // transferred a payload into. §35.5 makes it "an **owned
+                    // local of the arm body's scope**" and names `_ := r;`
+                    // among the four warning-free discharges; §17.13's
+                    // "Discard of a named owned binding" then disposes it at
+                    // the end of the discard statement. The dataflow keeps no
+                    // `states_` entry for a pattern binding, so `dstate` is
+                    // null and this whole path was skipped: the statement
+                    // compiled and emitted NOTHING. MEASURED: a 24-byte
+                    // LeakSanitizer leak, exit 1, on an ACCEPTED program —
+                    // the silent-degrade shape. There is nothing to mark
+                    // disposed (no `states_` entry to move), so this stamps
+                    // only the two flags codegen reads.
+                    // // per §35.5, §17.13, §28.3, v0.307
+                    if (!dstate &&
+                        isOwningMatchTransferredArmBinding(
+                            ctx_.exprSymbol(*id))) {
+                        const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
+                            true;
+                        const_cast<ast::IdentifierExpr*>(id)
+                            ->owningMatchTransferBinding = true;
+                    }
                     if (dstate && dstate->state == OwnershipState::Owned) {
                         // fix #3253 / §17.13 / §28.10 (v0.256, #2071 residual): a
                         // discard `_ := alias;` over a `using var alias := r;`
@@ -8915,6 +8938,23 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
         if (auto* locSym = dynamic_cast<sema::LocalSymbol*>(sym)) {
             if (locSym->decl &&
                 dynamic_cast<const ast::BindingPattern*>(locSym->decl)) {
+                // fix #4734 (§35.5 *The owning match*, §28.6, v0.307): the
+                // rejection below is §19.3's BORROWING-match rule, and §28.6's
+                // borrow-receiver list names "a pattern binding (§19.3)" in
+                // exactly that sense. §35.5 scopes it: in an OWNING match a
+                // transferred payload binding "is an **owned local of the arm
+                // body's scope**", and §35.5 names "an explicit `r.Dispose()`"
+                // verbatim as one of the four warning-free discharges — the
+                // owner disposing its own value, which §28.6 admits ("an owned
+                // local"). Admit, and stamp the receiver so codegen's
+                // LOCALDECL-ONLY slot resolver reclaims the block instead of
+                // dispatching the destructor and leaking it.
+                // // per §35.5, §28.6 "Who may call Dispose()", v0.307
+                if (isOwningMatchTransferredArmBinding(locSym)) {
+                    const_cast<ast::IdentifierExpr*>(id)
+                        ->owningMatchTransferBinding = true;
+                    return;
+                }
                 report(
                     Severity::Error, loc,
                     std::string("cannot call `Dispose()` on `") +

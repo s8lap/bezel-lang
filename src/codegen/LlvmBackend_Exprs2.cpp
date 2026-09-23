@@ -654,9 +654,33 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                         return ld->autoDropAtScopeEnd;
                     return false;
                 }();
+                // (e) fix #4734 (§35.5 *The owning match*, §28.8.1,
+                // v0.307): this bare `move` consumes an arm binding an OWNING
+                // match transferred a payload into — §35.5's "owned local of
+                // the arm body's scope". #4734 newly admits the section's
+                // other three discharges on such a binding (`r.Dispose()`,
+                // `_ := r;`, an owned-consuming call), each of which reclaims
+                // through the binding's own slot under a null guard. The
+                // ownership dataflow keeps NO `states_` entry for a pattern
+                // binding, so it cannot reject a SECOND consume the way it
+                // rejects `move x` twice on an ordinary owned local (§28.8.1:
+                // "a moved-from binding is unreadable until reassigned") —
+                // and without this null, `using var u := move w;
+                // w.Dispose();` freed a block `u` also owns. Nulling here
+                // makes the later reclaim reload null and skip, exactly the
+                // trade case (d) records for the K3.4 arm transfer. Stamped
+                // per-occurrence by the ownership pass, which only ever
+                // stamps a binding it PROVED the owning match transfers, so a
+                // BORROWING match's arm binding (whose `move` is #4664's hard
+                // error) can never reach here. // per §35.5, §28.8.1, v0.307
+                const bool isOwningMatchTransferConsume =
+                    id->owningMatchTransferBinding &&
+                    dynamic_cast<const ast::BindingPattern*>(loc->decl) !=
+                        nullptr;
                 if (loc->isUsing || isIterVarAutoDrop ||
                     loc->autoDropAtScopeEnd || isArmTransferDischarge ||
-                    isPlainVarAutoDropAtScopeEnd) {
+                    isPlainVarAutoDropAtScopeEnd ||
+                    isOwningMatchTransferConsume) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);

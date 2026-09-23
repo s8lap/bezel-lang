@@ -7756,7 +7756,18 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
             bool transfers = false;
             for (const sema::Symbol* t : transferred)
                 if (t == bindSym) { transfers = true; break; }
-            if (transfers) continue;
+            if (transfers) {
+                // fix #4734 (§35.5 *The owning match*, v0.307): record the
+                // complement. §35.5 makes a transferred payload binding "an
+                // owned local of the arm body's scope"; the three checks that
+                // asked "is `decl` a BindingPattern?" and answered with
+                // §19.3's BORROWING-match rule consult this set instead. See
+                // the declaration in Ownership_impl.hpp for the three
+                // measured rejections. Class/interface payloads only —
+                // #4633's admission bound. // per §35.5, v0.307
+                if (classValued) owningMatchTransferBindings_.insert(bindSym);
+                continue;
+            }
             borrowOnlyArmBindings_[bindSym] =
                 BorrowOnlyArmBinding{bindSym->name, owning};
         }
@@ -7766,8 +7777,7 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
 // fix #4664: see the declaration in Ownership_impl.hpp.
 void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
         const ast::UnaryExpr& mv) {
-    if (suppressDiag_) return;
-    if (borrowOnlyArmBindings_.empty() || !mv.operand) return;
+    if (!mv.operand) return;
     // Only the BARE identifier spelling. `move w[i]` through a pattern
     // binding is §19.3/§15.3's own rule (sema, #1665), and `move w.f` is the
     // non-`owned`-field rule (#4284); neither is this one's business.
@@ -7775,6 +7785,25 @@ void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
     if (!id) return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     if (!sym) return;
+    // fix #4734 (§35.5 *The owning match*, §28.8.1, v0.307): the COMPLEMENT
+    // case — this `move` consumes a binding the owning match DID transfer a
+    // payload into, which §35.5 admits. Stamp the occurrence so codegen nulls
+    // the binding's slot after the transfer. Without it, `using var u := move
+    // w; w.Dispose();` (or `; _ := w;`) reclaims a block `u` also owns: the
+    // dataflow keeps no `states_` entry for a pattern binding, so it cannot
+    // reject the second consume the way it rejects the same shape on an
+    // ordinary owned local, and the newly-admitted §35.5 reclaims would
+    // double-free. The reclaims are null-guarded, so the null makes the second
+    // consume a no-op — #4016's null-site reasoning for the sibling K3.4
+    // discharge. NOT gated on `suppressDiag_`: this is a codegen fact, not a
+    // diagnostic, and the pre-pass walk runs once per method.
+    // // per §35.5, §28.8.1, §28.3 K3.4, v0.307
+    if (isOwningMatchTransferredArmBinding(sym)) {
+        const_cast<ast::IdentifierExpr*>(id)->owningMatchTransferBinding = true;
+        return;
+    }
+    if (suppressDiag_) return;
+    if (borrowOnlyArmBindings_.empty()) return;
     auto it = borrowOnlyArmBindings_.find(sym);
     if (it == borrowOnlyArmBindings_.end()) return;
     const std::string name(it->second.name);
@@ -7985,6 +8014,7 @@ void MethodOwnership::collectCaseArmBorrowSources(
     // fix #4664: per-method side state, like pendingThrowableInTryChecks_ —
     // the checker instance is reused across members. // per §35.5, v0.307
     borrowOnlyArmBindings_.clear();
+    owningMatchTransferBindings_.clear();   // fix #4734, same per-method reset
     for (const auto& s : body) if (s) collectCaseArmBorrowSourcesStmt(*s);
 }
 
@@ -13573,8 +13603,21 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // bound field is a reference type (a record field is always non-owning, §9.7).
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
         if (loc->decl &&
-            dynamic_cast<const ast::BindingPattern*>(loc->decl))
+            dynamic_cast<const ast::BindingPattern*>(loc->decl)) {
+            // fix #4734 (§35.5 *The owning match*, §28.8, v0.307): the branch
+            // above is §19.3's BORROWING-match rule, which §35.5 scopes to the
+            // borrowing match. In an OWNING match a transferred payload binding
+            // is "an owned local of the arm body's scope" whose §28.3
+            // discharges §35.5 lists include "an owned-consuming call" — so it
+            // is an owned source, not a borrow, and `Take(move w)` must be
+            // admitted. The statement-position, call-argument sibling of
+            // #4633's expression-position arm-result fix. The value's
+            // construct-completion reclaim is already discharged per slot by
+            // #4617's mark, so the owned sink is the ONLY disposer.
+            // // per §35.5, §28.8, §28.3 K3.4, v0.307
+            if (isOwningMatchTransferredArmBinding(loc)) return false;
             return isBorrowableType(ctx_.exprType(*id));
+        }
     }
     // Anything else we cannot positively classify as a borrow: conservatively
     // NOT flagged, so a valid transfer is never over-rejected. // per §28.8

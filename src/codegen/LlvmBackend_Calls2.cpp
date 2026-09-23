@@ -4642,6 +4642,27 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                     if (outOwnedRecipients_.count(static_cast<const void*>(ie)))
                         return lvalueAddr(receiver, slotTy);
                 }
+                // fix #4734 (§35.5 *The owning match*, §28.6, §17.13, v0.307):
+                // an arm binding an OWNING match transferred a payload into.
+                // Its `decl` is a `BindingPattern` (or #1271's synthesized
+                // naked-binding anchor), so it reaches neither the `ld` branch
+                // below nor any arm above and fell to the trailing `return
+                // nullptr` — dispatch-only, the heap block LEAKED. §35.5 makes
+                // the binding "an owned local of the arm body's scope", and
+                // the case lowering keys its slot on exactly that anchor node
+                // (`locals_[bp]` / `locals_[nakedAnchor]`), which `localSlot`
+                // resolves — so this scope's slot IS the sole reclaim path.
+                // Exactly-once: #4617's `dischargeOwningMatchTransfers` zeroes
+                // the transferred slot in the scrutinee temp at the top of the
+                // selected arm, so the construct-completion reclaim declines
+                // it. Gated on the PER-OCCURRENCE flag the ownership pass
+                // stamps only where it proved the owning-match transfer, so a
+                // BORROWING match's arm binding — whose payload the
+                // scrutinee's owner still disposes — can never reach here.
+                // // per §35.5, §28.6, §17.13, v0.307
+                if (id->owningMatchTransferBinding &&
+                    dynamic_cast<const ast::BindingPattern*>(loc->decl))
+                    return lvalueAddr(receiver, slotTy);
                 // #963 / §28.11 / §29.2: a for-loop variable of an
                 // `IOwningEnumerable<T>` loop (`for var x in Gen()`) is a
                 // LocalSymbol whose decl is the ForStmt (sema sets `lsym->decl =

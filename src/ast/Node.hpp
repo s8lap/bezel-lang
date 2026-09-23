@@ -1126,6 +1126,41 @@ struct IdentifierExpr : Expr {
     // sound however many such calls a program contains, in either order.
     // // per §28.3, §28.6
     bool disposeReclaimsReassignedBorrow = false;
+    // fix #4734 (§35.5 *The owning match*, §28.6 "Who may call Dispose()",
+    // §17.13, §28.8.1, v0.307): set by the ownership pass on every occurrence
+    // of an arm binding an OWNING match transferred a payload into that
+    // CONSUMES it — the receiver of an explicit `r.Dispose()`, the operand of
+    // a discard `_ := r;`, and the operand of a `move r`. §35.5 makes such a binding "an **owned local of the arm
+    // body's scope**" and names both spellings as warning-free discharges, but
+    // codegen's `explicitDisposeOwnedReceiverSlot` is LOCALDECL-ONLY and an
+    // arm binding's `decl` is a `BindingPattern`, so both fell to its trailing
+    // `return nullptr`: the destructor would run and the heap block LEAK.
+    // MEASURED pre-fix on `_ := w;`: 24 bytes in 1 allocation under
+    // LeakSanitizer, on a program the compiler ACCEPTED.
+    //
+    // Per-occurrence for the same reason `disposeReclaimsReassignedBorrow` is:
+    // only the sites the ownership pass proved to be an owning-match transfer
+    // binding are stamped, so a same-named binding of a BORROWING match — whose
+    // payload the scrutinee's owner still disposes — can never reclaim.
+    // Reclaiming here is exactly-once: #4617's per-slot mark
+    // (`dischargeOwningMatchTransfers`) already zeroes the transferred slot in
+    // the scrutinee temp at the top of the selected arm, so the construct-
+    // completion reclaim declines it.
+    //
+    // At a `move r` the flag instead asks codegen to NULL the binding's slot
+    // after the transfer, which is what keeps a SECOND consume harmless: the
+    // ownership dataflow keeps no `states_` entry for a pattern binding, so it
+    // cannot reject `using var u := move r; r.Dispose();` the way it rejects
+    // that shape on an ordinary owned local (§28.8.1: "a moved-from binding is
+    // unreadable until reassigned"). The reclaim above is null-guarded, so a
+    // nulled slot makes the later consume a no-op instead of a double free —
+    // the same null-site reasoning #4016 records for the K3.4 arm-transfer
+    // discharge, and the reason this flag had to cover the `move` spelling
+    // before the other two could be admitted at all. A second consume is
+    // therefore memory-safe but still UNDIAGNOSED; diagnosing it needs the
+    // `states_` entry #4634's auto-drop introduces.
+    // // per §35.5, §28.6, §17.13, §28.8.1, v0.307
+    bool owningMatchTransferBinding = false;
 };
 
 // Source-level parentheses (`(expr)`) are NOT represented as their own AST
