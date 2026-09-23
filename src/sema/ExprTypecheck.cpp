@@ -4920,6 +4920,59 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // stdlib §4.3 (conformance cases l4_3_0002, l4_3_0003): the borrowing
+    // and owning collection families are UNRELATED — there is no implicit
+    // conversion between them. OwningArray<T> does not convert to Array<T>,
+    // and IList<T> (borrowing) is unrelated to IOwningList<T> (owning).
+    // The two hierarchies DO share the read-only interfaces
+    // (IEnumerable<T>, IReadOnlyCollection<T>, IReadOnlyList<T>) per spec
+    // §4.3, so the same-family path stays open (e.g. OwningArray<T> →
+    // IOwningList<T>, the l4_3_0004 case). The cross-family reject is
+    // restricted to the cross-family concrete pair and to the borrowing-side
+    // mutating interfaces (IList<T>, ICollection<T>) which are explicitly
+    // called out as "unrelated to IOwningList<T> / IOwningCollection<T>"
+    // (spec §4.3). Built-in named TypeRefs (Array<T>, OwningArray<T>,
+    // IList<T>, IOwningList<T>, …) carry `declaration == nullptr` because
+    // the spec types are synthesized — they hit the fall-through catch-all
+    // otherwise, exactly because the §5.1 mixed-concrete-primitive gate
+    // above requires `declaration != nullptr` and so misses them. A
+    // head-name check closes the gap without touching the existing gate.
+    {
+        auto isOwningConcrete = [](std::string_view n) {
+            return common::isOwningCollectionHead(n);
+        };
+        auto isBorrowingConcrete = [](std::string_view n) {
+            return common::isArrayBackedCollectionName(n) && n != "OwningBuffer"
+                && !common::isOwningCollectionHead(n);
+        };
+        auto isBorrowingMutIface = [](std::string_view n) {
+            return n == "IList" || n == "ICollection";
+        };
+        if (from->kind == TypeRef::Kind::Named &&
+            to->kind == TypeRef::Kind::Named) {
+            std::string_view fromHN = from->headName();
+            std::string_view toHN = to->headName();
+            bool crossFamily =
+                (isOwningConcrete(fromHN) && isBorrowingConcrete(toHN)) ||
+                (isBorrowingConcrete(fromHN) && isOwningConcrete(toHN)) ||
+                (isOwningConcrete(fromHN) && isBorrowingMutIface(toHN)) ||
+                (isBorrowingMutIface(fromHN) && isOwningConcrete(toHN));
+            if (crossFamily) {
+                reportNotConvertible(
+                    std::string("the borrowing and owning collection "
+                                "families are unrelated per stdlib §4.3: "
+                                "an `") +
+                    std::string(fromHN) + "` is not implicitly convertible "
+                    "to `" + std::string(toHN) +
+                    "` (no implicit conversion between the families — "
+                    "use the borrowing read-only family `IEnumerable<T>` / "
+                    "`IReadOnlyCollection<T>` / `IReadOnlyList<T>` to read "
+                    "without ownership transfer, or `IOwningEnumerable<T>` "
+                    "to transfer ownership)");
+                return;
+            }
+        }
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
