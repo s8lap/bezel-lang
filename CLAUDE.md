@@ -542,6 +542,36 @@ dispose-count/ASan-clean for a double-free.
   not work that is 80% done. Re-derive the diagnosis from the issue and HEAD:
   5 of 5 inherited WIPs were once defective, and two would have shipped a bug.
 
+### ⚠ At most TWO lanes may cold-build `--area codegen` at once
+
+Measured 2026-09-23 by **three independent lanes in one cycle**, all reporting the same
+thing: a `--area codegen` cold build in a lane is **not survivable** when several siblings
+are doing the same.
+
+- one lane's build killed with **161** concurrent `cmake`/`clang++` observed;
+- one `Terminated` by the slice at **33%** with 6 lanes building and 2 GB of swap in use;
+- one measuring **92** concurrent `clang++` in an 18-core slice, progressing at ~4 TUs per
+  poll against 1,532 remaining, after an earlier attempt was SIGTERM'd at a 1.7 GB peak.
+
+**The kill looks exactly like a build failure** — `gmake … Terminated`, no `error:` lines —
+which is the same signature as genuine contention noise and as a real compile error. Two of
+the three lanes lost verification work to it.
+
+**The constraint is not the lane count, it is concurrent cold builds of the 212 MB
+`bezel_tests_codegen` binary.** `--area sema`, `module`, `frontend` and `support` are ~50 MB
+and are cheap by comparison; a dozen lanes doing those cost little.
+
+Rules:
+- **Cap concurrent `--area codegen` lanes at 2.** Stagger the rest; a lane that will build
+  codegen should wait rather than start a third.
+- Spread a wave across areas deliberately — do not dispatch six codegen lanes because six
+  issues happen to be codegen issues.
+- When a lane reports a build "failure" with **zero `error:` lines**, suspect the slice
+  before suspecting the code, and check `ps -eo comm= | grep -cE '^(clang\+\+|cc1plus)$'`
+  before re-running.
+- A lane that stops its own build to return slots to siblings further along is doing the
+  right thing, not giving up — one lane did exactly this and said so.
+
 ### The orchestrator MUST run a CronCreate heartbeat
 
 **An autonomous run's coordinator schedules a recurring heartbeat (CronCreate) for the
