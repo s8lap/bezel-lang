@@ -546,7 +546,7 @@ s15_1_3_0001	pass
 s15_2_0001	pass	
 s15_2_0002	pass	
 s15_3_0001	pass	
-s15_3_0002	fail	divergence
+s15_3_0002	pass	
 s15_3_0003	pass	
 s15_3_0004	pass	
 s15_3_0005	pass	
@@ -554,7 +554,7 @@ s15_3_0006	fail	divergence
 s15_3_0007	fail	divergence
 s15_3_0008	fail	divergence
 s15_3_0009	pass	
-s15_3_0010	fail	divergence
+s15_3_0010	pass	
 s15_3_0011	pass	
 s15_3_0012	pass	
 s15_3_0014	pass	

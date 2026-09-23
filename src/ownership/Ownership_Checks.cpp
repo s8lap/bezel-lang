@@ -1329,6 +1329,24 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 recordMovesIn(*a.value);
                 ++pos; continue;
             }
+            // fix #4677 (§15.3 "Parameter passing", v0.307): the constructor-
+            // call twin of `recordMovesInArgs`' identical addition (this
+            // file, ~line 1632) — `new T(a)` where T's constructor takes a
+            // plain (non-`owned`) move-only-array parameter is the same
+            // §15.3 bullet-3 transfer a method call is; `ctorOwnedSink`
+            // above is false for it (a move-only formal's `owned` marker is
+            // redundant, never required), so this argument was never marked
+            // moved-from.
+            if (ctorParams.valid() && boundPos < ctorParams.size()) {
+                const sema::TypeRef* pt = nullptr;
+                if (const ast::Type* dt = ctorParams.declType(boundPos))
+                    pt = ctx_.resolvedType(*dt);
+                else
+                    pt = ctorParams.resolvedType(boundPos);
+                long long moSize = 0;
+                if (isMoveOnlyInlineArrayType(pt, moSize))
+                    noteMoveOnlyArrayWholeMoveRead(*a.value);
+            }
             recordMovesIn(*a.value);
             ++pos;
         }
@@ -1628,6 +1646,34 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                                           /*onFreshProducer=*/true);
             recordMovesIn(*a.value);
             ++pos; continue;
+        }
+        // fix #4677 (§15.3 "Parameter passing", v0.307): "A parameter
+        // declared `(x: V)` for an ordinary V is by value (copy); for a
+        // move-only V, it is by value-move (transfer ownership). The
+        // caller's argument expression is in moved-from state after the
+        // call." A move-only-typed formal (an owning inline array) is
+        // NEVER `ownedSink` above — its plain-vs-`owned` spelling is
+        // redundant (§28.1 clause 1), so `userOwned` reads false — and the
+        // bare-identifier fallthrough below (`recordMovesIn`) has no arm
+        // for a plain (non-`move`-wrapped) IdentifierExpr at all, so the
+        // caller's argument was left fully readable after the call:
+        // `Sink.Take(a); Console.WriteLine(a[0].Tag);` compiled with no
+        // diagnostic. `noteMoveOnlyArrayWholeMoveRead` is the existing,
+        // already-correct move-marking primitive #1899/#1922 built for the
+        // local-to-local-assignment sibling of this same rule (`var b :=
+        // a;`) — it already handles a PARAMETER source (lazily seeding it
+        // into `states_`) as well as a tracked local, and no-ops for any
+        // non-move-only / non-bare-identifier argument, so calling it here
+        // for every plain argument is a safe, narrow addition.
+        if (formals.valid() && boundPos < formals.size()) {
+            const sema::TypeRef* pt = nullptr;
+            if (const ast::Type* dt = formals.declType(boundPos))
+                pt = ctx_.resolvedType(*dt);
+            else
+                pt = formals.resolvedType(boundPos);
+            long long moSize = 0;
+            if (isMoveOnlyInlineArrayType(pt, moSize))
+                noteMoveOnlyArrayWholeMoveRead(*a.value);
         }
         recordMovesIn(*a.value);
         ++pos;
@@ -1957,6 +2003,14 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         if (call->callee && !skipCalleeReadForDispose)
             checkRead(*call->callee, /*selfTarget=*/true);
         // Slice O14 + §28.8: argument-mode handling.
+        // fix #4677 (§15.3 "Parameter passing", v0.307): resolved once,
+        // outside the loop — the bare-statement-call twin of
+        // `recordMovesInArgs`'s own `formals` (this file, ~line 1505),
+        // needed by this arm's own move-only-argument check below (a
+        // move-only-typed formal is never `ownedSink`/`isImplicitOwned`, so
+        // that classification alone cannot see it).
+        const CalleeFormals discFormals =
+            calleeOrChainFormals(call->callee.get(), call->args);
         std::size_t pos = 0;
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }
@@ -2205,8 +2259,42 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 else if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
                     dynamic_cast<const ast::CallExpr*>(a.value.get()))
                     handleDischarge(*a.value);
-                else
+                else {
+                    // checkRead FIRST, unconditionally — it is what catches
+                    // a read of an ALREADY-moved-from source (its own
+                    // general IdentifierExpr moved-from diagnostic, ~line
+                    // 2750 below, keyed on tracked-local STATE, not on
+                    // move-only-ness); nothing here should narrow that.
                     checkRead(*a.value, /*selfTarget=*/false);
+                    // fix #4677 (§15.3 "Parameter passing", v0.307): see the
+                    // `discFormals` comment above — a plain, unmarked
+                    // bare-identifier argument bound to a move-only-typed
+                    // (owning-inline-array) formal is a §15.3 bullet-3
+                    // transfer, exactly as `var b := a;` is bullet 1's.
+                    // `Sink.Take(a); Console.WriteLine(a[0].Tag);` (the
+                    // rule-corpus repro, s15_3_0010) compiled with no
+                    // diagnostic because neither `ownedSink` (gated on an
+                    // explicit `owned` formal, which a move-only formal
+                    // never carries — its marker is redundant, §28.1 clause
+                    // 1) nor plain `checkRead` marks the source moved-from.
+                    // `noteMoveOnlyArrayWholeMoveRead` marks it AFTER
+                    // checkRead has read the pre-call state, mirroring
+                    // `recordMovesInArgs`'s identical ordering.
+                    const std::size_t boundPos =
+                        discFormals.valid()
+                            ? boundParamIndex(call->args, pos, discFormals)
+                            : pos;
+                    if (discFormals.valid() && boundPos < discFormals.size()) {
+                        const sema::TypeRef* pt = nullptr;
+                        if (const ast::Type* dt = discFormals.declType(boundPos))
+                            pt = ctx_.resolvedType(*dt);
+                        else
+                            pt = discFormals.resolvedType(boundPos);
+                        long long moSize = 0;
+                        if (isMoveOnlyInlineArrayType(pt, moSize))
+                            noteMoveOnlyArrayWholeMoveRead(*a.value);
+                    }
+                }
             }
             ++pos;
         }
@@ -2482,8 +2570,30 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
                     dynamic_cast<const ast::CallExpr*>(a.value.get()))
                     handleDischarge(*a.value);
-                else
+                else {
+                    // checkRead first, unconditionally — see the CallExpr
+                    // arm's identical comment above for why.
                     checkRead(*a.value, /*selfTarget=*/false);
+                    // fix #4677 (§15.3 "Parameter passing", v0.307): the
+                    // bare-statement-`new T(a)` twin of this file's other
+                    // three move-only-argument additions (recordMovesInArgs,
+                    // recordMovesIn's NewExpr arm, and this function's own
+                    // CallExpr arm above).
+                    const std::size_t boundPos =
+                        ctorParams.valid()
+                            ? boundParamIndex(ne->args, pos, ctorParams)
+                            : pos;
+                    if (ctorParams.valid() && boundPos < ctorParams.size()) {
+                        const sema::TypeRef* pt = nullptr;
+                        if (const ast::Type* dt = ctorParams.declType(boundPos))
+                            pt = ctx_.resolvedType(*dt);
+                        else
+                            pt = ctorParams.resolvedType(boundPos);
+                        long long moSize = 0;
+                        if (isMoveOnlyInlineArrayType(pt, moSize))
+                            noteMoveOnlyArrayWholeMoveRead(*a.value);
+                    }
+                }
             }
             ++pos;
         }

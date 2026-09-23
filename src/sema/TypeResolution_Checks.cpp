@@ -1942,23 +1942,34 @@ void Resolver::checkRecordRestrictions() {
                     continue;
                 }
                 // Inline-array field with owned slots.
-                if (auto* fd =
-                        // SEAM-ACCESSOR: `fs` is a member of `t`, which checkRecordRestrictions draws only
-                        // from `ctx_.module()->children` — never an imported symbol (#3152).
-                        dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                    if (fd->type) {
-                        auto* rt = ctx_.resolvedType(*fd->type);
-                        if (rt &&
-                            rt->kind == TypeRef::Kind::InlineArray &&
-                            rt->arrayOwned) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, m->declLoc,
-                                std::string("record `") +
-                                std::string(t->name) +
-                                "` may not have an owning inline-array "
-                                "field `" + std::string(fs->name) +
-                                "` (§9.7)");
-                        }
+                //
+                // fix #4677 (§9.7 / §15.3 v0.307): this used to read ONLY the
+                // body-record `ast::FieldDecl` source
+                // (`dynamic_cast<const ast::FieldDecl*>(fs->decl)`), so a
+                // POSITIONAL record's own [N owned]T-typed constructor
+                // parameter (`record Wrapper(Items: [2 owned]Connection);`)
+                // was never checked — `fs->decl` is null for a positional
+                // field (ModuleLoader/SymbolCollection's positional-param
+                // representation), so the cast always failed and the whole
+                // branch was silently skipped. The sibling owning-choice
+                // check 20 lines below already reads BOTH sources via the
+                // shared #3650 accessor (`sema::fieldDeclTypeOf`, which
+                // checks `fs->posParam` first, then `fs->decl`'s
+                // `ast::FieldDecl`); this check just never got migrated to
+                // it. Same accessor here closes the gap for both record
+                // forms uniformly.
+                if (const ast::Type* fty = sema::fieldDeclTypeOf(fs)) {
+                    auto* rt = ctx_.resolvedType(*fty);
+                    if (rt &&
+                        rt->kind == TypeRef::Kind::InlineArray &&
+                        rt->arrayOwned) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, m->declLoc,
+                            std::string("record `") +
+                            std::string(t->name) +
+                            "` may not have an owning inline-array "
+                            "field `" + std::string(fs->name) +
+                            "` (§9.7)");
                     }
                 }
                 // §9.7 / §35.4 (issue #2210, v0.226): an owning-classified
