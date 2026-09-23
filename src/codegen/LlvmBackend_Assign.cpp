@@ -615,10 +615,31 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return nullptr;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. The runtime reads `key_size`
+    // bytes from the key pointer (bz_dict_try_get_gen -> dict_find_gen ->
+    // hash_fn/eq_fn, both `key_size`-byte memcpys); with a bare `int` key the
+    // codegen lowered the value as i32, spilled it to a 4-byte stack slot, and
+    // the runtime then read 12 B of stack redzone past it — MEASURED under
+    // ASan as a stack-buffer-overflow in bz$valkey$hash at
+    // bz_dict_try_get_gen. boxForTarget (LlvmBackend_Layout.cpp) mints a fresh
+    // §8.6 box (24 B / 1 alloc for an int payload) and returns the box
+    // pointer; the runtime then reads a 16-byte box (vtable, rc, payload)
+    // align. boxForTarget is a no-op for a reference source (the pre-boxed
+    // `var o: Object := 1;` spelling) and for a non-Object/interface key
+    // (Dictionary<int, V> etc.), so every already-correct shape stays
+    // byte-identical — control rows in
+    // dict_object_bare_value_key_indexer_set_4640_test.cpp prove that.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     auto* tmpSlot = entryAlloca(ptrTy());
     llvm::Value* found;
     if (keyTy) {
         // spill the key value to a slot (record keys arrive as an address).
+        // fix #4640: a freshly-boxed key is already a pointer; the spill arm
+        // is skipped for it (k->getType()->isPointerTy()) — the box pointer IS
+        // the key slot's content.
         llvm::Value* keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
@@ -853,6 +874,15 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);     // evaluate once
     if (!k) return nullptr;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. Same defect as
+    // lowerCollectionIndexerGet: bz_dict_try_get_gen reads `key_size` bytes
+    // from the key pointer, so a bare-int key on a 4-byte stack slot is a
+    // stack-buffer-overflow in bz$valkey$hash. See that site for the full
+    // rationale; boxForTarget is a no-op for reference / non-Object keys.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     auto* tmpSlot = entryAlloca(ptrTy());
     llvm::Value* found;
     llvm::Value* keyPtr = nullptr;     // generic-key path needs it again to null
@@ -861,6 +891,8 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     llvm::Value* kw = nullptr;         // fix #4499: storage width rides along
     if (keyTy) {
         keyPtr = k;
+        // fix #4640: a freshly-boxed key is already a pointer; the spill arm
+        // is skipped for it (k->getType()->isPointerTy()).
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
             builder_.CreateStore(k, slot);
@@ -1408,6 +1440,32 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return false;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. The runtime reads `key_size`
+    // bytes from the key pointer (bz_dict_set_gen -> memcpy(kc, key,
+    // d->key_size)); with a bare `int` key the codegen lowered the value as
+    // i32, spilled it to a 4-byte stack slot, and the runtime then read 12 B
+    // of stack redzone past it — MEASURED under ASan as a stack-buffer-overflow
+    // in bz$valkey$hash at bz_dict_set_gen:925. boxForTarget
+    // (LlvmBackend_Layout.cpp) mints a fresh §8.6 box (24 B / 1 alloc for an
+    // int payload) and returns the box pointer; the runtime then reads a
+    // 16-byte box (vtable, rc, payload) align. boxForTarget is a no-op for a
+    // reference source (the pre-boxed `var o: Object := 1;` spelling) and for
+    // a non-Object/interface key (Dictionary<int, V> etc.), so every
+    // already-correct shape stays byte-identical — control rows in
+    // dict_object_bare_value_key_indexer_set_4640_test.cpp prove that.
+    //
+    // ⚠ MEASURED LEAK, deliberately not discharged. The runtime's
+    // bz_dict_set_gen memcpys the 16 box bytes into a freshly malloc'd table
+    // entry (kc) and frees its own copy; the original box allocation is then
+    // unreferenced — 24 B / 1 alloc per call. Per the same trade #4619
+    // declined for the Array<Object> membership-query residual (24 B per
+    // call, same `Box<` spelling carries the same residual, runtime
+    // box-vtable guard is the way out): recorded here as a decline-with-
+    // reasons rather than taken silently.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     // §4.9: an OWNING dictionary (OwningDictionary<K,V> where V: class/interface)
     // disposes the displaced value before storing the new owner. Unlike owning
     // ARRAYS (whose owned element is genericArgs[0]), an owning dictionary's
@@ -1459,6 +1517,10 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
         llvm::Value* keyPtr = k;
+        // fix #4640: a freshly-boxed key is already a pointer (boxForTarget
+        // returned the box pointer); the spill arm is skipped for it
+        // (k->getType()->isPointerTy()) — the box pointer IS the key slot's
+        // content. Records are still pointers and still skip the spill arm.
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
             builder_.CreateStore(k, slot);
