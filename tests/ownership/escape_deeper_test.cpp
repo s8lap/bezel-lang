@@ -401,7 +401,14 @@ BEZEL_TEST(own_multihop_escape, multihop_rebound_to_null_clean_28_3) {
 // because the callee-side rule rejects a static method returning a borrow of one
 // of its parameters (otherwise the borrow is misclassified as owned -> double free).
 // [Superseded: pre-v0.180 these parameter-source returns were "not flagged".]
-// A record/closure/`this` return is a DIFFERENT rule and stays accepted (below).
+// A record/`this` return is a DIFFERENT rule and stays accepted (below).
+// [Superseded again, v0.298/v0.307 (#4709): a CLOSURE return is also a
+// different rule, but it no longer "stays accepted" unconditionally — §28.3's
+// closure bullet rejects a returned closure whose source set is non-empty,
+// which a captured plain borrow parameter makes it. The control below keeps
+// this section's own question (does the static-borrow rule misfire on a
+// closure return?) and leaves the capture question to
+// plain_borrow_param_closure_escape_4709_test.cpp.]
 // =====================================================================
 
 // v0.180: returning a direct re-borrow of a parameter from a static method is REJECTED.
@@ -427,13 +434,33 @@ BEZEL_TEST(own_param_source, return_holder_borrowing_param_clean_9_7) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL: returning a closure capturing a parameter is accepted — the
-// captured parameter's source is the caller's frame, which outlives the
-// returned closure.
+// CONTROL: returning a closure from a static method is not the CASE 4
+// static-borrow-return rule — `return lambda() => …;` returns a function
+// value, not a borrow, so `own_param_source`'s "a borrow may not be returned
+// from a static method" rejection above must not fire on it.
+//
+// ⚠ This control's BODY was re-spelled for v0.307 (#4709/#4757). It used to
+// read `return lambda() => src.V;` and assert a clean accept, on the
+// rationale "the captured parameter's source is the caller's frame, which
+// outlives the returned closure". §28.3's closure bullet (v0.298, restated
+// v0.307) settles that the other way: a closure's source set includes "a
+// captured borrowed local or parameter[’s] … source", and a function value
+// "may not be … returned from the enclosing method, while its source set is
+// non-empty — a function type announces no source set (K2.4), so no holder
+// outside this body can re-establish it and no caller could bound it".
+// `ac2c7c6e` (fix #4709) implements that, and rule-corpus `s27_5_0007`
+// (`expect: reject`) is the spec-authored case for it. The capture-bearing
+// form is pinned as a REJECT in
+// `tests/ownership/plain_borrow_param_closure_escape_4709_test.cpp`; this row
+// keeps its ORIGINAL axis — the static-borrow-return rule does not misfire on
+// a closure return — by reading the parameter into a value-typed local first,
+// so the returned closure's source set is empty and only the CASE 4 question
+// is under test. // per §28.3 v0.307, §27.5
 BEZEL_TEST(own_param_source, return_closure_capturing_param_clean_28_9) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Make(src: R): () -> int "
-        "  return lambda() => src.V; "
+        "  var v := src.V; "
+        "  return lambda() => v; "
         "end Make;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
