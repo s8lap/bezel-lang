@@ -3599,12 +3599,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 : lowerLinqLambda(call.args[0].value.get(), selRetRef);
             if (!call.args.empty() && !closure) return nullptr;
             llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+            // fix #4728 (spec §29.1, stdlib §5 + §11.1 Average widening, v0.305):
+            // the no-selector Average() widening must honor the element's
+            // signedness — UIToFP for `byte`/`ushort`/`uint`/`ulong`/`char`, SIToFP
+            // for the signed family. Before this fix the `toDouble` lambda used
+            // `CreateSIToFP` unconditionally, so a `byte` 250 was reinterpreted
+            // as i8 -6 → double -6.0, and the accumulator's double sum no longer
+            // matched the element's numeric value. stdlib §11.1's
+            // narrowing/widening table promotes an unsigned element to `double`
+            // BEFORE the sum; that is the contract this widens-to. The selector
+            // form mirrors the no-selector form via `selRetRef`'s primitive
+            // (already derived at line 3513 above).
+            bool srcIsUnsigned = false;
+            if (call.args.empty() && recvTy && !recvTy->genericArgs.empty() &&
+                recvTy->genericArgs[0] &&
+                recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+                !recvTy->genericArgs[0]->nullable) {
+                srcIsUnsigned = isUnsignedPrim(recvTy->genericArgs[0]->primitive);
+            } else if (!call.args.empty() && selRetRef &&
+                       selRetRef->kind == sema::TypeRef::Kind::Primitive &&
+                       !selRetRef->nullable) {
+                srcIsUnsigned = isUnsignedPrim(selRetRef->primitive);
+            }
             // Coerce an int/float numeric value to double.
             auto toDouble = [&](llvm::Value* v) -> llvm::Value* {
                 if (v->getType()->isDoubleTy()) return v;
                 if (v->getType()->isFloatingPointTy())
                     return builder_.CreateFPExt(v, dblTy);
-                return builder_.CreateSIToFP(v, dblTy);
+                return srcIsUnsigned ? builder_.CreateUIToFP(v, dblTy)
+                                     : builder_.CreateSIToFP(v, dblTy);
             };
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
