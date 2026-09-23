@@ -3025,10 +3025,36 @@ private:
     // f := lambda(): int => c.Ping();`) is caught exactly as the direct one
     // is, rather than the two routes disagreeing about what roots at a
     // transferred binding.
+    // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the per-arm MAY-TAINT
+    // set. Keys are the DECL NODES of arm-declared locals (the identity
+    // `sema::LocalSymbol::decl` carries, the same one `aliases` and
+    // `localDeclsInArm` are keyed by); the value is the transferred-binding
+    // identifier that tainted the local, kept so the diagnostic can name the
+    // BINDING (`w`) and its `move w` remedy rather than the intermediate.
+    // An UNORDERED map is deliberate and safe here: the set is only ever
+    // looked up by key and merged wholesale, never iterated on a decision
+    // path (#2116), so its iteration order cannot reach a diagnostic.
+    using OwningMatchArmTaint =
+        std::unordered_map<const ast::Node*, const ast::IdentifierExpr*>;
+
+    // fix #4720: the state the ordered arm walk threads. The three pointers
+    // are per-arm constants computed once by `checkOwningMatchArmStmtEscape`;
+    // `tainted` is the only field that flows, and `silent` is set during a
+    // loop body's fixpoint passes so they cannot double-report.
+    struct OwningMatchArmEscapeCtx {
+        const std::vector<const sema::Symbol*>* transferred = nullptr;
+        std::unordered_map<const ast::Node*, const ast::Expr*>* aliases =
+            nullptr;
+        const std::set<const ast::Node*>* localDeclsInArm = nullptr;
+        OwningMatchArmTaint tainted;
+        bool silent = false;
+    };
+
     const ast::IdentifierExpr* findOwningMatchCaptureInLambdas(
         const ast::Expr& e,
         const std::vector<const sema::Symbol*>& transferred,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted = nullptr);
 
     // fix #4715 (§28.3 K8.4, §35.5, v0.307): the SAME-ARM local aliases a K8.4
     // escape candidate may be routed THROUGH. #4635's and #4663's checks both
@@ -3087,10 +3113,54 @@ private:
     //     make large. 32 is far past any real chain (the deepest shape
     //     measured for #4715 is 2) while keeping the walk constant-time.
     // // per §28.3 K8.4, §35.5, v0.307
+    // fix #4720 extends it with `tainted` — the ORDERED per-arm taint the
+    // statement-position walk carries. `aliases` answers "this local's value
+    // is its initializer's at EVERY point in the arm", which is why an
+    // assigned local is excluded from it; `tainted` answers the
+    // program-point question "this local MAY hold the payload HERE", which is
+    // the only way to see `var c := alt; c := w; outer := c;`. A hit returns
+    // the identifier naming the TRANSFERRED BINDING that tainted the local
+    // (not the local), so the diagnostic names `w` and its `move w` remedy
+    // exactly as the direct and initializer-aliased routes already do.
     const ast::IdentifierExpr* owningMatchEscapeRoot(
         const ast::Expr& value,
         const std::vector<const sema::Symbol*>& transferred,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted = nullptr);
+
+    // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the ORDERED,
+    // taint-carrying replacement for #4663's flat `forEachNestedStmt` sweep
+    // over an owning-match arm's statements.
+    //
+    // #4715 closed the INITIALIZER-sourced indirect escape and recorded the
+    // residual it deliberately left open: an arm-local that reaches the
+    // payload by ASSIGNMENT is excluded from the alias map, because including
+    // it would falsely reject `var c := w; c := alt; outer := c;` — a program
+    // that stores `alt` and is sound. Both facts are program-POINT facts, and
+    // a flat unordered sweep cannot hold one. This walk is ordered and keeps
+    // a may-taint set instead.
+    //
+    // THE TWO ERROR DIRECTIONS ARE NOT SYMMETRIC HERE EITHER, and the shape
+    // follows from that: under-rejecting leaves today's leak (the status quo),
+    // while over-rejecting breaks a working program. So a KILL (`c := alt;`
+    // clears `c`) applies only along a straight-line statement sequence, and
+    // a nested CONDITIONAL contributes its taint by UNION while its kills stay
+    // inside it — `var c := w; if p then c := alt; end; outer := c;` is then
+    // still rejected, correctly, because the `!p` path really does escape. A
+    // `do â¦ end` block is unconditional, so its kills do propagate. A loop
+    // body is walked to a taint fixpoint SILENTLY first, so a loop-carried
+    // taint (`while p do outer := c; c := w; end`) is seen on the reporting
+    // pass without the fixpoint passes double-reporting.
+    void walkOwningMatchArmEscapeStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx);
+    void walkOwningMatchArmEscapeStmt(const ast::Stmt& cur,
+                                      OwningMatchArmEscapeCtx& cx);
+    // The loop-body arm of the walk above: silent fixpoint passes, then one
+    // reporting pass from the fixpoint taint.
+    void owningMatchArmEscapeLoopBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx);
 
     // fix #4635: the symbols `arm`'s pattern binds to a TRANSFERRING slot of
     // `chDecl`'s named case — a whole-slot binding (`W(var w, _)`, or the

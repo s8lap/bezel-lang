@@ -7091,7 +7091,8 @@ void MethodOwnership::checkOwningMatchArmEscape(const ast::CaseExpr& ce) {
 const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
         const ast::Expr& e,
         const std::vector<const sema::Symbol*>& transferred,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted) {
     std::vector<const ast::LambdaExpr*> lambdas;
     std::function<void(const ast::Expr&)> findLambdas =
         [&](const ast::Expr& x) {
@@ -7117,8 +7118,12 @@ const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
             // binding" means instead of drifting apart. A capture with no
             // alias behind it costs exactly the pre-#4715 comparison — the
             // trace's first hop IS that comparison. // per §28.3 K8.4, v0.307
+            // fix #4720: the capture route reads the SAME taint the direct
+            // store route does, so `var c := alt; c := w;
+            // f := lambda(): int => c.Ping();` cannot slip through a check
+            // its non-capturing twin now rejects.
             if (const ast::IdentifierExpr* hit =
-                    owningMatchEscapeRoot(*id, transferred, aliases))
+                    owningMatchEscapeRoot(*id, transferred, aliases, tainted))
                 return hit;
         }
     }
@@ -7224,7 +7229,8 @@ const ast::IdentifierExpr* MethodOwnership::owningMatchAliasPeel(
 const ast::IdentifierExpr* MethodOwnership::owningMatchEscapeRoot(
         const ast::Expr& value,
         const std::vector<const sema::Symbol*>& transferred,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted) {
     constexpr int kMaxOwningMatchAliasHops = 32;  // see the declaration
     std::set<const sema::Symbol*> seen;
     const ast::Expr* cur = &value;
@@ -7236,8 +7242,19 @@ const ast::IdentifierExpr* MethodOwnership::owningMatchEscapeRoot(
         for (const sema::Symbol* b : transferred)
             if (b == rootSym) return root;  // the escape, named as the author
                                             // must spell the `move` (§35.5)
-        if (!seen.insert(rootSym).second) return nullptr;
         auto* ls = dynamic_cast<sema::LocalSymbol*>(rootSym);
+        // fix #4720 (§28.3 K8.4, v0.307): the ASSIGNMENT-sourced hop. An
+        // arm-local that reached the payload by assignment is excluded from
+        // `aliases` on purpose (see that map's declaration), so the chain
+        // below cannot continue through it; the ordered walk's taint set is
+        // the program-point fact that can. The identifier returned names the
+        // TRANSFERRED BINDING, not this local, so the diagnostic and its
+        // `move w` remedy read exactly as the direct route's do.
+        if (tainted && ls && ls->decl) {
+            auto t = tainted->find(ls->decl);
+            if (t != tainted->end() && t->second) return t->second;
+        }
+        if (!seen.insert(rootSym).second) return nullptr;
         if (!ls || !ls->decl) return nullptr;
         auto it = aliases.find(ls->decl);
         if (it == aliases.end() || !it->second) return nullptr;
@@ -7329,107 +7346,233 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
                     if (dynamic_cast<const ast::LocalDecl*>(&cur))
                         localDeclsInArm.insert(&cur);
                 });
-        for (const auto& top : arm.stmts) {
-            if (!top) continue;
-            forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
-                // The two STORE shapes that hand a value to a location
-                // outliving the arm: an assignment (to a pre-existing
-                // local, a field, a property, or an indexer slot — every
-                // one of those outlives the arm's own block) and a
-                // `return` (which leaves the enclosing method entirely).
-                // `LocalDecl`'s own initializer is deliberately NOT a
-                // store here: the newly-declared local is itself scoped to
-                // the arm (or a nested block within it), so it cannot
-                // outlive the construct by virtue of being declared — only
-                // a FURTHER store out of THAT local could, and that store
-                // is caught in its own right when this same walk reaches
-                // it, unless its target resolves into `localDeclsInArm`.
-                const ast::Expr* value = nullptr;
-                const ast::Expr* target = nullptr;
-                bool isReturn = false;
-                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
-                    value = as->value.get();
-                    target = as->target.get();
-                } else if (auto* rs =
-                               dynamic_cast<const ast::ReturnStmt*>(&cur)) {
-                    value = rs->value.get();
-                    isReturn = true;
-                } else {
-                    return;
-                }
-                if (!value) return;
-                // Only a borrow-CARRYING value can dangle; a value result
-                // (e.g. `outer := w.Ping();`, an `int`) is a copy and is
-                // fine — mirrors #4635's identical gate on the arm's own
-                // result type. A CLOSURE's type is a FUNCTION type, which
-                // this gate never admits, so the capture check below runs
-                // independently of it rather than being skipped by it.
-                const sema::TypeRef* vt = ctx_.exprType(*value);
-                const ast::IdentifierExpr* root = nullptr;
-                if (isBorrowableType(vt) ||
-                    common::isBorrowBearingRecordOrSpan(vt, ctx_)) {
-                    // fix #4715: `owningMatchEscapeRoot` is `identifierRoot`
-                    // plus a bounded trace through this arm's own
-                    // single-assignment local aliases, so `const c := w;
-                    // outer := c;` (and its `var`, multi-hop,
-                    // borrow-returning-chain and field-store spellings) no
-                    // longer roots at `c` and slips through.
-                    root = owningMatchEscapeRoot(*value, transferred, aliases);
-                }
-                // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE stored/returned
-                // out of the arm that CAPTURES a transferring binding is
-                // the same escape by a third route — see
-                // `findOwningMatchCaptureInLambdas`'s declaration for why
-                // this needs its own check rather than falling out of the
-                // `identifierRoot` gate above.
-                bool viaCapture = false;
-                if (!root) {
-                    root = findOwningMatchCaptureInLambdas(*value, transferred,
-                                                           aliases);
-                    viaCapture = root != nullptr;
-                }
-                if (!root) return;
-                if (!isReturn && target) {
-                    if (auto* tid =
-                            dynamic_cast<const ast::IdentifierExpr*>(target)) {
-                        if (auto* tls = dynamic_cast<sema::LocalSymbol*>(
-                                ctx_.exprSymbol(*tid)))
-                            if (tls->decl &&
-                                localDeclsInArm.count(tls->decl))
-                                return;  // arm-scoped target: does not escape
-                    }
-                }
-                const std::string why =
-                    isReturn
-                        ? "a `return` leaves the enclosing method entirely"
-                        : "the assignment target outlives the arm's own "
-                          "block";
-                const std::string verb =
-                    isReturn ? (viaCapture ? "this `return` captures"
-                                           : "this `return` borrows")
-                             : (viaCapture ? "this assignment's closure "
-                                             "captures"
-                                           : "this assignment stores");
-                const std::string readShape =
-                    viaCapture ? "captured by a closure" : "read here";
-                report(
-                    Severity::Error, cur.span.begin,
-                    verb + " owning-match payload binding `" +
-                        std::string(root->name) +
-                        "`, whose payload does not outlive the `case` "
-                        "construct — the scrutinee is consumed and its "
-                        "un-transferred remainder is disposed at construct "
-                        "completion (\xc2\xa7""35.5, K8.3), and an UNMARKED "
-                        "named owned binding " + readShape + " is a BORROW "
-                        "(\xc2\xa7""28.3), so " + why +
-                        ": the borrow would escape its boundary — rejected, "
-                        "never lifetime-extended (K8.4, v0.307). Transfer "
-                        "the payload out of the arm instead (`move " +
-                        std::string(root->name) +
-                        "`, \xc2\xa7""35.5), or read it only within the "
-                        "arm's own block.");
-            });
+        // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the sweep is ORDERED
+        // and carries a may-taint set, replacing #4663's flat
+        // `forEachNestedStmt` pass. See `walkOwningMatchArmEscapeStmts`'s
+        // declaration for the shape and why the asymmetry of the two error
+        // directions dictates it; the per-store DECISION inside it is #4663's
+        // and #4715's, moved verbatim.
+        OwningMatchArmEscapeCtx cx;
+        cx.transferred = &transferred;
+        cx.aliases = &aliases;
+        cx.localDeclsInArm = &localDeclsInArm;
+        walkOwningMatchArmEscapeStmts(arm.stmts, cx);
+    }
+}
+
+// fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): see the declarations in
+// Ownership_impl.hpp.
+//
+// MEASURED on r19-c23 with #4715 landed (`6221ed38`): #4720's own repro
+//
+//   W(var w, _) => do
+//     var c := alt;
+//     c := w;          // the payload reaches `c` by ASSIGNMENT
+//     outer := c;      // escapes
+//   end
+//
+// compiled CLEAN and leaked 24 B / 1 allocation under LSan, while every
+// INITIALIZER-sourced spelling of the same store is rejected by #4715. The
+// two facts #4715 could not hold at once are both program-POINT facts —
+// "`c`'s value is its initializer's" and "`c` was reassigned" — and a flat
+// unordered sweep has no program point. This walk is ordered and carries the
+// may-taint set instead.
+//
+// The ORACLE for this fix is the K8.4 DIAGNOSTIC, not the leak, for the
+// reason #4715 recorded: a one-shot repro can keep its block reachable from a
+// live stack slot and print no LSan report on either side.
+void MethodOwnership::walkOwningMatchArmEscapeStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx) {
+    for (const auto& up : list)
+        if (up) walkOwningMatchArmEscapeStmt(*up, cx);
+}
+
+// fix #4720: a LOOP body is walked to a taint FIXPOINT silently first, so the
+// loop-carried taint of `while p do outer := c; c := w; end` is present on the
+// reporting pass. Silent passes cannot report, so the fixpoint costs no
+// duplicate diagnostics. The union at each entry keeps the set monotone, so
+// the iteration terminates; the cap is a second bound for a malformed AST,
+// exactly as `owningMatchEscapeRoot`'s hop cap is.
+void MethodOwnership::owningMatchArmEscapeLoopBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx) {
+    constexpr int kMaxOwningMatchTaintPasses = 8;
+    const bool wasSilent = cx.silent;
+    for (int pass = 0; pass < kMaxOwningMatchTaintPasses; ++pass) {
+        const std::size_t before = cx.tainted.size();
+        OwningMatchArmTaint entry = cx.tainted;
+        cx.silent = true;
+        walkOwningMatchArmEscapeStmts(list, cx);
+        cx.silent = wasSilent;
+        cx.tainted.insert(entry.begin(), entry.end());
+        if (cx.tainted.size() == before) break;
+    }
+    OwningMatchArmTaint carried = cx.tainted;
+    walkOwningMatchArmEscapeStmts(list, cx);
+    cx.tainted.insert(carried.begin(), carried.end());
+}
+
+void MethodOwnership::walkOwningMatchArmEscapeStmt(
+        const ast::Stmt& cur, OwningMatchArmEscapeCtx& cx) {
+    if (!cx.transferred || !cx.aliases || !cx.localDeclsInArm) return;
+    // ---- the STORE shapes ----------------------------------------------
+    // The two that hand a value to a location outliving the arm: an
+    // assignment (to a pre-existing local, a field, a property, or an indexer
+    // slot — every one of those outlives the arm's own block) and a `return`
+    // (which leaves the enclosing method entirely). A `LocalDecl` /
+    // `LocalConstDecl` is deliberately NOT a store: the newly-declared local
+    // is itself scoped to the arm, so it cannot outlive the construct by
+    // virtue of being declared — only a FURTHER store out of THAT local
+    // could, and that store is caught in its own right when this walk reaches
+    // it. fix #4720 reads the declaration anyway, for its TAINT effect.
+    const ast::Expr* value = nullptr;
+    const ast::Expr* target = nullptr;
+    bool isReturn = false;
+    const ast::Node* declNode = nullptr;
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+        value = as->value.get();
+        target = as->target.get();
+    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+        value = rs->value.get();
+        isReturn = true;
+    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+        value = ld->initializer.get();
+        declNode = &cur;
+    } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+        value = lc->value.get();
+        declNode = &cur;
+    }
+    if (value) {
+        // Only a borrow-CARRYING value can dangle; a value result (e.g.
+        // `outer := w.Ping();`, an `int`) is a copy and is fine — mirrors
+        // #4635's identical gate on the arm's own result type. A CLOSURE's
+        // type is a FUNCTION type, which this gate never admits, so the
+        // capture check below runs independently of it rather than being
+        // skipped by it.
+        const sema::TypeRef* vt = ctx_.exprType(*value);
+        const ast::IdentifierExpr* root = nullptr;
+        if (isBorrowableType(vt) ||
+            common::isBorrowBearingRecordOrSpan(vt, ctx_)) {
+            // fix #4715: `owningMatchEscapeRoot` is `identifierRoot` plus a
+            // bounded trace through this arm's own single-assignment local
+            // aliases. fix #4720 adds this walk's taint set as a second hop
+            // kind, so an ASSIGNMENT-sourced alias roots at the binding too.
+            root = owningMatchEscapeRoot(*value, *cx.transferred, *cx.aliases,
+                                         &cx.tainted);
         }
+        // fix #4663 (§28.3 K8.4, v0.307): a CLOSURE stored/returned out of
+        // the arm that CAPTURES a transferring binding is the same escape by
+        // a third route — see `findOwningMatchCaptureInLambdas`'s
+        // declaration for why this needs its own check.
+        bool viaCapture = false;
+        if (!root) {
+            root = findOwningMatchCaptureInLambdas(*value, *cx.transferred,
+                                                   *cx.aliases, &cx.tainted);
+            viaCapture = root != nullptr;
+        }
+        // ---- the TAINT update (fix #4720) ------------------------------
+        // An arm-local DECLARATION, or an assignment whose TARGET is an
+        // arm-declared local, does not escape — the local dies at the arm's
+        // own `end`, inside K8.3's boundary (that exemption is #4663's, kept
+        // verbatim). What it DOES do is decide whether that local may hold
+        // the payload from here on: a store of the payload TAINTS it, and a
+        // store of anything else KILLS the taint. The kill is what keeps
+        // `var c := w; c := alt; outer := c;` — which stores `alt` and is
+        // sound — accepted, and it is why #4715 could not simply widen its
+        // alias map. Identity is by AST NODE, never by name, so a same-named
+        // outer local is never mistaken for one of these.
+        const ast::Node* armLocalTarget = declNode;
+        if (!armLocalTarget && !isReturn && target) {
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(target)) {
+                if (auto* tls = dynamic_cast<sema::LocalSymbol*>(
+                        ctx_.exprSymbol(*tid)))
+                    if (tls->decl && cx.localDeclsInArm->count(tls->decl))
+                        armLocalTarget = tls->decl;
+            }
+        }
+        if (armLocalTarget) {
+            if (root) cx.tainted[armLocalTarget] = root;
+            else cx.tainted.erase(armLocalTarget);
+        } else if (root && !cx.silent) {
+            const std::string why =
+                isReturn ? "a `return` leaves the enclosing method entirely"
+                         : "the assignment target outlives the arm's own "
+                           "block";
+            const std::string verb =
+                isReturn ? (viaCapture ? "this `return` captures"
+                                       : "this `return` borrows")
+                         : (viaCapture ? "this assignment's closure captures"
+                                       : "this assignment stores");
+            const std::string readShape =
+                viaCapture ? "captured by a closure" : "read here";
+            report(
+                Severity::Error, cur.span.begin,
+                verb + " owning-match payload binding `" +
+                    std::string(root->name) +
+                    "`, whose payload does not outlive the `case` "
+                    "construct — the scrutinee is consumed and its "
+                    "un-transferred remainder is disposed at construct "
+                    "completion (\xc2\xa7""35.5, K8.3), and an UNMARKED "
+                    "named owned binding " + readShape + " is a BORROW "
+                    "(\xc2\xa7""28.3), so " + why +
+                    ": the borrow would escape its boundary — rejected, "
+                    "never lifetime-extended (K8.4, v0.307). Transfer "
+                    "the payload out of the arm instead (`move " +
+                    std::string(root->name) +
+                    "`, \xc2\xa7""35.5), or read it only within the "
+                    "arm's own block.");
+        }
+    }
+    // ---- the RECURSION -------------------------------------------------
+    // A nested CONDITIONAL contributes its taint by UNION and keeps its kills
+    // inside it: `var c := w; if p then c := alt; end; outer := c;` really
+    // does escape on the `!p` path, so staying tainted at the merge is the
+    // correct verdict, not a conservatism. A `do ... end` block is
+    // UNCONDITIONAL, so it is walked in sequence and its kills do propagate.
+    // The nested-list grammar mirrors `forEachNestedStmt`'s — the same
+    // container kinds, in the same order — because that header is this
+    // project's single source of truth for the statement grammar (#3656); the
+    // walk is spelled out here only because it must thread state through the
+    // recursion, which the stateless form cannot.
+    auto branchInto =
+        [&](const std::vector<std::unique_ptr<ast::Stmt>>& body,
+            OwningMatchArmTaint& merged) {
+            OwningMatchArmTaint saved = cx.tainted;
+            walkOwningMatchArmEscapeStmts(body, cx);
+            merged.insert(cx.tainted.begin(), cx.tainted.end());
+            cx.tainted = std::move(saved);
+        };
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
+        OwningMatchArmTaint merged = cx.tainted;
+        branchInto(ifs->ifBranch.body, merged);
+        for (const auto& el : ifs->elifBranches) branchInto(el.body, merged);
+        branchInto(ifs->elseBody, merged);
+        cx.tainted = std::move(merged);
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
+        owningMatchArmEscapeLoopBody(ws->body, cx);
+    } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
+        owningMatchArmEscapeLoopBody(fs->body, cx);
+    } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&cur)) {
+        walkOwningMatchArmEscapeStmts(dob->body, cx);
+    } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(&cur)) {
+        OwningMatchArmTaint merged = cx.tainted;
+        branchInto(ts->body, merged);
+        for (const auto& carm : ts->catches) {
+            if (!carm.body) continue;
+            OwningMatchArmTaint saved = cx.tainted;
+            walkOwningMatchArmEscapeStmt(*carm.body, cx);
+            merged.insert(cx.tainted.begin(), cx.tainted.end());
+            cx.tainted = std::move(saved);
+        }
+        branchInto(ts->finallyBody, merged);
+        cx.tainted = std::move(merged);
+    } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+        OwningMatchArmTaint merged = cx.tainted;
+        for (const ast::CaseArm& inner : cs->arms)
+            branchInto(inner.stmts, merged);
+        cx.tainted = std::move(merged);
     }
 }
 
