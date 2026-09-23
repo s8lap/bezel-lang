@@ -2189,16 +2189,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // nested IdentifierExpr / member access / etc. resolves.
             visitExpr(*ce.args[0].value);
             TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
-            // §22.16 ownership restriction: a class- or interface-typed
-            // capture would hold a borrow across the entire method body.
-            // Reject it with a diagnostic that names the copyable-
-            // projection remedy (§22.16 "old(E) — class- and
-            // interface-typed operands are captured as a frame-resident
-            // borrow" + the move-only operand paragraph). The
-            // value/primitive types are admitted: copyable by value
-            // (primitives, enums, records by value, strings, function
-            // types) or read-only borrows of fields that are themselves
-            // copyable. A class-typed operand fails the gate.
+            // §22.16 ownership restriction (class/interface borrow arm):
+            // a class- or interface-typed capture would hold a borrow
+            // across the entire method body. Reject it with a diagnostic
+            // that names the copyable-projection remedy (§22.16 "old(E)
+            // — class- and interface-typed operands are captured as a
+            // frame-resident borrow"). The value/primitive types are
+            // admitted: copyable by value (primitives, enums, records
+            // by value, strings, function types) or read-only borrows
+            // of fields that are themselves copyable.
+            //
+            // §22.16 ownership restriction (move-only operand arm):
+            // an owning inline array or an owning-classified choice
+            // admits NO sound capture — a copy is the operation
+            // move-only-ness forbids (§15.3) and the literal desugaring
+            // would not copy but consume. Same remedy as the class arm
+            // (§22.16, #3113): capture a copyable projection of the
+            // pre-state — an element-derived value, a borrowing-match
+            // projection, or a pure member's read on a borrowed
+            // receiver.
+            //
+            // Both gates are computed off the resolved operand type
+            // (post-order, so `argTy` is populated above). The order
+            // is deliberate: class/interface operands fail the borrow
+            // gate first (that is what a class operand's rejection
+            // names); a choice that is not class-typed but IS owning-
+            // classified fails the move-only gate below.
+            bool rejected = false;
             if (argTy) {
                 const bool isClassOrInterface =
                     (argTy->kind == TypeRef::Kind::Named &&
@@ -2217,12 +2234,39 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         "\xe2\x80\x94 an element- or payload-derived "
                         "value, a `pure` member's result over a borrowed "
                         "receiver, or a borrowing-match projection");
+                    rejected = true;
                 } else {
+                    const char* moveOnlyKind = nullptr;
+                    if (common::isMoveOnlyValueType(argTy, ctx_,
+                                                    moveOnlyKind)) {
+                        // `kindOut` strings already include their article
+                        // ("an owning inline array", "an owning-classified
+                        // choice", common/OwnershipFacts.cpp#isMoveOnlyValueType).
+                        std::string kindDesc = moveOnlyKind
+                            ? std::string(moveOnlyKind)
+                            : std::string("move-only");
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`old` over ") + kindDesc +
+                            " value is rejected \xe2\x80\x94 a copy is "
+                            "the operation move-only-ness forbids, and "
+                            "the literal desugaring would not copy "
+                            "but consume (\xc2\xa7""22.16, " \
+                            "\xc2\xa7""15.3, \xc2\xa7""35.4); capture a " \
+                            "copyable projection of the pre-state " \
+                            "instead \xe2\x80\x94 an element- or " \
+                            "payload-derived value, a `pure` member's " \
+                            "result over a borrowed receiver, or a " \
+                            "borrowing-match projection");
+                        rejected = true;
+                    }
+                }
+                if (!rejected) {
                     // Set the CallExpr's type to the operand's type —
                     // §22.16 "old(E) denotes the value E had at entry"
                     // returns the same shape as E (the capture is by
-                    // copy for value kinds, by borrow for the
-                    // reference kinds we just gated).
+                    // copy for value kinds, by borrow for the reference
+                    // kinds the class/interface arm gated).
                     ctx_.setExprType(&ce, argTy);
                 }
             }
