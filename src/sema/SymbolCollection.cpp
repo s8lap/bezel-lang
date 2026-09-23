@@ -1741,7 +1741,15 @@ bool recordIsConstructorOnly(const TypeSymbol* rec) {
     // be constructor-only. Both sources are consulted for symmetry with
     // `recordIsPositional` above.
     if (recordIsPositional(rec)) return false;
-    auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl);
+    // SEAM-DEBT: #3301 this is NOT a benign null branch. `recordIsConstructorOnly`
+    // feeds USE-site consumers (§17.11 `default(T)`, §14.2 `new` constraints,
+    // §7.9), so answering `false` for an IMPORTED record wrongly ADMITS
+    // `default(ImportedCtorOnlyRecord)`. The §2.8.2 wire channel that would
+    // carry the property is unbuilt — #3301 tracks it, and this file's own
+    // IMPORTED READING in Symbol.hpp states the conservative fallback. Closing
+    // #3301 must revisit this read; do not treat the early `false` as correct.
+    auto* rawRecDecl = rec->decl;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(rawRecDecl);
     if (!td) return false;  // imported — see IMPORTED READING in Symbol.hpp
     for (const auto& m : td->members) {
         if (!m) continue;
