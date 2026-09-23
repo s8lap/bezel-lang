@@ -1580,6 +1580,20 @@ void Resolver::checkGenericConstraintConsistency() {
             // per declaration, independent of instantiation.
             std::unordered_set<std::string_view> paramSet(paramOrder.begin(),
                                                           paramOrder.end());
+            // fix #4689: a resolution scope for the new record/enum/choice
+            // bound check below — module-level names plus this declaration's
+            // own generic-param names as markers (mirrors the identical
+            // construction in checkGenericConstraints/checkOneConstraint's
+            // caller, so `where T: IComparable<T>` and similar self-
+            // referencing bounds resolve here exactly as they do there).
+            Scope boundModule;
+            if (ctx_.module())
+                for (Symbol* child : ctx_.module()->children)
+                    if (!child->name.empty())
+                        boundModule.names[child->name] = child;
+            Scope boundScope;
+            boundScope.parent = &boundModule;
+            for (std::string_view p : paramOrder) boundScope.names[p] = nullptr;
             // A bound is a *type-parameter bound* only when it is a bare name (a
             // single-part `QualifiedName` with no generic arguments) that matches
             // a type parameter in scope. `where T: IComparable<T>` is NOT such a
@@ -1663,6 +1677,68 @@ void Resolver::checkGenericConstraintConsistency() {
             };
             for (std::string_view p : paramOrder)
                 if (color[p] == 0) dfs(p);
+
+            // fix #4689 (§14.2 / §19.6 / the #4372 ruling, v0.307): §14.2's
+            // constraint table admits exactly two NAMED-TYPE bound forms —
+            // `where T: SomeClass` ("Class types only") and `where T: IFoo`
+            // (interface conformance) — plus the type-parameter bound
+            // `where T: U` (handled by `boundParam` above, and excluded
+            // below). Grammar A.3 `Constraint ::= ... | Type` admits ANY
+            // type as the catch-all last alternative, so a bound that
+            // resolves to a RECORD, ENUM, or CHOICE parses and reaches
+            // instantiation-time checking, but §14.2 never describes such a
+            // bound: every cross-reference to a concrete-type bound
+            // elsewhere in the spec speaks only of "a class bound" or "an
+            // interface bound" (e.g. the erasure-guard passage's "a class
+            // bound (`where T: SomeClass`) qualifies — only class types
+            // satisfy it"). Admitting it was therefore a grammar-vs-
+            // semantics gap, not a deliberate third form — the same gap
+            // `caseArmsExhaustive`'s `forEachConstraintBound` walk inherited
+            // (#4674/#4685's sibling issues) by resolving such a bound as a
+            // legitimate closed-value-space scrutinee kind rather than
+            // rejecting it as ill-formed. Reject it HERE, at the
+            // declaration, independent of instantiation: an un-instantiated
+            // generic is never visited by the per-instantiation
+            // `checkGenericConstraints`/`checkOneConstraint` (this
+            // function's own opening comment states exactly this reach
+            // gap), so this declaration-level pass is the only site that
+            // reliably catches it — the identical reasoning that puts the
+            // self-referential/cyclic checks above in this function rather
+            // than in the per-instantiation one.
+            for (const auto& gc : gcs) {
+                if (!gc.modifierConstraint.empty()) continue;
+                for (const auto& item : gc.items) {
+                    if (item.kind != "type" || !item.typeArg) continue;
+                    if (!boundParam(item).empty()) continue;  // type-param bound
+                    TypeRef* bound = ctx_.resolvedType(*item.typeArg);
+                    if (!bound) bound = resolveType(*item.typeArg, &boundScope);
+                    if (!bound || bound->kind != TypeRef::Kind::Named ||
+                        !bound->declaration)
+                        continue;  // primitive/builtin/unresolved: defer
+                    ast::TypeDeclKind bk = bound->declaration->kind;
+                    if (bk == ast::TypeDeclKind::Record ||
+                        bk == ast::TypeDeclKind::Enum ||
+                        bk == ast::TypeDeclKind::Choice) {
+                        const char* kindWord =
+                            bk == ast::TypeDeclKind::Record
+                                ? "record"
+                                : (bk == ast::TypeDeclKind::Enum ? "enum"
+                                                                  : "choice");
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            "type parameter `" + std::string(gc.typeParam) +
+                            "` is constrained to `" +
+                            std::string(bound->declaration->name) + "`, a " +
+                            kindWord +
+                            " — a where-clause type bound may name only a "
+                            "class or an interface (§14.2); write `where " +
+                            std::string(gc.typeParam) +
+                            ": value` to admit records, enums, and choices, "
+                            "or constrain on an interface the type "
+                            "implements");
+                    }
+                }
+            }
         };
     for (Symbol* child : ctx_.module()->children) {
         auto* ts = dynamic_cast<TypeSymbol*>(child);
