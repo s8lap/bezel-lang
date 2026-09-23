@@ -7268,12 +7268,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // keyed seven and left byte/sbyte/short/ushort on
                             // the `int` default, which codegen then tried to
                             // reach by `trunc i8 -> i32`.
+                            // fix #4731: char satisfies IComparable<char> per
+                            // §3.4 / §9.5 but is not an §2.19 INumber conformer
+                            // (the eleven primitives
+                            // `isNoSelectorAggregationElem` keys on). Including
+                            // char in the keyed set lets `Array<char>.Min()/
+                            // Max()` type the result as char, so
+                            // `Console.WriteLine` reaches `bz_char_to_string`
+                            // and prints "a" rather than the int code point
+                            // "97". The Sum() INumber<T> constraint gate is
+                            // handled by a separate fix (#4730).
                             bool noSelectorKeyed = false;
                             if (ce.args.empty() && elem &&
                                 elem->kind == TypeRef::Kind::Primitive &&
                                 !elem->nullable) {
                                 P ep = elem->primitive;
-                                if (isNoSelectorAggregationElem(ep)) {
+                                bool keyForThisOp =
+                                    isNoSelectorAggregationElem(ep) ||
+                                    ((m == "Min" || m == "Max") &&
+                                     ep == P::Char);
+                                if (keyForThisOp) {
                                     ctx_.setExprType(&ce,
                                         ctx_.primitiveTypeRef(ep));
                                     noSelectorKeyed = true;

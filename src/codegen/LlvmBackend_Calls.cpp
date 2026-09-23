@@ -4172,6 +4172,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         case sema::PrimitiveType::Double:
                             retP = e->primitive;
                             break;
+                        // fix #4731 (stdlib §5.1, v0.286): char satisfies
+                        // IComparable<char> per §3.4 / §9.5 but is not an
+                        // §2.19 INumber conformer (the eleven primitives
+                        // `isNoSelectorAggregationElem` keys on). Including it
+                        // here lets `Array<char>.Min()` / `.Max()` key the
+                        // accumulator at char (i32 width, unsigned compare via
+                        // `isUnsignedPrim`), so `Console.WriteLine` reaches
+                        // `bz_char_to_string` and prints "a" rather than "97".
+                        case sema::PrimitiveType::Char:
+                            retP = e->primitive;
+                            break;
                         default:
                             break;  // Int stays
                     }
