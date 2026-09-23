@@ -5511,6 +5511,53 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // (#965). Owned only when the result is a disposable class/interface (an
     // `owned`-returning operator on a value type is impossible — §9.7 forbids
     // record destructors). The operands stay borrowed, so there is no double-free.
+    //
+    // fix #4737 (§11.8 "Dispatch through the type parameter", v0.307): the
+    // result-type gate was `rt->declaration` is a non-value-builtin Class or
+    // Interface — which a BARE TYPE PARAMETER can never satisfy (an
+    // unsubstituted `T` is a Named TypeRef with `declaration == nullptr`; sema
+    // type-checks a generic body once, before monomorphization, so `exprType`
+    // never resolves it). So a constraint-sourced `static operator +(a: T,
+    // b: T): owned T` — §11.8's OWN worked example, `tests/conformance/cases/
+    // spec_0049.bzl` — classified its result Borrowed, while `T.Zero()` on the
+    // SAME constraint interface with the SAME `owned T` declared return
+    // classified Owned through the `md->returnOwned` CallExpr arm above.
+    // Measured on 921dbc45: in one generic body, `var z := T.Zero();` fired the
+    // §28.3 auto-drop warning and `var r := a + b;` fired nothing; `const z :=
+    // T.Zero();` was rejected by §21.1 and `const r := a + b;` was accepted.
+    // Two producers, one declaration shape, two classifications.
+    //
+    // §11.8 (v0.307) settles which one is right: "At a class or interface
+    // substitution of `T`, `total` is an owned local: `T.Zero()` AND EACH
+    // OPERATOR RESULT transfer per stdlib §2.19's `owned` producer signatures,
+    // the loop's reassignment disposes the displaced previous total by
+    // drop-on-overwrite (§28.7) … At value and runtime-managed substitutions
+    // the markers are erased and every step is a plain copy (§28.1, §28.9)."
+    // That two-case dichotomy is EXACTLY what `isValueSubstitutionErased`
+    // implements (§28.1, v0.196, #1817) and exactly what the `md->returnOwned`
+    // CallExpr arm above already consults, so this arm now mirrors that arm
+    // byte-for-byte instead of re-deriving a narrower predicate. An
+    // unsubstituted bare `T` is deliberately NOT erased (the predicate's
+    // documented conservative direction: "keeping the marker over-warns at
+    // worst, never under-disposes"), which is the already-settled verdict the
+    // sibling call arm has been giving `T.Zero()` since #1425.
+    //
+    // CODEGEN ALREADY AGREES — this closes a sema/codegen divergence rather
+    // than opening one. Both of codegen's owned-operator classifiers
+    // (`unwindOwnedLocalClass` LlvmBackend_Setup.cpp:21079 and
+    // `usingVarOwnsClassObjectDynamically` :38001) gate on
+    // `isClassOrInterfaceRef(initTy) || isClassOrInterfaceRef(
+    // resolveTypeParamRef(initTy))`, i.e. they resolve the bare parameter
+    // through the active substitution and register the disposal. Only the
+    // ownership pass lacked the type-parameter half.
+    //
+    // BUILT-IN OPERATORS ARE UNAFFECTED. The gate is unchanged above the
+    // result-type test: an operator MethodSymbol on the BinaryExpr
+    // (`ctx_.exprSymbol(*be)`) that `ms->isOperator && methodReturnsOwned`
+    // accepts. A built-in `a + b` over int/string/decimal is a compiler
+    // intrinsic (§3.5) with no operator MethodSymbol, so it cannot reach the
+    // result-type test at all and stays Borrowed — no disposal obligation is
+    // manufactured on arithmetic. // per §11.8, §28.1, §28.7, v0.307, #4737
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         // fix #3189 (family M2 of umbrella #3152): read the marker through the
         // both-sources accessor. `ms->decl` is null for an operator of a
@@ -5525,16 +5572,17 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // exactly as narrow as it was.
         if (auto* sym = ctx_.exprSymbol(*be))
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_))
-                    if (const sema::TypeRef* rt = ctx_.exprType(e))
-                        if (rt->kind == sema::TypeRef::Kind::Named &&
-                            rt->declaration &&
-                            (rt->declaration->kind ==
-                                 ast::TypeDeclKind::Class ||
-                             rt->declaration->kind ==
-                                 ast::TypeDeclKind::Interface) &&
-                            !rt->declaration->isValueBuiltin)
-                            return OwnershipState::Owned;
+                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_)) {
+                    // fix #4737: the SAME two lines the `md->returnOwned`
+                    // CallExpr arm above runs, for the same §28.1 question.
+                    // A record/enum/value-builtin/primitive/unit/function
+                    // result erases the marker and stays Borrowed exactly as
+                    // the old `rt->declaration` gate made it; a class,
+                    // interface, or still-generic bare `T` result transfers.
+                    if (isValueSubstitutionErased(ctx_.exprType(e)))
+                        return OwnershipState::Borrowed;
+                    return OwnershipState::Owned;
+                }
         // #1029 / §28.3: built-in `??` (NullCoalescing) with an Owned-producing
         // RHS. The caller owns whichever branch's value is taken: LHS non-null →
         // ownership transfers from the LHS (codegen nulls the LHS slot); LHS null
