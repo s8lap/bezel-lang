@@ -13337,6 +13337,10 @@ void ExprTC::runMethodBody(
                     if (auto* pty = ctx_.resolvedType(*params[i].type)) {
                         ctx_.setExprType(params[i].defaultValue.get(), pty);
                         rejectNewOnEnumOrChoice(*shNe, pty);
+                        // fix s17_7_0003 (§17.7 / §15.1, v0.307): sibling
+                        // of the Enum/Choice call just above — inline
+                        // arrays declare no constructors either.
+                        rejectNewOnInlineArray(*shNe, pty);
                         bool nonInstantiable =
                             rejectNewOnNonInstantiableKind(*shNe, pty);
                         if (!nonInstantiable &&
@@ -14260,6 +14264,10 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // IR-verifier backstop instead. Shares the one
                             // predicate the explicit site now calls too.
                             rejectNewOnEnumOrChoice(*shNe, fty);
+                            // fix s17_7_0003 (§17.7 / §15.1, v0.307):
+                            // sibling of the call just above — inline
+                            // arrays declare no constructors either.
+                            rejectNewOnInlineArray(*shNe, fty);
                             // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
                             // v0.298): the explicit `new T(...)` site's
                             // abstract/closed/static/interface rejection
@@ -15463,6 +15471,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // one predicate the explicit site now calls
                             // too, instead of a third spelling.
                             rejectNewOnEnumOrChoice(*shNe, lsym->declType);
+                            // fix s17_7_0003 (§17.7 / §15.1, v0.307):
+                            // sibling of the call just above — inline
+                            // arrays declare no constructors either.
+                            rejectNewOnInlineArray(*shNe, lsym->declType);
                             // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7,
                             // v0.298): local-declaration twin of the
                             // field-initializer check above — the
@@ -16021,6 +16033,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (!shNe->type) {
                     ctx_.setExprType(rs->value.get(), currentReturnType_);
                     rejectNewOnEnumOrChoice(*shNe, currentReturnType_);
+                    // fix s17_7_0003 (§17.7 / §15.1, v0.307): sibling of
+                    // the call just above — inline arrays declare no
+                    // constructors either.
+                    rejectNewOnInlineArray(*shNe, currentReturnType_);
                     bool nonInstantiable = rejectNewOnNonInstantiableKind(
                         *shNe, currentReturnType_);
                     if (!nonInstantiable &&

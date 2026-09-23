@@ -2952,6 +2952,22 @@ private:
     // apply to the same node.
     bool rejectNewOnEnumOrChoice(const ast::NewExpr& ne, const TypeRef* rt);
 
+    // fix s17_7_0003 (§17.7 / §15.1, v0.307; sibling of `rejectNewOnEnumOrChoice`
+    // just above, same shape): inline arrays declare no constructors — §17.7,
+    // verbatim: "`new [3]int(0, 1, 2)` is rejected by the type checker —
+    // inline arrays do not declare constructors, and the `new` syntax has no
+    // meaning on them." `rt->kind` for an inline-array type spelling (`[N]T`,
+    // §15.1) is `TypeRef::Kind::InlineArray`, a kind every existing `new`-
+    // classification predicate in this file guards past with
+    // `rt->kind == TypeRef::Kind::Named` — so `new [3]int(0, 1, 2)` fell
+    // through every one of them, typed cleanly with its args silently
+    // discarded, instead of being rejected. Single authority for both the
+    // explicit `new T(...)` arm (ExprTypecheck_Exprs.cpp) and the four
+    // §17.7 shorthand call sites in ExprTypecheck.cpp, mirroring
+    // `rejectNewOnEnumOrChoice`. Returns true iff `rt` is an inline-array
+    // type (i.e. iff it rejected).
+    bool rejectNewOnInlineArray(const ast::NewExpr& ne, const TypeRef* rt);
+
     // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298): sibling of
     // `rejectNewOnEnumOrChoice` just above, same shape — the single
     // authority for "does `new` construct a value of this NAMED

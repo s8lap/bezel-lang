@@ -1084,6 +1084,23 @@ bool ExprTC::rejectNewOnEnumOrChoice(const ast::NewExpr& ne,
     return false;
 }
 
+// fix s17_7_0003 (§17.7 / §15.1, v0.307): see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. Inline arrays declare no
+// constructors; `new` has no meaning on them (§17.7, verbatim). Construct
+// one with a collection literal (`[e1, e2, ...]`) or the implicit
+// zero/null fill at declaration (§15.4, §17.11) instead.
+bool ExprTC::rejectNewOnInlineArray(const ast::NewExpr& ne,
+                                     const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::InlineArray) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "`new` cannot construct an inline array — inline arrays declare no "
+        "constructors, and the `new` syntax has no meaning on them; "
+        "construct one with a collection literal (`[e1, e2, ...]`) or the "
+        "implicit zero/null fill at declaration instead (§17.7, §15.1)");
+    return true;
+}
+
 // fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
 // above and `rejectNewOnNonInstantiableKind` below — same shape, one
 // authority, per this repo's "duplicated classification predicates"
@@ -4220,6 +4237,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // this one authority instead of a third/fourth spelling
                 // of the same two checks.
                 rejectNewOnEnumOrChoice(*ne, rt);
+                // fix s17_7_0003 (§17.7 / §15.1, v0.307): inline arrays
+                // declare no constructors either — see
+                // `rejectNewOnInlineArray`'s declaration for the full
+                // rationale. Sibling call to the one just above.
+                rejectNewOnInlineArray(*ne, rt);
                 // §14.5 Scope (v0.184, #1687): "Class-, record-, and
                 // interface-level type arguments are never inferred from
                 // constructor arguments: `new Pair(1, "x")` against `record
