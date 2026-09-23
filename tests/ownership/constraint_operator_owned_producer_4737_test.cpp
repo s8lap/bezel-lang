@@ -313,7 +313,12 @@ BEZEL_TEST(constraint_operator_owned_producer_4737,
         "  using var t := F.Sum(xs); "
         "  return t.Value; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    // NO `if (wasSkipped(r)) return;` guard here, deliberately (#3733). That
+    // guard makes the row ABSORBING: on a box without the checked toolchain it
+    // returns early and the whole exactly-once oracle below evaporates while
+    // the row still reports PASS. This row's entire value is the dispose-count
+    // assertion, so a silent skip is worse than a failure. `r.ran` false fails
+    // loudly instead, which is the burn-down direction the ratchet enforces.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // 10 + 13 + 19
     // 7 instances: m0(0), m1(1), m2(2), Zero()(3), and the three `+` results

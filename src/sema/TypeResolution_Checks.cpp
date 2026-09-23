@@ -2768,7 +2768,20 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
         auto* msB = dynamic_cast<const MethodSymbol*>(bSym);
         if (!msA || !msB) return false;
         if (msA->isOperator || msB->isOperator) return false;
+        // An imported MethodSymbol carries no `decl`, so both casts below
+        // yield null and this helper answers `false` for every imported
+        // method (#3152 class-3). Severity is DIAGNOSTIC WORDING ONLY: the
+        // clash is already decided elsewhere, and a false answer here merely
+        // falls back to the §22.6/§11.3 "indistinguishable" text instead of
+        // §22.16's "same signature". It never changes admission. The path is
+        // probably unreachable with imported symbols at all — a clash is
+        // diagnosed at the declaring site — but that is reasoning, not a
+        // measurement, so it is tracked rather than asserted safe. Drain by
+        // deciding from MethodSymbol state (clauses, resolved return type,
+        // returnOwned, modifiers) with no `->decl` dereference.
+        // SEAM-DEBT: #4753 AST-gated; answers false for every imported method
         auto* mdA = dynamic_cast<const ast::MethodDecl*>(msA->decl);
+        // SEAM-DEBT: #4753 sibling of the read above; same analysis
         auto* mdB = dynamic_cast<const ast::MethodDecl*>(msB->decl);
         if (!mdA || !mdB) return false;
         // Return type must match — the parameter signature is already
