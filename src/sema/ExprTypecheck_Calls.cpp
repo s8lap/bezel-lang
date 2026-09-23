@@ -6395,19 +6395,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
                 if (!colName.empty()) {
-                    // §4.5 (#1022/#920): an OWNING collection deliberately exposes
-                    // NO non-owning value copy-form — `ToArray`/`ToSet`/
-                    // `ToDictionary` would each manufacture a second collection over
-                    // the same uniquely owned elements (double-owning them) or drain
-                    // the source. The borrowing `Sorted`/`Reversed`/`AsSpan` forms
-                    // are rejected separately below; this catches the materializer
-                    // copy-forms, which were silently accepted and mis-reclaimed by
-                    // codegen. Only a DIRECT owning-collection receiver triggers it —
-                    // a LINQ query result (`owned.Where(p).ToArray()`) has an
-                    // IEnumerable receiver, so colName != Owned* and it stays valid.
-                    // `OwningBuffer<T>` is exempt (§4.14 gives it owning spans) and is
-                    // not in this set.
-                    if ((colName == "OwningArray" || colName == "OwningStack" ||
+                    // fix #4749 (stdlib §4.5 + spec §26.5 rule 1, v0.307):
+                    // `OwningArray<T>` declares no instance member named
+                    // `ToArray`/`ToSet`/`ToDictionary` — spec §26.5 rule 1
+                    // blocks extensions by NAME ("Instance members win — by
+                    // name. If `x`'s declared type … *declares* any instance
+                    // member named `Foo` … instance resolution is committed
+                    // and extension blocks are never consulted"), so the §5
+                    // LINQ extension on `IEnumerable<T>` IS reachable on
+                    // `OwningArray<T>` and returns a borrowing-snapshot
+                    // `owned Array<T>` (§4.5: "its slots hold borrows of
+                    // the elements, sourced from this array, which continues
+                    // to own them"; §5's materialization paragraph). The
+                    // pre-#3286 reject listed `OwningArray` here and
+                    // contradicted that paragraph; it is removed.  The
+                    // sibling owning-collection types (`OwningStack`,
+                    // `OwningQueue`, `OwningLinkedList`, `OwningSet`,
+                    // `OwningDictionary`) keep their reject — the §4.5
+                    // generalization ("The same reachability and the same
+                    // obligation hold for `ToSet()`, `ToDictionary(…)`,
+                    // and every other §5 operator applied to an owning
+                    // receiver") covers them too, but their per-type
+                    // `Owned*` paragraphs (§4.6/§4.7/§4.9/§4.10/§4.11) do
+                    // not yet echo it, and unblocking them here would be
+                    // the "while we're at it" expansion the project
+                    // declines (#4749's scope is OwningArray<T>.ToArray()).
+                    // The borrowing `Sorted`/`Reversed`/`AsSpan` forms are
+                    // rejected separately below; this block catches only
+                    // the materializer copy-forms on a direct
+                    // `Owning*Collection` receiver — a LINQ query result
+                    // (`owned.Where(p).ToArray()`) has an `IEnumerable`
+                    // receiver, so `colName != Owning*` and it stays valid.
+                    // `OwningBuffer<T>` is exempt (§4.14 gives it owning
+                    // spans) and is not in this set.
+                    if ((colName == "OwningStack" ||
                          colName == "OwningQueue" || colName == "OwningLinkedList" ||
                          colName == "OwningSet" || colName == "OwningDictionary") &&
                         (m == "ToArray" || m == "ToSet" || m == "ToDictionary")) {
