@@ -3427,6 +3427,11 @@ static bool isBareLazyGroupingType(const TypeRef* t) {
            elem->headName() == "IGrouping";
 }
 
+// Forward declaration: defined below (§8.6 boxing rejection, its first use
+// site) but needed here too — earlier in the file — for the §30.1/§30.5
+// move-only Task<T>/OwningTask<T> rejection this function adds below.
+static std::string spellMoveOnlySource(const TypeRef* t);
+
 void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
                                    TypeRef*& outType) {
     outCtx = ReturnCtx::VoidMethod;
@@ -3447,6 +3452,34 @@ void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
         // returns the element type T.
         outCtx = ReturnCtx::ValueMethod;
         outType = r->genericArgs.front();
+        // fix s35_4_0006 (§30.1 / §30.5 / §35.4, v0.307): §30.1, verbatim —
+        // "Task<T> for some type T admitted by §30.5's producer taxonomy (a
+        // move-only value T is admitted by neither container)"; §35.4 —
+        // "No §30.5 producer row admits a move-only value result, so a
+        // Task<T> or OwningTask<T> declared over an owning choice is a
+        // compile error at the declaration." Neither this peeling arm nor
+        // any §30.5 producer-row check classified the peeled element T
+        // against §15.3's move-only kinds (an owning inline array or an
+        // owning-classified choice) — `T` just became `outType`, the
+        // body's ValueMethod result type, with no rejection, so
+        // `return LoadOutcome.Failed;` type-checked as an ordinary value
+        // return with no Task-result slot shaped to carry a move-only
+        // payload. This is the one site every declared async return type
+        // (method AND async-lambda, both callers of this function) passes
+        // through, so it is the single authority for the rejection.
+        const char* moveOnlyKind = nullptr;
+        if (common::isMoveOnlyValueType(outType, ctx_, moveOnlyKind)) {
+            ctx_.diagnostics().report(
+                Severity::Error, rt->span.begin,
+                std::string("`") + std::string(head) + "<" +
+                spellMoveOnlySource(outType) + ">` declares a move-only "
+                "value result — `" + spellMoveOnlySource(outType) + "` is " +
+                (moveOnlyKind ? std::string(moveOnlyKind) : std::string("move-only")) +
+                " (§15.3), and no §30.5 producer row admits a move-only "
+                "value result: a `Task<T>`/`OwningTask<T>` declared over "
+                "an owning choice (or an owning inline array) is a compile "
+                "error at the declaration (§30.1, §30.5, §35.4)");
+        }
     }
 }
 
