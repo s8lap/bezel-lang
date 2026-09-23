@@ -163,20 +163,27 @@ BEZEL_TEST(codegen_inline_owned_3766,
 }
 
 // ============================================================================
-// Row 3 (SOUNDNESS, non-class T twin): SKIPPED. The brief asks for a
-// `[N owned]int` (no class T, no destructor) twin to guard against a phantom
-// free. Measured pre-fix on a plain `var a: [2 owned]int := [1,2]; return
-// a[0] + a[1];` test program: SEGFAULT (exit 139) — there is a pre-existing
-// SIGSEGV on `[N owned]int` independent of any lambda involvement. That is
-// NOT a #3766 regression introduced by this fix and NOT caused by the
-// widening relaxation; the segfault reproduces with `var a: [2 owned]int :=
-// [1,2]; return a[0];` and no lambda at all. The non-class-T form is left
-// out of this fix's regression test pending a separate root-cause —
-// including it here would fail pre-fix AND post-fix, which obscures the
-// #3766 verdict. If a future fix lands for the non-class-T codegen, this
-// row should be re-added verbatim from the brief: `var a: [2 owned]int :=
-// [1, 2]; var g := lambda() => do var h := lambda() => a[1]; return a[0]
-// + h(); end;` ×200 iterations, asserting total == 600 with runCheckedLenient.
+// Row 3 (SOUNDNESS, non-class T twin): NOT REPRESENTABLE — closed, not
+// pending. The brief asked for a `[N owned]int` (no class T, no destructor)
+// twin to guard against a phantom free, and this row recorded it as skipped
+// because such a program SEGFAULTed (exit 139) on the pre-fix compiler,
+// independent of any lambda — "a pre-existing SIGSEGV pending a separate
+// root-cause", with an instruction to re-add the row verbatim once that
+// codegen was fixed.
+//
+// That conclusion was wrong, and §15.1.1 (v0.307) is why: "T must be a class
+// or interface type; value types and runtime-managed reference types are not
+// admitted with the `owned` marker." An owning inline array over `int` is not
+// a well-formed Bezel program, so the SEGFAULT was the back end lowering a
+// declaration sema should never have admitted — a missing front-end check,
+// not a back-end defect, and there is no non-class-T codegen to fix. As of
+// `ade3b1d6` that declaration is rejected at its declaration site with the
+// §15.1.1 diagnostic (regression: tests/lit/sema/
+// inline_owned_array_element_class_or_interface_15_1_1.bzl).
+//
+// So the axis this row stood in for does not exist: every legal `[N owned]T`
+// has a class or interface T, which is exactly what rows 1, 2, 4 and 5 below
+// already exercise over `Cell`. Do NOT re-add the row.
 // ============================================================================
 
 // ============================================================================

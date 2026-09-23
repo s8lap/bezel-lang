@@ -53,7 +53,8 @@
 //   return arity     (T3 reject, T4 accept)         — symmetric axis the issue names
 //   T → T? widening  (T5 reject: still size-strict under widening)
 //   element equality (T6 accept: same element, same size — no false reject)
-//   ownedness        (T7 reject: owned ≠ unowned even at same size)
+//   ownedness        (T7 reject: owned ≠ unowned even at same size,
+//                     over a class element — §15.1.1 admits no other kind)
 //
 // All seven rows MUST pass on `main`. T1 / T3 / T5 / T7 are the rows a
 // pre-#3183 build silently accepts and #3183 makes discriminate; T2 / T4 / T6
@@ -415,22 +416,36 @@ BEZEL_TEST(xmod_iface_inline_array_arity_imported_3203,
 // ("an inline array may not be the element of another inline array (`[N][M]T`)
 // — multi-dimensional inline arrays are not admitted (§15.1)"), so a
 // nested-axis regression cannot even be expressed in source. The T7 slot is
-// kept as an ownedness-discrimination axis: `[2 owned]int` and `[2]int` are
-// distinct types per §15.3 even at the same arity, and `typeRefEqual`'s
-// `a->arrayOwned != b->arrayOwned` guard (line 1396) is what distinguishes
-// them. Both sides must reject when the impl owns and the interface doesn't
-// (or vice versa) — exactly the same predicate the issue's "every arity
-// compares equal" claim asserted was missing.
+// kept as an ownedness-discrimination axis: `[2 owned]E3203T7` and
+// `[2]E3203T7` are distinct types per §15.3 even at the same arity, and
+// `typeRefEqual`'s `a->arrayOwned != b->arrayOwned` guard (line 1396) is what
+// distinguishes them. Both sides must reject when the impl owns and the
+// interface doesn't (or vice versa) — exactly the same predicate the issue's
+// "every arity compares equal" claim asserted was missing.
+//
+// §15.1.1 (v0.307): this row was originally spelled `[2 owned]int` vs
+// `[2]int`. The `owned` marker admits only a class or interface element
+// ("value types and runtime-managed reference types are not admitted"), so
+// `[2 owned]int` is not a well-formed type and the row would have been
+// rejected for the WRONG reason — a §15.1.1 element error instead of the
+// §11.2 conformance mismatch it exists to pin, which is precisely the
+// vacuous-pass shape (right verdict, wrong mechanism). The element type is
+// now the class `E3203T7`, exported from the interface's module so the
+// imported arrangement resolves it too; the ownedness axis is unchanged, and
+// the `mentions3203(..., "11.2")` assertions keep the mechanism honest.
 // ===========================================================================
 BEZEL_TEST(xmod_iface_inline_array_arity_imported_3203,
            t7_ownedness_distinct_from_unowned_at_same_arity_15_3) {
     const char* iface =
+        "public class E3203T7 "
+        "  public constructor() end constructor; "
+        "end E3203T7; "
         "public interface IBig3203T7 "
-        "  method HP(a: [2]int): int; "
+        "  method HP(a: [2]E3203T7): int; "
         "end IBig3203T7; ";
     const std::string body =
         "public class Big: IBig3203T7 "
-        "  method HP(a: [2 owned]int): int "
+        "  method HP(a: [2 owned]E3203T7): int "
         "    return 0; "
         "  end HP; "
         "end Big;";
