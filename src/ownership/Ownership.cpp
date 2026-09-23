@@ -7702,6 +7702,42 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // // per §28.7, §28.3 K1.3, v0.294, #3950
             if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
                 const_cast<ast::AssignmentStmt&>(as).lhsMovedFromAtStore = true;
+            // §28.3 "State match on reassignment" (v0.307): "Reassignment to
+            // an existing `var x` is state-matched: an owned-state LHS
+            // requires an owned RHS — a fresh producer, or a named owned
+            // binding under the explicit transfer marker (`x := move y;`) …
+            // Assigning a borrow to an owned-state LHS … is rejected — the
+            // mismatch would silently drop or double-hold a disposal
+            // obligation." This is the UNMARKED path only (the `owned`/
+            // `move` marker forms are diverted to `handleMarkedOwnedAssign-
+            // ment` above, and `handleMarkedOwnedAssignment` state-matches
+            // its own target against the BORROWED-LHS half of the rule
+            // already); reachable here with `st.state == Owned` and an
+            // unmarked RHS that classifies Borrowed (`best := next;` over
+            // two owned locals — a bare read never consumes, §28.3's
+            // no-silent-consume rule, so `next` reads as a borrow here).
+            // Rejecting BEFORE the overwrite below leaves `best` untouched
+            // (still Owned, still live) rather than silently reclassifying
+            // it Borrowed and losing its disposal obligation with no
+            // diagnostic and no dispose — the double-ownership hazard #1538
+            // recorded: `next` stays a live owner too, so a later `move` /
+            // scope-end drop of `next` and any use through `best` alias the
+            // SAME object with two owners. // per §28.3, v0.307, #1538
+            if (st.state == OwnershipState::Owned &&
+                producerState(*as.value) == OwnershipState::Borrowed) {
+                report(Severity::Error, as.value->span.begin,
+                       std::string("cannot assign a borrow to `") +
+                           std::string(id->name) +
+                           "`: it currently holds an owned value, and a "
+                           "state-matched reassignment requires an owned "
+                           "RHS — a fresh producer, or a named owned "
+                           "binding under the explicit transfer marker "
+                           "(`" + std::string(id->name) +
+                           " := move ...;`) — the state-match rule (§28.3, "
+                           "v0.307)");
+                if (!suppressDiag_) st.state = OwnershipState::Poisoned;
+                return;
+            }
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
             // §28.3 (#1626): a reassignment writes a fresh value, so any
