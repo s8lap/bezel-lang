@@ -41,6 +41,38 @@ const char* primitiveSpellingForDiag(PrimitiveType p) {
     return "<unknown>";
 }
 
+// fix #4695 / stdlib §5.1 + §2.19 (v0.307): the element types whose no-selector
+// `Sum()` / `Min()` / `Max()` result is the element's OWN type rather than the
+// legacy `int` default. stdlib §2.19 names the `INumber<T>` conformers exactly —
+// "byte, sbyte, short, ushort, int, uint, long, ulong, float, double, decimal
+// conform to all three" — and §5.1 declares `Sum(): owned T` over that
+// constraint, `Min()/Max(): T` over `IComparable<T>`; the eleven below are the
+// primitives both constraints admit and codegen's accumulator switch handles.
+//
+// Fix #1836 keyed only SEVEN of them and left the four NARROW integers typed
+// `int` while codegen kept loading the element at its own width, so the Sum and
+// Min/Max array terminals reconciled the two with `CreateTrunc(i8 -> i32)` — a
+// widening spelled as a truncation, which LLVM's verifier rejects ("DestTy too
+// big for Trunc"). Spelling the set once keeps sema and codegen in lockstep: a
+// site that types the call `int` while codegen accumulates at the element width
+// is silent wrong code, not a compile error (measured on the vtable-backed
+// `IEnumerable<long>` path, which returned 9e9 mod 2^32 = 410_065_408).
+//
+// `char` and `bool` are deliberately absent: §2.19 conforms `char` to
+// `ISteppable`/`IParsable` only and `bool` to none, so `Sum()` over them is not
+// well-typed at all (tracked separately — this predicate does not admit them).
+bool isNoSelectorAggregationElem(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:  case P::SByte: case P::Short: case P::UShort:
+        case P::Int:   case P::UInt:  case P::Long:  case P::ULong:
+        case P::Float: case P::Double: case P::Decimal:
+            return true;
+        default:
+            return false;
+    }
+}
+
 std::string typeNameForDiag(const TypeRef* t) {
     if (!t) return "<unresolved>";
     std::string s;
@@ -5890,15 +5922,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // result off the element; the selector form keeps the
                         // decimal/int default. (Mirrors the concrete-collection
                         // path below; codegen derives the accumulator likewise.)
+                        // fix #4695: the set is `isNoSelectorAggregationElem`
+                        // (this TU, top) — the ELEVEN §2.19 `INumber<T>`
+                        // conformers, not the seven #1836 spelled here. See
+                        // that predicate for why the four narrow integers
+                        // matter (codegen keys its accumulator off the element
+                        // either way, so a site left on `int` is a sema/codegen
+                        // disagreement, not a conservative default).
                         bool noSelectorKeyed = false;
                         if (ce.args.empty() && srcElem &&
                             srcElem->kind == TypeRef::Kind::Primitive &&
                             !srcElem->nullable) {
                             P ep = srcElem->primitive;
-                            if (ep == P::Int || ep == P::Long ||
-                                ep == P::UInt || ep == P::ULong ||
-                                ep == P::Float || ep == P::Double ||
-                                ep == P::Decimal) {
+                            if (isNoSelectorAggregationElem(ep)) {
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(ep));
                                 noSelectorKeyed = true;
                             }
@@ -6123,11 +6159,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (lt->kind == TypeRef::Kind::Function &&
                                     lt->funcReturn)
                                     uTy = lt->funcReturn;
+                        // fix #4695 / stdlib §5.1 (v0.307): the NO-SELECTOR
+                        // form returns the element's own type here too. This
+                        // site was the one #1836 missed, and the omission is
+                        // not conservative: codegen's Min/Max accumulator has
+                        // keyed off `recvTy->genericArgs[0]` since #1836, so a
+                        // vtable-backed receiver typed `int` here disagrees
+                        // with the accumulator codegen actually builds.
+                        TypeRef* noSelTy = nullptr;
+                        if (ce.args.empty() && srcElem2 &&
+                            srcElem2->kind == TypeRef::Kind::Primitive &&
+                            !srcElem2->nullable &&
+                            isNoSelectorAggregationElem(srcElem2->primitive))
+                            noSelTy = ctx_.primitiveTypeRef(srcElem2->primitive);
                         ctx_.setExprType(
-                            &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
+                            &ce, uTy ? uTy
+                                     : (noSelTy ? noSelTy
+                                                : ctx_.primitiveTypeRef(P::Int)));
                     }
-                    else if (m == "Sum")
-                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "Sum") {
+                        // fix #4695 / stdlib §5.1 (v0.307): `Sum(): owned T`.
+                        // Measured before this fix on the vtable path:
+                        // `IEnumerable<long>.Sum()` over 3e9 + 6e9 printed
+                        // 410_065_408 (= 9e9 mod 2^32) — codegen accumulated
+                        // at the element's 64-bit width while sema typed the
+                        // call `int`, so the result was truncated at the use
+                        // site. At a NARROW element the same disagreement is
+                        // the `trunc i8 -> i32` this issue reports.
+                        TypeRef* sumTy = nullptr;
+                        if (ce.args.empty() && srcElem2 &&
+                            srcElem2->kind == TypeRef::Kind::Primitive &&
+                            !srcElem2->nullable &&
+                            isNoSelectorAggregationElem(srcElem2->primitive))
+                            sumTy = ctx_.primitiveTypeRef(srcElem2->primitive);
+                        ctx_.setExprType(
+                            &ce, sumTy ? sumTy : ctx_.primitiveTypeRef(P::Int));
+                    }
                     else if (m == "Average")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
                     // issue #995 / stdlib §5: a DEFERRED LINQ operator
@@ -7151,15 +7218,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // `Min()/Max(): T`), not int. The seven §5.1 numeric
                             // primitives key the result off the element; the
                             // selector form keeps the decimal/int default below.
+                            // fix #4695: the set is
+                            // `isNoSelectorAggregationElem` (this TU, top) —
+                            // the ELEVEN §2.19 `INumber<T>` conformers. #1836
+                            // keyed seven and left byte/sbyte/short/ushort on
+                            // the `int` default, which codegen then tried to
+                            // reach by `trunc i8 -> i32`.
                             bool noSelectorKeyed = false;
                             if (ce.args.empty() && elem &&
                                 elem->kind == TypeRef::Kind::Primitive &&
                                 !elem->nullable) {
                                 P ep = elem->primitive;
-                                if (ep == P::Int || ep == P::Long ||
-                                    ep == P::UInt || ep == P::ULong ||
-                                    ep == P::Float || ep == P::Double ||
-                                    ep == P::Decimal) {
+                                if (isNoSelectorAggregationElem(ep)) {
                                     ctx_.setExprType(&ce,
                                         ctx_.primitiveTypeRef(ep));
                                     noSelectorKeyed = true;

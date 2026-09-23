@@ -3330,9 +3330,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // numeric type. Sema types it likewise (ExprTypecheck_Calls);
                 // derive the accumulator width from the element so a long/uint/
                 // ulong/float/double element is summed at its own width.
+                // fix #4695 / stdlib §5.1 + §2.19 (v0.307): the four NARROW
+                // integers belong here too. #1836 listed five (Int being the
+                // initialiser and decimal taking the path above), so a
+                // byte/sbyte/short/ushort element fell to `retP = Int` while
+                // `elemTy` stayed i8/i16 — and the reconciliation below then
+                // spelled the i8→i32 WIDENING as `CreateTrunc`, which LLVM's
+                // verifier rejects ("DestTy too big for Trunc"). Keying the
+                // accumulator off the element removes the mismatch at its
+                // source rather than patching the cast: per stdlib §5 "a
+                // narrow integer element type accumulates in that type".
                 sema::TypeRef* e = recvTy->genericArgs[0];
                 if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
                     switch (e->primitive) {
+                        case sema::PrimitiveType::Byte:
+                        case sema::PrimitiveType::SByte:
+                        case sema::PrimitiveType::Short:
+                        case sema::PrimitiveType::UShort:
                         case sema::PrimitiveType::UInt:
                         case sema::PrimitiveType::Long:
                         case sema::PrimitiveType::ULong:
@@ -3385,10 +3399,45 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 accLLTy->isIntegerTy())
                 val = builder_.CreateTrunc(val, accLLTy);
             llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
-            builder_.CreateStore(
+            // fix #4695 / stdlib §5 + §5.1, spec §6.1 (v0.307): the
+            // accumulation is `+` AT THE RESULT TYPE (stdlib §5.1's
+            // `Sum(): owned T` folds with `T.Zero()` and `T`'s `+`), so it
+            // carries §6.1's checked-overflow posture — "a narrow integer
+            // element type accumulates in that type and is overflow-checked in
+            // it … `bytes.Sum()` over an `Array<byte>` raises
+            // `OverflowException` past 255" (stdlib §5). The plain `CreateAdd`
+            // this replaces wrapped silently at EVERY integer width, not just
+            // the narrow ones: measured, `Array<int>` summing 2e9 + 2e9 printed
+            // -294_967_296 where §6.1 requires a throw.
+            //
+            // The intrinsic's SIGNEDNESS is the accumulator's own
+            // (`isUnsignedPrim`), and it is load-bearing rather than
+            // cosmetic: `byte` and `sbyte` are the same i8, yet 100 + 100 =
+            // 200 is in range for one and out of range for the other. One
+            // intrinsic for both is wrong in a direction no single-element-type
+            // test can see, which is why the regression rows come in
+            // signed/unsigned pairs at each width.
+            //
+            // Guarded on the operands actually sharing an integer type: a
+            // non-numeric element (bool, a pointer-typed element) still lands
+            // on the `int` fallback with a mismatched `val`, and those shapes
+            // are sema over-accepts to be rejected at their own layer — this
+            // arm leaves their (already malformed) lowering exactly as it was
+            // rather than silently minting a value for them.
+            const bool checkedAdd = !accIsFP && accLLTy->isIntegerTy() &&
+                                    val->getType() == accLLTy;
+            llvm::Value* nextAcc =
                 accIsFP ? builder_.CreateFAdd(acc, val)
-                        : builder_.CreateAdd(acc, val),
-                accSlot);
+                        : (checkedAdd
+                               ? emitCheckedArith(
+                                     isUnsignedPrim(retP)
+                                         ? llvm::Intrinsic::uadd_with_overflow
+                                         : llvm::Intrinsic::sadd_with_overflow,
+                                     acc, val)
+                               : builder_.CreateAdd(acc, val));
+            // NB: emitCheckedArith leaves the insert point in its `chk.cont`
+            // block, so everything below continues on the non-throwing path.
+            builder_.CreateStore(nextAcc, accSlot);
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
@@ -4099,9 +4148,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // returns the element's own numeric type T (long/uint/ulong/
                 // float/double), not int. (Decimal took the §5.1 decimal path
                 // above; class/string took the pointer-comparable path.)
+                // fix #4695 / stdlib §5.1 (v0.307): the four NARROW integers
+                // belong here for the same reason they do in `Sum` above — a
+                // byte/short element otherwise kept the i32 accumulator and
+                // the reconciliation below emitted `trunc i8 -> i32`, which the
+                // IR verifier rejects. Keying `retP` off the element also feeds
+                // `accIsUnsigned` below, so `byte`/`ushort` get `icmp ult` /
+                // `icmp ugt`: read as signed i8, 200 is -56 and `Min`/`Max`
+                // over `[200, 50]` come back INVERTED. That is the same
+                // unsigned-compare requirement #1836 recorded for `ulong`,
+                // one width family down.
                 sema::TypeRef* e = recvTy->genericArgs[0];
                 if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
                     switch (e->primitive) {
+                        case sema::PrimitiveType::Byte:
+                        case sema::PrimitiveType::SByte:
+                        case sema::PrimitiveType::Short:
+                        case sema::PrimitiveType::UShort:
                         case sema::PrimitiveType::UInt:
                         case sema::PrimitiveType::Long:
                         case sema::PrimitiveType::ULong:
