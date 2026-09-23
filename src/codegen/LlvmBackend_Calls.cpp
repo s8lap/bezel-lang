@@ -4319,6 +4319,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
                 : (recvTy && !recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
+            // fix #4729 (spec §29.1, stdlib §5 line 3641-3645, v0.305): the
+            // numeric-element comparison below must honor the element's
+            // signedness — `byte`/`ushort`/`uint`/`ulong`/`char` order
+            // UNSIGNED (the bit pattern), the signed family orders signed.
+            // The legacy Min/Max arm above already does this via
+            // `accIsUnsigned` / `isUnsignedPrim(retP)` at line ~4229-4236;
+            // the *OrNull sibling, added in #2783, did not carry the same
+            // dispatch. `isUnsignedPrim(Char) == true` makes the string
+            // arm's synthetic `Char` substitution (above, fix #3786) order
+            // unsigned — char is unsigned for §11.1 widening anyway.
+            const bool elemIsUnsigned = elemTypeRef &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Primitive &&
+                !elemTypeRef->nullable &&
+                isUnsignedPrim(elemTypeRef->primitive);
             llvm::Type* elemLLTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
@@ -4423,8 +4437,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     : builder_.CreateICmpSLT(cmp, zero);
             } else if (elemLLTy->isIntegerTy()) {
                 shouldUpdate = isMaxOrNull
-                    ? builder_.CreateICmpSGT(el, acc)
-                    : builder_.CreateICmpSLT(el, acc);
+                    ? (elemIsUnsigned ? builder_.CreateICmpUGT(el, acc)
+                                      : builder_.CreateICmpSGT(el, acc))
+                    : (elemIsUnsigned ? builder_.CreateICmpULT(el, acc)
+                                      : builder_.CreateICmpSLT(el, acc));
             } else if (elemLLTy->isFloatTy() ||
                        elemLLTy->isDoubleTy()) {
                 shouldUpdate = isMaxOrNull
