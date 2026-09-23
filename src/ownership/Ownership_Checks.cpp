@@ -7036,10 +7036,39 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
         // the arm's own `end`, which is inside K8.3's boundary. Identity is
         // by AST NODE (a LocalSymbol's `decl`), not by name, so a same-named
         // outer local is never mistaken for one of these.
+        //
+        // Why no sibling LocalConstDecl handling belongs here (#3591): this
+        // set's only consumer (below, `localDeclsInArm.count(tls->decl)`)
+        // asks whether an ASSIGNMENT'S OWN TARGET was declared inside this
+        // arm. A `const` local is single-assignment (§21.1 — "not an
+        // assignable location"); an earlier typecheck pass rejects any
+        // program that assigns to one, so a `LocalConstDecl` can never
+        // reach `tls->decl` at that use site, in any program that reaches
+        // ownership checking. Same structural argument, same role
+        // (assignment-TARGET-only exemption set), as the existing marker
+        // for `targetLocal->decl` above.
+        //
+        // MEASURED 2026-09-23, not just reasoned: a `const` alias of a
+        // transferred payload is NOT a benign gap in general — `const c :=
+        // w; outer := c;` and its `var` counterpart both compile clean and
+        // leak payload `w` under ASan (24 B / 1 alloc, re-verified on this
+        // HEAD). That escape is real but is NOT caused by this set: `c` is
+        // not `target` there, it's the VALUE of a *different* assignment,
+        // reached on this walk's own iteration via `identifierRoot(value)`,
+        // which resolves one hop to `c` itself (no initializer
+        // trace-through) regardless of whether `c` was declared `const` or
+        // `var`. Widening THIS set would not close it. Filed as #4715
+        // (indirect-through-a-local-alias store/return escape, open on both
+        // #4635's expression-position check and this statement-position
+        // one) as a residual on top of #4663, not a defect #4663
+        // introduced.
         std::set<const ast::Node*> localDeclsInArm;
         for (const auto& top : arm.stmts)
             if (top)
                 forEachNestedStmt(*top, [&](const ast::Stmt& cur) {
+                    // LOCALDECL-ONLY: a const can never be an assignment
+                    // target (§21.1); see the block comment above for the
+                    // full argument and the #4715 measurement.
                     if (dynamic_cast<const ast::LocalDecl*>(&cur))
                         localDeclsInArm.insert(&cur);
                 });
