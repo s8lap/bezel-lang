@@ -67,6 +67,22 @@ bool nonExhaustiveWarningMentions(const bezel::test::SemaResult& r,
     return false;
 }
 
+// §21.7: true iff a diagnostic reports the "has a return type but does not
+// return a value on every path" ERROR — i.e. §21.7's statement-`case`
+// totality grant was WITHHELD for a value-returning method whose only
+// return path is a statement-position `case` (every arm diverges, but the
+// no-match fall-through was not proven statically dead).
+bool hasReturnEveryPathError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("does not return a value on every path") !=
+                std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // §19.3/§5.1/§12.9 (#1913): true iff an ERROR reports the ADMISSION rejection of
 // a wrong-instantiation type-test binding. A GROUND wrong-instantiation arm
 // (`var x: Ok<string>` at `Result<int>`) is not merely non-covering (#1874, the
@@ -2087,4 +2103,94 @@ BEZEL_TEST(sema_case_exhaust,
         "end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// --- §21.7 statement-`case` totality grant over a Record scrutinee
+// (fix #4685, follows #4674) ------------------------------------------
+//
+// `stmtAlwaysExits`'s `admitsTotality` gate (a DIFFERENT function from
+// `caseArmsExhaustive`, reusing its verdict) hardcoded Bool/Choice/Enum/
+// Class and had no Record arm, so even after #4674 taught
+// `caseArmsExhaustive` to prove a record `case` exhaustive, a STATEMENT-
+// position `case` over that same exhaustive record destructure — every
+// arm diverging — still fell through to "does not return a value on every
+// path (§21.7)" instead of being granted totality. The #4372 ruling states
+// the registry directly: "§21.7's statement-`case` totality grant is keyed
+// to exactly this property, and this list is its registry."
+
+// The #4685 repro: an all-slots-irrefutable positional record destructure,
+// its only arm a `return`, as the WHOLE body of a value-returning method.
+// Before the fix this drew the §21.7 "does not return a value on every
+// path" error even though the case only has one reachable outcome.
+BEZEL_TEST(sema_case_exhaust,
+           record_positional_stmt_case_totality_granted_spec_21_7) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point): int "
+        "    case p of "
+        "      Point(x, y) => return x + y; "
+        "    end; "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasReturnEveryPathError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// COMPANION (must not become a blanket totality grant for every record
+// `case`): a REFUTABLE slot leaves the record `case` non-exhaustive
+// (§19.6), so §21.7 totality must still be WITHHELD — the method falls
+// through with no return on the excluded value and the error must fire.
+BEZEL_TEST(sema_case_exhaust,
+           record_positional_refutable_stmt_case_totality_withheld_spec_21_7) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method YOf(p: Point): int "
+        "    case p of "
+        "      Point(0, var y) => return y; "
+        "    end; "
+        "  end YOf; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasReturnEveryPathError(r));
+}
+
+// A NULLABLE record scrutinee: the destructure plus an explicit `null` arm,
+// both diverging, grants totality (§19.6's nullable rule: "the rules above
+// plus an explicit `null` pattern").
+BEZEL_TEST(sema_case_exhaust,
+           nullable_record_stmt_case_totality_granted_spec_21_7) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point?): int "
+        "    case p of "
+        "      Point(x, y) => return x + y;, "
+        "      null => return 0; "
+        "    end; "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasReturnEveryPathError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// COMPANION: the same nullable destructure WITHOUT the `null` arm leaves
+// the case non-exhaustive (only the non-null values are covered), so
+// totality must still be withheld.
+BEZEL_TEST(sema_case_exhaust,
+           nullable_record_no_null_arm_stmt_case_totality_withheld_spec_21_7) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Sum(p: Point?): int "
+        "    case p of "
+        "      Point(x, y) => return x + y; "
+        "    end; "
+        "  end Sum; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasReturnEveryPathError(r));
 }

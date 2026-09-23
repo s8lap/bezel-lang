@@ -689,6 +689,24 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         //     space (an open hierarchy, a `when` construct) still grants nothing,
         //     and a constants-INEXHAUSTIVE enum `case` still grants nothing —
         //     the caseArmsExhaustive verdict below is what decides.
+        //
+        //     fix #4685 (§21.7 / §19.6 / the #4372 ruling, v0.307): the RECORD
+        //     bullet joins the closed-value-space list on the same footing as
+        //     Enum. §19.6's "Record scrutinee" bullet states the closure
+        //     directly: "a record has exactly one shape and is implicitly
+        //     sealed (§9.6), so covering that shape covers every value" — the
+        //     #4372 ruling that added it to caseArmsExhaustive (fix #4674) is
+        //     the same closed-value-space proof this registry exists to key
+        //     on, per the ruling's own text: "§21.7's statement-`case`
+        //     totality grant is keyed to exactly this property, and this list
+        //     is its registry." Before this fix the registry had drifted from
+        //     `caseArmsExhaustive`'s own kind coverage: #4674 taught
+        //     `caseArmsExhaustive` to prove a record `case` exhaustive, but
+        //     this gate never called it for a Record scrutinee, so a
+        //     statement-`case` over an all-slots-irrefutable record
+        //     destructure whose every arm diverges still fell through to
+        //     "does not return a value on every path" instead of being
+        //     granted totality.
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         bool admitsTotality = scrutTy && (
@@ -696,12 +714,14 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
             (scrutTy->kind == TypeRef::Kind::Primitive &&
              scrutTy->primitive == PrimitiveType::Bool) ||
             // choice bullet (§35.1) + sealed-hierarchy bullet (§11.7) +
-            // enum constants-coverage bullet (§5.4's invariant, #3044)
+            // enum constants-coverage bullet (§5.4's invariant, #3044) +
+            // record-scrutinee bullet (§9.6 / the #4372 ruling, #4685)
             (scrutTy->kind == TypeRef::Kind::Named &&
              scrutTy->declaration &&
              (scrutTy->declaration->kind == ast::TypeDeclKind::Choice ||
               scrutTy->declaration->kind == ast::TypeDeclKind::Enum ||
-              scrutTy->declaration->kind == ast::TypeDeclKind::Class)));
+              scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+              scrutTy->declaration->kind == ast::TypeDeclKind::Record)));
         if (admitsTotality &&
             caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
                                s.span.begin, /*quiet=*/true)) {
