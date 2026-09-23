@@ -19063,6 +19063,67 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // fix #4746 (stdlib §4.1/§4.2, v0.307): `IsReadOnly` is a declared
+        // `readonly property … : bool` on `ICollection<T>` (§4.1) and on
+        // `IOwningCollection<T>` (§4.2), and §4.1's prose fixes its value
+        // outright: "`IsReadOnly` is `false` for every standard collection
+        // implementing `ICollection<T>` (`Array<T>`, `LinkedList<T>`,
+        // `Set<T>`, `Dictionary<K, V>` …). The standard library currently
+        // ships no read-only `ICollection<T>` implementation".
+        //
+        // The builtin collections carry no user TypeSymbol (their TypeRef is
+        // a Named ref with a null `declaration`), so — exactly as for
+        // `Count`/`Capacity` immediately above — the ordinary member-lookup
+        // path never types a PROPERTY read on them. Two distinct defects
+        // followed, and this one handler closes both:
+        //   * `Array<T>`/`OwningArray<T>` — the FIRST type §4.1's sentence
+        //     names — fell through to the §4.4/§4.5 catch-all further down
+        //     and were REJECTED outright ("no member `IsReadOnly` …").
+        //   * the five families the #2538 allow-list already exempts from
+        //     that reject typed as NOTHING AT ALL, so every read degraded to
+        //     the #3079 silent no-op: `Console.WriteLine(s.IsReadOnly)`
+        //     emitted no output whatsoever, not even the line terminator.
+        // Typing the read here runs before both catch-alls and returns, so
+        // neither is reached.
+        //
+        // The admitted set is exactly the families whose stdlib class
+        // declaration conforms to `ICollection<T>` or `IOwningCollection<T>`:
+        // `Array` (§4.4, via `IList<T>`), `OwningArray` (§4.5, via
+        // `IOwningList<T>`), `LinkedList` (§4.6), `OwningLinkedList` (§4.7),
+        // `Dictionary` (§4.8, via `ICollection<DictionaryEntry<K, V>>`),
+        // `Set` and `OwningSet` (§4.10).
+        //
+        // Deliberately EXCLUDED — each one's rejection is pinned by an
+        // existing test and must stay red: `OwningDictionary` (§4.9 —
+        // implements `IDisposable` only), `Stack`/`Queue` and their owning
+        // twins (§4.11 — `IReadOnlyCollection<T>` only, #1354/#1811),
+        // `SortedDictionary` (§4.17), `SortedSet` (§4.18), `FrozenArray`
+        // (§4.19), `OwningBuffer` (§4.14).
+        //
+        // Only the PROPERTY-REFERENCE form is typed here (`&ma !=
+        // calleeOfCallCtx_`): `IsReadOnly` is a property, not a method, so
+        // the call spelling `x.IsReadOnly()` keeps whatever behaviour it has
+        // today rather than being newly admitted by this fix.
+        if (ma.target && ma.member == "IsReadOnly" &&
+                &ma != calleeOfCallCtx_) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltinColl =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty();
+                std::string_view cn = isBuiltinColl
+                    ? tt->headName()
+                    : std::string_view();
+                if (cn == "Array" || cn == "OwningArray" ||
+                    cn == "LinkedList" || cn == "OwningLinkedList" ||
+                    cn == "Dictionary" ||
+                    cn == "Set" || cn == "OwningSet") {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+            }
+        }
         // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): Array<T> (§4.5)
         // and FrozenArray<T> (§4.19) both declare `ToArray()` (0 args,
         // returning owned Array<T>). A same-named §5 LINQ `ToArray()`

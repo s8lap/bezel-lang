@@ -4614,6 +4614,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
         }
     }
+    // fix #4746 (stdlib §4.1/§4.2, v0.307): `IsReadOnly` on a builtin
+    // collection is a compile-time constant `false`. §4.1 states the whole
+    // runtime story — "`IsReadOnly` is `false` for every standard collection
+    // implementing `ICollection<T>` … The standard library currently ships no
+    // read-only `ICollection<T>` implementation; the member exists for
+    // user-defined read-only implementations" — so there is no per-object
+    // state to read here, only the constant.
+    //
+    // Without this arm the property read lowered to no value at all and the
+    // #3079 silent no-op followed: `Console.WriteLine(s.IsReadOnly)` emitted
+    // NOTHING, not even the line terminator (measured on three families).
+    // The admitted family set mirrors the #4746 sema handler in
+    // `ExprTypecheck_Calls.cpp` exactly — sema types only these seven, so a
+    // receiver outside the set never reaches this arm with a typed read; the
+    // guard is repeated rather than inferred because codegen dispatch here is
+    // AST-structural, not symbol-based.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "IsReadOnly") {
+            auto* tt = ctx_.exprType(*ma->target);
+            std::string_view cn =
+                (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                 !tt->declaration && tt->astNode && tt->astNode->name &&
+                 !tt->astNode->name->parts.empty())
+                    ? tt->headName()
+                    : std::string_view();
+            if (cn == "Array" || cn == "OwningArray" ||
+                cn == "LinkedList" || cn == "OwningLinkedList" ||
+                cn == "Dictionary" ||
+                cn == "Set" || cn == "OwningSet") {
+                // Lower the receiver for its side effects and discard the
+                // value: the property does not depend on the object's state.
+                lowerExpr(*ma->target);
+                return llvm::ConstantInt::get(i1(), 0);
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.
