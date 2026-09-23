@@ -140,6 +140,14 @@ void bz_array_sort_closure(void* arr, int64_t elem_size,
                            void* closure,
                            int (*cmpfn)(void*, const void*, const void*));
 
+// §29.12 / #4631: record an in-place repositioning the CALLER performed, so a
+// live enumerator is invalidated. The in-place `Reverse()` (stdlib §4.4) is
+// lowered as an inlined swap loop in codegen rather than as a call into the
+// runtime, so it has no other site at which to bump the modification epoch.
+// No-op on an array of 0 or 1 elements (nothing repositions), matching
+// bz_array_sort.
+void bz_array_note_repositioned(void* arr);
+
 // Return a shallow copy of `arr` (same element bytes, no deep clone).
 // The caller owns the returned array and must free it with
 // bz_array_free(result, /*disposer=*/null).  Used by Array<T>.Reversed()

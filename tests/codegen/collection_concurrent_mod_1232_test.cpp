@@ -432,3 +432,112 @@ BEZEL_TEST(collection_concurrent_mod_1232,
         "  return 0; "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// fix #4631 (Reverse half) / §29.12, v0.307 — the in-place Array<T>.Reverse()
+// never bumped mod_count.
+//
+// §29.12 names the two in-place reorderings together — "together with the
+// in-place `Sort()`/`Reverse()` (they reposition)" — so each must invalidate a
+// live enumerator. #4631's fix landed the Sort() half only (bz_array_sort /
+// bz_array_sort_closure gained their bump) and the issue was closed; the
+// Reverse() half, which that issue itself called "worse", was left undone.
+//
+// Reverse() is not a runtime call at all: Emitter::tryLowerArrayCall lowers it
+// as an INLINED IR element-swap loop (LlvmBackend_Calls.cpp, the "rev.c" /
+// "rev.b" / "rev.e" blocks) that reaches the runtime only through
+// bz_array_ptr_at, so there was no site bumping the epoch. A `for` over an
+// Array<T> that reversed it in the loop body therefore kept walking
+// repositioned elements and never raised InvalidOperationException — the
+// FALSE-NEGATIVE direction, exactly as Sort() did before #4631.
+//
+// The fix adds bz_array_note_repositioned (bezel_runtime_collections.cpp) and
+// calls it after the emitted swap loop. Pre-fix all three throwing rows below
+// return 0 (no exception caught).
+// ===========================================================================
+
+// §29.12 / #4631 — Array<int>: Reverse() during for-in must throw.
+// This is issue #4631's own stated repro.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_reverse_during_for_throws_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); "
+        "  try "
+        "    for var x in xs do xs.Reverse(); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #4631 + #3345 — the STATIC call form `Array.Reverse(xs)` re-binds
+// the receiver to args[0] and reaches the same inlined swap loop, so it must
+// fault identically. Pinned separately because the two spellings enter the arm
+// through different guards.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_static_reverse_during_for_throws_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); "
+        "  try "
+        "    for var x in xs do Array.Reverse(xs); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #4631 — the OWNING family counterpart. §29.12's structural list
+// covers the standard collections "together with their owning-collection
+// counterparts", and OwningArray<T>.Reverse() (stdlib §4.4) lowers through the
+// very same arm, so it must fault too.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           owning_array_reverse_during_for_throws_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Item public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; end Item; "
+        "class C public static method Main(): int "
+        "  using var xs := new OwningArray<Item>(); "
+        "  xs.Add(new Item(1)); xs.Add(new Item(2)); xs.Add(new Item(3)); "
+        "  try "
+        "    for var it in xs do xs.Reverse(); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #4631 — NO FALSE POSITIVE: a Reverse() that cannot have
+// repositioned anything invalidates nothing. A one-element array's swap loop
+// runs zero iterations, so bz_array_note_repositioned's `count > 1` guard (the
+// same guard bz_array_sort carries) must leave the enumerator valid and the
+// loop must complete normally. Returns the single element, 7.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_reverse_singleton_during_for_no_throw_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); xs.Add(7); "
+        "  var s := 0; "
+        "  for var x in xs do xs.Reverse(); s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), 7);
+}
+
+// §29.12 / #4631 — Reverse() STILL REVERSES. The fix appends a call after the
+// emitted swap loop; this row pins that the loop itself is untouched, so a
+// Reverse() outside any iteration keeps reordering the elements. [1,2,3,4]
+// reversed is [4,3,2,1]; 4*10 + 1 = 41 reads both ends.
+BEZEL_TEST(collection_concurrent_mod_1232,
+           array_reverse_outside_loop_still_reorders_4631) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4); "
+        "  xs.Reverse(); "
+        "  return xs[0] * 10 + xs[3]; "
+        "end Main; end C;"), 41);
+}

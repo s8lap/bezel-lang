@@ -5281,6 +5281,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            // fix #4631 (Reverse half) per §29.12, v0.307: the in-place
+            // Sort()/Reverse() are structural — "they reposition" — so each
+            // must invalidate a live enumerator. Sort() gets its bump inside
+            // bz_array_sort; this swap loop is emitted inline and calls into
+            // the runtime nowhere, so the epoch is bumped explicitly here.
+            // The runtime helper no-ops when nothing can have repositioned
+            // (count <= 1), matching bz_array_sort's own guard.
+            {
+                auto* bumpFn = declareC("bz_array_note_repositioned",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(bumpFn, {recv});
+            }
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §5 LINQ: .OrderBy / .OrderByDescending are LAZY — see

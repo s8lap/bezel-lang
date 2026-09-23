@@ -368,6 +368,25 @@ void bz_array_sort_closure(void* arrp, int64_t elem_size,
     arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort(comparer) repositions)
 }
 
+// §29.12, v0.307: record an in-place repositioning that the CALLER performed.
+//
+// The in-place `Array<T>`/`OwningArray<T>` `Reverse()` (stdlib §4.4) is lowered
+// as an inlined element-swap loop in codegen (`Emitter::tryLowerArrayCall`'s
+// `Reverse` arm) rather than as a call into this file, so unlike every other
+// structural mutator here it had no site at which to bump the modification
+// epoch. §29.12 names it in the same breath as `Sort()` — "together with the
+// in-place `Sort()`/`Reverse()` (they reposition)" — so a `for` over the array
+// that reverses it in the loop body must raise `InvalidOperationException` at
+// the next advance, exactly as `Sort()` already does via `bz_array_sort`.
+//
+// The `count > 1` guard mirrors `bz_array_sort`'s: an array of 0 or 1 elements
+// repositions nothing, so no enumerator is invalidated.
+void bz_array_note_repositioned(void* arrp) {
+    auto* arr = (bz_array_t*)arrp;
+    if (arr && arr->count > 1)
+        arr->mod_count++;  // §29.12 / #4631: structural mutation (Reverse repositions)
+}
+
 // stdlib §3 / #472: Shallow-copy `arr` — allocate a new bz_array_t with the
 // same element bytes.  The copy does NOT deep-clone pointer-typed elements;
 // for the borrowing Array<T> this is correct (Array<T> does not own its class
