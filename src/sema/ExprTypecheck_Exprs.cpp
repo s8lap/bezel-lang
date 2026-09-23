@@ -7300,6 +7300,73 @@ ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
     return {};
 }
 
+// §4.14 (l4_14_0010): `move buf[i]` is NOT admitted when `buf` has the
+// VALUE-TYPED `OwningBuffer<T>` presentation — slots hold `T` directly
+// (no nullability wrapper), values have no ownership to transfer, and
+// `move` would read a plain value while pretending an ownership transfer
+// happened (a runtime hazard: the slot's storage is unowned buffer memory,
+// not an owned reference, so any caller treating the result as owned would
+// free slot-storage it does not own). The class-typed `OwningBuffer<T>`
+// presentation (slots hold `T?`) IS admitted by `move` and is NOT matched
+// here — the existing class-typed path in codegen's
+// `lowerMoveFromCollectionSlot` runs untouched.
+std::string
+ExprTC::moveThroughOwningBufferValueElementName(
+        const ast::Expr& operand) const {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&operand);
+    if (!ix || !ix->target) return {};
+    const TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != TypeRef::Kind::Named || tt->declaration)
+        return {};
+    if (!tt->astNode || !tt->astNode->name ||
+        tt->astNode->name->parts.empty())
+        return {};
+    if (tt->headName() != "OwningBuffer")
+        return {};
+    // Classify the element type. The class-typed presentation (Class /
+    // Interface / Shared<T> / Weak<T>) keeps `move` admitted (slot holds an
+    // owned reference); every other TypeRef kind — Primitive (including
+    // `string`), Function, Unit, InlineArray, Record, Enum, Choice, value
+    // builtin, or a bare generic parameter — is the value-typed presentation
+    // where `move` is rejected by spec §4.14. A bare generic parameter
+    // (declaration == nullptr on the substituted element) is conservatively
+    // admitted here; the per-instantiation `instantiations_` walk decides
+    // value-vs-class at the use site and would double-diagnose if we
+    // rejected eagerly.
+    if (tt->genericArgs.empty()) return {};
+    const TypeRef* el = tt->genericArgs[0];
+    if (!el) return {};
+    switch (el->kind) {
+        case TypeRef::Kind::Named: {
+            // Class / Interface substitution — class-typed presentation.
+            if (el->declaration &&
+                (el->declaration->kind == ast::TypeDeclKind::Class ||
+                 el->declaration->kind == ast::TypeDeclKind::Interface))
+                return {};
+            // Built-in reference wrapper (Shared<T>/Weak<T>) — class-typed.
+            if (!el->declaration && el->astNode && el->astNode->name &&
+                !el->astNode->name->parts.empty()) {
+                auto en = el->headName();
+                if (en == "Shared" || en == "Weak") return {};
+            }
+            // Records, enums, choices, value builtins, AND bare generic
+            // parameters → value-typed presentation.
+            break;
+        }
+        case TypeRef::Kind::Primitive:
+        case TypeRef::Kind::Function:
+        case TypeRef::Kind::Unit:
+        case TypeRef::Kind::InlineArray:
+            break;
+    }
+    // Use the receiver identifier's source-text name when available; the
+    // IndexExpr's `target` is the receiver expression itself, and a bare
+    // identifier is the canonical local-binding shape the case corpus uses.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix->target.get()))
+        return std::string(id->name);
+    return std::string();
+}
+
 // §19.3 / §15.3 (v0.184, #1665): a `case`/`when` pattern binding over a
 // MOVE-ONLY value-type scrutinee (an owning inline array, `[N owned]T` /
 // `[N owned]T?`) is a BORROW of the scrutinee's value — "the case construct
@@ -7555,7 +7622,28 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "` views a borrowing source (a non-owning `Array<T>`, `string`, "
                 "or read-only buffer), so its slots hold borrows with no "
                 "ownership to transfer (§28.11 / §4.15 — `move arrSpan[i]` is "
-                "rejected; use the plain indexer-get to read the borrow)");
+                            "rejected; use the plain indexer-get to read the borrow)");
+        }
+        // §4.14 (l4_14_0010): `move buf[i]` on the VALUE-TYPED `OwningBuffer<T>`
+        // presentation (slots hold `T` directly) is rejected — values have no
+        // ownership to transfer, and accepting the move would silently admit a
+        // plain read as an ownership transfer. The class-typed presentation
+        // (slots hold `T?`, T a class type) IS admitted by `move` and is NOT
+        // matched here (its handler is `lowerMoveFromCollectionSlot`, which
+        // runs through the null-out path).
+        std::string owningBufValTy =
+            moveThroughOwningBufferValueElementName(*ue.operand);
+        if (!owningBufValTy.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted on a value-typed "
+                            "`OwningBuffer<T>` slot — value elements are read "
+                            "with the plain indexer and copied at the use site "
+                            "(§4.14 — the value-typed `OwningBuffer<T>` "
+                            "presentation stores `T` directly with no ownership "
+                            "to transfer; read the slot plainly instead, or use "
+                            "the class-typed presentation `OwningBuffer<C>` if "
+                            "the elements are owned references)"));
         }
         // §19.3 / §15.3 (v0.184, #1665): `move s[i]` is rejected when `s` is a
         // `case`/`when` pattern binding over a move-only owning-inline-array

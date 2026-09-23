@@ -3421,6 +3421,22 @@ private:
     // OWNING `Span<T>` (over an `OwningBuffer`) is NOT matched here.
     std::string moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const;
 
+    // §4.14 (#4670-class, l4_14_0010): if `operand` is `buf[i]` whose receiver
+    // has an `OwningBuffer<T>` static type and T is value-typed (a primitive,
+    // record, enum, value-like or borrow-bearing choice, inline array of
+    // values, function value, value builtin, or the unit type — anything
+    // whose slot semantics dispatch on the value-presentation arm), return
+    // the receiver's display name; otherwise the empty string. Such a slot
+    // holds no ownership to transfer: the value-typed `OwningBuffer<T>`
+    // presentation stores T directly (no nullability wrapper), so `move`
+    // would read a plain value and pretend an ownership transfer happened.
+    // Spec §4.14's *Value-typed T* bullet: "`move buf[i]` is not admitted;
+    // values are read with the plain indexer and copied at the use site."
+    // The class-typed presentation of `OwningBuffer<T>` (slots hold `T?`)
+    // IS admitted by `move` and is NOT matched here.
+    std::string moveThroughOwningBufferValueElementName(
+        const ast::Expr& operand) const;
+
     // §19.3 / §15.3 (v0.184, #1665): if `operand` is `s[i]` where `s` is a
     // `case`/`when` pattern binding (a LocalSymbol whose `decl` is a pattern
     // `BindingPattern`, not a plain `var`-declared LocalDecl) over a MOVE-ONLY
