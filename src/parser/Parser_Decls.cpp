@@ -1839,10 +1839,19 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         }
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = ast::Visibility::None; // implicit public in iface
-        if (readonlyMod) pd->modifiers.push_back("readonly");
         // §22.15 (v0.202, #2052): IfaceProperty/IfaceIndexer admit `pure?`
-        // before `readonly?` per A.4.
+        // before `readonly?` per A.4 — and §11.5's canonical order likewise
+        // puts the `(async|pure)` slot ahead of `readonly`. This function
+        // scans the prefix into FLAGS (the `while` above accepts any spelling
+        // order and discards source order), so these push_backs are the one
+        // place the order is re-established: they must emit the canonical
+        // sequence. Emitting `readonly` first made checkMemberModifierOrder
+        // (#4719) observe a slot DECREASE (readonly=6 then pure=3) and
+        // falsely reject every `pure readonly property` — including §11.2's
+        // own `IReadOnlyCollection<out T>` example, which is what broke the
+        // spec-example conformance phase. per §11.5, v0.307
         if (pureMod) pd->modifiers.push_back("pure");
+        if (readonlyMod) pd->modifiers.push_back("readonly");
         if (consumePunctuator("[")) {
             pd->isIndexer = true;
             pd->indexerParams = parseParamList();
