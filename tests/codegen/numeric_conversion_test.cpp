@@ -466,7 +466,16 @@ BEZEL_TEST(codegen_numeric_conv, long_to_int_signed_unaffected_1133) {
     BEZEL_EXPECT_EQ(run(
         "var ok := 0; "
         "var a: long := -5L; if int(a) = -5 then ok := ok + 1; end; "        // in range
-        "try var b: int := int(5000000000L); catch OverflowException => ok := ok + 6; end; "
+        // The out-of-range operand is bound to a LOCAL first, deliberately.
+        // §5.2 (v0.300) rejects a faulting COMPILE-TIME-CONSTANT operand at
+        // the conversion site rather than deferring it to a runtime fault, so
+        // the inline `int(5000000000L)` this row used to spell is now a
+        // compile error and could never reach the `catch`. Binding through a
+        // local keeps the operand non-constant, so the conversion still raises
+        // `OverflowException` at runtime — which is the behaviour this row
+        // exists to pin. Measured: exit 6, the catch arm taken.
+        "var big: long := 5000000000L; "
+        "try var b: int := int(big); catch OverflowException => ok := ok + 6; end; "
         "return ok;"),                                     // 1 + 6 = 7
         7);
 }

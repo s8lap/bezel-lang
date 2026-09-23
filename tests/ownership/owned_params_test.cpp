@@ -38,9 +38,21 @@ BEZEL_TEST(own_param, owned_param_explicitly_disposed_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// The return type is `owned Resource`, not `Resource` — REQUIRED as of v0.307
+// and load-bearing for this row. §28.3's announcement table row 4 admits only
+// a RECEIVER-SOURCED BORROW through a plain concrete class return, and an
+// `owned` parameter is neither receiver-sourced nor a borrow: returning it is
+// a transfer, which is spelled `owned`. The diagnostic says so itself
+// ("declare the return type `owned` to transfer ownership to the caller").
+//
+// The row originally spelled the plain return and was admitted pre-v0.307.
+// `fe95b173` implemented row 4 and it became a compile error. The row's axis
+// — that an owned parameter may be discharged by returning it — is unchanged
+// and still pinned; only the spelling of the transfer moved.
+// per §28.3 announcement table row 4, §28.8, v0.307
 BEZEL_TEST(own_param, owned_param_returned_clean) {
     auto r = parseAndCheckOwnership(wrap(
-        "public method Pass(owned r: Resource): Resource "
+        "public method Pass(owned r: Resource): owned Resource "
         "  return r; "
         "end Pass;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
