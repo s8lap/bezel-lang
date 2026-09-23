@@ -69,11 +69,34 @@ BEZEL_TEST(own_escape, return_member_call_on_param_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_escape, return_bare_local_not_borrow_escape) {
-    // `return c;` where c is a plain `var` is a discharge (the local's
-    // ownership transfers to the caller); not a borrow escape.
+// FLIPPED by `fe95b173` (§28.3 announcement table row 4). The old expectation
+// — that `return c;` through a PLAIN `Connection` return is a move-out — is
+// refuted by the spec twice over: row 4 admits only a receiver-sourced borrow
+// through a plain concrete class/interface return (§28.3, and the worked
+// interface/implementation example at spec line 1945), and §28.6's fresh-value
+// rule states that "a fresh literal returned through a non-`owned` instance
+// return is rejected exactly as any freshly-produced owned value is".
+// Ownership transfers only through an `owned` return — which the diagnostic
+// itself names as the remedy, and which the control row below pins.
+BEZEL_TEST(own_escape, return_bare_local_rejected_row4_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(): Connection "
+        "  var c := new Connection(); "
+        "  return c; "
+        "end Take;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Pin the SPECIFIC rule, not a bare section number — a section number is
+    // the #4716 vacuous shape (it matches surrounding prose, so an unrelated
+    // rejection satisfies it).
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "may return only a receiver-sourced borrow"));
+}
+
+// The remedy the row-4 diagnostic names, pinned so the rejection above cannot
+// be "fixed" by making the whole shape inexpressible.
+BEZEL_TEST(own_escape, return_bare_local_accepted_through_owned_return_28_8) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Take(): owned Connection "
         "  var c := new Connection(); "
         "  return c; "
         "end Take;"));
@@ -504,19 +527,22 @@ BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
         r, "§28.3 borrow-lifetime rule"));
 }
 
-// §28.3 (#1960 POSITIVE control — must NOT be over-rejected): a bare-identifier
-// return of a plain `var` owned local is a MOVE-OUT (the ownership transfers to
-// the caller), not a borrow escape. Duplicates return_bare_local_not_borrow_
-// escape's intent to pin that the relaxed gate did not perturb the move-out
-// path (handleReturn's earlier bare-identifier fast-path handles it before this
-// check ever runs).
-BEZEL_TEST(own_escape, return_bare_plain_var_still_moveout_1960) {
+// §28.3 (#1960): this row was written as a POSITIVE control against
+// over-rejection, asserting that a bare-identifier return of a plain `var`
+// owned local is a move-out. `fe95b173` reversed that, and the spec is on the
+// fix's side — see return_bare_local_rejected_row4_28_3 above for the two
+// citations. The row is KEPT rather than deleted because its axis is still
+// worth pinning: it is the same repro as that row, so if a future change ever
+// re-admits the shape, both fail together and the disagreement is visible.
+BEZEL_TEST(own_escape, return_bare_plain_var_rejected_row4_1960) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(): Connection "
         "  var c := new Connection(); "
         "  return c; "
         "end Take;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "may return only a receiver-sourced borrow"));
 }
 
 // ===========================================================================

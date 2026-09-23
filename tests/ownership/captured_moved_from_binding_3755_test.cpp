@@ -446,14 +446,46 @@ BEZEL_TEST(own_captured_moved_from_3755, lambda_body_local_shadow_accepted_28_3)
     BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
 }
 
-// A BORROWED (plain, non-`owned`) parameter captured by a closure. It carries
-// no ownership obligation, is never MovedFrom, and stays accepted.
+// A BORROWED (plain, non-`owned`) parameter captured by a closure carries no
+// ownership obligation and is never MovedFrom, so THIS rule stays silent.
+//
+// The original row stored the closure into a FIELD and asserted
+// `!hasErrors()`. `ac2c7c6e` (#4709) then made that shape a §27.5 escape —
+// correctly: `p`'s source is the call, which the field necessarily outlives,
+// and a function type announces no source set, so no caller can bound the
+// escaping borrow. The row was red not because its axis changed but because
+// its oracle was over-broad: `!hasErrors()` catches EVERY rule, including ones
+// the row is not about. Its sibling `lambda_body_local_shadow_accepted_28_3`
+// got this right by also asserting `!rejectsMovedFromCapture(...)`.
+//
+// Split in two, so each row is load-bearing on exactly one rule.
+
+// (a) The original axis, on a NON-escaping capture: a plain borrow parameter
+// captured by a closure that stays local is not a moved-from capture.
 BEZEL_TEST(own_captured_moved_from_3755, borrow_param_capture_accepted_28_3) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Take(p: R) "
+        "  var f := lambda(): int => p.V(); "
+        "  _ := f(); "
+        "end Take; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
+}
+
+// (b) The field-store shape #4709 now rejects. Pinned on the §27.5 escape
+// rule specifically — and on `rejectsMovedFromCapture` being FALSE, which is
+// the division of labour: the escape rule owns this, the moved-from rule does
+// not, and a future widening of either must not silently take it over.
+BEZEL_TEST(own_captured_moved_from_3755,
+           borrow_param_capture_field_store_escapes_27_5) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(p: R) "
         "  this.h := lambda(): int => p.V(); "
         "end Take; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "a plain (borrowing) parameter"));
+    BEZEL_EXPECT_FALSE(rejectsMovedFromCapture(r, "p"));
 }
 
 // --- The boundary row: the literal is created BEFORE the move -------------
