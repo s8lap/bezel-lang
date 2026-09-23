@@ -102,7 +102,7 @@ class C
     return;
   end LogAsync;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
     finally
@@ -134,7 +134,7 @@ class C
     return;
   end Cleanup;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield return 2;
@@ -245,7 +245,7 @@ class C
     return n;
   end Val;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       var v := await Val(3);
       yield return v;
@@ -278,7 +278,7 @@ class C
     C.logged := C.logged + 1;
   end Log;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     yield return 3;
     try
       throw new Exception("oops");

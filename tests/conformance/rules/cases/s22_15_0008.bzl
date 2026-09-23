@@ -21,5 +21,5 @@ public choice Basket
 end Basket;
 
 public abstract class Ops
-  public abstract pure method MakeBasket(): Basket;
+  public pure abstract method MakeBasket(): Basket;
 end Ops;

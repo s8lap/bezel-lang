@@ -3,7 +3,7 @@
 // CAPTURING a catch-arm binding in an async iterator body leaked the captured
 // exception object plus the lambda-side capture cell once per enumeration.
 //
-//     public async static method Gen(): IAsyncEnumerable<int>
+//     public static async method Gen(): IAsyncEnumerable<int>
 //       var a := 0;
 //       var b := 0;
 //       try
@@ -119,7 +119,7 @@ BEZEL_TEST(async_iterator_catch_arm_capture_cell_reclaim_3507,
         "module M; import System; import System.Collections.Generic; "
         "import System.Threading.Tasks; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    var a := 0; "
         "    var b := 0; "
         "    try "
@@ -160,7 +160,7 @@ BEZEL_TEST(async_iterator_catch_arm_capture_cell_reclaim_3507,
     BEZEL_EXPECT_EQ(checkedOut(
         "module M; import System; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    var a := 0; "
         "    var b := 0; "
         "    try "
@@ -233,7 +233,7 @@ BEZEL_TEST(async_iterator_catch_arm_capture_cell_reclaim_3507,
         "module M; import System; import System.Collections.Generic; "
         "import System.Threading.Tasks; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    var a := 0; "
         "    var b := 0; "
         "    try "

@@ -66,7 +66,7 @@ const char* kAsyncRes =
     "end AsyncRes; ";
 const char* kGen3 =
     "class C "
-    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "  public static async method Gen(): IAsyncEnumerable<int> "
     "    await using var r := new AsyncRes(); "
     "    yield return 1; yield return 2; yield return 3; "
     "  end Gen; "
@@ -256,7 +256,7 @@ BEZEL_TEST(async_iter_early_abandonment_dispose_1525,
     auto r = runAot(
         "module M; import System.Threading; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    await using var scope := new TaskScope(); "
         "    yield return 1; "
         "    await scope.Join(); "

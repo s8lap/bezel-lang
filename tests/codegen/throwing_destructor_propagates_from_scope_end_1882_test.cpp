@@ -340,7 +340,7 @@ BEZEL_TEST(throwing_destructor_propagates_from_scope_end_1882,
         "  destructor throw new Fault(); end destructor; "
         "end AsyncRes; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    await using var r := new AsyncRes(); "
         "    yield return 1; yield return 2; yield return 3; "
         "  end Gen; "

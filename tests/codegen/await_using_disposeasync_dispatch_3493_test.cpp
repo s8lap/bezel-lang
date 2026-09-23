@@ -49,12 +49,12 @@ int run(const std::string& prog) {
 const char* kHier =
     "class Base: IAsyncDisposable public static bda: int := 0; "
     "  public static bdt: int := 0; "
-    "  public virtual async method DisposeAsync(): Task "
+    "  public async virtual method DisposeAsync(): Task "
     "    Base.bda := Base.bda + 1; end DisposeAsync; "
     "  destructor Base.bdt := Base.bdt + 1; end destructor; end Base; "
     "class Der: Base public static dda: int := 0; "
     "  public static ddt: int := 0; "
-    "  public override async method DisposeAsync(): Task "
+    "  public async override method DisposeAsync(): Task "
     "    Der.dda := Der.dda + 1; end DisposeAsync; "
     "  destructor Der.ddt := Der.ddt + 1; end destructor; end Der; ";
 }  // namespace
@@ -191,11 +191,11 @@ BEZEL_TEST(await_using_disposeasync_dispatch_3493, residual_derived_owned_field_
         "  public constructor() Cell.n:=Cell.n+1; end constructor; "
         "  destructor Cell.n:=Cell.n-1; end destructor; end Cell; "
         "class Base: IAsyncDisposable "
-        "  public virtual async method DisposeAsync(): Task end DisposeAsync; "
+        "  public async virtual method DisposeAsync(): Task end DisposeAsync; "
         "end Base; "
         "class Der: Base public owned _d: Cell; "
         "  public constructor() _d := new Cell(); end constructor; "
-        "  public override async method DisposeAsync(): Task end DisposeAsync; "
+        "  public async override method DisposeAsync(): Task end DisposeAsync; "
         "end Der; "
         "class C "
         "  public static async method Run(): Task "

@@ -23,7 +23,7 @@
 //     named-property sibling of #3641's already-fixed indexer gap).
 //   - TypeResolution_Checks.cpp's `pure`-on-auto-property redundancy check
 //     (found auditing every PropertyBodyKind::Auto reader for the same
-//     hazard: `abstract pure property` was false-rejected as "redundant"
+//     hazard: `pure abstract property` was false-rejected as "redundant"
 //     with the identical reasoning the check's own comment already carves
 //     out for INTERFACE properties, just never extended to a class's own
 //     abstract shorthand).
@@ -245,10 +245,10 @@ BEZEL_TEST(sema_abstract_property_shorthand_4018_4020,
     BEZEL_EXPECT_EQ(runProg(
         "module M; "
         "public abstract class BasePure4018 "
-        "  public abstract pure property Name: string; "
+        "  public pure abstract property Name: string; "
         "end BasePure4018; "
         "class DPure4018 : BasePure4018 "
-        "  public override pure property Name: string => \"pure\"; "
+        "  public pure override property Name: string => \"pure\"; "
         "end DPure4018; "
         "class C "
         "  public static method Main(): int "

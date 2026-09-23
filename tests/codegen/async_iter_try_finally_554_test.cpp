@@ -113,7 +113,7 @@ module M;
 class C
   public static finallyRan: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield return 2;
@@ -148,7 +148,7 @@ module M;
 class C
   public static finallyRan: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield return 2;
@@ -183,7 +183,7 @@ module M;
 class C
   public static finallyRan: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       throw new Exception("test");
@@ -221,7 +221,7 @@ class C
     return x;
   end Compute;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       var a := await Compute(1);
       yield return a;
@@ -259,7 +259,7 @@ class C
     C.logged := C.logged + 1;
   end Log;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     yield return 3;
     try
       throw new Exception("oops");
@@ -319,7 +319,7 @@ class C
     C.finallyRan := C.finallyRan + 1;
   end LogAsync;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 4;
     finally
@@ -346,7 +346,7 @@ BEZEL_TEST(async_iter_try_finally_554, yield_in_try_with_catch_rejected) {
     BEZEL_EXPECT_EQ(compileFails(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
     catch
@@ -367,7 +367,7 @@ BEZEL_TEST(async_iter_try_finally_554, yield_in_catch_arm_body_rejected) {
     BEZEL_EXPECT_EQ(compileFails(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       throw new Exception("x");
     catch
@@ -388,7 +388,7 @@ BEZEL_TEST(async_iter_try_finally_554, yield_in_finally_block_rejected) {
     BEZEL_EXPECT_EQ(compileFails(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
     finally
       yield return 1;
@@ -421,7 +421,7 @@ class C
     return 42;
   end MayFail;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     var x: int := 0;
     try
       x := await MayFail(true);
@@ -458,7 +458,7 @@ module M;
 class C
   public static finallyRan: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       throw new Exception("before yield");
       yield return 1;
@@ -495,7 +495,7 @@ module M;
 class C
   public static cleanups: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
     finally
@@ -532,7 +532,7 @@ module M;
 class C
   public static cleanups: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       try
         yield return 1;
@@ -569,7 +569,7 @@ module M;
 class C
   public static order: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       try
         yield return 1;
@@ -602,7 +602,7 @@ BEZEL_TEST(async_iter_try_finally_554, async_iterator_plain_return_rejected_721)
     BEZEL_EXPECT_TRUE(compileFails(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     yield return 1;
     return;
   end Gen;
@@ -616,7 +616,7 @@ BEZEL_TEST(async_iter_try_finally_554, async_iterator_yield_break_ok_721) {
     BEZEL_EXPECT_FALSE(compileFails(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     yield return 1;
     yield break;
   end Gen;
@@ -708,7 +708,7 @@ BEZEL_TEST(async_iter_try_finally_554, async_yield_break_runs_finally_721) {
 module M;
 class C
   public static ran: int := 0;
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield break;

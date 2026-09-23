@@ -29,7 +29,7 @@ BEZEL_TEST(async_iter_var_frame_width_833, class_element_no_crash) {
         "  public constructor(v: int) Value := v; end; "
         "  destructor end destructor; end Box; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<Box> "
+        "  public static async method Gen(): IAsyncEnumerable<Box> "
         "    yield return new Box(4); yield return new Box(5); end Gen; "
         "  public static async method Main(): Task<int> "
         "    var sum := 0; "
@@ -42,7 +42,7 @@ BEZEL_TEST(async_iter_var_frame_width_833, class_element_no_crash) {
 BEZEL_TEST(async_iter_var_frame_width_833, string_element) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public async static method Gen(): IAsyncEnumerable<string> "
+        "  public static async method Gen(): IAsyncEnumerable<string> "
         "    yield return \"hi\"; yield return \"abc\"; end Gen; "
         "  public static async method Main(): Task<int> "
         "    var n := 0; "
@@ -55,7 +55,7 @@ BEZEL_TEST(async_iter_var_frame_width_833, string_element) {
 BEZEL_TEST(async_iter_var_frame_width_833, long_element) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public async static method Gen(): IAsyncEnumerable<long> "
+        "  public static async method Gen(): IAsyncEnumerable<long> "
         "    yield return 5000000000L; end Gen; "
         "  public static async method Main(): Task<int> "
         "    var found := 0; "

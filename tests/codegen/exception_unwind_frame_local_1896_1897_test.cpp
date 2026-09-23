@@ -182,7 +182,7 @@ BEZEL_TEST(exception_unwind_frame_local_1896, async_iterator_owned_local_dispose
     auto r = runAotChecked(
         std::string("module M; ") + kResource +
         "class Program "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    var r := new Resource(); "         // plain owned async-iter frame local
         "    await Task.Delay(0); "
         "    yield return 1; "

@@ -57,7 +57,7 @@ BEZEL_TEST(async_iter_frame_spill_747, for_over_array_yields_all_elements) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
 module M;
 class C
-  public async static method Gen(items: Array<int>): IAsyncEnumerable<int>
+  public static async method Gen(items: Array<int>): IAsyncEnumerable<int>
     for var x in items do
       yield return x;
     end;
@@ -79,7 +79,7 @@ BEZEL_TEST(async_iter_frame_spill_747, for_over_ienumerable_no_segfault) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
 module M;
 class C
-  public async static method Gen(items: IEnumerable<int>): IAsyncEnumerable<int>
+  public static async method Gen(items: IEnumerable<int>): IAsyncEnumerable<int>
     for var x in items do
       yield return x;
     end;
@@ -101,7 +101,7 @@ BEZEL_TEST(async_iter_frame_spill_747, loop_var_survives_suspend) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
 module M;
 class C
-  public async static method Gen(items: Array<int>): IAsyncEnumerable<int>
+  public static async method Gen(items: Array<int>): IAsyncEnumerable<int>
     for var x in items do
       yield return x;
       yield return x * 10;
@@ -124,7 +124,7 @@ BEZEL_TEST(async_iter_frame_spill_747, range_for_in_async_iter_unregressed) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
 module M;
 class C
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     for var i in 1..3 do
       yield return i;
     end;

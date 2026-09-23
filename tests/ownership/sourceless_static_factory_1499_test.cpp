@@ -168,7 +168,7 @@ bool hasStaticPropertyRemedyError(const bezel::test::OwnershipResult& r) {
 BEZEL_TEST(sourceless_static_factory_1499, static_owned_field_reexposed_by_method_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class Config "
-        "  public static readonly owned _instance: Config := new Config(); "
+        "  public static owned readonly _instance: Config := new Config(); "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "  public static method Instance(): Config => _instance; "
@@ -183,7 +183,7 @@ BEZEL_TEST(sourceless_static_factory_1499, static_owned_field_reexposed_by_metho
 BEZEL_TEST(sourceless_static_factory_1499, static_owned_field_reexposed_by_method_blockbody_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class Config "
-        "  public static readonly owned _instance: Config := new Config(); "
+        "  public static owned readonly _instance: Config := new Config(); "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "  public static method Instance(): Config return _instance; end Instance; "

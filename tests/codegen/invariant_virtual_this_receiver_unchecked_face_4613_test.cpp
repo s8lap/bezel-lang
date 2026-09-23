@@ -19,7 +19,7 @@
 // `bezelc --checked-contracts` on the pre-fix compiler (this file's own
 // FAIL-WITHOUT run, and identically on `origin/main`):
 //
-//   * `invariant(Ok());` over a `public virtual pure method Ok()` — unbounded
+//   * `invariant(Ok());` over a `public pure virtual method Ok()` — unbounded
 //     self-recursion in `bz$V.C$Ok`, one frame per level until the stack died:
 //     SIGSEGV, exit 139, where §22.16 requires ContractViolationException.
 //   * a public method that drives its instance through a state its own
@@ -70,7 +70,7 @@ const char* kVirtualClauseCallee =
     "  public k: int := 1; "
     "  invariant(Ok()); "
     "  public constructor(v: int) k := v; end constructor; "
-    "  public virtual pure method Ok(): bool return k > 0; end Ok; "
+    "  public pure virtual method Ok(): bool return k > 0; end Ok; "
     "  public static method Main(): int "
     "    var r: int := 0; "
     "    try "
@@ -91,8 +91,8 @@ const char* kVirtualClauseCalleeTransitive =
     "  public k: int := 1; "
     "  invariant(Ok()); "
     "  public constructor(v: int) k := v; end constructor; "
-    "  public virtual pure method Ok(): bool return Helper(); end Ok; "
-    "  public virtual pure method Helper(): bool return k > 0; end Helper; "
+    "  public pure virtual method Ok(): bool return Helper(); end Ok; "
+    "  public pure virtual method Helper(): bool return k > 0; end Helper; "
     "  public static method Main(): int "
     "    var r: int := 0; "
     "    try "
@@ -112,7 +112,7 @@ const char* kVirtualClauseCalleeSatisfied =
     "  public k: int := 1; "
     "  invariant(Ok()); "
     "  public constructor(v: int) k := v; end constructor; "
-    "  public virtual pure method Ok(): bool return k > 0; end Ok; "
+    "  public pure virtual method Ok(): bool return k > 0; end Ok; "
     "  public static method Main(): int "
     "    using var c := new C(7); "
     "    return c.k; "
