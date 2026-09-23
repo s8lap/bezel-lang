@@ -12950,7 +12950,44 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
         isOwningTypeNameHead(returnType_->name->parts.front()))
         return;  // owning-type return: checkBorrowReturnedThroughOwningType
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
-    if (!ownedArgSourceIsBorrow(e)) return;
+    if (!ownedArgSourceIsBorrow(e)) {
+        // §28.3 announcement table row 4 (v0.307): an instance method's
+        // non-`owned` plain concrete class/interface return admits ONLY a
+        // receiver-sourced borrow — "return only a receiver-(parameter-)
+        // sourced borrow; a fresh owned value is rejected (§28.6) — declare
+        // `owned`." `ownedArgSourceIsBorrow(e) == false` does not by itself
+        // mean `e` is a fresh owned producer — its own header documents that
+        // it also answers false for shapes it does not classify at all (a
+        // CallExpr result, deferred separately to #4009's "relayed call"
+        // gap; see its own comment above the ConditionalExpr arm). Scope
+        // this rejection to the two shapes this fix's spec-cited corpus
+        // cases pin — a direct `new` expression (s28_3_0039) and a bare
+        // identifier naming a tracked local currently in the OWNED state
+        // (s28_3_0029) — so the CallExpr-relay gap is left untouched rather
+        // than guessed at.
+        bool isFreshOwnedProducer = false;
+        if (dynamic_cast<const ast::NewExpr*>(&e)) {
+            isFreshOwnedProducer = producerState(e) == OwnershipState::Owned;
+        } else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (auto* st = lookupState(rid->name))
+                // Exclude a maybe-consumed local (K7.4 join): that is a
+                // narrower, separately-diagnosed hazard (checkRead's
+                // maybe-consumed report), not this rule's business — mirrors
+                // the `st.state == Owned && st.maybeConsumed` gating already
+                // established at the reassignment site above in this file.
+                isFreshOwnedProducer =
+                    st->state == OwnershipState::Owned && !st->maybeConsumed;
+        }
+        if (!isFreshOwnedProducer) return;
+        report(
+            Severity::Error, e.span.begin,
+            "an instance method whose declared return type is a plain "
+            "concrete class or interface type may return only a "
+            "receiver-sourced borrow (§28.3 announcement table row 4) — a "
+            "fresh owned value is rejected here; declare the return type "
+            "`owned` to transfer ownership to the caller");
+        return;
+    }
     // Is the borrow's root a plain (non-`owned`) parameter? Only then is the
     // return non-receiver-sourced. `this`/`base` and receiver field reads are
     // admitted (their root is not a ParameterSymbol).
