@@ -1537,6 +1537,21 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             return false;
         }
         if (d->kind == ast::TypeDeclKind::Record) {
+            // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only
+            // record has no well-defined default value (§17.11's "Not
+            // defaultable" list names it directly) — the §14.2
+            // value-substitution-is-default rule is therefore unsatisfiable
+            // for such a substitution. Short-circuit BEFORE the per-field
+            // walk below (mirrors `Resolver::argSatisfiesNew`'s sibling fix
+            // in TypeResolution_Checks.cpp; the two paths answer the same
+            // question, just at different passes). The fields may all be
+            // defaultable value types (the cycle-23 s9_9_0003 case is
+            // exactly that), and the per-field walk would otherwise say
+            // "satisfied" and silently admit the substitution.
+            if (recordIsConstructorOnly(d)) {
+                decided = true;
+                return false;
+            }
             // A positional record satisfies new() iff default(R) is well-defined
             // — every field has a well-defined default (§14.2 / §17.11): reject a
             // non-nullable reference field.

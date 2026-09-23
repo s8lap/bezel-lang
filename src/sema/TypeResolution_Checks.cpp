@@ -8457,6 +8457,23 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             return false;
         }
         if (d->kind == ast::TypeDeclKind::Record) {
+            // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only
+            // record has no well-defined default value (§17.11's
+            // "Not defaultable" list names it directly) — the §14.2
+            // value-substitution-is-default rule is therefore unsatisfiable
+            // for such a substitution, regardless of how defaultable every
+            // individual field happens to be. Short-circuit BEFORE the
+            // field walk below: a constructor-only record's storage can all
+            // be defaultable value types (the cycle-23 s9_9_0003 case is
+            // exactly that — `record Port { readonly property Value: int; … }`)
+            // and the per-field walk would otherwise say "satisfied" and
+            // silently admit the substitution. See the parallel
+            // short-circuit at `typeHasNoDefault` (this file) for the
+            // `default(R)` site — the two share the same authority.
+            if (recordIsConstructorOnly(d)) {
+                decided = true;
+                return false;
+            }
             // A record (positional, body-only, or combined-form — §9.3)
             // satisfies new() iff default(R) is well-defined — every
             // DECLARED field has a well-defined default (§14.2 / §17.11).
@@ -9248,6 +9265,28 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
 
 bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
                       const common::RecordSubstEnv* incoming) {
+    // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only record has
+    // no well-defined default (§17.11's "Not defaultable" list names it
+    // directly), so the value-recursion below never has to find a
+    // non-defaultable field — the record IS already non-defaultable at the
+    // type level. Bail out before the walk; the per-field recursion
+    // `typeHasNoDefaultWalk` runs only when the record itself is
+    // defaultable, so this is a SHORT-CIRCUIT, not a duplicated check.
+    //
+    // Note the SUBSTITUTION interaction (§14.2's "value substitution is
+    // equivalent to `default(T)`" rule — the cycle-23 s9_9_0003 row): the
+    // property is carried on the record's DECLARATION, not on its
+    // instantiation, so checking it off `t->declaration` (the bare
+    // declaration-side TypeSymbol) is correct regardless of `genericArgs`.
+    // The shared call sites (`defaultIllFormed` at §17.11, `argSatisfiesNew`
+    // at §14.2, and §22.10's inline-array-of-T defaultability check) all
+    // reach the same `default(R)` semantics, so they all close at this one
+    // entry point.
+    if (t && !t->nullable && t->kind == TypeRef::Kind::Named && t->declaration &&
+        t->declaration->kind == ast::TypeDeclKind::Record &&
+        recordIsConstructorOnly(t->declaration)) {
+        return true;
+    }
     std::unordered_set<const TypeRef*> seen;
     return typeHasNoDefaultWalk(t, incoming, ctx, seen);
 }

@@ -3425,7 +3425,47 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // ref field) satisfy new(); conservatively
                                         // accept — the exhaustive check is in
                                         // Resolver::argSatisfiesNew. Defer (decided=false).
-                                        continue;
+                                        //
+                                        // fix #4699 (§9.9, v0.307, proposal 0107):
+                                        // a constructor-only record is the ONE
+                                        // record case the previous deferral
+                                        // dropped on the floor — the §14.2
+                                        // value-substitution-is-default rule
+                                        // (§17.11's "Not defaultable" list
+                                        // names it directly) makes the
+                                        // substitution unsatisfiable. The
+                                        // shared `sema::typeHasNoDefault`
+                                        // authority closes it: it short-circuits
+                                        // before its per-field walk when the
+                                        // record itself is constructor-only.
+                                        // See the parallel fix at
+                                        // `Resolver::argSatisfiesNew`
+                                        // (TypeResolution_Checks.cpp).
+                                        if (recordIsConstructorOnly(argDecl)) {
+                                            decided = true;
+                                            satisfied = false;
+                                            // Override the generic §14.2
+                                            // report (see `report` lambda
+                                            // above) with one that names the
+                                            // §9.9 reason — a constructor-only
+                                            // record has no well-defined
+                                            // default value, so the
+                                            // substitution is unsatisfiable
+                                            // not because `T` lacks a
+                                            // parameterless ctor but because
+                                            // the property §9.9 names
+                                            // forbids producing one at all.
+                                            report("new()",
+                                                   std::string(" — `") +
+                                                       argNameOf(argRef) +
+                                                       "` is a constructor-only "
+                                                       "record (\xC2\xA7""9.9), "
+                                                       "which has no well-defined "
+                                                       "default value");
+                                            continue;
+                                        } else {
+                                            continue;
+                                        }
                                     }
                                     // §35.10 (v0.200, #2044): "Choices never
                                     // satisfy the value-type arm — `default(C)`

@@ -1588,6 +1588,49 @@ bool propertyGetterIsPure(const PropertySymbol* ps);
 // sema. Route new callers through this rather than re-deriving it again.
 bool recordIsPositional(const TypeSymbol* rec);
 
+// §9.9 (v0.307, proposal 0107, fix #4699): true when `rec` is
+// constructor-only, the §3.6 derived property that triggers every §9.9
+// consequence (`default(R)` rejection at §17.11, `new T()` rejection at
+// §14.2's `where T: new()`, default initialization of `R`-typed storage at
+// §7.9/§15.1, the `with` rejection at §9.5, etc.). A record is
+// constructor-only when it declares a constructor carrying a contract clause
+// (§22.16 — a `requires` clause, an `ensures` clause, or both) on ANY
+// constructor of the record, of any visibility, in any recorded tier.
+//
+// LOCAL READING (the path the cycle-23 failing rows exercise): the AST
+// `ast::RecordDecl` carries its `members` as a flat list of `ast::MemberDecl`
+// subclasses, and `ast::ConstructorDecl::contractClauses` carries the clause
+// vector (§22.16). The symbol-side `decl` points at the same `RecordDecl`,
+// so `dynamic_cast<const ast::RecordDecl*>(rec->decl)->members` enumerates
+// every declared constructor in source order.
+//
+// IMPORTED READING: per §2.8.2 the property is part of the public contract
+// and is supposed to be carried in the artifact interface (the §3.6 rule 3
+// reason this is a property rather than a local rule). The carriage
+// infrastructure is NOT built yet (issue #3301's broader impl-catch-up
+// tracks it; the cycle-23 corpus does not exercise the imported-clause case
+// — only LOCAL records appear in the failing rows). An imported record's
+// `ConstructorSymbol::decl` is null (cross-module AST is unavailable), so
+// this predicate conservatively returns false for an imported record until
+// that wire channel lands: it never INCORRECTLY says "no contract clause"
+// for a locally-declared constructor (the local AST is always available
+// when `rec->decl` is non-null), and an imported constructor-only record
+// quietly staying defaultable is the documented gap, not a silent accept
+// the cycle-23 corpus can detect.
+//
+// POSITIONAL READING: a record declaring POSITIONAL fields may not declare
+// such a constructor at all (#4702's compile error in `run()`), so a
+// positional record CANNOT be constructor-only. Returning false for the
+// positional case keeps the predicate consistent with the declaration-site
+// rule already shipped.
+//
+// Called from `ExprTC::defaultIllFormed` (§17.11), `Resolver::argSatisfiesNew`
+// (§14.2), and `isSevenNineStrictField`/`isSevenNineStrictAutoProp`/
+// `isSevenNineStrictStaticField` (§7.9) — the three failure sites the
+// cycle-23 corpus targets — and from no other site yet. Route new callers
+// through this rather than re-deriving.
+bool recordIsConstructorOnly(const TypeSymbol* rec);
+
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body
 // auto-property's type for the combined form) is an admissible component type

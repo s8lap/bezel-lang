@@ -1719,6 +1719,39 @@ bool recordIsPositional(const TypeSymbol* rec) {
     return false;
 }
 
+// §9.9 (v0.307, proposal 0107, fix #4699): see Symbol.hpp for the full
+// reading. Local-only check: walk the AST `TypeDecl::members` for any
+// `ConstructorDecl` whose `contractClauses` is non-empty. The local AST is
+// always available for a record actually declared in the current module
+// (`rec->decl` is the `ast::TypeDecl*`); the null-decl fallback is the
+// cross-module (imported) case, for which this returns false conservatively
+// (the wire-channel carriage is not yet built — see Symbol.hpp's
+// IMPORTED READING).
+//
+// fix #4699 (cycle 23): landed as the predicate behind the three
+// downstream checks the corpus targets — `default(R)` at §17.11,
+// `where T: new()` substitution at §14.2, and default-initialized `R`-typed
+// storage at §7.9.
+bool recordIsConstructorOnly(const TypeSymbol* rec) {
+    if (!rec) return false;
+    if (rec->kind != ast::TypeDeclKind::Record) return false;
+    // A positional record may not declare a clause-bearing constructor at
+    // all (the declaration-site rule from fix #4702 in TypeResolution.cpp's
+    // `checkRecordCombinedFormContractClauseConstructors`), so it cannot
+    // be constructor-only. Both sources are consulted for symmetry with
+    // `recordIsPositional` above.
+    if (recordIsPositional(rec)) return false;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl);
+    if (!td) return false;  // imported — see IMPORTED READING in Symbol.hpp
+    for (const auto& m : td->members) {
+        if (!m) continue;
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
+            if (!cd->contractClauses.empty()) return true;
+        }
+    }
+    return false;
+}
+
 // §9.2: auto-equality eligibility for a body record. The spec's membership
 // rule ("A body-only record receives auto-generated `=`, `<>`, `GetHashCode`,
 // and `ToString` over its auto-properties … when every member of the record

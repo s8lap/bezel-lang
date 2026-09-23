@@ -5125,6 +5125,30 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "it has no well-defined zero value; declare a "
                         "zero-valued constant (§17.11)");
                 } else if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                           rt->declaration &&
+                           rt->declaration->kind == ast::TypeDeclKind::Record &&
+                           recordIsConstructorOnly(rt->declaration)) {
+                    // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only
+                    // record has no well-defined zero value (§17.11's
+                    // "Not defaultable" list names it directly — alongside
+                    // "non-nullable reference types", but the reason is the
+                    // record's own property, not its field types). The
+                    // generic record arm below would otherwise misclassify
+                    // the rejection as "a record any of whose fields is a
+                    // non-nullable reference type" — false for a
+                    // constructor-only record whose fields are all
+                    // defaultable values. Specific branch above the generic
+                    // arm so the diagnostic matches the rule.
+                    ctx_.diagnostics().report(
+                        Severity::Error, de->span.begin,
+                        "`default(T)` is a compile error for the "
+                        "constructor-only record `" +
+                        std::string(rt->declaration->name) +
+                        "` — the property claims every value is produced by "
+                        "a constructor call, so there is no zero value to "
+                        "materialize; the remedy is a constructor call "
+                        "(\xC2\xA7""9.9, \xC2\xA7""17.11)");
+                } else if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
                            rt->declaration == ctx_.builtinClassSym("Range")) {
                     // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a
                     // compile error — the all-zeroes `Range<T>` would have step=0,
