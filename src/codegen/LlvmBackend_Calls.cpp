@@ -13615,17 +13615,36 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             {rng, builder_.getInt32(0),
                              builder_.getInt32(2147483647)});
                     }
+                    // stdlib §2.7: `Next(maxValue)` is documented
+                    // "0..<maxValue; maxValue < 0:
+                    // ArgumentOutOfRangeException". The guard is emitted
+                    // BEFORE the call, the same order `Math.DivRem` (#3580)
+                    // and `/` (§6.1) emit their zero-divisor trap in, so the
+                    // fault is raised rather than a nonsense range reaching
+                    // `bz_random_next_int`.
                     if (mname == "Next" && call.args.size() == 1 && call.args[0].value) {
                         llvm::Value* hi = lowerExpr(*call.args[0].value);
+                        if (!hi) return nullptr;
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(
+                                hi, llvm::ConstantInt::get(hi->getType(), 0)),
+                            "ArgumentOutOfRangeException");
                         auto* fn = declareC("bz_random_next_int", i32(),
                                             {ptrTy(), i32(), i32()});
                         return builder_.CreateCall(fn,
                             {rng, builder_.getInt32(0), hi});
                     }
+                    // stdlib §2.7: `Next(minValue, maxValue)` is documented
+                    // "minValue > maxValue: ArgumentOutOfRangeException".
+                    // `minValue = maxValue` is the documented empty range,
+                    // not a fault, so the test is strictly greater-than.
                     if (mname == "Next" && call.args.size() == 2 &&
                         call.args[0].value && call.args[1].value) {
                         llvm::Value* lo = lowerExpr(*call.args[0].value);
                         llvm::Value* hi = lowerExpr(*call.args[1].value);
+                        if (!lo || !hi) return nullptr;
+                        emitGuardThrow(builder_.CreateICmpSGT(lo, hi),
+                                       "ArgumentOutOfRangeException");
                         auto* fn = declareC("bz_random_next_int", i32(),
                                             {ptrTy(), i32(), i32()});
                         return builder_.CreateCall(fn, {rng, lo, hi});
