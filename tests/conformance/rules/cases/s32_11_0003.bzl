@@ -7,6 +7,7 @@
 //!   variadic symbol).
 //! cites: 32.11
 //! expect: accept
+//! issue: 4561
 module Conf;
 
 extern "libc"

@@ -8,6 +8,7 @@
 //! cites: 32.8
 //! expect: reject
 //! diagnostic: environment
+//! issue: 4671
 module Conf;
 
 extern "libc"

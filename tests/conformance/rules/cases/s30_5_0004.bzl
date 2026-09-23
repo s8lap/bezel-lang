@@ -9,6 +9,7 @@
 //! cites: 30.5, 28.3
 //! expect: reject
 //! diagnostic: marker-free
+//! issue: 4670
 module Conf;
 
 public class Widget

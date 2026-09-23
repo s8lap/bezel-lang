@@ -6,6 +6,7 @@
 //!   the declaration to the named symbol instead.
 //! cites: 32.11
 //! expect: accept
+//! issue: 4561
 module Conf;
 
 extern "libexample"

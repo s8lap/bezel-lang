@@ -5,6 +5,7 @@
 //! rule: Several declarations, of any mix of shapes, may bind one symbol.
 //! cites: 32.11
 //! expect: accept
+//! issue: 4561
 module Conf;
 
 extern "libcurl"
