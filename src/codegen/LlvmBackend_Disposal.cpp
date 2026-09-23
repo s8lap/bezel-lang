@@ -1565,6 +1565,16 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // nulled at the move (lowerMoveFromCollectionSlot), so the null-guard skips
     // it — no double-free. Unlike the owned-reference fields above there is no
     // single object to dispatch on; the field is a [N x ptr] sub-aggregate.
+    //
+    // fix #4552 (§15.1.1 / §28.4 v0.307, ruling #4388): "the array's auto-
+    // dispose pass disposes each non-null slot, in reverse slot order — the
+    // same order ... as the whole-value-reassignment pass of §15.3 ... one
+    // pass definition governs all four of this paragraph's endings [scope
+    // end, instance-field Dispose(), whole-value reassignment, static
+    // program exit]." This loop iterated 0..n-1 (establishment order); the
+    // reassignment pass (lowerOwningInlineArrayReassign,
+    // LlvmBackend_Stmts.cpp) already iterates N..1 for exactly this reason.
+    // Iterate in reverse to match.
     {
         llvm::StructType* st = classStruct(ts);
         for (const sema::Symbol* m : ts->members) {
@@ -1585,7 +1595,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             llvm::Value* fieldAddr =
                 builder_.CreateStructGEP(st, currentThis_, idx, "ioaf.addr");
             auto* arrTy = llvm::ArrayType::get(ptrTy(), n);
-            for (unsigned i = 0; i < n; ++i) {
+            for (unsigned fwd = 0; fwd < n; ++fwd) {
+                // fix #4552 (§15.1.1 v0.307): reverse slot order.
+                unsigned i = n - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, fieldAddr,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioaf.slot");
@@ -7581,9 +7593,18 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // "a move-only local's owned slots are auto-disposed at scope end").
         // Only registered for locals proven never transferred out, so this is the
         // single disposal of each slot's object (no double-free).
+        //
+        // fix #4552 (§15.1.1 v0.307, ruling #4388): "the array's auto-dispose
+        // pass disposes each non-null slot, in reverse slot order ... one
+        // pass definition governs all four of this paragraph's endings"
+        // (scope end included). This loop iterated 0..N-1 (establishment
+        // order); the reassignment pass (lowerOwningInlineArrayReassign,
+        // LlvmBackend_Stmts.cpp) already iterates N..1 for exactly this
+        // reason. Iterate in reverse to match.
         if (it->inlineOwnedArray) {
             auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
-            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+            for (unsigned fwd = 0; fwd < it->inlineSlotCount; ++fwd) {
+                unsigned i = it->inlineSlotCount - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, it->slot,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioa.slot");
@@ -7611,6 +7632,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // null the slot. The cell itself is freed separately by the boxedCellFree
         // that fires AFTER this. Non-escaping-gated at registration so the cell is
         // alive here and no escaping closure still references the elements.
+        //
+        // fix #4552 (§15.1.1 v0.307, ruling #4388): same reverse-slot-order
+        // fix as the plain `inlineOwnedArray` arm above — a boxed/captured
+        // local is disposed at the same "scope end" ending, just through
+        // heap-cell storage instead of a plain alloca.
         if (it->inlineOwnedArrayCell) {
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "ioac.cell");
@@ -7621,7 +7647,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCondBr(cellNull, afterBB, liveBB);
             builder_.SetInsertPoint(liveBB);
             auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
-            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+            for (unsigned fwd = 0; fwd < it->inlineSlotCount; ++fwd) {
+                unsigned i = it->inlineSlotCount - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, cell,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioac.slot");
