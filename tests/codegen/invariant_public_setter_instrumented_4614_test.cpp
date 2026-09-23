@@ -30,13 +30,16 @@
 // SCOPE OF THE FIX THIS FILE PINS. The instrumentation is emitted at the
 // three setter paths that live in `LlvmBackend_Assign.cpp` — the local
 // block-form / `set(owned)` named-property setter, and (by the same gate) the
-// `this`-receiver exemption. §22.16's auto-property row is NOT covered: a
+// `this`-receiver exemption. §22.16's auto-property row is NOT covered here: a
 // same-module `c.P := v` on a non-virtual auto-property lowers to a direct
 // backing-field store through `lvalueAddr` (LlvmBackend_Layout.cpp) and never
-// reaches a setter path at all. That residual, and the virtual/interface
-// dispatched setter (which needs the setter's own §22.16 unchecked face
-// before it can be instrumented without introducing an over-check), stay
-// recorded on #4614.
+// reaches a setter path at all. That residual was closed separately by
+// **#4646**, at the generic assignment arm of `lowerStmt` — see
+// `tests/codegen/invariant_auto_property_store_instrumented_4646_test.cpp`,
+// which reuses this file's `instrumentedSetterClass` gate so the two shapes
+// cannot drift apart. The VIRTUAL / interface-dispatched setter (which needs
+// the setter's own §22.16 unchecked face before it can be instrumented without
+// introducing an over-check) stays recorded on #4646.
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"

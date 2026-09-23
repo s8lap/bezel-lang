@@ -118,6 +118,55 @@ llvm::Value* Emitter::rescueUnitAssignRhs(llvm::Value* rhs,
 }
 
 
+// fix #4646 (§22.16, v0.307): the AUTO-PROPERTY row of §22.16's
+// instrumentation set.
+//
+// §22.16, verbatim:
+//
+//   "- **Entry and normal exit** of every `public` **setter** — block-form,
+//      auto-property, indexer, `set(owned)` alike. (Auto-property assignments
+//      inside constructors are backing-field stores, not accessor
+//      invocations, so construction does not double-check.)"
+//
+// #4614(b) emitted that row at `lowerPropertySetValue` — the path a BLOCK-FORM
+// setter's inlined body takes — and #4651 made the exported cross-module stub
+// the same checked face. Neither reaches an AUTO-property: a same-module
+// `c.P := v` on a non-virtual auto-property has no setter body at all, so
+// `computedSetterOf` returns null and `lowerPropertySet` declines; the store
+// falls through to the generic `lvalueAddr` arm of the AssignmentStmt lowering
+// and lands directly in the backing field. MEASURED on this HEAD before this
+// fix, with `--checked-contracts`, on the issue's own repro: 42 where §22.16
+// requires ContractViolationException (99) — a SILENT UNDER-CHECK, which is
+// the direction §22.16's observable-boundary property exists to prevent.
+//
+// This predicate answers whether an assignment target IS such a store, and
+// whose conjunction it evaluates. Every §22.16 and §13.6 question — release
+// mode, class kind, `static`, accessor visibility, a non-empty conjunction,
+// and the `this`-reentrancy exemption decided on the receiver's SYNTAX — is
+// deferred to `instrumentedSetterClass` (#4614(b)), deliberately: the two
+// setter shapes must not be able to drift apart, and re-deciding the
+// exemption here is exactly how a silent under-check becomes a loud
+// OVER-check (`this.P := v` inside an instance member is EXEMPT, and the
+// constructor's own `P := v` is the spelling §22.16's parenthetical names).
+//
+// Declines for a FIELD target (`ctx_.exprSymbol` yields a FieldSymbol, never a
+// PropertySymbol — §22.16 makes a public field no instrumentation point at
+// all) and for an INDEXER (its own row is reached through `lowerIndexerSet`).
+const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
+    const ast::Expr& target) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
+    if (!ps || ps->isIndexer) return nullptr;
+    // An IMPORTED property carries no `ast::PropertyDecl` (#2414); a null `pd`
+    // means "no §13.6 accessor-level refinement", which is what
+    // `setterInstrumentationClass` already documents its null-`pd` arm as. An
+    // imported property does not reach this path anyway — `lowerImportedProperty
+    // Set` claims that store first, and #4651's exported stub is its checked
+    // face.
+    return instrumentedSetterClass(
+        target, ps, dynamic_cast<const ast::PropertyDecl*>(ps->decl));
+}
+
+
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // fix #3377 / §28.3: a `using var` is a SCOPE-BOUND consumer — §28.3
@@ -782,6 +831,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = nullptr;
             llvm::Value* rhs = nullptr;
+            // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+            // boundary for `obj.P := v`. `invRecv4646` receives the receiver
+            // pointer `lvalueAddr` already lowered for the field store (see
+            // `instrumentedAutoPropertyStoreClass` above); `invCls4646` is the
+            // class whose conjunction to evaluate, or null when §22.16
+            // instruments nothing here.
+            llvm::Value* invRecv4646 = nullptr;
+            const sema::TypeSymbol* invCls4646 = nullptr;
             // #736: a whole-array collection-literal assignment
             // `target := [e0, e1, ...]` to an inline-array lvalue (field or
             // local). A CollectionLiteralExpr is not a general expression value
@@ -1106,7 +1163,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
             } else {
-                addr = lvalueAddr(*as->target, elemTy);
+                // fix #4646 (§22.16, v0.307): ask for the receiver pointer
+                // here, on the ONE `lvalueAddr` call that an `obj.P := v`
+                // auto-property store reaches. Threading the out-parameter
+                // (rather than re-lowering `ma->target` at the boundary) keeps
+                // the receiver expression evaluated exactly once — and puts
+                // the boundary check AFTER §28.2's disposed guard, which
+                // `fieldAddr` emits internally. That order is not incidental:
+                // #4651 measured it on the public-METHOD row, where a class
+                // whose `destructor` zeroes the field its own invariant reads
+                // must answer DisposedAccessException, not
+                // ContractViolationException.
+                addr = lvalueAddr(*as->target, elemTy, &invRecv4646);
                 // fix #4045 (§28.3/§28.9, v0.294): the generic lvalueAddr
                 // fallback's null-address exit was silently dropping the write
                 // with NO diagnostic of any severity, and the RHS was never
@@ -1292,6 +1360,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (as->op == ":=") {
+                // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+                // ENTRY boundary. Emitted here — after the RHS has been lowered
+                // and coerced ("after argument binding") and before ANY part of
+                // the store sequence below runs — so the instance is observed
+                // in exactly the state the caller handed over, mirroring
+                // `lowerPropertySetValue`'s entry check (#4614(b)) and
+                // `emitFunctionBody`'s public-method entry check.
+                //
+                // `invRecv4646` is non-null only when `lvalueAddr` resolved an
+                // `obj.f`-shaped target through `fieldAddr` (a class receiver);
+                // a shape whose receiver pointer never materialized degrades to
+                // the pre-fix behaviour rather than checking over a null
+                // pointer.
+                invCls4646 = invRecv4646
+                    ? instrumentedAutoPropertyStoreClass(*as->target)
+                    : nullptr;
+                if (invCls4646) emitInvariantCheck(invRecv4646, invCls4646);
                 // §28.7 / §15.3 (#1385): whole-value reassignment of a move-only
                 // OWNING inline-array local or field (`[N owned]T` / `[N owned]T?`)
                 // disposes each non-null slot of the displaced value in reverse
@@ -1765,6 +1850,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             ctx_.exprSymbol(*as->value))
                         nullTransferredOwnedLocalSlot(as->value.get());
                 }
+                // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+                // NORMAL-EXIT boundary. This is the end of the whole `:=` store
+                // sequence, so the instance is observed in the state the store
+                // left it — the auto-property analogue of `lowerPropertySetValue`'s
+                // `accEndBB` check (#4614(b)) and of the public-method
+                // `finalizeEnsuresEpilogue` check.
+                //
+                // The terminator guard is §22.16's "throw exits check nothing":
+                // a store path that left the current block terminated (an
+                // unwind edge) must not have an exit check appended to it, and
+                // appending one to a terminated block is malformed IR besides.
+                if (invCls4646 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4646, invCls4646);
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`
                 // whose underlying binary operator resolves to a user-defined

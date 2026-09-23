@@ -99,7 +99,8 @@ bool Emitter::isCharTargetExpr(const ast::Expr& e) {
 }
 
 
-llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
+llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy,
+                                 llvm::Value** outRecvPtr) {
     // fix #3090 (§12.7 / §8.6, v0.252): a §12.7 value-narrowed identifier
     // denotes the boxed VALUE, so its address is the box payload — not the
     // `Object` slot, whose bytes are the box POINTER. Checked FIRST, ahead of
@@ -140,7 +141,15 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
         return boxedStorage(slot, elemTy);
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
-        if (llvm::Value* a = fieldAddr(*ma, elemTy)) return a;
+        // fix #4646 (§22.16, v0.307): forward the #1039 receiver out-parameter
+        // so an `obj.P := v` caller can name the receiver the §22.16 setter
+        // boundary must evaluate the invariant over. `fieldAddr` lowers
+        // `ma->target` exactly once and hands back that same pointer, so the
+        // boundary check and the field store observe one evaluation of the
+        // receiver expression — re-lowering it at the call site would duplicate
+        // its side effects. Null for every other caller (the default), which is
+        // what `fieldAddr` already does with a null `outRecvPtr`.
+        if (llvm::Value* a = fieldAddr(*ma, elemTy, outRecvPtr)) return a;
     }
     if (llvm::GlobalVariable* gv = staticFieldGlobal(target)) {
         // #720 / §22.13 / #1513: a static-field lvalue (write or compound

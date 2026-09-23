@@ -5180,7 +5180,16 @@ private:
     // CG31: the address (and element type) of an assignable target — a
     // local/parameter slot, a static-field global, a `this.f`/`obj.f`
     // field, or a bare implicit-`this` field. Null if not assignable.
-    llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy);
+    //
+    // fix #4646 (§22.16, v0.307): `outRecvPtr`, when non-null, forwards
+    // `fieldAddr`'s existing #1039 out-parameter — the lowered class-instance
+    // receiver pointer for an `obj.f` target. It exists so the §22.16
+    // auto-property store boundary can name the receiver it must evaluate the
+    // invariant over WITHOUT lowering the receiver expression a second time
+    // (which would duplicate its side effects). Defaulted to null, so every
+    // pre-existing caller is unchanged.
+    llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy,
+                            llvm::Value** outRecvPtr = nullptr);
 
     // CG31: apply a compound-assignment/increment arithmetic or bitwise
     // operator (op without the trailing `=`). Integer `+ - *` and `/ mod`
@@ -8776,6 +8785,20 @@ private:
     const sema::TypeSymbol* instrumentedSetterClass(
         const ast::Expr& target, const sema::PropertySymbol* ps,
         const ast::PropertyDecl* pd) const;
+
+    // fix #4646 (§22.16, v0.307): the AUTO-PROPERTY half of the same row.
+    // §22.16 instruments "every `public` setter — block-form, auto-property,
+    // indexer, `set(owned)` alike", but a same-module `c.P := v` on a
+    // non-virtual auto-property has no setter body to inline: it lowers to a
+    // direct backing-field store through `lvalueAddr`, so it never reaches
+    // `lowerPropertySetValue` and #4614(b)'s instrumentation could not see it.
+    // Answers "is the assignment target `target` such a store, and if so whose
+    // conjunction does it evaluate?", by resolving the target's own
+    // `PropertySymbol`/`PropertyDecl` and deferring every §22.16 and §13.6
+    // question — including the `this`-reentrancy exemption — to
+    // `instrumentedSetterClass`, so the two shapes cannot drift apart.
+    const sema::TypeSymbol* instrumentedAutoPropertyStoreClass(
+        const ast::Expr& target) const;
 
     // fix #4651 (§22.16 / §2.8.2, v0.307): the receiver-INDEPENDENT half of
     // `instrumentedSetterClass` — the class whose invariant `ps`'s setter must
