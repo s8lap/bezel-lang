@@ -66,6 +66,16 @@ BEZEL_TEST(r41_diagnostics_746, plain_index_not_rejected) {
 }
 
 // §31.2 (G): a try with neither catch nor finally is rejected.
+//
+// ORACLE STRENGTHENED (v0.307): this used to assert only that SOME diagnostic
+// mentioned "§31.2". That is the #4716 vacuous-pass shape — a bare section
+// number is short enough to appear in a neighbouring diagnostic's text, so the
+// row would stay green if an EARLIER check started rejecting this program for
+// an unrelated reason. It also could not see whether the diagnostic NAMES the
+// rule it enforced. §31.2 (v0.307) states the rule as "At least one of `catch`
+// or `finally` must be present"; the diagnostic now carries that clause
+// verbatim and this asserts it, which is what rule-corpus case `s31_2_0001`
+// (`//! diagnostic: must be present`) measures.
 BEZEL_TEST(r41_diagnostics_746, try_without_catch_or_finally_rejected) {
     auto r = parseSemaAll(
         "module M; class C public static method Main(): int "
@@ -75,6 +85,8 @@ BEZEL_TEST(r41_diagnostics_746, try_without_catch_or_finally_rejected) {
         "  return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "§31.2"));
+    BEZEL_EXPECT_TRUE(
+        hasMsg(r, "at least one of `catch` or `finally` must be present"));
 }
 
 // §31.2: a try WITH a catch is accepted.

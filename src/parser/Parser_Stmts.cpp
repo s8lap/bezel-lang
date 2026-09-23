@@ -808,10 +808,22 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         consumeOptionalEndKeyword("try"); // §1.6 / v0.170 (#1374)
         // §31.2 (#746 R41-G): "At least one of catch or finally must be
         // present." A bare `try ... end;` with neither was silently accepted.
+        //
+        // The wording carries the spec's own clause verbatim ("at least one of
+        // `catch` or `finally` must be present"), not a paraphrase of it. The
+        // pre-fix text said "at least one `catch` arm or a `finally` block",
+        // which is the same rule in different words — and a diagnostic that
+        // does not name the rule in the rule's language cannot be matched back
+        // to it. The rule corpus measures exactly that: case `s31_2_0001`
+        // authors `diagnostic: must be present` straight out of §31.2 and the
+        // runner reported the row under "reject/warn cases whose diagnostic
+        // does not carry the rule's wording" even while its verdict read
+        // `pass` (the verdict is exit-code-only). per §31.2, v0.307
         if (stmt->catches.empty() && !stmt->hasFinally) {
             diagnostics_.report(Severity::Error, tryLoc,
-                                "a `try` statement must have at least one "
-                                "`catch` arm or a `finally` block (§31.2)");
+                                "a `try` statement must have a `catch` block, "
+                                "a `finally` block, or both — at least one of "
+                                "`catch` or `finally` must be present (§31.2)");
         }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
