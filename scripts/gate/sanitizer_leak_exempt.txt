@@ -215,3 +215,39 @@ iter_lambda_captured_iter_format_local_unbox_3603.async_var_seq_captured_by_lamb
 iter_lambda_captured_iter_format_local_unbox_3603.issue_3539_repro_disposes_captured_using_var_exactly_once_27_5  # status:residue issue:3541 #3541/#3539, spec §27.5: the #3539 repro. The name refers to the CELL destructor count (the "0" in its expected stdout — every Cell destructed, i.e. disposed exactly once on all 200 abandoned rounds); the leak it still carries is the separate #3541 residue, which is why it is here and not a contradiction. tests/codegen/iter_lambda_captured_iter_format_local_unbox_3603_test.cpp:435
 dict_object_bare_value_key_indexer_set_4640.dict_object_bare_int_key_indexer_set_leak_floor_spec_8_6  # status:residue issue:4717 #4640/#4717, spec §8.6, §28.11 v0.135: boxing a bare value key into a `Dictionary<Object,_>` slot mints a §8.6 box the borrowing slot's null disposer never discharges — 24 B per call, measured both sides loop-amplified 300x (pre-fix the program SIGSEGV'd in bz_dict_set_gen instead). The row asserts the residual FROM BELOW; #4717's box-vtable guard must UPDATE it, not delete it. tests/codegen/dict_object_bare_value_key_indexer_set_4640_test.cpp
 set_object_element_4642.tryadd_contains_box_residual_floor_spec_8_6  # status:residue issue:4717 #4642/#4717, spec §8.6, §28.11 v0.135: the Set<Object> member of the same family — one box for the inserted element, one for the query, 24 B each, measured both sides loop-amplified 300x (pre-fix the program computed 0 of 600 correct and minted no box at all). Same floor-not-ceiling caveat as the row above. tests/codegen/set_object_element_4642_test.cpp
+
+# ── pattern (h): the LEAK ORACLE'S OWN KNOWN-POSITIVE — 1 row ──────────────
+# The first row here that is not a statement about the COMPILER at all. #4638
+# added `BEZEL_AOT_DETECT_LEAKS` (off | report | strict) and this row is the
+# only place in the tree that watches the strict oracle FAIL a program — "a
+# leak check nobody has seen fail is the vacuous oracle this issue is about".
+# Its known-positive is a deliberately-leaking program: 500
+# `Array<Object>.Contains(i)` membership queries with a bare `int` query, one
+# §8.6 box minted and never discharged per call, 24 B x 500 = 12000 B. The
+# strict path re-emits the LeakSanitizer report to the harness's real stderr
+# (aot_support.hpp `emitSanitizerReportToStderr`), so the report lands inside
+# this row's own `[san-scope]` bracket while the row itself reports green —
+# byte for byte the shape this file exists to declare.
+#
+# #4638 landed without the declaration and the first `--full` cycle over it
+# failed by name (gate 3232da43, 2026-09-23: "1 leak report(s) in a PASSING
+# test"). That failure is the mechanism working, exactly as the RESIDUAL RISK
+# note above predicts for a row added after 2026-09-21; the fix is this entry,
+# not a weakened oracle.
+#
+# ⚠ WHEN #4717 IS FIXED, RE-POINT THIS ROW'S KNOWN-POSITIVE — DO NOT DELETE
+# IT. `kLeak500` stops leaking the moment the §8.6 box mints are discharged,
+# and the row's `exp.lastBytes == 12000` / `exp.lastAllocs == 500` assertions
+# go red with it. The repair is a different program that still leaks BY
+# DESIGN, because deleting the row would retire the only proof that the leak
+# oracle can fire at all. Same "must UPDATE it, not delete it" caveat as the
+# #4640 / #4642 rows above, and for the same open issue.
+#
+# Its four siblings in the same file need NO declaration, and the asymmetry is
+# structural rather than lucky: `report_mode_counts_without_changing_the_
+# verdict` runs the identical leaking program but Report mode CONSUMES the
+# report text (`errText.clear()`) and never calls emitSanitizerReportToStderr,
+# so it is invisible to this channel; `detection_off_is_blind_to_the_known_
+# leak` runs with detect_leaks=0 and LSan never reports; and the two
+# `*_clean_*` / classifier rows do not leak at all.
+leak_detection_4638.strict_mode_fails_the_known_leak  # status:residue issue:4717 #4638/#4717, spec §8.6, §28.11, v0.307: the leak oracle's own known-positive. 500 `Array<Object>.Contains(int)` queries mint 500 §8.6 boxes that are never discharged (24 B apiece), and the row asserts LeakSanitizer fired with EXACTLY 12000 byte(s) in 500 allocation(s) while `ran == false`. A fix IS owed — this is #4717's Array member, the residual #4619 left behind when it landed — so it is residue, not a permanent trade; but #4717 must RE-POINT the row at another leaking program rather than delete it. tests/support/aot_leak_detection_4638_test.cpp:159
