@@ -231,19 +231,32 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
 // `owned` for a transfer.
 // ===========================================================================
 
-// §28.6 / §5.11: a non-`owned` NON-OWNING collection return (`Array<T>`) is
-// a borrow, the borrow is sound (the source is the receiver-held field, the
-// caller reads it, the receiver disposes it at its own scope end), and the
-// capability restriction follows from the type (Array<T> has no Dispose
-// method that would affect element ownership). Admitted.
+// §28.6 / §5.11: a non-`owned` NON-OWNING read-only-view return
+// (`IReadOnlyList<T>`) is a borrow, the borrow is sound (the source is the
+// receiver-held field, the caller reads it, the receiver disposes it at its
+// own scope end), and the capability restriction follows from the type
+// (`IReadOnlyList<T>` has no Dispose member that would affect element
+// ownership). Admitted.
+//
+// The view is spelled `IReadOnlyList<T>`, not `Array<T>`. stdlib §4.3
+// (v0.307) grants exactly three cross-family ancestors — "The two
+// hierarchies share `IEnumerable<T>`, `IReadOnlyCollection<T>`, and
+// `IReadOnlyList<T>` as common ancestors. A function that wants to read
+// elements without taking ownership accepts one of these interfaces; both
+// borrowing and owning collections of T conform" — and denies the concrete
+// classes: "`IList<T>` (borrowing) and `IOwningList<T>` (owning) are
+// unrelated types with no subtyping." The `Array<Cell>` this row used to
+// spell was a cross-family conversion the stdlib never granted; the row's
+// subject — a non-`owned` borrowing-view return of a bare read of an
+// `owned` owning-collection field is ADMITTED — is unchanged.
 BEZEL_TEST(owning_collection_borrow_return_1760,
-           nonowning_array_return_via_receiver_field_accepted) {
+           nonowning_view_return_via_receiver_field_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class Holder "
         "  public owned _items: OwningArray<Cell>; "
         "  public constructor() _items := new OwningArray<Cell>(); end constructor; "
         "  destructor end destructor; "
-        "  public method Get(): Array<Cell> => _items; "
+        "  public method Get(): IReadOnlyList<Cell> => _items; "
         "end Holder;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

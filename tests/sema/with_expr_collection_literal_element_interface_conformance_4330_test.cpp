@@ -194,6 +194,21 @@ BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
+// Two DIFFERENT conforming implementors in one `with`-clause collection
+// literal, both accepted — the control the element-conformance walk must not
+// over-reject.
+//
+// The carrier is `[2]IHolder` with `using var` element bindings, the same
+// shape every other ACCEPT row in this file uses. It was written
+// `[2 owned]IHolder` with inline `new` elements, which §9.7 (v0.307) forbids
+// outright: "Records also cannot have inline-array fields whose slots carry
+// the `owned` marker (`[N owned]T?` or `[N owned]T`); such fields are
+// move-only value types (§15.3), and records support only copy semantics."
+// The non-owning carrier then requires borrow elements rather than fresh
+// producers, per §15.1 — hence the `using var` locals, exactly as
+// `positional_field_conforming_accepted_control` above. Only the carrier
+// spelling moved; the subject (two distinct `IHolder` implementors in a
+// `with`-clause literal, accepted, 5 + 5 == 10) is unchanged.
 BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
            two_different_conforming_implementors_accepted_control) {
     auto r = runAot(
@@ -209,12 +224,16 @@ BEZEL_TEST(with_expr_collection_literal_element_interface_conformance_4330,
         "  public constructor(v: string) V := v; end constructor; "
         "  public method GetV(): string return V; end GetV; "
         "end Widget4Ok; "
-        "record Box2(Items: [2 owned]IHolder); "
+        "record Box2(Items: [2]IHolder); "
         "class C public static method Main(): int "
         "  var s := \"he\" + \"llo\"; "
-        "  var items1: [2 owned]IHolder := [new Widget3Ok(s), new Widget4Ok(s)]; "
+        "  using var w1 := new Widget3Ok(s); "
+        "  using var w2 := new Widget4Ok(s); "
+        "  using var w3 := new Widget3Ok(s); "
+        "  using var w4 := new Widget4Ok(\"world\"); "
+        "  var items1: [2]IHolder := [w1, w2]; "
         "  var b1 := new Box2(items1); "
-        "  var b2 := b1 with(Items := [new Widget3Ok(s), new Widget4Ok(\"world\")]); "
+        "  var b2 := b1 with(Items := [w3, w4]); "
         "  return b2.Items[0].GetV().Length + b2.Items[1].GetV().Length; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
