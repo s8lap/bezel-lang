@@ -289,7 +289,13 @@ BEZEL_TEST(sema_gettype_chain_511, normal_member_chain_unaffected) {
         "  public method First(): string => _first; "
         "end Name; "
         "class Builder "
-        "  public method MakeName(): Name => new Name(\"Alice\"); "
+        // `owned` is REQUIRED here, not decoration (#4758). Per §28.3
+        // announcement table row 4 (v0.307), a plain concrete class-typed
+        // instance return admits only a receiver-sourced borrow, and
+        // `new Name("Alice")` is a fresh owned value. This row runs on
+        // `parseSemaAll` (sema only, no ownership pass), so the unmarked
+        // spelling would surface only against the full driver.
+        "  public method MakeName(): owned Name => new Name(\"Alice\"); "
         "  destructor end destructor; "
         "end Builder; "
         "class C "
