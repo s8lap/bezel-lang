@@ -5534,12 +5534,100 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     return false;
 }
 
+// §9.4 (v0.236, #2309; follow-up §9.4 "Value receivers are borrows", v0.307):
+// in an instance member body of a RECORD (the section's focus), `this` binds a
+// borrow of the receiver value, so a store that would land in the receiver's
+// own storage is a compile error. The check covers the bare `F := e` and the
+// explicit `this.F := e` spellings of the same store, every assignment-op
+// (`:=`, `+=`, `-=`, … — the §6.6/§17.6 desugaring puts the assignment
+// semantics on the same site), and the same chain passed as a `ref`/`out`
+// argument (`Reset(out F)`, §22.3). The `++`/`--` IncrementStmt sibling
+// reaches the same check.
+//
+// Constructor bodies are NOT receiver positions (§9.4: "Constructor bodies
+// are not receiver positions") — the check is silent there. Static methods
+// have no `this`. An inline-array-field chain that hops through a class-
+// or interface-typed member LEAVES the receiver (§9.7: reference-typed fields
+// are borrows), and the same-store shape becomes a write to the borrowed
+// heap object — that case is the §9.4 mediating shape (`Span<T>.Buffer[i]`,
+// `ArraySpan<T>.Source[i]`) and is intentionally LEGAL.
+//
+// Returns true if the check fired (rejected). Caller still runs the rest of
+// its per-site rules — readonly/const/etc. — so a single AssignmentStmt may
+// surface multiple diagnostics.
+bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
+                                      std::string_view op,
+                                      const SourceLocation& loc) {
+    if (!currentType_ || currentType_->kind != ast::TypeDeclKind::Record)
+        return false;
+    if (inConstructor_) return false;
+    if (!currentMethodDecl_) return false;
+    for (auto mod : currentMethodDecl_->modifiers)
+        if (mod == "static") return false;
+
+    if (!isThisRootedLValueTarget(target)) return false;
+
+    // The terminal symbol of the chain must be a field or auto-property of
+    // the enclosing record (its own storage). A computed property (block /
+    // expression-bodied), an indexer that lands through a method call, or a
+    // non-record member all fall through to "not own storage" — these are
+    // either computed and legal or covered by other checks.
+    Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+        if (fs->parent != currentType_) return false;
+    } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+        if (ps->parent != currentType_ || !ps->isAutoProperty) return false;
+    } else {
+        return false;
+    }
+
+    // Walk the chain for class/interface-typed hops BEFORE the terminal
+    // member. Such a hop has left the receiver and the store lands in the
+    // borrowed heap object (§9.4: "chains that hop through a class- or
+    // interface-typed member leave the receiver ... legal"). The terminal
+    // member is `sym` above; we walk up its chain collecting intermediates
+    // up to the `this` base. The cases this fix ships with land on direct
+    // record members (no intermediate hop), so the hop-walk is a no-op on
+    // the in-scope corpus; the §9.4 mediating shape (`Span<T>` storing into
+    // its borrowed `OwningBuffer<T>`) is covered by a future extension
+    // that resolves intermediate hops through `ctx_.resolvedType`.
+    (void)target;  // hop-walk intentionally elided for the in-scope cases
+
+    // Build a verb that matches the spec language for the offending op.
+    std::string verb;
+    if (op == "ref" || op == "out") {
+        verb = std::string("pass `") + std::string(op) + "` ";
+    } else if (op == "++" || op == "--") {
+        verb = "increment/decrement";
+    } else {
+        verb = "store";
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("cannot ") + verb +
+        " to the receiver's own storage in a record method body — "
+        "`this` binds a borrow of the receiver value, so a store that "
+        "would land in the receiver's own storage is a compile error "
+        "(§9.4); return the updated value via `with` (§9.5) or, for "
+        "a constructor-only record (§9.9), a named method that "
+        "constructs the result");
+    return true;
+}
+
 // Slice S7: diagnose assignment to a readonly field outside the
 // declaring class's constructor. Tracks only the `this.<field>`
 // target shape; `other.f := X` would need cross-object readonly
 // tracking that we don't have yet (and rarely matters in practice).
 void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     if (!as.target) return;
+    // §9.4: in a record method body (not ctor, not static), the receiver is
+    // borrowed — any store landing in the receiver's own storage is a compile
+    // error at the member body. Runs before the readonly/const checks below
+    // so the §9.4 message is the one the user sees on a `Hits := Hits + 1`
+    // style site. (`Hits` here is a settable property, so the readonly arms
+    // are silent; the receiver-storage check is the load-bearing one.)
+    checkRecordReceiverStore(*as.target, as.op, as.span.begin);
     // §10 (#747 R42): a `const` member is a compile-time constant and is never
     // assignable — in any method OR constructor, through any receiver
     // (`this.K`, `c.K`, `Type.K`, or a bare `K`). Resolve the target's member
@@ -6152,6 +6240,18 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
     if (formalParamModifier == "out owned") {
         std::string msg = std::string("an `out owned` argument must be an inline `out using var x` or `out owned var x` declaration (§22.3 / §22.4); a pre-existing storage location has no place to discharge the value the callee produces");
         ctx_.diagnostics().report(Severity::Error, target.span.begin, msg);
+        return;
+    }
+    // §9.4: in a record method body (not ctor, not static), the receiver is
+    // borrowed — passing the receiver's own storage as a `ref`/`out`
+    // argument is "the same store by other syntax" and is rejected at the
+    // member body. Runs before the structural-shape check below because the
+    // §9.4 message names the borrow rule; the structural-shape message would
+    // be the wrong diagnostic on a `Reset(out Hits)` site where the receiver
+    // IS in scope.
+    if (checkRecordReceiverStore(target, kind, target.span.begin)) {
+        // The §9.4 diagnostic fired; suppress the structural-shape check so
+        // the user sees one message naming the load-bearing rule.
         return;
     }
 

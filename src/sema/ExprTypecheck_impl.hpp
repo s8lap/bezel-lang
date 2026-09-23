@@ -1966,6 +1966,16 @@ private:
     // mutable-static-rule-2 (§22.12) for a field operand.
     void checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
                                  const char* kind);
+    // §9.4 (v0.236 / v0.307 "Value receivers are borrows"): in a record
+    // method body (not ctor, not static), reject any store that would land
+    // in the receiver's own storage — `this.F := e`, bare `F := e`, the
+    // same chain passed as `ref`/`out`, and `++`/`--` over the same shape.
+    // Called from checkReadonlyAssignment (every AssignOp), from
+    // checkRefOutOperandCategory (ref/out arguments), and from the
+    // IncrementStmt site. Returns true if a diagnostic was reported.
+    bool checkRecordReceiverStore(const ast::Expr& target,
+                                  std::string_view op,
+                                  const SourceLocation& loc);
     // Shared by the MemberAccess and Index cases of
     // checkRefOutOperandCategory: no-setter / readonly-auto-outside-context /
     // setter-visibility for a property (incl. indexer) operand — mirrors the
