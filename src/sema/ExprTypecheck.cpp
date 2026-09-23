@@ -5179,6 +5179,62 @@ TypeRef* ExprTC::catchArmNcb(
 
 void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
                              const ast::Expr& e) {
+    // §20: "**No branch-level target-typing** beyond the bare-`null` rule: a
+    // branch whose form requires a target type from context — a collection
+    // literal (§15.4), the `new()` shorthand (§17.7), a bare case
+    // construction (§35.3) — is a compile error inside an `if` expression
+    // even when the whole expression occupies a target-typed position."
+    // The pre-fix code left the branch un-typed (the literal had no target
+    // to lift against, the `new()` shorthand's `type` field is null, and a
+    // bare case construction never reaches the case-reading path because
+    // that path is gated on a *declared-result* position and an if-branch
+    // is not one). Codegen then hit the un-typed slot and degraded to the
+    // #2434/#2491 `internal: lowerLocalDecl's initializer expression
+    // failed to lower to a value` note — a silent wrong value (the worse
+    // failure mode), not the §20 error the rule requires. Detect each
+    // target-typed-form branch here so the compiler emits the spec's rule
+    // and the user sees a fix path (write the statement form, or construct
+    // each arm through a typed expression).
+    if (cnd.thenValue) {
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(cnd.thenValue.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, cnd.thenValue->span.begin,
+                "a collection literal cannot be an `if` expression branch: "
+                "it requires a target type from context, which an `if` "
+                "branch does not supply (§20)");
+            return;
+        }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(cnd.thenValue.get())) {
+            if (!ne->type) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cnd.thenValue->span.begin,
+                    "the `new()` shorthand cannot be an `if` expression "
+                    "branch: it requires a target type from context, which "
+                    "an `if` branch does not supply (§20)");
+                return;
+            }
+        }
+    }
+    if (cnd.elseValue) {
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(cnd.elseValue.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, cnd.elseValue->span.begin,
+                "a collection literal cannot be an `if` expression branch: "
+                "it requires a target type from context, which an `if` "
+                "branch does not supply (§20)");
+            return;
+        }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(cnd.elseValue.get())) {
+            if (!ne->type) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cnd.elseValue->span.begin,
+                    "the `new()` shorthand cannot be an `if` expression "
+                    "branch: it requires a target type from context, which "
+                    "an `if` branch does not supply (§20)");
+                return;
+            }
+        }
+    }
     TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
     TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
     // §20 / §7.4 (#1089): a bare `null` branch does not impose a type — it makes
