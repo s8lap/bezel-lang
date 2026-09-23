@@ -163,9 +163,30 @@ void Resolver::run(const ast::SourceFile& src) {
     // compile error. Track each name's origin module; on collision, remove it
     // from scope and record it in ambiguousImportNames_ so resolveNamed can
     // diagnose a clear "ambiguous" error rather than "unresolved identifier".
-    // Only engaged when imports were actually loaded — the no-import path is
-    // byte-for-byte unchanged.
-    if (ctx_.hasImports()) {
+    // Only engaged when the file has at least one `import` declaration — the
+    // no-import path is byte-for-byte unchanged.
+    //
+    // fix #4690 (§2.2, v0.307): this used to read `ctx_.hasImports()`
+    // (`!importedByModule_.empty()`), which is true only once some import
+    // resolved to a LOADED dependency ARTIFACT (ModuleLoader's
+    // registerImportedType). A file whose only imports are stdlib pseudo-
+    // modules (`System.Threading`, `System.IO`, ...) never registers one —
+    // those names resolve through the separate builtin-name tables in
+    // TypeResolution_Names.cpp / ExprTypecheck_Calls.cpp, not through a
+    // loaded artifact — so `hasImports()` was FALSE for such a file and this
+    // entire block, including the alias/alias and alias/local-declaration
+    // collision checks below (which need only `src.imports` and the local
+    // scope, not a loaded artifact), silently never ran. Measured:
+    // `import System.Threading as Th; public class Th ...` compiled clean
+    // despite §2.2's "[an alias] may not collide with ... a type declared in
+    // the file's module" (s2_2_0006 in the rule corpus). The
+    // `importedNameOrigin` loop just below already no-ops per-import when
+    // `ctx_.importedTypesOf(dotted)` is null (line ~196's `if (!exported)
+    // continue;`), so widening the gate to "the file wrote an import" rather
+    // than "an import loaded an artifact" changes behavior ONLY for the
+    // alias-collision checks — which is exactly the gap to close — and stays
+    // byte-for-byte unchanged for a file with no `import` at all.
+    if (ctx_.hasImports() || !src.imports.empty()) {
         // Snapshot local module declarations already in scope: these shadow
         // imports and are never marked ambiguous (§2.2: local wins silently).
         std::unordered_set<std::string_view> localNames;
