@@ -76,7 +76,16 @@ BEZEL_TEST(sema_call, method_call_returns_named) {
         "module M; "
         "class T end T; "
         "class C "
-        "  public method Make(): T => new T(); "
+        // `owned` is REQUIRED here, not decoration (#4759). Per §28.3
+        // announcement table row 4 (v0.307), an instance method whose declared
+        // return type is a plain concrete class type may return only a
+        // receiver-sourced borrow; `new T()` is a fresh owned value, so the
+        // unmarked spelling is rejected by the real compiler. This row runs on
+        // `parseSemaAll` (sema only — the ownership pass never runs), so the
+        // violation would surface only on a port to `runAot` (#3439). The
+        // marker does not change what this row measures: the call expression's
+        // type is still TypeRef::Kind::Named.
+        "  public method Make(): owned T => new T(); "
         "  public method M() _ := this.Make(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
