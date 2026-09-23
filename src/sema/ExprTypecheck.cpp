@@ -3479,6 +3479,86 @@ bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
     }
 }
 
+// fix #4655 (§5.1 "Implicit conversions", v0.307): names the specific §5.1
+// sub-rule that rejects `from -> to` for a Primitive-Primitive pair that is
+// neither identity nor a `primitiveWidens` widening — in the spec's own
+// wording, so a reader (and the conformance corpus, tests/conformance/
+// rules/cases/s5_1_000{1,3,9}.bzl, s5_1_00{11,12,15}.bzl) can see WHICH row
+// of the §5.1 table fired, not merely that the pair failed it. Returns
+// empty for a pair the closed-form rules below don't name (the caller's
+// generic "(§5.1)" wording stands alone; this is deliberately conservative
+// — no pair should be MISCLASSIFIED into a rule it doesn't match).
+//
+// PRECEDENCE (constant narrowing before signed/unsigned): §5.1's own text —
+// "the source may be a compile-time constant of any integer type ... and the
+// target any integer type whose range contains the value, ACROSS
+// SIGNEDNESS" — means an out-of-range compile-time constant (`var b: byte :=
+// 300;`) must report "does not fit", never "same or narrower width", even
+// though `int`/`byte` also differ in signedness: constant narrowing is a
+// distinct sub-rule that deliberately IGNORES signedness. So the constant
+// check runs first and, when it fires, short-circuits the signed/unsigned
+// classification below it. A constant whose value DOES fit was already
+// re-typed to `to` by `narrowIntConstantToTarget` upstream (called at the
+// top of checkAssignable) and never reaches this function at all — the
+// `from->primitive == to->primitive` early-return in the caller catches it
+// first — so this function need not re-check the fits-the-range case.
+std::string ExprTC::primitiveNeverImplicitReason(const ast::Expr* fromExpr,
+                                                 PrimitiveType from,
+                                                 PrimitiveType to) {
+    using P = PrimitiveType;
+    auto isIntegerType = [](P p) {
+        switch (p) {
+            case P::SByte: case P::Byte: case P::Short: case P::UShort:
+            case P::Int:   case P::UInt: case P::Long:  case P::ULong:
+                return true;
+            default:
+                return false;
+        }
+    };
+    // "Constant narrowing": "A constant whose value does not fit the
+    // target's range is a compile error at the conversion site." Mirrors
+    // narrowIntConstantToTarget's own gate (only a plain, non-nullable `int`
+    // source and one of these six narrower integer targets — the ones §5.1's
+    // widening table does not already admit from `int` — are eligible).
+    if (fromExpr && from == P::Int) {
+        const bool narrowerIntTarget =
+            to == P::Byte || to == P::SByte || to == P::Short ||
+            to == P::UShort || to == P::UInt || to == P::ULong;
+        if (narrowerIntTarget) {
+            if (auto cv = foldIntConstExprTC(*fromExpr);
+                cv && !fitsInIntType(*cv, to)) {
+                return "a constant whose value does not fit the target's "
+                       "range is a compile error at the conversion site";
+            }
+        }
+    }
+    // "Between integers and `bool`."
+    if (from == P::Bool || to == P::Bool) {
+        P other = from == P::Bool ? to : from;
+        if (isIntegerType(other))
+            return "between integers and `bool` is never implicit";
+    }
+    // "Between `decimal` and binary floats (`float`, `double`)."
+    if ((from == P::Decimal && (to == P::Float || to == P::Double)) ||
+        (to == P::Decimal && (from == P::Float || from == P::Double)))
+        return "between `decimal` and binary floats (`float`, `double`) is "
+               "never implicit";
+    // "Between signed and unsigned types of the same or narrower width" —
+    // the complement of the widening table's one unsigned-to-strictly-wider-
+    // signed exception, which the caller already ruled out via
+    // `primitiveWidens` before reaching this function.
+    if (isIntegerType(from) && isIntegerType(to)) {
+        auto isUnsigned = [](P p) {
+            return p == P::Byte || p == P::UShort || p == P::UInt ||
+                   p == P::ULong;
+        };
+        if (isUnsigned(from) != isUnsigned(to))
+            return "between signed and unsigned types of the same or "
+                   "narrower width is never implicit";
+    }
+    return std::string();
+}
+
 // §12.9 (issue #1180): forward declarations for variance-check helpers.
 // All are defined after builtinInterfaceAncestorsOf (the §26.5 hierarchy
 // section), which they depend on.
@@ -4133,11 +4213,23 @@ void ExprTC::checkAssignable(
             std::string("the ") + what +
             " is nullable but the target type is non-nullable (§7)");
     };
-    auto reportNotConvertible = [&] {
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            std::string("the ") + what + " has a type that is not "
-            "implicitly convertible to the target type (§5.1)");
+    // fix #4655 (§5.1, v0.307): `reason`, when non-empty, names the specific
+    // §5.1 sub-rule that rejected — in the spec's own wording — so the
+    // diagnostic says WHY, not merely THAT. §5.1's "never implicit" bullets
+    // (signed/unsigned of the same or narrower width, `decimal`/binary-float,
+    // enum/underlying-integer, integer/`bool`) and its "constant narrowing"
+    // clause each have their own reason; every OTHER caller of this lambda
+    // (subtype/variance/base-conformance failures, below and elsewhere in
+    // this function) passes no reason and keeps the prior generic wording —
+    // this is additive, not a rewrite of the general case.
+    auto reportNotConvertible = [&](const std::string& reason = std::string()) {
+        std::string msg = std::string("the ") + what + " has a type that is "
+            "not implicitly convertible to the target type (§5.1)";
+        if (!reason.empty()) {
+            msg += ": ";
+            msg += reason;
+        }
+        ctx_.diagnostics().report(Severity::Error, loc, msg);
     };
     // §5.4 / §10 (#924): an enum is NOT implicitly convertible to or from its
     // underlying integer type — both directions require an explicit cast
@@ -4164,7 +4256,11 @@ void ExprTC::checkAssignable(
         bool toIntPrim = to->kind == TypeRef::Kind::Primitive &&
                          to->primitive != PrimitiveType::Object;
         if ((fromEnum && toIntPrim) || (toEnum && fromIntPrim)) {
-            reportNotConvertible();
+            // spec §5.1 v0.307: "The following are never implicit: ... —
+            // Between an enum and its underlying integer."
+            reportNotConvertible(
+                "between an enum and its underlying integer is never "
+                "implicit");
             return;
         }
     }
@@ -4195,7 +4291,9 @@ void ExprTC::checkAssignable(
         if (from->nullable && !to->nullable) { reportNullable(); return; }
         if (from->primitive == to->primitive) return;
         if (primitiveWidens(from->primitive, to->primitive)) return;
-        reportNotConvertible();
+        reportNotConvertible(
+            primitiveNeverImplicitReason(fromExpr, from->primitive,
+                                          to->primitive));
         return;
     }
     if (from->kind == TypeRef::Kind::Named &&

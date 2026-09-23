@@ -1510,6 +1510,17 @@ private:
     // distinct). Identity is handled by the caller.
     static bool primitiveWidens(PrimitiveType from, PrimitiveType to);
 
+    // fix #4655 (§5.1, v0.307): names the specific §5.1 "never implicit" /
+    // "constant narrowing" sub-rule that rejects a Primitive-Primitive pair
+    // `checkAssignable` has already determined is neither identity nor a
+    // `primitiveWidens` widening — in the spec's own wording — or returns
+    // empty when none of the closed-form rules names the pair. `fromExpr`
+    // (nullable) is consulted for the constant-narrowing case; see the
+    // definition for the precedence rationale.
+    std::string primitiveNeverImplicitReason(const ast::Expr* fromExpr,
+                                             PrimitiveType from,
+                                             PrimitiveType to);
+
     // fix #4501 (§5.1/§6.2/§17.3/§8.4, v0.306): THE answer to "does §5.1
     // admit an implicit conversion between these two operand types?", asked
     // once for every binary operator that needs it. `typeBinary` carried TWO
