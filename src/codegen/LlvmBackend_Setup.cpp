@@ -21724,6 +21724,68 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             return;
         }
     }
+    // fix #4667 / §28.3 (v0.307): every OTHER vtable-less builtin the
+    // `using var` sibling path already covers per-type in
+    // `registerUsingDisposal` (Mutex, Lock, Semaphore, SemaphoreToken,
+    // CancellationTokenSource, Subscription, StringBuilder, Stopwatch,
+    // FileStream, EventSource/AsyncEventSource, TaskCompletionSource/
+    // OwningTaskCompletionSource) or via its `usingAutoDropVtablelessBuiltin`
+    // catch-all (Random, Atomic, AtomicInteger) has NO user TypeSymbol either
+    // (`rt->declaration == nullptr`, same shape as the #1957 ChannelSender/
+    // Channel/Shared trio above and the #3033 collection family one arm up),
+    // so `isClassOrInterfaceRef` below rejects it too and the owned-PARAMETER
+    // auto-drop registration was silently skipped — the diagnostic this very
+    // call site prints ("owned parameter `m` is implicitly disposed at the
+    // end of the method (§28.3 auto-drop)") promised a release that never
+    // ran.
+    //
+    // Measured (#4667): `Worker.Run(owned m: Mutex)` discharging `m` only
+    // through an unmarked `using var s := m;` borrow-pin (§28.10 — a
+    // borrow-pin assumes no obligation, so `m` itself stays undischarged and
+    // relies on THIS auto-drop) leaked the Mutex core (48 bytes) on every
+    // call — `bz_mutex_dispose` is hit on NEITHER the direct-call NOR the
+    // `Domain.Spawn`-invoked path pre-fix (confirmed via a gdb breakpoint on
+    // both). Reached through `Domain.Spawn` the leak is LSan-visible (the
+    // worker thread's teardown makes the abandoned pointer unreachable);
+    // called directly the identical defect is masked because the pointer
+    // happens to still be reachable from a live stack slot in the
+    // (still-running) caller frame — the one-shot leak-oracle blind spot
+    // this run's "Oracles that pass vacuously" catalogue warns about. An
+    // explicit adopt (`using var m2 := owned m;`) or explicit `m.Dispose()`
+    // were unaffected (they discharge through a different, already-correct
+    // path), which is what isolated the gap to auto-drop specifically.
+    //
+    // Reuse the SAME classification `emitVtablelessBuiltinRelease` (#4185)
+    // dispatches on, through the existing generic `Disposal::vtablelessBuiltin`
+    // field `emitDisposals` already knows how to release (Disposal.cpp
+    // ~8395) — so this arm cannot drift from what a `using var` of the same
+    // type already does. `usingAutoDropVtablelessBuiltin`'s own discipline
+    // (never storing `bn`'s own AST-derived pointer in a field that outlives
+    // this call) is mirrored here: only a name from this fixed literal table
+    // — one every `classifyVtablelessBuiltinRelease` case compares against —
+    // is ever stored.
+    {
+        std::string_view bn;
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+            rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty())
+            bn = rt->headName();
+        static const char* const kVtablelessBuiltinNames[] = {
+            "StringBuilder", "Random", "Atomic", "AtomicInteger",
+            "EventSource", "AsyncEventSource",
+            "TaskCompletionSource", "OwningTaskCompletionSource",
+            "Stopwatch", "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+            "CancellationTokenSource", "FileStream", "Subscription",
+        };
+        for (const char* name : kVtablelessBuiltinNames) {
+            if (bn != name) continue;
+            Disposal d{slot, nullptr};
+            d.vtablelessBuiltin = name;
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;
     Disposal d{slot, nullptr};
