@@ -10077,6 +10077,21 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
                 "(\xC2\xA7""32.5)");
         return false;
     }
+    // §32.5 (fix #4660) — "Not admitted, with reasons": `owned` parameters are
+    // not admitted at the FFI boundary. The diagnostic must carry the rule's
+    // own spec term (`owned`). Runs BEFORE `isFfiCompatibleType` because the
+    // latter would otherwise admit the bare type and silently return true.
+    if (!returnPosition && paramModifier == "owned") {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("extern method ") + declSpelling +
+                " declares an `owned` parameter of type `" +
+                spellExternType(t) +
+                "`, which is not admitted at the FFI boundary — there is no "
+                "native contract for consuming a Bezel-owned argument at the "
+                "FFI boundary (\xC2\xA7""32.5)");
+        return false;
+    }
     if (isFfiCompatibleType(t, returnPosition, scope)) return true;
     // per §32.13 clause 3 (v0.306): "Admission — by address (§32.5): as
     // `ref`/`out` extern parameters (C sees `R*`; §32.5's rules) and as
