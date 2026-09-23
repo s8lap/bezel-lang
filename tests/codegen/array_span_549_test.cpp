@@ -28,6 +28,9 @@
 //   §4.15 for-in iteration over span
 //   §4.15 ASan: span over a 'using var' array does NOT free array at span end
 //   §4.15 ReadOnly: indexer setter rejected at compile time
+//   §4.5/§5 (#4749) OwningArray<T>.ToArray/ToSet/ToDictionary are
+//     reachable borrowing snapshots — value-asserted and x200-amplified
+//   §4.5/§4.10 (#4749) control: OwningSet<T>.ToArray() still rejected
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +49,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_result_asserts.hpp"   // diagnosticMessageContains
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
@@ -175,40 +179,127 @@ BEZEL_TEST(array_span_549, array_asspan_index_unaffected_1022) {
         "end Main; end C;", 8);
 }
 
-// §4.5 (#1022): the non-owning copy-form materializers ToArray/ToSet/ToDictionary
-// are rejected on an OWNING collection — copying would double-own its uniquely
-// owned elements. (Before the fix they were silently accepted and codegen
-// mis-reclaimed the materializer backing.) §4.5 L1202: "There is no ToArray() on
-// OwningArray<T> that produces a non-owning copy."
-BEZEL_TEST(array_span_549, ownedarray_toarray_rejected_1022) {
-    BEZEL_EXPECT_TRUE(rejectedAtCompile(
-        "module M; class R end R; "
-        "class C public static method Main(): int "
-        "  using var a := new OwningArray<R>(); a.Add(new R()); "
-        "  _ := a.ToArray(); "
-        "  return 0; "
-        "end Main; end C;"));
-}
-
-BEZEL_TEST(array_span_549, ownedarray_toset_rejected_1022) {
-    BEZEL_EXPECT_TRUE(rejectedAtCompile(
-        "module M; class R end R; "
-        "class C public static method Main(): int "
-        "  using var a := new OwningArray<R>(); a.Add(new R()); "
-        "  _ := a.ToSet(); "
-        "  return 0; "
-        "end Main; end C;"));
-}
-
-BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
-    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+// §4.5 / §5 (#4749, v0.307) — SUPERSEDES the pre-#3286 #1022 reject that these
+// three rows used to assert.  The §5 LINQ materializers `ToArray`/`ToSet`/
+// `ToDictionary` ARE reachable on an `OwningArray<T>` receiver: the type
+// declares no instance member of any of those names, so spec §26.5 rule 1
+// never commits instance resolution for them, and the `IEnumerable<T>`
+// extension block is consulted (§4.13 supplies the conformance).  What comes
+// back is not an owning copy but a **borrowing snapshot** — stdlib §4.5,
+// v0.307: "It returns an `owned Array<T>` — a **borrowing snapshot**: at a
+// class element type `Array<T>` is a borrowing collection, so its slots hold
+// borrows of the elements, sourced from this array, which continues to own
+// them", generalized in the same paragraph: "The same reachability and the
+// same obligation hold for `ToSet()`, `ToDictionary(…)`, and every other §5
+// operator applied to an owning receiver."  The caller's obligation is the
+// snapshot container, never its elements.
+//
+// The rows are flipped AND strengthened past "it compiles".  #1022's original
+// defect was codegen silently materializing a ZEROED backing — invisible to a
+// bare no-compile-error oracle — so each row now RUNS under generated-code
+// ASan/LSan (`runAotChecked`) and asserts the snapshot's `Count` *and* the
+// element values read back THROUGH the snapshot's slots.  Each is
+// loop-amplified x200 (#4749's one-shot rows cannot see a leak that stays
+// reachable from a live stack slot): a leaked snapshot container, or a
+// snapshot slot wrongly treated as OWNING (which would double-free every
+// element against the array's own disposal cascade), is an LSan/ASan report
+// here rather than a silent pass.
+BEZEL_TEST(array_span_549, ownedarray_toarray_borrowing_snapshot_4_5_4749) {
+    auto r = runAotChecked(
         "module M; "
-        "import System.Collections.Generic; "
+        "class R public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwningArray<int>(); a.Add(1); a.Add(2); "
-        "  _ := a.ToDictionary(lambda(x) => x); "
+        "  var counts := 0; var total := 0; "
+        "  for var i in 0..<200 do "
+        "    using var a := new OwningArray<R>(); "
+        "    a.Add(new R(1)); a.Add(new R(2)); a.Add(new R(3)); "
+        "    using var snap := a.ToArray(); "
+        "    counts := counts + snap.Count; "
+        "    total := total + snap[0].V + snap[1].V + snap[2].V; "
+        "  end; "
+        "  Console.WriteLine(counts); "
+        "  Console.WriteLine(total); "
         "  return 0; "
-        "end Main; end C;"));
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n1200\n"));
+}
+
+BEZEL_TEST(array_span_549, ownedarray_toset_borrowing_snapshot_4_5_4749) {
+    auto r = runAotChecked(
+        "module M; "
+        "class R public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end R; "
+        "class C public static method Main(): int "
+        "  var counts := 0; var total := 0; "
+        "  for var i in 0..<200 do "
+        "    using var a := new OwningArray<R>(); "
+        "    a.Add(new R(1)); a.Add(new R(2)); a.Add(new R(3)); "
+        "    using var snap := a.ToSet(); "
+        "    counts := counts + snap.Count; "
+        "    for var x in snap do total := total + x.V; end; "
+        "  end; "
+        "  Console.WriteLine(counts); "
+        "  Console.WriteLine(total); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n1200\n"));
+}
+
+// The ToDictionary row additionally re-spells its fixture.  It used to read
+// `new OwningArray<int>()`, which stdlib §4.5's `where T: class` head forbids
+// outright — so after #4749 removed `OwningArray` from the materializer
+// reject the row kept passing on the ELEMENT-TYPE error, pinning nothing about
+// `ToDictionary` at all (the sibling `ownedarray_linq_then_toarray_valid_1022`
+// row below records the same migration, "per stdlib §4.2/#1327").  A class
+// element type puts the row back on its own axis.
+BEZEL_TEST(array_span_549, ownedarray_todictionary_borrowing_snapshot_4_5_4749) {
+    auto r = runAotChecked(
+        "module M; "
+        "class R public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end R; "
+        "class C public static method Main(): int "
+        "  var counts := 0; var total := 0; "
+        "  for var i in 0..<200 do "
+        "    using var a := new OwningArray<R>(); "
+        "    a.Add(new R(1)); a.Add(new R(2)); a.Add(new R(3)); "
+        "    using var snap := a.ToDictionary(lambda(x: R): int => x.V); "
+        "    counts := counts + snap.Count; "
+        "    total := total + snap[1].V + snap[2].V + snap[3].V; "
+        "  end; "
+        "  Console.WriteLine(counts); "
+        "  Console.WriteLine(total); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n1200\n"));
+}
+
+// §4.5 / §4.10 (#4749) CONTROL — the guard this file used to exercise is keyed
+// on receiver AND method, and #4749 narrowed only its receiver list.  The
+// sibling owning collections keep the reject (their per-type paragraphs
+// §4.6/§4.7/§4.9/§4.10/§4.11 do not yet echo §4.5's generalization, so
+// unblocking them was declined as out of #4749's scope).  Without this row the
+// three flips above would delete this file's only coverage of the surviving
+// arm; it fails if a later change drops the whole block instead of its
+// `OwningArray` entry.
+BEZEL_TEST(array_span_549, ownedset_toarray_still_rejected_control_4749) {
+    auto r = runAot(
+        "module M; class R end R; "
+        "class C public static method Main(): int "
+        "  using var s := new OwningSet<R>(); s.Add(new R()); "
+        "  _ := s.ToArray(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(!r.ran && r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "`OwningSet<T>` does not expose `ToArray`"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "\xC2\xA7" "4.5"));
 }
 
 // §4.5 (#1022) regression: a LINQ query result over an owning collection has an
