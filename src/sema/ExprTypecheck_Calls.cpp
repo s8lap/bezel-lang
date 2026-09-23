@@ -2532,6 +2532,144 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                 }
+                // §5.2 / §17.14 constant-operand rule (v0.300, #4405): where
+                // the operand of an explicit conversion is a compile-time
+                // constant (§17.14) whose value would raise
+                // `OverflowException` under any rule of this section — integer
+                // narrowing, the same-width signedness change, the
+                // integer-to-`char` code-point range, and (per spec text;
+                // floating/`decimal` literal-folding follow-up filed separately
+                // since this branch folds integers only) — the conversion is
+                // a **compile error at the conversion site**, never a deferred
+                // runtime fault: `uint(-1)`, `byte(300)`, `char(0xD800)` are
+                // rejected where they are written. A **non-constant** operand
+                // keeps §5.2's literal text and raises `OverflowException` at
+                // runtime. Carve-outs the rule itself names:
+                //   - a SATURATING conversion is unaffected (e.g. `float(1e300)`
+                //     is `Infinity`, `float(0.0/0.0)` is `NaN`), exactly as at
+                //     runtime — see §5.2's "bounds" paragraph;
+                //   - the rule reads the OPERAND only — it does not make the
+                //     conversion expression a constant expression (§17.14's
+                //     inductive set is unchanged, so `const K := byte(1);` is
+                //     still not a compile-time `const`).
+                // This matches the posture §5.1, §5.4, §6.5, and §17.14
+                // already take — the section was the only checked operation
+                // deferring a decidable fault. Diagnostic carries the word
+                // "constant" so a literal case / corpus grep can pin it.
+                if (ce.args.size() == 1 && ce.args[0].value) {
+                    const TypeRef* argTy2 =
+                        ctx_.exprType(*ce.args[0].value);
+                    if (argTy2 && argTy2->kind == TypeRef::Kind::Primitive &&
+                        !argTy2->nullable) {
+                        PrimitiveType srcPt2 = argTy2->primitive;
+                        const bool srcIsIntish =
+                            srcPt2 == PrimitiveType::Byte  ||
+                            srcPt2 == PrimitiveType::SByte ||
+                            srcPt2 == PrimitiveType::Short ||
+                            srcPt2 == PrimitiveType::UShort ||
+                            srcPt2 == PrimitiveType::Int   ||
+                            srcPt2 == PrimitiveType::UInt  ||
+                            srcPt2 == PrimitiveType::Long  ||
+                            srcPt2 == PrimitiveType::ULong ||
+                            srcPt2 == PrimitiveType::Char;
+                        const bool tgtIsNarrowerInt =
+                            pt == PrimitiveType::SByte || pt == PrimitiveType::Byte  ||
+                            pt == PrimitiveType::Short || pt == PrimitiveType::UShort ||
+                            pt == PrimitiveType::Int   || pt == PrimitiveType::UInt  ||
+                            pt == PrimitiveType::Long  || pt == PrimitiveType::ULong;
+                        // (a) integer narrowing / same-width signedness change
+                        // at a compile-time-constant integer operand — the
+                        // `fitsInIntType` gate already covers the SAME-width
+                        // signedness change (`uint(-1)`, `int(uint.MaxValue)`)
+                        // and every narrowing (`byte(300)`, `short(70000)`); the
+                        // Long/ULong fall-through returns true (no narrowing)
+                        // so a same-type widening `long(1)` is admitted.
+                        if (tgtIsNarrowerInt && srcIsIntish) {
+                            if (auto cv =
+                                    foldIntConstExprTC(*ce.args[0].value)) {
+                                // Inlined from `ExprTypecheck.cpp`'s
+                                // file-static `fitsInIntType` (the var-decl /
+                                // assignment gate this section defers to) —
+                                // the public surface, no separate header
+                                // include. The ORIGINAL `fitsInIntType`
+                                // returns true for `Int` via its default arm
+                                // because §5.1's narrowing gate only ever
+                                // sees `Int`-sourced targets (same-type
+                                // identity, no narrowing to check). §5.2's
+                                // constant-operand rule needs the WIDER-arm
+                                // check too: `int(uint.MaxValue)` is a
+                                // same-width signedness change from an
+                                // unsigned source, and the value 4294967295
+                                // overflows `int`'s range — add the explicit
+                                // `Int` arm that the §5.1 default elides.
+                                auto fits = [](long long v,
+                                               PrimitiveType tgt) {
+                                    switch (tgt) {
+                                        case PrimitiveType::SByte:
+                                            return v >= -128 && v <= 127;
+                                        case PrimitiveType::Byte:
+                                            return v >= 0 && v <= 255;
+                                        case PrimitiveType::Short:
+                                            return v >= -32768 && v <= 32767;
+                                        case PrimitiveType::UShort:
+                                            return v >= 0 && v <= 65535;
+                                        case PrimitiveType::Int:
+                                            return v >= -2147483648LL &&
+                                                   v <= 2147483647LL;
+                                        case PrimitiveType::UInt:
+                                            return v >= 0 &&
+                                                   v <= 4294967295LL;
+                                        case PrimitiveType::ULong:
+                                            return v >= 0;
+                                        default:
+                                            return true;
+                                    }
+                                };
+                                if (!fits(*cv, pt)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "the compile-time-constant operand `"
+                                        + std::to_string(*cv) +
+                                        "` of the explicit conversion to `"
+                                        + std::string(id->name) +
+                                        "` would raise `OverflowException`; "
+                                        "§5.2 rejects a faulting constant "
+                                        "operand at the conversion site, "
+                                        "not as a deferred runtime fault "
+                                        "(§17.14, v0.300)");
+                                    return;
+                                }
+                            }
+                        }
+                        // (b) integer-to-`char` code-point range at a constant
+                        // operand — U+0000–U+10FFFF excluding the surrogate
+                        // range U+D800–U+DFFF; otherwise `OverflowException`
+                        // per §5.2. A char-source `char('A')` collapses to
+                        // the same predicate (a char is its own code-point
+                        // value), and the constant char literal `'A'` folds
+                        // to 65 → admitted.
+                        if (pt == PrimitiveType::Char && srcIsIntish) {
+                            if (auto cv =
+                                    foldIntConstExprTC(*ce.args[0].value)) {
+                                long long v = *cv;
+                                if (v < 0 || v > 0x10FFFF ||
+                                    (v >= 0xD800 && v <= 0xDFFF)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "the compile-time-constant operand `"
+                                        + std::to_string(v) +
+                                        "` of the explicit conversion to "
+                                        "`char` is not a valid Unicode code "
+                                        "point (U+0000–U+10FFFF excluding "
+                                        "U+D800–U+DFFF); §5.2 rejects a "
+                                        "faulting constant operand at the "
+                                        "conversion site (§17.14, v0.300)");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(pt));
                 return;
             }
