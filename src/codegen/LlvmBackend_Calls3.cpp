@@ -3399,6 +3399,24 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        // fix #4639 (§8.6, v0.307): the #819 mirror — an element stored into
+        // an INTERFACE/Object element slot must be heap-boxed when it is a
+        // value type (record/enum/primitive), so a vtable sits at word 0 of
+        // the pointer the node stores. Without this, `ll.AddLast(10)` on a
+        // `LinkedList<Object>` spills the bare `i32` into a 4-byte alloca
+        // while `esz` (the Object slot's pointer-wide stride) is 8: MEASURED
+        // as `AddressSanitizer: stack-buffer-overflow … READ of size 8 …
+        // memcpy / llist_node_alloc / bz_llist_add_first` (or `_add_last`)
+        // from this probe. On the plain build the same 4-byte-into-8-byte
+        // spill leaves the node holding a pointer-shaped word built from
+        // stack garbage, and any later membership op that treats a
+        // `LinkedList<Object>` element as a box (`.Contains`, `.Find`,
+        // `.Remove`, `x in coll` — all boxed by #4619's `boxMembershipQuery`)
+        // dereferences it as a vtable pointer: SIGSEGV. `boxForTarget` is a
+        // no-op for a class/already-pointer element or a non-Object/
+        // interface slot, so every already-correct shape (a class element,
+        // a pre-boxed `Object` local, `LinkedList<int>`) is unchanged.
+        v = boxForTarget(v, llElemRef, call.args[0].value.get());
         llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
@@ -3423,6 +3441,10 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        // fix #4639 (§8.6, v0.307): see the AddFirst note above — the #819
+        // mirror, §8.6-box a value element into an Object/interface slot
+        // before it is spilled to the node.
+        v = boxForTarget(v, llElemRef, call.args[0].value.get());
         llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
@@ -3443,6 +3465,14 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        // narrow #4639 (§8.6, v0.307): the sibling of the AddFirst/AddLast
+        // box, taken here because AddBefore shares the exact same
+        // `llElemSlot`-spill-into-`bz_llist_add_*` shape — MEASURED with the
+        // same ASan stack-buffer-overflow (`bz_llist_add_before` ->
+        // `bz_llist_add_first` -> memcpy) on `LinkedList<Object>.AddBefore`
+        // fed a bare value, so leaving it unboxed while its siblings were
+        // fixed would still SIGSEGV.
+        v = boxForTarget(v, llElemRef, call.args[1].value.get());
         llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
@@ -3463,6 +3493,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        // narrow #4639 (§8.6, v0.307): see the AddBefore note above — the
+        // same box, same reason, same measured overflow shape.
+        v = boxForTarget(v, llElemRef, call.args[1].value.get());
         llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
