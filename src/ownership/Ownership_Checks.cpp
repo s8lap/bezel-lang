@@ -1167,6 +1167,43 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                             "the indexer plainly instead.");
                         return;
                     }
+                // §28.11 (fix, §28.11 v0.307): the BUILTIN indexer of a
+                // BORROWING-family collection (`Array<T>`, `Dictionary<K,
+                // V>`, `Set<T>`'s sibling forms, ...) carries no
+                // sema::PropertySymbol at all — it is compiler-intrinsic,
+                // never a user-defined indexer — so the check just above
+                // never sees it and `move coll[i]` on one fell through with
+                // NO diagnostic whatsoever, leaving `checkRead` +
+                // `recordMovesIn`'s plain (non-`move`) recursion into the
+                // target as the only thing that ran: no rejection, no
+                // consume-marking. §28.11: "Array<T>, Dictionary<K, V>, and
+                // the other borrowing collections do not admit `move
+                // coll[i]` — their slots hold borrows, not owned values;
+                // there is no ownership to transfer." Reject symmetrically
+                // with the user-defined-indexer branch above, keyed on the
+                // collection's static type head via the same predicate
+                // §28.6's Dispose()-receiver check already uses for the
+                // identical borrowing/owning distinction
+                // (isBorrowingCollectionNameHead). // per §28.11, v0.307
+                if (ixOp->target) {
+                    const sema::TypeRef* ct = ctx_.exprType(*ixOp->target);
+                    if (ct && ct->kind == sema::TypeRef::Kind::Named &&
+                        isBorrowingCollectionNameHead(ct->headName())) {
+                        report(
+                            Severity::Error, un->span.begin,
+                            "`move` is not admitted on a borrowing "
+                            "collection's slot: `" +
+                                std::string(ct->headName()) +
+                                "`'s elements are borrows, not owned "
+                                "values (§28.11) — there is no ownership "
+                                "to transfer. `move coll[i]` transfers "
+                                "only an owning collection's element slot "
+                                "(`OwningArray<T>`, `OwningDictionary<K, "
+                                "V>`, ...); read the element plainly "
+                                "instead.");
+                        return;
+                    }
+                }
             }
             checkRead(*un->operand, /*selfTarget=*/false);
         }
