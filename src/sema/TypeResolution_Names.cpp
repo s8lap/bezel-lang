@@ -1797,6 +1797,19 @@ void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
             std::string_view nm = t->headName();
             if (isValueBuiltinByName(nm)) {
                 badDesc = "a value-type builtin";
+            } else if (nm == "Type") {
+                // §28.9 (v0.300, #4393): `Type` is runtime-managed — the runtime
+                // holds exactly one instance per type for the life of the process,
+                // and user code never allocates one, so no holder acquires an
+                // obligation. `owned Type` is inadmissible at every position
+                // §28.1 lists (and is the named-but-declaration=null member of
+                // §28.9's runtime-managed family at this check site; `string` is
+                // the other runtime-managed member and is handled in the
+                // `Primitive` arm above by `PrimitiveType::String`). The same
+                // message the `Primitive`-arm `string` reject emits, framed for
+                // `Type` and citing §28.9 alongside §28.1.
+                badDesc = "the runtime `Type` token (a runtime-managed "
+                          "reference type, §28.9)";
             } else if (hasValueConstraint(nm)) {
                 // §28.1 (v0.196): "A declaration whose constraints exclude class
                 // and interface substitutions outright (`where T: value`) rejects
