@@ -27,4 +27,4 @@
 
 module M; class C public static method Main(): int var o: Object := new Object(); var s := o.Anything; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: codegen cannot read member 'Anything' on receiver of type 'Object': permissive acceptance (spec §3 / issue #605) admits this site but no concrete member dispatch exists (CG8's fall-through degrades the slot to zero via lowerLocalDecl's initializer-failed fallback — #2547)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: codegen cannot read member 'Anything' on receiver of type 'Object': permissive acceptance (spec §3 / issue #605) admits this site but no concrete member dispatch exists (CG8's fall-through degrades the slot to zero via lowerLocalDecl's initializer-failed fallback — #2547)

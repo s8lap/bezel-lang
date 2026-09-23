@@ -52,5 +52,5 @@ class C
   end M;
 end C;
 
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: assignment RHS expression failed to lower to a value for this assignment's target (store dropped — target retains its previous value) — #2961
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: assignment RHS expression failed to lower to a value for this assignment's target (store dropped — target retains its previous value) — #2961
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: assignment RHS expression failed to lower to a value for this assignment's target (store dropped — target retains its previous value) — #2961
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: assignment RHS expression failed to lower to a value for this assignment's target (store dropped — target retains its previous value) — #2961

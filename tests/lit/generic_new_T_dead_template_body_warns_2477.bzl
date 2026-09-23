@@ -23,4 +23,4 @@
 
 module M; class Widget public constructor() end constructor; destructor end destructor; end Widget; static class Factory public static method Make<T>(): int where T: class, new() using var t := new T(); return 1; end Make; end Factory; class C public static method Main(): int return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: codegen cannot construct 'new T()' in the dead abstract template body: no monomorphization binding exists for this type parameter (spec #14.1 / #14.2 permits the form but the abstract body is never invoked — real calls route through the monomorphized clone — #2477)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: codegen cannot construct 'new T()' in the dead abstract template body: no monomorphization binding exists for this type parameter (spec #14.1 / #14.2 permits the form but the abstract body is never invoked — real calls route through the monomorphized clone — #2477)

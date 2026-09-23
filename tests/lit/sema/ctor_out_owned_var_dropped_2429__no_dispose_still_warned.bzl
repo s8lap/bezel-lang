@@ -24,5 +24,5 @@
 
 module M; class Item end Item; class Widget public constructor(s: string, out owned n: Item) n := new Item(); end constructor; end Widget; class C public static method Main(): int var w := new Widget("x", out owned var n); w.Dispose(); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `n` is implicitly disposed at the end of its scope
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `n` is implicitly disposed at the end of its scope
 // CHECK-SAME: (§28.3 auto-drop)

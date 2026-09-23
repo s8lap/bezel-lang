@@ -16,5 +16,5 @@
 
 module M; class C public static _v: decimal := 1.5m; public static method Main(): int => 0; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_v` has type `decimal` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_v` has type `decimal` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

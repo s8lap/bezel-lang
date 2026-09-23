@@ -14,5 +14,5 @@
 
 module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var d := new OwningDictionary<string, Cell>(); d.Add("a", (new Cell(1))); var ok := d.TryPopValue("a", out owned var v); end; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `v` is implicitly disposed at the end of its scope
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `v` is implicitly disposed at the end of its scope
 // CHECK-SAME: (§28.3 auto-drop)

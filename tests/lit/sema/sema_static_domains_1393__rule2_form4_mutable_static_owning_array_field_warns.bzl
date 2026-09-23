@@ -12,5 +12,5 @@
 
 module M; class Cell public n: int := 0; end Cell; class App public static _pool: [2 owned]Cell?; public static method Main(): int => 0; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_pool` has owning-inline-array type `[2 owned]Cell?` — admitted with a declaration-site warning (§22.12 rule 2 form (iv)): the array's owned instances are reachable from every domain and its slots are mutable; confine every slot read/write, `move arr[j]`, and whole-field reassignment to one domain, or restructure behind a `Locked<T>` registry
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_pool` has owning-inline-array type `[2 owned]Cell?` — admitted with a declaration-site warning (§22.12 rule 2 form (iv)): the array's owned instances are reachable from every domain and its slots are mutable; confine every slot read/write, `move arr[j]`, and whole-field reassignment to one domain, or restructure behind a `Locked<T>` registry
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

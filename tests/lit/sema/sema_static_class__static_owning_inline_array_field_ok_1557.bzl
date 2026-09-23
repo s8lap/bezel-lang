@@ -23,5 +23,5 @@
 
 module M; class Slot end Slot; static class Globals public static _arr: [2 owned]Slot? := [new Slot(), new Slot()]; end Globals;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_arr` has owning-inline-array type `[2 owned]Slot?` — admitted with a declaration-site warning (§22.12 rule 2 form (iv))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_arr` has owning-inline-array type `[2 owned]Slot?` — admitted with a declaration-site warning (§22.12 rule 2 form (iv))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

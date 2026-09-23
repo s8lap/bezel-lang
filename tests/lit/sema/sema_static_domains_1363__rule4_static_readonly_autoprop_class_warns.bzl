@@ -10,5 +10,5 @@
 
 module M; class Registry public X: int := 0; end Registry; class App public static readonly property Instance: Registry?; public static method Main(): int => 0; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: static readonly property `Instance` has class type `Registry` which is reachable from every domain; confine its use to one domain or ensure its own internal synchronization
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} static readonly property `Instance` has class type `Registry` which is reachable from every domain; confine its use to one domain or ensure its own internal synchronization
 // CHECK-SAME: (§22.12 rule 4, #1363)

@@ -20,6 +20,6 @@
 
 module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push((new Cell())); if s.TryPop(out owned var item) then item?.Dispose(); end; s.Push((new Cell())); end; return Cell._n; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)
 // CHECK-NOT: auto-drop

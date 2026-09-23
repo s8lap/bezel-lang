@@ -77,5 +77,5 @@ class C
   end Main;
 end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: this type test was DROPPED and reads as false — no runtime descriptor resolved for the target type (a value type reaching an Object/interface location must be boxed, §8.6) — #2775
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: this type test was DROPPED and reads as false — no runtime descriptor resolved for the target type (a value type reaching an Object/interface location must be boxed, §8.6) — #2775
 // CHECK-NOT: #2775

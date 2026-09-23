@@ -48,5 +48,5 @@ class C
   end Main;
 end C;
 
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: the argument of this `Console.WriteLine` failed to lower to a value, so the whole statement emits nothing — not even the line terminator (stdlib §2.1 / §21.9) — #3079
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: the argument of this `Console.Write` failed to lower to a value, so the whole statement emits nothing — not even the line terminator (stdlib §2.1 / §21.9) — #3079
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: the argument of this `Console.WriteLine` failed to lower to a value, so the whole statement emits nothing — not even the line terminator (stdlib §2.1 / §21.9) — #3079
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: the argument of this `Console.Write` failed to lower to a value, so the whole statement emits nothing — not even the line terminator (stdlib §2.1 / §21.9) — #3079

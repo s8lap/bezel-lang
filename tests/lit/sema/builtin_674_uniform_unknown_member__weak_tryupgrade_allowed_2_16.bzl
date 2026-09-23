@@ -10,5 +10,5 @@
 
 module M; class Foo end Foo; class C public static method Test(owned w: Weak<Foo>) var ok := w.TryUpgrade(out using var s); end Test; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned parameter `w` is implicitly disposed at the end of the method
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned parameter `w` is implicitly disposed at the end of the method
 // CHECK-SAME: (§28.3 auto-drop)

@@ -10,5 +10,5 @@
 
 module M; class Foo end Foo; class C public static method Test(owned s: Shared<Foo>) using var s2 := s.Clone(); var _f := s2.Get(); using var w := s2.Downgrade(); end Test; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned parameter `s` is implicitly disposed at the end of the method
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned parameter `s` is implicitly disposed at the end of the method
 // CHECK-SAME: (§28.3 auto-drop)

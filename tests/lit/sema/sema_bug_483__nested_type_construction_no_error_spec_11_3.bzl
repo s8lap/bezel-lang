@@ -12,5 +12,5 @@
 
 module M; class Outer public class Inner public _v: int := 99; destructor end destructor; end Inner; end Outer; class Main2 public static method Main(): int var i := new Outer.Inner(); return i._v; end Main; end Main2;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `i` is implicitly disposed at the end of its scope
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `i` is implicitly disposed at the end of its scope
 // CHECK-SAME: (§28.3 auto-drop)

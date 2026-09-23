@@ -24,4 +24,4 @@
 
 module M; class C public method M(o: Object): int var s := o.Anything(); return 0; end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: codegen cannot dispatch member 'Anything' on receiver of type 'Object': permissive acceptance (spec #3 / issue #605) admits this site but no concrete member dispatch exists (lowerLocalDecl's zero-init fallback will degrade the slot — #2477)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: codegen cannot dispatch member 'Anything' on receiver of type 'Object': permissive acceptance (spec #3 / issue #605) admits this site but no concrete member dispatch exists (lowerLocalDecl's zero-init fallback will degrade the slot — #2477)
