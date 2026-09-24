@@ -51,6 +51,23 @@ bool hasConstantOverflowDiag(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// narrow #4724: the UNIQUE needle of this fix's literal-operand diagnostic.
+// hasConstantOverflowDiag's two words also occur in #4405's integer-constant
+// diagnostic and #4801's constant-expression one, so a TRUE row asserting only
+// them would stay green if the literal arm were deleted and another arm
+// happened to fire. The EXPECT_FALSE rows keep the broad predicate — broader is
+// the stronger oracle in that direction.
+bool hasLiteralFoldDiag(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(" literal) of the explicit conversion to `") !=
+                std::string::npos &&
+            d.message.find("would raise `OverflowException` after truncation "
+                           "toward zero") != std::string::npos &&
+            d.message.find("fix #4724") != std::string::npos)
+            return true;
+    return false;
+}
+
 const char* kHeader =
     "module M; class C public static method Main(): int ";
 const char* kFooter = " return 0; end Main; end C;";
@@ -84,7 +101,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_decimal_one_past_int_max_rejected) {
     auto r = check("return int(2147483648m);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `int(1e19m)` — decimal 10^19, five orders past int.MaxValue.
@@ -93,7 +110,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_decimal_out_of_range_rejected) {
     auto r = check("return int(1e19m);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `long(9223372036854775808m)` — 2^63, one past long.MaxValue.
@@ -103,7 +120,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            long_of_decimal_one_past_max_rejected) {
     auto r = check("var v: long := long(9223372036854775808m); return 0;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `long(-9223372036854775809m)` — -(2^63+1), one past long.MinValue.
@@ -114,7 +131,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            long_of_decimal_one_past_min_rejected) {
     auto r = check("var v: long := long(-9223372036854775809m); return 0;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `ulong(-1m)` — negative decimal to unsigned target.
@@ -123,7 +140,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            ulong_of_decimal_negative_rejected) {
     auto r = check("var v: ulong := ulong(-1m); return 0;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `ulong(18446744073709551616m)` — 2^64, one past ulong.MaxValue.
@@ -133,7 +150,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            ulong_of_decimal_one_past_max_rejected) {
     auto r = check("var v: ulong := ulong(18446744073709551616m); return 0;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `uint(1e19m)` — decimal 10^19 to unsigned int.
@@ -141,7 +158,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            uint_of_decimal_out_of_range_rejected) {
     auto r = check("return uint(1e19m);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `byte(1e2m)` exists as a 1e2 = 100 fit. But `byte(300m)` rejects
@@ -150,7 +167,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            byte_of_decimal_out_of_range_rejected) {
     auto r = check("return byte(300m);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // =====================================================================
@@ -190,7 +207,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_f_suffix_at_2p31_rejected) {
     auto r = check("return int(2147483648.0f);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `byte(256.0f)` — float32 represents 256.0 exactly (it's a power
@@ -202,7 +219,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            byte_of_f_suffix_rounds_up_rejected) {
     auto r = check("return byte(256.0f);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `sbyte(-129.0f)` — float rounds -129.0 exactly; below sbyte.MinValue.
@@ -210,7 +227,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            sbyte_of_f_suffix_below_min_rejected) {
     auto r = check("return sbyte(-129.0f);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // =====================================================================
@@ -222,7 +239,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_double_out_of_range_rejected) {
     auto r = check("return int(1.0e30);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724 amendment A (truncate-toward-zero): `int(2147483647.9)` rounds
@@ -271,7 +288,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_negative_double_rejected) {
     auto r = check("return int(-1.0e30);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `uint(-1.0)` — unary negative to unsigned target.
@@ -279,7 +296,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            uint_of_negative_double_rejected) {
     auto r = check("return uint(-1.0);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // =====================================================================
@@ -413,7 +430,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            byte_of_underscore_double_256_rejected) {
     auto r = check("return int(byte(2_56.0));");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `byte(1_000.5)` truncates to 1000 → REJECT.
@@ -421,7 +438,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            byte_of_underscore_double_fraction_rejected) {
     auto r = check("return int(byte(1_000.5));");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `int(3_000_000_000.0)` exceeds int.MaxValue → REJECT.
@@ -429,7 +446,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_underscore_double_3e9_rejected) {
     auto r = check("return int(3_000_000_000.0);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: `int(1e1_0)` — the separator is in the EXPONENT's DigitGroup;
@@ -438,7 +455,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            int_of_underscore_exponent_double_rejected) {
     auto r = check("return int(1e1_0);");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // =====================================================================
@@ -451,7 +468,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            long_of_double_1e19_rejected) {
     auto r = check("var c: long := long(1.0e19); return 0;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
 }
 
 // #4724: a literal already out of range at FORMATION (§4.3: `1e400` is a
@@ -469,7 +486,7 @@ BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
 BEZEL_TEST(s5_2_float_decimal_literal_folding_4724,
            byte_of_negative_one_diag_shows_sign) {
     auto r = check("return int(byte(-1.0));");
-    BEZEL_EXPECT_TRUE(hasConstantOverflowDiag(r));
+    BEZEL_EXPECT_TRUE(hasLiteralFoldDiag(r));
     bool signed_ = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("`-1.0`") != std::string::npos) signed_ = true;

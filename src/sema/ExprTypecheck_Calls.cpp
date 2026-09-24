@@ -8,16 +8,48 @@
 #include <limits>     // std::numeric_limits — fix #4801 wrapper constants
 
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
-#include "runtime/bezel_runtime.h"  // bz_decimal_t, bz_decimal_parse_cstr, bz_exc_addr — fix #4724 (§4.4 literal parser)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
+// fix #4724 / #4801 (§4.4, §5.2, §6.4, v0.307): the compile-time float and
+// decimal folds reuse the runtime's decimal entry points — the SAME ops codegen
+// calls, so the fold IS the run-time semantics. The runtime is linked into
+// `bezelc`, so these resolve at final link. Declared locally (the #1781
+// precedent in ExprTypecheck_Exprs.cpp) rather than including
+// runtime/bezel_runtime.h, which would drag the whole runtime ABI into sema.
+// The first two declarations match that precedent exactly; every decimal is
+// passed by pointer to a 16-byte {lo32, mid32, hi32, flags} value
+// (FoldDecimal below). A fault is a store into the thread-local `bz_exc` slot.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                      void* ove_vtable, void* fe_vtable);
+extern "C" void** bz_exc_addr();
+extern "C" void bz_decimal_add(const void* a, const void* b, void* out,
+                               void* ove_vtable);
+extern "C" void bz_decimal_sub(const void* a, const void* b, void* out,
+                               void* ove_vtable);
+extern "C" void bz_decimal_mul(const void* a, const void* b, void* out,
+                               void* ove_vtable);
+extern "C" void bz_decimal_div(const void* a, const void* b, void* out,
+                               void* ove_vtable);
+extern "C" void bz_decimal_mod(const void* a, const void* b, void* out,
+                               void* ove_vtable);
+extern "C" void bz_decimal_neg(const void* a, void* out);
+extern "C" void bz_decimal_from_int64(std::int64_t v, void* out);
+extern "C" void bz_decimal_from_double(double v, void* out, void* ove_vtable);
+
 namespace bezel::sema {
 
 namespace {
+
+// The runtime's `bz_decimal_t` layout (runtime/bezel_runtime.h): a 96-bit
+// mantissa plus a flags word carrying scale (bits 16-23) and sign (bit 31).
+struct FoldDecimal {
+    std::uint32_t lo32, mid32, hi32, flags;
+};
+static_assert(sizeof(FoldDecimal) == 16, "must match runtime bz_decimal_t");
 
 // fix #2513 / spec §35.2 (v0.236): a short, allocation-free TypeRef -> string
 // for the `Result` combinator diagnostics. The full typeRefToString lives in
@@ -283,13 +315,14 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
 // the exponent also uses) and the type suffix removed — the identical
 // normalisation the literal-formation range check (ExprTypecheck_Exprs.cpp)
 // and codegen's materialisation (LlvmBackend_Exprs.cpp) apply before parsing,
-// so the fold sees the value the program will actually carry.
+// so the fold sees the value the program will actually carry. Appendix A.1's
+// FloatSuffix is exactly `f`/`F`/`m`/`M` — there is no `d`/`D` suffix, so a
+// `d` is never stripped (it cannot occur in a lexed FloatLiteral).
 std::string floatLiteralDigitsForFold(std::string_view text, bool isDecimal) {
     std::string digits;
     for (char c : text) {
         if (c == '_') continue;
-        if (isDecimal ? (c == 'm' || c == 'M')
-                      : (c == 'f' || c == 'F' || c == 'd' || c == 'D'))
+        if (isDecimal ? (c == 'm' || c == 'M') : (c == 'f' || c == 'F'))
             continue;
         digits.push_back(c);
     }
@@ -321,10 +354,10 @@ bool decimalOpFaults(Op&& op) {
 // `decimal`'s range — the latter already a §4.3/§4.4 formation error), so the
 // caller skips the fold rather than reading an unwritten value or cascading
 // a second diagnostic. The output is zero-initialised.
-std::optional<bz_decimal_t> decimalLiteralValue(std::string_view text) {
+std::optional<FoldDecimal> decimalLiteralValue(std::string_view text) {
     const std::string digits = floatLiteralDigitsForFold(text, true);
     if (digits.empty()) return std::nullopt;
-    bz_decimal_t dec{0, 0, 0, 0};
+    FoldDecimal dec{0, 0, 0, 0};
     if (decimalOpFaults([&](void* vt) {
             bz_decimal_parse_cstr(digits.c_str(), &dec, vt, vt);
         }))
@@ -335,7 +368,7 @@ std::optional<bz_decimal_t> decimalLiteralValue(std::string_view text) {
 // A `decimal` value truncated toward zero, computed EXACTLY (96-bit mantissa /
 // 10^scale in 128-bit arithmetic — no IEEE rounding, so
 // `long(9223372036854775807m)` folds to long.MaxValue).
-__int128 truncatedDecimal(const bz_decimal_t& dec) {
+__int128 truncatedDecimal(const FoldDecimal& dec) {
     const __uint128_t mant = ((__uint128_t)dec.hi32 << 64) |
                              ((__uint128_t)dec.mid32 << 32) |
                              (__uint128_t)dec.lo32;
@@ -377,7 +410,7 @@ std::string formatFoldedDouble(double v) {
     return buf;
 }
 
-std::string formatFoldedDecimal(const bz_decimal_t& dec) {
+std::string formatFoldedDecimal(const FoldDecimal& dec) {
     __uint128_t mant = ((__uint128_t)dec.hi32 << 64) |
                        ((__uint128_t)dec.mid32 << 32) | (__uint128_t)dec.lo32;
     const uint32_t scale = (dec.flags >> 16) & 0xFFu;
@@ -2432,7 +2465,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         r.d = d;
         return r;
     };
-    auto makeDec = [](const bz_decimal_t& dv) {
+    auto makeDec = [](const FoldDecimal& dv) {
         FoldedNumConst r;
         r.kind = K::Decimal;
         r.dec[0] = dv.lo32;
@@ -2442,7 +2475,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         return r;
     };
     auto decOf = [](const FoldedNumConst& v) {
-        return bz_decimal_t{v.dec[0], v.dec[1], v.dec[2], v.dec[3]};
+        return FoldDecimal{v.dec[0], v.dec[1], v.dec[2], v.dec[3]};
     };
     // §5.1 / §6.2 implicit promotion of a folded value to kind `to`:
     // integer → float/double/decimal and float → double. Anything else is
@@ -2455,7 +2488,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             if (to == K::Float)
                 return makeBin(K::Float, (double)(float)v.i);
             if (to == K::Decimal) {
-                bz_decimal_t dv{0, 0, 0, 0};
+                FoldDecimal dv{0, 0, 0, 0};
                 bz_decimal_from_int64((int64_t)v.i, &dv);
                 return makeDec(dv);
             }
@@ -2491,8 +2524,8 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                     return std::nullopt;
                 v->i = -v->i;
             } else if (v->kind == K::Decimal) {
-                const bz_decimal_t a = decOf(*v);
-                bz_decimal_t out{0, 0, 0, 0};
+                const FoldDecimal a = decOf(*v);
+                FoldDecimal out{0, 0, 0, 0};
                 bz_decimal_neg(&a, &out);
                 v = makeDec(out);
             } else {
@@ -2534,8 +2567,8 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         rr = coerce(*rr, rk);
         if (!l || !rr) return std::nullopt;
         if (rk == K::Decimal) {
-            const bz_decimal_t a = decOf(*l), c = decOf(*rr);
-            bz_decimal_t out{0, 0, 0, 0};
+            const FoldDecimal a = decOf(*l), c = decOf(*rr);
+            FoldDecimal out{0, 0, 0, 0};
             const bool zeroDivisor = c.lo32 == 0 && c.mid32 == 0 && c.hi32 == 0;
             // §6.4: division / `mod` by zero raises DivideByZeroException
             // (codegen guards it inline; the runtime op aborts on it) and
@@ -3295,7 +3328,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 folded->kind != FoldedNumConst::Kind::Int) {
                                 using FK = FoldedNumConst::Kind;
                                 const bool isDec = folded->kind == FK::Decimal;
-                                const bz_decimal_t dv{
+                                const FoldDecimal dv{
                                     folded->dec[0], folded->dec[1],
                                     folded->dec[2], folded->dec[3]};
                                 const double d = folded->d;
@@ -3305,7 +3338,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                                 : "double";
                                 bool fits = true;
                                 if (toDecimal) {
-                                    bz_decimal_t out{0, 0, 0, 0};
+                                    FoldDecimal out{0, 0, 0, 0};
                                     fits = !decimalOpFaults([&](void* vt) {
                                         bz_decimal_from_double(d, &out, vt);
                                     });
