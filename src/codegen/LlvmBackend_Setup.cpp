@@ -18077,6 +18077,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     Disposal d{it->second, nullptr};
     d.iterEnumDispose = true;
     disposeStack_.back().push_back(d);
+    // fix #4794: record the claim so a later `move` of this local hands it to
+    // the new owner (see iterableSourceClaimedDecls_). // per §28.8.1, v0.307
+    iterableSourceClaimedDecls_.insert(declNode);
     return true;
 }
 

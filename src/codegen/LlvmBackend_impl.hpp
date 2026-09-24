@@ -1141,6 +1141,17 @@ private:
     // routed to the class disposal the explicit `.Dispose()` path already takes.
     // Keyed by the decl ast::Node* (module-lifetime — no clearing).
     std::unordered_set<const ast::Node*> iterFormatWrappedDecls_;
+    // fix #4794 (§28.8.1 / §28.3 / §29.1, stdlib §4.13, v0.307): the decl
+    // nodes whose local `registerIterableSourceDisposal` CLAIMED — a plain
+    // `var`/`const` holding a freshly produced iterator-format source that
+    // this scope disposes (null-guarded slot-1 Dispose) at its end. A `move`
+    // of such a local transfers that frame to its new owner, so the `move`
+    // lowering (LlvmBackend_Exprs2.cpp) nulls the slot and the claim reloads
+    // null and skips. Without it `var view := Gen(); Take(move view);` into
+    // an `owned` parameter the callee disposes was a heap-use-after-free in
+    // the caller. Keyed by the decl ast::Node* (module-lifetime — no
+    // clearing, like iterFormatWrappedDecls_).
+    std::unordered_set<const ast::Node*> iterableSourceClaimedDecls_;
     // fix #3419 (§29.2 / §23.2 / §23.4 / §28.6, v0.283): the PROPERTY/INDEXER
     // READ face's half of the same self-report. `iterFormatWrappedDecls_` cannot
     // cover it: `preIterWrap` is captured AFTER `lowerExpr(*init)` has run, so a

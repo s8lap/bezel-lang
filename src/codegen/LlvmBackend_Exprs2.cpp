@@ -677,10 +677,27 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     id->owningMatchTransferBinding &&
                     dynamic_cast<const ast::BindingPattern*>(loc->decl) !=
                         nullptr;
+                // (f) fix #4794 (§28.8.1 / §28.3 / §29.1, stdlib §4.13,
+                // v0.307): a plain local whose freshly produced
+                // iterator-format source `registerIterableSourceDisposal`
+                // claimed for a null-guarded scope-end slot-1 Dispose
+                // (`var view := Gen();`, `var view := pool.Drain();`). The
+                // `move` hands that frame to its new owner — an `owned`
+                // parameter whose callee may dispose it — so the caller's
+                // claim must not fire on it again. MEASURED pre-fix (ASan):
+                // `var view := Gen(); var r := Take(move view);` with `Take`
+                // calling `src.Dispose()` was a heap-use-after-free in the
+                // caller's scope-end Dispose. Nulling makes that claim reload
+                // null and skip — case (c)'s null-site reasoning; the claim
+                // is exactly-once-safe under a conditional move for the same
+                // reason. // per §28.8.1, §28.3, §29.1, v0.307
+                const bool isClaimedIterableSource =
+                    iterableSourceClaimedDecls_.count(loc->decl) != 0;
                 if (loc->isUsing || isIterVarAutoDrop ||
                     loc->autoDropAtScopeEnd || isArmTransferDischarge ||
                     isPlainVarAutoDropAtScopeEnd ||
-                    isOwningMatchTransferConsume) {
+                    isOwningMatchTransferConsume ||
+                    isClaimedIterableSource) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);
