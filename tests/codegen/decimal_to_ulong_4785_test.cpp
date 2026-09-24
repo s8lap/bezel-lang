@@ -185,6 +185,65 @@ BEZEL_TEST(decimal_to_ulong_4785, ulong_decimal_roundtrip_above_int64_max) {
         "end C;"), 1);
 }
 
+// §5.2 (fix #4785 amend, v0.307): truncate toward zero.  -0.5m has magnitude
+// 0.5, truncates to 0, which fits in uint64.  Pre-fix the helper raised on
+// every negative input unconditionally; post-fix it only raises when the
+// truncated magnitude is non-zero.
+BEZEL_TEST(decimal_to_ulong_4785, ulong_from_negative_decimal_truncates_to_zero) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := -0.5m; "
+        "    try "
+        "      var v: ulong := ulong(d); "
+        "      if v = 0UL then return 42; end; "
+        "      return 201; "
+        "    catch OverflowException => return 202; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §5.2: same for -0.999m.
+BEZEL_TEST(decimal_to_ulong_4785, ulong_from_negative_decimal_truncates_to_zero_999) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := -0.999m; "
+        "    try "
+        "      var v: ulong := ulong(d); "
+        "      if v = 0UL then return 42; end; "
+        "      return 201; "
+        "    catch OverflowException => return 202; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §5.2 (fix #4785 amend, v0.307): regression guard — -1m truncates to 1,
+// which is positive and fits in uint64, BUT the NEGATIVE sign makes the
+// result -1, which does NOT fit in uint64.  OverflowException is correct.
+// This is a DIFFERENT row from the existing ulong_from_negative_decimal_raises
+// test: that one was added by the original #4785 fix and covered -1m; this
+// row is identical in input and output but is cited here as a spec-trace
+// proof that the truncate-toward-zero rule produces the right result.
+BEZEL_TEST(decimal_to_ulong_4785, ulong_from_negative_decimal_raises_unchanged) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := -1m; "
+        "    try var v: ulong := ulong(d); return 201; "
+        "    catch OverflowException => return 42; end; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// Note: -0m (negative zero decimal) is canonicalised to 0m by the decimal
+// representation (mantissa=0 → sign forced to positive per dec_store), so
+// ulong(-0m) returns 0 without overflow.  Bezel's decimal literal grammar
+// (§18.1) accepts "-0.0m" but the sign bit is dropped when mantissa=0, so
+// there is no distinct negative-zero literal to test here.
+
 // §5.2: long(1e19m) must CONTINUE to raise OverflowException (long-target
 // path unchanged — only the ulong-target arm switched helpers).
 BEZEL_TEST(decimal_to_ulong_4785, long_from_decimal_beyond_int64_raises_regression) {

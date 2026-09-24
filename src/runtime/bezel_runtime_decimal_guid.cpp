@@ -591,10 +591,15 @@ extern "C" uint64_t bz_decimal_to_uint64(const bz_decimal_t* a, void* ove_vtable
         return 0;
     }
     __uint128_t trunc = m / pow10_128[s];
-    // Range check: the unsigned target REJECTS negatives (the sign bit of a
-    // decimal is separate from the mantissa, so a negative decimal with
-    // |mantissa| < 2^63 would have fit in int64 but does NOT fit in uint64).
-    if (dec_sign(a) || trunc > (__uint128_t)UINT64_MAX) {
+    // §5.2 (fix #4785 amend, v0.307): truncate-toward-zero means a negative
+    // decimal like -0.5m truncates to 0, which is a valid ulong.  A negative
+    // sign is only an error when the truncated magnitude is non-zero:
+    //   -0.5m  → trunc=0, sign=1 → 0      (fits, no overflow)
+    //   -1m    → trunc=1, sign=1 → -1     (does not fit in uint64 → overflow)
+    //   -0m    → trunc=0, sign=1 → 0      (canonical zero, fits)
+    // The upper-bound check is unchanged: any magnitude exceeding uint64.MaxValue
+    // raises regardless of sign.
+    if ((dec_sign(a) && trunc != 0) || trunc > (__uint128_t)UINT64_MAX) {
         bz_set_exc(ove_vtable);
         return 0;
     }
