@@ -16564,14 +16564,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 checkCollectionLiteralElementAssignability(
                     *retCl, currentReturnType_);
         }
-        // Slice T3: a returned value must be primitive-assignable to
-        // the callable's return type.
-        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
-            checkAssignable(
-                ctx_.exprType(*rs->value), currentReturnType_,
-                rs->value->span.begin, "returned value",
-                rs->value.get());  // §27.6 #756 property-ref
-        }
         // issue #777 / §30.6: forgotten `await` in an async METHOD body. For an
         // async method `(): Task<T>`, currentReturnType_ is the peeled element T
         // and inAsyncContext_ is set. `return <Task<U>>` (a bare un-awaited
@@ -16586,6 +16578,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // body-return check is about the declared-wrapper mapping (§30.6) — a
         // `Task?` body return is a different question; this rule's
         // forgetfulness diagnosis does not extend to nullable spellings.
+        // narrow #4770 (§5.1, §30.6, v0.307): this check leads, and a fired
+        // §30.6 suppresses the downstream §5.1 assignability check below —
+        // `Task<U>` returned where `int` is expected also fails §5.1
+        // ("heap reference and target is value type"), but the §30.6 message
+        // names the remedy (`add \`await\``) and must lead. checkAssignable
+        // itself is unchanged; the suppress is at this call site, as the
+        // brief directs.
+        bool forgotAwait30_6 = false;
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
             inAsyncContext_ && currentReturnType_ &&
             !isTaskShapedRef(currentReturnType_) &&
@@ -16595,6 +16595,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 "an `async` method's `return` must produce the element type of "
                 "its `Task<T>`/`OwningTask<T>` return, not a `Task` value; add "
                 "`await` (e.g. `return await Producer();`) (§30.6)");
+            forgotAwait30_6 = true;
+        }
+        // Slice T3: a returned value must be primitive-assignable to
+        // the callable's return type.
+        if (!forgotAwait30_6 && rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
+            checkAssignable(
+                ctx_.exprType(*rs->value), currentReturnType_,
+                rs->value->span.begin, "returned value",
+                rs->value.get());  // §27.6 #756 property-ref
         }
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) visitExpr(*es->expr);
