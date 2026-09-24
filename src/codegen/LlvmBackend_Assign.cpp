@@ -13731,6 +13731,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // with nobody to discharge it, §28.6). It keeps today's
             // compile-time rejection through the #1386 fallback below; the
             // missing dedicated §22.3 diagnostic is filed separately.
+            //
+            // The #4805 fix-forward places the clean §22.3 ref-mismatch
+            // diagnostic block (below) AFTER this fallback so an indexer-slot
+            // or property-slot `ref` argument still goes through copy-in /
+            // copy-out rather than being rejected with the §22.3 message.
             if (!v && accessorRefArgs &&
                 (params[idx].modifier == "ref" || params[idx].modifier == "out")) {
                 llvm::Type* paramTy = nullptr;
@@ -13741,6 +13746,45 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 v = emitAccessorRefArgCopyIn(
                     *a.value, paramTy,
                     /*isOut=*/params[idx].modifier == "out", *accessorRefArgs);
+            }
+            // fix #4805 (§22.3, §9.3, v0.307): only AFTER the
+            // `emitAccessorRefArgCopyIn` indexer/property fallback above has
+            // had a chance to recover do we conclude this argument is a true
+            // non-lvalue (e.g. `new Rec(6)` where `Rec` has
+            // `constructor(ref x: int)`). `lvalueAddr` does NOT itself handle
+            // indexer/property slots — only `emitAccessorRefArgCopyIn` does
+            // (see #1302 above). The block fires only when BOTH `lvalueAddr`
+            // returned null AND the accessor fallback did not assign `v`,
+            // emitting the clean §22.3 diagnostic instead of falling through
+            // to the generic #1386 ICE.
+            if (!v) {
+                // `currentCallee_` is a Member* (MethodDecl/ConstructorDecl)
+                // for method calls but may be null or non-Member for
+                // `new Record(...)` — resolve the name via `initialSymbol`
+                // which is always a NamedSymbol for any callable.
+                std::string pname = params[idx].name.empty()
+                                        ? "(unnamed)"
+                                        : std::string(params[idx].name);
+                std::string calleeName = "(unknown)";
+                if (currentCallee_) {
+                    if (auto* md = dynamic_cast<const ast::MethodDecl*>(currentCallee_))
+                        calleeName = std::string(md->name);
+                    else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(currentCallee_))
+                        ;  // ConstructorDecl has no name field; use "(unknown)"
+                    else if (const ast::IdentifierExpr* id =
+                                 dynamic_cast<const ast::IdentifierExpr*>(currentCallee_))
+                        calleeName = std::string(id->name);
+                }
+                std::string modifierStr(params[idx].modifier);
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    "call to `" + calleeName +
+                        "` has a call-site `ref`/`out` mismatch: parameter `" +
+                        pname + "` is `" + modifierStr +
+                        "` — pass the argument with `ref` at the call site "
+                        "(§22.3 — the caller writes `ref`/`out` at the call site, "
+                        "and only for a `ref`/`out` parameter)");
+                return false;
             }
         } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                        a.value.get())) {
