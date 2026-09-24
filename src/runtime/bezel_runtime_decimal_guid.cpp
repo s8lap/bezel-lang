@@ -541,6 +541,66 @@ extern "C" int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable) 
     return (int32_t)v;
 }
 
+// Conversion to uint64 (explicit per §5.2, fix #4785).
+// §5.2: truncates toward zero; raises OverflowException when the truncated
+// value does not fit in uint64 — i.e. when the source decimal is negative
+// OR its magnitude exceeds 2^64-1.  Decimal.MaxValue
+// (79228162514264337593543950335 ≈ 7.9e28) is well above uint64.MaxValue
+// (18446744073709551615 ≈ 1.8e19), so the upper-bound check is load-bearing
+// here and was the silently-wrong-rejection root cause of #4785: the codegen
+// `ulong(decimal)` arm at LlvmBackend_Exprs2.cpp:9825-9833 reused the SIGNED
+// `bz_decimal_to_int64` helper, which enforces `trunc <= (uint64_t)INT64_MAX`
+// and rejects every value in (int64.MaxValue, uint64.MaxValue] — half of
+// `ulong`'s range.  A NEGATIVE decimal also makes this helper raise; the
+// pre-fix signed helper silently converted -1m to 1 (and downstream, the
+// ulong conversion reinterpreted that as ulong(1)), so this side of the bug
+// is fixed structurally here too.
+extern "C" uint64_t bz_decimal_to_uint64(const bz_decimal_t* a, void* ove_vtable) {
+    // Same truncation logic as bz_decimal_to_int64 (the decimal-to-int helper
+    // shares the truncation math because the only target-specific bits are
+    // the upper-bound check and the sign application); we duplicate the
+    // mantissa / scale / pow10 extraction rather than add an out-parameter
+    // to the signed helper, mirroring the from-side pattern (the int64 and
+    // uint64 FROM helpers are also separate — bz_decimal_from_int64 /
+    // bz_decimal_from_uint64 — per fix #743).  Duplication is the smaller
+    // refactor: threading a signedness flag through would touch every caller.
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s = dec_scale(a);
+    static const __uint128_t pow10_128[29] = {
+        (uint64_t)1, (uint64_t)10, (uint64_t)100, (uint64_t)1000,
+        (uint64_t)10000, (uint64_t)100000, (uint64_t)1000000,
+        (uint64_t)10000000, (uint64_t)100000000, (uint64_t)1000000000,
+        (uint64_t)10000000000ULL, (uint64_t)100000000000ULL,
+        (uint64_t)1000000000000ULL, (uint64_t)10000000000000ULL,
+        (uint64_t)100000000000000ULL, (uint64_t)1000000000000000ULL,
+        (uint64_t)10000000000000000ULL, (uint64_t)100000000000000000ULL,
+        (uint64_t)1000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL * 10,
+        (__uint128_t)10000000000000000000ULL * 100,
+        (__uint128_t)10000000000000000000ULL * 1000,
+        (__uint128_t)10000000000000000000ULL * 10000,
+        (__uint128_t)10000000000000000000ULL * 100000,
+        (__uint128_t)10000000000000000000ULL * 1000000,
+        (__uint128_t)10000000000000000000ULL * 10000000,
+        (__uint128_t)10000000000000000000ULL * 100000000,
+        (__uint128_t)10000000000000000000ULL * 1000000000,
+    };
+    if (s >= 29) {
+        // Any decimal with scale >= 29 has integer part = 0 — a valid ulong(0).
+        return 0;
+    }
+    __uint128_t trunc = m / pow10_128[s];
+    // Range check: the unsigned target REJECTS negatives (the sign bit of a
+    // decimal is separate from the mantissa, so a negative decimal with
+    // |mantissa| < 2^63 would have fit in int64 but does NOT fit in uint64).
+    if (dec_sign(a) || trunc > (__uint128_t)UINT64_MAX) {
+        bz_set_exc(ove_vtable);
+        return 0;
+    }
+    return (uint64_t)trunc;
+}
+
 // A code-point sequence to parse (fix #2273).  The parser reads by INDEX over
 // an explicit length, never by scanning for a NUL: the former `char buf[64]`
 // copies in bz_decimal_parse / bz_decimal_try_parse truncated any input past 63

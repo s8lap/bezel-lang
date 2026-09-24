@@ -9824,6 +9824,20 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                     return trunc;
                 } else {
                     // int64 or uint64 target.
+                    // #4785 / §5.2 (v0.307): ulong targets must route through
+                    // bz_decimal_to_uint64 (uint64 semantics: rejects negatives
+                    // and values > uint64.MaxValue) — the signed helper
+                    // bz_decimal_to_int64 silently rejects the whole range
+                    // (int64.MaxValue, uint64.MaxValue], which is exactly half
+                    // of `ulong`'s domain.  The long-target arm is unchanged.
+                    if (target == P::ULong) {
+                        auto* fn = declareC("bz_decimal_to_uint64", i64(),
+                                           {ptrTy(), ptrTy()});
+                        llvm::Value* v64 = builder_.CreateCall(
+                            fn, {srcSlot, getOVEVtable()}, "dec.tou64");
+                        emitPendingCheck();
+                        return v64;
+                    }
                     auto* fn = declareC("bz_decimal_to_int64", i64(),
                                        {ptrTy(), ptrTy()});
                     llvm::Value* v64 = builder_.CreateCall(fn, {srcSlot, getOVEVtable()},

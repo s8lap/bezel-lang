@@ -589,6 +589,10 @@ double bz_decimal_to_double(const bz_decimal_t* a);
 // the truncated integer value does not fit in the target type's range.
 int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable);
 int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable);
+// #4785 / §5.2: unsigned mirror of bz_decimal_to_int64.  The codegen
+// `ulong(decimal)` arm at LlvmBackend_Exprs2.cpp:9825-9833 routes ulong
+// targets here; rejecting negative decimals and values > uint64.MaxValue.
+uint64_t bz_decimal_to_uint64(const bz_decimal_t* a, void* ove_vtable);
 
 // Parse from string (stdlib §9.3 Decimal.Parse / TryParse).
 // per fix #521: bz_decimal_parse raises FormatException (fe_vtable) for
