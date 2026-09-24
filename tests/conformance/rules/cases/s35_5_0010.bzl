@@ -8,6 +8,7 @@
 //! cites: 35.5, 19.3
 //! expect: reject
 //! diagnostic: never transfers
+//! issue: 4763
 module Conf;
 
 public class Widget

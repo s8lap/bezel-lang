@@ -9,6 +9,7 @@
 //! cites: 19.3
 //! expect: reject
 //! diagnostic: unknown
+//! issue: 4763
 module Conf;
 
 public record Rect(Width: int, Height: int);

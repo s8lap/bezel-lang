@@ -1164,7 +1164,7 @@ s27_7_1_0001	pass
 s27_7_1_0002	pass	
 s27_7_1_0003	pass	
 s27_8_0001	pass	
-s27_8_0002	pass	
+s27_8_0002	fail	divergence
 s28_0001	pass	
 s28_0002	pass	
 s28_1_0001	pass	

@@ -6,6 +6,7 @@
 //!   borrowed scrutinee of any provenance (field read, parameter, this).
 //! expect: reject
 //! diagnostic: borrowed
+//! issue: 4763
 module Conf;
 
 public class Widget
