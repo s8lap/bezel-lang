@@ -1561,6 +1561,75 @@ if ! python3 scripts/gate_rule_corpus_baseline.py --strict \
 fi
 say "rule-corpus-baseline phase: GREEN ($(tail -1 "$_rcb_log"))"
 
+# ── INTERNAL-RESIDUAL PHASE (#4761) ─────────────────────────────────────────
+# The compiler has a deliberate "I cannot lower this but I will return something"
+# convention: a lowering arm that fails its job emits `ctx_.diagnostics().
+# report(Severity::Warning, span, "internal: ...")` and continues, rather than
+# aborting compilation. The literal `internal:` prefix is the project's marker
+# for silent-wrong-code paths — "not a diagnostic" in the spec-cited wording,
+# because the program compiles and exits 0, and three measurable reasons
+# (per the issue body) keep that shape from being caught today:
+#
+#   1. runAot's JitResult::diagnostics is populated ONLY on a REJECT; a
+#      Warning / Note / `internal:` on a program that compiles and runs is
+#      never surfaced through the harness. The stderr that carried it is
+#      discarded on success.
+#   2. lit FileCheck: only 27 of the lit corpus pin `CHECK-NOT: internal:`.
+#   3. The rule-corpus verdict cannot see it on accept rows either.
+#
+# The `#3079` / `#2434` silent-degrade class has been sighted 7 times. Every
+# sighting: an `internal:` warning on a program that COMPILED and EXITED 0.
+# None of the above can see it; the script below can.
+#
+# `scripts/check_internal_residual.py` measures the total `internal:` count
+# across the lit corpus + non-rejects main-conformance cases + run/accept
+# rules-cases (per the script's docstring: three populations, one shared
+# diagnostic prefix). The baseline in scripts/internal_residual.baseline is
+# EXACT, not a ceiling — a count below the baseline fails as STALE HEADROOM
+# (a fix landed but was not banked), and `--update` refuses to raise without
+# `--force` (a rise is a deliberate act that names the new emitter in its
+# commit body).
+#
+# The baseline was measured at r20-c25 (5a528344) against
+# /mnt/fast/lane-builds/r20-l1-e031b0e1/bezelc (SHA = 5a528344 = r20-c25):
+# `total_internal_lines = 0` — the current tree emits none on the corpus.
+# Update it with `python3 scripts/check_internal_residual.py --update` after
+# porting a fix that removes the last remaining emission; the script refuses
+# a rise without `--force`.
+#
+# Like rule-corpus-baseline (#4621), this phase needs a built bezelc, so it
+# sits beside that one rather than in the source-ratchet block above. The
+# --self-test runs FIRST for the same reason every sibling phase pins: a green
+# from a matcher that matched nothing is worth nothing, and the detector's
+# self-test (synthetic tree + fake bezelc) is build-free.
+say "internal-residual phase: detector self-test + `internal:` count ratchet (#4761)"
+_ir_log="$LOGDIR/${TAG}_internal_residual.log"
+if ! python3 scripts/check_internal_residual.py --self-test \
+      > "$_ir_log" 2>&1; then
+  say "CYCLE FAILURE: check_internal_residual SELF-TEST failed — the"
+  say "  detector is broken, so its verdict on the tree means nothing."
+  say "  See $_ir_log"
+  sed -n '1,30p' "$_ir_log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if [ ! -x "$REPO/build/bezelc" ]; then
+  say "CYCLE FAILURE: $REPO/build/bezelc not executable — the internal-"
+  say "  residual detector cannot run against the corpus"
+  exit 1
+fi
+if ! python3 scripts/check_internal_residual.py --strict \
+      --bezelc "$REPO/build/bezelc" \
+      >> "$_ir_log" 2>&1; then
+  say "CYCLE FAILURE: the `internal:` emission count moved against"
+  say "  scripts/internal_residual.baseline — a silent-wrong-code"
+  say "  emitter shipped green, or the baseline is stale headroom (#4761)."
+  say "  See $_ir_log"
+  tail -30 "$_ir_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "internal-residual phase: GREEN ($(tail -1 "$_ir_log"))"
+
 # ── CLANG-TIDY PHASE (fix #3666) — ADVISORY, ONCE PER CYCLE ────────────────
 # The clang-tidy tier (scripts/check_tidy.sh, changed TUs only) used to be a
 # gate.sh phase, so it ran once per ORACLE. Measured over 46 gate.sh runs:
