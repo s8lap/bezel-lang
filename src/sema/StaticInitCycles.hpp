@@ -22,4 +22,13 @@ namespace bezel::sema {
 // Reports an Error diagnostic for each detected cycle.
 bool checkStaticInitCycles(const ast::SourceFile& src, SemaContext& ctx);
 
+// fix #4865 / §17.14 / §22.12 (v0.307): rejects cyclic class-level `const`
+// initializer references (e.g. `K1 := K2; K2 := K1`). Without detection
+// codegen's `constMemberValue` re-lowers the referenced const's initializer
+// and recurses unboundedly into the same pair until the process stack
+// overflows (SIGSEGV). Reports an Error diagnostic for each detected cycle;
+// the codegen path keeps a visited-set backstop so a pre-fix-style crash
+// cannot resurface if a future fold change reopens a cycle here.
+bool checkConstInitCycles(const ast::SourceFile& src, SemaContext& ctx);
+
 }  // namespace bezel::sema

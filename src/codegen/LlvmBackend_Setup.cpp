@@ -452,6 +452,19 @@ llvm::Value* Emitter::enumConstantByName(const sema::TypeSymbol* enumTy,
 llvm::Value* Emitter::constMemberValue(const ast::Expr& e) {
     auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(ctx_.exprSymbol(e));
     if (!cs) return nullptr;
+    // fix #4865 / §17.14 / §22.12 (v0.307): defensive backstop against a
+    // cyclic class-level const initializer. Sema's `checkConstInitCycles`
+    // rejects the cycle with a diagnostic; if a future fold change reopens
+    // a cycle here, this guard converts the unbounded recursion that would
+    // overflow the stack (SIGSEGV) into a clean null return that
+    // `lowerExpr`'s caller treats as a low-value expression. The cycle
+    // remains the bug — sema's diagnostic carries the user-facing message.
+    if (!constMemberLoweringStack_.insert(cs).second) return nullptr;
+    struct PopGuard {
+        std::unordered_set<const sema::ConstMemberSymbol*>& s;
+        const sema::ConstMemberSymbol* k;
+        ~PopGuard() { s.erase(k); }
+    } pop{constMemberLoweringStack_, cs};
     // SEAM-ACCESSOR: the local-path cast; the imported fallback (all
     // primitive kinds via foldImportedConstText) is the `if (!cd)
     // return importedConstValue(e, cs);` line just below. #3152

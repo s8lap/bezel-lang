@@ -962,6 +962,17 @@ private:
     // (a synthesized Serialize FUNCTION would be required to support it).
     std::unordered_set<const sema::TypeSymbol*> serializeEmitStack_;
     std::unordered_set<const sema::TypeSymbol*> deserializeEmitStack_;
+    // fix #4865 / §17.14 / §22.12 (v0.307): the class-level `const` members
+    // whose initializer is currently being lowered. `constMemberValue` calls
+    // `lowerExpr(*cd->value)`, which for a bare-identifier or qualified const
+    // reference re-resolves to that const's own AST decl and re-enters
+    // `constMemberValue`. A self/mutually-referential cycle recurses
+    // unboundedly and overflows the process stack (SIGSEGV, codegen). Sema's
+    // `checkConstInitCycles` rejects the cycle with a diagnostic; this set is
+    // the defensive backstop — a re-entry on a symbol already in the set
+    // returns null rather than recursing, so a future fold change that reopens
+    // a cycle in sema cannot reintroduce the crash.
+    std::unordered_set<const sema::ConstMemberSymbol*> constMemberLoweringStack_;
     // fix #3140 follow-up (§9.8): the type whose synthesized Serialize /
     // Deserialize is currently being emitted, so `emitSerializeField` /
     // `emitDeserializeField` — which take a bare `TypeRef` and have no

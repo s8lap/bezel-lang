@@ -560,4 +560,221 @@ bool checkStaticInitCycles(const ast::SourceFile& /*src*/, SemaContext& ctx) {
     return clean && sameTypeClean;
 }
 
+// fix #4865 / §17.14 / §22.12 (v0.307): a class-level `const` initializer must
+// be a compile-time constant whose value is well-defined; a self/mutually-
+// referential initializer has no value. Sema §17.14 folds terminate on their
+// depth bound, but codegen's `constMemberValue` re-LOWERS the value through
+// `lowerExpr(*cd->value)`, which for a bare-identifier or qualified const
+// reference re-resolves to its own AST const member and re-lowers that —
+// unbounded recursion that overflows the process stack and SIGSEGVs the
+// compiler. The same shape over two classes (`A.K := B.K; B.K := A.K`) and
+// over integer typed pairs (`I1 := I2 + 1; I2 := I1 + 1`) all share the bug.
+//
+// Build a DIRECTED graph over LOCAL class-level ConstMemberSymbols: an edge
+// K1 -> K2 iff K1's initializer (transitively, through expression sub-trees)
+// references K2 by ConstMemberSymbol. Imported consts fold via the textual
+// `importedConstValue` path and don't enter the graph. DFS rejects each
+// distinct cycle once. Reference location is the SOURCE location of the
+// const reference expression (a const reference is the only thing the §17.14
+// fold cannot terminate on — it terminates on its own depth bound, but the
+// identifier node's source location identifies the back-edge in the graph).
+namespace {
+struct ConstRefCollector {
+    const SemaContext& ctx;
+    const ConstMemberSymbol* owner;   // the const whose initializer we walk
+    // Edges from `owner` to the LOCAL ConstMemberSymbols its initializer
+    // references. Each edge carries the source location of the back-reference
+    // expression so the diagnostic can name the offending site.
+    std::unordered_map<const ConstMemberSymbol*, SourceLocation>& out;
+    // Visited guard against recursion through nested expression sub-trees.
+    // Const initializers are §17.14 expressions — bounded depth in practice —
+    // but a cycle through an IdentifierExpr that names a different const
+    // re-enters `collectConstRefs`, not `expr`, so this set guards that.
+    std::unordered_set<const ConstMemberSymbol*> visited;
+
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        // Record a reference at THIS node (an IdentifierExpr or
+        // MemberAccessExpr that resolves to a class-level const).
+        recordRef(e);
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get()); return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get()); return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& a : ix->indices) expr(a.value.get());
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get()); return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get());
+            return;
+        }
+        if (auto* tr = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(tr->operand.get()); return;
+        }
+        if (auto* q = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(q->condition.get()); expr(q->thenValue.get());
+            expr(q->elseValue.get()); return;
+        }
+        // §17.1 mandatory parenthesization (#1086): source-level parens leave
+        // no ParenExpr node — the tree shape encodes grouping. The walk
+        // already descends into the inner expression via the
+        // `parenthesized` flag on Expr; nothing else to do here.
+    }
+
+    void recordRef(const ast::Expr* e) {
+        if (!e) return;
+        Symbol* s = ctx.exprSymbol(*e);
+        if (!s) return;
+        auto* cm = dynamic_cast<ConstMemberSymbol*>(s);
+        if (!cm || !cm->parent) return;
+        // Imported consts are folded via textual value, not the AST path —
+        // they cannot appear as a re-entry target of `constMemberValue` for
+        // this source unit, so an edge to one is a false positive.
+        if (ctx.isImported(cm)) return;
+        // Record this DIRECT reference (the const named at THIS expression
+        // node) — the graph is built over DIRECT initializer references, not
+        // transitive ones. The DFS walks the graph to find cycles, so a
+        // 3-node chain (`K1 := K2 + 1; K2 := K3 + 1; K3 := K1 + 1`) is one
+        // 3-edge cycle, not three independent 2-edge ones. Each reference
+        // is recorded at most once per source const; the `visited` gate
+        // keeps multi-reference initializers from recording the same edge
+        // twice (e.g. `K1 + K1`).
+        if (!visited.insert(cm).second) return;
+        out.emplace(cm, e->span.begin);
+    }
+};
+
+// Collect every LOCAL class-level const symbol with an AST ConstDecl. Keyed on
+// the symbol so the DFS walks the actual symbol graph, not string lookups.
+std::vector<const ConstMemberSymbol*> collectLocalConstMembers(
+        const SemaContext& ctx) {
+    std::vector<const ConstMemberSymbol*> out;
+    for (const auto& sym : ctx.symbols()) {
+        auto* cm = dynamic_cast<const ConstMemberSymbol*>(sym.get());
+        if (!cm || !cm->parent) continue;
+        if (ctx.isImported(cm)) continue;
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cm->decl);
+        if (!cd) continue;
+        out.push_back(cm);
+    }
+    return out;
+}
+
+void collectConstRefs(
+        const SemaContext& ctx,
+        const ConstMemberSymbol* cm,
+        std::unordered_map<const ConstMemberSymbol*, SourceLocation>& edges) {
+    ConstRefCollector c{ctx, cm, edges, {}};
+    auto* cd = dynamic_cast<const ast::ConstDecl*>(cm->decl);
+    if (cd && cd->value) c.expr(cd->value.get());
+}
+}  // namespace
+
+bool checkConstInitCycles(const ast::SourceFile& /*src*/, SemaContext& ctx) {
+    auto locals = collectLocalConstMembers(ctx);
+    if (locals.empty()) return true;
+
+    using EdgeMap = std::unordered_map<const ConstMemberSymbol*, SourceLocation>;
+    std::unordered_map<const ConstMemberSymbol*, EdgeMap> deps;
+    for (const ConstMemberSymbol* cm : locals) {
+        EdgeMap e;
+        collectConstRefs(ctx, cm, e);
+        if (!e.empty()) deps[cm] = std::move(e);
+    }
+    if (deps.empty()) return true;
+
+    std::unordered_map<const ConstMemberSymbol*, int> color;  // 0 white, 1 gray, 2 black
+    std::vector<const ConstMemberSymbol*> path;
+    // Cycle reports dedupe by MEMBER SET so the SAME cycle is reported once
+    // even when both endpoints start their own DFS, and also record the sets
+    // for a SUPERSET check: a length-2 cycle is the real defect, and the
+    // length-1 self-edges its traversal creates are subsets of it. We report
+    // a cycle only when no already-reported cycle's member set is a proper
+    // superset of it — so the user sees the smallest cycle that closes the
+    // graph, not every back-edge individually.
+    std::vector<std::set<const ConstMemberSymbol*>> reportedCycles;
+    bool clean = true;
+
+    auto reportCycle = [&](const std::vector<const ConstMemberSymbol*>& cyc,
+                           SourceLocation edgeLoc) {
+        std::set<const ConstMemberSymbol*> key(cyc.begin(), cyc.end());
+        for (const auto& prev : reportedCycles) {
+            if (prev.size() > key.size() && std::includes(
+                    prev.begin(), prev.end(), key.begin(), key.end()))
+                return;   // `prev` is a proper superset — already covered.
+        }
+        reportedCycles.push_back(key);
+        clean = false;
+        std::string msg = "cyclic class-level const initializer: ";
+        for (const ConstMemberSymbol* c : cyc) {
+            std::string ownerName = c->parent
+                ? std::string(c->parent->name)
+                : std::string("?");
+            msg += ownerName + "." +
+                   std::string(c->name) + " -> ";
+        }
+        std::string headName = cyc.front()->parent
+            ? std::string(cyc.front()->parent->name)
+            : std::string("?");
+        msg += headName + "." +
+               std::string(cyc.front()->name);
+        msg += " (§22.12 / §17.14: a class-level const's "
+               "initializer must be a compile-time constant "
+               "expression with a well-defined value)";
+        // Report at the reference that closes the cycle.
+        ctx.diagnostics().report(Severity::Error, edgeLoc, msg);
+    };
+
+    std::function<void(const ConstMemberSymbol*)> dfs =
+        [&](const ConstMemberSymbol* t) {
+        color[t] = 1;
+        path.push_back(t);
+        auto it = deps.find(t);
+        if (it != deps.end()) {
+            for (const auto& [u, edgeLoc] : it->second) {
+                if (color[u] == 1) {
+                    auto pit = std::find(path.begin(), path.end(), u);
+                    std::vector<const ConstMemberSymbol*> cyc(pit, path.end());
+                    reportCycle(cyc, edgeLoc);
+                } else if (color[u] == 0) {
+                    dfs(u);
+                }
+            }
+        }
+        color[t] = 2;
+        path.pop_back();
+    };
+
+    for (const ConstMemberSymbol* cm : locals)
+        if (color[cm] == 0) dfs(cm);
+
+    return clean;
+}
+
 }  // namespace bezel::sema

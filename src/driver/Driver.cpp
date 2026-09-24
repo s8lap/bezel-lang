@@ -597,6 +597,12 @@ CompileResult Driver::compileExecutableObject(
         // dependencies — runs after typecheck so static-member references are
         // resolved.
         sema::checkStaticInitCycles(*unit, semaCtx);
+        // fix #4865 / §17.14 / §22.12: reject cyclic class-level const
+        // initializers (e.g. `K1 := K2; K2 := K1`) — without detection
+        // codegen's `constMemberValue` re-lowers the referenced const and
+        // recurses unboundedly into the same pair (SIGSEGV). Runs after
+        // typecheck, alongside the cross-type static-init cycle pass.
+        sema::checkConstInitCycles(*unit, semaCtx);
 
         // Ownership milestone — runs after sema since it needs
         // resolved local symbols + producer info.
@@ -750,6 +756,10 @@ CompileResult Driver::compileObject(const std::string& path,
         sema::checkPureBodies(*unit, semaCtx);
         sema::checkDefiniteAssignment(*unit, semaCtx);
         sema::checkStaticInitCycles(*unit, semaCtx);  // §2.5 / #797
+        // fix #4865 / §17.14 / §22.12: cyclic class-level const initializer
+        // detection — codegen's constMemberValue recurses unboundedly on a
+        // cycle (SIGSEGV), so the rejection must happen in sema.
+        sema::checkConstInitCycles(*unit, semaCtx);
         ownership::checkOwnership(*unit, semaCtx);
 
         TypeChecker typeChecker(diagnostics);
