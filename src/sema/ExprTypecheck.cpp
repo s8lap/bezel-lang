@@ -7443,6 +7443,20 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
         // Stack/Queue/SortedSet conform only to the read-only chain (v0.165,
         // #1354). The Owning* concretes map here conservatively (see header).
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
+    else if (name == "SharedEventSource")
+        // fix #4793 / §6.5 (v0.307): SharedEventSource<T> implements
+        // ISharedEvent<T> and ONLY ISharedEvent<T>. Registering the
+        // ISharedEvent<T> ancestor admits the legal upcast (the
+        // ISharedEvent<S>.Subscribe capture-free signature). The IEvent<S>
+        // entry is deliberately OMITTED — §6.5 names it: an upcast would
+        // launder the capture-free requirement through IEvent<S>.Subscribe's
+        // capture-admitting `scoped` signature. The omission, combined with
+        // SharedEventSource's registration in
+        // `builtinBorrowingCollectionFullyModeled` below, makes a missing
+        // IEvent<S> ancestor a provable non-conformance and the §5.1
+        // assignment is REJECTed, rather than the variant search's
+        // conservative-accept fallback.
+        ancestors.push_back(makeBuiltin("ISharedEvent", {T}));
     else if (name == "IList")
         ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
         ancestors.push_back(makeBuiltin("ICollection", {T}));
@@ -7545,6 +7559,21 @@ void ExprTC::collectBuiltinAncestorInstantiationsOf(
 static bool builtinBorrowingCollectionFullyModeled(std::string_view name) {
     return name == "Array" || name == "LinkedList" || name == "Set" ||
            name == "Stack" || name == "Queue" || name == "SortedSet" ||
+           // fix #4793 / §6.5 (v0.307): SharedEventSource<T>'s interface
+           // set is COMPLETELY captured by builtinInterfaceAncestors above
+           // — the single declared interface ISharedEvent<T> — so its
+           // variance search finding no candidate for the requested
+           // builtin interface is proof it does not conform (matching the
+           // #1851 borrowing-collection rationale). Without this entry, the
+           // both-builtin lookup falls through to conservative-accept and a
+           // `var e: IEvent<T> := src` upcast wrongly compiles. The
+           // predicate's name (`builtinBorrowingCollectionFullyModeled`)
+           // is a perfect-fit for the original borrowing-collection set and
+           // now also a perfect-fit for SharedEventSource — its semantic
+           // is "the builtin generics whose COMPLETE generic-interface
+           // set is captured by builtinInterfaceAncestors above" — so a
+           // name change is not necessary.
+           name == "SharedEventSource" ||
            name == "IList" || name == "ICollection" ||
            name == "IReadOnlyList" || name == "IReadOnlyCollection" ||
            name == "IEnumerable";
