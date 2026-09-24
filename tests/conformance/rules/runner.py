@@ -28,6 +28,7 @@ observed — the regeneration protocol, run on a box with a current bezelc.
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -166,6 +167,97 @@ def diagnostic_matches(row, compile_log):
     return want in (compile_log or "").lower()
 
 
+# per #4859: a directory case may carry .bzl files that main.bzl never
+# references — extension candidates the case sets up but does not select,
+# siblings of the chosen module, library fragments not on the import path.
+# Linking them compiles and links symbols main.bzl never uses, and
+# duplicates extension members across unselected candidates; the linker
+# then errors with a multiple-definition of the shared extension symbol
+# (s26_5_0016's symptom: exta.bzl and extb.bzl both define
+# `bz$ext$Shapes.Shape$Describe`; only ExtA is imported; linking both .o
+# files duplicates the symbol). The link list is therefore reduced to the
+# *symbol-referenced* subset — main.bzl's transitive import closure, plus
+# any dep file whose module name is named as a top-level identifier in
+# main.bzl or in any of its imports, plus any dep file that re-declares
+# main.bzl's own module name (so §2.8.1's duplicate-name rejection still
+# fires rather than being silently hidden).
+_MODULE_DECL_RE = re.compile(
+    r'^\s*module\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;', re.MULTILINE)
+_IMPORT_DECL_RE = re.compile(
+    r'^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)'
+    r'(?:\s+as\s+[A-Za-z_]\w*)?\s*;',
+    re.MULTILINE)
+_IDENT_RE = re.compile(r'[A-Za-z_]\w*')
+
+
+def _module_info(path):
+    """Parse a .bzl file: returns (module_name, set of imported module names,
+    set of identifier tokens) or (None, set(), set()) on read failure."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, IOError):
+        return None, set(), set()
+    m = _MODULE_DECL_RE.search(text)
+    name = m.group(1) if m else None
+    imports = set(_IMPORT_DECL_RE.findall(text))
+    refs = set(_IDENT_RE.findall(text))
+    return name, imports, refs
+
+
+def _symbol_referenced_deps(main_path, dep_paths):
+    """Return the subset of `dep_paths` that should appear on the link line.
+
+    The link list contains every .bzl whose module name is *referenced* from
+    main.bzl — directly via `import X;`, transitively through that import's
+    own imports, or as a top-level identifier that names a module in the case
+    directory. A dotted-name reference such as `Data.Item` names module
+    `Data` via its first segment, so the segment lookup covers that case.
+    Any .bzl file declaring the same module name as main.bzl is kept by the
+    identifier walk (its `module X;` line names X in main's token set), so
+    §2.8.1's rule-1 rejection of a root+dep module-name collision is not
+    silently hidden when the dep declares the same module as main."""
+    all_paths = [main_path] + list(dep_paths)
+    parsed = {p: _module_info(p) for p in all_paths}
+    name_to_file = {n: p for p, (n, _, _) in parsed.items() if n}
+    first_seg_to_files = {}
+    for p, (n, _, _) in parsed.items():
+        if n:
+            seg = n.split(".")[0]
+            first_seg_to_files.setdefault(seg, []).append(p)
+
+    visited = {main_path}
+    queue = [main_path]
+    while queue:
+        path = queue.pop()
+        _n, imports, refs = parsed.get(path, (None, set(), set()))
+        # walk imports: include the named module (full match) and any dep
+        # whose module-name first segment the import statement names
+        for imp in imports:
+            target = name_to_file.get(imp)
+            if target and target not in visited:
+                visited.add(target)
+                queue.append(target)
+            for seg in imp.split("."):
+                for target in first_seg_to_files.get(seg, []):
+                    if target not in visited:
+                        visited.add(target)
+                        queue.append(target)
+        # walk identifier tokens: a top-level identifier that names a module
+        # (full name OR first segment of a dotted module name) is a
+        # reference to that module
+        for ref in refs:
+            target = name_to_file.get(ref)
+            if target and target not in visited:
+                visited.add(target)
+                queue.append(target)
+            for target in first_seg_to_files.get(ref, []):
+                if target not in visited:
+                    visited.add(target)
+                    queue.append(target)
+    return visited
+
+
 def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
     deps = [d for d in (row.get("deps") or "").split(";") if d]
     if deps:
@@ -176,6 +268,19 @@ def run_case(row, bezelc, cases_dir, tmpdir, run=conformance.caged_run):
         return "fail", "source file missing", ""
     work = os.path.join(tmpdir, row["case-id"])
     os.makedirs(work, exist_ok=True)
+
+    # per #4859: filter the link list to the symbol-referenced subset. A
+    # directory case's .bzl files include every sibling — extension
+    # candidates the case sets up but does not select, library fragments
+    # not on main.bzl's import path. Compiling and linking the unreferenced
+    # files duplicates extension symbols across unselected candidates and
+    # trips a multiple-definition error at the linker (s26_5_0016).
+    if deps:
+        case_dir = os.path.join(cases_dir, row["case-id"])
+        dep_paths = [os.path.join(case_dir, d) for d in deps]
+        reachable = _symbol_referenced_deps(src, dep_paths)
+        deps = [d for d in deps
+                if os.path.join(case_dir, d) in reachable]
 
     # A dependency is compiled to a library artifact and imported by everything
     # after it. A dependency that does not compile is a broken CASE, never a
