@@ -518,13 +518,17 @@ extern "C" int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable) 
         return 0;
     }
     __uint128_t trunc = m / pow10_128[s];
-    // Overflow check: truncated value must fit in int64.
-    if (trunc > (__uint128_t)(uint64_t)INT64_MAX) {
+    // Overflow check: sign-aware magnitude bound.
+    // Positive decimals: max = INT64_MAX (2^63 - 1).
+    // Negative decimals: max = INT64_MAX + 1 (2^63), so |long.MinValue| is admitted.
+    bool neg = dec_sign(a);
+    __uint128_t limit = neg ? (__uint128_t)(uint64_t)INT64_MAX + 1 : (__uint128_t)(uint64_t)INT64_MAX;
+    if (trunc > limit) {
         bz_set_exc(ove_vtable);
         return 0;
     }
-    int64_t v = (int64_t)trunc;
-    return dec_sign(a) ? -v : v;
+    // Negate as unsigned then cast to avoid signed overflow of INT64_MIN.
+    return neg ? (int64_t)(0 - (uint64_t)trunc) : (int64_t)trunc;
 }
 
 // Conversion to int32 (explicit per §5.2).
