@@ -1594,6 +1594,21 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 "method/lambda modifier (A.4 admits it in MethodDecl and "
                 "LambdaExpr only; §30.1, v0.300)");
         }
+        // fix #4871 (§22.15, v0.307): mirror the async rejection for `pure`.
+        // `pure` is rejected on destructors (disposal is the effect context
+        // purity fences off). The DestructorDecl AST also does not carry the
+        // modifiers vector, so the sema arm at
+        // TypeResolution_Checks.cpp:15442-15454 that carries the rule text is
+        // dead code in the current AST — it is preserved here defensively,
+        // but the load-bearing rejection happens at parse time, with the
+        // SAME diagnostic text so the §22.15 needle is byte-identical.
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("pure")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`pure` is not admitted on a destructor — disposal is the "
+                "effect context purity fences off (§22.15)");
+        }
         auto dtor = std::make_unique<ast::DestructorDecl>();
         advance(); // past `destructor`
         while (!isKeyword("end") &&
