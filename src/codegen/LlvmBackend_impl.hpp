@@ -14695,9 +14695,23 @@ private:
         // If exactly one constructor matches by arity, use it directly —
         // but ONLY after the type check above confirms its params agree
         // with the call's args (the #3760 fix).
+        //
+        // fix #4779 (§22.5 "Optional parameters and named arguments" / §22.6
+        // stage 1, v0.307): an equal-arity candidate is not thereby
+        // applicable. A named argument that names none of its parameters
+        // leaves it INAPPLICABLE — §22.5 binding precedes arity-equal type
+        // matching — so resolution continues to the defaulted candidates in
+        // the fill loop below: `new C(x := 5)` against `constructor(x: int :=
+        // 1, y: int := 0)` beside `constructor(z: int)` binds the former. The
+        // pre-fix arm returned null here and the `new` silently zero-filled.
+        // `argsCanFillSymbolic` at equal arity is exactly "every argument
+        // binds a distinct slot". A candidate whose names DO bind but whose
+        // type classes disagree keeps #3760's null.
         if (ctorArityCount(cls, args.size(), exclude) == 1) {
-            if (auto* exact = ctorByArity(cls, args.size(), exclude))
-                return ctorTypeMatches(exact) ? exact : nullptr;
+            if (auto* exact = ctorByArity(cls, args.size(), exclude)) {
+                if (ctorTypeMatches(exact)) return exact;
+                if (argsCanFillSymbolic(*exact, args)) return nullptr;
+            }
         }
         // Multiple constructors with same arity: resolve by LLVM type
         // matching. Lower each arg, check if the lowered type matches
@@ -14718,8 +14732,13 @@ private:
             for (auto* cs : candidates) {
                 if (ctorTypeMatches(cs)) return cs;
             }
-            // No perfect type match — fall back to first by arity.
-            return candidates.empty() ? nullptr : candidates[0];
+            // No perfect type match — fall back to first by arity whose
+            // arguments bind by name (fix #4779, §22.5 / §22.6 stage 1,
+            // v0.307): a candidate a named argument cannot bind is
+            // inapplicable, never a fallback. When none binds, resolution
+            // continues to the defaulted candidates in the fill loop below.
+            for (auto* cs : candidates)
+                if (argsCanFillSymbolic(*cs, args)) return cs;
         }
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
