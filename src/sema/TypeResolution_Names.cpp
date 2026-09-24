@@ -3473,6 +3473,37 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             const auto* aliasDecl =
                 dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
             if (aliasDecl && aliasDecl->aliasedType) {
+                // fix #4764 (§27.8, v0.307): "A generic alias may not
+                // reference itself (no recursive aliases)" — and the same
+                // rule holds for a non-generic alias and for an indirect
+                // (mutual) cycle: nothing downstream can give a self- or
+                // mutually-referential alias body "a concrete type after
+                // substitution" (§27.8). Detect the cycle BEFORE recursing
+                // into `aliasedType` below: push `aliasDecl` on the on-stack
+                // guard (RAII-popped on every exit from this block,
+                // including the early returns), and if it is already on the
+                // stack, this reference reaches back to an alias currently
+                // being expanded further up this same call — a cycle direct
+                // (`Loop<T> := Loop<T>`) or indirect (`A := B; B := A`).
+                // Report once, at the innermost re-entry, and resolve to
+                // Error rather than recursing further (previously: unbounded
+                // recursion / SIGSEGV, issue #4764).
+                if (!aliasResolutionStack_.insert(aliasDecl).second) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("type alias `") +
+                            std::string(aliasDecl->name) +
+                            "` is recursive (\xC2\xA7""27.8) \xE2\x80\x94 a "
+                            "type alias may not reference itself, directly "
+                            "or through a chain of other aliases");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+                struct AliasStackGuard {
+                    std::unordered_set<const ast::TypeAlias*>& stack;
+                    const ast::TypeAlias* decl;
+                    ~AliasStackGuard() { stack.erase(decl); }
+                } aliasStackGuard{aliasResolutionStack_, aliasDecl};
                 // fix #4167 (§27.8, v0.298): a reference to a GENERIC alias
                 // that does not supply exactly the alias's own declared
                 // number of type arguments has no sound resolution — this

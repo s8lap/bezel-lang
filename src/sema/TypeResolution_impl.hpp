@@ -1198,6 +1198,20 @@ private:
 
     void resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref);
 
+    // fix #4764 (§27.8, v0.307): the alias-transparency arm of resolveNamed
+    // resolves a type alias's body by recursively calling resolveType on
+    // `aliasedType`. A self-referential alias (`type Loop<T> := Loop<T>;`)
+    // or a mutual cycle (`type A := B; type B := A;`) has no base case, so
+    // that recursion was unbounded — a stack overflow (SIGSEGV), not a
+    // diagnostic (#4764). This set tracks the `ast::TypeAlias*` declarations
+    // currently being expanded on THIS call stack (push on entry to the
+    // alias-transparency arm, pop via RAII on every exit path, including the
+    // early returns) — a true on-stack guard, not a permanent "visited"
+    // set, so it correctly flags a cycle of any length (direct self-cycle or
+    // an N-alias mutual cycle) while still permitting the same alias to be
+    // expanded again from an unrelated, non-recursive call site.
+    std::unordered_set<const ast::TypeAlias*> aliasResolutionStack_;
+
     // §14.2 / Appendix C.4: at a generic instantiation site
     // (`Named<...>` type, including `new C<...>()`), verify every supplied
     // type argument satisfies the constraints its corresponding type
