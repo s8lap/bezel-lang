@@ -21,8 +21,8 @@ public record Setting: ISerializable, IDeserializable
   public readonly property Mode: int;
   public readonly property CacheRef: Cache? serialized skip;
 
-  public constructor(mode: int, cache: Cache?)
+  public constructor(mode: int, cacheRef: Cache?)
     Mode := mode;
-    CacheRef := cache;
+    CacheRef := cacheRef;
   end constructor;
 end Setting;
