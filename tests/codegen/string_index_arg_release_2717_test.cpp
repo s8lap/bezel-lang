@@ -82,7 +82,8 @@
 //     generic `T` reached through a `this` receiver (no substitution installed,
 //     so it stays an unresolved `Kind::Named`), and a NULL `exprType` (an
 //     imported indexer with no side-table entry) all fell THROUGH into the
-//     release. Cases (R) and (S) pin two of those; the `IEquatable<string>`
+//     release. Cases (R) and (S) pin two of those ((S) is a sema reject
+//     since #4910, pending #4914); the `IEquatable<string>`
 //     shape is a PRE-EXISTING heap-buffer-overflow independent of #2717 (it
 //     reproduces identically on 2a990de) and is filed as #2752, so it cannot
 //     serve as a regression test here; the null-`exprType` shape is covered by
@@ -99,6 +100,7 @@
 // no IR-emitting flag and the lit track is a diagnostics track; adding compiler
 // CLI surface for a test is out of scope for a fix lane.)
 
+#include <cstdio>
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
@@ -633,7 +635,9 @@ const char* kObjectElementResidual =
 
 // (S) A bare generic `T` element reached through a `this` receiver. The value
 // crosses back to a caller that READS it as a `string`, which is what makes a
-// premature free observable rather than latent.
+// premature free observable rather than latent. Since #4910 this program is a
+// REJECT pin: `get => k;` returns a `string` as an unconstrained `T`, which
+// has no §5.1 conversion (v0.307). The codegen half waits on #4914.
 const char* kBareGenericElementViaThisResidual =
     "module M; class Box<T> "
     "  public property [k: string]: T "
@@ -1048,25 +1052,53 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 }
 
 BEZEL_TEST(codegen_string_index_arg_release_2717,
-           bare_generic_element_via_this_receiver_is_not_released_spec_14_1) {
-    // A `this` receiver carries no exprType, so no generic substitution is
-    // installed and the element stays an UNRESOLVED `Kind::Named` with a null
-    // declaration — which the fail-open test could not see. The helper now
-    // routes through resolveTypeParamRef first and declines every Kind::Named.
-    // Under the fail-open gate this was `heap-use-after-free` under ASan and
-    // SIGABRT (134) on the plain path.
-    JitResult r = runAotChecked(kBareGenericElementViaThisResidual);
-    if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);
-}
-
-BEZEL_TEST(codegen_string_index_arg_release_2717,
-           bare_generic_element_via_this_receiver_value_is_correct_spec_14_1) {
-    // A live oracle in BOTH directions here: the premature free aborted in
-    // glibc (134) rather than merely returning a wrong value.
+           bare_generic_element_via_this_receiver_is_rejected_spec_5_1) {
+    // fix #4910: this program is ILL-TYPED, so it is pinned as a REJECT.
+    // The getter `get => k;` returns `k: string` as the unconstrained element
+    // type `T`. §5.1 (v0.307) has no implicit conversion from `string` (or any
+    // primitive) to a type parameter; the only conversions out of a `T` go to
+    // `Object` and to its constraint bounds. §3.6 rule 2 says a generic body
+    // type-checks under the weakest assumption its constraints establish. So
+    // 64c0d712 (#4810) rejects the getter's return, correctly. Before that
+    // commit the program compiled, and these two rows asserted
+    // `expectLeakButNoMemoryError` + exit 71 on it.
+    //
+    // The program text is unchanged, so this row pins the original repro.
+    // The codegen pin it used to carry (a bare-`T` element via a `this`
+    // receiver must not be released, the #2717 fail-closed element gate) has
+    // no well-typed program yet: the legal spelling `get => (k as T)!;`
+    // degrades to a null return (#2491 residual). Restore the leak-but-no-
+    // memory-error and value rows on that spelling once #4914 lands. The
+    // diagnostic wording ("primitive literal … generic field") is
+    // misleading here (#4916); update the needle together with it.
     JitResult r = runAot(kBareGenericElementViaThisResidual);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
+    BEZEL_EXPECT_TRUE(!r.ran);
+    // The #4810 arm's own wording, unique in src/sema/ExprTypecheck.cpp.
+    const std::string needle =
+        "`T` is a type parameter, and a primitive literal cannot initialize "
+        "a generic field whose type parameter may resolve to a class, "
+        "record, or non-int primitive";
+    // The program is one source line; the diagnostic must sit on the `k` of
+    // `get => k;` (1-based column), not merely somewhere in the file. runAot
+    // surfaces the compiler's "<path>:<line>:<col>: " prefix in the message
+    // text (the structured location is 0:0), so the position is read there.
+    const std::string prog = kBareGenericElementViaThisResidual;
+    const std::size_t getAt = prog.find("get => k;");
+    BEZEL_EXPECT_TRUE(getAt != std::string::npos);
+    const std::string wantPos =
+        ":1:" + std::to_string(getAt + std::string("get => ").size() + 1) +
+        ": ";
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find(needle) == std::string::npos) continue;
+        if (d.message.find(wantPos) != std::string::npos) found = true;
+    }
+    if (!found)
+        for (const auto& d : r.diagnostics.diagnostics())
+            std::fprintf(stderr, "    [%u:%u] %s\n", d.location.line,
+                         d.location.column, d.message.c_str());
+    BEZEL_EXPECT_TRUE(found);
 }
 
 // ---------------------------------------------------------------------
