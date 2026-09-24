@@ -9820,19 +9820,44 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                         fn64, {srcSlot, getOVEVtable()},
                         "dec.toi64v");
                     emitPendingCheck();  // §5.2, #872: raises if decimal > int64 range
-                    // Range check: [-2147483648 .. 2147483647]
+                    // §5.2 (fix #4802, v0.307): uint target uses UINT32_MAX as the
+                    // upper bound instead of INT32_MAX.
+                    //
+                    // Before #4802, every 32-bit-or-smaller target was range-checked
+                    // against the signed int32 upper bound INT32_MAX — for a `uint`
+                    // target this wrongly rejected every value in (INT32_MAX, UINT32_MAX],
+                    // throwing away half of uint's domain.  The fix narrows the
+                    // condition to `target == P::UInt` (not the broader
+                    // `dstUns && dstTy == i32`): `char` shares the i32 / unsigned
+                    // shape but has its OWN contract (code-point range [0, 0x10FFFF]
+                    // excluding surrogates — §5.2 char semantics) which is enforced
+                    // elsewhere; widening the upper bound for char too would change
+                    // char's behaviour rather than fix it, and is out of scope for
+                    // #4802.  The sibling ulong arm (≥32-bit) was already fixed by
+                    // #4785 via a dedicated `bz_decimal_to_uint64` helper — this is
+                    // the same defect shape at the 32-bit-or-smaller codegen dispatch.
+                    //
+                    // For the other unsigned narrower targets (ushort, byte) the
+                    // existing trunc + roundtrip check (ZExt then compare back to
+                    // the i32 value) already correctly bounds at USHRT_MAX /
+                    // UINT8_MAX; the wider signed-range upper bound above the roundtrip
+                    // is harmless (the roundtrip catches anything outside the narrower
+                    // range), so we leave it unchanged.
+                    llvm::Type* dstTy = lowerPrimitive(target);
+                    bool dstUns = isUnsignedPrim(target);
+                    int64_t hiBound = (target == P::UInt)
+                        ? (int64_t)(uint64_t)UINT32_MAX
+                        : (int64_t)INT32_MAX;
                     llvm::Value* lo = builder_.CreateICmpSLT(
                         v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN),
                         "dec.ilo");
                     llvm::Value* hi = builder_.CreateICmpSGT(
-                        v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MAX),
+                        v64, llvm::ConstantInt::get(i64(), hiBound),
                         "dec.ihi");
                     emitGuardThrow(builder_.CreateOr(lo, hi), "OverflowException");
                     llvm::Value* v32 = builder_.CreateTrunc(v64, i32(), "dec.toi32");
-                    llvm::Type* dstTy = lowerPrimitive(target);
                     if (dstTy == i32()) return v32;
                     // Further narrowing (e.g. to i8/i16): check sub-range and trunc.
-                    bool dstUns = isUnsignedPrim(target);
                     llvm::Value* trunc = builder_.CreateTrunc(v32, dstTy);
                     llvm::Value* back = dstUns
                         ? builder_.CreateZExt(trunc, i32())
