@@ -381,6 +381,13 @@ void Resolver::run(const ast::SourceFile& src) {
     // each instantiation of the enclosing generic binds (runs after all member
     // types are resolved, so every instantiation has been recorded).
     checkOwningElementInstantiations();
+    // §15.1.1 / §3.6 rule 2 (#4678): the `[N owned]T` inline-array sibling of
+    // checkOwningElementInstantiations above — an owning inline array whose
+    // element slot is a bare generic parameter is re-checked against the
+    // type each instantiation of the enclosing generic binds (e.g.
+    // `Pool<string>` at a field-type mention, per #4367's ruling that a
+    // field-type mention is itself an instantiation site).
+    checkOwningInlineArrayElementInstantiations();
     // §28.11 / §15.3 (#3775): every recorded element-category slot must not
     // be a move-only value type (an owning inline array or an owning-
     // classified choice) — runs after checkOwningElementInstantiations for

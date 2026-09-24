@@ -700,6 +700,18 @@ private:
     // at the instantiation site per §3.6 rule 2.
     void checkOwningElementInstantiations();
 
+    // §15.1.1 / §3.6 rule 2 (fix #4678) — Pass 2 for the OWNING-INLINE-ARRAY
+    // element check, the `[N owned]T` sibling of checkOwningElementInstantiations
+    // above. The declaration-site check in resolveType() admits a bare generic
+    // parameter (`[4 owned]T` inside `class Pool<T>`) provisionally; this walks
+    // the recorded instantiations of the enclosing generic type (Pool<string>)
+    // and re-checks the concrete binding, reporting at the instantiation site
+    // per §3.6 rule 2. Defined in TypeResolution_Names.cpp (not
+    // TypeResolution_Checks.cpp) alongside its recorder — see
+    // owningInlineArrayElementSites_ below for why a parallel struct/pass
+    // rather than reusing OwningElementSite/checkOwningElementInstantiations.
+    void checkOwningInlineArrayElementInstantiations();
+
     // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735) — the CROSS-MODULE
     // half of the recorder above. `owningElementSites_` is populated while
     // resolving THIS compilation's own type bodies, so an IMPORTED generic
@@ -1599,6 +1611,28 @@ private:
         TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
     };
     std::vector<OwningElementSite> owningElementSites_;
+
+    // §15.1.1 / §3.6 rule 2 (fix #4678): one `[N owned]T` inline-array
+    // annotation whose element T is a bare generic parameter of the ENCLOSING
+    // type, e.g. `private _slots: [4 owned]T?;` inside `class Pool<T>`. The
+    // declaration-site check (resolveType's InlineArray arm, TypeResolution_
+    // Names.cpp) cannot decide such a site (no concrete T is known there), so
+    // it is recorded here and re-checked per instantiation of the enclosing
+    // type by checkOwningInlineArrayElementInstantiations() — mirrors
+    // OwningElementSite/checkOwningElementInstantiations immediately above,
+    // which covers the NAMED owning-collection family (OwningArray<T>, …).
+    // `[N owned]T` cannot reuse that struct/pass directly: it is
+    // TypeRef::Kind::InlineArray, not a Named type with a `headName()` to key
+    // `container` by, and the shared Pass 2's diagnostic text is written
+    // around a container name ("`Container<…>` requires …") that does not fit
+    // an inline array's `[N owned]T` spelling — see #4678 for the fuller
+    // rationale against generalizing the shared pass instead.
+    struct OwningInlineArrayElementSite {
+        std::string_view paramName;       // the bare type parameter, e.g. "T"
+        const ast::Type* site = nullptr;  // the `[N owned]T` annotation node
+        TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
+    };
+    std::vector<OwningInlineArrayElementSite> owningInlineArrayElementSites_;
 
     // fix #2735: imported generic TypeSymbols whose member surface has already
     // been swept by recordImportedOwningElementObligations(). The sweep is a

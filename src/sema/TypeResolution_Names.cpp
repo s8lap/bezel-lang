@@ -1709,11 +1709,39 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                 // that predicate — correct here too, but only provisionally:
                 // §15.1.1 says the restriction is checked "at instantiation"
                 // for that case (paralleling §28.5's generic-owned-field
-                // check), which is a deferred site-tracking check this fix
-                // does not add (tracked: issue filed on the corpus row for
-                // the generic-instantiation half, s15_1_1_0003).
+                // check). fix #4678: record such a site here (mirrors the
+                // owning-collection recorder below in resolveNamed, same
+                // shape: `owningElementBadDesc` empty + a bare single-part
+                // Named element with no declaration and no generic args, not
+                // shadowed by the current generic METHOD) so
+                // checkOwningInlineArrayElementInstantiations() (Pass 2) can
+                // re-run the same predicate against each concrete
+                // instantiation of the enclosing generic type, e.g.
+                // `Pool<string>` at a field-type mention (#4367's ruling,
+                // v0.300: a field-type mention is an instantiation site).
                 if (t.arrayOwned) {
                     std::string badDesc = owningElementBadDesc(ref->arrayElement);
+                    if (badDesc.empty() && ref->arrayElement &&
+                        ref->arrayElement->kind == TypeRef::Kind::Named &&
+                        !ref->arrayElement->declaration &&
+                        ref->arrayElement->astNode &&
+                        ref->arrayElement->astNode->name &&
+                        ref->arrayElement->astNode->name->parts.size() == 1 &&
+                        ref->arrayElement->genericArgs.empty() &&
+                        currentOuterType_) {
+                        // Same shadowing guard as the owning-collection
+                        // recorder (fix #2742): a generic METHOD's own type
+                        // parameter of the same name denotes the method's
+                        // binding, not the enclosing type's, and the
+                        // method's bindings are not tracked in
+                        // instantiations_ at all.
+                        std::string_view elName =
+                            ref->arrayElement->headName();
+                        if (!elName.empty() &&
+                            !nameBoundByCurrentMethod(elName))
+                            owningInlineArrayElementSites_.push_back(
+                                {elName, &t, currentOuterType_});
+                    }
                     if (!badDesc.empty()) {
                         ctx_.diagnostics().report(
                             Severity::Error, t.span.begin,
@@ -4518,6 +4546,131 @@ void warnChainHeadTypeShadows(
                 "module-name prefix `" + std::string(headName) +
                 ".\xE2\x80\xA6` — qualify via an alias to reach the "
                 "module (\xC2\xA7""2.7)");
+    }
+}
+
+// §15.1.1 / §3.6 rule 2 (fix #4678) — Pass 2 for the owning-inline-array
+// element check, the `[N owned]T` sibling of checkOwningElementInstantiations
+// (TypeResolution_Checks.cpp, #2713).
+//
+// §15.1.1, v0.307: "The form `[N owned]T` ... denotes an inline array whose
+// slots own their (non-null) class-typed contents. T must be a class or
+// interface type; value types and runtime-managed reference types are not
+// admitted with the `owned` marker. When T is a generic type parameter, the
+// class-or-interface restriction is checked at instantiation ... paralleling
+// the generic-class-fields rule of §28.5." Per #4367's ruling (v0.300), a
+// field-type mention forms the constructed type and is itself an
+// instantiation site — `new` is not required.
+//
+// The declaration-site check (resolveType's InlineArray arm above) admits
+// `[N owned]T` inside `class Pool<T>` because T is a placeholder there.
+// Without this pass nothing ever re-checked the binding, so `Pool<string>`
+// was admitted with no diagnostic at any severity (rule-corpus case
+// s15_1_1_0003).
+//
+// Modelled on checkOwningElementInstantiations's shape (including its
+// chained-binding worklist for `class Outer<U>` holding `Inner<U>` whose body
+// is the one with the owning inline array) — see that function's own comment
+// for the full rationale; the only difference here is the site's shape
+// (InlineArray, no container name to key or spell a diagnostic around) and
+// the diagnostic wording, which names `[N owned]T` instead of a container.
+void Resolver::checkOwningInlineArrayElementInstantiations() {
+    // One diagnostic per (instantiation site, parameter) — mirrors
+    // checkOwningElementInstantiations's key, minus `container` (there is
+    // only one shape here, so the parameter alone disambiguates a body that
+    // misuses two different parameters).
+    std::set<std::pair<const void*, std::string_view>> reported;
+    for (const OwningInlineArrayElementSite& s : owningInlineArrayElementSites_) {
+        if (!s.enclosingType) continue;
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == s.paramName) {
+                paramIdx = i;
+                break;
+            }
+        }
+        // Not a type parameter of the enclosing TYPE — e.g. a generic
+        // METHOD's own parameter, whose bindings are not recorded in
+        // instantiations_. Nothing to re-check (the recorder's own
+        // nameBoundByCurrentMethod guard should already have excluded a
+        // shadowing case, but a NON-shadowing method parameter of the same
+        // name is not distinguishable there — same residual as #2736(a)).
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+
+        struct Pending {
+            TypeSymbol* type;
+            std::string_view paramName;
+            std::size_t idx;
+        };
+        std::vector<Pending> work{{s.enclosingType, s.paramName, paramIdx}};
+        std::set<std::pair<TypeSymbol*, std::string_view>> seen;
+        while (!work.empty()) {
+            Pending p = work.back();
+            work.pop_back();
+            if (!seen.insert({p.type, p.paramName}).second) continue;
+            for (const GenericInstantiation& inst : instantiations_) {
+                if (inst.type != p.type) continue;
+                if (p.idx >= inst.argRefs.size()) continue;
+                const TypeRef* arg = inst.argRefs[p.idx];
+                const ast::Type* argAst = (p.idx < inst.argAsts.size())
+                                              ? inst.argAsts[p.idx] : nullptr;
+                if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+
+                if (isBareGenericParamBinding(arg, argAst)) {
+                    if (!inst.enclosingType) continue;
+                    std::string_view nextName = argAst->name->parts.front();
+                    bool boundByMethod = false;
+                    if (inst.methodGenericParams) {
+                        for (const ast::GenericParam& gp :
+                             *inst.methodGenericParams) {
+                            if (gp.name == nextName) {
+                                boundByMethod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (boundByMethod) continue;
+                    std::size_t nextIdx = inst.enclosingType->genericParams.size();
+                    for (std::size_t i = 0;
+                         i < inst.enclosingType->genericParams.size(); ++i) {
+                        if (inst.enclosingType->genericParams[i] &&
+                            inst.enclosingType->genericParams[i]->name ==
+                                nextName) {
+                            nextIdx = i;
+                            break;
+                        }
+                    }
+                    if (nextIdx >= inst.enclosingType->genericParams.size())
+                        continue;
+                    work.push_back({inst.enclosingType, nextName, nextIdx});
+                    continue;
+                }
+
+                std::string badDesc = owningElementBadDesc(arg);
+                if (badDesc.empty()) continue;
+                if (!reported.insert({inst.siteKey, s.paramName}).second)
+                    continue;
+                // Names the type that DECLARES the `[N owned]T` field
+                // (s.enclosingType) and its parameter, not p.type — through a
+                // chain those differ, and it is the declaring site the
+                // reader must go fix. The location is the instantiation that
+                // made the binding concrete, per §3.6 rule 2.
+                ctx_.diagnostics().report(
+                    Severity::Error, inst.loc,
+                    std::string("`[N owned]T` requires T to be a class or "
+                                "interface type (\xC2\xA7""15.1.1) "
+                                "\xE2\x80\x94 at this instantiation, `") +
+                    std::string(s.enclosingType->name) +
+                    "`'s type parameter `" + std::string(s.paramName) +
+                    "`, used as an owning inline array's element type, is "
+                    "bound to " + badDesc +
+                    ", which has no disposal obligation and cannot be owned "
+                    "by an inline array's slots (\xC2\xA7""3.6 rule 2 "
+                    "\xE2\x80\x94 the property is evaluated at each "
+                    "instantiation).");
+            }
+        }
     }
 }
 
