@@ -1736,6 +1736,22 @@ private:
         const ast::Type& target,
         std::unordered_set<std::string_view>& out) const;
 
+    // fix #4810 (§14.2): does the named type parameter carry ANY `where`-
+    // clause constraint in the current enclosing type/method/extension
+    // declaration? The #4810 arm rejects primitive-literal initializers into a
+    // type-parameter-typed storage slot at the DECLARATION (per the issue
+    // body's "unconstrained type parameter" wording), but the spec's
+    // instantiation-time check (§14.2: "operations that copy T (assignment,
+    // parameter passing by value, returning by value) are checked at
+    // instantiation") deliberately keeps the CONSTRAINED case as a deferred-
+    // to-instantiation conversion; the deferred-to-instantiation path is the
+    // one an existing test (`generic_ref_out_exact_unification_1686__…`) pins
+    // and the fix's narrow issuance must not collide with. Answering "does
+    // ANY `where T: …` clause in scope name this param?" is enough — a clause
+    // for a name means the parameter is constrained and we skip; absent any
+    // clause the parameter is unconstrained and we fire.
+    bool isCurrentScopeTypeParamConstrained(std::string_view name) const;
+
     // fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4, §19.3, v0.300): does
     // `t` mention a free/rigid type parameter of the ENCLOSING scope anywhere —
     // the shape (`Named` + no decl + no args + non-empty head) used as a proxy

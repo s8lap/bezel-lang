@@ -4051,6 +4051,34 @@ void ExprTC::collectExtensionTargetTypeParamNames(
     }
 }
 
+// fix #4810 (§14.2): see the declaration comment on the impl header. Walks
+// the in-scope `where`-clauses on the enclosing type/method/extension and
+// answers whether the named type parameter appears as the `typeParam` of
+// any one of them. The #4810 arm fires only for unconstrained parameters
+// (the issue body's "unconstrained type parameter U" wording).
+bool ExprTC::isCurrentScopeTypeParamConstrained(std::string_view name)
+    const {
+    auto inAny = [&](const auto* owner) -> bool {
+        if (!owner) return false;
+        for (const auto& gc : owner->genericConstraints)
+            if (gc.typeParam == name) return true;
+        return false;
+    };
+    // Same SEAM-ACCESSOR caveat as the loop at 2964 above
+    // (`currentType_->decl` is null for an imported type whose own
+    // `where T: …` clauses don't belong to this translation unit anyway —
+    // the instantiation-time check is invoked separately there).
+    if (currentType_ && currentType_->decl)
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
+            if (inAny(td)) return true;
+    if (inAny(currentMethodDecl_)) return true;
+    if (currentExtension_ && currentExtension_->decl)
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl))
+            if (inAny(ed)) return true;
+    return false;
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -5286,6 +5314,77 @@ void ExprTC::checkAssignable(
                 "type-parameter value only to `Object` and to the bounds its "
                 "constraints guarantee (§5.1, §14.2) — never to a primitive; "
                 "constrain `" + std::string(tpHead) +
+                "` to an interface that exposes the value you need");
+            return;
+        }
+    }
+    // fix #4810 (§5.1 / §14.2 / §3.6 rule 2, v0.307): the FORWARD mirror of
+    // #4768 — a CONCRETE primitive SOURCE (e.g. the integer constant 99) into a
+    // bare TYPE PARAMETER TARGET (e.g. a generic record body-field
+    // `public F: T := 7`, or a class instance field `public dv: U := 99`).
+    //
+    // §5.1's conversion table is finite and primitive-to-type-parameter is not
+    // on it — a type parameter value converts only to `Object` and to the
+    // interface/class bounds its constraints guarantee (§5.1 reference
+    // conversions). Constant narrowing — the only path by which a bare integer
+    // literal could otherwise reach a non-integer target — requires "a written
+    // integer target" (§5.1 "Constant narrowing": "what it additionally
+    // requires is a written integer target, so an untyped context … and a
+    // non-integer target remain the §4.2 error"); a bare type parameter `T`
+    // is, by §3.6 rule 2, NOT a "written integer target" (its weakest
+    // constraint guarantees nothing about being an integer). So neither
+    // primitive widening nor constant narrowing nor reference conversion admits
+    // the assignment, and the program is rejected at the declaration.
+    //
+    // Before this arm the shape reached the catch-all and was silently
+    // accepted: the int payload was stored into the field whose LLVM layout
+    // (under the substitution) is, e.g., a string header at `T = string` and
+    // an object reference at `T = SomeClass` — the same defect class as #4768
+    // but on the source side. Specifically test #3944's
+    // `public readonly property D: T := 5` / `public F: T := 7` row pinned
+    // the OLD acceptance; that test is updated by this commit to use
+    // `default(T)`, the legal §17.11 spelling.
+    //
+    // Scope, deliberately narrow — same as #4768's arm: only names in
+    // `currentScopeGenericParamNames()` (the enclosing type's, method's and
+    // extension target's own parameters), with a primitive non-Object source
+    // (the surface from which an integer literal `99` arrives: every primitive
+    // is treated symmetrically — `99` is `int`, `99L` is `long`, `1.5` is
+    // `double`, all of which a type-parameter target cannot accept). A
+    // reference-typed source into a type-parameter target is the unrelated
+    // `Object → U` boxing question and stays accepted by the `Object` arm above
+    // (every type, including a type parameter, converts to `Object`). A
+    // callee's unsubstituted free parameter (freeTypeParamNames) is again an
+    // inference gap, not a conversion, and is left alone.
+    {
+        std::string_view toTpHead =
+            (to->kind == TypeRef::Kind::Named && !to->declaration &&
+             to->genericArgs.empty())
+                ? to->headName()
+                : std::string_view();
+        bool fromConcretePrimitive = from->kind == TypeRef::Kind::Primitive &&
+                                     from->primitive != PrimitiveType::Object;
+        if (!toTpHead.empty() && fromConcretePrimitive &&
+            currentScopeGenericParamNames().count(toTpHead) &&
+            // fix #4810 scope (§14.2): only UNCONSTRAINED type-parameter
+            // targets (§5.1's narrow wording — primitive widening and
+            // constant narrowing both fail under the weakest "no constraint
+            // names a primitive" assumption). A CONSTRAINED parameter like
+            // `where T: value` admits primitive substitutions, so a
+            // primitive-literal initializer into T-typed storage is checked
+            // at instantiation per §14.2's "operations that copy T …
+            // are checked at instantiation" — that path is the
+            // `generic_ref_out_exact_unification_1686__…` lit test's
+            // pinned behaviour and the fix's narrow issuance must NOT
+            // collide with it.
+            !isCurrentScopeTypeParamConstrained(toTpHead)) {
+            reportNotConvertible(
+                std::string("`") + std::string(toTpHead) +
+                "` is a type parameter, and a primitive literal cannot "
+                "initialize a generic field whose type parameter may resolve "
+                "to a class, record, or non-int primitive (§5.1, §14.2) — use a "
+                "`default(" + std::string(toTpHead) +
+                ")` expression, or constrain `" + std::string(toTpHead) +
                 "` to an interface that exposes the value you need");
             return;
         }
@@ -14877,6 +14976,55 @@ void ExprTC::visitMember(const ast::Member& m) {
                             checkCollectionLiteralElementAssignability(
                                 *cl, fty);
                     }
+                    // fix #4810 (§5.1 / §14.2, v0.307): the field-initializer
+                    // path runs the §5.1 assignability check below, but #2926
+                    // gated it on `!mentionsUnsubstitutedTypeParam(fty)` because
+                    // the §5.1 widening/narrowing arms false-reject a numeric
+                    // initializer at an unsubstituted generic field (the
+                    // checked-against-unsubstituted bug). The deferral's
+                    // rationale does NOT cover the FORWARD direction (a
+                    // concrete-primitive SOURCE into a bare type-parameter
+                    // TARGET): checkAssignable's own #4810 arm fires there, and
+                    // skipping it would silently accept the exact bug the lane
+                    // is closing. Run the check unconditionally — the existing
+                    // widening arms' false-reject is a separate matter (#2926's
+                    // scope) and the new arm is the only one whose trigger set
+                    // (bare type-parameter target) overlaps with the deferred
+                    // case.
+                    if (auto* initTy = ctx_.exprType(*fd->initializer)) {
+                        if (initTy->kind == TypeRef::Kind::Primitive &&
+                            initTy->primitive != PrimitiveType::Object &&
+                            fty->kind == TypeRef::Kind::Named &&
+                            !fty->declaration && fty->genericArgs.empty() &&
+                            currentScopeGenericParamNames().count(
+                                fty->headName()) &&
+                            // fix #4810 scope: only UNCONSTRAINED type-
+                            // parameter targets — see the matching clause at
+                            // the #4810 `checkAssignable` arm for the spec
+                            // derivation.
+                            !isCurrentScopeTypeParamConstrained(
+                                fty->headName())) {
+                            std::string_view toTpHead = fty->headName();
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                fd->initializer->span.begin,
+                                std::string("initializer for field `") +
+                                    std::string(fd->name) +
+                                    "` has a type that is not implicitly "
+                                    "convertible to the target type (§5.1): `"
+                                    + std::string(toTpHead) +
+                                    "` is a type parameter, and a primitive "
+                                    "literal cannot initialize a generic "
+                                    "field whose type parameter may resolve "
+                                    "to a class, record, or non-int primitive "
+                                    "(§5.1, §14.2) — use a `default(" +
+                                    std::string(toTpHead) +
+                                    ")` expression, or constrain `" +
+                                    std::string(toTpHead) +
+                                    "` to an interface that exposes the value "
+                                    "you need");
+                        }
+                    }
                     // The §5.1 / §22.8 / §23.1 assignability check that
                     // #2926 added still defers on `mentionsUnsubstitutedTypeParam`
                     // (its contract says deferring is the SAFE direction —
@@ -15225,6 +15373,52 @@ void ExprTC::visitMember(const ast::Member& m) {
                         if (!mentionsUnsubstitutedTypeParam(pty))
                             checkCollectionLiteralElementAssignability(
                                 *cl, pty);
+                    }
+                    // fix #4810 (§5.1 / §14.2, v0.307): the auto-property
+                    // initializer arm — like its FieldDecl twin above (the
+                    // FieldDecl arm of visitMember precedes this PropertyDecl
+                    // arm in source order; the earlier comment at line ~15280
+                    // has the same directionality in this block) —
+                    // needs to fire the FORWARD-mirror #4810 diagnostic even
+                    // when the `mentionsUnsubstitutedTypeParam` deferral
+                    // would otherwise suppress the gated assignability check.
+                    // A primitive literal initializer at a bare type-parameter
+                    // target has no §5.1 conversion, and the auto-property
+                    // form `public property P: T := 99` (the #3944 codegen
+                    // row's spelling) is exactly the case the lane is closing.
+                    if (auto* initTy = ctx_.exprType(*pd->autoInitializer)) {
+                        if (initTy->kind == TypeRef::Kind::Primitive &&
+                            initTy->primitive != PrimitiveType::Object &&
+                            pty->kind == TypeRef::Kind::Named &&
+                            !pty->declaration && pty->genericArgs.empty() &&
+                            currentScopeGenericParamNames().count(
+                                pty->headName()) &&
+                            // fix #4810 scope: only UNCONSTRAINED type-
+                            // parameter targets — see the matching clause at
+                            // the #4810 `checkAssignable` arm for the spec
+                            // derivation.
+                            !isCurrentScopeTypeParamConstrained(
+                                pty->headName())) {
+                            std::string_view toTpHead = pty->headName();
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                pd->autoInitializer->span.begin,
+                                std::string("initializer for property `") +
+                                    std::string(pd->name) +
+                                    "` has a type that is not implicitly "
+                                    "convertible to the target type (§5.1): `"
+                                    + std::string(toTpHead) +
+                                    "` is a type parameter, and a primitive "
+                                    "literal cannot initialize a generic "
+                                    "field whose type parameter may resolve "
+                                    "to a class, record, or non-int primitive "
+                                    "(§5.1, §14.2) — use a `default(" +
+                                    std::string(toTpHead) +
+                                    ")` expression, or constrain `" +
+                                    std::string(toTpHead) +
+                                    "` to an interface that exposes the value "
+                                    "you need");
+                        }
                     }
                     // The assignability half still defers on
                     // `mentionsUnsubstitutedTypeParam` for the same reason
