@@ -278,6 +278,46 @@ class TestSilentShapeEnumeration(unittest.TestCase):
                 % sites)
 
 
+class TestSeverityPrefixMatching(unittest.TestCase):
+    r"""Pins that RE_INTERNAL matches the real compiler output shape with
+    a severity token between the location pair and `internal:`.
+
+    Per #4626, Driver.cpp renders diagnostics as
+    `<file>:<L>:<C>: warning: <msg>`. The original regex required
+    `\s*internal:` immediately after the location pair, so it never
+    matched the real output. These tests assert the fixed regex matches
+    both the severity-prefixed form AND the bare form (regression guard).
+    """
+    def test_realistic_render_form_matches(self):
+        # The #4626-ruling shape: severity token between location and internal:
+        text = "x.bzl:3:5: warning: internal: foo\n"
+        hits = cir.RE_INTERNAL.findall(text)
+        self.assertEqual(len(hits), 1,
+            'RE_INTERNAL must match the real compiler output shape '
+            '"<file>:L:C: warning: internal: ..."; got %r' % hits)
+
+    def test_note_severity_prefix_matches(self):
+        # note: is also possible per Driver.cpp severity enum
+        text = "x.bzl:10:1: note: internal: diagnostics\n"
+        hits = cir.RE_INTERNAL.findall(text)
+        self.assertEqual(len(hits), 1,
+            'RE_INTERNAL must match the note: severity form; got %r' % hits)
+
+    def test_error_severity_prefix_matches(self):
+        text = "x.bzl:1:1: error: internal: severity\n"
+        hits = cir.RE_INTERNAL.findall(text)
+        self.assertEqual(len(hits), 1,
+            'RE_INTERNAL must match the error: severity form; got %r' % hits)
+
+    def test_no_severity_prefix_still_matches(self):
+        # The bare form (pre-#4626) must still match - regression guard.
+        text = "x.bzl:3:5: internal: foo\n"
+        hits = cir.RE_INTERNAL.findall(text)
+        self.assertEqual(len(hits), 1,
+            'RE_INTERNAL must still match the bare form '
+            '"<file>:L:C: internal: ..."; got %r' % hits)
+
+
 class TestMeasureShape(unittest.TestCase):
     """Pins the structural shape of measure()'s output.
 

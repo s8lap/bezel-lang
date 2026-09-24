@@ -144,7 +144,7 @@ def _src_codegen(root=ROOT):
 #   - bare `internal:` strings in non-location contexts
 # But DOES match the Bezel compiler's own diagnostic output, which is
 # the entire signal we care about.
-RE_INTERNAL = re.compile(r'(?m)^[^\s][^:]*:\d+:\d+:\s*internal:')
+RE_INTERNAL = re.compile(r'(?m)^[^\s][^:]*:\d+:\d+:\s*(?:(?:warning|note|error):\s*)?internal:')
 
 # An `internal:` emit site in src/codegen: the call site of a `report(...)`
 # whose string-arg starts with `internal:`. The body of the call may
@@ -449,7 +449,8 @@ def measure(bezelc, jobs, root=ROOT):
                     per_file[rel] = per_file.get(rel, 0) + n
                     total += n
         else:
-            with _mp.Pool(processes=jobs) as pool:
+            ctx = _mp.get_context('fork')
+            with ctx.Pool(processes=jobs) as pool:
                 for rel, n, _ok in pool.imap_unordered(
                         _compile_count, work, chunksize=8):
                     if n:
