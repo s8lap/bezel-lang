@@ -341,22 +341,57 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
         ma *= 10; ++extra;
     }
     __uint128_t q = ma / mb;
+    // fix #4870 / §6.4, v0.307: keep the remainder so the quotient can be
+    // extended with its TRUE digits below (exact long division) instead of
+    // appended zeros. ma <= kMax96 here, so q * mb <= ma and rem < mb fit.
+    __uint128_t rem = ma - q * mb;
     // Scale: sa + extra (from ma) - sb (denominator's scale) → net scale.
     int32_t rs_signed = (int32_t)(sa + extra) - (int32_t)sb;
     if (rs_signed < 0) {
-        // Result scale is negative: multiply q by 10^|rs| to compensate.
-        while (rs_signed < 0 && q <= kMax96 / 10) { q *= 10; ++rs_signed; }
-        if (rs_signed < 0) {
-            // fix #4864 / §6.4, v0.307: q still needs more upscaling than the
-            // 96-bit mantissa can hold at scale 0 (the minimum representable
-            // scale) — the exact quotient's magnitude exceeds decimal's range.
-            // Previously this stored the partially-upscaled `q` at scale 0
-            // regardless, silently returning a wrong finite value instead of
-            // raising OverflowException (matching how every other overflow
-            // path in this file signals via bz_set_exc).
-            bz_set_exc(ove_vtable);
-            return;
+        // Result scale is negative: the quotient needs -rs_signed more integer
+        // digits to reach scale 0 (the minimum representable scale).
+        // fix #4870 / §6.4, v0.307: generate each digit by long division on
+        // the remainder — floor(10*N/mb) == 10*floor(N/mb) + floor(10*rem/mb)
+        // — so the result is the exact quotient truncated at scale 0. The
+        // previous `q *= 10` appended zeros instead: with a dividend near
+        // kMax96 (so `extra` stays 0) and a large-scale divisor, `q` kept a
+        // single significant digit (decimal.MaxValue /
+        // 1.0000000000000000000000000001m printed
+        // 70000000000000000000000000000), and the #4864 overflow check below
+        // was never reached for quotients just above MaxValue.
+        while (rs_signed < 0) {
+            if (q > kMax96 / 10) {
+                // fix #4864 / §6.4, v0.307: q still needs more integer digits
+                // than the 96-bit mantissa can hold at scale 0 — the exact
+                // quotient's magnitude exceeds decimal's range. Raise
+                // OverflowException (matching how every other overflow path
+                // in this file signals via bz_set_exc).
+                bz_set_exc(ove_vtable);
+                return;
+            }
+            __uint128_t r10 = rem * 10;  // rem < mb <= kMax96: no wrap
+            q = q * 10 + r10 / mb;
+            rem = r10 % mb;
+            ++rs_signed;
+            if (q > kMax96) {
+                // fix #4870 / §6.4, v0.307: the last true digit pushes the
+                // truncated quotient past MaxValue (e.g. decimal.MaxValue /
+                // 0.9999999999999999999999999999m).
+                bz_set_exc(ove_vtable);
+                return;
+            }
         }
+    }
+    if (rs_signed > 28) {
+        // fix #4870 / §4.4, v0.307: `extra` may bring sa + extra to 29, which
+        // with sb == 0 gives a scale-29 result — outside the 0..28 scale range
+        // every other decimal operation in this file produces (0.1m / 3m
+        // printed 29 fractional digits, and 0.0000000000000000000000000001m /
+        // 3m printed 0.00000000000000000000000000003, below the smallest
+        // non-zero decimal). Drop the excess digit, truncating like the rest
+        // of this division.
+        q /= kPow10[rs_signed - 28];
+        rs_signed = 28;
     }
     uint32_t rs = (uint32_t)rs_signed;
     dec_store(out, q, rs, rsign, ove_vtable);
