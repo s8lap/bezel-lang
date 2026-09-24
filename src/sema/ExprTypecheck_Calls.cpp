@@ -2640,7 +2640,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         // two declaration kinds foldConstIdentTC walks). An IMPORTED
         // floating const carries no AST initializer and no folded value
         // (ConstMemberSymbol::intValue is integer-only), so it is declined.
-        Symbol* s = lookupName(id->name);
+        Symbol* s = lookupName(id->name, foldInDeclScope_);
         if (!s) return std::nullopt;
         const ast::Expr* val = nullptr;
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
@@ -2648,7 +2648,10 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         else
             val = constInitializer(s);
         if (!val) return std::nullopt;
-        r = foldNumConstExprTC(*val, depth + 1);
+        // fix #4856 (§17.14 / §2.8.3, v0.307): a class const's initializer
+        // names are resolved in its DECLARING scope, not the use site's.
+        r = inConstDeclScope(
+            s, [&] { return foldNumConstExprTC(*val, depth + 1); });
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         auto* head = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
         if (!head) return std::nullopt;
@@ -2708,7 +2711,9 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             if (!cms) return std::nullopt;
             const ast::Expr* val = constInitializer(cms);
             if (!val) return std::nullopt;
-            r = foldNumConstExprTC(*val, depth + 1);
+            // fix #4856: fold `C.K`'s initializer in C's scope.
+            r = inConstDeclScope(
+                cms, [&] { return foldNumConstExprTC(*val, depth + 1); });
         }
     }
     if (!r) return std::nullopt;

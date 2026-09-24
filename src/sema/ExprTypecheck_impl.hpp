@@ -2243,6 +2243,36 @@ private:
     // for what the other two silently answered.
     std::optional<long long> foldConstIdentTC(std::string_view name, int depth);
 
+    // fix #4856 (§17.14 / §2.8.3 / §22.12, v0.307): a `const` reference
+    // denotes that const's value, and the names in its initializer were bound
+    // where it was DECLARED — visitMember's ConstDecl arm typechecks a class
+    // const's initializer with `currentScope_` = the module scope and
+    // `currentType_` = the declaring type, looking bare names up in value
+    // position. The §17.14 folds used to follow the initializer and re-resolve
+    // its names at the USE site, so a same-named local or member there
+    // (`A.K := M1` read from a class that also declares `M1`) substituted the
+    // wrong value. `inConstDeclScope(s, f)` runs `f` with lookup positioned as
+    // that visit had it when `s` is a class const with a known declaring type
+    // (otherwise `f` runs unchanged); `foldInDeclScope_` makes the folds'
+    // bare-name lookups use the same value-position order the visit used.
+    bool foldInDeclScope_ = false;
+    template <class F>
+    auto inConstDeclScope(const Symbol* s, F&& f) -> decltype(f()) {
+        auto* cms = dynamic_cast<const ConstMemberSymbol*>(s);
+        if (!cms || !cms->parent || !moduleScope_) return f();
+        Scope* const saveScope = currentScope_;
+        TypeSymbol* const saveType = currentType_;
+        const bool saveFlag = foldInDeclScope_;
+        currentScope_ = moduleScope_.get();
+        currentType_ = cms->parent;
+        foldInDeclScope_ = true;
+        auto r = f();
+        currentScope_ = saveScope;
+        currentType_ = saveType;
+        foldInDeclScope_ = saveFlag;
+        return r;
+    }
+
     // §17.14 (v0.184, #1688): does `e` contain a `/` or `mod` node whose RHS
     // folds to a compile-time zero, using the SAME identifier resolution as
     // foldIntConstExprTC (lexical-scope `lookupName`, not a type's member-

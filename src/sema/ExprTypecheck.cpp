@@ -11024,7 +11024,9 @@ void ExprTC::checkCasePatternConstantRanges(
 //     ("Invalid indices for GEP pointer type!", IR verification failed).
 std::optional<long long> ExprTC::foldConstIdentTC(std::string_view name,
                                                   int depth) {
-    Symbol* s = lookupName(name);
+    // fix #4856: inside a followed class-const initializer, look names up in
+    // value position, as the declaration-site visit did.
+    Symbol* s = lookupName(name, foldInDeclScope_);
     if (!s) return std::nullopt;
     const ast::Expr* val = nullptr;
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
@@ -11032,10 +11034,16 @@ std::optional<long long> ExprTC::foldConstIdentTC(std::string_view name,
     else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
         val = cd->value.get();
     if (val)
-        return foldIntConst(
-            *val,
-            [this](std::string_view n, int d) { return foldConstIdentTC(n, d); },
-            depth + 1);
+        // fix #4856 (§17.14 / §2.8.3, v0.307): a class const's initializer is
+        // folded in its DECLARING scope, not the use site's.
+        return inConstDeclScope(s, [&] {
+            return foldIntConst(
+                *val,
+                [this](std::string_view n, int d) {
+                    return foldConstIdentTC(n, d);
+                },
+                depth + 1);
+        });
     // fix #3230 (§17.14 / §5.1 / §22.12; family M11 of umbrella #3152):
     // an IMPORTED class member const has no AST ConstDecl — the symbol
     // is reconstructed from dependency metadata, fix #328 — so the
@@ -11122,7 +11130,10 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
             if (cms->intValue) return *cms->intValue;
             return std::nullopt;
         }
-        return foldIntConst(*cd->value, resolve, 1);
+        // fix #4856 (§17.14 / §2.8.3, v0.307): fold `C.K`'s initializer in
+        // C's (the declaring type's) scope, not the use site's.
+        return inConstDeclScope(
+            cms, [&] { return foldIntConst(*cd->value, resolve, 1); });
     }
     return foldIntConst(e, resolve, 0);
 }
