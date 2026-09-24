@@ -12812,6 +12812,68 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         ctx_.setInheritanceClauseCtorBinding(
                             &td->primaryBaseCtorArgs, clauseCtor,
                             cb.paramToArg);
+                    // fix #4576 gap (a) (§22.5 "Optional parameters and
+                    // named arguments" / §22.6 / §22.10, v0.307): at an
+                    // OVERLOAD SET the binder above is quiet, because the
+                    // clause's names may belong to a SIBLING (#4551's
+                    // decline). When it declines, ask every sibling — and
+                    // the base's §22.10 primary list, if it has one — the
+                    // same §22.5 question; if NONE binds, no candidate
+                    // survives and §22.5 says the error is reported there.
+                    // Re-running the binder loud against `clauseCtor` (the
+                    // exact-arity candidate) reports the concrete reason
+                    // (`has no parameter named `zz``, a doubled parameter,
+                    // an unbound required one) in the binder's own text.
+                    //
+                    // MEASURED: `class D(v: int) : B(zz := v, b := 9)` over
+                    // `constructor(a: int)` + `constructor(a: int, b: int)`
+                    // printed `n=4 s=9` on c7d4411f (codegen's positional
+                    // type-class pairing bound `zz` to `a`) and `n=0 s=0`
+                    // from b83afbe3 (#4722 keyed that pairing by name, so
+                    // `ctorForArgs` found nothing and the base subobject
+                    // was never constructed). Both accepted silently; `zz`
+                    // names a parameter of no constructor of `B`.
+                    //
+                    // Only a clause NO candidate binds is reported, so no
+                    // clause a sibling can bind changes disposition. §5.1
+                    // assignability (#4576 gap (c)) is still not checked.
+                    if (!cb.ok && !emitClauseCtorBinding &&
+                        !clauseBindsPrimaryList) {
+                        bool anyBinds = false;
+                        for (Symbol* m : baseTs->members) {
+                            auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                            if (!other || other->isStatic) continue;
+                            if (bindArgsToParams(
+                                    sema::FormalsView::of(*other),
+                                    td->primaryBaseCtorArgs,
+                                    td->primaryBaseCtorArgs[0]
+                                        .value->span.begin,
+                                    desc, /*emit=*/false)
+                                    .ok) {
+                                anyBinds = true;
+                                break;
+                            }
+                        }
+                        if (!anyBinds && baseTs->hasPositionalFields) {
+                            const std::vector<const Symbol*> pf =
+                                recordPositionalFieldSymbols(baseTs);
+                            if (!pf.empty() &&
+                                bindArgsToParams(
+                                    sema::FormalsView::of(pf),
+                                    td->primaryBaseCtorArgs,
+                                    td->primaryBaseCtorArgs[0]
+                                        .value->span.begin,
+                                    desc, /*emit=*/false)
+                                    .ok)
+                                anyBinds = true;
+                        }
+                        if (!anyBinds)
+                            (void)bindArgsToParams(
+                                sema::FormalsView::of(*clauseCtor),
+                                td->primaryBaseCtorArgs,
+                                td->primaryBaseCtorArgs[0].value->span.begin,
+                                desc, /*emit=*/true);
+                    }
                 }
             }
             // The base positional field clause argument `ai` binds to. Empty

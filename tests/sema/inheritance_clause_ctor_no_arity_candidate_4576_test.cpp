@@ -14,10 +14,10 @@
 // reason. #4551's own header explicitly declined this shape: "'No
 // constructor of this arity at all.' Left to whatever diagnoses an
 // unresolvable base call today — which, measured, is nothing." This fix
-// closes that deferral. It does NOT touch #4576's gap (a) (a doubly-bound or
-// unknown-named parameter against a SURVIVING sibling of an overload set —
-// #4551 already declines that shape with its own control, reasserted here as
-// PIN 5) or gap (c) (§5.1 assignability of a bound argument).
+// closes that deferral. Gap (a) (a doubly-bound or unknown-named parameter
+// where NO sibling of the overload set binds the clause) is fix #4878, PINs 5
+// and 6 below; gap (c) (§5.1 assignability of a bound argument) is still
+// open.
 //
 // spec §22.5 "Optional parameters and named arguments" ("the error is
 // reported only where no candidate survives"), §22.10 "Primary constructors"
@@ -230,45 +230,85 @@ BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
 }
 
 // ---------------------------------------------------------------------------
-// PIN 5 — ⚠⚠⚠ THIS ROW PINS A KNOWN DEFECT, NOT SPEC-REQUIRED BEHAVIOUR.
-// ⚠⚠⚠
+// PIN 5 — #4576 gap (a), fixed by #4878. Until #4878 this row was a
+// CHARACTERIZATION pin of a known defect (`n=4 s=9`, the argument naming no
+// parameter bound POSITIONALLY), whose comment instructed that it "MUST FLIP
+// to a rejection" once gap (a) landed. It has.
 //
-// It is a CHARACTERIZATION test only: it records what the compiler currently
-// DOES (pre-existing, unfixed, WRONG per §22.5) so that THIS commit — which
-// deliberately does not touch gap (a) — does not accidentally change it as a
-// side effect. It is NOT an assertion that `n=4 s=9` is the correct answer
-// for this program. The correct answer, once #4576 gap (a) is fixed, is a
-// REJECTION naming `zz` as an unknown parameter — because `zz` is not a real
-// parameter name on EITHER constructor in the overload set, and §22.5 says
-// naming a nonexistent parameter "is a compile error at the call naming that
-// parameter — not an applicability failure, so at an overloaded name it is
-// diagnosed rather than resolved away", exactly the wording #4551 read to
-// justify gap (b) above.
-//
-// Gap (a) (a doubly-bound or unknown-named parameter against a SURVIVING
-// sibling of an overload set) needs a scan over every candidate's parameter
-// NAMES, not just arity, per #4551's own recorded decline — a different
-// shape from this commit's gap (b) fix, and NOT attempted here.
-//
-// >>> WHEN GAP (a) LANDS, THIS ROW'S EXPECTATION MUST FLIP to a rejection.
-// >>> Flipping it is the CORRECT outcome of that fix, not a regression to
-// >>> investigate — do not "fix" the future failure by reverting gap (a).
+// `zz` is not a parameter of EITHER constructor in the overload set, so no
+// candidate binds the clause and §22.5's "the error is reported only where no
+// candidate survives" is met: the exact-arity candidate's own binder reason is
+// reported. MEASURED: c7d4411f printed `n=4 s=9`; b83afbe3 (#4722, which
+// keyed `ctorForArgs`'s type check by name) printed `n=0 s=0` — the base
+// subobject never constructed — and failed this pin on r20-c25. Both were
+// silent acceptances.
 // ---------------------------------------------------------------------------
-// per §22.5 / §22.6, issue #4576 gap (a), NOT fixed by this commit — pins
-// the pre-existing defective behaviour as a characterization, see #4551's
-// own overload-set control for the sibling shape
+// per §22.5 / §22.6 / §22.10 (v0.307), issue #4576 gap (a), fix #4878
 BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
-           overload_set_unknown_named_parameter_gap_a_known_defect_pin) {
+           overload_set_unknown_named_parameter_is_rejected_4878) {
     auto r = runAot(overOverloadSetNoDefaults("B(zz := v, b := 9)"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "inheritance-clause base call to a constructor of `B` has no "
+           "parameter named `zz` (§22.5)"));
+}
+
+// ---------------------------------------------------------------------------
+// PIN 6 — #4878's other §22.5 "compile error, not an applicability failure"
+// shape: a parameter bound twice, where no sibling binds the clause either.
+// ---------------------------------------------------------------------------
+// per §22.5 / §22.10 (v0.307), issue #4576 gap (a), fix #4878
+BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
+           overload_set_doubly_bound_parameter_is_rejected_4878) {
+    auto r = runAot(overOverloadSetNoDefaults("B(a := v, a := 9)"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "inheritance-clause base call to a constructor of `B`: parameter "
+           "`a` is bound more than once (§22.5)"));
+}
+
+// ---------------------------------------------------------------------------
+// NO-REGRESSION 4 — #4878 reports only when NO candidate binds. Here the
+// exact-arity candidate `(a, b)` cannot bind `x`, but the defaulted sibling
+// `(x, y := 0, z := 0)` can, so the clause is valid and must NOT be rejected.
+// The row asserts acceptance only: the constructed VALUES are wrong today
+// (`n=0 s=0` where `n=40 s=90` is right — measured on b83afbe3 and 7dd479cf,
+// independent of #4878), tracked as #4879; its fix should strengthen this row
+// to the exact stdout.
+// ---------------------------------------------------------------------------
+// per §22.5 / §22.10 (v0.307), fix #4878 — no-regression control (see #4879)
+BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
+           overload_set_named_clause_binding_a_sibling_is_not_rejected_4878) {
+    auto r = runAot(
+        "module M; "
+        "class B "
+        "  public n: int := 0; "
+        "  public s: int := 0; "
+        "  public constructor(a: int, b: int) "
+        "    n := a; "
+        "    s := b; "
+        "  end constructor; "
+        "  public constructor(x: int, y: int := 0, z: int := 0) "
+        "    n := x * 10; "
+        "    s := y * 10; "
+        "  end constructor; "
+        "  public method Show() "
+        "    Console.WriteLine($\"n={n} s={s}\"); "
+        "  end Show; "
+        "end B; "
+        "class D(v: int) : B(x := v, y := 9) "
+        "  public method Go() Show(); end Go; "
+        "end D; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var d := new D(4); "
+        "    d.Go(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // KNOWN-DEFECT VALUE, not a correctness claim (see the block comment
-    // above): `zz` is not a real parameter name on EITHER sibling, but the
-    // 2-argument arity still finds the 2-formal constructor's exact-arity
-    // match, and both arguments bind POSITIONALLY (`a := zz-argument`,
-    // `b := 9`) rather than being rejected. This is exactly the shape
-    // #4576's gap (a) records as still open, and this row exists to detect
-    // an ACCIDENTAL behaviour change from this commit, not to certify the
-    // value as right.
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("n=4 s=9\n"));
 }
