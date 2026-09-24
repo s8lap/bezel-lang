@@ -2204,6 +2204,30 @@ private:
     // (a literal/arithmetic/const may; a variable or call result may not).
     std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
+    // fix #4801 (§5.2 / §17.14 / §6.3 / §6.4, v0.307): the floating/decimal
+    // sibling of foldIntConstExprTC. Folds a §17.14 constant expression whose
+    // static type is `float`, `double`, `decimal` or an integer type to its
+    // value under the run-time semantics §17.14 requires: IEEE 754 for the
+    // binary floats (a `float`-typed node computes in single precision, as
+    // codegen does; overflow to ±Infinity and NaN are VALUES), and the
+    // runtime's own exact decimal ops for `decimal`. Accepted forms: literals,
+    // `const` references (local, class-level, qualified `C.K`, and the
+    // primitive-wrapper constants `double.MaxValue` / `double.NaN` / …),
+    // unary `+`/`-`, binary `+ - * /` (and `mod` on decimal), parentheses (no
+    // AST node), and integer subtrees via foldIntConstExprTC. nullopt for
+    // anything else, and for a subexpression that itself faults (a decimal
+    // overflow or division by zero, a literal that failed §4.3/§4.4
+    // formation) — the conversion-site rule then stays silent rather than
+    // cascading.
+    struct FoldedNumConst {
+        enum class Kind { Int, Float, Double, Decimal } kind = Kind::Int;
+        long long i = 0;          // Kind::Int (ULong values are declined)
+        double d = 0.0;           // Kind::Float (exactly a float) / Double
+        std::uint32_t dec[4] = {0, 0, 0, 0};  // Kind::Decimal, bz_decimal_t
+    };
+    std::optional<FoldedNumConst> foldNumConstExprTC(const ast::Expr& e,
+                                                     int depth = 0);
+
     // fix #3617 (§17.14 / §15.1 / §22.12 / §2.8.3 rule 4, v0.286): the ONE
     // bare-identifier resolver the three ExprTC §17.14 constant folds share.
     // Resolves `name` through `lookupName` (the lexical scope chain plus the

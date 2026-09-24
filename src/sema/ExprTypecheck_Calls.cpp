@@ -3,7 +3,9 @@
 #include <algorithm>  // std::find (isCaptureFreeEntry's static-modifier check)
 #include <cctype>     // std::tolower — fix #4724 literal-suffix read
 #include <cmath>      // std::trunc, std::isfinite — fix #4724 (§5.2, v0.307)
+#include <cstdio>     // std::snprintf — fix #4801 diagnostic value
 #include <cstdlib>    // std::strtod, std::free — fix #4724
+#include <limits>     // std::numeric_limits — fix #4801 wrapper constants
 
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "runtime/bezel_runtime.h"  // bz_decimal_t, bz_decimal_parse_cstr, bz_exc_addr — fix #4724 (§4.4 literal parser)
@@ -294,56 +296,100 @@ std::string floatLiteralDigitsForFold(std::string_view text, bool isDecimal) {
     return digits;
 }
 
-// A `decimal` literal's value truncated toward zero, negated when `negate`,
-// computed EXACTLY (96-bit mantissa / 10^scale in 128-bit arithmetic — no
-// IEEE rounding, so `long(9223372036854775807m)` folds to long.MaxValue).
-// nullopt when the runtime literal parser faults (malformed or beyond
-// `decimal`'s range — the latter already a §4.3/§4.4 formation error), so the
-// caller skips the fold rather than reading an unwritten value or cascading
-// a second diagnostic.
-std::optional<__int128> truncatedDecimalLiteral(std::string_view text,
-                                                bool negate) {
-    const std::string digits = floatLiteralDigitsForFold(text, true);
-    if (digits.empty()) return std::nullopt;
-    bz_decimal_t dec{0, 0, 0, 0};
-    // Non-null sentinel vtables make both failure kinds observable as a
-    // `bz_exc` store (a null vtable is bz_set_exc's silent no-op); the slot is
-    // saved and restored around the probe, as decimalLiteralOutOfRange does.
+// fix #4801 (§5.2 / §6.4, v0.307): run one runtime decimal operation (the
+// ops codegen itself calls, so the fold IS the run-time semantics) under a
+// pending-exception probe. `op` receives a non-null sentinel vtable to pass as
+// every `ove_vtable`/`fe_vtable`: a null vtable is bz_set_exc's silent no-op,
+// so the sentinel is what makes a fault observable as a `bz_exc` store. The
+// slot is saved and restored around the probe, as decimalLiteralOutOfRange
+// (ExprTypecheck_Exprs.cpp) does. Returns true when the op faulted.
+template <class Op>
+bool decimalOpFaults(Op&& op) {
     unsigned char sentinel = 0;
     void** excSlot = bz_exc_addr();
     void* saved = *excSlot;
     *excSlot = nullptr;
-    bz_decimal_parse_cstr(digits.c_str(), &dec, &sentinel, &sentinel);
+    op(static_cast<void*>(&sentinel));
     const bool failed = (*excSlot != nullptr);
     if (failed) std::free(*excSlot);  // bz_set_exc's calloc'd object
     *excSlot = saved;
-    if (failed) return std::nullopt;
+    return failed;
+}
+
+// A `decimal` literal's exact value, parsed by the runtime literal parser
+// codegen uses. nullopt when the parser faults (malformed, or beyond
+// `decimal`'s range — the latter already a §4.3/§4.4 formation error), so the
+// caller skips the fold rather than reading an unwritten value or cascading
+// a second diagnostic. The output is zero-initialised.
+std::optional<bz_decimal_t> decimalLiteralValue(std::string_view text) {
+    const std::string digits = floatLiteralDigitsForFold(text, true);
+    if (digits.empty()) return std::nullopt;
+    bz_decimal_t dec{0, 0, 0, 0};
+    if (decimalOpFaults([&](void* vt) {
+            bz_decimal_parse_cstr(digits.c_str(), &dec, vt, vt);
+        }))
+        return std::nullopt;
+    return dec;
+}
+
+// A `decimal` value truncated toward zero, computed EXACTLY (96-bit mantissa /
+// 10^scale in 128-bit arithmetic — no IEEE rounding, so
+// `long(9223372036854775807m)` folds to long.MaxValue).
+__int128 truncatedDecimal(const bz_decimal_t& dec) {
     const __uint128_t mant = ((__uint128_t)dec.hi32 << 64) |
                              ((__uint128_t)dec.mid32 << 32) |
                              (__uint128_t)dec.lo32;
     uint32_t scale = (dec.flags >> 16) & 0xFFu;
     __uint128_t whole = mant;
     while (scale-- > 0 && whole != 0) whole /= 10;
-    const bool neg = (((dec.flags >> 31) & 1u) != 0) != negate;
+    const bool neg = ((dec.flags >> 31) & 1u) != 0;
     // |whole| < 2^96, so the signed value is exact in __int128.
     return neg ? -(__int128)whole : (__int128)whole;
 }
 
-// A `float`/`double` literal's value, negated when `negate`, truncated toward
-// zero IN THE DOUBLE DOMAIN (no integer cast, so no UB on a huge magnitude).
-// A `float` literal is materialised as `(float)strtod(digits)` by codegen and
-// is rounded the same way here. nullopt when the literal is non-finite — an
-// out-of-range literal is already a §4.3 formation error, and a second
-// diagnostic at the conversion would only cascade.
-std::optional<double> truncatedBinaryFloatLiteral(std::string_view text,
-                                                  bool isFloat, bool negate) {
+// A `float`/`double` literal's value. A `float` literal is materialised as
+// `(float)strtod(digits)` by codegen and is rounded the same way here. nullopt
+// when the literal is non-finite — an out-of-range literal is already a §4.3
+// formation error, and a second diagnostic at the conversion would only
+// cascade.
+std::optional<double> binaryFloatLiteralValue(std::string_view text,
+                                              bool isFloat) {
     const std::string digits = floatLiteralDigitsForFold(text, false);
     if (digits.empty()) return std::nullopt;
     double v = std::strtod(digits.c_str(), nullptr);
     if (isFloat) v = (double)(float)v;
     if (!std::isfinite(v)) return std::nullopt;
-    if (negate) v = -v;
-    return std::trunc(v);
+    return v;
+}
+
+// fix #4801: the folded operand's value as the diagnostic prints it — the
+// shortest round-tripping spelling of a double, `NaN` / `Infinity` /
+// `-Infinity` for the non-finite values (the spellings of stdlib §9.2's
+// constants), and a decimal's exact digits.
+std::string formatFoldedDouble(double v) {
+    if (std::isnan(v)) return "NaN";
+    if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";
+    char buf[64];
+    for (int prec = 1; prec <= 17; ++prec) {
+        std::snprintf(buf, sizeof buf, "%.*g", prec, v);
+        if (std::strtod(buf, nullptr) == v) break;
+    }
+    return buf;
+}
+
+std::string formatFoldedDecimal(const bz_decimal_t& dec) {
+    __uint128_t mant = ((__uint128_t)dec.hi32 << 64) |
+                       ((__uint128_t)dec.mid32 << 32) | (__uint128_t)dec.lo32;
+    const uint32_t scale = (dec.flags >> 16) & 0xFFu;
+    std::string digits;
+    do {
+        digits.insert(digits.begin(), char('0' + (int)(mant % 10)));
+        mant /= 10;
+    } while (mant != 0);
+    while (digits.size() <= scale) digits.insert(digits.begin(), '0');
+    if (scale > 0) digits.insert(digits.size() - scale, ".");
+    if (((dec.flags >> 31) & 1u) != 0) digits.insert(digits.begin(), '-');
+    return digits;
 }
 
 // Range of an integer (or `char`) conversion target, as closed bounds on the
@@ -2313,6 +2359,306 @@ const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
     return nullptr;
 }
 
+// fix #4801 (§5.2 / §17.14 / §6.3 / §6.4, v0.307) — see the declaration in
+// ExprTypecheck_impl.hpp. §17.14: "A constant expression is evaluated at
+// compile time under the *same semantics* the expression has at run time —
+// … §6.3 IEEE 754 (overflow to `±Infinity` and `NaN` propagation are
+// *values*, not faults), §6.4 decimal". Each node's static type (set by the
+// ordinary typecheck, which has already visited the operand) picks the
+// domain; a node with no recorded type is folded structurally and promoted
+// at its parent per §6.2.
+std::optional<ExprTC::FoldedNumConst>
+ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
+    using K = FoldedNumConst::Kind;
+    if (depth > 64) return std::nullopt;  // cyclic / runaway const reference
+    // The initializer of a class-level `const` (bare `K` or qualified `C.K`).
+    // An IMPORTED floating const has no AST decl and ConstMemberSymbol
+    // carries only an integer folded value, so it is declined (residual).
+    auto constInitializer = [](const Symbol* s) -> const ast::Expr* {
+        // SEAM-DEBT: #4843 imported float/decimal consts carry no folded value
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl);
+        return cd ? cd->value.get() : nullptr;
+    };
+    const TypeRef* t = ctx_.exprType(e);
+    if (t && (t->kind != TypeRef::Kind::Primitive || t->nullable))
+        return std::nullopt;
+    auto kindOf = [](PrimitiveType p) -> std::optional<K> {
+        switch (p) {
+            case PrimitiveType::Float:   return K::Float;
+            case PrimitiveType::Double:  return K::Double;
+            case PrimitiveType::Decimal: return K::Decimal;
+            case PrimitiveType::SByte: case PrimitiveType::Byte:
+            case PrimitiveType::Short: case PrimitiveType::UShort:
+            case PrimitiveType::Int:   case PrimitiveType::UInt:
+            case PrimitiveType::Long:  case PrimitiveType::ULong:
+            case PrimitiveType::Char:
+                return K::Int;
+            default:
+                return std::nullopt;
+        }
+    };
+    std::optional<K> want;
+    if (t) {
+        want = kindOf(t->primitive);
+        if (!want) return std::nullopt;
+    }
+
+    // An integer-typed subtree (`2` in `1.5 * 2`, an `int` const): the
+    // integer folder owns it, under its type's range — a subtree whose
+    // unchecked 64-bit fold escapes its type faulted (§6.1) and has no
+    // value. A `ulong` above long.MaxValue is declined (the fold is signed).
+    if ((want && *want == K::Int) ||
+        (!want && (dynamic_cast<const ast::IntLiteralExpr*>(&e) ||
+                   dynamic_cast<const ast::CharLiteralExpr*>(&e)))) {
+        auto v = foldIntConstExprTC(e);
+        if (!v) return std::nullopt;
+        if (t) {
+            if (t->primitive == PrimitiveType::ULong && *v < 0)
+                return std::nullopt;
+            if (t->primitive != PrimitiveType::Char &&
+                t->primitive != PrimitiveType::ULong &&
+                !fitsConstIntRange(*v, t->primitive))
+                return std::nullopt;
+        }
+        FoldedNumConst r;
+        r.kind = K::Int;
+        r.i = *v;
+        return r;
+    }
+
+    auto makeBin = [](K k, double d) {
+        FoldedNumConst r;
+        r.kind = k;
+        r.d = d;
+        return r;
+    };
+    auto makeDec = [](const bz_decimal_t& dv) {
+        FoldedNumConst r;
+        r.kind = K::Decimal;
+        r.dec[0] = dv.lo32;
+        r.dec[1] = dv.mid32;
+        r.dec[2] = dv.hi32;
+        r.dec[3] = dv.flags;
+        return r;
+    };
+    auto decOf = [](const FoldedNumConst& v) {
+        return bz_decimal_t{v.dec[0], v.dec[1], v.dec[2], v.dec[3]};
+    };
+    // §5.1 / §6.2 implicit promotion of a folded value to kind `to`:
+    // integer → float/double/decimal and float → double. Anything else is
+    // not an implicit conversion, so it is declined rather than guessed.
+    auto coerce = [&](const FoldedNumConst& v,
+                      K to) -> std::optional<FoldedNumConst> {
+        if (v.kind == to) return v;
+        if (v.kind == K::Int) {
+            if (to == K::Double) return makeBin(K::Double, (double)v.i);
+            if (to == K::Float)
+                return makeBin(K::Float, (double)(float)v.i);
+            if (to == K::Decimal) {
+                bz_decimal_t dv{0, 0, 0, 0};
+                bz_decimal_from_int64((int64_t)v.i, &dv);
+                return makeDec(dv);
+            }
+        }
+        if (v.kind == K::Float && to == K::Double)
+            return makeBin(K::Double, v.d);
+        return std::nullopt;
+    };
+
+    std::optional<FoldedNumConst> r;
+    if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
+        if (fl->text.empty()) return std::nullopt;
+        const char suf = (char)std::tolower((unsigned char)fl->text.back());
+        if (suf == 'm') {
+            auto dv = decimalLiteralValue(fl->text);
+            if (!dv) return std::nullopt;
+            r = makeDec(*dv);
+        } else {
+            auto dv = binaryFloatLiteralValue(fl->text, suf == 'f');
+            if (!dv) return std::nullopt;
+            r = makeBin(suf == 'f' ? K::Float : K::Double, *dv);
+        }
+    } else if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        // §17.14: unary `-`/`+` applied to a constant operand, at any depth
+        // (`--x` parses as `-(-x)`).
+        if (!u->operand || (u->op != "-" && u->op != "+"))
+            return std::nullopt;
+        auto v = foldNumConstExprTC(*u->operand, depth + 1);
+        if (!v) return std::nullopt;
+        if (u->op == "-") {
+            if (v->kind == K::Int) {
+                if (v->i == std::numeric_limits<long long>::min())
+                    return std::nullopt;
+                v->i = -v->i;
+            } else if (v->kind == K::Decimal) {
+                const bz_decimal_t a = decOf(*v);
+                bz_decimal_t out{0, 0, 0, 0};
+                bz_decimal_neg(&a, &out);
+                v = makeDec(out);
+            } else {
+                v->d = -v->d;
+            }
+        }
+        r = v;
+    } else if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // §17.14: binary arithmetic on constant operands. `mod` is defined
+        // on decimal only (§6.1); comparisons / boolean ops have a `bool`
+        // type and were declined above.
+        if (!b->left || !b->right) return std::nullopt;
+        const bool isMod = (b->op == "mod" || b->op == "%");
+        if (b->op != "+" && b->op != "-" && b->op != "*" && b->op != "/" &&
+            !isMod)
+            return std::nullopt;
+        auto l = foldNumConstExprTC(*b->left, depth + 1);
+        auto rr = foldNumConstExprTC(*b->right, depth + 1);
+        if (!l || !rr) return std::nullopt;
+        K rk;
+        if (want) {
+            rk = *want;
+        } else {
+            // §6.2 promotion when the node carries no recorded type.
+            auto rank = [](K k) {
+                return k == K::Int ? 0 : k == K::Float ? 1
+                     : k == K::Double ? 2 : 3;
+            };
+            const bool mixesDecBin =
+                (l->kind == K::Decimal &&
+                 (rr->kind == K::Float || rr->kind == K::Double)) ||
+                (rr->kind == K::Decimal &&
+                 (l->kind == K::Float || l->kind == K::Double));
+            if (mixesDecBin) return std::nullopt;
+            rk = rank(l->kind) >= rank(rr->kind) ? l->kind : rr->kind;
+        }
+        if (rk == K::Int) return std::nullopt;
+        l = coerce(*l, rk);
+        rr = coerce(*rr, rk);
+        if (!l || !rr) return std::nullopt;
+        if (rk == K::Decimal) {
+            const bz_decimal_t a = decOf(*l), c = decOf(*rr);
+            bz_decimal_t out{0, 0, 0, 0};
+            const bool zeroDivisor = c.lo32 == 0 && c.mid32 == 0 && c.hi32 == 0;
+            // §6.4: division / `mod` by zero raises DivideByZeroException
+            // (codegen guards it inline; the runtime op aborts on it) and
+            // overflow raises OverflowException — a faulting subexpression
+            // has no value, so the fold declines.
+            if ((b->op == "/" || isMod) && zeroDivisor) return std::nullopt;
+            const bool faulted = decimalOpFaults([&](void* vt) {
+                if (b->op == "+")      bz_decimal_add(&a, &c, &out, vt);
+                else if (b->op == "-") bz_decimal_sub(&a, &c, &out, vt);
+                else if (b->op == "*") bz_decimal_mul(&a, &c, &out, vt);
+                else if (b->op == "/") bz_decimal_div(&a, &c, &out, vt);
+                else                   bz_decimal_mod(&a, &c, &out, vt);
+            });
+            if (faulted) return std::nullopt;
+            r = makeDec(out);
+        } else {
+            if (isMod) return std::nullopt;  // §6.1: no `mod` on float/double
+            // §6.3 IEEE 754. A `float` node computes in single precision, as
+            // codegen's `fadd float` does. Division by zero is spelled out
+            // (±Infinity, or NaN for 0/0 and NaN/0) rather than left to the
+            // host's floating-point environment.
+            auto ieee = [&](auto x, auto y) -> double {
+                using F = decltype(x);
+                if (b->op == "+") return (double)(F)(x + y);
+                if (b->op == "-") return (double)(F)(x - y);
+                if (b->op == "*") return (double)(F)(x * y);
+                if (y == 0) {
+                    if (x == 0 || std::isnan(x))
+                        return std::numeric_limits<double>::quiet_NaN();
+                    const bool neg = std::signbit(x) != std::signbit(y);
+                    return neg ? -std::numeric_limits<double>::infinity()
+                               : std::numeric_limits<double>::infinity();
+                }
+                return (double)(F)(x / y);
+            };
+            const double d = (rk == K::Float)
+                                 ? ieee((float)l->d, (float)rr->d)
+                                 : ieee(l->d, rr->d);
+            r = makeBin(rk, d);
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        // §17.14: a reference to a `const` — local or class-level (the same
+        // two declaration kinds foldConstIdentTC walks). An IMPORTED
+        // floating const carries no AST initializer and no folded value
+        // (ConstMemberSymbol::intValue is integer-only), so it is declined.
+        Symbol* s = lookupName(id->name);
+        if (!s) return std::nullopt;
+        const ast::Expr* val = nullptr;
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+            val = lc->value.get();
+        else
+            val = constInitializer(s);
+        if (!val) return std::nullopt;
+        r = foldNumConstExprTC(*val, depth + 1);
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        auto* head = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!head) return std::nullopt;
+        const PrimitiveType hp = primitiveFromName(head->name);
+        if (hp == PrimitiveType::Double || hp == PrimitiveType::Float) {
+            // stdlib §9.2's compiler-provided constants, with the values
+            // codegen materialises (LlvmBackend_Exprs.cpp, "static
+            // properties on primitive type names"): MinValue is the most
+            // negative finite value, Epsilon the smallest subnormal.
+            const bool f = (hp == PrimitiveType::Float);
+            const K k = f ? K::Float : K::Double;
+            const std::string_view m = ma->member;
+            double v;
+            if (m == "MaxValue")
+                v = f ? (double)std::numeric_limits<float>::max()
+                      : std::numeric_limits<double>::max();
+            else if (m == "MinValue")
+                v = f ? (double)std::numeric_limits<float>::lowest()
+                      : std::numeric_limits<double>::lowest();
+            else if (m == "Epsilon")
+                v = f ? (double)std::numeric_limits<float>::denorm_min()
+                      : std::numeric_limits<double>::denorm_min();
+            else if (m == "PositiveInfinity")
+                v = std::numeric_limits<double>::infinity();
+            else if (m == "NegativeInfinity")
+                v = -std::numeric_limits<double>::infinity();
+            else if (m == "NaN")
+                v = std::numeric_limits<double>::quiet_NaN();
+            else
+                return std::nullopt;
+            r = makeBin(k, v);
+        } else if (hp == PrimitiveType::Decimal) {
+            // stdlib §9.3's compiler-provided constants, spelled as codegen
+            // materialises them (LlvmBackend_Calls.cpp decConstant).
+            const std::string_view m = ma->member;
+            const char* text = m == "MaxValue" ? "79228162514264337593543950335"
+                             : m == "MinValue" ? "-79228162514264337593543950335"
+                             : m == "Zero"     ? "0"
+                             : m == "One"      ? "1"
+                                               : nullptr;
+            if (!text) return std::nullopt;
+            auto dv = decimalLiteralValue(text);
+            if (!dv) return std::nullopt;
+            r = makeDec(*dv);
+        } else if (hp == PrimitiveType::None) {
+            // A qualified class const `C.K` (or `Alias.K`), resolved the way
+            // foldIntConstExprTC's #2986 / #4071 arm resolves it.
+            Symbol* hs = lookupName(head->name);
+            if (!hs) return std::nullopt;
+            TypeSymbol* ts = dynamic_cast<TypeSymbol*>(hs);
+            if (!ts)
+                if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(hs))
+                    ts = resolveAliasToTypeSymbol(aliasSym);
+            if (!ts) return std::nullopt;
+            auto* cms =
+                dynamic_cast<ConstMemberSymbol*>(lookupMember(ts, ma->member));
+            if (!cms) return std::nullopt;
+            const ast::Expr* val = constInitializer(cms);
+            if (!val) return std::nullopt;
+            r = foldNumConstExprTC(*val, depth + 1);
+        }
+    }
+    if (!r) return std::nullopt;
+    // The node's own static type is authoritative (`const K: double := 1;`
+    // reads as the double 1.0).
+    if (want && r->kind != *want) return coerce(*r, *want);
+    return r;
+}
+
 // Slice 3h: resolve a CallExpr's return type from the callee's
 // resolved MethodSymbol.
 void ExprTC::typeCall(const ast::CallExpr& ce) {
@@ -2899,10 +3245,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                         // (c) float/double/decimal → integer (or `char`) at a
-                        // floating-point or decimal LITERAL operand, optionally
-                        // under one unary `+`/`-` — fix #4724 (§5.2, v0.307).
-                        // §5.2: "Floating-point to integer truncates toward
-                        // zero; ... out-of-range values raise
+                        // compile-time-constant operand (§17.14) — fix #4724
+                        // (literal operands) generalised by fix #4801 (every
+                        // constant expression: `int(0.0 / 0.0)`,
+                        // `int(-(-1.0e30))`, `int(double.MaxValue)`, a `const`
+                        // reference, …), §5.2 v0.307. §5.2: "Floating-point
+                        // to integer truncates toward zero; `NaN`,
+                        // `±Infinity`, and out-of-range values raise
                         // `OverflowException`", and a constant operand that
                         // would raise is a compile error at the conversion
                         // site (`int(1e30)` is the spec's own example). The
@@ -2910,75 +3259,133 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // truncated value, exactly as the runtime conversion
                         // does: `byte(-0.5)` / `uint(-0.9)` / `byte(-0.0m)`
                         // are 0 and admitted; `byte(256.0)` is rejected.
-                        //   - `decimal` is folded exactly (runtime literal
-                        //     parser, 96-bit mantissa / 10^scale in 128-bit
-                        //     integers), so `long(9223372036854775807m)` fits;
-                        //   - `float`/`double` are compared in the double
-                        //     domain against exact bounds (strict `< 2^63` /
-                        //     `< 2^64` for `long`/`ulong`), never through an
-                        //     out-of-range integer cast;
-                        //   - `_` digit separators and the suffix are
-                        //     stripped as literal formation and codegen do
-                        //     (Appendix A.1 DigitGroup);
+                        //   - `decimal` is folded exactly (the runtime's own
+                        //     decimal ops, 96-bit mantissa / 10^scale in
+                        //     128-bit integers), so
+                        //     `long(9223372036854775807m)` fits;
+                        //   - `float`/`double` are folded under IEEE 754
+                        //     (§6.3: overflow to ±Infinity and NaN are values)
+                        //     and compared in the double domain against exact
+                        //     bounds (strict `< 2^63` / `< 2^64` for
+                        //     `long`/`ulong`), never through an out-of-range
+                        //     integer cast; a non-finite value never fits;
                         //   - a literal that faulted at formation (§4.3/§4.4
-                        //     out of range) is skipped, not re-diagnosed.
-                        // The unary unwrap: the parser emits a FloatLiteralExpr
-                        // only for the bare token, so `int(-1.0e30)` is
-                        // `UnaryExpr{"-", FloatLiteralExpr{"1.0e30"}}`. Deeper
-                        // constant expressions are #4801's scope.
-                        const ast::Expr* floatOperand = ce.args[0].value.get();
-                        std::string signText;
-                        bool negate = false;
-                        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(floatOperand)) {
-                            if (u->operand && (u->op == "-" || u->op == "+")) {
-                                if (auto* innerFl =
-                                        dynamic_cast<const ast::FloatLiteralExpr*>(
-                                            u->operand.get())) {
-                                    floatOperand = innerFl;
-                                    signText = std::string(u->op);
-                                    negate = (u->op == "-");
+                        //     out of range) is not folded, so it is not
+                        //     re-diagnosed here.
+                        // (d) binary float → `decimal` at a constant operand —
+                        // fix #4801. §5.2: "`decimal(x)` for binary-float `x`
+                        // … `NaN`, `±Infinity`, and magnitudes outside
+                        // `decimal`'s range raise `OverflowException`". The
+                        // fold calls the runtime conversion codegen emits
+                        // (bz_decimal_from_double), so the compile-time range
+                        // is exactly the run-time one.
+                        const bool srcIsFloatish =
+                            srcPt2 == PrimitiveType::Float ||
+                            srcPt2 == PrimitiveType::Double ||
+                            srcPt2 == PrimitiveType::Decimal;
+                        const bool toIntegral =
+                            tgtIsNarrowerInt || pt == PrimitiveType::Char;
+                        const bool toDecimal =
+                            pt == PrimitiveType::Decimal &&
+                            srcPt2 != PrimitiveType::Decimal;
+                        if (srcIsFloatish && (toIntegral || toDecimal)) {
+                            auto folded =
+                                foldNumConstExprTC(*ce.args[0].value);
+                            if (folded &&
+                                folded->kind != FoldedNumConst::Kind::Int) {
+                                using FK = FoldedNumConst::Kind;
+                                const bool isDec = folded->kind == FK::Decimal;
+                                const bz_decimal_t dv{
+                                    folded->dec[0], folded->dec[1],
+                                    folded->dec[2], folded->dec[3]};
+                                const double d = folded->d;
+                                const char* kind =
+                                    isDec ? "decimal"
+                                    : folded->kind == FK::Float ? "float"
+                                                                : "double";
+                                bool fits = true;
+                                if (toDecimal) {
+                                    bz_decimal_t out{0, 0, 0, 0};
+                                    fits = !decimalOpFaults([&](void* vt) {
+                                        bz_decimal_from_double(d, &out, vt);
+                                    });
+                                } else if (isDec) {
+                                    fits = truncatedDecimalFits(
+                                        truncatedDecimal(dv), pt);
+                                } else if (std::isfinite(d)) {
+                                    fits = truncatedDoubleFits(std::trunc(d),
+                                                               pt);
+                                } else {
+                                    fits = false;
                                 }
-                            }
-                        }
-                        auto* fl =
-                            dynamic_cast<const ast::FloatLiteralExpr*>(floatOperand);
-                        if (fl && !fl->text.empty() &&
-                            (tgtIsNarrowerInt || pt == PrimitiveType::Char)) {
-                            const std::string_view txt = fl->text;
-                            const char suf =
-                                (char)std::tolower((unsigned char)txt.back());
-                            bool known = false;
-                            bool fits = true;
-                            const char* kind = "double";
-                            if (suf == 'm') {
-                                kind = "decimal";
-                                if (auto s = truncatedDecimalLiteral(txt, negate)) {
-                                    known = true;
-                                    fits = truncatedDecimalFits(*s, pt);
+                                if (!fits) {
+                                    // A (signed) literal operand keeps
+                                    // #4724's wording, spelled as written.
+                                    const ast::Expr* opnd =
+                                        ce.args[0].value.get();
+                                    std::string signText;
+                                    if (auto* u = dynamic_cast<
+                                            const ast::UnaryExpr*>(opnd)) {
+                                        if (u->operand &&
+                                            (u->op == "-" || u->op == "+") &&
+                                            dynamic_cast<
+                                                const ast::FloatLiteralExpr*>(
+                                                u->operand.get())) {
+                                            signText = std::string(u->op);
+                                            opnd = u->operand.get();
+                                        }
+                                    }
+                                    auto* fl = dynamic_cast<
+                                        const ast::FloatLiteralExpr*>(opnd);
+                                    const std::string tgt(id->name);
+                                    std::string msg;
+                                    if (fl && toIntegral) {
+                                        msg = "the compile-time-constant "
+                                              "operand `" + signText +
+                                              std::string(fl->text) +
+                                              "` (a " + kind + " literal) of "
+                                              "the explicit conversion to `" +
+                                              tgt + "` would raise "
+                                              "`OverflowException` after "
+                                              "truncation toward zero; §5.2 "
+                                              "rejects a faulting constant "
+                                              "operand at the conversion "
+                                              "site, not as a deferred "
+                                              "runtime fault (§17.14, v0.307; "
+                                              "fix #4724)";
+                                    } else {
+                                        const std::string val =
+                                            isDec ? formatFoldedDecimal(dv)
+                                                  : formatFoldedDouble(d);
+                                        msg = "the compile-time-constant "
+                                              "operand (a `" +
+                                              std::string(kind) +
+                                              "` constant expression whose "
+                                              "value is `" + val + "`) of "
+                                              "the explicit conversion to `" +
+                                              tgt + "` would raise "
+                                              "`OverflowException`";
+                                        if (toDecimal)
+                                            msg += ": `NaN`, `±Infinity` and "
+                                                   "magnitudes outside "
+                                                   "`decimal`'s range have no "
+                                                   "`decimal` value";
+                                        else if (!isDec && !std::isfinite(d))
+                                            msg += ": `NaN` and `±Infinity` "
+                                                   "have no integer value";
+                                        else
+                                            msg += " after truncation toward "
+                                                   "zero";
+                                        msg += "; §5.2 rejects a faulting "
+                                               "constant operand at the "
+                                               "conversion site, not as a "
+                                               "deferred runtime fault "
+                                               "(§17.14, v0.307; fix #4801)";
+                                    }
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin, msg);
+                                    return;
                                 }
-                            } else {
-                                if (suf == 'f') kind = "float";
-                                if (auto t = truncatedBinaryFloatLiteral(
-                                        txt, suf == 'f', negate)) {
-                                    known = true;
-                                    fits = truncatedDoubleFits(*t, pt);
-                                }
-                            }
-                            if (known && !fits) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    "the compile-time-constant operand `"
-                                    + signText + std::string(txt) +
-                                    "` (a " + kind + " literal) of the "
-                                    "explicit conversion to `"
-                                    + std::string(id->name) +
-                                    "` would raise `OverflowException` "
-                                    "after truncation toward zero; §5.2 "
-                                    "rejects a faulting constant operand "
-                                    "at the conversion site, not as a "
-                                    "deferred runtime fault "
-                                    "(§17.14, v0.307; fix #4724)");
-                                return;
                             }
                         }
                     }
