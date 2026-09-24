@@ -14585,6 +14585,143 @@ private:
             }
             return -1;
         };
+        // fix #4790 (§22.5 "Optional parameters and named arguments" / §22.6
+        // stage 3, v0.307): the parameter TYPE at slot `pi` of `cs`, resolved
+        // the same both-sources way #3760's original `localParamType` always
+        // has — the local AST when `cs` carries an `ast::ConstructorDecl`
+        // (`cd->params[pi].type`, resolved via `ctx_.resolvedType`), falling
+        // back to the imported `ParameterSymbol::resolvedDeclType`/`declType`.
+        // Pulled out of `ctorTypeMatches` (which used to nest an identical
+        // lambda, capturing its OWN `cs` parameter) so the generalized
+        // defaulted-candidate check below — over a constructor whose arity
+        // EXCEEDS the call's argument count, a shape `ctorTypeMatches` itself
+        // refuses outright via its `cs->params.size() != args.size()` guard —
+        // can ask the identical question about a DIFFERENT `cs`.
+        auto paramTypeAt = [&](sema::ConstructorSymbol* cs,
+                               std::size_t pi) -> const sema::TypeRef* {
+            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                if (pi < cd->params.size() && cd->params[pi].type)
+                    return ctx_.resolvedType(*cd->params[pi].type);
+            }
+            if (pi < cs->params.size()) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
+                // Prefer the already-resolved `resolvedDeclType` (filled
+                // by sema for an inferred-typed lambda param) when
+                // available; fall back to resolving `declType` (the AST
+                // type). `ps->declType` is `const ast::Type*` here —
+                // ParameterSymbol's own field shadows the inherited
+                // `Symbol::declType` (a `sema::TypeRef*`).
+                if (ps) {
+                    if (ps->resolvedDeclType) return ps->resolvedDeclType;
+                    if (ps->declType) return ctx_.resolvedType(*ps->declType);
+                }
+            }
+            return nullptr;
+        };
+        // fix #4790 (§22.6 stage 3, v0.307): does call argument `arg`
+        // type-match parameter slot `pi` of `cs`? The exact per-argument rule
+        // `ctorTypeMatches` applied inline before this fix (the #3760
+        // null-vs-nullable follow-up; the #4046 §5.1 int-family→floating
+        // widening) — pulled out so the exact-arity check and the
+        // generalized defaulted-candidate check below apply IDENTICALLY.
+        // #4790's own defect was these two disagreeing: the exact-arity arm
+        // type-checked a bound argument and the defaulted-fill arm
+        // (`argsCanFill`/`argsCanFillSymbolic`, below) never did.
+        //
+        // fix #4790 rework (§5.1 / §14.2 clause 5 / §22.6 stages 3 + 5,
+        // v0.307): the class comparison below is a RANKING proxy, not a model
+        // of §5.1. Used alone as an applicability gate (as the first #4790
+        // commit did) it made `ctorForArgs` return null for calls sema had
+        // accepted through a §5.1 conversion it does not model — a primitive
+        // boxed into the builtin interface it conforms to (`new C(5)` against
+        // `constructor(v: IComparable<int>, k: int := 7)`), or `null` into a
+        // type-parameter slot (`new Box<string?>(null)` against
+        // `constructor(v: T, k: int := 9)`) — and the `new` silently
+        // zero-filled the object. The search therefore runs in two passes
+        // (`relaxedPass`, below): the STRICT pass is the class comparison,
+        // which keeps every same-class candidate ahead of a converting one
+        // (§22.6 stage 5's exact-match preference: `(n: int)` still beats a
+        // sibling `(v: IComparable<int>)` for `new C(5)` whatever their
+        // declaration order); only when it finds nothing does the RELAXED
+        // pass also admit the §5.1 conversions the class proxy cannot see.
+        bool relaxedPass = false;
+        // §14.2 clause 5 / §5.1 / stdlib §9.1–§9.5 (v0.307): a primitive
+        // value boxes into the builtin `IComparable<P>` / `IEquatable<P>` at
+        // its own type exactly (non-nullable type argument; `bool` has
+        // `IEquatable<bool>` only). The codegen spelling of sema's
+        // `ExprTC::primitiveBoxesIntoBuiltinIface` (ExprTypecheck.cpp), which
+        // is private to sema's typechecker.
+        auto primitiveBoxesInto = [](const sema::TypeRef* from,
+                                     const sema::TypeRef* to) -> bool {
+            if (!from || !to || from->kind != sema::TypeRef::Kind::Primitive ||
+                from->nullable || to->kind != sema::TypeRef::Kind::Named ||
+                !to->declaration ||
+                to->declaration->kind != ast::TypeDeclKind::Interface ||
+                !to->declaration->isSynthesizedBuiltinInterface ||
+                to->genericArgs.size() != 1 || !to->genericArgs[0])
+                return false;
+            const bool isCmp = to->declaration->name == "IComparable";
+            const bool isEq = to->declaration->name == "IEquatable";
+            if (!isCmp && !isEq) return false;
+            if (from->primitive == sema::PrimitiveType::Object) return false;
+            if (isCmp && from->primitive == sema::PrimitiveType::Bool)
+                return false;
+            const sema::TypeRef* targ = to->genericArgs[0];
+            return targ->kind == sema::TypeRef::Kind::Primitive &&
+                   !targ->nullable && targ->primitive == from->primitive;
+        };
+        // Does argument expression `argExpr` type-match a slot of type
+        // `paramTy`? Shared by the explicit-constructor slots
+        // (`slotTypeMatches`) and the §22.10 primary-parameter slots
+        // (`primaryStrictlyApplicable`, below).
+        auto argMatchesParamType = [&](const ast::Expr* argExpr,
+                                       const sema::TypeRef* paramTy) -> bool {
+            if (!argExpr) return true;
+            auto* argTy = ctx_.exprType(*argExpr);
+            bool argIsNull =
+                dynamic_cast<const ast::NullLiteralExpr*>(argExpr) != nullptr;
+            int paramCls = typeClassOf(paramTy);
+            // fix #3760 follow-up: a `null` arg against a NULLABLE param is a
+            // valid match — a `null` literal carries no typeClass information
+            // of its own, so a bare class comparison would reject `new
+            // B(null)` against `constructor(n: int?)` even though the
+            // parameter clearly admits null.
+            //
+            // fix #4790 rework (§5.1 / §7, v0.307): `null` also converts to
+            // every REFERENCE slot class (Named/function/`string` 3 — the
+            // pre-rework verdict, unchanged) and to a TYPE-PARAMETER slot
+            // (class -1: `T` is instantiated at a nullable type for sema to
+            // have accepted the call — `new Box<string?>(null)`). The
+            // pre-rework `argCls == paramCls` compared null's 3 against the
+            // type parameter's -1 and rejected the only candidate. Only a
+            // non-nullable value-primitive slot (bool/integral/floating)
+            // rejects it.
+            if (argIsNull) {
+                if (paramTy && paramTy->nullable) return true;  // null -> nullable param
+                return paramCls == 3 || paramCls == -1;
+            }
+            int argCls = typeClassOf(argTy);
+            // Relaxed pass only: the §5.1 / §14.2 clause 5 boxing conversion
+            // the class proxy files under a mismatch (primitive 0/1/2 vs
+            // interface 3).
+            if (relaxedPass && primitiveBoxesInto(argTy, paramTy)) return true;
+            if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
+                // fix #4046 (§5.1, v0.294): the §5.1 implicit-conversion
+                // table admits `int` → `float`/`double`/`decimal` (and every
+                // other integer-typed source → the same three floating-class
+                // targets), so an integer-typed ARGUMENT against a
+                // floating-typed PARAMETER is a legal source position; every
+                // other class mismatch (including the reverse, decimal arg
+                // against int param) is rejected.
+                if (argCls == 1 && paramCls == 2) return true;
+                return false;
+            }
+            return true;
+        };
+        auto slotTypeMatches = [&](sema::ConstructorSymbol* cs, std::size_t pi,
+                                   const ast::CallArgument& arg) -> bool {
+            return argMatchesParamType(arg.value.get(), paramTypeAt(cs, pi));
+        };
         auto ctorTypeMatches = [&](sema::ConstructorSymbol* cs) -> bool {
             if (cs->params.size() != args.size()) return false;
             // fix #4722 (b) (§22.5 "Optional parameters and named arguments"
@@ -14621,172 +14758,261 @@ private:
                     boundParam[ai] = idx;
                 }
             }
-            // fix #3760: the type-class check reads the parameter type off the
-            // LOCAL AST when present (`ast::ConstructorDecl::params[i].type`,
-            // resolved to a `sema::TypeRef` via `ctx_.resolvedType`) — and
-            // falls back to the `ParameterSymbol::declType` carried on the
-            // IMPORTED shape (the dep never ships an `ast::ConstructorDecl`,
-            // so the `cd` path is null for an imported ctor and was returning
-            // false unconditionally — which broke every imported convenience
-            // call site, e.g. `WithCounter(6)` from
-            // primary_ctor_direct_new_step2_field_init_3713). Both routes
-            // must agree on the type-class verdict so a single imported
-            // sibling is not rejected on a #3760-motivated check the local
-            // twin would have accepted.
-            auto localParamType = [&](std::size_t pi) -> const sema::TypeRef* {
-                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                    if (pi < cd->params.size() && cd->params[pi].type)
-                        return ctx_.resolvedType(*cd->params[pi].type);
-                }
-                if (pi < cs->params.size()) {
-                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
-                    // Prefer the already-resolved `resolvedDeclType` (filled
-                    // by sema for an inferred-typed lambda param) when
-                    // available; fall back to resolving `declType` (the AST
-                    // type). `ps->declType` is `const ast::Type*` here —
-                    // ParameterSymbol's own field shadows the inherited
-                    // `Symbol::declType` (a `sema::TypeRef*`).
-                    if (ps) {
-                        if (ps->resolvedDeclType) return ps->resolvedDeclType;
-                        if (ps->declType) return ctx_.resolvedType(*ps->declType);
-                    }
-                }
-                return nullptr;
-            };
+            // fix #4790: per-slot type check factored into `slotTypeMatches`
+            // above (was inlined here; #3760 / #4046's rules unchanged).
             for (std::size_t pi = 0; pi < args.size(); ++pi) {
-                if (!args[pi].value) continue;
-                auto* argTy = ctx_.exprType(*args[pi].value);
-                bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
-                    args[pi].value.get()) != nullptr;
-                int argCls = argIsNull ? 3 : typeClassOf(argTy);
-                auto* paramTy = localParamType(boundParam[pi]);  // fix #4722 (b)
-                int paramCls = typeClassOf(paramTy);
-                // fix #3760 follow-up: a `null` arg against a NULLABLE param
-                // is a valid match — a `null` literal carries no typeClass
-                // information of its own (sema leaves its exprType either null
-                // or a sentinel), so the previous `argCls=3 vs paramCls=1`
-                // rejection rejected `new B(null)` against `constructor(n:
-                // int?)` even though the parameter clearly admits null. The
-                // param's `nullable` flag is the load-bearing signal: a null
-                // arg → nullable param is fine, null arg → non-nullable param
-                // is rejected (the value-1 nullCls=3 vs the value-1 primitive
-                // mismatch above correctly rejects that). For NAMED class 3
-                // params both nullable and non-nullable are class 3 (the
-                // typeClassOf NAMED branch flattens), so this branch only
-                // narrows the rejection for primitives.
-                if (argIsNull) {
-                    if (paramTy && paramTy->nullable) {
-                        // null → nullable param: accept
-                    } else if (argCls != paramCls) {
-                        return false;
-                    }
-                    continue;
-                }
-                if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
-                    // fix #4046 (§5.1, v0.294): the §5.1 implicit-conversion
-                    // table admits `int` → `float`/`double`/`decimal` (and
-                    // every other integer-typed source → the same three
-                    // floating-class targets — `byte`/`short`/.../ `ulong`/
-                    // `char` all list `float`, `double`, `decimal` as
-                    // implicit destinations), so an integer-typed ARGUMENT
-                    // against a floating-typed PARAMETER is a legal source
-                    // position. The pre-#4046 class-only check rejected it
-                    // (argCls 1 vs paramCls 2), which made `ctorForArgs`
-                    // fall through to `buildRecordValue`'s final
-                    // "no constructor accepts them" arm and let
-                    // `lowerLocalDecl`'s pre-existing #2434 fallback
-                    // silently zero-fill the local — a record's validating
-                    // explicit ctor body never runs, a record whose fields
-                    // would have been initialized with the int literal
-                    // read as zero instead. The fix is a one-directional
-                    // widening: integer → floating is implicit and accepted;
-                    // the reverse (decimal arg against int param) is NOT in
-                    // §5.1's table (would lose information, needs an
-                    // explicit cast) and remains rejected, so the class
-                    // disambiguation #3760 introduced for `this(...)`
-                    // chain-target selection still holds for the float →
-                    // int shape.
-                    if (argCls == 1 && paramCls == 2) {
-                        // int-family arg → float-family param: §5.1 implicit.
-                    } else {
-                        return false;
-                    }
-                }
+                if (!slotTypeMatches(cs, boundParam[pi], args[pi])) return false;
             }
             return true;
         };
-        // If exactly one constructor matches by arity, use it directly —
-        // but ONLY after the type check above confirms its params agree
-        // with the call's args (the #3760 fix).
-        //
-        // fix #4779 (§22.5 "Optional parameters and named arguments" / §22.6
-        // stage 1, v0.307): an equal-arity candidate is not thereby
-        // applicable. A named argument that names none of its parameters
-        // leaves it INAPPLICABLE — §22.5 binding precedes arity-equal type
-        // matching — so resolution continues to the defaulted candidates in
-        // the fill loop below: `new C(x := 5)` against `constructor(x: int :=
-        // 1, y: int := 0)` beside `constructor(z: int)` binds the former. The
-        // pre-fix arm returned null here and the `new` silently zero-filled.
-        // `argsCanFillSymbolic` at equal arity is exactly "every argument
-        // binds a distinct slot". A candidate whose names DO bind but whose
-        // type classes disagree keeps #3760's null.
-        if (ctorArityCount(cls, args.size(), exclude) == 1) {
-            if (auto* exact = ctorByArity(cls, args.size(), exclude)) {
-                if (ctorTypeMatches(exact)) return exact;
-                if (argsCanFillSymbolic(*exact, args)) return nullptr;
+        // fix #4790 (§22.5 stage 1 + §22.6 stage 3, v0.307): is `cs`
+        // APPLICABLE to `args` when its arity may EXCEED `args.size()` (the
+        // rest defaulted)? Every argument must bind to a distinct slot (the
+        // same rule `argsCanFillSymbolic`/`argsCanFill` check), every unbound
+        // slot must have a default, and every BOUND slot's argument must
+        // type-match (`slotTypeMatches` above) — the rule sema's own
+        // `bindArgsToParams` + `resolveOverload` pipeline applies
+        // (ExprTypecheck_Calls.cpp). Before this fix the defaulted-candidate
+        // search (the trailing loop below) checked binding only, so a
+        // same-named, WRONG-typed candidate at a DIFFERENT arity could shadow
+        // an applicable defaulted sibling (silent zero-fill, #4790 repro A:
+        // `new C(x := 5)` against `constructor(x: string)` beside
+        // `constructor(x: int, y: int := 0)`) or, with three equal-arity
+        // siblings, get selected outright over the correct one (IR-verifier
+        // failure, #4790 repro D).
+        auto ctorApplicableWithDefaults =
+                [&](sema::ConstructorSymbol* cs) -> bool {
+            const std::size_t n = sema::formalParamCount(*cs);
+            std::vector<int> argForSlot(n, -1);
+            std::vector<bool> filled(n, false);
+            std::size_t pos = 0;
+            for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                std::size_t idx;
+                if (args[ai].name.empty()) {
+                    if (pos >= n) return false;
+                    idx = pos++;
+                } else {
+                    idx = n;
+                    for (std::size_t j = 0; j < n; ++j)
+                        if (sema::formalParamName(*cs, j) == args[ai].name) {
+                            idx = j;
+                            break;
+                        }
+                    if (idx >= n) return false;
+                }
+                if (filled[idx]) return false;
+                filled[idx] = true;
+                argForSlot[idx] = static_cast<int>(ai);
             }
-        }
-        // Multiple constructors with same arity: resolve by LLVM type
-        // matching. Lower each arg, check if the lowered type matches
-        // the constructor's parameter type. Use the sema type of each
-        // arg (ptr for class/string, i32 for int, etc.) to discriminate.
-        if (ctorArityCount(cls, args.size(), exclude) > 1) {
-            // Collect candidate ctors with matching arity.
-            std::vector<sema::ConstructorSymbol*> candidates;
+            for (std::size_t j = 0; j < n; ++j)
+                if (!filled[j] && !sema::formalParamHasDefault(*cs, j))
+                    return false;
+            for (std::size_t j = 0; j < n; ++j) {
+                if (argForSlot[j] < 0) continue;  // defaulted: nothing supplied
+                if (!slotTypeMatches(
+                        cs, j, args[static_cast<std::size_t>(argForSlot[j])]))
+                    return false;
+            }
+            return true;
+        };
+        // fix #4790 rework (§22.10 / §22.5, v0.307): is the §22.10 PRIMARY
+        // constructor applicable to `args` at the strict tier? Bound like
+        // `ctorApplicableWithDefaults` over the positional-field view
+        // (`recordPositionalFieldSymbols`, both sources — a local `posParam`
+        // or #2516's synthetic imported one), each bound slot type-checked
+        // against `storageComponentType` (null → unknown → admitted).
+        auto primaryStrictlyApplicable = [&]() -> bool {
+            const std::vector<const sema::Symbol*> pf =
+                sema::recordPositionalFieldSymbols(cls);
+            const std::size_t n = pf.size();
+            auto paramOf = [&](std::size_t j) -> const ast::Param* {
+                auto* fs = dynamic_cast<const sema::FieldSymbol*>(pf[j]);
+                return fs ? fs->posParam : nullptr;
+            };
+            std::vector<int> argForSlot(n, -1);
+            std::size_t pos = 0;
+            for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                std::size_t idx = n;
+                if (args[ai].name.empty()) {
+                    idx = pos++;
+                } else {
+                    for (std::size_t j = 0; j < n; ++j)
+                        if (pf[j] && pf[j]->name == args[ai].name) {
+                            idx = j;
+                            break;
+                        }
+                }
+                if (idx >= n || argForSlot[idx] >= 0) return false;
+                argForSlot[idx] = static_cast<int>(ai);
+            }
+            for (std::size_t j = 0; j < n; ++j) {
+                if (argForSlot[j] >= 0) {
+                    const std::size_t ai = static_cast<std::size_t>(argForSlot[j]);
+                    if (!argMatchesParamType(
+                            args[ai].value.get(),
+                            pf[j] ? sema::storageComponentType(pf[j], ctx_)
+                                  : nullptr))
+                        return false;
+                    continue;
+                }
+                const ast::Param* pp = paramOf(j);
+                if (!pp || (!pp->defaultValue && pp->defaultText.empty()))
+                    return false;
+            }
+            return true;
+        };
+        // fix #4790 rework: ONE search, run up to twice (strict, then
+        // relaxed — see `relaxedPass` above). Its three arms are unchanged.
+        auto searchOnce = [&]() -> sema::ConstructorSymbol* {
+            // If exactly one constructor matches by arity, use it directly —
+            // but ONLY after the type check above confirms its params agree
+            // with the call's args (the #3760 fix).
+            //
+            // fix #4779 (§22.5 "Optional parameters and named arguments" / §22.6
+            // stage 1, v0.307): an equal-arity candidate is not thereby
+            // applicable. A named argument that names none of its parameters
+            // leaves it INAPPLICABLE — §22.5 binding precedes arity-equal type
+            // matching — so resolution continues to the defaulted candidates in
+            // the fill loop below.
+            //
+            // fix #4790 (§22.5 / §22.6 stages 1 + 3, v0.307): #4779 still kept
+            // #3760's null for a candidate whose names DO bind but whose type
+            // classes disagree, returning IMMEDIATELY instead of continuing —
+            // which was wrong whenever a DEFAULTED sibling also binds these
+            // names: `new C(x := 5)` against `constructor(x: string)` beside
+            // `constructor(x: int, y: int := 0)` bound `x` to the arity-1
+            // sibling's own `x` (names agree), failed the type check (int vs
+            // string), and returned null right here — the `new` silently
+            // zero-filled the object, never reaching the applicable defaulted
+            // sibling below. A type mismatch now ALWAYS falls through, whether or
+            // not the names bind, to the search below — which applies the
+            // IDENTICAL type check (`ctorApplicableWithDefaults`) to every other
+            // candidate, so the #3760 self-chain scenario (no OTHER candidate
+            // applies either) still ends in null, exactly as before.
+            if (ctorArityCount(cls, args.size(), exclude) == 1) {
+                if (auto* exact = ctorByArity(cls, args.size(), exclude)) {
+                    if (ctorTypeMatches(exact)) return exact;
+                }
+            }
+            // Multiple constructors with same arity: resolve by LLVM type
+            // matching. Lower each arg, check if the lowered type matches
+            // the constructor's parameter type. Use the sema type of each
+            // arg (ptr for class/string, i32 for int, etc.) to discriminate.
+            if (ctorArityCount(cls, args.size(), exclude) > 1) {
+                // Collect candidate ctors with matching arity.
+                std::vector<sema::ConstructorSymbol*> candidates;
+                for (sema::Symbol* m : cls->members) {
+                    auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic || cs == exclude) continue;
+                    if (cs->params.size() == args.size()) candidates.push_back(cs);
+                }
+                // For each candidate, check if positional arg sema types are
+                // compatible with param sema types. The same `ctorTypeMatches`
+                // helper the ==1 arm uses (#3760) — sharing keeps the two paths
+                // from drifting on what "type match" means.
+                for (auto* cs : candidates) {
+                    if (ctorTypeMatches(cs)) return cs;
+                }
+                // fix #4790 (§22.5 / §22.6 stage 3, v0.307): #4779's own
+                // fallback here — "first candidate that binds by NAME" — is
+                // REMOVED. It had the identical defect the ==1 arm had above:
+                // binding without a type check. Three equal-arity siblings
+                // `(z: int)`, `(x: string)`, and (at a DIFFERENT arity)
+                // `(x: int, y: int := 0)`: `new C(x := 5)` fell through both
+                // loops above (no perfect type match at arity 1) and this
+                // fallback adopted `(x: string)` — binds `x` by name, but the
+                // caller passed an `int` — which the caller then lowered as if
+                // it were a `string` slot: `bezelc: codegen error: IR
+                // verification failed` (repro D). No fallback belongs here at
+                // all: resolution falls through to the defaulted-fill search
+                // below, which performs the SAME name-binding test this fallback
+                // did (`ctorApplicableWithDefaults`) PLUS the type check it
+                // lacked.
+            }
+            // fix #4852 (§22.6 "defaulted-arity tie-break", v0.307): the loop
+            // just below is the ONLY one of `searchOnce`'s three arms that can
+            // select a candidate which fills one or more §22.5 defaults — the
+            // ==1 and >1 arms above only ever return a candidate whose OWN
+            // arity equals `args.size()` exactly, so they fill none. When the
+            // class also has a §22.10 primary constructor whose own arity
+            // equals `args.size()` exactly (so it fills no default either) and
+            // which is strictly applicable, §22.6's tie-break prefers the
+            // primary over anything this loop could only reach by filling a
+            // default — it is trivially "better-or-equal at every
+            // supplied-argument position" since it needs none of them
+            // defaulted. Consulting `primaryStrictlyApplicable` only after
+            // `searchOnce()` returns null (as the #4790 rework originally had
+            // it, further down in `ctorForArgs`) never reaches this rule once
+            // this loop already has a defaulted hit in hand: `class C(x:
+            // int)` with `constructor(x: int, k: int := 7) this(x + 100);` —
+            // `new C(5)` reached this loop, matched the sibling via
+            // `ctorApplicableWithDefaults` (k defaulted), and returned it,
+            // printing 105 where the primary's 5 is correct (#4852). This also
+            // corrects the identical mis-selection when no OTHER sibling is
+            // present (`ctorArityCount` never even reaches 1, so only this
+            // loop ever runs) — a pre-existing instance of the same gap; see
+            // #4838 (record primary vs. body ctor).
+            if (cls->hasPositionalFields &&
+                sema::recordPositionalFieldSymbols(cls).size() ==
+                    args.size() &&
+                primaryStrictlyApplicable())
+                return nullptr;
             for (sema::Symbol* m : cls->members) {
                 auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-                if (!cs || cs->isStatic || cs == exclude) continue;
-                if (cs->params.size() == args.size()) candidates.push_back(cs);
+                if (!cs || cs->isStatic || cs == exclude) continue;  // fix #3777
+                // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
+                // <ast::ConstructorDecl*>` gate made this fallback unreachable for
+                // every IMPORTED constructor (the #2374 shape — the dep never
+                // ships the AST), so an imported constructor with a default
+                // parameter, called with fewer arguments, returned null here and
+                // the ctor-arg call was never emitted. Lift the gate: a local
+                // ctor still uses the AST-level `argsCanFill` (its `cd->params`
+                // carries the real `ast::Expr` defaults, which a `Param`-list
+                // binder can reference); an imported ctor uses the
+                // `ParameterSymbol`-level predicate `formalParamHasDefault` over
+                // `argsCanFillSymbolic`, the per-slot counterpart that reads
+                // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
+                // off the wire). Both rules admit an omitted trailing default
+                // and reject every other shape the same way the call site does.
+                //
+                // fix #4790 (§22.5 / §22.6 stage 3, v0.307): `argsCanFill`/
+                // `argsCanFillSymbolic` alone answer only §22.5 binding —
+                // whether names/positions fill every slot with the rest
+                // defaulted. Neither ever checked whether a BOUND slot's
+                // argument type-matches, so a same-named, wrong-typed candidate
+                // passed this gate exactly like one that both binds AND
+                // type-matches (#4790's repro A/D — see `ctorApplicableWithDefaults`
+                // above). ANDing it in re-derives the identical §22.5 binding (so
+                // this loop's verdict is unchanged for any candidate the bind
+                // check alone already rejected) and adds the §22.6 stage-3 check
+                // `ctorTypeMatches` already applies at exact arity.
+                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                    if (argsCanFill(cd->params, args) &&
+                        ctorApplicableWithDefaults(cs))
+                        return cs;
+                    continue;
+                }
+                if (argsCanFillSymbolic(*cs, args) &&
+                    ctorApplicableWithDefaults(cs))
+                    return cs;
             }
-            // For each candidate, check if positional arg sema types are
-            // compatible with param sema types. The same `ctorTypeMatches`
-            // helper the ==1 arm uses (#3760) — sharing keeps the two paths
-            // from drifting on what "type match" means.
-            for (auto* cs : candidates) {
-                if (ctorTypeMatches(cs)) return cs;
-            }
-            // No perfect type match — fall back to first by arity whose
-            // arguments bind by name (fix #4779, §22.5 / §22.6 stage 1,
-            // v0.307): a candidate a named argument cannot bind is
-            // inapplicable, never a fallback. When none binds, resolution
-            // continues to the defaulted candidates in the fill loop below.
-            for (auto* cs : candidates)
-                if (argsCanFillSymbolic(*cs, args)) return cs;
-        }
-        for (sema::Symbol* m : cls->members) {
-            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-            if (!cs || cs->isStatic || cs == exclude) continue;  // fix #3777
-            // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
-            // <ast::ConstructorDecl*>` gate made this fallback unreachable for
-            // every IMPORTED constructor (the #2374 shape — the dep never
-            // ships the AST), so an imported constructor with a default
-            // parameter, called with fewer arguments, returned null here and
-            // the ctor-arg call was never emitted. Lift the gate: a local
-            // ctor still uses the AST-level `argsCanFill` (its `cd->params`
-            // carries the real `ast::Expr` defaults, which a `Param`-list
-            // binder can reference); an imported ctor uses the
-            // `ParameterSymbol`-level predicate `formalParamHasDefault` over
-            // `argsCanFillSymbolic`, the per-slot counterpart that reads
-            // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
-            // off the wire). Both rules admit an omitted trailing default
-            // and reject every other shape the same way the call site does.
-            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                if (argsCanFill(cd->params, args)) return cs;
-                continue;
-            }
-            if (argsCanFillSymbolic(*cs, args)) return cs;
-        }
-        return nullptr;
+            return nullptr;
+        };
+        if (sema::ConstructorSymbol* hit = searchOnce()) return hit;
+        // fix #4790 rework (§22.10 / §22.6 stage 5, v0.307): for a class with
+        // a §22.10 primary constructor a null result MEANS "the call binds
+        // the primary" (`directPrimaryNew`, `emitChainCall`'s primary arm) —
+        // the primary has no `ConstructorSymbol` of its own. When the primary
+        // is applicable to these arguments at the STRICT tier, it outranks
+        // any explicit constructor the relaxed pass could only reach through
+        // a boxing conversion (§22.6 stage 5 exact-match preference), so the
+        // strict null stands.
+        if (cls->hasPositionalFields && primaryStrictlyApplicable())
+            return nullptr;
+        relaxedPass = true;
+        sema::ConstructorSymbol* relaxed = searchOnce();
+        relaxedPass = false;
+        return relaxed;
     }
 
     // fix #3777 (§22.5 / §22.8 step 1 / §12.8 / §22.10, v0.286): fill the

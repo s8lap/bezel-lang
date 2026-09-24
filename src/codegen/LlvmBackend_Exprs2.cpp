@@ -9428,6 +9428,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // ContractViolationException propagates.
         emitInvariantCheck(obj, rt->declaration,
                             /*disposeAndFreeOnThrow=*/true);
+    } else if (!t->hasPositionalFields && !ctx_.diagnostics().hasErrors()) {
+        // fix #4790 rework (§22.6 / §22.8, v0.307): the type declares an
+        // explicit constructor and no §22.10 primary one, sema accepted this
+        // `new`, and `ctorForArgs` still selected no constructor. Nothing
+        // above ran — no constructor body, no field initializer — so the
+        // object would leave here calloc-zero with no diagnostic at all: the
+        // silent zero-fill #4790's first fix produced for boxed-interface and
+        // `null`-into-`T` arguments. Codegen's selector must be at least as
+        // permissive as sema's; when it is not, say so, in the established
+        // `internal:` degradation convention (#2434 / #2658).
+        ctx_.diagnostics().report(
+            Severity::Warning, ne.span.begin,
+            "internal: codegen selected no constructor for this `new` that "
+            "sema accepted, so no constructor body or field initializer runs "
+            "and the object is default-initialized — #4790");
     }
     // CG-generic: record the substitution for this new object so that
     // lowerLocalDecl can associate it correctly even when the outer
