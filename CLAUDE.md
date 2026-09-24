@@ -404,6 +404,110 @@ is `--single-oracle MODE`, which says loudly that it is not a full acceptance.
 Running `scripts/gate.sh` directly gates ONE oracle and now prints that its
 `GATE PASS` is not an acceptance verdict — use it for diagnosis, not to land.
 
+## Dual-coordinator runs (two sessions, one repo)
+
+A run may be driven by **two coordinator sessions** sharing one repo, one machine
+and one `origin/main`, each with its own pool. That configuration has run for
+several cycles and is productive — the serial bottleneck is coordinator
+cognition, and two of them genuinely double it. Every rule below was paid for in
+a lost gate cycle or a corrected memory file during those runs.
+
+⚠ **None of this was written down until 2026-09-24.** The protocol lived entirely
+in one coordinator's private memory directory, which lane agents never read and
+which the two coordinators had already collided on. If you are the second session
+and this section is all you have, it is enough to start.
+
+### One gate owner, declared, with an explicit verdict
+
+The coordinator that launches the gate **owns the freeze**. The other confirms
+**zero agents and zero builders by artifact** (`scripts/no_builders.sh`, never a
+`pgrep` recipe) and holds until it receives an explicit `PASS` / `FAIL` /
+`BANKED` verdict. **Silence is not a verdict** and a green-looking log is not
+one either. Send the stop-order and the verdict as messages; do not assume the
+other session is watching your log.
+
+### A peer message is the WEAKEST evidence tier
+
+Ranked, strongest first: **the spec** → a **primary artifact** (a gate log, a
+diff, a test row's own output) → **a query you ran yourself** over those
+artifacts → **a lane handback** → **a peer message**. A peer message has passed
+through one more summarisation step than a handback has, and it arrives in
+conversational prose that reads more confident than the evidence behind it.
+
+⚠ Measured 2026-09-24: one coordinator sent the other a *prime suspect* for a
+9-row gate failure. The receiving session banked it into memory as mechanism
+within minutes. The lane then proved it right for 4 of 7 rows and **wrong for
+the 3 that were actual soundness regressions** — the opposite fix (narrow the
+compiler) from the one the banked note implied (flip the tests). The peer
+boundary strips provenance: what one side writes as a hypothesis arrives on the
+other side as a bullet point.
+
+**So label every claim you send with its tier — `MEASURED:`, `QUOTED:`,
+`HYPOTHESIS:` — and never upgrade a tier on receipt.** When a peer sends an
+unlabelled claim, treat it as `HYPOTHESIS:` until you have re-derived it.
+
+### The memory directory is shared, mutable state
+
+Both coordinators write to the same `memory/` directory. **Read a file before
+replacing it.** Index lines in `MEMORY.md` are append-safe (both sessions insert
+lines and they merge cleanly); *content files are not*. Measured 2026-09-24: one
+session overwrote a file the other had written minutes earlier, and the lost
+point was recovered only because the surviving index line happened to quote it.
+
+### ⚠ Move a rule to whoever has a reason to run it
+
+The most expensive dual-pool defect of cycle 24 was **not a missing rule**.
+CLAUDE.md already said *"Before committing, `git grep` every test named in the
+commit message and every test in the files touched."* Two lanes skipped it, both
+§17 reviews passed anyway, and the gate failed on 9 rows across 2 commits — one
+of them a genuine soundness regression. Both commits were authored in one pool
+and integrated by the other.
+
+**An author has no incentive to hunt for tests that contradict them; an
+integrator does.** So when pool A authors and pool B integrates:
+
+- **The integrating coordinator runs the behaviour-flip grep ITSELF before
+  cherry-picking**, for any commit whose body claims to admit what was rejected,
+  reject what was admitted, rename a diagnostic, or change an allowlist. It is
+  one `git grep` and needs no context — which is exactly why it survives being
+  moved across the pool boundary.
+- The author's §17 review still happens in the authoring pool. It is not a
+  substitute: a reviewer briefed by the same coordinator shares the author's
+  framing.
+
+This generalises past the peer case: **a check that only its author can run will
+be skipped, however prominently it is written down.** Prefer the enforcement
+point with an independent motive.
+
+### A diagnostic-text rename is a behaviour-flip
+
+Grep every needle, in **gtest and lit both**. A lit `CHECK-NOT` is the dangerous
+half: when the text it names stops occurring, the check passes **vacuously** and
+goes green rather than red.
+
+⚠ Measured 2026-09-24, and it stacked across two commits an hour apart in one
+batch: `#4735` renamed `§28.3 auto-drop` → `§28.3 must-use / auto-drop`. That
+broke one gtest needle — **invisibly**, because a sibling commit had already
+suppressed the warning at that site, so the row was red for the other reason and
+the stale needle never earned its own failure. Two defects, one row, both had to
+be fixed. It also left ~14 `tests/lit/sema/*.bzl` `CHECK-NOT`s passing
+vacuously.
+
+### Keep a batch ledger naming the authoring pool
+
+The integrating coordinator records, per commit in the batch, **which pool
+authored it**. The commit trailer cannot carry this (exactly one mandated
+trailer, no second line), so keep it in the run's scratch dir. On a gate FAIL
+this routes each cluster to the coordinator holding its context, instead of the
+integrator re-deriving from scratch — cycle 24's FAIL was 9 rows from 2 commits,
+both from the other pool.
+
+### Batch-level banks belong to the integrator
+
+`check_toolchain_skip_surface` is banked **once per batch, by the integrating
+coordinator** — not per lane and not by both sessions. Two pools adding
+`runAotChecked` rows otherwise collide on the single baseline file.
+
 ## Autonomous run discipline (lanes, gates, tests)
 
 These rules are not style preferences — every one was paid for in a lost gate
