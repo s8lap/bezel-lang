@@ -16963,28 +16963,84 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // when the block ends. Only a bare-identifier target can match a
         // narrowed simple variable.
         //
-        // NOTE (s12_7_0004, §12.7/§6.6, v0.307): a bare-binding COMPOUND form
-        // (`o += 1`) is supposed to read the target THROUGH this about-to-be-
-        // invalidated narrowing before boxing the result afresh — erasing up
-        // front here makes that read see the declared `Object` type instead,
-        // an over-reject. A sema-only fix (capture the pre-erasure narrowed
-        // type and feed it to the compound-assignment arithmetic block below)
-        // was tried and reverted: it made sema ACCEPT the program, but
-        // codegen's compound-assignment lowering (which independently
-        // consults `ctx_.exprType(*as->target)` — left at the declared type
-        // deliberately, unaffected by the sema-only capture) does not yet
-        // implement the box-write-back this admits, and crashed at IR
-        // verification (`Call parameter type does not match function
-        // signature! i32 1 / ptr`) instead of running — a WORSE outcome than
-        // today's clean (if mis-worded) reject. See the filed issue for the
-        // paired sema+codegen fix this needs.
+        // fix #4711 (§12.7/§6.6, v0.307): the invalidation takes effect AFTER
+        // the statement's right-hand side is read, not before it. §12.7,
+        // verbatim: the bare-binding compound form "reads through the
+        // narrowing, boxes the result afresh under §5.1, and invalidates the
+        // narrowing, exactly as the spelled-out `o := o + 1` does" — so the
+        // RHS `o` of `o := o + 1` is a narrowed read. Erasing before the RHS
+        // was visited typed that read at the declared `Object` and rejected
+        // the program ("operator `+` is not defined for type `Object`"). The
+        // TARGET is still visited with the narrowing erased, so its published
+        // type stays the declared one: the store lands in the declared slot
+        // (codegen's `lvalueAddr` would otherwise address the box payload —
+        // exactly the §12.7 box write this rule forbids) and the
+        // assignability check below reads the declared target type.
+        Symbol* narrowedTargetSym = nullptr;
+        TypeRef* narrowedTargetTy = nullptr;
         if (as->target) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
                 if (tid->name != "this" && tid->name != "base") {
-                    if (Symbol* tsym = lookupName(tid->name))
+                    if (Symbol* tsym = lookupName(tid->name)) {
+                        if (auto nit = narrowings_.find(tsym);
+                            nit != narrowings_.end() && nit->second) {
+                            narrowedTargetSym = tsym;
+                            narrowedTargetTy = nit->second;
+                        }
                         narrowings_.erase(tsym);
+                    }
                 }
+            }
+        }
+        // fix #4711 (§12.7/§6.6, v0.307): a bare-binding compound form on a
+        // narrowed binding whose DECLARED type is `Object` or an interface is
+        // rewritten to its §6.6 desugaring `o := o op e` — §12.7: "`o += 1`
+        // and `o++` are equivalent to `o := o + 1` ... and that store targets
+        // the *declared* `Object`/interface location". The rewrite is exact
+        // here, not an approximation: the target is a bare identifier (the
+        // "evaluated once" clause has nothing to evaluate), and §6.6's one
+        // compound-only rule — the narrow-integer write-back — applies only
+        // when T is an integer type or `char`, which an `Object`/interface T
+        // never is; every R implicitly converts to T (§5.1 boxing). So the
+        // spelled-out form's typing (the RHS read through the narrowing,
+        // above) and its lowering (unbox the narrowed read, compute, box the
+        // result afresh into the declared slot) ARE the compound form's, with
+        // no second copy of either. Before this, the compound typing block
+        // below read the target at its declared `Object` (over-reject), and a
+        // sema-only admission crashed codegen's compound arm, which ran the
+        // arithmetic against the `Object` slot pointer (IR verifier: "Call
+        // parameter type does not match function signature!").
+        if (narrowedTargetSym && narrowedTargetTy && as->value &&
+            (as->op == "+=" || as->op == "-=" || as->op == "*=" ||
+             as->op == "/=" || as->op == "mod=" || as->op == "&=" ||
+             as->op == "|=" || as->op == "^=" || as->op == "<<=" ||
+             as->op == ">>=")) {
+            TypeRef* d = declaredTypeOf(narrowedTargetSym);
+            const bool declObjectOrIface =
+                d && ((d->kind == TypeRef::Kind::Primitive &&
+                       d->primitive == PrimitiveType::Object) ||
+                      (d->kind == TypeRef::Kind::Named && d->declaration &&
+                       d->declaration->kind ==
+                           ast::TypeDeclKind::Interface));
+            auto* tid = static_cast<const ast::IdentifierExpr*>(
+                as->target.get());
+            if (declObjectOrIface && tid->typeArgs.empty()) {
+                // `op` is a string_view into the source buffer (`+=`); the
+                // binary operator is its prefix, which outlives the AST.
+                std::string_view binOp = as->op.substr(0, as->op.size() - 1);
+                auto* mas = const_cast<ast::AssignmentStmt*>(as);
+                auto read = std::make_unique<ast::IdentifierExpr>();
+                read->name = tid->name;
+                read->span = tid->span;
+                auto bin = std::make_unique<ast::BinaryExpr>();
+                bin->op = binOp;
+                bin->span = SourceSpan{tid->span.begin,
+                                            mas->value->span.end};
+                bin->left = std::move(read);
+                bin->right = std::move(mas->value);
+                mas->value = std::move(bin);
+                mas->op = ":=";
             }
         }
         // §23 (#1192): mark the plain-`:=` target node so resolveMemberAccess
@@ -17263,7 +17319,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // fix #4711 (§12.7, v0.307): the right-hand side reads THROUGH
+            // the target's narrowing — the invalidation above takes effect
+            // after this read (see the comment at the top of this arm). Put
+            // the entry back for the RHS visit only, then drop it again.
+            if (narrowedTargetSym && narrowedTargetTy)
+                narrowings_[narrowedTargetSym] = narrowedTargetTy;
             visitExpr(*as->value);
+            if (narrowedTargetSym) narrowings_.erase(narrowedTargetSym);
             // per §22.12 rule 5 (v0.180, #1542): a handler subscribed to a
             // `static event` — the rule names `+=`/`Add`/`Subscribe`, not
             // `-=`/`Remove` — must be capture-free: a non-capturing lambda or
