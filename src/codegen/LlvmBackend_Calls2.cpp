@@ -3578,12 +3578,46 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // unchanged (its `genericSubstSemaTy_` is empty, so
         // `resolveTypeParamRef` returns the bare-unresolved ref unchanged).
         // Replaces what was previously `ctx_.exprType(argE)`.
-        const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+        // fix #4799 (§14.1 / §9.1 / §8.3, v0.307): the ARGUMENT belongs to
+        // the CALLER, so its type and its value are resolved under the
+        // caller's substitution, not the receiver record's. `valSubst` above
+        // replaced the whole substitution with the record's own
+        // (`Pair<T>`'s T -> int). Inside `AreEqual<T>(a: T, b: T)` called
+        // with T = Pair<int>, the argument `b: T` was then read as the
+        // RECORD's T, so `at` became `int` and (a) answered a static False
+        // for two equal pairs. Measured: `record Pair<T>(A: T, B: T)` +
+        // `AreEqual(new Pair<int>(1, 2), new Pair<int>(1, 2))` printed
+        // `False`, and renaming the record parameter to `U` printed `True`.
+        // `withCallerSubst` swaps the outer substitution back in for every
+        // argument-side step: resolving `at`, lowering the argument, and the
+        // run-time route (which also boxes `recv` through `recvTy`, itself a
+        // caller-side type). A non-generic record installs nothing
+        // (`valSubst.active` is false), so this is a no-op for it. It is
+        // also a no-op in the dead generic-template pass
+        // (`emittingGenericTemplateBody_`): that body never runs and has no
+        // caller binding to restore, so it keeps its pre-#4799 lowering
+        // unchanged.
+        const bool swapToCaller =
+            valSubst.active && !emittingGenericTemplateBody_;
+        auto withCallerSubst = [&](auto&& fn) {
+            if (swapToCaller) {
+                std::swap(genericSubst_, valSubst.savedSubst);
+                std::swap(genericSubstSemaTy_, valSubst.savedSemaTy);
+            }
+            auto r = fn();
+            if (swapToCaller) {
+                std::swap(genericSubst_, valSubst.savedSubst);
+                std::swap(genericSubstSemaTy_, valSubst.savedSemaTy);
+            }
+            return r;
+        };
+        const sema::TypeRef* at = withCallerSubst(
+            [&] { return resolveTypeParamRef(ctx_.exprType(argE)); });
         // (a) The argument's static type settles the answer at False on its own.
         //     The argument is still lowered — §22.5 makes its effects part of
         //     the call whatever the answer is.
         if (equalsArgSettlesFalse(at, ts)) {
-            lowerExpr(argE);
+            withCallerSubst([&] { return lowerExpr(argE); });
             return builder_.getFalse();
         }
         // (b) This record itself, or a type parameter this instantiation has
@@ -3595,9 +3629,12 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // (c) Anything else — `Object`, an interface, a class, `Pt?` — can
         //     dynamically BE a box of this record, so only the run time can say.
         if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
-            return lowerValueSemUniversalEquals(recvTy, recv, call);
+            return withCallerSubst([&] {
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            });
         // §9.1 / §9.2: structural equality, same as the `=` operator (§8.3).
-        llvm::Value* other = lowerExpr(argE);
+        llvm::Value* other =
+            withCallerSubst([&] { return lowerExpr(argE); });
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
