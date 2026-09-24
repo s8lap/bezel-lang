@@ -9720,6 +9720,49 @@ llvm::Type* Emitter::owningDrainElemType(const sema::TypeRef* iOwnEnumTy) {
     return ptrTy();
 }
 
+// fix #4750 / #4772 (§29.1 / §31.4, v0.307): see the declaration. Mirrors the
+// iterator-method TakeCurrent (LlvmBackend_Iterators.cpp, #1349): the uniform
+// kExcObjSize exception block, the InvalidOperationException vtable, the
+// `bz_exc_addr` signal, and a null return the dispatching caller's pending-
+// exception check turns into the raise.
+void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
+                                             llvm::StructType* stTy,
+                                             unsigned pendIdx) {
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
+    auto* okBB = llvm::BasicBlock::Create(llvm_, "tc.ok", tcFn);
+    auto* ioeBB = llvm::BasicBlock::Create(llvm_, "tc.ioe", tcFn);
+    llvm::IRBuilder<> b(entryBB);
+    llvm::Value* self = &*tcFn->arg_begin();
+    llvm::Value* pendF = b.CreateStructGEP(stTy, self, pendIdx);
+    llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "odtc.pend");
+    b.CreateCondBr(
+        b.CreateICmpEQ(pend, llvm::ConstantPointerNull::get(ptrTy()),
+                       "odtc.pend.null"),
+        ioeBB, okBB);
+
+    b.SetInsertPoint(ioeBB);
+    auto* callocTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+    auto* callocC = module_->getOrInsertFunction("calloc", callocTy).getCallee();
+    llvm::Value* excObj = b.CreateCall(
+        callocTy, callocC,
+        {llvm::ConstantInt::get(i64(), 1),
+         llvm::ConstantInt::get(i64(), kExcObjSize)},
+        "odtc.excobj");
+    auto vit = builtinVtable_.find("InvalidOperationException");
+    if (vit != builtinVtable_.end()) b.CreateStore(vit->second, excObj);
+    auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+    auto* excAddrC =
+        module_->getOrInsertFunction("bz_exc_addr", excAddrTy).getCallee();
+    b.CreateStore(excObj, b.CreateCall(excAddrTy, excAddrC, {}, "odtc.exc"));
+    b.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+
+    // Transfer: null the slot BEFORE returning so a later TakeCurrent /
+    // MoveNext / Dispose sees an empty pending (§29.1 single consumption).
+    b.SetInsertPoint(okBB);
+    b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+    b.CreateRet(pend);
+}
+
 llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
     llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
@@ -9892,26 +9935,22 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     }
 
-    // --- TakeCurrent(self) -> ptr — move pending out, null slot, return. ---
+    // --- TakeCurrent(self) -> ptr — null pending raises IOE; else transfer. ---
+    // fix #4750 / #4772 (§29.1, v0.307): this used to hand back a null
+    // pending as-is ("null in, null out"), deferring to the caller's
+    // `if en.MoveNext()` guard. §29.1 makes the raise normative for every
+    // `IOwningEnumerator<T>.TakeCurrent()`: "a second take without an
+    // intervening advance, or a take before the first advance / after
+    // exhaustion, raises InvalidOperationException". The §29.2 for-in
+    // desugaring takes exactly once per successful MoveNext, so the raise
+    // arm is unreachable there; only the manual protocol observes it.
     auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
     if (!tcFn) {
         tcFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = tcFn->arg_begin();
-        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
-        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
-        // Null the slot before returning so a subsequent TakeCurrent / Dispose
-        // / MoveNext sees an empty pending. (The IOE check on a null pending
-        // is raised by the iterator-frame's TakeCurrent wrapper when the
-        // enumerator is a yield-iterator frame; for THIS manual-protocol
-        // wrapper we just hand back the pointer as-is — null in, null out —
-        // and let the caller's `if en.MoveNext() then ...` guard the take.)
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
-        b.CreateRet(pend);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same
@@ -10153,20 +10192,15 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     }
 
-    // --- TakeCurrent(self) -> ptr — move pending out, null the slot. ---
+    // --- TakeCurrent(self) -> ptr — null pending raises IOE; else transfer. ---
+    // fix #4750 / #4772 (§29.1, v0.307): the same body as the array leaf.
     auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
     if (!tcFn) {
         tcFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = tcFn->arg_begin();
-        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
-        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "olltc.pend");
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
-        b.CreateRet(pend);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH frame over the same borrowed

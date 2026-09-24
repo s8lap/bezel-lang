@@ -16147,6 +16147,61 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // drift from it — a new wrap helper is covered the day it is added, and a
     // new decline path is covered the day it is added.
     llvm::Value* preIterWrap = v;
+    // fix #4750 / #4772 (§29.1 / §29.2 / §28.3; stdlib §4.5 / §4.13, v0.307):
+    // the NAMED-LOCAL face of a builtin `coll.Drain()` view —
+    // `using var view := pool.Drain();`. The member call itself lowers to no
+    // value (only the for-in desugaring and the GetOwningEnumerator dispatch
+    // recognise the shape, by walking back to this initializer), so the slot
+    // was degraded to zero under #2434. That was survivable for the families
+    // the GetOwningEnumerator dispatch re-derives, and a null-vtable SIGSEGV
+    // for the rest (`view.GetOwningEnumerator()` over an OwningStack /
+    // OwningLinkedList view dispatches slot 4 on the slot's value).
+    //
+    // stdlib §4.13 says what belongs in the slot: "every owning collection's
+    // `Drain()` mints a fresh drain-view frame — a caller-owned enumerable
+    // over the collection, never the collection re-exposed". The source gate
+    // is therefore the OWNING-COLLECTION family (`isOwningCollectionHead` —
+    // the heads that declare `Drain()`), minus the dictionary head, whose
+    // drain yields `DrainedEntry<K, V>` through its own machinery. The frame
+    // is NOT chosen here: the collection value is handed to the §29.2
+    // coercion authority `wrapAsIEnumerableForTarget` at the view's own
+    // `IOwningEnumerable<T>` type, which picks the leaf by the source's
+    // backing — forward array (OwningArray / OwningQueue / the class-element
+    // OwningSet), LIFO array (OwningStack, stdlib §4.11) or node list
+    // (OwningLinkedList) — and each leaf mints its draining frame through
+    // `owningDrainWrapForHead`. Every one of those frames BORROWS the
+    // collection (stdlib §4.5: "disposing the drain view does not dispose the
+    // array"), so the only thing this decl claims is the frame itself, via
+    // the `v != preIterWrap` self-report below. A fresh-producer receiver
+    // (`MakePool().Drain()`) is left alone: re-lowering it would evaluate the
+    // producer twice.
+    if (!v && init) {
+        auto* dce = dynamic_cast<const ast::CallExpr*>(init);
+        auto* dma = dce ? dynamic_cast<const ast::MemberAccessExpr*>(
+                              dce->callee.get())
+                        : nullptr;
+        const sema::TypeRef* viewTy = ctx_.exprType(*init);
+        if (dma && dma->member == "Drain" && dma->target &&
+            dce->args.empty() &&
+            builtinTypeName(viewTy) == "IOwningEnumerable" &&
+            !dynamic_cast<const ast::CallExpr*>(dma->target.get()) &&
+            !dynamic_cast<const ast::NewExpr*>(dma->target.get())) {
+            std::string_view srcHead =
+                builtinTypeName(ctx_.exprType(*dma->target));
+            if (common::isOwningCollectionHead(srcHead) &&
+                !common::isDictionaryName(srcHead)) {
+                llvm::Value* coll = lowerExpr(*dma->target);
+                if (coll && coll->getType()->isPointerTy()) {
+                    bool made = false;
+                    llvm::Value* frame = wrapAsIEnumerableForTarget(
+                        coll, viewTy, dma->target.get(),
+                        /*ownLazyPipeline=*/false, &made,
+                        /*srcOwnedByCallee=*/false);
+                    if (made && frame && frame != coll) v = frame;
+                }
+            }
+        }
+    }
     if (v && declType && init) {
         const sema::TypeRef* declTR = ctx_.resolvedType(*declType);
         // fix #3419 (§29.2 / stdlib §4.12–§4.13, v0.283): the local-decl MINT
@@ -17974,7 +18029,14 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // (the ownership pass registers no auto-drop for it either). A user
     // iterator-method call (fresh frame) is not recognized and still owns.
     // // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
-    if (isCall) {
+    //
+    // fix #4750 / #4772 (stdlib §4.13, v0.307): the carve's premise — "the
+    // slot holds the receiver" — is FALSE once `lowerLocalDecl` minted the
+    // §4.13 drain-view frame into it (`wrappedHere`, the coercion's own
+    // report). The slot then holds a fresh frame that BORROWS the receiver,
+    // so this decl owns the frame and nothing else; skipping the claim leaks
+    // it (MEASURED 24 B per `using var view := pool.Drain();`).
+    if (isCall && !wrappedHere) {
         if (auto* dce =
                 dynamic_cast<const ast::CallExpr*>(init))
             if (common::isOwningCollectionDrainAliasCall(*dce, ctx_))
@@ -18977,7 +19039,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     // pass does not annotate can never register the slot-1
                     // iterator dispose against a bz_array (type confusion →
                     // SEGV). // per §28.10, stdlib §4.5, #2146
-                    if (common::isOwningCollectionDrainAliasCall(*ce, ctx_))
+                    // fix #4750 / #4772 (stdlib §4.13, v0.307): not when the
+                    // slot holds the minted drain-view frame (`wrappedHere`)
+                    // — see the plain-`var` twin in
+                    // registerIterableSourceDisposal.
+                    if (!wrappedHere &&
+                        common::isOwningCollectionDrainAliasCall(*ce, ctx_))
                         ownsSource = false;
                 }
             }
