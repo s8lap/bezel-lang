@@ -739,6 +739,18 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     // the stored mantissa loses; it must be absorbed by scale (a '.' fraction
     // or a negative exponent) or the value is out of range — settled below.
     uint32_t dropped_int = 0;
+    // §4.3 (v0.307) / #4876: when the mantissa is at the 96-bit limit and a
+    // fractional digit cannot be stored, the pre-fix code silently dropped it.
+    // §4.3 ("A floating-point literal denotes the nearest representable value
+    // of its type") and §5.2 ("decimal(x) for binary-float x yields the nearest
+    // representable decimal value") support rounding over truncation; the
+    // runtime's dec_store overflow-reduction path rounds half-up
+    // (`rem >= 5 → m += 1`), so a folded literal must agree.  Track the FIRST
+    // dropped fractional digit only: subsequent dropped digits cannot change
+    // the rounding direction (the first one decides).  After the loop, if that
+    // digit is >= 5, increment m by 1; dec_store handles overflow.
+    bool saw_dropped_frac = false;
+    uint32_t dropped_frac_digit = 0;
     for (; i < src.len; ++i) {
         uint32_t c = dec_src_at(src, i);
         if (c == '.') {
@@ -815,10 +827,20 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             // §4.4 / §9.3 (fix #1829): the 96-bit mantissa is full and this
             // digit is in the integer part, so it cannot be stored.  Count it:
             // it is a factor of 10 in the magnitude that must be paid for by
-            // scale or reported as out of range.  (Fractional digits beyond
-            // the 29th significant are dropped: they change neither the
-            // magnitude nor the scale, only the precision.)
+            // scale or reported as out of range.
             ++dropped_int;
+        } else {
+            // #4876 / §4.3 (v0.307): the 96-bit mantissa is full and this
+            // digit is in the fractional part.  Track the FIRST such dropped
+            // digit's value so the post-loop half-up rounding (matching
+            // dec_store's `rem >= 5 → m += 1`) can round the stored mantissa
+            // to the nearest representable value at scale 0.  Subsequent
+            // dropped fractional digits cannot change the rounding direction:
+            // once the first dropped digit decides, only its value matters.
+            if (!saw_dropped_frac) {
+                saw_dropped_frac = true;
+                dropped_frac_digit = (uint32_t)(c - '0');
+            }
         }
     }
     if (!any_digit) {
@@ -844,6 +866,14 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             return;
         }
         sc -= dropped_int;
+    }
+    // §4.3 (v0.307) / #4876: if a fractional digit was dropped because the
+    // mantissa was at the 96-bit limit, round the stored mantissa half-up to
+    // match dec_store's `rem >= 5 → m += 1` rule (§6.4).  dec_store handles
+    // overflow — a literal like `MaxValue.5m` correctly raises OverflowException
+    // because m would exceed kMax96 with sc=0 after the +1.
+    if (saw_dropped_frac && dropped_frac_digit >= 5) {
+        m += 1;
     }
     dec_store(out, m, sc, neg, ove_vtable);
 }
