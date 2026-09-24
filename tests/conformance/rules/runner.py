@@ -224,9 +224,9 @@ def main(argv, base_dir=None, run=conformance.caged_run):
     ap.add_argument("--update", action="store_true",
                     help="bank the observed verdicts into the baseline")
     ap.add_argument("--classify", action="store_true",
-                    help="ignore the baseline and rewrite it from this run; "
-                         "incompatible with --filter (refused with exit 2 to "
-                         "protect the baseline from truncation — #4814)")
+                    help="bank observed verdicts into the baseline (starts from "
+                         "existing baseline; --filter X narrows the run, only "
+                         "matching rows are updated — #4814)")
     ap.add_argument("--strict-new", action="store_true",
                     help="fail on any case with no baseline row")
     ap.add_argument("--filter", default="",
@@ -234,23 +234,6 @@ def main(argv, base_dir=None, run=conformance.caged_run):
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--report", default="")
     args = ap.parse_args(argv)
-
-    # #4814: --classify --filter X truncates baseline.tsv to the filter's
-    # subset. --classify starts from `baseline = {}` (so it ignores the
-    # existing file), and --filter X narrows the iteration to the matching
-    # rows; only those rows are banked back, so every other row in the file
-    # is destroyed. Two lanes in the same cycle hit this and had to restore
-    # from `git checkout --`. Refuse the combination at the parser so it
-    # cannot reach the writer. The safe alternative is `--update --filter X`
-    # (--update starts from the existing baseline, so non-matching rows
-    # survive), or `--classify` alone on the full corpus.
-    if args.classify and args.filter:
-        print("ERROR: refused: --classify --filter {!r} combination writes "
-              "only the matching subset back to {}; use --update --filter "
-              "{!r} to bank a subset, or run --classify alone on the full "
-              "corpus. (see issue #4814)".format(
-                  args.filter, args.baseline, args.filter), file=sys.stderr)
-        return 2
 
     if not os.access(args.bezelc, os.X_OK):
         print("ERROR: bezelc not executable: " + args.bezelc, file=sys.stderr)
@@ -268,7 +251,7 @@ def main(argv, base_dir=None, run=conformance.caged_run):
         print("ERROR: no cases selected", file=sys.stderr)
         return 2
 
-    baseline = {} if args.classify else read_baseline(args.baseline)
+    baseline = read_baseline(args.baseline)
     cases_dir = os.path.join(base, "cases")
     tmpdir = tempfile.mkdtemp(prefix="rulecorpus-")
     results = {}
