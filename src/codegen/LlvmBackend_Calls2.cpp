@@ -344,6 +344,7 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
                 } else if (rt->astNode && rt->astNode->name &&
                            !rt->astNode->name->parts.empty()) {
                     std::string_view n = rt->headName();
+                    // GRID-DEBT: #4912 fresh-storage head list, not a wrap claim; should read a BuiltinRegistry classifier
                     if (n == "Array" || n == "OwningArray" ||
                         n == "OwningBuffer" || n == "Stack" || n == "OwningStack" ||
                         n == "Queue" || n == "OwningQueue" ||

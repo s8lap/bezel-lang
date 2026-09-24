@@ -2973,6 +2973,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                             cv = bl2->value;
                     }
                 } else if (auto* cd =
+                               // SEAM-DEBT: #4911 imported const falls through to the ConstMemberSymbol arm
                                dynamic_cast<const ast::ConstDecl*>(s->decl)) {
                     if (cd->value) {
                         if (auto* bl2 = dynamic_cast<

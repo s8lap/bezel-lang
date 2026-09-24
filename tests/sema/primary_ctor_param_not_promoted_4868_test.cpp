@@ -177,9 +177,12 @@ BEZEL_TEST(primary_ctor_param_not_promoted_4868,
         "end Counter; "
         "class Program public static method Main() "
         "  using var c := new Counter(5); "
-        "  if c.Value() <> 5 then Console.WriteLine(\"wrong value\"); end if; "
+        "  Console.WriteLine(c.Value()); "
         "end Main; end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_FALSE(hasNoMemberDiagnostic(r));
+    // Value oracle, not a diagnostic scan: a program that ran has an empty
+    // r.diagnostics by construction, so an EXPECT_FALSE over it cannot fail
+    // (check_vacuous_tests, #3138).
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));
 }
