@@ -618,9 +618,19 @@ private:
     // §12.7 narrowing the IdentifierExpr visit deliberately did NOT apply
     // (they name the DECLARED location). Read only by the two §22.3
     // exact-referent diagnostics, which append a copy-out hint when the
-    // mismatching operand is in this set: the user almost certainly meant
+    // mismatching operand is in this map: the user almost certainly meant
     // the narrowed type, and the sound way to pass it is a fresh local.
-    std::unordered_set<const ast::Expr*> refOutSuppressedNarrowing_;
+    //
+    // narrow #4806 (§12.7 / §22.3, v0.307): maps to the NARROWED TypeRef
+    // captured at the moment the narrowing was suppressed (rather than a bare
+    // presence set), because the call-argument visit that runs right after
+    // this one unconditionally erases `narrowings_[sym]` for every ref/out
+    // operand (§7.4 invalidation, ExprTypecheck_Exprs.cpp ~9192) — by the
+    // time checkArgsAgainstParams builds the diagnostic, `narrowings_` no
+    // longer has the entry. Capturing the type here, before that erasure, is
+    // what lets the hint verify the copy-out it suggests actually type-checks
+    // (narrow #4806's Note A).
+    std::unordered_map<const ast::Expr*, TypeRef*> refOutSuppressedNarrowing_;
 
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a

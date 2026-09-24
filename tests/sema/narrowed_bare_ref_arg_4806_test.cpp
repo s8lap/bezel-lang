@@ -57,6 +57,17 @@ bool hasError(const bezel::test::JitResult& r, const std::string& a,
     }
     return false;
 }
+
+// narrow #4806: true iff NO error diagnostic contains `needle` — used to pin
+// the copy-out hint's ABSENCE (Note A) across the whole diagnostic set,
+// rather than just within one already-matched message.
+bool noErrorContains(const bezel::test::JitResult& r, const std::string& needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find(needle) != std::string::npos) return false;
+    }
+    return true;
+}
 }  // namespace
 
 // The issue's repro: `var z := G(ref o)` inside `if o is int`. G stores a
@@ -327,4 +338,79 @@ end Program;
 )BZ");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(hasError(r, "cannot ref `o`", "is §12.7-narrowed to a value type"));
+}
+
+// narrow #4806 Note A (§22.3, v0.307): the reviewer MEASURED the hint firing
+// even when its own suggested copy-out is ill-typed. `a: Animal` narrowed to
+// `Dog`, passed as `ref x: Cat` — `Cat` is unrelated to `Dog`, so
+// `var aCopy: Cat := a;` would itself be rejected. The plain §22.3
+// referent-type diagnostic must still fire, but the copy-out hint must NOT be
+// appended: it would advise code that does not compile.
+BEZEL_TEST(narrowed_bare_ref_arg_4806, narrowed_type_mismatched_with_referent_type_omits_copy_out_hint_spec_22_3) {
+    auto r = runAot(R"BZ(
+module Conf;
+public class Animal
+  public constructor() end constructor;
+end Animal;
+public class Dog: Animal
+  public constructor() end constructor;
+end Dog;
+public class Cat: Animal
+  public constructor() end constructor;
+end Cat;
+public class Program
+  public static method G(ref x: Cat): int
+    return 0;
+  end G;
+  public static method Main()
+    var d := new Dog();
+    var a: Animal := d;
+    if a is Dog then
+      var z := G(ref a);
+    end;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasError(r, "the `ref` argument for parameter `x` to call to `G`",
+                               "does not match the parameter's referent type"));
+    BEZEL_EXPECT_TRUE(noErrorContains(r, "copy it out"));
+}
+
+// narrow #4806 Note B (§12.7 / §22.3, v0.307): the nullable shape. `a: Animal?`
+// narrowed to `Dog` (narrowing is always non-nullable, §12.7), passed as
+// `ref x: Dog?`. The copy-out IS sound here — a non-null `Dog` widens to a
+// `Dog?` local (§5.1) — so the hint must still fire, spelled at the
+// parameter's own nullable type. This is also the row that exercises the
+// `tyText` fix: the removed `tyText.find('?') == 0` guard never matched a
+// trailing-`?` spelling like `Dog?`, so the placeholder fallback never fired
+// for a nullable parameter type either before or after that removal — this
+// row pins that the nullable spelling survives verbatim.
+BEZEL_TEST(narrowed_bare_ref_arg_4806, narrowed_type_nullable_widening_to_referent_type_keeps_copy_out_hint_spec_12_7_22_3) {
+    auto r = runAot(R"BZ(
+module Conf;
+public class Animal
+  public constructor() end constructor;
+end Animal;
+public class Dog: Animal
+  public constructor() end constructor;
+end Dog;
+public class Program
+  public static method G(ref x: Dog?): int
+    return 0;
+  end G;
+  public static method Main()
+    var d := new Dog();
+    var a: Animal? := d;
+    if a is Dog then
+      var z := G(ref a);
+    end;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasError(r, "the `ref` argument for parameter `x` to call to `G`",
+                               "does not match the parameter's referent type"));
+    BEZEL_EXPECT_TRUE(hasError(r, "`a` is §12.7-narrowed here",
+                               "(`var aCopy: Dog? := a;` then `ref aCopy`)"));
 }

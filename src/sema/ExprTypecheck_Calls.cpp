@@ -1711,19 +1711,60 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
 // The sound way to pass the narrowed value is to copy it out into a fresh
 // local of the parameter's type. The hint says so; where the parameter type
 // has a simple printable spelling, it spells the declaration.
+//
+// narrow #4806 (§12.7 / §22.3, v0.307): the reviewer MEASURED the hint firing
+// even when the suggested copy-out is ITSELF ill-typed — `a: Animal` narrowed
+// to `Dog`, passed as `ref x: Cat`, advised `var aCopy: Cat := a;`, which does
+// not type-check (Dog is not assignable to Cat). The remedy is only sound
+// when the narrowed value the copy-out reads (always non-nullable — §12.7:
+// "a successful `is T` means the value is a non-null T", narrowFromTypeTest
+// above) is the SAME declared type as the parameter's referent, once the
+// parameter's own nullability is set aside: widening a non-null `Dog` into a
+// nullable `Dog?` local is always sound (§5.1), so a `ref x: Dog?` parameter
+// still earns the hint, spelled at the parameter's own (nullable) type.
 std::string ExprTC::refOutNarrowedCopyOutHint(const ast::Expr& operand,
                                               const TypeRef* paramTy,
                                               std::string_view mod) const {
-    if (!refOutSuppressedNarrowing_.count(&operand)) return {};
+    // The narrowed type this operand carried before §12.7's ref/out
+    // suppression stepped in — captured at that moment (see the call site in
+    // ExprTypecheck_Exprs.cpp that populates refOutSuppressedNarrowing_)
+    // because the call-argument visit erases narrowings_[sym] for this same
+    // operand right afterward (§7.4 invalidation), so `narrowings_` no
+    // longer has it by the time this runs.
+    const auto rn = refOutSuppressedNarrowing_.find(&operand);
+    if (rn == refOutSuppressedNarrowing_.end()) return {};
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
     if (!id) return {};
+    TypeRef* narrowedTy = rn->second;
+    if (!narrowedTy || !paramTy) return {};
+    // Compare ignoring nullability: narrowedTy is always non-nullable (the
+    // narrowing invariant above), so the only mismatch this can paper over is
+    // a nullable parameter referent, which is the sound direction (§5.1
+    // nullable widening). A parameter referent of a genuinely different
+    // declaration (Dog vs Cat) still fails this check regardless.
+    const TypeRef* narrowedForCompare = narrowedTy;
+    if (narrowedTy->nullable != paramTy->nullable) {
+        TypeRef* widened = ctx_.makeTypeRef(*narrowedTy);
+        widened->nullable = paramTy->nullable;
+        narrowedForCompare = widened;
+    }
+    if (!typeRefEqual(narrowedForCompare, paramTy)) return {};
     const std::string nm(id->name);
     std::string tyText;
-    if (paramTy && paramTy->genericArgs.empty() &&
+    if (paramTy->genericArgs.empty() &&
         (paramTy->kind == TypeRef::Kind::Primitive ||
          paramTy->kind == TypeRef::Kind::Named))
         tyText = spellTypeRefForDiag(paramTy);
-    if (tyText.empty() || tyText.find('?') == 0) tyText = "<parameter type>";
+    // narrow #4806 (§12.7, v0.307): this used to also fall back to the
+    // placeholder when `tyText.find('?') == 0` — meant to catch an
+    // unspellable/malformed text, but `spellTypeRefForDiag` appends `?` at
+    // the END for a nullable type (`Dog?`), never at the front, so the check
+    // never fired and was dead. Removed rather than "fixed" to test the
+    // trailing character: a nullable parameter type IS a valid local
+    // declaration spelling (`var aCopy: Dog? := a;`), so there is nothing to
+    // guard against there — only the empty (unspellable) case needs the
+    // placeholder.
+    if (tyText.empty()) tyText = "<parameter type>";
     const std::string tmp = nm + "Copy";
     return "; `" + nm + "` is §12.7-narrowed here, but a bare `" +
            std::string(mod) + "` argument aliases its DECLARED location "

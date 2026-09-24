@@ -2146,7 +2146,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (&e != refOutArgTargetNode_)
                     ctx_.setExprType(&e, nt->second);
                 else
-                    refOutSuppressedNarrowing_.insert(&e);
+                    // narrow #4806: capture the narrowed type NOW — the
+                    // call-argument visit erases narrowings_[sym] for this
+                    // ref/out operand right after this visit returns (§7.4
+                    // invalidation), so a plain presence marker would lose it.
+                    refOutSuppressedNarrowing_[&e] = nt->second;
             }
         } else if (primitiveFromName(id->name) != PrimitiveType::None) {
             // §5.2: a primitive type name used in expression position is
