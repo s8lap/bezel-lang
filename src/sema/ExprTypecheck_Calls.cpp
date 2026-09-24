@@ -19099,6 +19099,52 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // narrow #4766 (§5.1, v0.307): `int`-typed extent/count properties
+        // of built-in heap types that no path above types. Left untyped, the
+        // read reaches `checkAssignable` with a null source and §5.1 is
+        // skipped outright, so `var b: bool := a.Length;` compiled clean.
+        //   - `Length` on Array/Stack/Queue (and Owning twins): the
+        //     undocumented structural alias for `Count` that codegen lowers
+        //     through the same runtime length call (see the #2459 exemption
+        //     `isLengthAlias` below); typed exactly as `Count` above. ⚠ stdlib
+        //     §4.4 (and its Count-vs-Length note) gives these types `Count`
+        //     ONLY; whether the alias should exist at all is tracked by #4811.
+        //     It is typed here only so §5.1 is not skipped while it does.
+        //   - `Length` on StringBuilder (stdlib §3.1), OwningBuffer<T>
+        //     (stdlib §4.14) and FrozenArray<T> (stdlib §4.19; the
+        //     annotation shape only — the `From(...)` result carries a
+        //     builtinClassSym declaration and takes the declared-type
+        //     lookup path instead); `Count` on SortedDictionary<K, V> (stdlib
+        //     §4.17), SortedSet<T> (§4.18) and Channel<T> (§6.9) — each declared
+        //     `readonly property … : int`.
+        // Bare reads and 0-arity calls only, mirroring the `Count` arm; a
+        // call with arguments keeps its existing handling.
+        if (ma.target && currentCallArity_ <= 0 &&
+            (ma.member == "Length" || ma.member == "Count")) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltin =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty();
+                std::string_view cn = isBuiltin
+                    ? std::string_view(tt->headName())
+                    : std::string_view();
+                bool intLength =
+                    cn == "Array" || cn == "OwningArray" ||
+                    cn == "Stack" || cn == "OwningStack" ||
+                    cn == "Queue" || cn == "OwningQueue" ||
+                    cn == "StringBuilder" || cn == "FrozenArray" ||
+                    cn == "OwningBuffer";
+                bool intCount =
+                    cn == "SortedDictionary" || cn == "SortedSet" ||
+                    cn == "Channel";
+                if (ma.member == "Length" ? intLength : intCount) {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
         // fix #4746 (stdlib §4.1/§4.2, v0.307): `IsReadOnly` is a declared
         // `readonly property … : bool` on `ICollection<T>` (§4.1) and on
         // `IOwningCollection<T>` (§4.2), and §4.1's prose fixes its value
