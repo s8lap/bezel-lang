@@ -2613,9 +2613,26 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             const bool zeroDivisor = c.lo32 == 0 && c.mid32 == 0 && c.hi32 == 0;
             // §6.4: division / `mod` by zero raises DivideByZeroException
             // (codegen guards it inline; the runtime op aborts on it) and
-            // overflow raises OverflowException — a faulting subexpression
-            // has no value, so the fold declines.
-            if ((b->op == "/" || isMod) && zeroDivisor) return std::nullopt;
+            // overflow raises OverflowException. fix #4844 / §17.14 (v0.307):
+            // "An evaluation fault — integer or `decimal` overflow, division
+            // or `mod` by zero, … — is a compile error at the constant
+            // expression, never a deferred runtime fault." Report the §17.14
+            // error HERE — the constant expression's own node, not the
+            // conversion site, since §17.14 keys on the constant expression
+            // (a class-level `const D: decimal := 1m / 0m;` would carry the
+            // same error). The conversion site's §5.2 fall-through handles a
+            // non-constant operand unchanged.
+            if ((b->op == "/" || isMod) && zeroDivisor) {
+                const std::string op = isMod ? "mod" : "/";
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "the decimal constant expression `" + op +
+                    "` would raise `DivideByZeroException` — §17.14 "
+                    "rejects an evaluation fault at the constant "
+                    "expression, never as a deferred runtime fault "
+                    "(fix #4844, §17.14, v0.307)");
+                return std::nullopt;
+            }
             // narrow #4855: the compiler must never call a runtime op that
             // can abort(). Of the ops this fold calls, only bz_decimal_div
             // and bz_decimal_mod abort, and only on a zero divisor. div
@@ -2625,9 +2642,10 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             // within 96 bits, dec_align instead rounds the DIVISOR's
             // mantissa down a digit at a time — which can reach 0 and abort
             // (`decimal.MaxValue mod 0.4m`). dec_align shrinks the divisor
-            // exactly when ma * 10^(sb - sa) exceeds 2^96 - 1, so decline
-            // the fold on that condition (the runtime value is then
-            // rounding-dependent anyway; the conversion stays a runtime op).
+            // exactly when ma * 10^(sb - sa) exceeds 2^96 - 1. This is the
+            // same §17.14 fault class as a literal division by zero — the
+            // mod cannot be evaluated without an overflow abort — so report
+            // the §17.14 error and decline (fix #4844).
             if (isMod) {
                 const std::uint32_t sa = (a.flags >> 16) & 0xFF;
                 const std::uint32_t sb = (c.flags >> 16) & 0xFF;
@@ -2637,7 +2655,17 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                     __uint128_t ma = ((__uint128_t)a.hi32 << 64) |
                                      ((__uint128_t)a.mid32 << 32) | a.lo32;
                     for (std::uint32_t k = sa; k < sb; ++k) {
-                        if (ma > kMax96 / 10) return std::nullopt;
+                        if (ma > kMax96 / 10) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "the decimal constant expression `mod` would "
+                                "overflow the 96-bit decimal mantissa during "
+                                "scale alignment — §17.14 rejects an "
+                                "evaluation fault at the constant expression, "
+                                "never as a deferred runtime fault "
+                                "(fix #4844, §17.14, v0.307)");
+                            return std::nullopt;
+                        }
                         ma *= 10;
                     }
                 }
@@ -2649,7 +2677,23 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                 else if (b->op == "/") bz_decimal_div(&a, &c, &out, vt);
                 else                   bz_decimal_mod(&a, &c, &out, vt);
             });
-            if (faulted) return std::nullopt;
+            // §17.14 (v0.307, fix #4844): a `decimal` overflow is a compile
+            // error at the constant expression, never a deferred runtime
+            // fault. The runtime op set bz_exc — we report NO value (per
+            // #4864, the runtime value in the negative-scale branch is not
+            // trustworthy), and emit the §17.14 error at the constant
+            // expression itself.
+            if (faulted) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "the decimal constant expression `" +
+                    std::string(b->op) +
+                    "` would raise `OverflowException` (the result is outside "
+                    "`decimal`'s 96-bit range) — §17.14 rejects an "
+                    "evaluation fault at the constant expression, never as a "
+                    "deferred runtime fault (fix #4844, §17.14, v0.307)");
+                return std::nullopt;
+            }
             r = makeDec(out);
         } else {
             if (isMod) return std::nullopt;  // §6.1: no `mod` on float/double

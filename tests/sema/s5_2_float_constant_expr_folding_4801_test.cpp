@@ -346,14 +346,24 @@ BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
 }
 
 // =====================================================================
-// narrow #4855: the fold must never call a runtime decimal op that can
-// abort(). bz_decimal_mod aligns scales first; with a divisor that carries
-// more scale than a dividend too large to upscale, the alignment rounds the
-// DIVISOR down to 0 and the runtime aborts — so `decimal.MaxValue mod 0.4m`
-// used to SIGABRT bezelc itself. The conversion sits in a method Main never
-// calls: the row pins that COMPILATION survives (the run-time abort of the
-// same op is #4855's runtime half, out of scope here), and a compiler crash
-// is fork-isolated by runAot as ran == false.
+// fix #4844 / §17.14 (v0.307): a `decimal` evaluation fault at a constant
+// expression — overflow, division or `mod` by zero, or a `mod` whose scale
+// alignment overflows the 96-bit mantissa — is a compile error AT THE
+// CONSTANT EXPRESSION, not a deferred runtime fault. The three rows below
+// flip the two #4855 rows that previously pinned the silent-accept
+// behaviour: with the §17.14 rule applied at the fold, the constant
+// expression itself carries the rejection.
+//
+// Pre-#4844 (the #4855 commitment, when these folded silently to nullopt
+// and the conversion stayed a runtime op): the rows asserted
+// `r.diagnostics.hasErrors() == false`. Post-#4844 they assert the §17.14
+// diagnostic substring unique to each case.
+//
+// BUG-PIN mechanism: the diagnostic substring is unique to the §17.14
+// arm — it cites "§17.14" and "evaluation fault at the constant
+// expression" — and a wrong fix (one that only added a warning, or moved
+// the diagnostic to the conversion site without the §17.14 wording) would
+// fail the needle.
 // =====================================================================
 
 namespace {
@@ -364,21 +374,85 @@ bezel::test::JitResult compileUncalled(const std::string& expr) {
         "public static method Main(): int "
         "Console.WriteLine(\"compiled\"); return 0; end Main; end C;");
 }
+
+// True iff ONE error diagnostic carries the §17.14 constant-expression-
+// fault marker. Pin: the substring names §17.14, the source class
+// (evaluation fault), and the constant-expression location, so the row
+// discriminates from the conversion-site §5.2 reject (which cites §5.2 and
+// "conversion site").
+bool hasSec1714FaultDiag(const bezel::test::JitResult& r,
+                         std::string_view needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const bool sec17_14 = d.message.find("§17.14") != std::string::npos;
+        const bool exprLoc =
+            d.message.find("constant expression") != std::string::npos;
+        const bool fault = d.message.find("evaluation fault") !=
+                           std::string::npos;
+        const bool specific = needle.empty() ||
+                              d.message.find(needle) != std::string::npos;
+        if (sec17_14 && exprLoc && fault && specific) return true;
+    }
+    return false;
+}
 }  // namespace
 
+// The two repros from #4844 — `decimal.MaxValue + 1m` overflows and
+// `1m / 0m` divides by zero. Both previously compiled and faulted at
+// runtime; post-#4844 each carries a §17.14 compile error at the
+// constant expression.
 BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
-           decimal_mod_alignment_zeroing_divisor_does_not_abort_compiler_4855) {
-    auto r = compileUncalled("int(decimal.MaxValue mod 0.4m)");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+           decimal_max_value_plus_one_overflow_rejected_4844) {
+    auto r = compileUncalled("long(decimal.MaxValue + 1m)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSec1714FaultDiag(r, "OverflowException"));
+    BEZEL_EXPECT_FALSE(r.ran);  // no exec; compile error
 }
 
-// The other two abort() paths among the ops the fold calls: bz_decimal_div
-// and bz_decimal_mod on a literal zero divisor (declined before the call).
 BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
-           decimal_div_and_mod_by_zero_do_not_abort_compiler_4855) {
-    auto r = compileUncalled("int(1m / 0m) + int(5m mod 0m) + int(5m mod 0.0m)");
+           one_m_over_zero_rejected_4844) {
+    auto r = compileUncalled("int(1m / 0m)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSec1714FaultDiag(r, "DivideByZeroException"));
+    BEZEL_EXPECT_FALSE(r.ran);  // no exec; compile error
+}
+
+// narrow #4855 follow-up: `mod` with a zero divisor (the other abort()
+// path the #4855 fix declined). Post-#4844 it carries the §17.14
+// divide-by-zero diagnostic.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           decimal_mod_zero_divisor_rejected_4844) {
+    auto r = compileUncalled("int(5m mod 0m)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSec1714FaultDiag(r, "DivideByZeroException"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// narrow #4855 follow-up: `mod` with scale alignment that would round the
+// divisor down to 0 (`decimal.MaxValue mod 0.4m`). The runtime op
+// SIGABRT'd bezelc itself before #4855; #4855 declined the fold; #4844
+// reports the §17.14 overflow error at the constant expression.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           decimal_mod_alignment_overflow_rejected_4844) {
+    auto r = compileUncalled("int(decimal.MaxValue mod 0.4m)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSec1714FaultDiag(r, "96-bit decimal mantissa"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// ACCEPT control: in-range decimal arithmetic still compiles and folds.
+// Pins that the §17.14 arm is targeted, not blanket-rejecting decimal
+// arithmetic. The operand chain must not fault at any intermediate step:
+// `decimal.MaxValue + 1m` already overflows, so the fold's left-to-right
+// evaluation would reject the whole expression. Use a chain whose every
+// step is in-range: `decimal.MaxValue - decimal.MaxValue + 1m` evaluates
+// as `(decimal.MaxValue - decimal.MaxValue) + 1m = 1m`, which fits.
+// The expression sits inside `var l: long :=` so the call body's
+// `int`-typed return is unaffected.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           decimal_max_value_minus_max_plus_one_compiles_4844) {
+    auto r = compileUncalled(
+        "var l: long := long(decimal.MaxValue - decimal.MaxValue + 1m); "
+        "return 0;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
