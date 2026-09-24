@@ -490,7 +490,7 @@ batch: `#4735` renamed `§28.3 auto-drop` → `§28.3 must-use / auto-drop`. Tha
 broke one gtest needle — **invisibly**, because a sibling commit had already
 suppressed the warning at that site, so the row was red for the other reason and
 the stale needle never earned its own failure. Two defects, one row, both had to
-be fixed. It also left ~14 `tests/lit/sema/*.bzl` `CHECK-NOT`s passing
+be fixed. It also left 10 `tests/lit/sema/*.bzl` `CHECK-NOT`s passing
 vacuously.
 
 ### Keep a batch ledger naming the authoring pool
