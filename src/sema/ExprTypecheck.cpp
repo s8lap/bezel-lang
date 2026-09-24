@@ -5168,8 +5168,8 @@ void ExprTC::checkAssignable(
     // `DateTime`, `ReadOnlyStringSpan`, … — `kNonHeapReservedBuiltins`) are
     // deliberately OUT: they are not class references, so #1178's rule as
     // stated does not reach them, and their own conversion questions (§5.2
-    // explicit forms) are a separate measurement. Probe-confirmed still
-    // accepted after this fix, and filed rather than swept in here.
+    // explicit forms) are a separate measurement — filed as #4767 and closed
+    // by the next arm, with its own premise and wording.
     {
         std::string_view fromHead = from->headName();
         bool fromIsTypeVar =
@@ -5189,6 +5189,60 @@ void ExprTC::checkAssignable(
                 "§5.1 has no implicit conversion between them, and §4.6 "
                 "forbids an implicit conversion to `string`; read a member of "
                 "the value instead (e.g. its `Count`/`Length`), or index it");
+            return;
+        }
+    }
+    // fix #4767 (§5.1 / §5.2, v0.307): the VALUE-shaped reserved builtins —
+    // `common::kNonHeapReservedBuiltins`: the §2.5 temporal/identity values
+    // (`DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`, `Guid`), `Range<T>`
+    // (§9.8), the span records (stdlib §3.3 / §4.14 / §4.15), `JsonOptions`,
+    // `ExceptionInfo`, and the stdlib §10 FFI carriers (`IntPtr`/`UIntPtr`,
+    // `CString`/`WString`/`RawBytes`) — into a CONCRETE primitive. None has a
+    // §5.1 row: §5.1's table is primitive-to-primitive, and its reference
+    // conversions end at `Object` (boxing, excluded here — handled far above)
+    // or an implemented interface. The one numeric bridge any of them has is
+    // `IntPtr`/`UIntPtr` <-> `long`/`ulong`, and stdlib §10.0 states it is an
+    // EXPLICIT conversion (`long(ptr)`, §5.2) — not an implicit one.
+    //
+    // #4760's gate (below) is keyed on "the source is a heap reference",
+    // which is false for these, so they reached the catch-all and were
+    // SILENTLY ACCEPTED, reading an uninitialized slot (measured at e443f8dc:
+    // `var x: int := sp;` for an `ArraySpan<int>` printed 670081824, then
+    // 171139872, then 542810912).
+    //
+    // Scope: the declaration-less annotation shape (`var d: DateTime := …`,
+    // `a.AsSpan()`), head read through `headName()` so a transparent alias
+    // resolves. The `builtinClassSym(...)` shape member typing stamps (e.g.
+    // `t.Date`, `TimeSpan.FromSeconds(…)`) carries a declaration and was
+    // already rejected by #1178's gate above — probe-confirmed, untouched.
+    // A bare TYPE VARIABLE is Named-with-null-declaration too and is
+    // excluded exactly as #4644/#4760 exclude it — a type parameter that
+    // shadows a builtin name (`class Box<DateTime>`) is not the builtin.
+    {
+        std::string_view valueHead =
+            (from->kind == TypeRef::Kind::Named && !from->declaration)
+                ? from->headName()
+                : std::string_view();
+        bool fromIsTypeVar =
+            refMentionsTypeVariable(from) ||
+            (freeTypeParamNames && !valueHead.empty() &&
+             freeTypeParamNames->count(valueHead));
+        bool fromValueBuiltin =
+            !valueHead.empty() && !fromIsTypeVar &&
+            common::isReservedBuiltinTypeName(valueHead) &&
+            !common::isHeapPointerReferenceBuiltin(valueHead);
+        bool toConcretePrimitive = to->kind == TypeRef::Kind::Primitive &&
+                                   to->primitive != PrimitiveType::Object;
+        if (fromValueBuiltin && toConcretePrimitive) {
+            std::string reason =
+                std::string("the built-in type `") + std::string(valueHead) +
+                "` is a value type with no implicit conversion to a primitive "
+                "— §5.1 lists none, and §4.6 forbids an implicit conversion "
+                "to `string`; read one of its members instead";
+            if (valueHead == "IntPtr" || valueHead == "UIntPtr")
+                reason += ", or convert explicitly (`long(p)` / `ulong(p)`, "
+                          "§5.2, stdlib §10.0)";
+            reportNotConvertible(reason);
             return;
         }
     }
