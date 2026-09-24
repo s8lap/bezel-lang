@@ -3322,6 +3322,40 @@ private:
     // `borrowOnlyArmBindings_` entry. // per §35.5, §28.3 K3.1, v0.307
     void reportIfBorrowOnlyArmBindingMove(const ast::UnaryExpr& mv);
 
+    // fix #4803 (§15.3 *Pattern binding* / *Local-to-local assignment* /
+    // *Parameter passing*, §19.3, §35.5, §28.3 K3.12, v0.307): the UNMARKED
+    // twin of the `move` check above, for a borrow-only arm binding of
+    // MOVE-ONLY VALUE type (an owning-classified choice or an owning inline
+    // array). §15.3 makes such a binding "a **borrow** of the value;
+    // consuming operations through the binding … are rejected", and §35.5
+    // repeats it for a move-only payload binding ("the binding does not
+    // own"). A move-only value has no borrow reading at a store: "the plain
+    // binding can only move" (§15.3's scope note) — `var z := y;`, `z := y;`,
+    // `_ := y;`, `return y;`, a plain or `owned` argument `Take(y)` (K3.12,
+    // marker-free) are each a whole-value MOVE of `y`, i.e. a consume of a
+    // borrow. Accepted, the new holder disposed the payloads and the
+    // scrutinee's owner disposed them again: MEASURED heap-use-after-free
+    // (#4803) at every one of those positions, over a choice scrutinee, a
+    // nested move-only choice payload, an owning inline array scrutinee, a
+    // borrowed parameter scrutinee, and an owning match's non-destructuring
+    // arm (#4684's whole-value borrow).
+    //
+    // Keyed by SYMBOL; filled by `registerBorrowOnlyArmBindings` with every
+    // non-transferred arm binding whose type is move-only (both kinds —
+    // the class-scoped `borrowOnlyArmBindings_` skips inline arrays).
+    // // per §15.3, §19.3, §35.5, §28.3 K3.12, v0.307
+    std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
+        borrowOnlyMoveOnlyArmBindings_;
+    // The check point: `e` is an expression in a consuming (move) position —
+    // a local initializer, an assignment / discard RHS, a `return` operand,
+    // or a plain / `owned` call argument. Reports iff `e` (looking through
+    // the value arms of an if-expression or expression-`case`, whose selected
+    // arm IS the value moved) is a bare identifier naming a
+    // `borrowOnlyMoveOnlyArmBindings_` entry. `position` names the site for
+    // the diagnostic. // per §15.3, §35.5, §28.3 K3.12, v0.307
+    void reportIfBorrowOnlyMoveOnlyArmBindingConsume(const ast::Expr& e,
+                                                     const char* position);
+
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.

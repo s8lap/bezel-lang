@@ -7731,6 +7731,32 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
             // A copyable value payload "binds as a copy" (§35.5) and a
             // `string`/runtime-managed one a shared reference — neither can.
             const sema::TypeRef* bt = bindSym->declType;
+            // fix #4803 (§15.3 *Pattern binding*, §35.5, v0.307): record every
+            // NON-transferred binding of move-only value type — both kinds,
+            // before the Named-only filter below drops the inline arrays —
+            // so an unmarked whole-value move of it (a consume of a borrow)
+            // is rejected. // per §15.3, §19.3, §35.5, §28.3 K3.12, v0.307
+            //
+            // NOT the whole-value binding of an OWNING match's non-
+            // destructuring arm (`case Mk() of var y => …`): §35.5 makes it a
+            // borrow too, but codegen gives that one shape #4609's whole-
+            // value moved-from mark (so `var z := y;` / an arm result `y`
+            // disposes exactly once today). Whether §35.5 rejects that
+            // consume is an open ruling, #4821, not this memory-safety fix.
+            const bool owningWholeValueArm =
+                owning &&
+                anchor == static_cast<const ast::Node*>(arm.pattern.get());
+            if (!owningWholeValueArm) {
+                const char* moAny = nullptr;
+                if (bt && common::isMoveOnlyValueType(bt, ctx_, moAny)) {
+                    bool moTransfers = false;
+                    for (const sema::Symbol* t : transferred)
+                        if (t == bindSym) { moTransfers = true; break; }
+                    if (!moTransfers)
+                        borrowOnlyMoveOnlyArmBindings_[bindSym] =
+                            BorrowOnlyArmBinding{bindSym->name, owning};
+                }
+            }
             if (!bt || bt->kind != sema::TypeRef::Kind::Named ||
                 !bt->declaration)
                 continue;
@@ -7836,6 +7862,80 @@ void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
                "(\xc2\xa7""28.3 K8.3/K3.1, \xc2\xa7""35.5, v0.307). " + remedy);
 }
 
+// fix #4803 (§15.3 *Parameter passing*, §22.3, §25.2, v0.307): is argument
+// `a` of a call to `callee` a by-value MOVE when its value is move-only?
+// §15.3: "(x: V) … for a move-only V, it is by value-move", and `owned` is
+// "identical". `ref` / `out` pass a location, not the value, and the
+// comparison surface's `Equals(T)` parameter binds a borrow (§25.2), so none
+// of those consume. `callee` may be null (a `new` argument).
+static bool moveOnlyArgIsConsumed(const ast::Expr* callee,
+                                  const ast::CallArgument& a) {
+    if (!a.modifier.empty() && a.modifier != "owned") return false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        if (ma->member == "Equals") return false;
+    return true;
+}
+
+// fix #4803: see the declaration in Ownership_impl.hpp. MEASURED on the
+// pre-fix compiler (ASan, heap-use-after-free in `main`):
+//
+//   var o := Outer.W(new Widget("a"), new Widget("b"));   // owning choice
+//   case o of                                             // BORROWING match
+//     var y => do var z := y; Console.WriteLine("hit"); end
+//   end case;
+//
+// `z`'s scope-end pass disposed both payloads at arm exit and `o`'s disposed
+// them again. // per §15.3, §19.3, §35.5, §28.3 K3.12, v0.307
+void MethodOwnership::reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+        const ast::Expr& e, const char* position) {
+    if (suppressDiag_) return;
+    if (borrowOnlyMoveOnlyArmBindings_.empty()) return;
+    // The value of an if-expression / expression-`case` IS its selected
+    // arm's value, so an arm result sits in the same consuming position.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->thenValue)
+            reportIfBorrowOnlyMoveOnlyArmBindingConsume(*cd->thenValue, position);
+        if (cd->elseValue)
+            reportIfBorrowOnlyMoveOnlyArmBindingConsume(*cd->elseValue, position);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        for (const auto& arm : cx->arms)
+            if (arm.exprBody)
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(*arm.exprBody,
+                                                            position);
+        return;
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    auto it = borrowOnlyMoveOnlyArmBindings_.find(sym);
+    if (it == borrowOnlyMoveOnlyArmBindings_.end()) return;
+    const std::string name(it->second.name);
+    const std::string why =
+        it->second.owningMatch
+            ? std::string(
+                  "this binding is not one the owning match transfers into "
+                  "(only a positional slot or a marked named slot of a "
+                  "move-only payload receives the transfer at arm selection)")
+            : std::string(
+                  "a borrowing match transfers nothing to its bindings");
+    report(Severity::Error, id->span.begin,
+           "cannot move the `case` arm binding `" + name + "` into " +
+               position +
+               ": its type is a move-only value type, so the plain store "
+               "MOVES it (\xc2\xa7""15.3, K3.12), but a pattern binding over a "
+               "move-only value is a BORROW that does not own it "
+               "(\xc2\xa7""15.3 *Pattern binding*, \xc2\xa7""19.3, "
+               "\xc2\xa7""35.5) and " + why +
+               " \xe2\x80\x94 the scrutinee's owner still disposes the value, "
+               "so the move would dispose it twice (v0.307). Read through "
+               "the binding instead, or consume the value at its owner "
+               "(`case move <scrutinee> of` with a destructuring pattern, "
+               "\xc2\xa7""35.5).");
+}
+
 void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
     // fix #4664 (§35.5 / §28.3 K3.1, v0.307): the `move`-of-a-borrowed-arm-
     // binding check rides this walker for the same reason #4635's escape
@@ -7882,11 +7982,21 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (ce->callee) collectCaseArmBorrowSourcesExpr(*ce->callee);
         for (const auto& a : ce->args)
-            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+            if (a.value) {
+                collectCaseArmBorrowSourcesExpr(*a.value);
+                if (moveOnlyArgIsConsumed(ce->callee.get(), a))
+                    reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                        *a.value, "an argument (\xc2\xa7""15.3 *Parameter passing*)");
+            }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
         if (nc->callee) collectCaseArmBorrowSourcesExpr(*nc->callee);
         for (const auto& a : nc->args)
-            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+            if (a.value) {
+                collectCaseArmBorrowSourcesExpr(*a.value);
+                if (moveOnlyArgIsConsumed(nc->callee.get(), a))
+                    reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                        *a.value, "an argument (\xc2\xa7""15.3 *Parameter passing*)");
+            }
     } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) collectCaseArmBorrowSourcesExpr(*ix->target);
         for (const auto& a : ix->indices)
@@ -7906,7 +8016,12 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
         if (cd->elseValue) collectCaseArmBorrowSourcesExpr(*cd->elseValue);
     } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         for (const auto& a : ne->args)
-            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+            if (a.value) {
+                collectCaseArmBorrowSourcesExpr(*a.value);
+                if (moveOnlyArgIsConsumed(nullptr, a))
+                    reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                        *a.value, "an argument (\xc2\xa7""15.3 *Parameter passing*)");
+            }
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         if (th->operand) collectCaseArmBorrowSourcesExpr(*th->operand);
     } else if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
@@ -7957,20 +8072,43 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
             if (es->expr) collectCaseArmBorrowSourcesExpr(*es->expr);
             return;
         }
+        // fix #4803: each of these four statement operands is a
+        // whole-value MOVE of a move-only value (§15.3 *Local-to-local
+        // assignment*, *Return*; §17.13's move-only discard; K3.12). The
+        // check runs AFTER the descent, so an expression-`case` in the
+        // operand has registered its own arm bindings first.
+        // // per §15.3, §35.5, §28.3 K3.12, v0.307
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
-            if (ld->initializer) collectCaseArmBorrowSourcesExpr(*ld->initializer);
+            if (ld->initializer) {
+                collectCaseArmBorrowSourcesExpr(*ld->initializer);
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                    *ld->initializer, "a local binding (\xc2\xa7""15.3 "
+                    "*Local-to-local assignment*)");
+            }
             return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
-            if (as->value) collectCaseArmBorrowSourcesExpr(*as->value);
+            if (as->value) {
+                collectCaseArmBorrowSourcesExpr(*as->value);
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                    *as->value, "an assignment");
+            }
             return;
         }
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
-            if (rs->value) collectCaseArmBorrowSourcesExpr(*rs->value);
+            if (rs->value) {
+                collectCaseArmBorrowSourcesExpr(*rs->value);
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                    *rs->value, "a `return` (\xc2\xa7""15.3 *Return*)");
+            }
             return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
-            if (ds->value) collectCaseArmBorrowSourcesExpr(*ds->value);
+            if (ds->value) {
+                collectCaseArmBorrowSourcesExpr(*ds->value);
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                    *ds->value, "a discard (\xc2\xa7""17.13)");
+            }
             return;
         }
         if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
@@ -8014,6 +8152,7 @@ void MethodOwnership::collectCaseArmBorrowSources(
     // fix #4664: per-method side state, like pendingThrowableInTryChecks_ —
     // the checker instance is reused across members. // per §35.5, v0.307
     borrowOnlyArmBindings_.clear();
+    borrowOnlyMoveOnlyArmBindings_.clear();   // fix #4803, same per-method reset
     owningMatchTransferBindings_.clear();   // fix #4734, same per-method reset
     for (const auto& s : body) if (s) collectCaseArmBorrowSourcesStmt(*s);
 }
