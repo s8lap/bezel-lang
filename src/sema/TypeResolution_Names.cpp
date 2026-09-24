@@ -3488,14 +3488,36 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // Report once, at the innermost re-entry, and resolve to
                 // Error rather than recursing further (previously: unbounded
                 // recursion / SIGSEGV, issue #4764).
+                //
+                // fix #4784 (§27.8, v0.307): a re-entrant push at THIS SAME
+                // source location can be reached more than once — a built-in
+                // generic head's Named/no-declaration TypeRef looks
+                // (to `resolveAliasForwardReferences`, fix #4047) exactly
+                // like an unresolved forward alias reference, so it re-walks
+                // an already-rejected cyclic body a second time
+                // (`Loop2 := Array<Loop2>`); a compound alias body with more
+                // than one self-referencing occurrence (a function type's
+                // param AND return slot, `Fn3 := (Fn3) -> Fn3`) re-walks the
+                // WHOLE body from each occurrence's own expansion, so each
+                // occurrence is reported once from the other's walk and once
+                // from its own. `reportedRecursiveAliasSites_` is keyed on
+                // (aliasDecl, exact source location), so a second report at a
+                // location already reported for this alias is suppressed —
+                // a genuinely DIFFERENT occurrence (different location) is
+                // never suppressed, only a re-visit of one already reported.
                 if (!aliasResolutionStack_.insert(aliasDecl).second) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t.span.begin,
-                        std::string("type alias `") +
-                            std::string(aliasDecl->name) +
-                            "` is recursive (\xC2\xA7""27.8) \xE2\x80\x94 a "
-                            "type alias may not reference itself, directly "
-                            "or through a chain of other aliases");
+                    if (reportedRecursiveAliasSites_
+                            .insert({aliasDecl,
+                                     {t.span.begin.line, t.span.begin.column}})
+                            .second) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("type alias `") +
+                                std::string(aliasDecl->name) +
+                                "` is recursive (\xC2\xA7""27.8) \xE2\x80\x94 a "
+                                "type alias may not reference itself, directly "
+                                "or through a chain of other aliases");
+                    }
                     ref.kind = TypeRef::Kind::Error;
                     return;
                 }

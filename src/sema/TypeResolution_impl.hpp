@@ -1212,6 +1212,35 @@ private:
     // expanded again from an unrelated, non-recursive call site.
     std::unordered_set<const ast::TypeAlias*> aliasResolutionStack_;
 
+    // fix #4784 (§27.8, v0.307): #4764's on-stack guard reports "is
+    // recursive" at EVERY re-entrant push, but a single self-referential
+    // occurrence can be re-entered more than once for reasons that have
+    // nothing to do with there being more than one cycle: (a) a built-in
+    // generic head (`Array<T>`, no user TypeSymbol) resolves its Named
+    // TypeRef with `declaration == nullptr` by design (the "always-
+    // available built-in type names" arm), which is the exact shape
+    // `resolveAliasForwardReferences` (fix #4047) uses to detect an
+    // UNRESOLVED forward alias reference — so it re-resolves an already-
+    // correctly-rejected alias body a second time, re-walking the same
+    // cyclic reference and reporting the same diagnostic at the same
+    // location again (`Loop2 := Array<Loop2>`); (b) a compound alias body
+    // (a function type's parameter AND return slot, e.g. `Fn3 := (Fn3) ->
+    // Fn3`) has more than one top-level occurrence of the alias name, and
+    // resolving occurrence A's "underlying type" re-walks the WHOLE body —
+    // including occurrence B — while A is on-stack, then resolving
+    // occurrence B independently re-walks the whole body again — including
+    // A — while B is on-stack: each of the two occurrences gets reported
+    // once from the other's expansion AND once from its own, four reports
+    // for two real sites. Track which (alias, exact source location) pairs
+    // have already been reported and skip a repeat at the SAME site — this
+    // collapses (a) to one report and (b) to exactly one report per
+    // DISTINCT occurrence (param and return still each get their own,
+    // since they carry different locations — a genuinely distinct
+    // reference is never suppressed, only a re-visit of one already
+    // reported).
+    std::set<std::pair<const ast::TypeAlias*, std::pair<std::uint32_t, std::uint32_t>>>
+        reportedRecursiveAliasSites_;
+
     // §14.2 / Appendix C.4: at a generic instantiation site
     // (`Named<...>` type, including `new C<...>()`), verify every supplied
     // type argument satisfies the constraints its corresponding type
