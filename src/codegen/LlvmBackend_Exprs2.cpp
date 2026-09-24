@@ -6804,43 +6804,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // overflowing after ~16 appends and corrupting allocator metadata.
                 // per §6 / §3.1.
                 constexpr int64_t SB_ESZ = 8;
-                auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-                llvm::Value* sb = builder_.CreateCall(allocFn,
-                    {builder_.getInt64(SB_ESZ), builder_.getInt64(64)});
-                // Fix #531 (§3.1): new StringBuilder(initial: string) — if a string
-                // arg is present, append it as the first part via bz_array_add,
-                // reusing the same IR sequence as Append(string) in Calls.cpp.
-                // The no-arg ctor and capacity-int ctor are not affected: the
-                // capacity arg has an int type (not String), so isStrArg is false.
+                // fix #4884 (stdlib §1/§3.1, v0.307): "Negative magnitudes fault"
+                // requires capacity < 0 to raise ArgumentOutOfRangeException
+                // WITHOUT allocating the backing buffer. The guard must therefore
+                // run BEFORE bz_array_alloc below, mirroring the ordering already
+                // used by the sibling sized constructors OwningBuffer<T>(n)
+                // (~L6498) and Array<T>(size, fill) (~L6610) — previously it ran
+                // after the alloc, so a throwing negative-capacity call leaked the
+                // 56-byte header + 512-byte 64-slot backing store (568 B / 2
+                // allocations) on every call, since the ctor never returns a
+                // value for a caller to dispose.
+                bool isStrArg = false;
                 if (!ne.args.empty() && ne.args[0].value) {
                     auto* argTy = ctx_.exprType(*ne.args[0].value);
-                    bool isStrArg = argTy &&
+                    isStrArg = argTy &&
                         argTy->kind == sema::TypeRef::Kind::Primitive &&
                         argTy->primitive == sema::PrimitiveType::String;
-                    if (isStrArg) {
-                        const ast::Expr* sExpr = ne.args[0].value.get();
-                        llvm::Value* s = lowerExpr(*ne.args[0].value);
-                        if (s) {
-                            // #1185 / stdlib §3.1: the builder owns a +1 for the
-                            // initial part — retain a borrow, TRANSFER a +1
-                            // producer (mirrors Append in LlvmBackend_Calls.cpp).
-                            if (!isPlusOneStringProducer(sExpr))
-                                emitStringRetain(s);
-                            llvm::AllocaInst* slot = entryAlloca(ptrTy());
-                            builder_.CreateStore(s, slot);
-                            auto* addFn = declareC("bz_array_add",
-                                                   llvm::Type::getVoidTy(llvm_),
-                                                   {ptrTy(), ptrTy(), i64()});
-                            builder_.CreateCall(addFn,
-                                {sb, slot, builder_.getInt64(SB_ESZ)});
-                        }
-                    } else if (argTy &&
-                               argTy->kind == sema::TypeRef::Kind::Primitive &&
-                               argTy->primitive == sema::PrimitiveType::Int &&
-                               !argTy->nullable) {
+                    if (!isStrArg && argTy &&
+                        argTy->kind == sema::TypeRef::Kind::Primitive &&
+                        argTy->primitive == sema::PrimitiveType::Int &&
+                        !argTy->nullable) {
                         // stdlib §1/§3.1 (v0.183, #1396): StringBuilder(capacity)
                         // faults on a negative capacity. The capacity value is
-                        // not otherwise used to size the backing buffer above
+                        // not otherwise used to size the backing buffer below
                         // (a fixed 64-slot reservation) — only the fault matters.
                         llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                         if (capArg) {
@@ -6851,6 +6837,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                                        builder_.getInt64(0)),
                                 "ArgumentOutOfRangeException");
                         }
+                    }
+                }
+                auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* sb = builder_.CreateCall(allocFn,
+                    {builder_.getInt64(SB_ESZ), builder_.getInt64(64)});
+                // Fix #531 (§3.1): new StringBuilder(initial: string) — if a string
+                // arg is present, append it as the first part via bz_array_add,
+                // reusing the same IR sequence as Append(string) in Calls.cpp.
+                // The no-arg ctor and capacity-int ctor are not affected: the
+                // capacity arg has an int type (not String), so isStrArg is false.
+                if (isStrArg) {
+                    const ast::Expr* sExpr = ne.args[0].value.get();
+                    llvm::Value* s = lowerExpr(*ne.args[0].value);
+                    if (s) {
+                        // #1185 / stdlib §3.1: the builder owns a +1 for the
+                        // initial part — retain a borrow, TRANSFER a +1
+                        // producer (mirrors Append in LlvmBackend_Calls.cpp).
+                        if (!isPlusOneStringProducer(sExpr))
+                            emitStringRetain(s);
+                        llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                        builder_.CreateStore(s, slot);
+                        auto* addFn = declareC("bz_array_add",
+                                               llvm::Type::getVoidTy(llvm_),
+                                               {ptrTy(), ptrTy(), i64()});
+                        builder_.CreateCall(addFn,
+                            {sb, slot, builder_.getInt64(SB_ESZ)});
                     }
                 }
                 return sb;
