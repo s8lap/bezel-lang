@@ -51,17 +51,22 @@ std::string runOut(const std::string& prog) {
 // print and the test program trapped at SIGABRT inside `calloc` after
 // stack exhaustion. Post-fix: prints "4" and exits 0.
 // ---------------------------------------------------------------------------
+// §22.10 (v0.307, line 1861): post-#4868, a class primary-ctor parameter is
+// not auto-promoted to a public property. The test reads `c.X` via an explicit
+// `public readonly property X` declaration (spec §11 / §22.10 idiom,
+// docs/Bezel_Language_Spec.md:2042-2057).
 BEZEL_TEST(two_hop_primary_chain_3760, two_hop_chain_to_primary_runs) {
     BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "class C(x: int) "
+        "  public readonly property X: int := x; "
         "  public constructor(a: int, b: int) this(a + b); end constructor; "
         "  public constructor(s: string) this(s.Length, 1); end constructor; "
         "end C; "
         "class MainClass "
         "  public static method Main(): int "
         "    var c := new C(\"abc\"); "
-        "    Console.WriteLine(c.x.ToString()); "
+        "    Console.WriteLine(c.X.ToString()); "
         "    return 0; "
         "  end Main; "
         "end MainClass;"), std::string("4\n"));
@@ -72,17 +77,23 @@ BEZEL_TEST(two_hop_primary_chain_3760, two_hop_chain_to_primary_runs) {
 // (no sibling at matching arity). Pre-fix and post-fix: works (the §22.10
 // primary arm was the path). This row pins that the fix didn't disturb the
 // single-hop case.
+//
+// Per spec §22.10 (v0.307, line 1861) post-#4868: the class's primary-ctor
+// parameter `x` is not auto-promoted to a public property. Migration adds the
+// explicit `public readonly property X` (canonical idiom, lines 2042-2057) so
+// the chained value can be observed out-of-class as `c.X`.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(two_hop_primary_chain_3760, single_hop_chain_still_works) {
     BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "class C(x: int) "
+        "  public readonly property X: int := x; "
         "  public constructor(a: int) this(a + 1); end constructor; "
         "end C; "
         "class MainClass "
         "  public static method Main(): int "
         "    var c := new C(10); "
-        "    Console.WriteLine(c.x.ToString()); "
+        "    Console.WriteLine(c.X.ToString()); "
         "    return 0; "
         "  end Main; "
         "end MainClass;"), std::string("11\n"));
@@ -91,7 +102,10 @@ BEZEL_TEST(two_hop_primary_chain_3760, single_hop_chain_still_works) {
 // ---------------------------------------------------------------------------
 // Row 3 — control: an explicit `base(...)` chain from a derived class with
 // a primary base constructor. No `this(...)` involvement at all; pins the
-// fix didn't perturb the base-chain arm.
+// fix didn't perturb the base-chain arm. Per §22.10 (v0.307) post-#4868 the
+// base's primary-ctor parameter `x` is not auto-promoted, but this row reads
+// the value through `d.GetX()` (a method body access, still permitted) — no
+// property declaration needed.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(two_hop_primary_chain_3760, explicit_base_chain_still_works) {
     BEZEL_EXPECT_EQ(runOut(
@@ -119,11 +133,19 @@ BEZEL_TEST(two_hop_primary_chain_3760, explicit_base_chain_still_works) {
 // chain off-course), so the >1-candidate path's type-class check was the
 // load-bearing one for this row. Post-fix: prints "5/6/7" — the three
 // stored positional args.
+//
+// Per §22.10 (v0.307, line 1861) post-#4868, the three primary-ctor parameters
+// `x`/`y`/`z` are not auto-promoted. Migration declares three explicit
+// `public readonly property` accessors (canonical idiom, lines 2042-2057) so
+// the chained values are observable out-of-class as `c.X`/`c.Y`/`c.Z`.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(two_hop_primary_chain_3760, three_hop_chain_to_primary_runs) {
     BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "class C(x: int, y: int, z: int) "
+        "  public readonly property X: int := x; "
+        "  public readonly property Y: int := y; "
+        "  public readonly property Z: int := z; "
         "  public constructor(a: int) this(a, a + 1, a + 2); end constructor; "
         "  public constructor(a: int, b: int) this(a, b, 0); end constructor; "
         "  public constructor() this(5); end constructor; "
@@ -131,7 +153,7 @@ BEZEL_TEST(two_hop_primary_chain_3760, three_hop_chain_to_primary_runs) {
         "class MainClass "
         "  public static method Main(): int "
         "    var c := new C(); "
-        "    Console.WriteLine($\"{c.x}/{c.y}/{c.z}\"); "
+        "    Console.WriteLine($\"{c.X}/{c.Y}/{c.Z}\"); "
         "    return 0; "
         "  end Main; "
         "end MainClass;"), std::string("5/6/7\n"));

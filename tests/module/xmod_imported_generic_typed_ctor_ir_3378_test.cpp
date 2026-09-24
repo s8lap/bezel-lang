@@ -375,12 +375,20 @@ BEZEL_TEST(xmod_imported_generic_typed_ctor_ir_3378,
 // covers the same IR-monomorphization path. This row exists so the
 // §22.10 axis (primary-ctor parameters, the `bz$<Type>$init`-less generic
 // path #3201 closed) is covered alongside the explicit-ctor axis T1 covers.
-// ===========================================================================
+//
+// Per spec §22.10 (v0.307, line 1861, after #4868 5458a4e1): the class's
+// primary-ctor parameter `_t` is NOT auto-promoted to a public property. The
+// canonical idiom (docs/Bezel_Language_Spec.md:2042-2057) requires the class
+// author to declare an explicit `public readonly property` so the field is
+// readable out-of-class. Migration: declare `public readonly property _t: T := _t;`
+// (RHS `_t` is the primary-ctor parameter, in initializer position per
+// §22.10); the ctor's body still captures `_t` for any internal references.
 BEZEL_TEST(xmod_imported_generic_typed_ctor_ir_3378,
            t4_primary_ctor_typed_field_pt) {
     auto [code, out] = compileImportRun3378(
         std::string("module Lib3378T4; "
                     "public class GBox3378T4<T>(_t: T) "
+                    "  public readonly property _t: T := _t; "
                     "end GBox3378T4; ") + kPtDef3378,
         "module App3378T4; import Lib3378T4; "
         "public class C "
