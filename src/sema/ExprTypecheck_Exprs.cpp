@@ -6925,6 +6925,51 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // user-Named-type guard below. The operator * (TimeSpan * double) is
         // deliberately excluded — it requires cross-type widening that is
         // deferred per the existing datetime_timespan_test.cpp note.
+        //
+        // fix (R20 gate, follow-up to #4809; stdlib §2.5, v0.307): the four
+        // `DateTime` operators stdlib §2.5 declares are compiler-intrinsic in
+        // the same way (DateTime is also a scalar i64 tick count, so each is
+        // a plain i64 add/sub):
+        //   operator -(a: DateTime, b: DateTime): TimeSpan
+        //   operator -(d: DateTime, t: TimeSpan): DateTime
+        //   operator +(d: DateTime, t: TimeSpan): DateTime
+        //   operator +(t: TimeSpan, d: DateTime): DateTime
+        // Before #4809 `DateTime.UtcNow` was left untyped, so `t2 - t1` over
+        // two UtcNow reads never reached the §25 user-Named-type reject below;
+        // once #4809 typed the read, that reject fired on a stdlib-declared
+        // operator. Type these here, before the reject. Only the builtin
+        // shape qualifies — a user type that happens to be named `DateTime`
+        // carries a declaration with a `decl` and keeps the §25 rule. Both
+        // the declared-builtin shape (`DateTime.UtcNow`, `TimeSpan.FromX`)
+        // and the declaration-less Named shape (`new DateTime(...)`) are
+        // recognised; a nullable operand is not (no lifting here).
+        auto temporalName = [](const TypeRef* t) -> std::string_view {
+            if (!t || t->kind != TypeRef::Kind::Named || t->nullable)
+                return {};
+            if (t->declaration && t->declaration->decl) return {};
+            std::string_view n = namedTypeName(t);
+            return (n == "DateTime" || n == "TimeSpan") ? n
+                                                         : std::string_view{};
+        };
+        if (op == "+" || op == "-") {
+            TypeRef* rtT = be.right ? ctx_.exprType(*be.right) : nullptr;
+            std::string_view ln = temporalName(lt);
+            std::string_view rn = temporalName(rtT);
+            const char* result = nullptr;
+            if (ln == "DateTime" && rn == "DateTime" && op == "-")
+                result = "TimeSpan";
+            else if (ln == "DateTime" && rn == "TimeSpan")
+                result = "DateTime";
+            else if (ln == "TimeSpan" && rn == "DateTime" && op == "+")
+                result = "DateTime";
+            if (result) {
+                auto* rTy = ctx_.makeTypeRef();
+                rTy->kind = TypeRef::Kind::Named;
+                rTy->declaration = builtinClassSym(result);
+                ctx_.setExprType(&be, rTy);
+                return;
+            }
+        }
         if (lt && lt->kind == TypeRef::Kind::Named &&
             lt->declaration && !lt->declaration->decl &&
             lt->declaration->name == "TimeSpan" &&
