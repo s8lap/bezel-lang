@@ -614,6 +614,14 @@ private:
     // normally for write-only indexers.
     const ast::Expr* refOutArgTargetNode_ = nullptr;
 
+    // fix #4806 (§12.7 / §22.3, v0.307): the bare `ref`/`out` operands whose
+    // §12.7 narrowing the IdentifierExpr visit deliberately did NOT apply
+    // (they name the DECLARED location). Read only by the two §22.3
+    // exact-referent diagnostics, which append a copy-out hint when the
+    // mismatching operand is in this set: the user almost certainly meant
+    // the narrowed type, and the sound way to pass it is a fresh local.
+    std::unordered_set<const ast::Expr*> refOutSuppressedNarrowing_;
+
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
     // call argument bound to a function-typed parameter), this holds those
@@ -3113,6 +3121,14 @@ private:
     // symbol the positional fields belong to (the new-target class, or the
     // enclosing class for a chain); `t->genericParams` drives the substitution
     // walk exactly as the inlined loop did. See the body in ExprTypecheck_Calls.cpp.
+    // fix #4806 (§12.7 / §22.3, v0.307): suffix for the §22.3 exact-referent
+    // diagnostic when the mismatching `ref`/`out` operand is a bare
+    // identifier whose §12.7 narrowing was suppressed (it names the DECLARED
+    // location). Empty otherwise. Names the copy-out remedy.
+    std::string refOutNarrowedCopyOutHint(const ast::Expr& operand,
+                                          const TypeRef* paramTy,
+                                          std::string_view mod) const;
+
     void checkPositionalArgsAssignable(
         const std::vector<const Symbol*>& fields, const BindResult& b,
         const std::vector<ast::CallArgument>& args,

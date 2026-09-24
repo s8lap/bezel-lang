@@ -1623,6 +1623,37 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
 }
 }  // namespace
 
+// fix #4806 (§12.7 / §22.3, v0.307): a bare `ref`/`out` operand names its
+// DECLARED location even inside a §12.7 narrowing, so `ref a` with `a: Animal`
+// narrowed to `Dog` does not match a `ref x: Dog` parameter. Admitting it
+// would be unsound: the callee holds a `Dog` alias to an `Animal` slot, and
+// any store into that slot during the call (e.g. through a lambda that
+// captured `a` mutably) leaves the callee reading a non-`Dog` as a `Dog`.
+// The sound way to pass the narrowed value is to copy it out into a fresh
+// local of the parameter's type. The hint says so; where the parameter type
+// has a simple printable spelling, it spells the declaration.
+std::string ExprTC::refOutNarrowedCopyOutHint(const ast::Expr& operand,
+                                              const TypeRef* paramTy,
+                                              std::string_view mod) const {
+    if (!refOutSuppressedNarrowing_.count(&operand)) return {};
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
+    if (!id) return {};
+    const std::string nm(id->name);
+    std::string tyText;
+    if (paramTy && paramTy->genericArgs.empty() &&
+        (paramTy->kind == TypeRef::Kind::Primitive ||
+         paramTy->kind == TypeRef::Kind::Named))
+        tyText = spellTypeRefForDiag(paramTy);
+    if (tyText.empty() || tyText.find('?') == 0) tyText = "<parameter type>";
+    const std::string tmp = nm + "Copy";
+    return "; `" + nm + "` is §12.7-narrowed here, but a bare `" +
+           std::string(mod) + "` argument aliases its DECLARED location "
+           "(§12.7, §22.3) — to pass the narrowed value, copy it out into a "
+           "local of the parameter's type and pass that local (`var " + tmp +
+           ": " + tyText + " := " + nm + ";` then `" + std::string(mod) + " " +
+           tmp + "`)";
+}
+
 // §22.6/§12.1 (#1090): collect same-name overloads across the class hierarchy.
 void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                        std::vector<MethodSymbol*>& out) {
@@ -14382,7 +14413,8 @@ void ExprTC::checkArgsAgainstParams(
                         " does not match the parameter's referent type — "
                         "a `ref`/`out` argument aliases the caller's "
                         "location (§22.3), so the type must match exactly and "
-                        "no implicit conversion is admitted (§14.5)");
+                        "no implicit conversion is admitted (§14.5)" +
+                        refOutNarrowedCopyOutHint(*a.value, rparamTy, am));
             }
             continue;
         }
@@ -15437,7 +15469,8 @@ void ExprTC::checkPositionalArgsAssignable(
                         " does not match the parameter's referent type — "
                         "a `ref`/`out` argument aliases the caller's "
                         "location (§22.3), so the type must match exactly and "
-                        "no implicit conversion is admitted (§14.5)");
+                        "no implicit conversion is admitted (§14.5)" +
+                        refOutNarrowedCopyOutHint(*a.value, ft, am));
             continue;
         }
         // The inline-declaration family (`out var`, `out using var`,

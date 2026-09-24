@@ -2127,8 +2127,26 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // resolves against `T` (resolveMemberAccess reads the target's
             // exprType first). Narrowing applies only to simple variables
             // (locals and parameters), keyed by their resolved symbol.
+            //
+            // fix #4806 (§12.7 / §22.3 / §7.4, v0.307): a BARE identifier that
+            // is itself a `ref`/`out` argument operand is not a read. It names
+            // the storage location the callee aliases, and that location is
+            // the DECLARED one: §12.7 says the bare-binding store `o := …`
+            // "targets the *declared* `Object`/interface location", and
+            // §12.7(ii) rejects only a chain that extends the binding
+            // (`ref o[0]`, `out o.X`). Passing it also invalidates the
+            // narrowing (§7.4, erased right after this visit by #1188). With
+            // the narrowed type, `ref o` at a `ref x: Object` parameter was
+            // over-rejected by §22.3's exact-referent check. At a `ref x: int`
+            // parameter it was admitted, and codegen's #3090 lvalue arm handed
+            // the callee the SHARED §8.6 box's payload, so an alias
+            // `var p: Object := o` observed the callee's store. A chain operand
+            // is a different node, so its root still narrows.
             if (auto nt = narrowings_.find(sym); nt != narrowings_.end()) {
-                ctx_.setExprType(&e, nt->second);
+                if (&e != refOutArgTargetNode_)
+                    ctx_.setExprType(&e, nt->second);
+                else
+                    refOutSuppressedNarrowing_.insert(&e);
             }
         } else if (primitiveFromName(id->name) != PrimitiveType::None) {
             // §5.2: a primitive type name used in expression position is
