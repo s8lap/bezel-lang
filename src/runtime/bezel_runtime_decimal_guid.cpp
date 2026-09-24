@@ -492,6 +492,10 @@ extern "C" void bz_decimal_from_uint64(uint64_t v, bz_decimal_t* out) {
 // Conversion from double (explicit per §5.2).
 // per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
 // call emitPendingCheck() after this function.
+// per fix #4845: %.15g + bz_decimal_parse_cstr can land on a scale > 28
+// (e.g. 1e-40 parses to scale 40, which §4.4 forbids).  Post-process the
+// parsed value so scale is always ≤ 28 with half-up rounding (consistent
+// with dec_store's existing rounding rule).
 extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
                                         void* ove_vtable) {
     // Use snprintf to get the decimal representation.
@@ -505,6 +509,26 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     // ove_vtable also covers the (very unlikely) case where the string
     // produced by snprintf overflows (e.g. 1e29 edge case).
     bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
+    if (bz_exc) return;  // let OverflowException / FormatException propagate
+
+    // §5.2 (fix #4845): nearest-representable decimal value, scale ≤ 28.
+    // The %.15g + parser pipeline produces a (m, s) representation of the
+    // double's nearest-15-significant-digit value. For sub-scale-28 magnitudes
+    // (e.g. `decimal(1e-40)`), s > 28 — round the mantissa down to scale 28
+    // with half-up rounding (matches dec_store's rem >= 5 → m += 1 rule).
+    uint32_t s = dec_scale(out);
+    if (s > 28) {
+        __uint128_t m = dec_mantissa(out);
+        int neg = dec_sign(out);
+        uint32_t drop = s - 28;
+        for (uint32_t k = 0; k < drop; ++k) {
+            __uint128_t q = m / 10;
+            __uint128_t r = m - q * 10;
+            m = q;
+            if (r >= 5) m += 1;
+        }
+        dec_store(out, m, 28, neg, ove_vtable);
+    }
 }
 
 // Conversion to double (explicit per §5.2).
