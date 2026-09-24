@@ -24401,6 +24401,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // checkMemberVisibility handles all four levels and the overload-suppression
     // heuristic (a non-private accessible sibling → suppress the error).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
+        // §22.10 (v0.307, fix #4868): a CLASS's primary-constructor parameter
+        // has a FieldSymbol in `members` so `this.x` / in-body references can
+        // resolve through it (SymbolCollection.cpp's record/class branch
+        // shares the same `posParam` symbol-creation path), but it is NOT
+        // promoted to a public property (§22.10: "Primary-constructor
+        // parameters are not automatically promoted to public properties.
+        // To expose one, declare a property explicitly."). An out-of-class
+        // `p.x` access therefore does not see a public member at all — it is
+        // `no member \`x\` on type \`Point\``, not `\`x\` is private to \`Point\``.
+        // The two readings are observably different to a caller: the former
+        // says there is nothing to expose even if Point is reopened; the
+        // latter invites a `protected` subclass declaration as a workaround,
+        // which §22.10 also rejects. The check fires only when the access
+        // site is NOT the declaring class (currentType_ != parent); an
+        // in-class `this.x` or in-body IdentifierExpr `x` resolves fine,
+        // matching §22.10's "in scope inside the body of any method,
+        // property, constructor, or destructor of the class".
+        if (auto* fs = dynamic_cast<FieldSymbol*>(msym)) {
+            if (fs->posParam && fs->parent &&
+                fs->parent->kind == ast::TypeDeclKind::Class &&
+                currentType_ != fs->parent) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("no member `") + std::string(ma.member) +
+                    "` on type `" + std::string(fs->parent->name) +
+                    "` from outside the declaring class — "
+                    "primary-constructor parameters are not auto-promoted "
+                    "to public properties (§22.10); declare a property "
+                    "explicitly to expose one");
+                return;
+            }
+        }
         // §26.5 step 1 (v0.183): pass the receiver's type so a rejected
         // access can note a same-named, name-blocked extension.
         const TypeRef* recvTy = ma.target ? ctx_.exprType(*ma.target) : nullptr;
