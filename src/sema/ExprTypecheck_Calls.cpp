@@ -19189,6 +19189,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 std::string_view cn = isBuiltin
                     ? std::string_view(tt->headName())
                     : std::string_view();
+                // GRID-DEBT: #4833 a property-type list, not a wrap claim;
+                // consolidate onto the builtin member table.
                 bool intLength =
                     cn == "Array" || cn == "OwningArray" ||
                     cn == "Stack" || cn == "OwningStack" ||
