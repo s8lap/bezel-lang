@@ -344,3 +344,42 @@ BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("caught OverflowException\n"));
 }
+
+// =====================================================================
+// narrow #4855: the fold must never call a runtime decimal op that can
+// abort(). bz_decimal_mod aligns scales first; with a divisor that carries
+// more scale than a dividend too large to upscale, the alignment rounds the
+// DIVISOR down to 0 and the runtime aborts — so `decimal.MaxValue mod 0.4m`
+// used to SIGABRT bezelc itself. The conversion sits in a method Main never
+// calls: the row pins that COMPILATION survives (the run-time abort of the
+// same op is #4855's runtime half, out of scope here), and a compiler crash
+// is fork-isolated by runAot as ran == false.
+// =====================================================================
+
+namespace {
+bezel::test::JitResult compileUncalled(const std::string& expr) {
+    return runAot(
+        "module M; class C "
+        "public static method F(): int return " + expr + "; end F; "
+        "public static method Main(): int "
+        "Console.WriteLine(\"compiled\"); return 0; end Main; end C;");
+}
+}  // namespace
+
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           decimal_mod_alignment_zeroing_divisor_does_not_abort_compiler_4855) {
+    auto r = compileUncalled("int(decimal.MaxValue mod 0.4m)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+}
+
+// The other two abort() paths among the ops the fold calls: bz_decimal_div
+// and bz_decimal_mod on a literal zero divisor (declined before the call).
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           decimal_div_and_mod_by_zero_do_not_abort_compiler_4855) {
+    auto r = compileUncalled("int(1m / 0m) + int(5m mod 0m) + int(5m mod 0.0m)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+}

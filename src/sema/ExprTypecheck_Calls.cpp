@@ -2575,6 +2575,32 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             // overflow raises OverflowException — a faulting subexpression
             // has no value, so the fold declines.
             if ((b->op == "/" || isMod) && zeroDivisor) return std::nullopt;
+            // narrow #4855: the compiler must never call a runtime op that
+            // can abort(). Of the ops this fold calls, only bz_decimal_div
+            // and bz_decimal_mod abort, and only on a zero divisor. div
+            // checks the operand as given (covered above), but mod first
+            // aligns scales (dec_align), and when the divisor carries MORE
+            // scale than the dividend and the dividend cannot be upscaled
+            // within 96 bits, dec_align instead rounds the DIVISOR's
+            // mantissa down a digit at a time — which can reach 0 and abort
+            // (`decimal.MaxValue mod 0.4m`). dec_align shrinks the divisor
+            // exactly when ma * 10^(sb - sa) exceeds 2^96 - 1, so decline
+            // the fold on that condition (the runtime value is then
+            // rounding-dependent anyway; the conversion stays a runtime op).
+            if (isMod) {
+                const std::uint32_t sa = (a.flags >> 16) & 0xFF;
+                const std::uint32_t sb = (c.flags >> 16) & 0xFF;
+                if (sb > sa) {
+                    constexpr __uint128_t kMax96 =
+                        ((__uint128_t)1 << 96) - 1;
+                    __uint128_t ma = ((__uint128_t)a.hi32 << 64) |
+                                     ((__uint128_t)a.mid32 << 32) | a.lo32;
+                    for (std::uint32_t k = sa; k < sb; ++k) {
+                        if (ma > kMax96 / 10) return std::nullopt;
+                        ma *= 10;
+                    }
+                }
+            }
             const bool faulted = decimalOpFaults([&](void* vt) {
                 if (b->op == "+")      bz_decimal_add(&a, &c, &out, vt);
                 else if (b->op == "-") bz_decimal_sub(&a, &c, &out, vt);
