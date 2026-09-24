@@ -14564,6 +14564,40 @@ private:
         };
         auto ctorTypeMatches = [&](sema::ConstructorSymbol* cs) -> bool {
             if (cs->params.size() != args.size()) return false;
+            // fix #4722 (b) (§22.5 "Optional parameters and named arguments"
+            // / §9.3 / §22.6, v0.307): compare each argument against the
+            // parameter it BINDS to, not the parameter at its call-site
+            // index. §22.5 binds a positional argument to the next
+            // positional slot and a named argument to the parameter of that
+            // name, "in any order after positional arguments". The pre-fix
+            // check paired `args[i]` with `params[i]`, so `new P(n := 4,
+            // label := "abc")` against `constructor(label: string, n: int)`
+            // compared the int `4` with `label: string`, rejected the only
+            // candidate sema had accepted, and the `new` failed to lower (or
+            // — through `lowerLocalDecl`'s #2434 fallback — silently
+            // zero-filled the record). A name that matches no parameter, or
+            // a slot bound twice, makes the candidate inapplicable, the same
+            // answer `argsCanFill`/`argsCanFillSymbolic` give.
+            std::vector<std::size_t> boundParam(args.size());
+            {
+                std::vector<bool> filled(args.size(), false);
+                std::size_t pos = 0;
+                for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                    std::size_t idx = args.size();
+                    if (args[ai].name.empty()) {
+                        idx = pos++;
+                    } else {
+                        for (std::size_t j = 0; j < args.size(); ++j)
+                            if (sema::formalParamName(*cs, j) == args[ai].name) {
+                                idx = j;
+                                break;
+                            }
+                    }
+                    if (idx >= args.size() || filled[idx]) return false;
+                    filled[idx] = true;
+                    boundParam[ai] = idx;
+                }
+            }
             // fix #3760: the type-class check reads the parameter type off the
             // LOCAL AST when present (`ast::ConstructorDecl::params[i].type`,
             // resolved to a `sema::TypeRef` via `ctx_.resolvedType`) — and
@@ -14602,7 +14636,7 @@ private:
                 bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
                     args[pi].value.get()) != nullptr;
                 int argCls = argIsNull ? 3 : typeClassOf(argTy);
-                auto* paramTy = localParamType(pi);
+                auto* paramTy = localParamType(boundParam[pi]);  // fix #4722 (b)
                 int paramCls = typeClassOf(paramTy);
                 // fix #3760 follow-up: a `null` arg against a NULLABLE param
                 // is a valid match — a `null` literal carries no typeClass
