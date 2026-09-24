@@ -6552,6 +6552,66 @@ void Resolver::checkAbstractImplementations() {
             TypeSymbol* sym;
             std::unordered_map<std::string_view, const TypeRef*> subst;
         };
+        // fix #4831 (§11.1 / §11.2, v0.307): each binding is keyed by the
+        // FULL structural identity of the bound type — declaration, generic
+        // arguments (recursively), nullability, and the inline-array /
+        // function shape — not by `headName()` alone. The head-only key
+        // spelled `T=Box<int>`, `T=Box<string>`, `T=Box<T>` and `T=Box?` all
+        // as `T=Box;`, so `class D: IM<Box<int>>, IM<Box<string>>` visited
+        // `IM` once, recorded ONE obligation, and never checked the second —
+        // §11.1 requires §11.2's matching rule "applied once per obligation,
+        // each under its own instantiation's substitution". The unchecked
+        // obligation then dispatched through a type-confused itable slot.
+        std::function<void(const TypeRef*, std::string&)> typeKey =
+            [&](const TypeRef* v, std::string& out) {
+            if (!v) { out += "~"; return; }
+            switch (v->kind) {
+            case TypeRef::Kind::Error: out += "E"; break;
+            case TypeRef::Kind::Unit: out += "U"; break;
+            case TypeRef::Kind::Primitive:
+                out += "P";
+                out += std::to_string(static_cast<int>(v->primitive));
+                break;
+            case TypeRef::Kind::Named:
+                out += "N";
+                if (v->declaration) {
+                    out += "@";
+                    out += std::to_string(
+                        reinterpret_cast<std::uintptr_t>(v->declaration));
+                } else {
+                    out += "'";
+                    out += std::string(v->headName());
+                }
+                out += "<";
+                for (const TypeRef* ga : v->genericArgs) {
+                    typeKey(ga, out);
+                    out += ",";
+                }
+                out += ">";
+                break;
+            case TypeRef::Kind::InlineArray:
+                out += "A";
+                out += std::to_string(v->arraySizeValue);
+                out += v->arrayOwned ? "o" : "";
+                out += "[";
+                typeKey(v->arrayElement, out);
+                out += "]";
+                break;
+            case TypeRef::Kind::Function:
+                out += "F(";
+                for (const auto& fp : v->funcParams) {
+                    out += std::string(fp.modifier);
+                    out += ":";
+                    typeKey(fp.type, out);
+                    out += ",";
+                }
+                out += ")";
+                out += v->funcReturnOwned ? "o" : "";
+                typeKey(v->funcReturn, out);
+                break;
+            }
+            if (v->nullable) out += "?";
+        };
         auto substKey = [&](
             const std::unordered_map<std::string_view, const TypeRef*>& m)
             -> std::string {
@@ -6559,8 +6619,9 @@ void Resolver::checkAbstractImplementations() {
             std::vector<std::pair<std::string_view, std::string>> parts;
             parts.reserve(m.size());
             for (auto& [k, v] : m) {
-                parts.emplace_back(k,
-                    v ? std::string(v->headName()) : std::string());
+                std::string vk;
+                typeKey(v, vk);
+                parts.emplace_back(k, std::move(vk));
             }
             std::sort(parts.begin(), parts.end());
             std::string out;
