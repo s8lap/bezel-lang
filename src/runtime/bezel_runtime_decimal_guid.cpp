@@ -346,7 +346,17 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
     if (rs_signed < 0) {
         // Result scale is negative: multiply q by 10^|rs| to compensate.
         while (rs_signed < 0 && q <= kMax96 / 10) { q *= 10; ++rs_signed; }
-        if (rs_signed < 0) { dec_store(out, q, 0, rsign, ove_vtable); return; }
+        if (rs_signed < 0) {
+            // fix #4864 / §6.4, v0.307: q still needs more upscaling than the
+            // 96-bit mantissa can hold at scale 0 (the minimum representable
+            // scale) — the exact quotient's magnitude exceeds decimal's range.
+            // Previously this stored the partially-upscaled `q` at scale 0
+            // regardless, silently returning a wrong finite value instead of
+            // raising OverflowException (matching how every other overflow
+            // path in this file signals via bz_set_exc).
+            bz_set_exc(ove_vtable);
+            return;
+        }
     }
     uint32_t rs = (uint32_t)rs_signed;
     dec_store(out, q, rs, rsign, ove_vtable);
