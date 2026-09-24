@@ -14563,7 +14563,16 @@ private:
                 case P::UInt:  case P::ULong:  return 1;
                 case P::Float:  return 2;
                 case P::Double: case P::Decimal: return 2;
-                case P::String: return 3; // class 3 regardless of nullable
+                // fix #4822 (§5.1 / §22.6 stage 3, v0.307): `string` is its
+                // OWN class, not the Named class 3. No class, record or
+                // interface value converts to `string` (§5.1), and `string`
+                // converts to no Named type but `IComparable<string>` /
+                // `IEquatable<string>` (the relaxed pass's boxing arm). Filed
+                // under 3, a class-typed argument "matched" a `string`
+                // parameter: `new H(sq)` picked `(s: string)` over the
+                // applicable `(s: IShape, k: int := 2)` and read the `Sq`
+                // object as a string.
+                case P::String: return 4; // regardless of nullable
                 default: return -1;
                 }
             }
@@ -14688,7 +14697,7 @@ private:
             // parameter clearly admits null.
             //
             // fix #4790 rework (§5.1 / §7, v0.307): `null` also converts to
-            // every REFERENCE slot class (Named/function/`string` 3 — the
+            // every REFERENCE slot class (Named/function 3, `string` 4 — the
             // pre-rework verdict, unchanged) and to a TYPE-PARAMETER slot
             // (class -1: `T` is instantiated at a nullable type for sema to
             // have accepted the call — `new Box<string?>(null)`). The
@@ -14698,11 +14707,11 @@ private:
             // rejects it.
             if (argIsNull) {
                 if (paramTy && paramTy->nullable) return true;  // null -> nullable param
-                return paramCls == 3 || paramCls == -1;
+                return paramCls == 3 || paramCls == 4 || paramCls == -1;
             }
             int argCls = typeClassOf(argTy);
             // Relaxed pass only: the §5.1 / §14.2 clause 5 boxing conversion
-            // the class proxy files under a mismatch (primitive 0/1/2 vs
+            // the class proxy files under a mismatch (primitive 0/1/2/4 vs
             // interface 3).
             if (relaxedPass && primitiveBoxesInto(argTy, paramTy)) return true;
             if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
