@@ -6,6 +6,7 @@ doc-example harness.
 Run: python3 -m unittest discover -s tests/conformance/rules
 """
 
+import io
 import os
 import sys
 import tempfile
@@ -529,7 +530,9 @@ class TestDirectoryCases(unittest.TestCase):
             f.write("#!/bin/sh\nexit 0\n")
         os.chmod(bezelc, 0o755)
         baseline = os.path.join(self.base, "baseline.tsv")
-        rc = runner.main([bezelc, "--classify", "--filter", "s13_4",
+        # #4814: use --update --filter X (safe) rather than --classify --filter X
+        # (refused — would truncate baseline.tsv to the filter's subset).
+        rc = runner.main([bezelc, "--update", "--filter", "s13_4",
                           "--baseline", baseline],
                          base_dir=self.base, run=fake)
         self.assertEqual(rc, 0)
@@ -1090,7 +1093,12 @@ class TestRunnerEndToEnd(unittest.TestCase):
                          "fail")
 
     def test_filter_selects_a_section(self):
-        rc = runner.main([self.bezelc, "--classify", "--filter", "28.5",
+        # #4814: --classify --filter X is refused (truncates baseline.tsv to
+        # the filter's subset). The safe path is --update --filter X: it
+        # starts from the existing baseline, so non-matching rows survive and
+        # only the filter-matching rows are re-banked. With an empty baseline
+        # the post-run contents equal the filter's match set, as before.
+        rc = runner.main([self.bezelc, "--update", "--filter", "28.5",
                           "--baseline", self.baseline],
                          base_dir=self.base, run=self.all_as_spec_says())
         self.assertEqual(rc, 0)
@@ -1464,6 +1472,105 @@ class TestCoverageMarkup(unittest.TestCase):
 
     def test_a_sentence_after_an_anchor_is_prose(self):
         self.assertTrue(coverage._is_prose('<a id="x"></a> and then text'))
+
+
+class TestClassifyFilterGuard_4814(unittest.TestCase):
+    """#4814: `--classify --filter X` truncates baseline.tsv to the filter's
+    subset. `--classify` starts the run from `baseline = {}` (line 252 of
+    runner.py), so when `--filter X` narrows the iteration to the matching
+    rows, only those rows are banked back — every other row is destroyed. Two
+    lanes in the same cycle hit this (a morning sonnet-corpus-classify run
+    and the 21:30 sonnet-4792), both restoring from `git checkout --`. The
+    combination is refused at the argparse layer with exit 2. `--classify`
+    alone (full corpus) and `--update --filter X` (safe: starts from the
+    existing baseline) remain supported.
+    """
+
+    # Mirror the note `--update` writes back (runner.py ~line 294). Seeding
+    # with the same note lets the size assertion hold: the rendered output is
+    # byte-identical when the matching rows are already banked at the same
+    # verdict.
+    UPDATE_NOTE = ("Observed verdicts, banked by runner.py. A `fail` row is a "
+                   "recorded divergence between the spec and the implementation, "
+                   "not a case to edit. See README.md.")
+
+    def setUp(self):
+        import shutil as _shutil
+        self._shutil = _shutil
+        self.base = tempfile.mkdtemp()
+        write_corpus(self.base, [ACCEPT, REJECT])
+        corpus.main(["build"], base_dir=self.base)
+        self.bezelc = os.path.join(self.base, "bezelc")
+        with open(self.bezelc, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.bezelc, 0o755)
+        self.baseline = os.path.join(self.base, "baseline.tsv")
+        # Seed baseline with the manifest's cases so --update --filter X
+        # replaces matching rows in place (size preserved). The refuse path
+        # must not touch baseline.tsv at all, so its size MUST match.
+        rows = corpus.read_manifest(os.path.join(self.base, "manifest.tsv"))
+        seed = {r["case-id"]: {"verdict": "pass", "note": ""} for r in rows}
+        with open(self.baseline, "w", encoding="utf-8") as f:
+            f.write(runner.render_baseline(seed, self.UPDATE_NOTE))
+        self.size_before = os.path.getsize(self.baseline)
+        self.case_to_filter = rows[0]["case-id"]
+
+    def tearDown(self):
+        self._shutil.rmtree(self.base, ignore_errors=True)
+
+    def _stderr_of(self, func):
+        buf = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = buf
+        try:
+            rc = func()
+        finally:
+            sys.stderr = saved
+        return rc, buf.getvalue()
+
+    def _fake(self):
+        # The fake compiler returns rc=0 (compile success) for every case. For
+        # ACCEPT (expect=accept) this is a pass; for REJECT (expect=reject)
+        # this is a fail — same verdict that --classify / --update would bank
+        # pre-fix, so the test does not couple to a different verdict.
+        return lambda cmd, cwd=None: (0, "")
+
+    def test_classify_with_filter_refuses_with_exit_2(self):
+        rc, err = self._stderr_of(lambda: runner.main(
+            [self.bezelc, "--classify", "--filter", self.case_to_filter,
+             "--baseline", self.baseline],
+            base_dir=self.base, run=self._fake()))
+        self.assertEqual(rc, 2)
+        # Diagnostic names the refused combination, the safe alternative,
+        # and the issue.
+        self.assertIn("--classify", err)
+        self.assertIn("--filter", err)
+        self.assertIn("#4814", err)
+        self.assertIn("--update", err)
+        # baseline.tsv is untouched on the refuse path.
+        self.assertEqual(os.path.getsize(self.baseline), self.size_before)
+
+    def test_classify_alone_still_works(self):
+        # The supported full-corpus path. baseline.tsv is rewritten by --classify,
+        # but only because the user asked for it on the full set.
+        rc = runner.main([self.bezelc, "--classify", "--baseline", self.baseline],
+                         base_dir=self.base, run=self._fake())
+        self.assertEqual(rc, 0)
+        banked = runner.read_baseline(self.baseline)
+        self.assertGreater(len(banked), 0)
+
+    def test_update_with_filter_preserves_the_baseline(self):
+        # The safe path: --update starts from `dict(baseline)`, so non-matching
+        # rows survive and matching rows are replaced in place. The seeded
+        # baseline contains every manifest row, so the size is preserved.
+        rc = runner.main(
+            [self.bezelc, "--update", "--filter", self.case_to_filter,
+             "--baseline", self.baseline],
+            base_dir=self.base, run=self._fake())
+        self.assertEqual(rc, 0)
+        self.assertEqual(os.path.getsize(self.baseline), self.size_before)
+        banked = runner.read_baseline(self.baseline)
+        self.assertIn(self.case_to_filter, banked)
 
 
 if __name__ == "__main__":
