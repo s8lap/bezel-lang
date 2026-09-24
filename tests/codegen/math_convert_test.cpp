@@ -307,6 +307,7 @@ namespace {
 const char* kBox =
     "module M; import System; "
     "class Box(v: int): IComparable<Box> "
+    "  public readonly property V: int := v; "
     "  public method CompareTo(other: Box): int => "
     "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
     "end Box; ";
@@ -322,21 +323,21 @@ BEZEL_TEST(math_comparable_1148, min_class_explicit_type_arg) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
         "  var lo := Math.Min<Box>(a, b); "
-        "  return lo.v;")), 99);
+        "  return lo.V;")), 99);
 }
 
 // #1148: inferred form Math.Min(a, b) also dispatches via CompareTo.
 BEZEL_TEST(math_comparable_1148, min_class_inferred) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
-        "  return Math.Min(a, b).v;")), 99);
+        "  return Math.Min(a, b).V;")), 99);
 }
 
 // #1148: Math.Max<Box> returns the greater class instance — Box(150) > Box(99).
 BEZEL_TEST(math_comparable_1148, max_class) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
-        "  return Math.Max<Box>(a, b).v;")), 150);
+        "  return Math.Max<Box>(a, b).V;")), 150);
 }
 
 // #1148: Math.Clamp<Box> — below range clamps to lo (Box(80) → Box(99)).
@@ -344,7 +345,7 @@ BEZEL_TEST(math_comparable_1148, clamp_class_below_range) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var v := new Box(80); "
         "  using var lo := new Box(99); using var hi := new Box(150); "
-        "  return Math.Clamp<Box>(v, lo, hi).v;")), 99);
+        "  return Math.Clamp<Box>(v, lo, hi).V;")), 99);
 }
 
 // #1148: Math.Clamp<Box> — above range clamps to hi (Box(200) → Box(150)).
@@ -352,7 +353,7 @@ BEZEL_TEST(math_comparable_1148, clamp_class_above_range) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var v := new Box(200); "
         "  using var lo := new Box(99); using var hi := new Box(150); "
-        "  return Math.Clamp<Box>(v, lo, hi).v;")), 150);
+        "  return Math.Clamp<Box>(v, lo, hi).V;")), 150);
 }
 
 // #1148: Math.Clamp<Box> — in range returns the value unchanged (Box(120)).
@@ -360,7 +361,7 @@ BEZEL_TEST(math_comparable_1148, clamp_class_in_range) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var v := new Box(120); "
         "  using var lo := new Box(99); using var hi := new Box(150); "
-        "  return Math.Clamp<Box>(v, lo, hi).v;")), 120);
+        "  return Math.Clamp<Box>(v, lo, hi).V;")), 120);
 }
 
 // ── #1215 / §14.2: Math.Min/Max/Clamp over a NULLABLE class IComparable ──────
@@ -378,7 +379,7 @@ BEZEL_TEST(math_comparable_1215, min_nullable_class_rejected) {
         std::string(kBox) +
         "class App public static method Main(): int "
         "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
-        "  return Math.Min(a, b).v;"
+        "  return Math.Min(a, b).V;"
         " end Main; end App;"));
 }
 
@@ -388,7 +389,7 @@ BEZEL_TEST(math_comparable_1215, max_nullable_class_rejected) {
         std::string(kBox) +
         "class App public static method Main(): int "
         "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
-        "  return Math.Max(a, b).v;"
+        "  return Math.Max(a, b).V;"
         " end Main; end App;"));
 }
 
@@ -399,7 +400,7 @@ BEZEL_TEST(math_comparable_1215, clamp_nullable_class_rejected) {
         "class App public static method Main(): int "
         "  using var v: Box? := new Box(120); "
         "  using var lo: Box? := new Box(99); using var hi: Box? := new Box(150); "
-        "  return Math.Clamp(v, lo, hi).v;"
+        "  return Math.Clamp(v, lo, hi).V;"
         " end Main; end App;"));
 }
 
@@ -409,7 +410,7 @@ BEZEL_TEST(math_comparable_1215, min_nullable_explicit_type_arg_rejected) {
         std::string(kBox) +
         "class App public static method Main(): int "
         "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
-        "  return Math.Min<Box?>(a, b).v;"
+        "  return Math.Min<Box?>(a, b).V;"
         " end Main; end App;"));
 }
 
@@ -417,7 +418,7 @@ BEZEL_TEST(math_comparable_1215, min_nullable_explicit_type_arg_rejected) {
 BEZEL_TEST(math_comparable_1215, min_nonnull_class_still_works) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
-        "  return Math.Min(a, b).v;")), 99);
+        "  return Math.Min(a, b).V;")), 99);
 }
 
 // ── #1875 / §14.2 (clause 4) / stdlib §2.2: enforce `where T: IComparable<T>` ─
@@ -448,6 +449,7 @@ bool diagContains(const std::string& src, const std::string& needle) {
 const char* kUncomparable =
     "module M; import System; "
     "class Plain(v: int) "
+    "  public readonly property V: int := v; "
     "  public method Cmp(o: Plain): int return 0; end Cmp; "
     "end Plain; ";
 std::string plainMain(const std::string& body) {
@@ -463,7 +465,7 @@ const char* kConstraintNeedle = "does not satisfy the constraint";
 BEZEL_TEST(math_comparable_1875, max_nonconforming_class_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(plainMain(
         "  using var a := new Plain(1); using var b := new Plain(2); "
-        "  var m := Math.Max(a, b); return m.v;"),
+        "  var m := Math.Max(a, b); return m.V;"),
         kConstraintNeedle));
 }
 
@@ -471,7 +473,7 @@ BEZEL_TEST(math_comparable_1875, max_nonconforming_class_rejected) {
 BEZEL_TEST(math_comparable_1875, min_nonconforming_class_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(plainMain(
         "  using var a := new Plain(1); using var b := new Plain(2); "
-        "  var m := Math.Min(a, b); return m.v;"),
+        "  var m := Math.Min(a, b); return m.V;"),
         kConstraintNeedle));
 }
 
@@ -480,7 +482,7 @@ BEZEL_TEST(math_comparable_1875, clamp_nonconforming_class_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(plainMain(
         "  using var v := new Plain(1); "
         "  using var lo := new Plain(0); using var hi := new Plain(2); "
-        "  var m := Math.Clamp(v, lo, hi); return m.v;"),
+        "  var m := Math.Clamp(v, lo, hi); return m.V;"),
         kConstraintNeedle));
 }
 
@@ -489,7 +491,7 @@ BEZEL_TEST(math_comparable_1875, clamp_nonconforming_class_rejected) {
 BEZEL_TEST(math_comparable_1875, max_nonconforming_class_explicit_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(plainMain(
         "  using var a := new Plain(1); using var b := new Plain(2); "
-        "  var m := Math.Max<Plain>(a, b); return m.v;"),
+        "  var m := Math.Max<Plain>(a, b); return m.V;"),
         kConstraintNeedle));
 }
 
@@ -525,7 +527,7 @@ BEZEL_TEST(math_comparable_1875, max_nonconforming_enum_rejected) {
 BEZEL_TEST(math_comparable_1875, conforming_class_still_runs) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
-        "  return Math.Max(a, b).v;")), 150);
+        "  return Math.Max(a, b).V;")), 150);
 }
 
 // ── #1858 / §5 (Math.Min/Max/Clamp) / §11 (IComparable) / §14.2 ──────────────
