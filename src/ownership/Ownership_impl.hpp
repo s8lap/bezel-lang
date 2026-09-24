@@ -3336,13 +3336,17 @@ private:
     // borrow. Accepted, the new holder disposed the payloads and the
     // scrutinee's owner disposed them again: MEASURED heap-use-after-free
     // (#4803) at every one of those positions, over a choice scrutinee, a
-    // nested move-only choice payload, an owning inline array scrutinee, a
-    // borrowed parameter scrutinee, and an owning match's non-destructuring
-    // arm (#4684's whole-value borrow).
+    // nested move-only choice payload, an owning inline array scrutinee, and
+    // a borrowed parameter scrutinee. An owning match's NON-DESTRUCTURING arm
+    // binding (`case move o of var y => do var z := y; end`) is EXEMPT and
+    // was measured ASan-clean: codegen's #4609 whole-value moved-from mark
+    // makes the consume dispose exactly once. Whether §35.5 rejects that
+    // consume is the open ruling #4821.
     //
     // Keyed by SYMBOL; filled by `registerBorrowOnlyArmBindings` with every
     // non-transferred arm binding whose type is move-only (both kinds —
-    // the class-scoped `borrowOnlyArmBindings_` skips inline arrays).
+    // the class-scoped `borrowOnlyArmBindings_` skips inline arrays), except
+    // the owning-match non-destructuring binding above.
     // // per §15.3, §19.3, §35.5, §28.3 K3.12, v0.307
     std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
         borrowOnlyMoveOnlyArmBindings_;
