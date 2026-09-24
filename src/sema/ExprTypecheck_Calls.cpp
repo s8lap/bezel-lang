@@ -18511,6 +18511,66 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // narrow #4809 (§5.1 / §4.2, v0.307, follow-up to #4766 / commit 6173e0c6):
+    // the unannotated built-in static-property reads on the `DateTime` and
+    // `TimeSpan` type names — `DateTime.UtcNow`, `DateTime.Now`, `DateTime.
+    // Today`, `DateTime.MinValue`, `DateTime.MaxValue`, `TimeSpan.Zero` — must
+    // resolve to a typed DateTime / TimeSpan Named TypeRef BEFORE the
+    // `if (!targetType && ma.target)` block below assigns targetType to the
+    // DateTime/TS-builtin TypeSymbol (the L18648 arm does so via
+    // `dynamic_cast<TypeSymbol*>(sym)` against `lookupName` for the
+    // IdentifierExpr target). The §2.5 handler that performs that typing
+    // sits at L19712, INSIDE the `if (!targetType)` block — but by then
+    // targetType has already been set, so the typing never fires; `DateTime.
+    // UtcNow` is left UNTYPED, `var n: int := DateTime.UtcNow;` reaches
+    // `checkAssignable` with a null source, and §5.1 is skipped. This is
+    // #4809's residual of #4766 (the parent fix wired the assignability
+    // AFTER typing; the typing step itself was left dead for these
+    // built-in static-property reads).
+    //
+    // Mirror the early `if (ma.target)` shape of the CancellationToken.None /
+    // IntPtr.Zero / Encoding.UTF8 handlers immediately above so this typing
+    // runs before the `lookupName` → TypeSymbol arm in the next block and
+    // the §5.1 implicit-conversion check sees a fully-typed DateTime/TS
+    // source. Concretely:
+    //   * `var n: int := DateTime.UtcNow;` — REJECT (§5.1: no implicit
+    //     conversion DateTime → int; §4.2 row for `int` does not name
+    //     DateTime as a source).
+    //   * `var d: DateTime := DateTime.UtcNow;` — ACCEPT (the source's
+    //     Named DateTime typeref matches the target's Named DateTime
+    //     typeref by identity).
+    //   * `var n: int := TimeSpan.Zero;` — REJECT (same §5.1 reason).
+    //   * `var t: TimeSpan := TimeSpan.Zero;` — ACCEPT.
+    // The DateTime static-property typing below builds a Named TypeRef
+    // carrying declaration = builtinClassSym("DateTime") / "TimeSpan", the
+    // same shape §2.5 already declares on `DateTime.UtcNow: DateTime` /
+    // `TimeSpan.Zero: TimeSpan`, so codegen's `DateTime` / `TimeSpan`
+    // builders receive a typeref they already accept.
+    if (ma.target) {
+        if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(
+                ma.target.get())) {
+            if (did->name == "DateTime") {
+                if (ma.member == "Now" || ma.member == "UtcNow" ||
+                    ma.member == "Today" || ma.member == "MinValue" ||
+                    ma.member == "MaxValue") {
+                    auto* dt = ctx_.makeTypeRef();
+                    dt->kind = TypeRef::Kind::Named;
+                    dt->declaration = builtinClassSym("DateTime");
+                    ctx_.setExprType(&ma, dt);
+                    return;
+                }
+            }
+            if (did->name == "TimeSpan") {
+                if (ma.member == "Zero") {
+                    auto* ts = ctx_.makeTypeRef();
+                    ts->kind = TypeRef::Kind::Named;
+                    ts->declaration = builtinClassSym("TimeSpan");
+                    ctx_.setExprType(&ma, ts);
+                    return;
+                }
+            }
+        }
+    }
     if (!targetType && ma.target) {
         auto* tt = ctx_.exprType(*ma.target);
         // stdlib §5 (#651): IGrouping<TKey, T> property accesses.
