@@ -5,7 +5,8 @@
 //! rule: State match on reassignment: an owned-state LHS requires an owned RHS;
 //!   assigning a borrow to an owned-state LHS is rejected.
 //! expect: reject
-//! diagnostic: borrow
+//! diagnostic: owned-state
+//! issue: 4842, 4846
 module Conf;
 
 public class Widget
@@ -16,7 +17,10 @@ end Widget;
 public class Program
   public method Demo()
     var best := new Widget();
-    var next := new Widget();
-    best := next;
+    var other := new Widget();
+    var next := other;       // next is a borrow of OTHER (cross-source); the borrow's
+                              // source is `other`, not `best`, so the consume-site
+                              // freeze on `best` is silent here
+    best := next;            // assigning cross-source borrow to owned-state LHS — REJECT
   end Demo;
 end Program;
