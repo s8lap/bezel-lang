@@ -5246,6 +5246,50 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #4768 (§5.1 / §14.2 / §3.6 rule 2, v0.307): a bare TYPE PARAMETER
+    // of the enclosing generic declaration into a CONCRETE primitive. §5.1's
+    // only conversion out of a type parameter is "to an interface or class
+    // its constraints guarantee conformance to … inside the generic body a
+    // T-typed value converts to the bound" (plus `Object`, handled far
+    // above), and §3.6 rule 2 fixes WHERE that is judged: "a generic body
+    // type-checks under the weakest assumption its constraints establish".
+    // No constraint names a primitive, so `var t: int := v;` for `v: T` has
+    // no conversion under ANY constraint set, and is rejected at the
+    // declaration rather than per instantiation.
+    //
+    // Before this arm the shape reached the catch-all and was silently
+    // accepted: at `T = int` it ran with the payload reinterpreted, and at
+    // `T = string` codegen aborted the IR verifier ("Function return type
+    // does not match operand type of return inst!").
+    //
+    // Scope: only names in `currentScopeGenericParamNames()` — the enclosing
+    // type's, method's and extension target's own parameters, i.e. a
+    // parameter this body is generic OVER. A callee's free parameter
+    // leaking out unsubstituted (`freeTypeParamNames`) is a different
+    // question (an inference gap, not a conversion) and is left to flow
+    // through. A bare reference only: `T` with no generic args and no
+    // declaration, which is also exactly the shape a type parameter that
+    // shadows a builtin name (`class Box<Array>`) takes.
+    {
+        std::string_view tpHead =
+            (from->kind == TypeRef::Kind::Named && !from->declaration &&
+             from->genericArgs.empty())
+                ? from->headName()
+                : std::string_view();
+        bool toConcretePrimitive = to->kind == TypeRef::Kind::Primitive &&
+                                   to->primitive != PrimitiveType::Object;
+        if (!tpHead.empty() && toConcretePrimitive &&
+            currentScopeGenericParamNames().count(tpHead)) {
+            reportNotConvertible(
+                std::string("`") + std::string(tpHead) +
+                "` is a type parameter, and a generic body converts a "
+                "type-parameter value only to `Object` and to the bounds its "
+                "constraints guarantee (§5.1, §14.2) — never to a primitive; "
+                "constrain `" + std::string(tpHead) +
+                "` to an interface that exposes the value you need");
+            return;
+        }
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
