@@ -265,9 +265,125 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // builtinClassSym-declaration form). Passing resTy (FrozenArray<T>) yields
     // the same bz_array_t* shape an Array<T> target would — and bz_array_copy
     // doesn't care about the source TypeRef's nominal identity.
+    //
+    // Ownership tracking: per §4.19, `From(items: Array<T>)` COPIES — the
+    // caller still owns `items`. The pre-#4850 path unconditionally freed
+    // `src` at the end, which double-freed a borrowed-lvalue source at
+    // scope exit (the calling `using var xs: Array<string>` still owns its
+    // buffer; the SEGV at `bz_array_free:294` is `xs`'s scope-end dispose
+    // dereferencing already-freed storage).
+    //
+    // The v1 fix (#4850 6dcfb9d7) gated on `literal || owned || move` and
+    // mis-classified every other fresh rvalue (call results, instance-method
+    // results like `xs.ToArray()`, conditional/match yielding a fresh array)
+    // as a borrowed lvalue — leaking the source across 200 iterations of
+    // `FrozenArray<int>.From(Make(i))` per #4850 v2 (cycle-25 main measured
+    // 24120 bytes / 402 allocations). The rework inverts the predicate: a
+    // source is BORROWED only when it is a place expression (IdentifierExpr,
+    // MemberAccessExpr, IndexExpr — `this.field` is a MemberAccessExpr);
+    // anything else is an rvalue and the call owns the storage. The `owned`
+    // modifier and the `move` UnaryExpr (§28.3 move form) still override —
+    // caller-stated transfer, independently of the place/rvalue distinction.
+    const ast::Expr* argValue = call.args[0].value.get();
+    bool sourceIsMoved = (call.args[0].modifier == "owned");
+    if (!sourceIsMoved) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(argValue)) {
+            if (un->op == "move") sourceIsMoved = true;
+        }
+    }
+    // sourceHasFreshStorage — recursive helper that returns true iff the
+    // expression's storage is freshly allocated here (i.e. the call, not
+    // some outer local, owns it). The rework's predicate is the inverse:
+    //   sourceOwnedHere = sourceHasFreshStorage(argValue)
+    //                       OR explicit `owned` / `move` mark.
+    // Built locally (not lifted to the header) because #4850 v2 is the only
+    // call site that needs the recursive conditional/match walk; pulling it
+    // up would have wider review surface for no current benefit.
+    //
+    // The walk:
+    //   * `move e` — the §28.3 transfer mark. The modifier says the caller
+    //     has yielded storage; the call owns the source. Return TRUE
+    //     regardless of what `e` is (an IdentifierExpr operand is the common
+    //     case, and the move already null'd the local at parse time).
+    //   * literal / NewExpr of a class / interface / builtin collection,
+    //     CallExpr (treated as a fresh rvalue — the called method either
+    //     returns `owned T` or returns a fresh local whose +1 transfers):
+    //     owned here.
+    //   * ConditionalExpr / MatchExpr: owned iff every branch arm is owned.
+    //   * IdentifierExpr / MemberAccessExpr / IndexExpr / anything else:
+    //     BORROWED. The local-or-field's scope-end dispose is the source's
+    //     owner — unconditionally freeing here would double-free that
+    //     storage at scope end, the very defect #4850 fixed.
+    //
+    // ⚠ #4850 v3 (cycle-25 main 2026-09-25): an earlier draft walked
+    // IdentifierExpr → LocalDecl → initializer, recursing into a fresh
+    // ConditionalExpr through the local binding. That mis-classified
+    // `var src := if c then Make(i) else [i+1000]; FrozenArray.From(src)`
+    // as OWNED — the call freed the ConditionalExpr's storage AND the
+    // local's scope-end dispose freed it again (double-free). Fix: an
+    // IdentifierExpr (or any other place expression) is ALWAYS borrowed;
+    // the caller's local owns the storage. The conditional/match fresh
+    // shape is reached only when the conditional/match IS the direct
+    // argument (no binding local).
+    std::function<bool(const ast::Expr*)> hasFreshStorage =
+        [&](const ast::Expr* e) -> bool {
+        if (!e) return false;
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            // `move e` — the §28.3 transfer mark; always owns.
+            if (un->op == "move") return true;
+            return false;
+        }
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(e)) return true;
+        if (dynamic_cast<const ast::NewExpr*>(e)) {
+            const sema::TypeRef* rt = ctx_.exprType(*e);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+                if (rt->declaration) {
+                    if (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                        rt->declaration->kind == ast::TypeDeclKind::Interface)
+                        return true;
+                } else if (rt->astNode && rt->astNode->name &&
+                           !rt->astNode->name->parts.empty()) {
+                    std::string_view n = rt->headName();
+                    if (n == "Array" || n == "OwningArray" ||
+                        n == "OwningBuffer" || n == "Stack" || n == "OwningStack" ||
+                        n == "Queue" || n == "OwningQueue" ||
+                        n == "LinkedList" || n == "OwningLinkedList" ||
+                        n == "Set" || n == "OwningSet" || n == "SortedSet" ||
+                        n == "Dictionary" || n == "OwningDictionary" ||
+                        n == "SortedDictionary")
+                        return true;
+                }
+            }
+            return false;
+        }
+        if (dynamic_cast<const ast::CallExpr*>(e)) return true;
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            return hasFreshStorage(c->thenValue.get()) &&
+                   hasFreshStorage(c->elseValue.get());
+        }
+        if (auto* m = dynamic_cast<const ast::CaseExpr*>(e)) {
+            if (m->arms.empty()) return false;
+            for (const auto& arm : m->arms) {
+                // Expression-body arms expose their value via exprBody;
+                // block-body arms are unsupported by this walk (the
+                // borrow-pin extends across the whole block, so a free here
+                // would double-free the local at scope end) — be
+                // conservative and reject.
+                if (arm.bodyKind != ast::CaseArmBodyKind::Expression) return false;
+                if (!hasFreshStorage(arm.exprBody.get())) return false;
+            }
+            return true;
+        }
+        // Place expressions (IdentifierExpr, MemberAccessExpr, IndexExpr) and
+        // anything else: BORROWED. The unconditional free here would double-
+        // free an outer owner's storage at scope end — the very defect #4850
+        // fixed.
+        return false;
+    };
+    const bool sourceOwnedHere = sourceIsMoved || hasFreshStorage(argValue);
+
     llvm::Value* src = nullptr;
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
-            call.args[0].value.get())) {
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(argValue)) {
         if (!cl->isDict) {
             src = materializeHeapCollectionLiteral(cl, resTy);
         } else {
@@ -275,8 +391,12 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
         }
     }
     if (!src) {
-        // Not a collection literal (e.g. a named Array<T> variable) — fall
-        // through to lowerExpr for the ordinary expression path.
+        // Not a collection literal (e.g. a named Array<T> variable, a call
+        // result, an instance-method result, a conditional) — fall through
+        // to lowerExpr for the ordinary expression path. Per the rework
+        // predicate above, all non-place expressions are owned here, so the
+        // source-disposal below frees a fresh storage whose owner is the
+        // call, not a borrowed lvalue whose owner is the caller.
         src = lowerExpr(*call.args[0].value);
     }
     if (!src) return nullptr;
@@ -295,12 +415,17 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // type is a no-op.
     emitArrayRetainStringsIfStringArray(resTy, copy);
 
-    // §28.3: free the source Array<T> temporary now that the FrozenArray owns
-    // its own copy. The source's element policy is the borrowing form (no
-    // disposer), matching the bz_array_free call's null 2nd arg.
-    auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy()});
-    builder_.CreateCall(freeFn, {src, llvm::ConstantPointerNull::get(ptrTy())});
+    // §28.3: free the source storage ONLY when ownership transferred into the
+    // call (literal / `move` / explicit `owned` modifier). The source's
+    // element policy is the borrowing form (no disposer), matching the
+    // bz_array_free call's null 2nd arg. For a borrowed-lvalue source
+    // (the `FrozenArray<string>.From(xs)` idiom in #4850), the caller's
+    // `using var xs` remains the owner and would double-free here.
+    if (sourceOwnedHere) {
+        auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+        builder_.CreateCall(freeFn, {src, llvm::ConstantPointerNull::get(ptrTy())});
+    }
     return copy;
 }
 
