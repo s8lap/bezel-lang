@@ -307,6 +307,17 @@ const Entry kWarningDegrades[] = {
 // ever substituted; the site returns before evaluating the RHS or invoking any
 // store, so the bounded harm is a stale slot, not a manufactured pointer) —
 // so the count stays 9.
+//
+// #4790 (v0.307) is judged here but deliberately has NO entry above: its
+// lowerNew site in src/codegen/LlvmBackend_Exprs2.cpp ("codegen selected no
+// constructor for this `new` that sema accepted … — #4790") landed as a
+// Warning, and this test caught it. Its disposition is UnsafePointer: no
+// constructor body or field initializer runs, so the object is calloc-zero
+// and every string/class/collection field is a null pointer, and a `new`
+// always DEMANDS its value (the program reads those fields as objects, the
+// #2922 shape). Per this file's instructions it was made an Error instead of
+// being recorded as a shipped hazard. It is therefore outside the Warning
+// population this test pins, and the count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 struct Site {

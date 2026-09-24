@@ -9450,8 +9450,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `null`-into-`T` arguments. Codegen's selector must be at least as
         // permissive as sema's; when it is not, say so, in the established
         // `internal:` degradation convention (#2434 / #2658).
+        //
+        // Error, not Warning (#2924's disposition, R20 gate): the object is
+        // calloc-zero, so every string / class / collection field is a null
+        // pointer, and a `new` always demands its value — the program goes
+        // on to read those fields as objects (#2922 measured exactly that
+        // shape: a null `string` and a SIGSEGV at address 0x8). Shipping a
+        // binary here would be a memory-safety hazard inside a successful
+        // compile, so the compile fails instead.
         ctx_.diagnostics().report(
-            Severity::Warning, ne.span.begin,
+            Severity::Error, ne.span.begin,
             "internal: codegen selected no constructor for this `new` that "
             "sema accepted, so no constructor body or field initializer runs "
             "and the object is default-initialized — #4790");
