@@ -33,6 +33,11 @@
 #include "support/sema_support.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "module/ModuleLoader.hpp"
+#include "module/ModuleMetadataBuilder.hpp"
+#include "lexer/Lexer.hpp"
+#include "parser/Parser.hpp"
 #include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
@@ -52,6 +57,21 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
 // True iff ONE error diagnostic carries every needle.
 bool hasDiagWithAll(const bezel::test::SemaResult& r,
                     std::initializer_list<std::string_view> needles) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        bool all = true;
+        for (auto n : needles)
+            if (d.message.find(n) == std::string::npos) all = false;
+        if (all) return true;
+    }
+    return false;
+}
+
+// Mirror for `compileUncalled` (the runAot-driven helper for fold-fault
+// rows that need the §17.14 evaluation-fault path, which the sema-only
+// `check()` helper cannot reach — the fold-fault diagnostic is emitted
+// from a non-sema pass that only runs in the full AOT pipeline).
+bool hasDiagWithAllJit(const bezel::test::JitResult& r,
+                       std::initializer_list<std::string_view> needles) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         bool all = true;
         for (auto n : needles)
@@ -445,15 +465,220 @@ BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
 // `decimal.MaxValue + 1m` already overflows, so the fold's left-to-right
 // evaluation would reject the whole expression. Use a chain whose every
 // step is in-range: `decimal.MaxValue - decimal.MaxValue + 1m` evaluates
-// as `(decimal.MaxValue - decimal.MaxValue) + 1m = 1m`, which fits.
-// The expression sits inside `var l: long :=` so the call body's
-// `int`-typed return is unaffected.
+// as `(decimal.MaxValue - decimal.MaxValue) + 1m = 1m`, which fits. The
+// outer `int(...)` then narrows 1m to int and the return type is satisfied.
 BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
            decimal_max_value_minus_max_plus_one_compiles_4844) {
     auto r = compileUncalled(
-        "var l: long := long(decimal.MaxValue - decimal.MaxValue + 1m); "
-        "return 0;");
+        "int(decimal.MaxValue - decimal.MaxValue + 1m)");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+}
+
+// =====================================================================
+// #4843 / §5.3 / §17.14 (v0.307) — three residuals of #4801 fold.
+//
+// 1. Imported float / decimal / bool consts (#3230's integer pattern).
+// 2. `if` constant expression — (if c then a else b) folds when c, a, b
+//    are all §17.14 constant expressions (§17.14's inductive set).
+// 3. Nullable primitive cast `T?(x)` — per §5.3, `T?(x)` carries its
+//    constant-operand compile error (§5.2, §5.4); the nullable target
+//    does NOT lift the §5.2 / §17.14 fault.
+// =====================================================================
+
+// --- Sub-issue 2: if constant expression --------------------------------
+
+// ACCEPT control: `if true then 1.0 else 2.0` folds to 1.0 — pins that the
+// ConditionalExpr arm of foldNumConstExprTC (fix #4843) admits a literal
+// condition. Without the fix the fold path falls through to nullopt and the
+// outer explicit conversion `int((if ...))` is NOT a §5.2 compile error (the
+// fold never reaches the value-check arm), so the program would compile.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           if_constant_expression_folds_4843) {
+    auto r = compileUncalled("int((if true then 1.0 else 2.0))");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+}
+
+// REJECT: `if true then 1.0e30 else 0.0` folds to 1.0e30 (a constant
+// expression), so `int((if true then 1.0e30 else 0.0))` is a §5.2
+// compile error at the conversion site (the constant is out of `int`'s
+// range). Without the fix, the if-expression arm of foldNumConstExprTC
+// returned nullopt and the §5.2 reject at the explicit conversion never
+// fired — the program would compile.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           int_of_if_constant_out_of_range_rejected_4843) {
+    auto r = compileUncalled("int((if true then 1.0e30 else 0.0))");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAllJit(
+        r, {"a `double` constant expression whose value is `1e+30`",
+            "conversion to `int`", kTrunc}));
+}
+
+// --- Sub-issue 3: nullable cast `T?(x)` ---------------------------------
+
+// REJECT: per §5.3, `T?(x)` carries "its constant-operand compile error
+// (§5.2, §5.4)". The fold's `int?(1.0e30)` shape: a §5.2 reject at the
+// explicit conversion site, mirroring `int(1.0e30)` (which #4801 already
+// rejects). The diagnostic must name the nullable-target form and cite
+// §5.2 + §17.14. Without the fix (a helper called from the
+// NullCondCallExpr handler that mirrors typeCall's primitive-cast arm),
+// the Nullable arm of §5.2 silently admits the conversion and the program
+// compiles; runtime raises OverflowException on first call.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           int_question_of_double_out_of_range_rejected_4843) {
+    auto r = compileUncalled("int?(1.0e30)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAllJit(
+        r, {"a `double` constant expression whose value is `1e+30`",
+            "conversion to `int`", kTrunc, "nullable"}));
+}
+
+// REJECT: `uint?(-1)` — integer narrowing / same-width signedness change
+// at a compile-time-constant integer operand. The non-nullable `uint(-1)`
+// is already rejected by typeCall's primitive-cast arm; the nullable
+// `uint?(-1)` mirrors that rule per §5.3. Without the fix the program
+// compiles and runtime raises OverflowException on first call.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           uint_question_of_negative_one_rejected_4843) {
+    auto r = compileUncalled("uint?(-1)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Pin the §5.2 wording AND the "nullable" marker so a non-nullable
+    // arm's diagnostic (which lacks the marker) cannot satisfy the row.
+    BEZEL_EXPECT_TRUE(hasDiagWithAllJit(
+        r, {"the compile-time-constant operand `-1`",
+            "explicit conversion to `uint`", "nullable"}));
+}
+
+// REJECT: `byte?(300)` — integer narrowing at a compile-time-constant
+// integer operand (300 is out of byte's 0..255 range). Without the fix the
+// program compiles; runtime raises OverflowException on first call.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           byte_question_of_out_of_range_rejected_4843) {
+    auto r = compileUncalled("byte?(300)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAllJit(
+        r, {"the compile-time-constant operand `300`",
+            "explicit conversion to `byte`", "nullable"}));
+}
+
+// REJECT: `char?(0xD800)` — integer-to-`char` code-point range at a
+// constant operand (0xD800 is in the surrogate range U+D800..U+DFFF, which
+// §5.2 forbids). The non-nullable `char(0xD800)` is already rejected; the
+// nullable `char?(0xD800)` mirrors that rule per §5.3.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           char_question_of_surrogate_rejected_4843) {
+    auto r = compileUncalled("char?(0xD800)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAllJit(
+        r, {"the compile-time-constant operand `55296`",
+            "is not a valid Unicode code point", "nullable"}));
+}
+
+// ACCEPT control: `int?(42)!` — in-range nullable integer narrowing
+// compiles and unwraps to 42. Pins that the §5.3 arm of #4843 is
+// targeted, not blanket-rejecting nullable primitive casts. The `!`
+// postfix unwraps the nullable to its underlying `int` (§7.4); since
+// 42 is in `int`'s range the §5.2 reject never fires.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           int_question_of_in_range_compiles_4843) {
+    auto r = compileUncalled("int?(42)!");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("compiled\n"));
+}
+
+// --- Sub-issue 1: imported float / decimal / bool consts -----------------
+//
+// The ModuleLoader-populated typed-value channels (`floatValue`,
+// `decimalValue`, `boolValue`, `declaredPrimitiveType` on
+// `ConstMemberSymbol`) carry the typed value for an IMPORTED
+// `const K: T;` because the symbol has no AST initializer (the loader
+// reconstructs it from dependency metadata, fix #3230's pattern).
+// Without the fix, the loader drops `MetaMember::valueText` on the floor
+// for a non-integer primitive and the channels the fold reads are empty.
+//
+// This row is a STRUCTURAL test on the loader — it builds a dependency
+// module's metadata, loads it into a fresh importer context, and asserts
+// that `C.K`'s `ConstMemberSymbol` carries the typed `double` value
+// `1.0e30` (the same one the local `CK` test reads through the AST
+// path). The full fold → §5.2 reject path cannot be exercised here
+// because the cross-module qualified-const reach is out of scope (filed
+// as #2986 — the fold's MemberAccessExpr arm only resolves a local
+// `C.K`, not a `Lib.C.K`); the loader side is what #4843 actually
+// touches.
+BEZEL_TEST(s5_2_float_constant_expr_folding_4801,
+           imported_double_const_float_value_populated_4843) {
+    using bezel::DiagnosticEngine;
+    using bezel::Lexer;
+    using bezel::Parser;
+    DiagnosticEngine diags;
+    auto libSrc = std::string(
+        "module Lib; "
+        "public class C "
+        "  public static const K: double := 1.0e30; "
+        "end C;");
+    Lexer lexer(libSrc, diags);
+    Parser parser(lexer, diags);
+    auto sf = parser.parseCompilationUnit();
+    BEZEL_EXPECT_TRUE(sf != nullptr);
+    bezel::sema::SemaContext libCtx(diags);
+    bezel::sema::collectSymbols(*sf, libCtx);
+    bezel::sema::resolveTypes(*sf, libCtx);
+    bezel::sema::typecheckExpressions(*sf, libCtx);
+    BEZEL_EXPECT_FALSE(diags.hasErrors());
+    auto dep = bezel::module::buildModuleMetadata(libCtx, libSrc);
+
+    auto importerSrc = std::string(
+        "module App; "
+        "import Lib; "
+        "public class M "
+        "  public static method Main(): int return 0; end Main; "
+        "end M;");
+    DiagnosticEngine impDiags;
+    Lexer impLexer(importerSrc, impDiags);
+    Parser impParser(impLexer, impDiags);
+    auto impSf = impParser.parseCompilationUnit();
+    BEZEL_EXPECT_TRUE(impSf != nullptr);
+    bezel::sema::SemaContext impCtx(impDiags);
+    bezel::sema::collectSymbols(*impSf, impCtx);
+    bezel::module::loadMetadata(dep, impCtx);
+    bezel::sema::resolveTypes(*impSf, impCtx);
+    BEZEL_EXPECT_FALSE(impDiags.hasErrors());
+    // Find the imported `C` class via the importer's
+    // `importedByModule_` table (the loader registers the dependency's
+    // type symbols there under the module's dotted name, §2.8.3 rule 3).
+    // Its `K` member is a `ConstMemberSymbol` whose `floatValue` must
+    // carry `1.0e30` (the typed value the loader reads from
+    // `MetaMember::valueText`).
+    auto* libTypes = impCtx.importedTypesOf("Lib");
+    BEZEL_EXPECT_TRUE(libTypes != nullptr);
+    bool foundK = false;
+    if (libTypes) {
+        for (auto* ts : *libTypes) {
+            if (!ts || ts->name != "C") continue;
+            for (auto* sym : ts->members) {
+                auto* cms = dynamic_cast<bezel::sema::ConstMemberSymbol*>(sym);
+                if (!cms || cms->name != "K") continue;
+                foundK = true;
+                BEZEL_EXPECT_TRUE(cms->floatValue.has_value());
+                if (cms->floatValue) {
+                    // The textual carrier is rounded to the destination
+                    // precision (Double here, so no rounding); 1.0e30
+                    // fits in a double exactly.
+                    BEZEL_EXPECT_TRUE(*cms->floatValue == 1.0e30);
+                }
+                BEZEL_EXPECT_TRUE(cms->declaredPrimitiveType.has_value());
+                if (cms->declaredPrimitiveType) {
+                    BEZEL_EXPECT_TRUE(*cms->declaredPrimitiveType ==
+                                      bezel::sema::PrimitiveType::Double);
+                }
+                break;
+            }
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(foundK);
 }

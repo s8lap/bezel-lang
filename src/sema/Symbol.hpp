@@ -12,6 +12,7 @@
 // the base). Symbols are owned by SemaContext (slice 1) and live for the
 // duration of compilation.
 
+#include <array>
 #include <cstdint>
 #include <functional>  // #3145: anyRecordStorageField's predicate
 #include <memory>
@@ -21,6 +22,10 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/TypeRef.hpp"  // for `PrimitiveType` (fix #4843 — fold reads
+                              // declaredPrimitiveType to recover the `float`
+                              // vs `double` precision when reading floatValue
+                              // for an imported const).
 #include "support/SourceLocation.hpp"
 
 // fix #3169: `sema::recordStorageMembers` takes an optional
@@ -898,6 +903,52 @@ struct ConstMemberSymbol : MemberSymbol {
     // a legitimate zero (a `:= 0` initializer sets the value to 0, not to
     // "unset").
     std::optional<std::int64_t> intValue;
+    // fix #4843 (§5.2 / §17.14, v0.307; residual of #4801): the typed
+    // `float` / `double` value, populated for IMPORTED consts by
+    // ModuleLoader from `MetaMember::valueText` (parsed by the same
+    // `strtod` path `binaryFloatLiteralValue` uses for literals). The
+    // `#4801` `ExprTC::foldNumConstExprTC` declined an IMPORTED
+    // float/decimal const because the SEAM-DEBT it carried left no AST
+    // initializer to fall back on; the fold closures now consult this
+    // field (and `decimalValue` below) for the import case, the same
+    // pattern fix #3230 used for integers. A `float` const's value is the
+    // double-truncated single-precision value (the same shape codegen
+    // emits); the field is `std::nullopt` when the textual carrier is not
+    // a finite float (`1.0e400` is a §4.3 formation error in the producer,
+    // not a fold fault to recover here) or when the const's declared type
+    // is not a binary-float primitive.
+    std::optional<double> floatValue;
+    // fix #4843 (§5.2 / §17.14, v0.307): the typed `decimal` value as the
+    // 4-word `bz_decimal_t` layout (lo32, mid32, hi32, flags — the same
+    // shape FoldDecimal in ExprTypecheck_Calls.cpp carries). Populated
+    // for IMPORTED consts by ModuleLoader from `MetaMember::valueText`
+    // (parsed by the runtime `bz_decimal_parse_cstr` path the fold's
+    // `decimalLiteralValue` already uses). The field is `std::nullopt`
+    // when the textual carrier fails §4.4 formation or when the const's
+    // declared type is not `decimal`.
+    std::optional<std::array<std::uint32_t, 4>> decimalValue;
+    // fix #4843 (§17.14, v0.307): the typed `bool` value, populated for
+    // IMPORTED `const B := true;`-style consts by ModuleLoader from
+    // `MetaMember::valueText`. The fold's if-expression arm reads this so
+    // `int((if Lib.C.B then 1.0e30 else 0.0))` reaches the §5.2 constant-
+    // operand reject exactly as `int(Lib.C.B)` already does for integers.
+    std::optional<bool> boolValue;
+    // fix #4843 (§17.14, v0.307): the const's DECLARED primitive type,
+    // populated for BOTH local and imported consts whose declared type is a
+    // primitive (`int`, `float`, `double`, `decimal`, `bool`, etc.). For a
+    // LOCAL const the sema resolveTypes / checkConstTypes pass sets it
+    // from the AST; for an IMPORTED const `cms->decl` is null (the symbol
+    // is reconstructed from dependency metadata) and ModuleLoader sets it
+    // from `MetaMember::type.primitive`. The field exists because the
+    // fold's `floatValue`/`decimalValue`/`boolValue` readers need the
+    // destination precision (`float` is single, `double` is double) — the
+    // textual carrier was rounded to the right precision at parse time,
+    // but the fold must know which `K::` enum value to emit. Empty for a
+    // const whose declared type is not a primitive (records, classes,
+    // enums, etc.) and for a non-foldable initializer; default is
+    // `std::nullopt` so an unset type is distinguishable from a primitive
+    // type that happens to be the default value.
+    std::optional<PrimitiveType> declaredPrimitiveType;
 };
 
 struct EnumConstantSymbol : MemberSymbol {

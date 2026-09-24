@@ -9278,6 +9278,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // type to that primitive nullable (e.g. `long?`) so that inferred
         // locals, null checks, and the `!` unwrap all see the correct type.
         bool typedAsPrimCast = false;
+        PrimitiveType primCastTarget = PrimitiveType::None;
+        const ast::IdentifierExpr* primCastCalleeId = nullptr;
         if (nc->callee) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(nc->callee.get())) {
@@ -9287,9 +9289,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         ctx_.setExprType(
                             &e, ctx_.primitiveTypeRef(pt, /*nullable=*/true));
                         typedAsPrimCast = true;
+                        primCastTarget = pt;
+                        primCastCalleeId = id;
                     }
                 }
             }
+        }
+        // fix #4843 / §5.3 / §17.14 (v0.307): `T?(x)` carries "its constant-
+        // operand compile error (§5.2, §5.4)" — `T?(x)` is `T(x)` for §5.2's
+        // constant-operand rule (a nullable target doesn't lift the
+        // constant-operand fault), so `int?(1.0e30)` and `uint?(-1)` are
+        // §17.14 compile errors at the conversion site, not deferred
+        // runtime faults. The fold path lives in the non-nullable
+        // `typeCall` (ExprTypecheck_Calls.cpp) — the NullCondCallExpr handler
+        // runs the same fold for the primitive-cast arm and emits the §5.2
+        // diagnostic so the spec's "T?(x) carries its constant-operand
+        // compile error" posture is enforced.
+        if (typedAsPrimCast && nc->args.size() == 1 && nc->args[0].value &&
+            primCastCalleeId) {
+            checkNullableCastConstantOperand(*nc->args[0].value,
+                                             primCastTarget,
+                                             primCastCalleeId->name,
+                                             nc->span.begin);
         }
         if (!typedAsPrimCast) {
             // §27.7 (#738): `f?(args)` invokes the nullable function value `f`

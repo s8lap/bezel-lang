@@ -2312,6 +2312,26 @@ private:
                                std::string_view opSpelling,
                                SourceLocation fallbackLoc);
 
+    // fix #4843 / §5.3 / §5.2 / §17.14 (v0.307): `T?(x)` carries "its
+    // constant-operand compile error (§5.2, §5.4)" — `T?(x)` is `T(x)` for
+    // §5.2's constant-operand rule. The non-nullable arm of the rule
+    // already runs in `typeCall` for the `CallExpr` shape (`T(x)`); the
+    // nullable arm runs through this helper from the `NullCondCallExpr`
+    // handler in ExprTypecheck_Exprs.cpp (`T?(x)`, where `?(` parses as a
+    // 2-char punctuator). `target` is the cast's destination primitive
+    // type; `targetName` is its textual spelling (e.g. `"int"` for
+    // `PrimitiveType::Int`) for the diagnostic; `operand` is the
+    // conversion's single argument; `loc` is the source location for the
+    // diagnostic. The decimal-fault arm of `foldNumConstExprTC` already
+    // emits its own §17.14 error at the constant expression (#4844); this
+    // helper adds the integer-narrowing and float/double/decimal → integer
+    // checks so `uint?(-1)` and `int?(1.0e30)` are §5.2 compile errors at
+    // the conversion site.
+    void checkNullableCastConstantOperand(const ast::Expr& operand,
+                                          PrimitiveType target,
+                                          std::string_view targetName,
+                                          SourceLocation loc);
+
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type
     // resolution); a local const is only in scope during this pass, so when a

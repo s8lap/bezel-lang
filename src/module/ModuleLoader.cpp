@@ -1,6 +1,9 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>     // fix #4843: std::isfinite (float/double carrier parse)
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -140,6 +143,98 @@ std::optional<std::int64_t> parseImportedConstIntText(std::string_view text) {
         static_cast<std::uint64_t>(common::parseIntLiteral(mag));
     return negative ? static_cast<std::int64_t>(~mv + 1u)
                     : static_cast<std::int64_t>(mv);
+}
+
+// fix #4843 (§5.2 / §17.14, v0.307): an IMPORTED `float` / `double`
+// const's textual value. Same shape as `binaryFloatLiteralValue` in
+// ExprTypecheck_Calls.cpp (strtod on the digits-only carrier, then a
+// single-precision truncation for a `float` target) — nullopt on a
+// non-finite value (an out-of-range literal is already a §4.3 formation
+// error in the producer, so the caller's nullopt arm is the same
+// fall-back the integer parse already takes).
+std::optional<double> parseImportedConstFloatText(std::string_view text,
+                                                  bool isFloat) {
+    if (text.empty()) return std::nullopt;
+    // The textual carrier is the post-normalisation digits (Appendix
+    // A.1's FloatSuffix was already stripped at the producer). Reject a
+    // non-numeric leading char the way `parseImportedConstIntText` does:
+    // a non-literal reference would silently fold to 0 otherwise.
+    const char c0 = text.front();
+    if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-' || c0 == '.'))
+        return std::nullopt;
+    // Strip the `_` separators the textual channel admits (Appendix A.1's
+    // grouping character) — `strtod` does not consume them.
+    std::string digits;
+    digits.reserve(text.size());
+    for (char c : text) {
+        if (c == '_') continue;
+        digits.push_back(c);
+    }
+    char* end = nullptr;
+    double v = std::strtod(digits.c_str(), &end);
+    if (end == digits.c_str()) return std::nullopt;
+    if (isFloat) v = static_cast<double>(static_cast<float>(v));
+    if (!std::isfinite(v)) return std::nullopt;
+    return v;
+}
+
+// fix #4843 (§5.2 / §17.14, v0.307): an IMPORTED `decimal` const's
+// textual value as the 4-word `bz_decimal_t` layout. The same
+// `decimalLiteralValue` path used in ExprTypecheck_Calls.cpp (the runtime
+// `bz_decimal_parse_cstr` parser, faulted by the same `bz_exc` probe).
+// nullopt when the textual carrier fails §4.4 formation in the producer
+// (the producer's §4.4 diagnostic is the source of truth — a fold
+// recovery would be a second-pass error).
+//
+// Implemented inline in this TU (ModuleLoader is linked into the same
+// `bezel_core` library as ExprTypecheck_Calls.cpp, so the runtime's
+// `bz_decimal_parse_cstr` and `bz_exc` are addressable here). Per
+// ExprTypecheck_Calls.cpp the layout is `{lo32, mid32, hi32, flags}` and
+// a fault is a store into the thread-local `bz_exc` slot.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                      void* ove_vtable, void* fe_vtable);
+extern "C" void** bz_exc_addr();
+extern "C" void bz_set_exc(void* slot, void* vtable);
+
+std::optional<std::array<std::uint32_t, 4>>
+parseImportedConstDecimalText(std::string_view text) {
+    if (text.empty()) return std::nullopt;
+    // Strip `_` separators and the trailing `m`/`M` suffix (Appendix A.1).
+    std::string digits;
+    digits.reserve(text.size());
+    for (char c : text) {
+        if (c == '_') continue;
+        if (c == 'm' || c == 'M') continue;
+        digits.push_back(c);
+    }
+    if (digits.empty()) return std::nullopt;
+    std::array<std::uint32_t, 4> dec{0, 0, 0, 0};
+    unsigned char sentinel = 0;
+    void** excSlot = bz_exc_addr();
+    void* saved = *excSlot;
+    *excSlot = nullptr;
+    bz_decimal_parse_cstr(digits.c_str(), dec.data(), &sentinel, &sentinel);
+    const bool faulted = (*excSlot != nullptr);
+    if (faulted) {
+        // `bz_set_exc` calloc's the vtable-on-stack slot; free it so it
+        // doesn't leak into the next probe (the slot is reused, but the
+        // heap bytes would otherwise persist across module loads).
+        std::free(*excSlot);
+    }
+    *excSlot = saved;
+    if (faulted) return std::nullopt;
+    return dec;
+}
+
+// fix #4843 (§17.14, v0.307): an IMPORTED `bool` const's textual value.
+// The textual channel carries the producer's renderConstExpr output —
+// `true` / `false` for a literal (§4.5), or a const-reference name for
+// the const-reference arm (which we decline, matching the integer
+// parse's nullopt-on-non-literal posture).
+std::optional<bool> parseImportedConstBoolText(std::string_view text) {
+    if (text == "true") return true;
+    if (text == "false") return false;
+    return std::nullopt;
 }
 
 ast::TypeDeclKind fromMetaTypeDeclKind(MetaTypeDeclKind k) {
@@ -988,11 +1083,49 @@ struct Loader {
                 if (!mm.valueText.empty() && mm.type.kind == TypeKind::Primitive) {
                     const sema::PrimitiveType p =
                         fromPrimitiveKind(mm.type.primitive);
+                    // fix #4843 / §5.2 / §17.14 (v0.307): carry the const's
+                    // DECLARED primitive type alongside the typed value, so
+                    // the fold's `floatValue`/`decimalValue`/`boolValue`
+                    // reader in ExprTypecheck_Calls.cpp can recover the
+                    // `float` vs `double` precision. An imported const has
+                    // no AST (`cms->decl == nullptr`), so this side channel
+                    // is the only way to know what K:: enum to emit.
+                    c->declaredPrimitiveType = p;
                     using P = sema::PrimitiveType;
                     if (p == P::Byte || p == P::SByte || p == P::Short ||
                         p == P::UShort || p == P::Int || p == P::UInt ||
                         p == P::Long || p == P::ULong) {
                         c->intValue = parseImportedConstIntText(mm.valueText);
+                    } else if (p == P::Float || p == P::Double) {
+                        // fix #4843 / §5.2 / §17.14 (v0.307): the typed
+                        // `float` / `double` value, the same path
+                        // `binaryFloatLiteralValue` uses for literals. A
+                        // `float` const's textual carrier is rounded to
+                        // single precision the same way codegen does
+                        // (fix #4801's measurement). std::nullopt on a
+                        // non-finite value (an out-of-range literal is
+                        // already a §4.3 formation error in the producer).
+                        if (auto dv = parseImportedConstFloatText(
+                                mm.valueText, p == P::Float))
+                            c->floatValue = *dv;
+                    } else if (p == P::Decimal) {
+                        // fix #4843 / §5.2 / §17.14 (v0.307): the typed
+                        // `decimal` value as the 4-word `bz_decimal_t`
+                        // layout, the same path `decimalLiteralValue`
+                        // uses for literals. std::nullopt when the textual
+                        // carrier fails §4.4 formation in the producer
+                        // (a fold recovery would be a second-pass error).
+                        if (auto dv =
+                                parseImportedConstDecimalText(mm.valueText))
+                            c->decimalValue = std::array<std::uint32_t, 4>{
+                                (*dv)[0], (*dv)[1], (*dv)[2], (*dv)[3]};
+                    } else if (p == P::Bool) {
+                        // fix #4843 / §17.14 (v0.307): the typed `bool`
+                        // value, so the if-expression arm of the fold can
+                        // carry the boolean through an imported class const
+                        // the same way the integer fold carries `intValue`.
+                        if (auto bv = parseImportedConstBoolText(mm.valueText))
+                            c->boolValue = *bv;
                     }
                 }
                 applyBehavior(c);

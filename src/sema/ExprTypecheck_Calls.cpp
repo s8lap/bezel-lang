@@ -2723,8 +2723,9 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         // §17.14: a reference to a `const` — local or class-level (the same
         // two declaration kinds foldConstIdentTC walks). An IMPORTED
-        // floating const carries no AST initializer and no folded value
-        // (ConstMemberSymbol::intValue is integer-only), so it is declined.
+        // floating const carries no AST initializer; fix #4843 falls back
+        // to the typed value the loader populated (`floatValue` /
+        // `decimalValue`), the same pattern fix #3230 used for integers.
         Symbol* s = lookupName(id->name, foldInDeclScope_);
         if (!s) return std::nullopt;
         const ast::Expr* val = nullptr;
@@ -2732,11 +2733,38 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
             val = lc->value.get();
         else
             val = constInitializer(s);
-        if (!val) return std::nullopt;
-        // fix #4856 (§17.14 / §2.8.3, v0.307): a class const's initializer
-        // names are resolved in its DECLARING scope, not the use site's.
-        r = inConstDeclScope(
-            s, [&] { return foldNumConstExprTC(*val, depth + 1); });
+        if (val) {
+            // fix #4856 (§17.14 / §2.8.3, v0.307): a class const's initializer
+            // names are resolved in its DECLARING scope, not the use site's.
+            r = inConstDeclScope(
+                s, [&] { return foldNumConstExprTC(*val, depth + 1); });
+        } else if (auto* cms = dynamic_cast<ConstMemberSymbol*>(s)) {
+            // fix #4843 / §5.2 / §17.14 (v0.307): an IMPORTED `const K: T;`
+            // carries no AST initializer, so the AST path above returned
+            // nullopt. Read the typed value the loader populated — for
+            // float/double it is `floatValue`; for `decimal` it is
+            // `decimalValue`. A nullopt means the textual carrier was not
+            // a §17.14-foldable form (the producer's §4.3/§4.4 diagnostic
+            // is the source of truth, so we decline silently rather than
+            // re-diagnose).
+            if (cms->floatValue) {
+                const PrimitiveType pt = cms->declaredPrimitiveType.value_or(
+                    PrimitiveType::Double);
+                if (pt == PrimitiveType::Float) {
+                    r = makeBin(K::Float, *cms->floatValue);
+                } else if (pt == PrimitiveType::Double) {
+                    r = makeBin(K::Double, *cms->floatValue);
+                }
+            } else if (cms->decimalValue) {
+                FoldedNumConst dv;
+                dv.kind = K::Decimal;
+                dv.dec[0] = (*cms->decimalValue)[0];
+                dv.dec[1] = (*cms->decimalValue)[1];
+                dv.dec[2] = (*cms->decimalValue)[2];
+                dv.dec[3] = (*cms->decimalValue)[3];
+                r = dv;
+            }
+        }
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         auto* head = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
         if (!head) return std::nullopt;
@@ -2795,11 +2823,87 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                 dynamic_cast<ConstMemberSymbol*>(lookupMember(ts, ma->member));
             if (!cms) return std::nullopt;
             const ast::Expr* val = constInitializer(cms);
-            if (!val) return std::nullopt;
-            // fix #4856: fold `C.K`'s initializer in C's scope.
-            r = inConstDeclScope(
-                cms, [&] { return foldNumConstExprTC(*val, depth + 1); });
+            if (val) {
+                // fix #4856: fold `C.K`'s initializer in C's scope.
+                r = inConstDeclScope(
+                    cms, [&] { return foldNumConstExprTC(*val, depth + 1); });
+            } else {
+                // fix #4843 / §5.2 / §17.14 (v0.307): an IMPORTED
+                // `C.K: T;` — same arm as the bare-identifier path above,
+                // but reached through `MemberAccessExpr`. The loader's
+                // typed value is read here so `int(Lib.C.K)` for an
+                // imported double / decimal const folds the same way it
+                // does for an integer const (fix #3230's pattern).
+                if (cms->floatValue) {
+                    const PrimitiveType pt = cms->declaredPrimitiveType.value_or(
+                        PrimitiveType::Double);
+                    if (pt == PrimitiveType::Float) {
+                        r = makeBin(K::Float, *cms->floatValue);
+                    } else if (pt == PrimitiveType::Double) {
+                        r = makeBin(K::Double, *cms->floatValue);
+                    }
+                } else if (cms->decimalValue) {
+                    FoldedNumConst dv;
+                    dv.kind = K::Decimal;
+                    dv.dec[0] = (*cms->decimalValue)[0];
+                    dv.dec[1] = (*cms->decimalValue)[1];
+                    dv.dec[2] = (*cms->decimalValue)[2];
+                    dv.dec[3] = (*cms->decimalValue)[3];
+                    r = dv;
+                }
+            }
         }
+    } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        // fix #4843 / §17.14 (v0.307): `(if c then a else b)` is a constant
+        // expression when c, a, and b are constant expressions. A
+        // boolean-typed condition is a §17.14 constant in two forms — a
+        // literal (`true` / `false`) is one by §17.14's literal arm, and a
+        // `const B := true;` reference reads as the same literal by §17.14's
+        // const-reference arm. The branch is folded recursively, so an
+        // arithmetic-branch operand that itself faults fires the §17.14 arm
+        // of THIS function (the decimal overflow / divide-by-zero path
+        // above) at the same site — the issue's repro
+        // `int((if true then 1.0e30 else 0.0))` now reports the §5.2
+        // constant-operand compile error on `1.0e30` exactly as it does for
+        // `int(1.0e30)`.
+        if (!ce->condition || !ce->thenValue || !ce->elseValue)
+            return std::nullopt;
+        std::optional<bool> cv;
+        if (auto* bl = dynamic_cast<const ast::BoolLiteralExpr*>(
+                ce->condition.get())) {
+            cv = bl->value;
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                       ce->condition.get())) {
+            // fix #4843: a `const B := true;`-style boolean reference
+            // (§17.14's const-reference arm). Walk the same lexical path
+            // the integer fold walks (fix #3617), but for the boolean
+            // arm: a class-level const carries its initializer through
+            // `boolValue` (added below) the way integer consts carry
+            // `intValue`. A missing value leaves the fold declined.
+            Symbol* s = lookupName(id->name, foldInDeclScope_);
+            if (s) {
+                if (auto* lc =
+                        dynamic_cast<const ast::LocalConstDecl*>(s->decl)) {
+                    if (lc->value) {
+                        if (auto* bl2 = dynamic_cast<
+                                const ast::BoolLiteralExpr*>(lc->value.get()))
+                            cv = bl2->value;
+                    }
+                } else if (auto* cd =
+                               dynamic_cast<const ast::ConstDecl*>(s->decl)) {
+                    if (cd->value) {
+                        if (auto* bl2 = dynamic_cast<
+                                const ast::BoolLiteralExpr*>(cd->value.get()))
+                            cv = bl2->value;
+                    }
+                } else if (auto* cms = dynamic_cast<ConstMemberSymbol*>(s)) {
+                    if (cms->boolValue) cv = *cms->boolValue;
+                }
+            }
+        }
+        if (!cv) return std::nullopt;
+        auto branch = *cv ? ce->thenValue.get() : ce->elseValue.get();
+        return foldNumConstExprTC(*branch, depth + 1);
     }
     if (!r) return std::nullopt;
     // The node's own static type is authoritative (`const K: double := 1;`
@@ -13176,6 +13280,160 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 TypeRef* nn = ctx_.makeTypeRef(*ct);
                 nn->nullable = true;
                 ctx_.setExprType(&ce, nn);
+            }
+        }
+    }
+}
+
+// fix #4843 / §5.3 / §17.14 (v0.307): the nullable primitive-cast form
+// `T?(x)` carries "its constant-operand compile error (§5.2, §5.4)" per
+// §5.3 — a nullable target does NOT lift the constant-operand fault, so
+// `int?(1.0e30)`, `uint?(-1)`, `char?(0xD800)` and the rest are §17.14
+// compile errors at the conversion site, not deferred runtime faults.
+// This is the NullCondCallExpr mirror of the same checks `typeCall` runs
+// for the non-nullable `T(x)` form (lines ~3310–3620 above): §5.2's
+// integer narrowing / same-width signedness change, integer-to-`char`
+// code-point range, and float/double/decimal → integer (or `char`) and
+// binary float → `decimal` rules all apply identically. `target` is the
+// cast's destination primitive type; `targetName` is its textual spelling
+// (e.g. `"int"`) for the diagnostic; `operand` is the conversion's single
+// argument; `loc` is the diagnostic location (the cast site, not the
+// operand). The fold path lives here (not in the call-site handler)
+// because all the fold-result predicates (`truncatedDoubleFits`,
+// `truncatedDecimalFits`, `decimalOpFaults`) are file-static in this TU.
+void ExprTC::checkNullableCastConstantOperand(const ast::Expr& operand,
+                                              PrimitiveType target,
+                                              std::string_view targetName,
+                                              SourceLocation loc) {
+    using K = FoldedNumConst::Kind;
+    const TypeRef* argTy = ctx_.exprType(operand);
+    if (!argTy || argTy->kind != TypeRef::Kind::Primitive) return;
+    PrimitiveType srcPt = argTy->primitive;
+    const std::string tgt(targetName);
+    const bool srcIsIntish =
+        srcPt == PrimitiveType::Byte  || srcPt == PrimitiveType::SByte ||
+        srcPt == PrimitiveType::Short || srcPt == PrimitiveType::UShort ||
+        srcPt == PrimitiveType::Int   || srcPt == PrimitiveType::UInt  ||
+        srcPt == PrimitiveType::Long  || srcPt == PrimitiveType::ULong ||
+        srcPt == PrimitiveType::Char;
+    const bool tgtIsNarrowerInt =
+        target == PrimitiveType::SByte || target == PrimitiveType::Byte  ||
+        target == PrimitiveType::Short || target == PrimitiveType::UShort ||
+        target == PrimitiveType::Int   || target == PrimitiveType::UInt  ||
+        target == PrimitiveType::Long  || target == PrimitiveType::ULong;
+    // (a) integer narrowing / same-width signedness change at a
+    // compile-time-constant integer operand — `fits` mirrors the inlined
+    // `fits` from typeCall's primitive-cast arm; do not re-use a
+    // different boundary.
+    if (tgtIsNarrowerInt && srcIsIntish) {
+        if (auto cv = foldIntConstExprTC(operand)) {
+            auto fits = [](long long v, PrimitiveType tgt) {
+                switch (tgt) {
+                    case PrimitiveType::SByte:
+                        return v >= -128 && v <= 127;
+                    case PrimitiveType::Byte:
+                        return v >= 0 && v <= 255;
+                    case PrimitiveType::Short:
+                        return v >= -32768 && v <= 32767;
+                    case PrimitiveType::UShort:
+                        return v >= 0 && v <= 65535;
+                    case PrimitiveType::Int:
+                        return v >= -2147483648LL && v <= 2147483647LL;
+                    case PrimitiveType::UInt:
+                        return v >= 0 && v <= 4294967295LL;
+                    case PrimitiveType::ULong:
+                        return v >= 0;
+                    default:
+                        return true;
+                }
+            };
+            if (!fits(*cv, target)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "the compile-time-constant operand `" +
+                    std::to_string(*cv) +
+                    "` of the explicit conversion to `" + tgt +
+                    "` (with a nullable target per §5.3 `T?(x)`) would raise "
+                    "`OverflowException`; §5.2 rejects a faulting constant "
+                    "operand at the conversion site, not as a deferred "
+                    "runtime fault (§17.14, v0.307)");
+                return;
+            }
+        }
+    }
+    // (b) integer-to-`char` code-point range at a constant operand.
+    if (target == PrimitiveType::Char && srcIsIntish) {
+        if (auto cv = foldIntConstExprTC(operand)) {
+            long long v = *cv;
+            if (v < 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "the compile-time-constant operand `" +
+                    std::to_string(v) +
+                    "` of the explicit conversion to `char` (with a nullable "
+                    "target per §5.3 `T?(x)`) is not a valid Unicode code "
+                    "point (U+0000–U+10FFFF excluding U+D800–U+DFFF); §5.2 "
+                    "rejects a faulting constant operand at the conversion "
+                    "site (§17.14, v0.307)");
+                return;
+            }
+        }
+    }
+    // (c) float/double/decimal → integer (or `char`) at a constant
+    // operand; (d) binary float → `decimal` at a constant operand —
+    // mirrors typeCall's (c)/(d) arms (lines ~3525–3620 above).
+    const bool srcIsFloatish =
+        srcPt == PrimitiveType::Float ||
+        srcPt == PrimitiveType::Double ||
+        srcPt == PrimitiveType::Decimal;
+    const bool toIntegral = tgtIsNarrowerInt || target == PrimitiveType::Char;
+    const bool toDecimal =
+        target == PrimitiveType::Decimal && srcPt != PrimitiveType::Decimal;
+    if (srcIsFloatish && (toIntegral || toDecimal)) {
+        auto folded = foldNumConstExprTC(operand);
+        if (folded && folded->kind != K::Int) {
+            using FK = FoldedNumConst::Kind;
+            const bool isDec = folded->kind == FK::Decimal;
+            const FoldDecimal dv{
+                folded->dec[0], folded->dec[1], folded->dec[2], folded->dec[3]};
+            const double d = folded->d;
+            const char* kind =
+                isDec ? "decimal" : folded->kind == FK::Float ? "float" : "double";
+            bool fits = true;
+            if (toDecimal) {
+                FoldDecimal out{0, 0, 0, 0};
+                fits = !decimalOpFaults([&](void* vt) {
+                    bz_decimal_from_double(d, &out, vt);
+                });
+            } else if (isDec) {
+                fits = truncatedDecimalFits(truncatedDecimal(dv), target);
+            } else if (std::isfinite(d)) {
+                fits = truncatedDoubleFits(std::trunc(d), target);
+            } else {
+                fits = false;
+            }
+            if (!fits) {
+                const std::string val =
+                    isDec ? formatFoldedDecimal(dv) : formatFoldedDouble(d);
+                std::string msg =
+                    "the compile-time-constant operand (a `" +
+                    std::string(kind) +
+                    "` constant expression whose value is `" + val +
+                    "`) of the explicit conversion to `" + tgt +
+                    "` (with a nullable target per §5.3 `T?(x)`) would "
+                    "raise `OverflowException`";
+                if (toDecimal)
+                    msg += ": `NaN`, `±Infinity` and magnitudes outside "
+                           "`decimal`'s range have no `decimal` value";
+                else if (!isDec && !std::isfinite(d))
+                    msg += ": `NaN` and `±Infinity` have no integer value";
+                else
+                    msg += " after truncation toward zero";
+                msg += "; §5.2 rejects a faulting constant operand at the "
+                       "conversion site, not as a deferred runtime fault "
+                       "(§17.14, v0.307; fix #4843)";
+                ctx_.diagnostics().report(Severity::Error, loc, msg);
+                return;
             }
         }
     }
