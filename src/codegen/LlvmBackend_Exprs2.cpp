@@ -10774,25 +10774,30 @@ llvm::Value* Emitter::buildRecordValue(
                 fieldArg[i] = &args[i];
         } else {
             // §22.5 / #540: map each named argument to the field with that name.
-            // per §22.5, named arguments may appear in any order after positional
-            // arguments, but a positional record has no explicit constructor so
-            // all arguments must be named (or all positional — the mixed case
-            // is rejected by sema).
+            // fix #4776 / §22.5 (v0.307): sema defers combined-form record `new`
+            // resolution to codegen, so a mixed positional+named call such as
+            // `new P(1, Y := 2)` reaches this path. A named arg maps to the
+            // positional field of the same name. A positional arg in a mixed call
+            // maps to the positional field at the same index — the same rule the
+            // all-positional arm above uses.
             for (std::size_t ai = 0; ai < args.size(); ++ai) {
                 const ast::CallArgument& a = args[ai];
                 if (a.name.empty()) {
-                    // positional arg in a mixed call — fall through to body path.
-                    mappingOk = false; break;
-                }
-                bool found = false;
-                for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
-                    if (posFields[fi]->name == a.name) {
-                        fieldArg[fi] = &a;
-                        found = true;
-                        break;
+                    // positional arg in a mixed call — bind to the positional field
+                    // at the same index, exactly as the all-positional arm does.
+                    if (ai < posFields.size()) fieldArg[ai] = &a;
+                    else { mappingOk = false; break; }
+                } else {
+                    bool found = false;
+                    for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                        if (posFields[fi]->name == a.name) {
+                            fieldArg[fi] = &a;
+                            found = true;
+                            break;
+                        }
                     }
+                    if (!found) { mappingOk = false; break; }
                 }
-                if (!found) { mappingOk = false; break; }
             }
             // Verify every field got an argument.
             if (mappingOk) {
