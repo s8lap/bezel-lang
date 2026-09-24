@@ -400,20 +400,27 @@ BEZEL_TEST(codegen_numeric_conv, double_int_max_boundary_739) {
 }
 
 // byte (unsigned 8-bit): 200.0 fits, 300.0 overflows; negative also overflows.
+// #4724 (§5.2 constant-operand rule, v0.307): route the overflow operand
+// through a `double` local so the runtime conversion throws
+// `OverflowException` (the test's intent), not a compile-time reject.
 BEZEL_TEST(codegen_numeric_conv, double_to_byte_range_739) {
     BEZEL_EXPECT_EQ(run(
         "var ok: double := 200.0; var v := byte(ok); "
-        "try var w := byte(300.0); return 1; "
+        "var overflow: double := 300.0; "
+        "try var w: byte := byte(overflow); return 1; "
         "catch OverflowException => return int(v); end;"),  // 200
         200);
 }
 
 // long (signed 64-bit): a value below long.MaxValue casts; 1e19 overflows.
+// #4724 (§5.2 constant-operand rule, v0.307): route the overflow operand
+// through a `double` local so the runtime conversion throws.
 BEZEL_TEST(codegen_numeric_conv, double_to_long_range_739) {
     BEZEL_EXPECT_EQ(run(
         "var a: double := 9.0e18; var b: long := long(a); "
         "var inrange := (if b > 8999999000000000000L then 1 else 0); "
-        "try var c: long := long(1.0e19); return 1; "
+        "var overflow: double := 1.0e19; "
+        "try var c: long := long(overflow); return 1; "
         "catch OverflowException => return inrange; end;"),  // 1
         1);
 }

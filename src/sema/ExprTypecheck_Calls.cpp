@@ -1,8 +1,12 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
 #include <algorithm>  // std::find (isCaptureFreeEntry's static-modifier check)
+#include <cctype>     // std::tolower — fix #4724 literal-suffix read
+#include <cmath>      // std::trunc, std::isfinite — fix #4724 (§5.2, v0.307)
+#include <cstdlib>    // std::strtod, std::free — fix #4724
 
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
+#include "runtime/bezel_runtime.h"  // bz_decimal_t, bz_decimal_parse_cstr, bz_exc_addr — fix #4724 (§4.4 literal parser)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
@@ -264,6 +268,125 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
                "\xC2\xA7""26.5 extension provides `" + m + "`";
     }
     return {};
+}
+
+// fix #4724 (§5.2 / §4.3 / §4.4 / Appendix A.1, v0.307): the constant-operand
+// fold of a float/double/decimal literal operand of an explicit conversion to
+// an integer (or `char`) target. §5.2: "Floating-point to integer truncates
+// toward zero; ... out-of-range values raise `OverflowException`" — so the
+// fold TRUNCATES FIRST and range-checks the truncated value (`byte(-0.5)` is
+// 0, not a fault).
+
+// The literal text with `_` digit separators (Appendix A.1 DigitGroup, which
+// the exponent also uses) and the type suffix removed — the identical
+// normalisation the literal-formation range check (ExprTypecheck_Exprs.cpp)
+// and codegen's materialisation (LlvmBackend_Exprs.cpp) apply before parsing,
+// so the fold sees the value the program will actually carry.
+std::string floatLiteralDigitsForFold(std::string_view text, bool isDecimal) {
+    std::string digits;
+    for (char c : text) {
+        if (c == '_') continue;
+        if (isDecimal ? (c == 'm' || c == 'M')
+                      : (c == 'f' || c == 'F' || c == 'd' || c == 'D'))
+            continue;
+        digits.push_back(c);
+    }
+    return digits;
+}
+
+// A `decimal` literal's value truncated toward zero, negated when `negate`,
+// computed EXACTLY (96-bit mantissa / 10^scale in 128-bit arithmetic — no
+// IEEE rounding, so `long(9223372036854775807m)` folds to long.MaxValue).
+// nullopt when the runtime literal parser faults (malformed or beyond
+// `decimal`'s range — the latter already a §4.3/§4.4 formation error), so the
+// caller skips the fold rather than reading an unwritten value or cascading
+// a second diagnostic.
+std::optional<__int128> truncatedDecimalLiteral(std::string_view text,
+                                                bool negate) {
+    const std::string digits = floatLiteralDigitsForFold(text, true);
+    if (digits.empty()) return std::nullopt;
+    bz_decimal_t dec{0, 0, 0, 0};
+    // Non-null sentinel vtables make both failure kinds observable as a
+    // `bz_exc` store (a null vtable is bz_set_exc's silent no-op); the slot is
+    // saved and restored around the probe, as decimalLiteralOutOfRange does.
+    unsigned char sentinel = 0;
+    void** excSlot = bz_exc_addr();
+    void* saved = *excSlot;
+    *excSlot = nullptr;
+    bz_decimal_parse_cstr(digits.c_str(), &dec, &sentinel, &sentinel);
+    const bool failed = (*excSlot != nullptr);
+    if (failed) std::free(*excSlot);  // bz_set_exc's calloc'd object
+    *excSlot = saved;
+    if (failed) return std::nullopt;
+    const __uint128_t mant = ((__uint128_t)dec.hi32 << 64) |
+                             ((__uint128_t)dec.mid32 << 32) |
+                             (__uint128_t)dec.lo32;
+    uint32_t scale = (dec.flags >> 16) & 0xFFu;
+    __uint128_t whole = mant;
+    while (scale-- > 0 && whole != 0) whole /= 10;
+    const bool neg = (((dec.flags >> 31) & 1u) != 0) != negate;
+    // |whole| < 2^96, so the signed value is exact in __int128.
+    return neg ? -(__int128)whole : (__int128)whole;
+}
+
+// A `float`/`double` literal's value, negated when `negate`, truncated toward
+// zero IN THE DOUBLE DOMAIN (no integer cast, so no UB on a huge magnitude).
+// A `float` literal is materialised as `(float)strtod(digits)` by codegen and
+// is rounded the same way here. nullopt when the literal is non-finite — an
+// out-of-range literal is already a §4.3 formation error, and a second
+// diagnostic at the conversion would only cascade.
+std::optional<double> truncatedBinaryFloatLiteral(std::string_view text,
+                                                  bool isFloat, bool negate) {
+    const std::string digits = floatLiteralDigitsForFold(text, false);
+    if (digits.empty()) return std::nullopt;
+    double v = std::strtod(digits.c_str(), nullptr);
+    if (isFloat) v = (double)(float)v;
+    if (!std::isfinite(v)) return std::nullopt;
+    if (negate) v = -v;
+    return std::trunc(v);
+}
+
+// Range of an integer (or `char`) conversion target, as closed bounds on the
+// truncated value. Every bound is exactly representable as a double except
+// long.MaxValue / ulong.MaxValue, which the double check handles with a
+// strict `< 2^63` / `< 2^64` instead.
+bool truncatedDecimalFits(__int128 s, PrimitiveType pt) {
+    switch (pt) {
+        case PrimitiveType::SByte:  return s >= -128 && s <= 127;
+        case PrimitiveType::Byte:   return s >= 0 && s <= 255;
+        case PrimitiveType::Short:  return s >= -32768 && s <= 32767;
+        case PrimitiveType::UShort: return s >= 0 && s <= 65535;
+        case PrimitiveType::Int:
+            return s >= -(__int128)2147483648LL && s <= (__int128)2147483647LL;
+        case PrimitiveType::UInt:   return s >= 0 && s <= (__int128)4294967295LL;
+        case PrimitiveType::Long:
+            return s >= -((__int128)1 << 63) && s <= ((__int128)1 << 63) - 1;
+        case PrimitiveType::ULong:
+            return s >= 0 && s <= ((__int128)1 << 64) - 1;
+        case PrimitiveType::Char:
+            return s >= 0 && s <= 0x10FFFF && !(s >= 0xD800 && s <= 0xDFFF);
+        default:                    return true;
+    }
+}
+
+bool truncatedDoubleFits(double t, PrimitiveType pt) {
+    // `t` is already integral; `-0.0 >= 0.0` holds, so `byte(-0.5)` fits.
+    switch (pt) {
+        case PrimitiveType::SByte:  return t >= -128.0 && t <= 127.0;
+        case PrimitiveType::Byte:   return t >= 0.0 && t <= 255.0;
+        case PrimitiveType::Short:  return t >= -32768.0 && t <= 32767.0;
+        case PrimitiveType::UShort: return t >= 0.0 && t <= 65535.0;
+        case PrimitiveType::Int:
+            return t >= -2147483648.0 && t <= 2147483647.0;
+        case PrimitiveType::UInt:   return t >= 0.0 && t <= 4294967295.0;
+        case PrimitiveType::Long:
+            return t >= -9223372036854775808.0 && t < 9223372036854775808.0;
+        case PrimitiveType::ULong:
+            return t >= 0.0 && t < 18446744073709551616.0;
+        case PrimitiveType::Char:
+            return t >= 0.0 && t <= 1114111.0 && !(t >= 55296.0 && t <= 57343.0);
+        default:                    return true;
+    }
 }
 
 }  // namespace
@@ -2742,6 +2865,89 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         "conversion site (§17.14, v0.300)");
                                     return;
                                 }
+                            }
+                        }
+                        // (c) float/double/decimal → integer (or `char`) at a
+                        // floating-point or decimal LITERAL operand, optionally
+                        // under one unary `+`/`-` — fix #4724 (§5.2, v0.307).
+                        // §5.2: "Floating-point to integer truncates toward
+                        // zero; ... out-of-range values raise
+                        // `OverflowException`", and a constant operand that
+                        // would raise is a compile error at the conversion
+                        // site (`int(1e30)` is the spec's own example). The
+                        // fold therefore TRUNCATES FIRST and range-checks the
+                        // truncated value, exactly as the runtime conversion
+                        // does: `byte(-0.5)` / `uint(-0.9)` / `byte(-0.0m)`
+                        // are 0 and admitted; `byte(256.0)` is rejected.
+                        //   - `decimal` is folded exactly (runtime literal
+                        //     parser, 96-bit mantissa / 10^scale in 128-bit
+                        //     integers), so `long(9223372036854775807m)` fits;
+                        //   - `float`/`double` are compared in the double
+                        //     domain against exact bounds (strict `< 2^63` /
+                        //     `< 2^64` for `long`/`ulong`), never through an
+                        //     out-of-range integer cast;
+                        //   - `_` digit separators and the suffix are
+                        //     stripped as literal formation and codegen do
+                        //     (Appendix A.1 DigitGroup);
+                        //   - a literal that faulted at formation (§4.3/§4.4
+                        //     out of range) is skipped, not re-diagnosed.
+                        // The unary unwrap: the parser emits a FloatLiteralExpr
+                        // only for the bare token, so `int(-1.0e30)` is
+                        // `UnaryExpr{"-", FloatLiteralExpr{"1.0e30"}}`. Deeper
+                        // constant expressions are #4801's scope.
+                        const ast::Expr* floatOperand = ce.args[0].value.get();
+                        std::string signText;
+                        bool negate = false;
+                        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(floatOperand)) {
+                            if (u->operand && (u->op == "-" || u->op == "+")) {
+                                if (auto* innerFl =
+                                        dynamic_cast<const ast::FloatLiteralExpr*>(
+                                            u->operand.get())) {
+                                    floatOperand = innerFl;
+                                    signText = std::string(u->op);
+                                    negate = (u->op == "-");
+                                }
+                            }
+                        }
+                        auto* fl =
+                            dynamic_cast<const ast::FloatLiteralExpr*>(floatOperand);
+                        if (fl && !fl->text.empty() &&
+                            (tgtIsNarrowerInt || pt == PrimitiveType::Char)) {
+                            const std::string_view txt = fl->text;
+                            const char suf =
+                                (char)std::tolower((unsigned char)txt.back());
+                            bool known = false;
+                            bool fits = true;
+                            const char* kind = "double";
+                            if (suf == 'm') {
+                                kind = "decimal";
+                                if (auto s = truncatedDecimalLiteral(txt, negate)) {
+                                    known = true;
+                                    fits = truncatedDecimalFits(*s, pt);
+                                }
+                            } else {
+                                if (suf == 'f') kind = "float";
+                                if (auto t = truncatedBinaryFloatLiteral(
+                                        txt, suf == 'f', negate)) {
+                                    known = true;
+                                    fits = truncatedDoubleFits(*t, pt);
+                                }
+                            }
+                            if (known && !fits) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "the compile-time-constant operand `"
+                                    + signText + std::string(txt) +
+                                    "` (a " + kind + " literal) of the "
+                                    "explicit conversion to `"
+                                    + std::string(id->name) +
+                                    "` would raise `OverflowException` "
+                                    "after truncation toward zero; §5.2 "
+                                    "rejects a faulting constant operand "
+                                    "at the conversion site, not as a "
+                                    "deferred runtime fault "
+                                    "(§17.14, v0.307; fix #4724)");
+                                return;
                             }
                         }
                     }
