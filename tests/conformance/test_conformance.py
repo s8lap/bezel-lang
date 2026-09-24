@@ -468,6 +468,11 @@ class IsCrashTest(unittest.TestCase):
         for rc in (134, 137, 139, 128, 255):
             self.assertTrue(cf.is_crash(rc), rc)
 
+    def test_negative_signal_codes_are_crashes(self):
+        # Python subprocess.run on Unix returns negative signal number, e.g. -11
+        for rc in (-11, -6, -9, -15):
+            self.assertTrue(cf.is_crash(rc), rc)
+
     def test_exit_70_unhandled_exception_is_not_a_crash(self):
         # The runtime's unhandled-exception exit is acceptable for `compiles`.
         self.assertFalse(cf.is_crash(70))

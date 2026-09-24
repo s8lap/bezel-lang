@@ -551,10 +551,11 @@ def splice_preamble(wrapped_src, preamble_text):
 # -----------------------------------------------------------------------
 
 def is_crash(rc):
-    """per run_conformance.sh: SIGSEGV/SIGABRT/etc. surface as 128+signal
-    (>= 128) or the core-dump codes 139 (SIGSEGV) / 134 (SIGABRT) explicitly.
-    Exit 70 is the runtime unhandled-exception code and is NOT a crash."""
-    return rc >= 128 or rc in (134, 139)
+    r"""per run_conformance.sh: SIGSEGV/SIGABRT/etc. surface as either
+    128+signal (shell $? form, e.g. 139 for SIGSEGV) or negative -N
+    (Python subprocess.run on Unix, e.g. -11 for SIGSEGV). Exit 70 is the
+    runtime unhandled-exception code and is NOT a crash."""
+    return rc < 0 or rc >= 128 or rc in (134, 139)
 
 
 def _first_line(text):
