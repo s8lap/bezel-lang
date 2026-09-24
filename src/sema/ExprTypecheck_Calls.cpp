@@ -2444,8 +2444,7 @@ const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
 std::optional<ExprTC::FoldedNumConst>
 ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
     using K = FoldedNumConst::Kind;
-    if (depth > 64) return std::nullopt;  // cyclic / runaway const reference
-    // The initializer of a class-level `const` (bare `K` or qualified `C.K`).
+    if (depth > 64) return std::nullopt;
     // An IMPORTED floating const has no AST decl and ConstMemberSymbol
     // carries only an integer folded value, so it is declined (residual).
     auto constInitializer = [](const Symbol* s) -> const ast::Expr* {
@@ -2767,7 +2766,90 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
         }
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         auto* head = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-        if (!head) return std::nullopt;
+        // fix #4877 / §5.2 / §17.14 (v0.307): a qualified-import
+        // `Lib.C.K` — `ma->target` is itself a `MemberAccessExpr`
+        // (`Lib.C`), not an `IdentifierExpr` — resolves the same way the
+        // bare-identifier arm below resolves `C.K`, but C is an exported
+        // type of an imported module rather than a local lookup. The
+        // post-#4843 `C.K` arm covers the LOCAL path; without this
+        // extension the fold returned nullopt for `Lib.C.K`, the cast
+        // site declined to fold, and `int(Lib.C.K)` for
+        // `Lib.C.K := 1.0e30` admitted at compile time and faulted at
+        // runtime (Unhandled exception: System.OverflowException) —
+        // exactly the §17.14 prohibition this function is the canonical
+        // guard against. Factored out so the local and qualified paths
+        // share the const-member fold logic.
+        auto foldClassConst = [&](TypeSymbol* ts,
+                                  std::string_view member) -> bool {
+            auto* cms = dynamic_cast<ConstMemberSymbol*>(
+                lookupMember(ts, member));
+            if (!cms) return false;
+            const ast::Expr* val = constInitializer(cms);
+            if (val) {
+                // fix #4856: fold `C.K`'s initializer in C's scope.
+                r = inConstDeclScope(cms, [&] {
+                    return foldNumConstExprTC(*val, depth + 1);
+                });
+            } else {
+                // fix #4843 / §5.2 / §17.14 (v0.307): an IMPORTED
+                // `C.K: T;` — the loader's typed value is read here so
+                // `int(Lib.C.K)` for an imported double / decimal const
+                // folds the same way it does for an integer const (fix
+                // #3230's pattern).
+                if (cms->floatValue) {
+                    const PrimitiveType pt =
+                        cms->declaredPrimitiveType.value_or(
+                            PrimitiveType::Double);
+                    if (pt == PrimitiveType::Float) {
+                        r = makeBin(K::Float, *cms->floatValue);
+                    } else if (pt == PrimitiveType::Double) {
+                        r = makeBin(K::Double, *cms->floatValue);
+                    }
+                } else if (cms->decimalValue) {
+                    FoldedNumConst dv;
+                    dv.kind = K::Decimal;
+                    dv.dec[0] = (*cms->decimalValue)[0];
+                    dv.dec[1] = (*cms->decimalValue)[1];
+                    dv.dec[2] = (*cms->decimalValue)[2];
+                    dv.dec[3] = (*cms->decimalValue)[3];
+                    r = dv;
+                }
+            }
+            return r.has_value();
+        };
+        if (!head) {
+            // Qualified-import `Lib.C.K`. Walk the `Lib.C` prefix through
+            // `sourceImports_` + `importedTypesOf` (the same lookup
+            // `resolveMemberAccess` uses for the import-alias / single-
+            // segment module case), then run the const-member fold.
+            auto* innerMA =
+                dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
+            if (!innerMA) return std::nullopt;
+            auto* modHead =
+                dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get());
+            if (!modHead) return std::nullopt;
+            const std::string modName(modHead->name);
+            // `importAliases_` keys an alias to its dotted module name;
+            // a bare `Lib.C.K` writes `Lib` (the module name itself), but
+            // an aliased form `Mod = Lib; Mod.C.K` writes `Mod`. Cover
+            // both.
+            std::string resolvedMod;
+            auto aliasIt = importAliases_.find(modName);
+            if (aliasIt != importAliases_.end()) {
+                resolvedMod = aliasIt->second;
+            } else if (sourceImports_.count(modName)) {
+                resolvedMod = modName;
+            }
+            if (resolvedMod.empty()) return std::nullopt;
+            const auto* exported = ctx_.importedTypesOf(resolvedMod);
+            if (!exported) return std::nullopt;
+            TypeSymbol* ts = nullptr;
+            for (TypeSymbol* candidate : *exported) {
+                if (candidate->name == innerMA->member) { ts = candidate; break; }
+            }
+            if (!ts) return std::nullopt;
+            if (!foldClassConst(ts, ma->member)) return std::nullopt;
+        } else {
         const PrimitiveType hp = primitiveFromName(head->name);
         if (hp == PrimitiveType::Double || hp == PrimitiveType::Float) {
             // stdlib §9.2's compiler-provided constants, with the values
@@ -2852,6 +2934,7 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                     r = dv;
                 }
             }
+        }
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         // fix #4843 / §17.14 (v0.307): `(if c then a else b)` is a constant
@@ -24977,6 +25060,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (auto* rt = ctx_.exprType(*cd->value))
                     ctx_.setExprType(&ma, rt);
             }
+        } else if (cs->declaredPrimitiveType) {
+            // fix #4877 / §5.2 / §17.14 (v0.307): an IMPORTED
+            // `Class.Const: T;` carries no AST ConstDecl — the symbol
+            // is reconstructed from dependency metadata — so neither
+            // the local `cd->type` nor the `cd->value` fallback reads.
+            // Without this leg the outer `Lib.C.K` expression's exprType
+            // stays null, the §5.2 cast-fold site declines to fold it,
+            // and `int(Lib.C.K)` for an out-of-range float admits at
+            // compile time and faults at runtime — the exact defect
+            // #4843 closed for the LOCAL-const path. The loader
+            // populates `declaredPrimitiveType` (Symbol.hpp) so the
+            // fold path has the precision to drive `K::Float` vs
+            // `K::Double`; we mint the matching primitive TypeRef here
+            // so the cast site sees a typed operand.
+            TypeRef* tr = ctx_.makeTypeRef();
+            tr->kind = TypeRef::Kind::Primitive;
+            tr->primitive = *cs->declaredPrimitiveType;
+            tr->nullable = false;
+            ctx_.setExprType(&ma, tr);
         }
     } else if (dynamic_cast<EnumConstantSymbol*>(member) && targetType) {
         // §10: an enum-constant access `E.Green` has the enum type, so a
