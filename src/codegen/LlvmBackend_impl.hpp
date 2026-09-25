@@ -19285,6 +19285,20 @@ private:
         return true;
     }
 
+    // fix #4830 (§14.1 / §7 / §8.6, v0.307): shared by emitGenericSpecialization
+    // and emitInlineGenericMethod's expression-body parameter binding. Wraps
+    // `arg` into the tagged `{i8, T}` nullable-value carrier when the FORMAL
+    // parameter type is (A) already a nullable value type, (B) an explicitly
+    // `T?`-declared bare type parameter resolving (via nullableTypeParamConcrete)
+    // to a nullable value type, or (C) a BARE, non-`?`-declared type parameter
+    // `v: T` whose ACTIVE class-level substitution resolves `T` itself to a
+    // nullable value type — the "class instantiated at a nullable value type"
+    // shape (`Holder<int?>`'s `v: T`), which the other two cases do not cover
+    // because `T?` never appears in source. Declared here (defined in
+    // LlvmBackend_Calls2.cpp) since both call sites live in that file.
+    llvm::Value* wrapArgForNullableValueFormal(llvm::Value* arg,
+                                                const sema::TypeRef* formal);
+
     // fix #3501 (§4.7 "The unit type" / §7.10 "Generics and nullability" /
     // §14.1, v0.283): make the CALLEE's UNIT bindings visible to the §4.7
     // argument rescue, without disturbing the substitution the argument

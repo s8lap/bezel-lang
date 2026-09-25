@@ -14107,6 +14107,50 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 }
 
 
+// fix #4830 (§14.1 / §7 / §8.6, v0.307): see the declaration comment in
+// LlvmBackend_impl.hpp. Detects cases (A)/(B)/(C) and wraps `arg` into the
+// tagged `{i8, T}` struct when one applies; returns `arg` unchanged otherwise.
+llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
+                                                     const sema::TypeRef* formal) {
+    if (!formal || !arg) return arg;
+    sema::TypeRef concBuf;
+    const sema::TypeRef* nvTy = nullptr;
+    if (isNullableValueTy(formal)) {
+        nvTy = formal;
+    } else if (formal->nullable &&
+               formal->kind == sema::TypeRef::Kind::Named &&
+               !formal->declaration &&
+               nullableTypeParamConcrete(formal, concBuf) &&
+               isNullableValueTy(&concBuf)) {
+        nvTy = &concBuf;
+    } else if (!formal->nullable &&
+               formal->kind == sema::TypeRef::Kind::Named &&
+               !formal->declaration) {
+        // Case C (#4830): the formal is a BARE, non-`?`-declared type
+        // parameter (`v: T`), but the enclosing class was instantiated at a
+        // nullable value type (e.g. `Holder<int?>`), so under the active
+        // substitution `T` itself resolves to `int?`. The other two cases
+        // only fire when `T?` appears explicitly in source; this one catches
+        // the "class instantiated at a nullable value type" case. Per
+        // §14.1/§7 (v0.307), a nullable value type is represented as
+        // `{i8, T}` regardless of whether the nullability came from the
+        // parameter's own declaration or from its type parameter's
+        // substitution.
+        if (const sema::TypeRef* resolved = resolveTypeParamRef(formal);
+            resolved && resolved != formal && isNullableValueTy(resolved)) {
+            nvTy = resolved;
+        }
+    }
+    if (!nvTy) return arg;
+    auto* expectedSt = nullableValueStructTy(nvTy);
+    if (arg->getType() == expectedSt) return arg;
+    if (arg->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(arg))
+        return nullableValueNull(nvTy);
+    if (arg->getType() == expectedSt->getElementType(1))
+        return wrapNullableValue(nvTy, arg);
+    return arg;
+}
+
 llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                                        std::vector<llvm::Value*>& args,
                                        const CallableInfo& ci) {
@@ -14130,29 +14174,7 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                 const sema::TypeRef* formal =
                     ps->declType ? ctx_.resolvedType(*ps->declType)
                                  : ps->resolvedDeclType;
-                sema::TypeRef concBuf;
-                const sema::TypeRef* nvTy = nullptr;
-                if (formal && isNullableValueTy(formal)) {
-                    nvTy = formal;
-                } else if (formal && formal->nullable &&
-                           formal->kind == sema::TypeRef::Kind::Named &&
-                           !formal->declaration &&
-                           nullableTypeParamConcrete(formal, concBuf) &&
-                           isNullableValueTy(&concBuf)) {
-                    nvTy = &concBuf;
-                }
-                if (nvTy) {
-                    auto* expectedSt = nullableValueStructTy(nvTy);
-                    if (args[i]->getType() != expectedSt) {
-                        if (args[i]->getType()->isPointerTy() &&
-                            llvm::isa<llvm::ConstantPointerNull>(args[i])) {
-                            args[i] = nullableValueNull(nvTy);
-                        } else if (args[i]->getType() ==
-                                   expectedSt->getElementType(1)) {
-                            args[i] = wrapNullableValue(nvTy, args[i]);
-                        }
-                    }
-                }
+                args[i] = wrapArgForNullableValueFormal(args[i], formal);
             }
         }
         paramTys.push_back(args[i]->getType());
@@ -15140,8 +15162,29 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
                 ps->declType ? lowerType(ps->declType) : i32();
             refParams_[ms->params[pi]] = {args[pi + paramStart], elemTy};
         } else {
-            auto* slot = entryAlloca(args[pi + paramStart]->getType());
-            builder_.CreateStore(args[pi + paramStart], slot);
+            // fix #4830 (§14.1 / §7 / §8.6, v0.307): the SAME nullable-value
+            // wrap emitGenericSpecialization applies to a block-bodied
+            // method's specialized-function parameters is needed here too —
+            // this arm binds an EXPRESSION-bodied generic method's params
+            // directly into the caller's own stack slots (no specialized
+            // function, no buildSpecializedMethodFn), so without this an
+            // argument arriving as bare `T` (or a null ptr) under a `v: T`
+            // formal that resolves to a nullable value type (e.g.
+            // `Holder<int?>`) left the slot typed as the argument's OWN
+            // (unwrapped) type. A later `store ptr <null>` into a slot the
+            // callee body's other uses expect as `{i8, T}` is a type-size
+            // mismatch the emitted IR does not catch (opaque pointers): a
+            // narrower alloca overrun UB that ASan reports as a
+            // stack-buffer-overflow (measured: `Holder<bool?>.Id(null)`,
+            // "WRITE of size 8" into a 2-byte `{i8,i1}` slot).
+            const sema::TypeRef* formal =
+                ps ? (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : ps->resolvedDeclType)
+                   : nullptr;
+            llvm::Value* argVal = wrapArgForNullableValueFormal(
+                args[pi + paramStart], formal);
+            auto* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
             paramSlots_[ms->params[pi]] = slot;
         }
     }
@@ -15181,8 +15224,26 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         // active genericSubst_ substitutes T so the enumerator's element type
         // matches the instantiation.
         if (result && ci.returnType && !diverged_) {
-            result = boxForTarget(result,
-                ctx_.resolvedType(*ci.returnType), ci.exprBody);
+            const sema::TypeRef* declRet = ctx_.resolvedType(*ci.returnType);
+            // fix #4830 (§14.1 / §7 / §8.6, v0.307): the mirror of the
+            // STATEMENT `return v;` path's coerceReturnToNullableValue call
+            // (LlvmBackend_Stmts.cpp) for an EXPRESSION-bodied generic
+            // method's inlined result. Without this, `Id(v: T): T => v;`
+            // instantiated at `Holder<int?>` returned the bare unwrapped
+            // value (or, pre-parameter-fix, a mismatched IR-verify failure)
+            // instead of the tagged `{i8, T}` struct the declared `T`
+            // (resolved to a nullable value type) requires. Mutually
+            // exclusive with boxForTarget/wrapAsIEnumerableForTarget below —
+            // a declared return is either a nullable value type or an
+            // Object/interface/IEnumerable target, never both — so this is a
+            // no-op (returns `result` unchanged) whenever those apply.
+            const sema::TypeRef* srcTy = ctx_.exprType(*ci.exprBody);
+            bool srcNullableRef = srcTy && srcTy->nullable &&
+                                  !isNullableValueTy(srcTy);
+            result = coerceReturnToNullableValue(
+                result, declRet, isUnsignedTargetExpr(*ci.exprBody),
+                srcNullableRef, ci.exprBody);
+            result = boxForTarget(result, declRet, ci.exprBody);
             // #1916: ownLazyPipeline=true — this is a RETURN position (the caller
             // owns the inlined result), so a lazy pipeline returned as
             // IEnumerable<T> is drained into an OWNING enumerator (leak-free).
@@ -15191,7 +15252,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
             // collection the wrap only borrows (registers a scope-end
             // bz_array_free / bz_dict_free / bz_llist_free for the source).
             result = wrapAsIEnumerableForTarget(
-                result, ctx_.resolvedType(*ci.returnType), ci.exprBody,
+                result, declRet, ci.exprBody,
                 /*ownLazyPipeline=*/true,
                 /*outWrapMade=*/nullptr,
                 /*srcOwnedByCallee=*/

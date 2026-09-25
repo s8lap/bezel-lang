@@ -2647,6 +2647,18 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
                !declRet->declaration && !genericSubstSemaTy_.empty()) {
         if (nullableTypeParamConcrete(declRet, nvBuf) && isNullableValueTy(&nvBuf))
             nv = &nvBuf;
+    } else if (!declRet->nullable &&
+               declRet->kind == sema::TypeRef::Kind::Named &&
+               !declRet->declaration && !genericSubstSemaTy_.empty()) {
+        // Case C (#4830, §14.1/§7, v0.307): a BARE, non-`?`-declared return
+        // type parameter (`Id(v: T): T`) whose active class-level
+        // substitution resolves `T` itself to a nullable value type (e.g.
+        // `Holder<int?>`'s `Id`) — the "class instantiated at a nullable
+        // value type" shape. The branch above only fires when `T?` appears
+        // explicitly in source.
+        if (const sema::TypeRef* resolved = resolveTypeParamRef(declRet);
+            resolved && resolved != declRet && isNullableValueTy(resolved))
+            nv = resolved;
     }
     if (!nv) return v;  // reference `?` / non-nullable / unresolved — untouched.
 
