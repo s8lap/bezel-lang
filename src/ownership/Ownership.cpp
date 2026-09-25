@@ -1620,6 +1620,16 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Pick(a: Res, b: Res): owned Res => b;` (a borrowed parameter
     // returned through an `owned` return type, double-free). // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(exprBody);
+    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987): the `=>`
+    // expression-body sibling of the handleReturn driver above —
+    // `=> (if c then move y else g);` reaches the return site with the same
+    // mixed Owned/Borrowed arm set the block-body `return <same>;` form does,
+    // so the K7.3 rejection the `=>` body otherwise skipped (and which the
+    // local-decl-INITIALIZER driver does not see for the body itself) fires
+    // here too. A no-op outside a ConditionalExpr/CaseExpr body and any arm
+    // set that does not mix Owned with Borrowed-class-typed.
+    // // per §28.3, K7.3, v0.307
+    checkArmMeetMixed(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
     // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
@@ -8622,6 +8632,20 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // regard to the declared return type — the double-free this closes).
     // // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(e);
+    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987): the RETURN-site
+    // sibling of the local-decl-INITIALIZER driver. `return (if c then move y
+    // else g);` — one owned arm, one borrow arm — reaches a return with no
+    // coherent owner exactly as a binding `var z := (if c then move y else
+    // g);` does. The mixed-meet rule has only fired at binding sites
+    // previously (checkArmMeetMixed's lone caller), so a thrown-back return
+    // slipped through silently and the borrow arm's caller-attributed owner
+    // never disposed the moved-out `y` (a leak; the `c=true` path hands the
+    // moved-out local to the caller as a borrow of itself). Fires before the
+    // bare-identifier discharge fast-path below so the rejection is observed
+    // before handleDischarge silently marks anything moved-from. A no-op for
+    // a non-ConditionalExpr / non-CaseExpr `e` and for any arm set that does
+    // not mix Owned with Borrowed-class-typed. // per §28.3, K7.3, v0.307
+    checkArmMeetMixed(e);
     // fix #4948 (§17.8, §28.3, §28.10, v0.307): `return x!;` — §17.8: "if `x`
     // has ownership state owned …, `x!` is owned", i.e. the bare `x` itself,
     // so for a `using var` it is the same move-out of a scope-bound local the
@@ -13105,48 +13129,67 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
         if (common::isTaskFamilyHead(retHead)) return;
     }
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
-    if (!ownedArgSourceIsBorrow(e)) {
-        // §28.3 announcement table row 4 (v0.307): an instance method's
-        // non-`owned` plain concrete class/interface return admits ONLY a
-        // receiver-sourced borrow — "return only a receiver-(parameter-)
-        // sourced borrow; a fresh owned value is rejected (§28.6) — declare
-        // `owned`." `ownedArgSourceIsBorrow(e) == false` does not by itself
-        // mean `e` is a fresh owned producer — its own header documents that
-        // it also answers false for shapes it does not classify at all (a
-        // CallExpr result, deferred separately to #4009's "relayed call"
-        // gap; see its own comment above the ConditionalExpr arm). Scope
-        // this rejection to the two shapes this fix's spec-cited corpus
-        // cases pin — a direct `new` expression (s28_3_0039) and a bare
-        // identifier naming a tracked local currently in the OWNED state
-        // (s28_3_0029) — so the CallExpr-relay gap is left untouched rather
-        // than guessed at.
+    // §28.3 announcement table row 4 (v0.307): an instance method's
+    // non-`owned` plain concrete class/interface return admits ONLY a
+    // receiver-sourced borrow — "return only a receiver-(parameter-)
+    // sourced borrow; a fresh owned value is rejected (§28.6) — declare
+    // `owned`." Scope this rejection to the two shapes this fix's spec-
+    // cited corpus cases pin — a direct `new` expression (s28_3_0039) and
+    // a bare identifier naming a tracked local currently in the OWNED
+    // state (s28_3_0029) — so the CallExpr-relay gap (a fresh owned value
+    // returning through a CallExpr result, #4009) is left untouched rather
+    // than guessed at.
+    //
+    // fix #4986 (§17.8, §28.3 row 4, v0.307): peel a top-level `!` / `as`
+    // so `return y!;` over a tracked OWNED plain local is classified the
+    // same as `return y;` is — §17.8 "if x has ownership state owned …,
+    // x! is owned". Without this peel, the bare-identifier arm below
+    // matches only ast::IdentifierExpr, so the bang form slipped past row
+    // 4 entirely (UAF pre-#4955, leak post-#4955 — issue #4986). The
+    // borrow classifier `ownedArgSourceIsBorrow` itself is unchanged in
+    // this fix (it is too widely called to retune here), so the bang
+    // form STAYS classified as a borrow by it; the row-4 check therefore
+    // runs this peel-based classification BEFORE the borrow classifier's
+    // verdict is allowed to override it.
+    {
+        const ast::Expr* core = peelTopCastBang(&e);
         bool isFreshOwnedProducer = false;
-        if (dynamic_cast<const ast::NewExpr*>(&e)) {
-            isFreshOwnedProducer = producerState(e) == OwnershipState::Owned;
-        } else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (dynamic_cast<const ast::NewExpr*>(core)) {
+            isFreshOwnedProducer =
+                producerState(*core) == OwnershipState::Owned;
+        } else if (auto* rid =
+                       dynamic_cast<const ast::IdentifierExpr*>(core)) {
             if (auto* st = lookupState(rid->name))
                 // Exclude a maybe-consumed local (K7.4 join): that is a
                 // narrower, separately-diagnosed hazard (checkRead's
-                // maybe-consumed report), not this rule's business — mirrors
-                // the `st.state == Owned && st.maybeConsumed` gating already
-                // established at the reassignment site above in this file.
+                // maybe-consumed report), not this rule's business —
+                // mirrors the `st.state == Owned && st.maybeConsumed`
+                // gating already established at the reassignment site
+                // above in this file.
                 isFreshOwnedProducer =
                     st->state == OwnershipState::Owned && !st->maybeConsumed;
         }
-        if (!isFreshOwnedProducer) return;
-        report(
-            Severity::Error, e.span.begin,
-            "an instance method whose declared return type is a plain "
-            "concrete class or interface type may return only a "
-            "receiver-sourced borrow (§28.3 announcement table row 4) — a "
-            "fresh owned value is rejected here; declare the return type "
-            "`owned` to transfer ownership to the caller");
-        return;
+        if (isFreshOwnedProducer) {
+            report(
+                Severity::Error, e.span.begin,
+                "an instance method whose declared return type is a plain "
+                "concrete class or interface type may return only a "
+                "receiver-sourced borrow (§28.3 announcement table row 4) — a "
+                "fresh owned value is rejected here; declare the return type "
+                "`owned` to transfer ownership to the caller");
+            return;
+        }
     }
+    if (!ownedArgSourceIsBorrow(e)) return;
     // Is the borrow's root a plain (non-`owned`) parameter? Only then is the
     // return non-receiver-sourced. `this`/`base` and receiver field reads are
     // admitted (their root is not a ParameterSymbol).
-    const ast::IdentifierExpr* root = identifierRoot(e);
+    // fix #4986 (§17.8, §28.3 row 4, v0.307): peel a top-level `!`/`as` so a
+    // `return g!;` over a plain (non-`owned`) parameter `g` is classified the
+    // same as `return g;` is — the bang is a borrow of `g`'s value (§17.4
+    // analog, §17.8 confirms the source-and-state invariant), and §28.3
+    // rejects the parameter-sourced borrow through a plain return.
+    const ast::IdentifierExpr* root = identifierRootThroughCastBang(e);
     if (!root) return;
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*root));
     if (!ps) return;
