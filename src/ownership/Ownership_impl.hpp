@@ -3166,6 +3166,24 @@ private:
         std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
         std::vector<const ast::IdentifierExpr*>& out);
 
+    // fix #4943 (§19.3, §28.3 K2.2/K8.4, §35.5, v0.307): a pattern binding
+    // "is a borrow whose source is the scrutinee's source" (§19.3). So inside
+    // an owning-match arm, the `q` of a nested borrowing
+    // `(case w of var q: Widget => q, _ => other)` carries `w`. #4818's
+    // fan-out reached `q`, but `q` is neither a transferred binding nor an
+    // arm-local alias, so the trace stopped there and the payload escaped.
+    // This registers every binding anchor of `cx`'s arms (the `decl` its
+    // LocalSymbol carries, via `collectArmBindingAnchors`) into `aliases`
+    // with the SCRUTINEE as its initializer, so the ordinary alias hop in
+    // `owningMatchEscapeRoot` follows it. An expression arm holds no
+    // statement, so the binding is single-assignment there, which is the
+    // map's contract. The statement-position `case` is covered by the ordered
+    // walk's taint instead (see `walkOwningMatchArmEscapeStmt`), because its
+    // block arms can reassign the binding.
+    void registerOwningMatchCasePatternAliases(
+        const ast::CaseExpr& cx,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+
     // fix #4715: `identifierRoot`'s one-hop resolution, extended into a
     // BOUNDED trace through same-arm local aliases. Returns the identifier
     // naming a member of `transferred` that `value` ultimately roots at —

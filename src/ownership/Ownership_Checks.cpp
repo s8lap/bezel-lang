@@ -7157,6 +7157,10 @@ const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
             // conditional does, so the capture route follows them too —
             // matching `collectOwningMatchSourceRoots` on the borrow route.
             if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&x)) {
+                // fix #4943 (§19.3): a closure capturing the arm's pattern
+                // binding `q` captures the scrutinee's source, so `q` must
+                // resolve to the scrutinee on this route too.
+                registerOwningMatchCasePatternAliases(*cx, aliases);
                 for (const ast::CaseArm& arm : cx->arms)
                     if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
                         arm.exprBody)
@@ -7326,6 +7330,8 @@ void MethodOwnership::collectOwningMatchSourceRoots(
         return;
     }
     if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        // fix #4943 (§19.3): an arm's pattern bindings root at the scrutinee.
+        registerOwningMatchCasePatternAliases(*cx, aliases);
         for (const ast::CaseArm& arm : cx->arms)
             if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
                 arm.exprBody)
@@ -7339,6 +7345,20 @@ void MethodOwnership::collectOwningMatchSourceRoots(
                 collectOwningMatchSourceRoots(*be->right, aliases, out);
         }
         return;
+    }
+}
+
+// fix #4943 (§19.3, §28.3 K2.2/K8.4, §35.5, v0.307): see the declaration.
+void MethodOwnership::registerOwningMatchCasePatternAliases(
+        const ast::CaseExpr& cx,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
+    // A bare `case` (no scrutinee) binds nothing from a scrutinee.
+    if (!cx.scrutinee) return;
+    for (const ast::CaseArm& arm : cx.arms) {
+        std::vector<const ast::Node*> anchors;
+        collectArmBindingAnchors(arm.pattern.get(), anchors);
+        for (const ast::Node* a : anchors)
+            aliases.emplace(a, cx.scrutinee.get());
     }
 }
 
@@ -7470,6 +7490,19 @@ void MethodOwnership::checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs) {
                     // full argument and the #4715 measurement.
                     if (dynamic_cast<const ast::LocalDecl*>(&cur))
                         localDeclsInArm.insert(&cur);
+                    // fix #4943 (§19.3): a nested statement `case`'s pattern
+                    // bindings are arm-locals too. They die at their own
+                    // arm's `end`, inside K8.3's boundary, and a `var` binding
+                    // is assignable, so an assignment to one is a taint
+                    // update (see the walk's CaseStmt arm), not a store.
+                    if (auto* ics = dynamic_cast<const ast::CaseStmt*>(&cur))
+                        for (const ast::CaseArm& ia : ics->arms) {
+                            std::vector<const ast::Node*> anchors;
+                            collectArmBindingAnchors(ia.pattern.get(),
+                                                     anchors);
+                            localDeclsInArm.insert(anchors.begin(),
+                                                   anchors.end());
+                        }
                 });
         // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the sweep is ORDERED
         // and carries a may-taint set, replacing #4663's flat
@@ -7694,9 +7727,36 @@ void MethodOwnership::walkOwningMatchArmEscapeStmt(
         branchInto(ts->finallyBody, merged);
         cx.tainted = std::move(merged);
     } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+        // fix #4943 (§19.3, §28.3 K2.2/K8.4, §35.5, v0.307): a nested
+        // statement `case`'s pattern bindings are borrows "whose source is
+        // the scrutinee's source" (§19.3). Each one is therefore DECLARED at
+        // its arm's entry with the scrutinee as its value, which is the same
+        // taint update a `var q := <scrutinee>;` gets above. It is done as
+        // taint, not as an `aliases` entry, because a block arm may reassign
+        // `q` (`q := other2;` must kill the taint, and it can only do that
+        // because the binding is also in `localDeclsInArm`). The scrutinee
+        // itself is only READ, so no store is reported for it here.
+        const ast::IdentifierExpr* scrutRoot = nullptr;
+        if (cs->scrutinee) {
+            const sema::TypeRef* st = ctx_.exprType(*cs->scrutinee);
+            if (isBorrowableType(st) ||
+                common::isBorrowBearingRecordOrSpan(st, ctx_))
+                scrutRoot = owningMatchEscapeRoot(
+                    *cs->scrutinee, *cx.transferred, *cx.aliases, &cx.tainted);
+        }
         OwningMatchArmTaint merged = cx.tainted;
-        for (const ast::CaseArm& inner : cs->arms)
-            branchInto(inner.stmts, merged);
+        for (const ast::CaseArm& inner : cs->arms) {
+            OwningMatchArmTaint saved = cx.tainted;
+            std::vector<const ast::Node*> anchors;
+            collectArmBindingAnchors(inner.pattern.get(), anchors);
+            for (const ast::Node* a : anchors) {
+                if (scrutRoot) cx.tainted[a] = scrutRoot;
+                else cx.tainted.erase(a);
+            }
+            walkOwningMatchArmEscapeStmts(inner.stmts, cx);
+            merged.insert(cx.tainted.begin(), cx.tainted.end());
+            cx.tainted = std::move(saved);
+        }
         cx.tainted = std::move(merged);
     }
 }
