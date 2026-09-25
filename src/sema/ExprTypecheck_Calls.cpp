@@ -4269,6 +4269,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                     }
+                } else if (auto* ncm =
+                               dynamic_cast<const ast::NullCondMemberExpr*>(
+                                   ce.callee.get())) {
+                    // fix #4919 (§7.5 / §14.1 / §7.10, v0.307): the
+                    // null-conditional member-call path's return type needs
+                    // the SAME receiver substitution the plain `.` path runs
+                    // (T := concrete type arg) — otherwise a call returning a
+                    // bare class-level type parameter is typed as the bare T
+                    // at the call site, a record substitution's fields can't
+                    // resolve on the result, and codegen emits malformed IR
+                    // (§9: by-value record semantics) on the `?.` form when
+                    // the `.` form compiles cleanly. substituteMemberType is
+                    // gated to a non-empty `parent->genericParams` via its own
+                    // early-out, so non-generic receivers are unaffected —
+                    // same fail-safe as the parameter-side fix at the bottom
+                    // of `checkCallArity` (~L13595).
+                    if (ncm->target && ms->parent)
+                        rt = substituteMemberType(rt, ncm->target.get(),
+                                                  ms->parent);
                 }
                 // per §14.1/§14.2 (issue #509): EXPLICIT method-level type
                 // arguments supplied at the call site (e.g. `Identity<int>(v)`
@@ -13658,6 +13677,25 @@ void ExprTC::checkCallArity(
     const ast::Expr* recvTarget = nullptr;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
         recvTarget = ma->target.get();
+    else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+        // fix #4919 (§7.5 / §14.1 / §7.10, v0.307): the `?.` member-call
+        // path (`recv?.M(args)`) needs the receiver expression so
+        // `checkArgsAgainstParams` can run its `substituteMemberType`
+        // class-level substitution (T := receiver's concrete type arg)
+        // against each formal parameter type before the §5.1 / §7
+        // assignability check. The plain `.` path already passed
+        // `ma->target`; the `?.` path did not — leaving `classTarget`
+        // null and the substitution gate unsatisfied, so a bare-T
+        // formal (e.g. `v: T` on `Holder<T>.IdB`) was checked as the
+        // NON-nullable bare T against a substituted-`int?` argument,
+        // producing a spurious §7 "nullable but the target type is
+        // non-nullable" rejection. The substitution is otherwise
+        // unconditional for a generic receiver (gated only by
+        // `classParent->genericParams` non-empty inside
+        // `substituteMemberType`'s own early-out), so non-generic
+        // receivers are unaffected.
+        recvTarget = ncm->target.get();
     // §22.5 named-argument binding is now performed by checkArgsAgainstParams,
     // so a named-arg call is checked here too (no bail).
     // `ms` is the overload resolveMethodOverload selected for this call. Count
