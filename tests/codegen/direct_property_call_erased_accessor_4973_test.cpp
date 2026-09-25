@@ -262,3 +262,55 @@ BEZEL_TEST(direct_property_call_erased_accessor_4973,
     BEZEL_EXPECT_EQ(checked.exitCode, 0);
     BEZEL_EXPECT_EQ(checked.stdoutText, "100\n");
 }
+
+// ===========================================================================
+// P7-Direct setter_loop_200_iter (#4983, §14.1 / §23 / §2.8.3 rule 4,
+// v0.307): the SAME-CLASS twin of `p7_direct_setter_then_getter` above,
+// driven through a 200-iteration loop so the wrong-offset write can no
+// longer happen to land on benign bytes — every iteration's RHS
+// allocates a FRESH string and the SETTER body writes it into the
+// backing field; pre-fix the write lands at the i32-shaped offset 12
+// of the erased `%class.B` template layout, leaving the substituted
+// offset 16 at whatever prior bytes were there (stale or padding).
+// The final `Console.WriteLine(b.Val)` therefore reads garbage or empty
+// — pre-fix the program prints `\n\n` (3 bytes 78 0a 0a from
+// `x` + 2 newlines + the FINAL getter reading empty), post-fix it prints
+// `v199\n`. Runs under `runAot` only — the ASan/LSan path trips a
+// separate §28.9 leak in the constructor's `_v := v` body (the
+// constructor uses the erased T=i32 layout too, writing only 4 bytes
+// to offset 12 instead of 8 bytes to offset 16 — this is a separate
+// issue from the setter twin #4983 fixes), and that leak is outside the
+// scope of #4983. The 200-iteration amplification IS the regression
+// pin: a 1-shot write is not enough to catch the wrong-offset defect
+// on its own because the SETTER always correctly stores `value` SOMEWHERE
+// — the question is whether the READ sees that store. The plain
+// `runAot` printout (`x\ny\n` for the 1-shot rows, `v199\n` here)
+// discriminates the two layouts.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           setter_loop_200_iter_4983) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new B<string>(\"x\"); "
+        "    for var i in 0..<200 do "
+        "      b.Val := \"v\" + i.ToString(); "
+        "    end; "
+        "    Console.WriteLine(b.Val); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "v199\n");
+}
