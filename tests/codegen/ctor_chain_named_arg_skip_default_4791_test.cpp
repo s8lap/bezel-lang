@@ -194,3 +194,44 @@ BEZEL_TEST(codegen_ctor_chain_named_arg_skip_default_4791,
     // sum = 50 * 100 + sum(0..49) = 5000 + 1225 = 6225.
     BEZEL_EXPECT_EQ(r.stdoutText, "6225\n");
 }
+
+// End-to-end (§17 review of #4779/#4791, non-author reviewer's repro): a
+// `this(...)` chain call whose sole argument is named and skips a leading
+// defaulted parameter (`this(y := s.Length)` against a sibling `(x: int :=
+// 1, y: int := 0)`), exercised alongside a same-arity DIRECT call
+// (`new J(y := 9)`, no chain involved at all — plain §22.5 named-arg
+// binding on the constructor overload set) and the loop-amplified form, all
+// in one program so the three call shapes are proven consistent with each
+// other rather than merely each self-consistent.
+//   new J("abcd")  -> constructor(s: string) -> this(y := 4)  -> "XY1,4"
+//   new J(y := 9)  -> constructor(x, y)       directly         -> "XY1,9"
+//   50x new J("ab").Tag.Length -> this(y := 2) -> "XY1,2" (len 5) -> 250
+BEZEL_TEST(codegen_ctor_chain_named_arg_skip_default_4791,
+           this_chain_named_bare_one_param_ctor_end_to_end_spec_22_5_12_8) {
+    auto r = runAot(
+        "module M; "
+        "public class J "
+        "  public readonly property Tag: string; "
+        "  public constructor(x: int := 1, y: int := 0) "
+        "    Tag := $\"XY{x},{y}\"; "
+        "  end constructor; "
+        "  public constructor(s: string) "
+        "    this(y := s.Length); "
+        "  end constructor; "
+        "end J; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Console.WriteLine(new J(\"abcd\").Tag); "
+        "    Console.WriteLine(new J(y := 9).Tag); "
+        "    var s := 0; "
+        "    for var i in 0..<50 do "
+        "      s := s + new J(\"ab\").Tag.Length; "
+        "    end; "
+        "    Console.WriteLine(s.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "XY1,4\nXY1,9\n250\n");
+}

@@ -13890,6 +13890,149 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
     }
 }
 
+// narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307; design per #4854):
+// the typed half of the #3793 self-chain check. `Resolver::checkTypeConstructorChains`
+// judges a `this(...)` chain by ARITY alone — before any argument is typed —
+// and calls it a self-chain when its argument count matches only the
+// containing constructor. That is wrong for a NAMED chain: `this(y := 42,
+// x := 1)` inside `constructor(s: string, y: int)` has the containing
+// constructor's arity, but `x` names none of its parameters, so §22.5 binding
+// cannot bind the call to it at all; it binds `constructor(x: int := 1,
+// y: int := 0, z: int := 0)`. For exactly those calls
+// (`deferredNamedThisChain`) the resolver defers, and this check decides.
+//
+// The domain is exactly the set of programs the resolver used to REJECT, so
+// every conservative answer below is a reject — nothing previously rejected
+// becomes accepted unless all three conditions hold:
+//  (1) exactly one OTHER non-static constructor of the type binds the call
+//      under §22.5 (names, arity, defaults, no positional-after-named);
+//  (2) that constructor is §22.6-applicable: every bound argument is a plain
+//      value (no modifier, no discard) whose static type and whose parameter
+//      type are both resolved and `classifyArg` ≠ NotApplicable. An
+//      unresolved type is NOT given the benefit of the doubt here (unlike
+//      `classifyArg`'s own "can't judge → don't filter"), and §5.1 constant
+//      narrowing (`narrowIntConstantToTarget`) is not attempted — both only
+//      keep a previously-rejected program rejected;
+//  (3) following the leading `this(...)` chain edges of the constructors
+//      reachable from it — an edge to EVERY sibling its chain binds by name,
+//      an over-approximation of what codegen's `ctorForArgs` picks — never
+//      returns to `cd`. The spec (§12.8, §22.10) says a chain goes to
+//      "another" constructor but states no general cycle rule; this only
+//      refuses to widen acceptance to a cycle through `cd` (e_cycle of the
+//      #4791 review), it does not introduce cycle checking for chains the
+//      resolver already accepted.
+// More than one name-binding sibling is rejected rather than ranked: codegen's
+// `ctorForArgs` keys on names, not on the §22.6 ranking, so accepting a ranked
+// pick could lower a different constructor than the one checked here. That is
+// a restriction of this narrow, stated in the diagnostic; the general §22.6
+// resolution of a chain call is #4854.
+void ExprTC::checkDeferredNamedThisChain(const ast::ConstructorDecl& cd) {
+    if (!currentType_ || cd.isStatic) return;
+    const ConstructorSymbol* cs = nullptr;
+    for (Symbol* m : currentType_->members) {
+        auto* c = dynamic_cast<ConstructorSymbol*>(m);
+        if (c && c->decl == &cd) { cs = c; break; }
+    }
+    if (!cs) return;
+    const ast::CallExpr* chain = deferredNamedThisChain(*currentType_, *cs, cd);
+    if (!chain) return;
+    const std::string tname(currentType_->name);
+    const std::string desc =
+        std::string("`this(...)` constructor chain call in `") + tname + "`";
+
+    // The other non-static constructors of this (local) type, with decls.
+    auto siblingsOf = [&](const ast::ConstructorDecl* self) {
+        std::vector<const ast::ConstructorDecl*> out;
+        for (Symbol* m : currentType_->members) {
+            auto* o = dynamic_cast<ConstructorSymbol*>(m);
+            if (!o || o->isStatic) continue;
+            // SEAM-ACCESSOR: `o` is a member of `currentType_`, the LOCAL type whose
+            // constructor body is being checked; an imported type's
+            // constructor bodies are never walked by ExprTC.
+            auto* od = dynamic_cast<const ast::ConstructorDecl*>(o->decl);
+            if (!od || od == self) continue;
+            out.push_back(od);
+        }
+        return out;
+    };
+    auto bindsByName = [&](const ast::ConstructorDecl& target,
+                           const ast::CallExpr& call, BindResult* out) {
+        BindResult b = bindArgsToParams(target.params, call.args,
+                                        call.span.begin, desc, /*emit=*/false);
+        if (out) *out = b;
+        return b.ok;
+    };
+
+    // (1) the name-binding candidates.
+    std::vector<const ast::ConstructorDecl*> named;
+    std::vector<BindResult> binds;
+    for (const ast::ConstructorDecl* od : siblingsOf(&cd)) {
+        BindResult b;
+        if (bindsByName(*od, *chain, &b)) { named.push_back(od); binds.push_back(b); }
+    }
+    if (named.size() > 1) {
+        ctx_.diagnostics().report(
+            Severity::Error, chain->span.begin,
+            desc + " binds more than one other constructor of `" + tname +
+            "` by parameter name; a chain call whose argument count matches "
+            "only its own constructor must bind exactly one other constructor "
+            "(§12.8, §22.5, §22.6)");
+        return;
+    }
+    // (2) §22.6 applicability of the single candidate.
+    bool applicable = named.size() == 1;
+    if (applicable) {
+        const ast::ConstructorDecl& od = *named[0];
+        const BindResult& b = binds[0];
+        for (std::size_t j = 0; j < od.params.size() && applicable; ++j) {
+            const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+            if (ai < 0) continue;  // filled by its declared default
+            const ast::CallArgument& a = chain->args[static_cast<std::size_t>(ai)];
+            if (!a.modifier.empty() || a.isDiscard || !a.value ||
+                !od.params[j].type) { applicable = false; break; }
+            const TypeRef* at = ctx_.exprType(*a.value);
+            const TypeRef* pt = ctx_.resolvedType(*od.params[j].type);
+            if (!at || !pt ||
+                classifyArg(at, pt) == ArgMatch::NotApplicable)
+                applicable = false;
+        }
+    }
+    if (!applicable) {
+        ctx_.diagnostics().report(
+            Severity::Error, chain->span.begin,
+            desc + " binds no other constructor of `" + tname +
+            "`: no other constructor accepts these arguments by parameter "
+            "name and type, and a constructor cannot chain to its own "
+            "constructor (§12.8, §22.5, §22.6)");
+        return;
+    }
+    // (3) no chain path from the chosen constructor back to `cd`.
+    std::vector<const ast::ConstructorDecl*> work{named[0]};
+    std::vector<const ast::ConstructorDecl*> seen{named[0]};
+    while (!work.empty()) {
+        const ast::ConstructorDecl* cur = work.back();
+        work.pop_back();
+        if (cur->body.empty() || !cur->body[0]) continue;
+        bool isThis = false;
+        const ast::CallExpr* next = ast::chainCallOfStmt(*cur->body[0], isThis);
+        if (!next || !isThis) continue;
+        for (const ast::ConstructorDecl* od : siblingsOf(cur)) {
+            if (!bindsByName(*od, *next, nullptr)) continue;
+            if (od == &cd) {
+                ctx_.diagnostics().report(
+                    Severity::Error, chain->span.begin,
+                    desc + " chains back to the constructor itself through "
+                    "another constructor; a constructor cannot chain to its "
+                    "own constructor (§22.10)");
+                return;
+            }
+            if (std::find(seen.begin(), seen.end(), od) != seen.end()) continue;
+            seen.push_back(od);
+            work.push_back(od);
+        }
+    }
+}
+
 // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
 // §22.10, v0.306): the `base(...)` twin of `publishPrimaryCtorChainBinding`
 // above — publish the §22.5 argument BINDING for an explicit derived

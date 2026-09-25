@@ -449,7 +449,17 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                             break;
                         }
                     }
-                    if (!siblingMatch) {
+                    // narrow #4791 (§12.8 / §22.5, v0.307): a named
+                    // argument that names no parameter of `cs` means §22.5
+                    // binding cannot bind the call to `cs` at all, so the
+                    // arity match is not evidence of a self-chain. Defer
+                    // exactly those calls — `deferredNamedThisChain` is the
+                    // same predicate ExprTC reads — to
+                    // `ExprTC::checkDeferredNamedThisChain`, which decides
+                    // them with the argument types in hand and rejects every
+                    // one it cannot prove binds a single other constructor.
+                    if (!siblingMatch &&
+                        !deferredNamedThisChain(*t, *cs, *cd)) {
                         ctx_.diagnostics().report(
                             Severity::Error, selfChain->span.begin,
                             std::string("`this(...)` constructor chain call in `") +

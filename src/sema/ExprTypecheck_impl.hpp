@@ -2811,6 +2811,16 @@ private:
     // §22.8-step-0 body serves the chain site as well as the `new` site. See
     // the definition in ExprTypecheck_Calls.cpp.
     void publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd);
+    // narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307): decide a
+    // `this(...)` chain call the resolver's arity-only self-chain check
+    // (#3793) deferred because a named argument names no parameter of the
+    // containing constructor (`deferredNamedThisChain`, SymbolCollection.cpp).
+    // Accepts only when exactly one OTHER constructor of the type binds the
+    // call by §22.5 name binding, that one is §22.6-applicable to the typed
+    // arguments, and its own chain edges cannot lead back to `cd`; rejects
+    // with a specific diagnostic otherwise. See the definition in
+    // ExprTypecheck_Calls.cpp.
+    void checkDeferredNamedThisChain(const ast::ConstructorDecl& cd);
     // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
     // of the above — the §22.5 binding of a derived constructor's leading
     // `base(...)` arguments to the BASE class's primary-constructor parameter

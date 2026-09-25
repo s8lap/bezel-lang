@@ -1852,6 +1852,20 @@ std::string_view formalParamName(const ConstructorSymbol& cs, std::size_t pos);
 // Arity of the constructor's formal list, same dual sourcing.
 std::size_t formalParamCount(const ConstructorSymbol& cs);
 
+// narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307): the leading
+// `this(...)` chain call of constructor `cs` (declared by `cd` in type `t`)
+// when the resolver's arity-only self-chain check (#3793,
+// `Resolver::checkTypeConstructorChains`) would fire on it but one of its
+// NAMED arguments names no parameter of `cs` — so §22.5 binding cannot bind
+// the call to `cs` at all, and the arity match is not evidence of a
+// self-chain. Null otherwise. The resolver DEFERS exactly these calls, and
+// `ExprTC::checkDeferredNamedThisChain` decides them with the argument
+// types in hand; one predicate, read by both, so the two passes cannot
+// disagree about which calls were handed over.
+const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
+                                            const ConstructorSymbol& cs,
+                                            const ast::ConstructorDecl& cd);
+
 // §22.3 / §2.5 (v0.254, #3176 — family M1 of umbrella #3152): the same three
 // accessors for a METHOD's formal list. A `MethodSymbol` covers an ordinary
 // method, a free function, an extension method and an `operator` overload; the

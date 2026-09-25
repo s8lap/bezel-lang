@@ -676,6 +676,52 @@ std::size_t formalParamCount(const ConstructorSymbol& cs) {
     return cs.params.size();
 }
 
+// narrow #4791 (§12.8 / §22.5 / §22.10, v0.307): see Symbol.hpp. Each
+// conjunct below mirrors one gate of the #3793 self-chain check in
+// `Resolver::checkTypeConstructorChains`, in the same order, plus the one
+// new conjunct at the end.
+const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
+                                            const ConstructorSymbol& cs,
+                                            const ast::ConstructorDecl& cd) {
+    // #3793 applies only to a class WITHOUT a §22.10 primary constructor.
+    if (t.kind == ast::TypeDeclKind::Class && t.hasPositionalFields)
+        return nullptr;
+    if (cs.isStatic || cd.body.empty() || !cd.body[0]) return nullptr;
+    // A misplaced or duplicated chain call is already a §12.8 error.
+    int chainCount = 0;
+    for (std::size_t i = 0; i < cd.body.size(); ++i) {
+        bool isThisI = false;
+        if (!cd.body[i] || !ast::chainCallOfStmt(*cd.body[i], isThisI))
+            continue;
+        if (i != 0) return nullptr;
+        ++chainCount;
+    }
+    if (chainCount > 1) return nullptr;
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
+    if (!chain || !isThis) return nullptr;
+    const std::size_t n = chain->args.size();
+    if (n != cs.params.size()) return nullptr;
+    for (Symbol* m : t.members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic || other == &cs) continue;
+        if (other->params.size() == n) return nullptr;
+    }
+    // The new conjunct: a named argument naming no parameter of `cs`.
+    const std::size_t csArity = formalParamCount(cs);
+    for (const auto& a : chain->args) {
+        if (a.name.empty()) continue;
+        bool namesCsParam = false;
+        for (std::size_t j = 0; j < csArity; ++j)
+            if (formalParamName(cs, j) == a.name) {
+                namesCsParam = true;
+                break;
+            }
+        if (!namesCsParam) return chain;
+    }
+    return nullptr;
+}
+
 // fix #3176 (§22.3 / §2.5, v0.254 — family M1 of umbrella #3152): the METHOD
 // twin of the constructor accessors above. See Symbol.hpp for the contract and
 // for the measured heap-use-after-free that motivates it.

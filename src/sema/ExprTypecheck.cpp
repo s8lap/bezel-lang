@@ -15268,6 +15268,9 @@ void ExprTC::visitMember(const ast::Member& m) {
         // of a `this(...)` chain to this class's PRIMARY constructor, which is
         // where §22.8 puts step 0 for such a constructor.
         publishPrimaryCtorChainBinding(*cd);
+        // narrow #4791 (§12.8 / §22.5 / §22.6, v0.307): the typed half of the
+        // #3793 self-chain check, for the named chains the resolver defers.
+        checkDeferredNamedThisChain(*cd);
         returnCtx_ = saveRet;
         inStaticMember_ = saveStatic;
         inConstructor_ = saveCtor;
