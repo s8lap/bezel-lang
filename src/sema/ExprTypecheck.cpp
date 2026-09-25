@@ -18548,7 +18548,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 bool isShift = (as->op == "<<=" || as->op == ">>=");
                 bool isBitwise = (as->op == "&=" || as->op == "|=" ||
                                   as->op == "^=");
-                if (isShift || isBitwise) {
+                // fix #4808 (§25/§8.1/§6.6, v0.307): Object has no arithmetic
+                // or bitwise operators defined. Check before the
+                // shift/bitwise/arithmetic split — Object is not integer-kind,
+                // so the shift/bitwise branch's own "integer types" gate misses
+                // it, and the arithmetic branch's Widening path admits it.
+                if (tTy->primitive == P::Object) {
+                    std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        std::string("operator `") + binOp +
+                        "` is not defined for type `Object` (§25) — `Object`'s "
+                        "declared surface is fixed (§8.1) and an extension block "
+                        "cannot add an operator overload (§26.3), so no `" +
+                        binOp +
+                        "` overload can ever be declared for it; narrow to a "
+                        "concrete type first (`is`/`as`, §17.4) or use "
+                        "the `=`/`<>` operators (defined via `Equals`, §8.4) "
+                        "(§6.6)");
+                } else if (isShift || isBitwise) {
                     // §6.5: both operands of a bitwise/shift op must be
                     // (true) integer types — never bool, char, string, or
                     // floating-point. The target side is checked above;
