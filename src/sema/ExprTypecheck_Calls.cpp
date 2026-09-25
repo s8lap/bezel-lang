@@ -5721,8 +5721,94 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // an extern call site. Sibling helper — kept out of the general
         // dispatch path on peer directive, mirroring L3 commit 11b5fa1e's
         // `scoped`/`NewExpr` add to `checkArgsAgainstParams`.
-        if (xd->externDecl)
+        if (xd->externDecl) {
             checkCallSiteInlineArrayArg(ctx_, xd->externDecl->params, ce.args);
+            // fix #4671 / spec §32.8 (v0.307, line 9846): at a plain
+            // (un-`env`-paired) function-typed extern parameter the
+            // callback must be capture-free — a static method reference
+            // or a non-capturing lambda. A bound instance-method
+            // reference (`obj.Method`) and a capturing lambda each
+            // carry an environment (the receiver / the captures) that
+            // a bare C function pointer cannot represent; the spec
+            // names the two remedies (env-pairing for call-bounded
+            // invocations, the registry idiom for retained ones). Pre-
+            // fix the rule never fired — every capture-bearing form
+            // slipped through to codegen, so the corresponding
+            // `tests/conformance/rules/cases/s32_8_{0003,0004}.bzl`
+            // rows compiled clean.
+            //
+            // Locate the optional `env`-marker slot (at most one per
+            // declaration, §32.8 well-formedness rule 1) so the slot
+            // itself is not treated as a function-typed parameter —
+            // its Bezel-visible signature is omitted.
+            int envSlotIdx = -1;
+            for (std::size_t i = 0;
+                 i < xd->externDecl->params.size(); ++i) {
+                const ast::Param& sp = xd->externDecl->params[i];
+                if (sp.name == "env" && !sp.type) {
+                    envSlotIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            // AST helper: does a function-typed declaration contain an
+            // `env` position in its Bezel-visible function type? The
+            // parser stores such a position as a `FuncParamType` with
+            // empty modifier/name whose `.type` is a Named type whose
+            // single part is the contextual keyword `env`
+            // (src/parser/Parser_Decls.cpp's `parseFuncParam` falls
+            // through to `parseType` when the identifier is not
+            // followed by `:`). An env-paired parameter is exempt from
+            // the §32.8 reject — env-pairing makes it capture-admitting
+            // ("any function value — including a capturing lambda and a
+            // bound instance-method reference").
+            auto funcTypeHasEnvPosition = [](const ast::Type& ft) -> bool {
+                if (ft.kind != ast::TypeKind::Function) return false;
+                for (const auto& fp : ft.funcParams) {
+                    if (!fp.modifier.empty() || !fp.name.empty()) continue;
+                    if (!fp.type || fp.type->kind != ast::TypeKind::Named)
+                        continue;
+                    const auto& nm = fp.type->name;
+                    if (nm && nm->parts.size() == 1 &&
+                        nm->parts.front() == "env") return true;
+                }
+                return false;
+            };
+            for (std::size_t i = 0;
+                 i < xd->externDecl->params.size() && i < ce.args.size();
+                 ++i) {
+                if (static_cast<int>(i) == envSlotIdx) continue;
+                const ast::Param& fp = xd->externDecl->params[i];
+                if (!fp.type) continue;
+                TypeRef* pt = ctx_.resolvedType(*fp.type);
+                if (!pt || pt->kind != TypeRef::Kind::Function) continue;
+                if (funcTypeHasEnvPosition(*fp.type)) continue;  // env-paired: capture-admitting
+                const ast::CallArgument& a = ce.args[i];
+                if (!a.value) continue;
+                if (a.isDiscard) continue;
+                // Capture-free entries (static refs / non-capturing
+                // lambdas) are admitted; anything else (bound
+                // instance-method reference, capturing lambda) is
+                // rejected. `isCaptureFreeEntry` reads the visited
+                // argument's symbol / lambda captures — guaranteed
+                // populated because `visitChildren` runs before
+                // `typeCall`.
+                if (isCaptureFreeEntry(a.value.get())) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    "callback argument at a plain (un-`env`-paired) "
+                    "extern function-typed parameter must be "
+                    "capture-free: a static method reference or a "
+                    "non-capturing lambda — a bound instance-method "
+                    "reference and a capturing lambda are rejected "
+                    "because each carries an environment a bare C "
+                    "function pointer cannot represent; either mark "
+                    "the extern with the `env` clause if the native "
+                    "contract invokes the callback only during the "
+                    "call, or pass state through the user-data pointer "
+                    "as an integer token (the registry idiom) "
+                    "(\xC2\xA7""32.8)");
+            }
+        }
     }
     // CG60: call through a function-typed local/parameter — propagate the
     // function's declared return type to the CallExpr so that downstream
