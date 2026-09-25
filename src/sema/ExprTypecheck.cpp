@@ -16817,6 +16817,63 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #4670 / §30.5 (v0.307, line 8551): the borrow produced by
+        // `await Task<T>` (Pattern A) may not flow to a `using var` binding.
+        // `using var` announces a disposal obligation the spell cannot
+        // satisfy on a borrow — the borrow's storage belongs to its source,
+        // not the new local — so codegen would either skip the disposal
+        // (a leak) or insert a second disposal (a double-free). Pattern B
+        // (`OwningTask<T>`) IS admitted (the awaited value is owned and
+        // `using var` is its canonical discharge — s30_5_0003's case).
+        // The distinguishing test is on the await's OPERAND type
+        // (`Task<T>` carries the Pattern A shape; `OwningTask<T>` carries
+        // the Pattern B shape), not on the await's RESULT type (both
+        // patterns yield the same T).
+        if (ld->isUsing && ld->initializer) {
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(
+                    ld->initializer.get())) {
+                if (ue->op == "await" && ue->operand) {
+                    const TypeRef* ot = ctx_.exprType(*ue->operand);
+                    // Same predicate the `await` arm itself uses
+                    // (ExprTypecheck_Exprs.cpp: awaitedTaskHead) — sharing
+                    // it keeps the two mirrors from drifting apart the
+                    // way the s28.3 K3.13 fix's mirrors had. We inline
+                    // the head-name check here because the binding site
+                    // is `ExprTypecheck.cpp`, not `Exprs.cpp`, and the
+                    // `awaitedTaskHead` helper is a lambda inside the
+                    // `visitExpr` method. The shape is: Named, non-nullable,
+                    // single-part AST name OR non-empty importedName, and
+                    // headName() == "Task" with exactly one generic arg.
+                    if (ot && ot->kind == TypeRef::Kind::Named &&
+                        !ot->nullable) {
+                        bool headOk = false;
+                        if (ot->astNode && ot->astNode->name) {
+                            if (ot->astNode->name->parts.size() == 1)
+                                headOk = true;
+                        } else if (!ot->importedName.empty()) {
+                            headOk = true;
+                        }
+                        if (headOk && ot->headName() == "Task" &&
+                            !ot->genericArgs.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ld->initializer->span.begin,
+                                "the borrow produced by `await Task<T>` "
+                                "(Pattern A) may not flow to a `using var` "
+                                "binding — `using var` announces a disposal "
+                                "obligation the spell cannot assume on a "
+                                "borrow, since the borrow's storage belongs "
+                                "to its source (\xC2\xA7""30.5). Use "
+                                "`var r := await task;` for the borrow local, "
+                                "or produce the value through Pattern B "
+                                "(`Task.FromOwnedResult<T>(...)` → "
+                                "`await t` → `using var r := await t;`) and "
+                                "discharge via the canonical owned-binding "
+                                "form");
+                        }
+                    }
+                }
+            }
+        }
         if (currentScope_ && !ld->name.empty()) {
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = ld->name;

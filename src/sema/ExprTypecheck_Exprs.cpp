@@ -8259,6 +8259,36 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 // `await OwningTask<T>` → T (Pattern B; element type).
                 ctx_.setExprType(&ue, ot->genericArgs.front());
             }
+            // fix #4670 / §30.5 (v0.307, line 8566): a Pattern B await is
+            // MARKER-FREE — the transfer marker (`move`) is not admitted
+            // where the target already announces the consume. The Pattern
+            // B `await` deliberately joins no consume-site freeze list
+            // and takes no operand marker, so `await move t` (where `t`
+            // is `OwningTask<T>`) is a compile error. Pattern A
+            // (`Task<T>`) admits the marker — the marker transfers the
+            // task's borrow to the awaiting site, and Pattern A's task
+            // owns storage — so only the Pattern B branch rejects. Check
+            // AFTER the type dispatch so a `move` on a non-Task operand
+            // is not silenced here (it would already have been rejected
+            // by the §28.3 field/interface gates at line 7766 et seq.).
+            if (head == "OwningTask" && ue.operand) {
+                if (auto* inner = dynamic_cast<const ast::UnaryExpr*>(
+                        ue.operand.get())) {
+                    if (inner->op == "move") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ue.span.begin,
+                            "Pattern B `await` is marker-free "
+                            "(\xC2\xA7""30.5) \xE2\x80\x94 the transfer "
+                            "marker `move` is not admitted on the operand "
+                            "of an `OwningTask<T>` await; the consume is "
+                            "announced by the target, not the operand. "
+                            "Drop the `move` and bind the result with "
+                            "`using var r := await t;` (the canonical owned "
+                            "discharge) or `var r := await t;` (an owned "
+                            "local under the standard discharge rules)");
+                    }
+                }
+            }
             // NOTE (deferred, §30.7): the result typing specific to async
             // iteration — `await for` desugaring's `MoveNextAsync()` / the
             // owned-yield `GetOwningAsyncEnumerator` path — is deeper than this
