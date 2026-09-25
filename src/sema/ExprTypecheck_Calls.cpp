@@ -13955,6 +13955,40 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     std::unordered_set<std::string_view> calleeMethodGenericParamNames;
     for (Symbol* gp : ms->genericParams)
         if (gp) calleeMethodGenericParamNames.insert(gp->name);
+    // narrow #4915 (§14.5, §5.1, v0.307): the imported twin of
+    // `checkArgsAgainstParams`'s explicit-argument handling. An EXPLICIT type
+    // argument list binds the method's parameters at the call site, so each
+    // formal is checked at the substituted type (as #4325 does locally) and a
+    // bound name is no longer a free inference slot. Without this the
+    // formal stayed the callee's bare `T`, still in the free set, and the
+    // #4810 arm's by-name exemption admitted `LUtil.Id<T>(77)` inside a
+    // `Go<T>` instantiated at a class (and `LUtil.Id<string>(77)` anywhere).
+    // Clipped to min(genericParams, typeArgs) like the return-type arm;
+    // a count mismatch is reported there.
+    std::unordered_map<std::string_view, TypeRef*> explicitSubst;
+    {
+        const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+            nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ce.callee.get()))
+            callTypeArgs = &ma->typeArgs;
+        else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+            callTypeArgs = &ncm->typeArgs;
+        else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                     ce.callee.get()))
+            callTypeArgs = &id->typeArgs;
+        if (callTypeArgs)
+            for (std::size_t gi = 0; gi < ms->genericParams.size() &&
+                                     gi < callTypeArgs->size(); ++gi) {
+                const Symbol* gp = ms->genericParams[gi];
+                if (!gp || gp->name.empty() || !(*callTypeArgs)[gi]) continue;
+                if (TypeRef* ta = ctx_.resolvedType(*(*callTypeArgs)[gi]))
+                    explicitSubst[gp->name] = ta;
+            }
+        for (const auto& [nm, ty] : explicitSubst)
+            calleeMethodGenericParamNames.erase(nm);
+    }
     const std::size_t nparams = sema::formalParamCount(*ms);
     for (std::size_t j = 0; j < nparams; ++j) {
         const int ai = b.paramToArg[j];
@@ -13989,6 +14023,8 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         // a non-const pointer.
         auto* pt = const_cast<TypeRef*>(sema::formalParamResolvedType(*ms, j));
         if (!pt) continue;
+        if (!explicitSubst.empty())
+            pt = substituteReturnType(pt, explicitSubst);  // narrow #4915
         checkAssignable(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(ai + 1),
@@ -15889,6 +15925,36 @@ void ExprTC::checkArgsAgainstParams(
     if (calleeMethodDecl)
         for (const auto& gp : calleeMethodDecl->genericParams)
             calleeMethodGenericParamNames.insert(gp.name);
+    // narrow #4915 (§14.5, §5.1, v0.307): the subset of those names that is
+    // STILL the callee's inference slot once `paramTy` has been substituted
+    // below — the set the per-argument and per-element `checkAssignable`
+    // calls receive, and the only names the #4810 arm exempts by name.
+    //   * A name bound by an EXPLICIT type argument is gone from `paramTy`:
+    //     `explicitSubst` rewrites it to the caller's type argument, and a
+    //     same-spelled survivor (`Id<T>(5)` inside `Go<T>`) is then the
+    //     CALLER's `T`, which `int` does not convert to (§5.1). Leaving it in
+    //     the free set exempted that formal from the #4810 arm and admitted
+    //     ill-typed calls (`Get<T>(77)` at `Go<A>`: ASan overflow).
+    //   * A name the method SHADOWS from its receiver class is excluded too.
+    //     With a receiver, `substituteMemberType` resolves class parameters
+    //     by NAME, so the method's `T` in `Box<T>.Id<T>(x: T)` has already
+    //     been rewritten to the receiver's class argument; treating it as
+    //     free admitted `this.Id(5)` in `Box<T>`, and codegen aborted in the
+    //     IR verifier. With NO receiver (`Pick(5)` inside `Box<T>`) the
+    //     formal is still the method's `T`, but codegen's substitution maps
+    //     are keyed by name and cannot bind both `T`s (#4862): accepting it
+    //     measured an IR-verifier abort (a `T` local or a static `Id(5)`) and
+    //     a silent wrong value (`Pick(5)` at `Box<long>`). Excluding the name
+    //     keeps the pre-#4915 reject, which is spurious for a shadowing method
+    //     but never an unsound accept. Tracked by #4847 (sema) and #4862.
+    std::unordered_set<std::string_view> calleeFreeParamNames =
+        calleeMethodGenericParamNames;
+    if (explicitSubst)
+        for (const auto& [nm, ty] : *explicitSubst)
+            calleeFreeParamNames.erase(nm);
+    if (classParent)
+        for (auto* cgp : classParent->genericParams)
+            if (cgp) calleeFreeParamNames.erase(cgp->name);
     // per §5.1: each bound argument must be assignable to its parameter.
     // Iterate in parameter order so a reordered named-arg call checks each
     // argument against the parameter it actually fills.
@@ -16108,7 +16174,12 @@ void ExprTC::checkArgsAgainstParams(
             // admissibility gate above sets the literal's own exprType to
             // `paramTy`, so the `checkAssignable` call just below would
             // trivially pass without this.
-            checkCollectionLiteralElementAssignability(*cl, paramTy);
+            // narrow #4915 (§14.5, v0.307): the element targets mention the
+            // callee's own free parameters, as the argument check below does
+            // — the substituted subset, never a name an explicit type
+            // argument or the receiver class has already bound.
+            checkCollectionLiteralElementAssignability(
+                *cl, paramTy, &calleeFreeParamNames);
         }
         checkAssignable(ctx_.exprType(*a.value),
                         paramTy,
@@ -16116,7 +16187,7 @@ void ExprTC::checkArgsAgainstParams(
                         std::string("argument `") + std::string(p.name) +
                         "` to " + calleeDesc,
                         a.value.get(),  // per §7.4 / §27.6 (#1191)
-                        &calleeMethodGenericParamNames);  // fix #4199
+                        &calleeFreeParamNames);  // fix #4199, narrow #4915
     }
 }
 

@@ -5563,7 +5563,20 @@ void ExprTC::checkAssignable(
                 : std::string_view();
         bool fromConcretePrimitive = from->kind == TypeRef::Kind::Primitive &&
                                      from->primitive != PrimitiveType::Object;
+        // narrow #4915 (§14.5, v0.307): a callee's own method type parameter
+        // that the caller has not substituted (the argument check against
+        // `Id<T>(x: T)`'s formal before inference) is an INFERENCE slot —
+        // `Id(5)` infers `T = int` — not the enclosing body's `T`, even when
+        // both are spelled `T`. A bare `Kind::Named` carries no owning
+        // declaration, so `currentScopeGenericParamNames()` alone matched the
+        // caller's `Go<T>` by NAME and rejected a well-typed call. The
+        // caller-supplied `freeTypeParamNames` set identifies the callee's
+        // parameters; a name in it belongs to the callee here — the exclusion
+        // the scope note above already states for this arm.
+        bool toIsCalleeFreeParam = freeTypeParamNames && !toTpHead.empty() &&
+                                   freeTypeParamNames->count(toTpHead);
         if (!toTpHead.empty() && fromConcretePrimitive &&
+            !toIsCalleeFreeParam &&
             currentScopeGenericParamNames().count(toTpHead) &&
             // fix #4810 scope (§14.2): only UNCONSTRAINED type-parameter
             // targets (§5.1's narrow wording — primitive widening and
@@ -14979,7 +14992,8 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
 // `FromCollectionLiteral` opt-in) is out of scope — its element type is not
 // exposed the same way and #4310 did not measure a gap there.
 void ExprTC::checkCollectionLiteralElementAssignability(
-    const ast::CollectionLiteralExpr& cl, TypeRef* target) {
+    const ast::CollectionLiteralExpr& cl, TypeRef* target,
+    const std::unordered_set<std::string_view>* freeTypeParamNames) {
     if (!target) return;
     auto checkOne = [&](const ast::Expr* el, TypeRef* elemTarget,
                         const char* position) {
@@ -14992,12 +15006,16 @@ void ExprTC::checkCollectionLiteralElementAssignability(
             // `visitExpr` walk, so seed it here before recursing.
             if (!ctx_.exprType(*el))
                 ctx_.setExprType(const_cast<ast::Expr*>(el), elemTarget);
-            checkCollectionLiteralElementAssignability(*nestedCl, elemTarget);
+            checkCollectionLiteralElementAssignability(*nestedCl, elemTarget,
+                                                       freeTypeParamNames);
             return;
         }
+        // narrow #4915 (§14.5, v0.307): forward the callee's free parameters
+        // so `C([11, 22])` against `C<T>(xs: Array<T>)` inside a `B<T>` does
+        // not take the callee's element `T` for the caller's (the #4810 arm).
         checkAssignable(ctx_.exprType(*el), elemTarget, el->span.begin,
                         std::string("collection-literal ") + position,
-                        el);
+                        el, freeTypeParamNames);
     };
     if (target->kind == TypeRef::Kind::InlineArray) {
         if (!target->arrayElement) return;

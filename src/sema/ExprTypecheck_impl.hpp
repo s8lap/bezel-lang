@@ -881,8 +881,13 @@ private:
     // too. `target` must already be resolved to the collection's own type
     // (`[N]T` or a §15.4 builtin-collection head); a non-collection or
     // unresolved target is a no-op.
+    // `freeTypeParamNames` (narrow #4915): at a generic call's argument, the
+    // callee's own unsubstituted method type parameters, forwarded to each
+    // element's `checkAssignable` exactly as the argument-level check does.
     void checkCollectionLiteralElementAssignability(
-        const ast::CollectionLiteralExpr& cl, TypeRef* target);
+        const ast::CollectionLiteralExpr& cl, TypeRef* target,
+        const std::unordered_set<std::string_view>* freeTypeParamNames =
+            nullptr);
 
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
