@@ -25,7 +25,9 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::JitResult;
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 // Repro A (pA_eqarity_binds_typemismatch.bzl): ONE equal-arity sibling
 // `(x: string)` beside the defaulted `(x: int, y: int := 0)`. §22.5 binds
@@ -282,6 +284,99 @@ BEZEL_TEST(codegen_ctor_type_class_defaulted_sibling_4790,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "T9\nT2\nOne\n");
+}
+
+// p7 (p7_0 / p7_iface_chain): the same boxing conversion at a constructor
+// CHAIN call (§22.8 step 1) — `base(v := n)`, `base(n)`, and `this(v := 1)`
+// against a boxed-interface parameter.
+BEZEL_TEST(codegen_ctor_type_class_defaulted_sibling_4790,
+           rework_p7_boxed_iface_param_through_ctor_chain_4834_spec_5_1_22_8) {
+    auto r = runAot(
+        "module M; "
+        "public class B "
+        "  public readonly property Tag: string; "
+        "  public constructor(v: IComparable<int>) "
+        "    Tag := $\"IC{v.CompareTo(3)}\"; "
+        "  end constructor; "
+        "end B; "
+        "public class K : B "
+        "  public constructor(n: int) base(v := n); end constructor; "
+        "end K; "
+        "public class K2 : B "
+        "  public constructor(n: int) base(n); end constructor; "
+        "end K2; "
+        "public class J "
+        "  public readonly property Tag: string; "
+        "  public constructor(v: IComparable<int>, k: int := 7) "
+        "    Tag := $\"J{v.CompareTo(3)},{k}\"; "
+        "  end constructor; "
+        "  public constructor(s: string, t: string) this(v := 1); end constructor; "
+        "end J; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Console.WriteLine(new K(5).Tag); "
+        "    Console.WriteLine(new K2(5).Tag); "
+        "    Console.WriteLine(new J(\"a\", \"b\").Tag); "
+        "    Console.WriteLine(new J(9).Tag); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "IC1\nIC1\nJ-1,7\nJ1,7\n");
+}
+
+// p7 ownership leg (§8.6 / §28.3, v0.307): each chain-site box is a fresh
+// unbound owned temporary, released after the chained constructor returns
+// because `B`/`J` only READ `v` (#2952's non-escaping discipline). Loop-
+// amplified 300x over locals (NOT `new K(5).Tag`, whose receiver is the
+// separate #4786 leak) so a missing release is an LSan-visible leak and an
+// over-release is an ASan use-after-free (#4834). Pre-fix the program does not
+// compile at all (IR verification failure at the chain call).
+BEZEL_TEST(codegen_ctor_type_class_defaulted_sibling_4790,
+           rework_p7_chain_box_released_once_4834_spec_8_6_28_3) {
+    const char* prog =
+        "module M; "
+        "public class B "
+        "  public readonly property Tag: string; "
+        "  public constructor(v: IComparable<int>) "
+        "    Tag := $\"IC{v.CompareTo(3)}\"; "
+        "  end constructor; "
+        "end B; "
+        "public class K : B "
+        "  public constructor(n: int) base(v := n); end constructor; "
+        "end K; "
+        "public class K2 : B "
+        "  public constructor(n: int) base(n); end constructor; "
+        "end K2; "
+        "public class J "
+        "  public readonly property Tag: string; "
+        "  public constructor(v: IComparable<int>, k: int := 7) "
+        "    Tag := $\"J{v.CompareTo(3)},{k}\"; "
+        "  end constructor; "
+        "  public constructor(s: string, t: string) this(v := 1); end constructor; "
+        "end J; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..<300 do "
+        "      var a := new K(5); "
+        "      var b := new K2(5); "
+        "      var c := new J(\"a\", \"b\"); "
+        "      total := total + a.Tag.Length + b.Tag.Length + c.Tag.Length; "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    JitResult plain = runAot(prog);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "3300\n");
+    JitResult r = runAotChecked(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3300\n");
 }
 
 // Ranking controls (§22.6 stage 5 exact-match preference): the relaxed pass

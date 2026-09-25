@@ -13363,6 +13363,8 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // for the formal modifier / unit rescue. Source-indexed values are held in
     // a parallel vector and re-placed in parameter order below.
     std::vector<llvm::Value*> sourceVals(call->args.size(), nullptr);
+    // narrow #4834: argument-position §8.6 boxes to release after the call.
+    std::vector<llvm::Value*> chainArgBoxReleases;
     for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
         const auto& a = call->args[ai];
         if (!a.value) {
@@ -13428,6 +13430,32 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             if (!v) v = unitValueForCtorParam(v, target,
                                               static_cast<std::size_t>(pi),
                                               a.value.get());
+            // narrow #4834 (§8.6 / §5.1 / §14.2 clause 5 / §22.8 step 1,
+            // v0.307): a value-typed argument bound to an Object/interface
+            // formal is BOXED, exactly as `buildOrderedArgs` boxes it at a
+            // `new`/method call site. This lowering never did, so `base(n)`
+            // / `base(v := n)` / `this(v := 1)` against a `v:
+            // IComparable<int>` formal passed the raw `i32` into the `ptr`
+            // slot — `bezelc: codegen error: IR verification failed`.
+            // `boxForTarget` is the sole decision-maker (a no-op for a
+            // reference source or a non-Object/interface formal). The fresh
+            // box is a §28.3 unbound owned temporary: released after the
+            // direct call below when the target's body provably does not
+            // retain the parameter (#2952's discipline), else leaked — the
+            // safe direction.
+            if (v) {
+                llvm::Value* savedBoxMint = lastBoxMint_;
+                lastBoxMint_ = nullptr;
+                v = boxForTarget(v, paramTypeOf(target->params[pi]),
+                                 a.value.get());
+                if (v && lastBoxMint_ && v == lastBoxMint_) {
+                    const ast::ConstructorDecl* tcd = localCtorDeclOf(*target);
+                    if (tcd && isCalleeParamNonEscaping(
+                                   tcd, static_cast<std::size_t>(pi)))
+                        chainArgBoxReleases.push_back(v);
+                }
+                lastBoxMint_ = savedBoxMint;
+            }
         }
         if (!v) {
             // #1386: ICE — the expression kind is not yet handled by codegen.
@@ -13851,6 +13879,10 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         // branches, exactly the lowerCall / lowerNew discipline). Skipped
         // when the call diverged so we never double-release.
         if (!diverged_) {
+            // narrow #4834: §28.3 discharge of the argument-position boxes
+            // queued above (normal edge only; a throw leaks them — safe).
+            for (llvm::Value* b : chainArgBoxReleases)
+                emitBoxRelease(b);
             for (llvm::Value* cl : chainClosureArgs)
                 emitClosureRelease(cl);
             // fix #4077 (cell half, §27.5 / §28.9, v0.295): the §28.14
