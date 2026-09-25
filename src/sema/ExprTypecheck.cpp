@@ -5142,95 +5142,156 @@ void ExprTC::checkAssignable(
             }
         }
     }
-    // fix #4644 (§31.2.1 + §5.1, v0.307): a BUILT-IN exception type is not
-    // implicitly convertible to a USER-DECLARED class. This is the downcast
-    // direction of the §31.2.1 multi-type binding rule — "When binding, `name`
-    // has the static type of the **nearest common base** of the listed types …
-    // for alternatives sharing nothing more specific, it is `Exception`" — and
-    // the rule is only observable if the resulting `Exception` binding cannot
-    // then be silently re-narrowed. `catchArmNcb` already computes the NCB
-    // correctly (probe-confirmed: `ex.OnlyOnA()` on a `SiblingA | SiblingB`
-    // binding reports "no member `OnlyOnA` on `Exception`"), but
+    // fix #4733 (§5.1, §3.6 rule 2, §14.2, v0.307): the UNIFIED form of
+    // #4644's exception-family gate. Every built-in CLASS — the built-in
+    // EXCEPTION family (#4644's narrow subject) plus the §4 / §6 / §29 / §30
+    // / §32 built-in HEAP-POINTER CLASSES (`isHeapPointerReferenceBuiltin`,
+    // the same predicate codegen's two rep paths consult) — is not
+    // implicitly convertible to a USER-DECLARED CLASS, nor to a CONCRETE
+    // primitive, nor is a CONCRETE primitive implicitly convertible to it.
     //
-    //     catch var ex: SiblingA | SiblingB => var narrow: SiblingA := ex;
+    // #4644 stated the rule for the EXCEPTION half (built-in exception →
+    // user class, and built-in exception → concrete primitive). #4760 stated
+    // it for the HEAP-REFERENCE → concrete-primitive half. #1178 stated the
+    // mixed-class/primitive rule but explicitly excluded null-declaration
+    // Named types — "a generic type-parameter and a builtin both have a null
+    // declaration and must keep flowing through" — so the PRIMTIVE →
+    // BUILT-IN-CLASS direction slipped past it. This gate is the unified
+    // shape on the exact same fall-through that #4644 / #4760 / #1178 fire
+    // for adjacent shapes, with the same exclusion set:
     //
-    // was ACCEPTED — an unchecked downcast, and with `throw new SiblingB(...)`
-    // a `SiblingB` instance reachable through a `SiblingA`-typed slot. The
-    // divergence is NOT catch-specific: a plain `var e: Exception := …;
-    // var w: Widget := e;` was accepted too, because a built-in exception's
-    // TypeRef carries `declaration == nullptr` (built-ins have no TypeSymbol)
-    // and so misses the Named-Named branch above, which requires BOTH sides
-    // declared, and every later branch, which keys on generic args, spans or
-    // the collection families. The value fell through to this catch-all and
-    // was silently accepted — the same failure SHAPE as #1178's mixed
-    // class/primitive gate and #1935's builtin-interface residual, both fixed
-    // the same way.
+    //   * `from`/`to` is a BUILT-IN CLASS shape: heap-reference or exception,
+    //     MINUS the built-in INTERFACE heads (those are reference types but
+    //     implementable by user classes, and the existing variance arm at
+    //     line ~4623 already handles the generic-args target case). The
+    //     combined predicate is `(isHeapPointerReferenceBuiltin(n) ||
+    //     isBuiltinExceptionName(n)) && !isBuiltinInterfaceHead(n)` — built
+    //     out of the existing registry predicates, no hand-listed copy.
+    //   * a bare TYPE VARIABLE is Named-with-null-declaration too, and a
+    //     user type parameter that shadows a built-in name (e.g.
+    //     `class Box<StringBuilder>`) is NOT the built-in — excluded
+    //     explicitly by `refMentionsTypeVariable` and `freeTypeParamNames`
+    //     membership, exactly as #4644 excludes it.
+    //   * an ERROR-RECOVERY Named (an unresolved identifier with no
+    //     declaration) is also Named-with-null-declaration but is NOT in
+    //     either built-in name predicate, so it falls outside the gate
+    //     naturally — no false-positive cascade (already reported elsewhere
+    //     as a resolution error).
+    //   * legitimate built-in→built-in VARIANCE through a generic-arg target
+    //     (e.g. `Array<T>` → `IEnumerable<T>`) is handled by the variance
+    //     arm above when `to->genericArgs` is non-empty; this gate never
+    //     fires for those because `from->genericArgs` is also non-empty and
+    //     we restrict the predicate to `genericArgs.empty()` so a built-in
+    //     class with its own type argument list (e.g. `Array<T>`) reaches
+    //     the variance arm instead.
+    //   * `Object` is excluded on both sides — boxing is handled by the
+    //     `Object` early-return far above.
     //
-    // Scope, deliberately narrow — it fires only on shapes that currently
-    // reach the fall-through, i.e. that are silently accepted today:
-    //   * `from` is a built-in EXCEPTION type. `common::isBuiltinExceptionName`
-    //     is sema's single authoritative predicate for that (the one
-    //     `isExceptionDerivedClass` consults, backed by
-    //     `kBuiltinExceptionHierarchy`) — never a hand-listed copy. The wider
-    //     built-in→user-class hole (`StringBuilder` → `Widget`, also accepted)
-    //     is a separate defect with its own blast radius and is filed rather
-    //     than swept in here.
-    //   * a bare TYPE VARIABLE is also Named-with-null-declaration (see
-    //     `refMentionsAnyOf`), so a type parameter — including one that shadows
-    //     a built-in exception name — is excluded explicitly; its
-    //     well-formedness is per-instantiation and must keep flowing through.
-    //   * `to` is a CONCRETE user-declared CLASS, or a CONCRETE primitive
-    //     (`Object` excluded — boxing). An interface `to` keeps its current
-    //     permissive path (§31.2.1 admits interface-typed arms, so an
-    //     `Exception`-derived class may implement one), and a built-in `to`
-    //     (`Exception` → `IOException`) is left to the separate filed defect.
-    //   * and the ancestor test is still asked rather than assumed: a built-in
-    //     cannot derive from a user class, so `hasNamedAncestor` is false here
-    //     by construction, but asking it keeps this gate honest if the built-in
-    //     hierarchy ever gains a user-visible base.
-    // The UPCAST direction (`var e: Exception := new SiblingA(…)`) is untouched:
-    // `from` there carries a declaration and never enters this block.
+    // Repro A: `var sb := new StringBuilder(); var w: Widget := sb;` was
+    // ACCEPTED pre-fix (StringBuilder is in `isHeapPointerReferenceBuiltin`
+    // and not in `isBuiltinExceptionName`, so #4644 missed it; the
+    // §4.16/§4.14/§4.15 arms require their specific source names; the
+    // §12.9 generic-args arm requires `to->genericArgs` and misses; every
+    // other arm requires `declaration != nullptr` and misses). Result:
+    // silent acceptance, downstream shape mismatch.
+    //
+    // Repro B: `var e: Exception := 5;` was ACCEPTED pre-fix and IR-verified
+    // malformed (the #4644 arm only fires when `from` is the built-in, so
+    // the REVERSE direction slipped past — and #1178's mixed class/primitive
+    // gate explicitly excluded null-declaration Named types per its own
+    // header comment, so it missed the built-in-class half too).
+    //
+    // The UPCAST direction (`var e: Exception := new SiblingA(...)`) is
+    // untouched: `from` there carries a declaration and never enters the
+    // user-class arm. The BUILT-IN → BUILT-IN upcast inside the same family
+    // (`IOException` → `Exception`, `Array<T>` → `IEnumerable<T>`) is handled
+    // by the variance arm above and is left alone here.
     {
+        auto isBuiltinClassHead = [](std::string_view n) {
+            return !n.empty() &&
+                   (common::isHeapPointerReferenceBuiltin(n) ||
+                    common::isBuiltinExceptionName(n)) &&
+                   !common::isBuiltinInterfaceHead(n);
+        };
         std::string_view fromName = namedRefSimpleName(from);
+        std::string_view toName = namedRefSimpleName(to);
         bool fromIsTypeVar =
             refMentionsTypeVariable(from) ||
             (freeTypeParamNames && !fromName.empty() &&
              freeTypeParamNames->count(fromName));
-        bool fromBuiltinException =
+        bool toIsTypeVar =
+            refMentionsTypeVariable(to) ||
+            (freeTypeParamNames && !toName.empty() &&
+             freeTypeParamNames->count(toName));
+        bool fromBuiltinClass =
             from->kind == TypeRef::Kind::Named && !from->declaration &&
-            from->genericArgs.empty() && !fromName.empty() &&
-            common::isBuiltinExceptionName(fromName) && !fromIsTypeVar;
+            from->genericArgs.empty() && !fromIsTypeVar &&
+            isBuiltinClassHead(fromName);
+        bool toBuiltinClass =
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            to->genericArgs.empty() && !toIsTypeVar &&
+            isBuiltinClassHead(toName);
         bool toUserClass = to->kind == TypeRef::Kind::Named &&
                            to->declaration &&
                            to->declaration->kind == ast::TypeDeclKind::Class;
-        if (fromBuiltinException && toUserClass &&
+        // Repro A: built-in class → user class.
+        if (fromBuiltinClass && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name)) {
-            const std::string toName(to->declaration->name);
+            const std::string toN(to->declaration->name);
+            // Distinguish EXCEPTION sources (kept under #4644's old
+            // "the built-in exception type `X` is not a `Y`" wording so the
+            // pinned `catch_multitype_no_common_base_v182` row's
+            // substring assertion still matches) from HEAP-REFERENCE sources
+            // (Repro A — "the built-in type `X` is not a `Y`"). Same rule,
+            // §5.1 / §12.7 / §17.4 cited, distinct wording.
+            const char* kind =
+                common::isBuiltinExceptionName(fromName) ? "exception type" : "type";
             reportNotConvertible(
-                std::string("the built-in exception type `") +
-                std::string(fromName) + "` is not a `" + toName +
-                "` — `" + toName + "` is not a base of it, so the conversion "
+                std::string("the built-in ") + kind + " `" +
+                std::string(fromName) + "` is not a `" + toN +
+                "` — `" + toN + "` is not a base of it, so the conversion "
                 "would be a narrowing (or unrelated) reference conversion, "
-                "and §5.1 has none implicitly (a multi-type `catch` arm binds "
-                "at the nearest common base of the listed types, §31.2.1, "
-                "which is `Exception` for alternatives sharing nothing more "
-                "specific); test the runtime type with `if e is " + toName +
-                " then … end;` (§12.7) or `e as " + toName + "` (§17.4)");
+                "and §5.1 has none implicitly; test the runtime type with "
+                "`if e is " + toN + " then … end;` (§12.7) or `e as " + toN +
+                "` (§17.4)");
             return;
         }
-        // …and not to a CONCRETE primitive either. Same root cause, same
-        // fall-through, worse failure mode: `catch var ex: Exception => …
-        // var n: int := ex;` COMPILED and printed the exception object's
-        // address (probe-measured: 864801568) — a reference reinterpreted as
-        // an `int`, i.e. silent wrong code rather than a rejection. #1178's
-        // gate above states the rule ("There is no implicit conversion between
-        // a class reference and a primitive, §4.6 forbids implicit to-string")
-        // but is deliberately restricted to `declaration != nullptr`, so a
-        // built-in never reached it. `Object` stays excluded — boxing is
-        // handled by the `Object` branch far above.
+        // …and NOT to a CONCRETE primitive either. Same root cause, same
+        // fall-through, worse failure mode: a class reference reinterpreted
+        // as a primitive value is silent wrong code rather than a rejection
+        // — #1178's rule ("no implicit conversion between class reference
+        // and primitive, §4.6 forbids implicit to-string") but is
+        // deliberately restricted to `declaration != nullptr`, so a built-in
+        // class never reached it. `Object` stays excluded — boxing is
+        // handled by the `Object` branch far above. The HEAP-REFERENCE half
+        // of this arm uses #4760's exact wording so its pinned
+        // `tests/sema/builtin_collection_to_primitive_4760_test.cpp` rows
+        // (which assert on a UNIQUE substring of that wording, the
+        // `kRuleWording` fragment, to pin the rule itself rather than a
+        // generic §5.1 reject) keep passing unchanged — fix #4733 is the
+        // #4760 widen, not a rename.
         bool toConcretePrimitive = to->kind == TypeRef::Kind::Primitive &&
                                    to->primitive != PrimitiveType::Object;
-        if (fromBuiltinException && toConcretePrimitive) {
+        bool fromBuiltinHeapRef =
+            fromBuiltinClass && !fromName.empty() &&
+            common::isHeapPointerReferenceBuiltin(fromName);
+        if (fromBuiltinHeapRef && toConcretePrimitive) {
+            reportNotConvertible(
+                std::string("the built-in type `") + std::string(fromName) +
+                "` is a heap reference and the target is a value type — "
+                "§5.1 has no implicit conversion between them, and §4.6 "
+                "forbids an implicit conversion to `string`; read a member "
+                "of the value instead (e.g. its `Count`/`Length`), or index it");
+            return;
+        }
+        if (fromBuiltinClass && toConcretePrimitive) {
+            // The EXCEPTION half — same shape, distinct wording (an exception
+            // is a reference-typed class but not a heap-reference in
+            // #4760's sense; this is the #4644 second-arm widen). Cite
+            // §31.4's `Message` member as the concrete remedy the user
+            // can read instead. The HEAP-REFERENCE half fires ABOVE this
+            // arm and uses #4760's wording, so by the time we reach here
+            // `from` is necessarily an EXCEPTION.
             reportNotConvertible(
                 std::string("the built-in exception type `") +
                 std::string(fromName) + "` is a class reference and the "
@@ -5238,6 +5299,22 @@ void ExprTC::checkAssignable(
                 "between them, and §4.6 forbids an implicit conversion to "
                 "`string`; read a property of the exception instead (e.g. "
                 "its `Message`, §31.4)");
+            return;
+        }
+        // Repro B: concrete primitive → built-in class. The reverse of the
+        // arm #1178 covers for user-declared classes; #1178 explicitly
+        // excluded null-declaration Named types so it missed the built-in
+        // half. `Object` source is excluded — boxing handled above.
+        bool fromConcretePrimitive = from->kind == TypeRef::Kind::Primitive &&
+                                     from->primitive != PrimitiveType::Object;
+        if (toBuiltinClass && fromConcretePrimitive) {
+            reportNotConvertible(
+                std::string("the target is the built-in class `") +
+                std::string(toName) + "` and the source is a value type — "
+                "§5.1 has no implicit conversion between them, and §4.6 "
+                "forbids an implicit conversion from `string`; construct "
+                "the built-in value with `new " + std::string(toName) +
+                "(...)` (§17.7) or pass it directly");
             return;
         }
     }
