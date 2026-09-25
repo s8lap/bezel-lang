@@ -2938,6 +2938,24 @@ static bool stringIsInstanceOf(const sema::TypeRef* rt) {
 // `IEnumerable<char>` stdlib §9.6 gives it — may hold one. Pre-fix only
 // `Object` and declared interfaces were listed, so `e: IEnumerable<char>`
 // holding a string ran emitIsA on the string's `char* data` (SIGSEGV).
+// widen #4909 (§12.7, v0.307): a declaration-less `IEnumerable<T>` for any `T`
+// (the vtable-backed IEnumerable<T> shape — declaration=null, astNode or
+// importedName set, genericArgs non-empty) widens the lazy LINQ pipeline
+// (`var q: IEnumerable<int> := a.Select(...); q is IEquatable<string>`) and
+// thus may hold a vtable-less runtime value too. A `q is IEquatable<string>`
+// test on such a pipeline hit emitIsA over the bz_lazy_vtable C array, which
+// has NO null terminator (only [bz_lazy_vtable, bz_lazy_dispose,
+// bz_lazy_movenext, bz_lazy_current]), so the walk read past the chain and
+// matched `td$IEquatable_string` (a known address the linker happened to put
+// after the array). Gating through bz_obj_is_string — which catches the
+// bz_lazy_vtable first word as a vtable-less object — returns False.
+// widen #4925 (§12.7, v0.307): a bare type-parameter placeholder (Named with
+// no declaration and no generic args) at a generic body site COULD be
+// substituted to `string` at monomorphization, so the operand's runtime value
+// is then a bare `bz_string*` and emitIsA walks its `char* data`. Conservative
+// widening: a true answer here only gates through bz_obj_is_string, which
+// returns False (matches pre-fix T = int / Dog) for class/box-shaped runtimes
+// and True for a string.
 static bool staticTypeMightHoldBareString(const sema::TypeRef* opTy) {
     if (!opTy) return false;
     if (opTy->kind == sema::TypeRef::Kind::Primitive)
@@ -2945,9 +2963,19 @@ static bool staticTypeMightHoldBareString(const sema::TypeRef* opTy) {
     if (opTy->kind != sema::TypeRef::Kind::Named) return false;
     if (opTy->declaration)
         return opTy->declaration->kind == ast::TypeDeclKind::Interface;
+    // No declaration — could be a type parameter (#4925), the lazy LINQ
+    // sentinel (#4909), or the declaration-less `IEnumerable<char>` stdlib §9.6
+    // gives `string` (#4858).
+    if (opTy->genericArgs.empty()) return true;  // widen #4925: bare type param
     sema::TypeRef bare = *opTy;
     bare.nullable = false;
-    return stringIsInstanceOf(&bare);
+    // widen #4909: a declaration-less IEnumerable<T> for any `T` (the vtable-
+    // backed IEnumerable<T> shape: declaration=null, astNode or importedName
+    // set, single generic arg). The runtime value may be a lazy pipeline.
+    if (stringIsInstanceOf(&bare)) return true;
+    if (bare.headName() == "IEnumerable" &&
+        bare.genericArgs.size() == 1) return true;
+    return false;
 }
 
 llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
@@ -3178,17 +3206,32 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // when non-null (§12.7 — `null` is an instance of no type). `as` yields the
     // operand (a borrow, §17.4) on a match and `null` otherwise; a value target
     // (`s as int`) is never a match, so its `T?` is the all-zero null struct.
-    // The narrowed-carrier and generic-carrier shapes do not reach here: a
-    // narrowed identifier reports its DECLARED type (Object/interface) through
-    // operandStaticTy, and a `v: T` carrier's sema type is the type parameter.
-    if (const sema::TypeRef* opTy = operandStaticTy();
-        opTy && opTy->kind == sema::TypeRef::Kind::Primitive &&
-        opTy->primitive == sema::PrimitiveType::String &&
+    // The narrowed-carrier shape does not reach here: a narrowed identifier
+    // reports its DECLARED type (Object/interface) through operandStaticTy.
+    // widen #4925 (§12.7, v0.307): the generic-carrier `v: T` AT A GENERIC
+    // BODY SITE — `ctx_.exprType` reports the type parameter (it is the
+    // DECLARED type of `v`), but the runtime value is whatever `T` was
+    // substituted to at monomorphization. When `T = string`, the operand is a
+    // bare `bz_string*`; the pre-fix code fell through to emitIsA, which walked
+    // the string's `char* data` as a descriptor chain (SIGSEGV). Resolve
+    // through `genericSubstSemaTy_` so the static decision arm fires for
+    // monomorphized carriers; the unspecialized-template path (an empty
+    // substitution map) leaves `opTy` as the bare type parameter, which is
+    // NOT a Primitive String and so still falls through to the #1071 guard
+    // below (widened by #4925 to recognize a bare type-parameter placeholder).
+    const sema::TypeRef* opTyRaw = operandStaticTy();
+    const sema::TypeRef* opTyResolved =
+        (opTyRaw && opTyRaw->kind == sema::TypeRef::Kind::Named &&
+         !opTyRaw->declaration && opTyRaw->genericArgs.empty())
+            ? resolveTypeParamRef(opTyRaw)
+            : opTyRaw;
+    if (opTyResolved && opTyResolved->kind == sema::TypeRef::Kind::Primitive &&
+        opTyResolved->primitive == sema::PrimitiveType::String &&
         obj->getType()->isPointerTy() &&
         (te.op == "is" || te.op == "is not" || te.op == "as")) {
         const bool instance = stringIsInstanceOf(rt);
         llvm::Value* holds = builder_.getInt1(instance);
-        if (instance && opTy->nullable)
+        if (instance && opTyRaw->nullable)
             holds = builder_.CreateICmpNE(
                 obj, llvm::ConstantPointerNull::get(ptrTy()), "is.str.nonnull");
         if (te.op == "is") return holds;
@@ -3200,7 +3243,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             return llvm::Constant::getNullValue(nullableValueStructTy(&tmp));
         }
         if (!instance) return llvm::ConstantPointerNull::get(ptrTy());
-        return opTy->nullable
+        return opTyRaw->nullable
             ? builder_.CreateSelect(holds, obj,
                                     llvm::ConstantPointerNull::get(ptrTy()))
             : obj;
