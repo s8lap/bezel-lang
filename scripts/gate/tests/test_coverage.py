@@ -176,6 +176,24 @@ class FloorOkTest(unittest.TestCase):
         self.assertEqual(v.per_binary_ran, {"codegen": 60, "sema": 40})
         self.assertEqual(v.per_binary_expected, {"codegen": 60, "sema": 40})
 
+    def test_issue_3737_repro_stays_coverage_short_pending_3002_ruling(self):
+        # #3737's own shape: TOTAL 20573 passed, 2 failed, both arbitrated
+        # FLAKY. The floor compares PASSED, not attempted — #3002's deliberate
+        # choice (a cleared failure also leaves passed < expected). The ask to
+        # fold arbitration suspects into `ran` was declined-with-reasons
+        # pending a #3002 policy ruling, so this must stay coverage-short.
+        v = coverage.floor_ok(20573, 20575, {}, {})
+        self.assertFalse(v.ok)
+        self.assertEqual(v.verdict, "coverage-short")
+        self.assertEqual(v.ran, 20573)
+
+    def test_floor_takes_no_accepted_flaky_fold(self):
+        # Pins the decline: floor_ok has no side channel that credits
+        # arbitration suspects (which may include un-re-run capped suspects
+        # and `died on:` victims already counted in passed).
+        with self.assertRaises(TypeError):
+            coverage.floor_ok(26252, 26538, {}, {}, accepted_flaky=286)
+
 
 class CheckCoverageFloorTest(unittest.TestCase):
     def test_end_to_end_ok(self):
@@ -260,6 +278,26 @@ class CLITest(unittest.TestCase):
             self.assertEqual(m["expected"], "8")
             self.assertIn("codegen:5", m["bin_expected"])
             self.assertIn("sema:3", m["bin_expected"])
+
+    def test_check_rejects_accepted_flaky_flag(self):
+        # #3737 decline: the CLI must not accept a suspect fold (argparse
+        # usage error, exit 2) — reintroducing it needs a #3002 ruling.
+        with tempfile.TemporaryDirectory() as d:
+            b1 = _fake_binary(d, "codegen", 5)
+            mp = _write_manifest(d, [_row("codegen", b1, 99)])
+            r = self._run_cli(["check", "--ran", "3", "--manifest", mp,
+                               "--accepted-flaky", "2"])
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    def test_gate_sh_feeds_passed_count_and_keeps_gtests_meaning(self):
+        # #3002 wiring: gate.sh passes the in-shard PASSED total as --ran, adds
+        # no suspect fold, and does not overwrite COV_GTESTS (the telemetry
+        # `gtests` field) from the coverage module's output.
+        gate_sh = open(os.path.join(self._SCRIPTS_DIR, "gate.sh")).read()
+        self.assertIn('--ran "${COV_GTESTS:-0}"', gate_sh)
+        self.assertNotIn("--accepted-flaky", gate_sh)
+        self.assertNotIn("@cov:ran=", gate_sh)
+        self.assertNotRegex(gate_sh, r"(?m)^[^#]*\bCOV_GTESTS=\$_cov")
 
     def test_check_ran_superset_of_expected_is_ok(self):
         # A re-run that picks up a few extra tests is NOT a defect (== too strict).

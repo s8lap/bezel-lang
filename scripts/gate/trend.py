@@ -129,7 +129,11 @@ def judge(records, only_last=False, malformed=0):
         is null/0 (FAIL), or whose AOT cache stats / cache_n are absent after a
         ran shard (WARN). Scoped to PASS — a gate that failed early legitimately
         never reaches the coverage harvest.
-    R5 coverage-floor-disabled: coverage_floor_enforced == false.
+    R5 coverage-floor-disabled: result == pass and (coverage_floor_enforced is
+        not True or coverage_floor_satisfied is False) — a PASS record for which
+        the floor was never invoked, or was invoked and did not report
+        satisfied (per #3737; a floor FAIL on a result=fail record is not this
+        rule's concern — `result` already conveys it).
     """
     # High-water of gtests, used as the expected-count proxy for schema:1 records
     # written before gate.sh recorded `expected_gtests` (#3002 landed 2026-08-07).
@@ -247,11 +251,34 @@ def judge(records, only_last=False, malformed=0):
                     f"{ts(r)} {hd(r)}: cache_n=0 — the store was read as empty; if it "
                     f"is not, the read is broken (this is the #3000 shape)", 999.0))
 
-        # ---- R5: the coverage floor disabled itself --------------------------
-        if floor is False:
+        # ---- R5: a PASS without the floor's blessing -------------------------
+        # fix #3737: `coverage_floor_enforced` used to be VALUE-based (true only
+        # when the floor's own `ran >= expected` comparison passed), and this rule
+        # fired on `floor is False` unscoped to result — so a record whose floor
+        # genuinely ran, found a shortfall, and correctly reported result=fail was
+        # ALSO flagged "the gate ran without the #3002 floor". The field is now
+        # split: `coverage_floor_enforced` is presence-based (True iff gate.sh
+        # invoked the floor; None iff it never reached that code) and
+        # `coverage_floor_satisfied` keeps the old value (did the comparison pass).
+        #
+        # R5 fires on a PASS that either never invoked the floor OR invoked it and
+        # was not satisfied. The second arm is load-bearing, not redundant with
+        # `result`: gate.sh defaults GATE_FLOOR_OK to 0 when coverage.py exits 0
+        # without printing `@cov:floor_ok=`, so a PASS record with
+        # satisfied=false is reachable, and it means the pass carries no evidence
+        # the floor agreed. Scoped to PASS like R4, for R4's reason: a fail/retry
+        # that stopped before the floor legitimately never invokes it, and a
+        # coverage-short fail is already fully conveyed by result=fail.
+        satisfied = r.get("coverage_floor_satisfied")
+        if result == "pass" and (floor is not True or satisfied is False):
+            if floor is not True:
+                why = (f"coverage_floor_enforced={floor!r} — the gate PASSED "
+                       f"without ever invoking the #3002 floor")
+            else:
+                why = ("coverage_floor_satisfied=False — the gate PASSED although "
+                       "the #3002 floor did not report satisfied")
             findings.append(("FAIL", RULES[4], i,
-                f"{ts(r)} {hd(r)}: coverage_floor_enforced=false — the gate ran "
-                f"without the #3002 floor; its pass is not an acceptance", 999.0))
+                f"{ts(r)} {hd(r)}: {why}; its pass is not an acceptance", 999.0))
 
     scan_line = (f"trend: {len(records)} records scanned, {len(RULES)} rules evaluated"
                  + (f", {malformed} malformed lines skipped" if malformed else ""))

@@ -162,7 +162,21 @@ class R4UnmeasuredSentinelTest(unittest.TestCase):
 
 
 class R5CoverageFloorDisabledTest(unittest.TestCase):
-    def test_floor_false_fires_fail(self):
+    """fix #3737: coverage_floor_enforced was flipped from VALUE-based (true
+    only when the floor's own comparison passed) to PRESENCE-based (true iff
+    gate.sh actually invoked the floor check). The old
+    `test_floor_absent_does_not_fire` below asserted the OLD semantics — that
+    an absent/None floor field on a PASS record must never fire, reasoning it
+    was "a schema:1 record". Under the corrected field that reasoning no
+    longer holds: an absent field on a *result=pass* record now means "this
+    pass never invoked the #3002 floor at all", which is exactly the
+    coverage-floor-disabled signature R5 exists to catch, so that case now
+    fires FAIL (flipped intentionally, not a regression)."""
+
+    def test_floor_non_true_fires_fail_on_pass(self):
+        # Any non-True value (raw-dict robustness: a malformed/legacy value)
+        # on a PASS record must fire — R5's job is "never let a pass through
+        # without the floor's blessing" (#3011's fail-closed philosophy).
         rec = _rec(expected_gtests=100, gtests=100, coverage_floor_enforced=False)
         _, findings = trend.judge([rec])
         self.assertIn(trend.RULES[4], _fired_rules(findings))
@@ -173,9 +187,76 @@ class R5CoverageFloorDisabledTest(unittest.TestCase):
         _, findings = trend.judge([rec])
         self.assertNotIn(trend.RULES[4], _fired_rules(findings))
 
-    def test_floor_absent_does_not_fire(self):
-        # Schema:1 records predate the floor field; absence is not False.
+    def test_floor_absent_on_pass_now_fires(self):
+        # fix #3737 (flip): a PASS record whose floor was never invoked at all
+        # (the field is genuinely absent, the new post-fix shape for "gate.sh
+        # never reached the coverage floor code") is the real coverage-floor-
+        # disabled signature — this must fire, not stay silent.
         rec = _rec(expected_gtests=100, gtests=100)
+        _, findings = trend.judge([rec])
+        self.assertIn(trend.RULES[4], _fired_rules(findings))
+
+    def test_floor_satisfied_false_on_a_fail_result_does_not_fire(self):
+        # fix #3737: this is the exact 466a28e2 record 1185 shape — the floor
+        # genuinely ran, found a shortfall (286 short of the registry),
+        # and gate.sh correctly reported result=fail. Before this
+        # fix, R5 ALSO fired on it (unconditionally on `floor is False`,
+        # unscoped to result), producing the misleading "the gate ran without
+        # the #3002 floor; its pass is not an acceptance" message on an
+        # already-correctly-failed record. R5 must now stay silent here: the
+        # floor DID run (coverage_floor_enforced=True), it just did not pass
+        # (coverage_floor_satisfied=False) — that is fully and correctly
+        # conveyed by result=fail alone.
+        rec = _rec(expected_gtests=26538, gtests=26252, result="fail",
+                    coverage_floor_enforced=True, coverage_floor_satisfied=False)
+        _, findings = trend.judge([rec])
+        self.assertNotIn(trend.RULES[4], _fired_rules(findings))
+
+    def test_floor_enforced_but_not_satisfied_on_pass_fires(self):
+        # fix #3737 (the hole a presence-only R5 would open): gate.sh defaults
+        # GATE_FLOOR_OK to 0 when coverage.py exits 0 without printing
+        # `@cov:floor_ok=`, so a result=pass record with the floor invoked
+        # (enforced=True) but NOT satisfied is reachable. A pass with no
+        # evidence the floor agreed is not an acceptance — R5 must fire.
+        rec = _rec(expected_gtests=100, gtests=100, result="pass",
+                    coverage_floor_enforced=True, coverage_floor_satisfied=False)
+        _, findings = trend.judge([rec])
+        self.assertIn(trend.RULES[4], _fired_rules(findings))
+        r5 = [f for f in findings if f[1] == trend.RULES[4]]
+        self.assertEqual([f[0] for f in r5], ["FAIL"])
+        self.assertIn("coverage_floor_satisfied=False", r5[0][3])
+
+    def test_floor_enforced_and_satisfied_on_pass_does_not_fire(self):
+        # The healthy post-#3737 PASS shape.
+        rec = _rec(expected_gtests=100, gtests=100, result="pass",
+                    coverage_floor_enforced=True, coverage_floor_satisfied=True)
+        _, findings = trend.judge([rec])
+        self.assertNotIn(trend.RULES[4], _fired_rules(findings))
+
+    def test_floor_enforced_true_satisfied_absent_does_not_fire(self):
+        # Pre-split records carried only the value-based
+        # coverage_floor_enforced (True meant "ran and satisfied"); an absent
+        # coverage_floor_satisfied there is legacy, not a floor FAIL.
+        rec = _rec(expected_gtests=100, gtests=100, result="pass",
+                    coverage_floor_enforced=True)
+        _, findings = trend.judge([rec])
+        self.assertNotIn(trend.RULES[4], _fired_rules(findings))
+
+    def test_floor_not_enforced_but_satisfied_true_on_pass_fires(self):
+        # The two arms are independent: a satisfied=True cannot vouch for a
+        # record that does not also say the floor was invoked.
+        rec = _rec(expected_gtests=100, gtests=100, result="pass",
+                    coverage_floor_satisfied=True)
+        _, findings = trend.judge([rec])
+        self.assertIn(trend.RULES[4], _fired_rules(findings))
+
+    def test_floor_absent_on_fail_does_not_fire(self):
+        # Scoped to PASS, matching R4's precedent: a gate that failed/retried
+        # for an unrelated reason before ever reaching the coverage floor
+        # (e.g. a real arbitration regression) legitimately never invokes it —
+        # firing there would flood every non-pass record with a spurious
+        # second finding.
+        rec = _rec(expected_gtests=100, gtests=0, result="fail")
         _, findings = trend.judge([rec])
         self.assertNotIn(trend.RULES[4], _fired_rules(findings))
 
@@ -203,12 +284,17 @@ class HighWaterProxyTest(unittest.TestCase):
 
 class OnlyLastWindowTest(unittest.TestCase):
     def test_last_window_judges_only_the_newest_record(self):
-        # The middle record has the floor disabled; under --last only the
-        # (clean) newest record is judged, so R5 stays silent. Full scan fires.
-        clean0 = _rec(expected_gtests=10, gtests=10, ts="t0")
-        bad = _rec(expected_gtests=10, gtests=10, ts="t1",
-                   coverage_floor_enforced=False)
-        clean2 = _rec(expected_gtests=10, gtests=10, ts="t2")
+        # The middle record's floor was never invoked (result=pass, field
+        # absent); under --last only the (clean) newest record is judged, so
+        # R5 stays silent. Full scan fires. clean0/clean2 explicitly set
+        # coverage_floor_enforced=True so they stay clean under the new
+        # presence-based field (an unset field now itself means "never
+        # invoked" and would fire on its own).
+        clean0 = _rec(expected_gtests=10, gtests=10, ts="t0",
+                       coverage_floor_enforced=True)
+        bad = _rec(expected_gtests=10, gtests=10, ts="t1")
+        clean2 = _rec(expected_gtests=10, gtests=10, ts="t2",
+                       coverage_floor_enforced=True)
         records = [clean0, bad, clean2]
 
         _, last_findings = trend.judge(records, only_last=True)
@@ -262,9 +348,15 @@ class MalformedNewestRefusalTest(unittest.TestCase):
             os.unlink(path)
 
     def test_parseable_log_does_not_refuse(self):
+        # coverage_floor_enforced=True on both: this test is about the
+        # malformed-newest refusal path, not R5, so both records must stay
+        # clean under the new presence-based field (an absent field on a
+        # result=pass record now fires R5 — fix #3737).
         path = self._write_log([
-            json.dumps(_rec(expected_gtests=10, gtests=10, ts="t0")),
-            json.dumps(_rec(expected_gtests=10, gtests=10, ts="t1")),
+            json.dumps(_rec(expected_gtests=10, gtests=10, ts="t0",
+                             coverage_floor_enforced=True)),
+            json.dumps(_rec(expected_gtests=10, gtests=10, ts="t1",
+                             coverage_floor_enforced=True)),
         ])
         try:
             buf = _stdio_io.StringIO()

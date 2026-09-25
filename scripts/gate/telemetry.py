@@ -333,7 +333,23 @@ def build_record(*, ts, epoch, host, mode, head, head_short, dirty, result,
         "gtests": _posint(cov_gtests),
         "littests": _posint(cov_littests),
         "expected_gtests": _posint(expected_gtests),
-        "coverage_floor_enforced": _optbool(coverage_floor_ok),
+        # fix #3737: split what was one conflated field. coverage_floor_ok
+        # (gate.sh's GATE_FLOOR_OK / --coverage-floor-ok) is 0/1: 1 when
+        # `ran >= expected`, 0 when the floor genuinely ran and found a
+        # shortfall (coverage-short) OR the registry was unusable — either
+        # way the check DID run, it just did not pass. The old single field
+        # collapsed "ran" and "passed" into the same bit, so gate.trend's R5
+        # read a legitimate coverage-short FAIL (floor enforced, not
+        # satisfied) as "the gate ran WITHOUT the #3002 floor" — a
+        # misleading message on a record whose `result` was already
+        # correctly "fail". `coverage_floor_enforced` is now presence-based
+        # (was the flag passed at all — null only when gate.sh never called
+        # the floor); `coverage_floor_satisfied` keeps the old value-based
+        # semantics (did the comparison pass) that R5 actually needs.
+        "coverage_floor_enforced": (
+            None if coverage_floor_ok is None or coverage_floor_ok == ""
+            else True),
+        "coverage_floor_satisfied": _optbool(coverage_floor_ok),
         "cold": _optbool(cold),
         "cache_n": _optint(cache_n),
         "shard_timeout_s": _optint(shard_timeout),
