@@ -1838,6 +1838,177 @@ bool Emitter::instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t)
 }
 
 
+// fix #4933 (§11.2 "Interface declaration" / §14.1 "Generic declarations" /
+// §12.1, v0.307). See the declaration comment in LlvmBackend_impl.hpp.
+//
+// The repro is `class E: B<string>` with `B<T>: I<T>` and `B.Get(): T`. §14.1
+// makes the base clause an instantiation site of `B<string>`, and §11.2 says
+// `B<string>.Get` implements `I<string>.Get` "under the interface's
+// substitution" — so the itable slot `E` publishes for `I` must run the body
+// at T = string. declareVtables Pass D has no substitution active and fills the
+// slot with the erased `bz$<B>$Get` (T lowered as the i32 placeholder, #2896),
+// and the per-instantiation repair in `specializedVtableFor` is reached only
+// under an active substitution, i.e. never for the non-generic `E`. A direct
+// `e.Get()` / `B<string>` call already specializes through
+// computeAncestorGenericSubst (#585/#902); only the interface face was left on
+// the template, which read the string handle back as an i32 and printed "".
+//
+// For each itable of a NON-GENERIC local class, each METHOD / PROPERTY /
+// INDEXER slot whose implementation is declared on a GENERIC ancestor is
+// re-lowered under that ancestor's substitution (derived from the base-clause
+// chain by computeAncestorGenericSubst) whenever the body can differ: the
+// signature changes (`T` in a parameter or return) or the declaring class's
+// instance layout changes (#1240's GEP-offset reason). The same two questions,
+// and the same builders, `specializedVtableFor` uses for a generic class.
+// Only a slot still holding the erased template is replaced, so a #1139
+// nullable-widening thunk or an override declared on a non-generic class is
+// never touched. The `int` twin keeps its slot: the erased body is exact there.
+//
+// Runs after every ordinary method body is emitted: a specialization is a full
+// body emission, and #2759 records why no body may be lowered before Pass D has
+// created every vtable global. Rewriting the initializer in place keeps every
+// reference to the itab global (itmap entries, the imported mirror) valid.
+void Emitter::patchConcreteDerivedGenericBaseItables() {
+    // Deterministic order (#3020): itables_ is keyed by pointers.
+    std::vector<std::pair<std::pair<const sema::TypeSymbol*,
+                                    const sema::TypeSymbol*>,
+                          llvm::GlobalVariable*>>
+        work;
+    for (const auto& [key, gv] : itables_) {
+        const sema::TypeSymbol* ts = key.first;
+        if (!ts || !gv || !ts->genericParams.empty()) continue;
+        if (ts->kind != ast::TypeDeclKind::Class || ctx_.isImported(ts))
+            continue;
+        if (!gv->hasInitializer()) continue;
+        work.push_back({key, gv});
+    }
+    std::sort(work.begin(), work.end(), [](const auto& a, const auto& b) {
+        return a.second->getName() < b.second->getName();
+    });
+
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    // Install the substitution `ts` supplies to its generic ancestor `anc`;
+    // false (substitution untouched) when there is nothing to bind.
+    auto installAncestorSubst = [&](const sema::TypeSymbol* ts,
+                                    const sema::TypeSymbol* anc) {
+        if (!anc || anc == ts || anc->genericParams.empty()) return false;
+        sema::TypeRef synth;
+        synth.kind = sema::TypeRef::Kind::Named;
+        synth.declaration = const_cast<sema::TypeSymbol*>(ts);
+        std::unordered_map<std::string_view, llvm::Type*> s;
+        std::unordered_map<std::string_view, const sema::TypeRef*> sm;
+        if (!computeAncestorGenericSubst(&synth, anc, s, sm) || s.empty())
+            return false;
+        genericSubst_ = std::move(s);
+        genericSubstSemaTy_ = std::move(sm);
+        return true;
+    };
+    auto restore = [&]() {
+        genericSubst_ = savedSubst;
+        genericSubstSemaTy_ = savedSema;
+    };
+
+    for (const auto& [key, gv] : work) {
+        const sema::TypeSymbol* ts = key.first;
+        const sema::TypeSymbol* iface = key.second;
+        auto* init = llvm::cast<llvm::ConstantArray>(gv->getInitializer());
+        unsigned numSlots = init->getType()->getNumElements();
+        std::vector<llvm::Constant*> elems;
+        elems.reserve(numSlots);
+        for (unsigned i = 0; i < numSlots; ++i)
+            elems.push_back(init->getAggregateElement(i));
+        bool changed = false;
+
+        // METHOD slots: I's non-static methods in declaration order — the same
+        // enumeration Pass D fills (and every dispatch site indexes) with.
+        unsigned mi = 0;
+        for (sema::Symbol* m : iface->members) {
+            auto* im = dynamic_cast<sema::MethodSymbol*>(m);
+            if (!im || isStaticMethod(im)) continue;
+            unsigned slot = mi++;
+            if (slot >= numSlots) break;
+            sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
+            if (!impl || !impl->parent) continue;
+            auto mit = methodFns_.find(impl);
+            if (mit == methodFns_.end() ||
+                elems[slot] != llvm::cast<llvm::Constant>(mit->second))
+                continue;  // not the erased template (thunk, null, …)
+            if (!installAncestorSubst(ts, impl->parent)) continue;
+            llvm::Function* specFn = nullptr;
+            llvm::FunctionType* concFnTy = methodFnType(impl);
+            CallableInfo ci;
+            if (concFnTy &&
+                (concFnTy != mit->second->getFunctionType() ||
+                 instanceLayoutDiffersFromErasedTemplate(impl->parent)) &&
+                callableInfo(impl, ci)) {
+                std::vector<llvm::Type*> paramTys(concFnTy->param_begin(),
+                                                  concFnTy->param_end());
+                specFn = buildSpecializedMethodFn(impl, ci, paramTys);
+            }
+            restore();
+            if (specFn) {
+                elems[slot] = llvm::cast<llvm::Constant>(specFn);
+                changed = true;
+            }
+        }
+
+        // PROPERTY / INDEXER slots, at the indices Pass D and every dispatch
+        // site agree on (ifacePropertyGetIndex_ / ifacePropertySetIndex_).
+        for (sema::Symbol* m : iface->members) {
+            auto* ip = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ip) continue;
+            const sema::PropertySymbol* pimpl =
+                ip->isIndexer ? classIndexerImplementing(ts, ip)
+                              : classPropertyByName(ts, ip->name);
+            if (!pimpl || !pimpl->parent) continue;
+            // No AST read here (the #3152 imported-symbol seam): an accessor
+            // declared on an IMPORTED generic base must be patched too, and
+            // the only guards are templateAccessorFn / buildSpecializedAccessorFn
+            // answering null or the template itself. Whether a slot needs a
+            // specialized body is decided from LLVM signatures alone: the
+            // specialized accessor's function type vs the erased template's,
+            // or a differing instance layout. The prefilter skips building
+            // when every substituted argument lowers to the erased placeholder
+            // (i32, e.g. `B<int>`) and the layout is the template's, since the
+            // template body is then exact.
+            if (!installAncestorSubst(ts, pimpl->parent)) continue;
+            bool layoutDiffers =
+                instanceLayoutDiffersFromErasedTemplate(pimpl->parent);
+            bool substChangesErasure = false;
+            for (const auto& [name, ty] : genericSubst_)
+                if (ty != i32()) substChangesErasure = true;
+            auto patchSlot = [&](bool isSet, unsigned si) {
+                if (si >= numSlots) return;
+                llvm::Function* canon = templateAccessorFn(pimpl, isSet);
+                if (!canon || elems[si] != llvm::cast<llvm::Constant>(canon))
+                    return;
+                llvm::Function* specFn =
+                    buildSpecializedAccessorFn(ts, pimpl, isSet);
+                if (!specFn || specFn == canon) return;
+                if (!layoutDiffers &&
+                    specFn->getFunctionType() == canon->getFunctionType())
+                    return;
+                elems[si] = llvm::cast<llvm::Constant>(specFn);
+                changed = true;
+            };
+            if (substChangesErasure || layoutDiffers) {
+                if (auto git = ifacePropertyGetIndex_.find(ip);
+                    git != ifacePropertyGetIndex_.end())
+                    patchSlot(/*isSet=*/false, git->second);
+                if (auto sit = ifacePropertySetIndex_.find(ip);
+                    sit != ifacePropertySetIndex_.end())
+                    patchSlot(/*isSet=*/true, sit->second);
+            }
+            restore();
+        }
+
+        if (changed)
+            gv->setInitializer(llvm::ConstantArray::get(init->getType(), elems));
+    }
+}
+
+
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.

@@ -809,6 +809,10 @@ public:
             }
         }
         emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
+        // fix #4933 (§11.2 / §14.1, v0.307): after every method body exists and
+        // with no caller substitution active, re-point the erased itable slots
+        // of a non-generic class over a concrete generic base.
+        patchConcreteDerivedGenericBaseItables();
         {
             std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
                 sorted(ctorFns_.begin(), ctorFns_.end());
@@ -6712,6 +6716,17 @@ private:
     // the vectors is structural. `collectInstanceStorage`/`storageType` only READ
     // the substitution, so measuring both sequences has no emission consequences.
     bool instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t);
+
+    // fix #4933 (§11.2 / §14.1 / §12.1, v0.307): re-point the itable slots of a
+    // NON-GENERIC class that inherits its interface implementation from a
+    // generic base instantiated at concrete arguments (`class E: B<string>`,
+    // `B<T>: I<T>`). declareVtables Pass D fills such a slot with the erased
+    // `T -> i32` template body, and `specializedVtableFor` — the per-
+    // instantiation repair for GENERIC classes — never runs for `E` (no
+    // substitution is active at `new E()`), so `I<string>.Get()` read the
+    // 8-byte string handle back as an i32 and printed "". Runs once, after
+    // every method body is emitted; see the definition (LlvmBackend_Layout.cpp).
+    void patchConcreteDerivedGenericBaseItables();
 
     // fix #2889: install what `ancestorGenericSubstAdditions` proves into the
     // ACTIVE substitution, for callers that hold a substitution for `t` across
