@@ -8367,6 +8367,24 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // visiting loop below, once the handler argument has itself been
         // visited (so isCaptureFreeEntry can see a lambda's captures).
         bool subscribeArgNeedsCaptureFree = false;
+        // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14 (v0.307): the
+        // Subscribe/Add positions on the ISharedEvent<T>/SharedEventSource<T>
+        // cross-domain publication-point pair ALSO require capture-free
+        // handlers, with the stdlib-stated admission (non-capturing lambda
+        // or static method reference) keyed on the resolved callee. The pair
+        // has no EventSymbol (neither is the `event` member kind — they are
+        // declared as `owned readonly SharedEventSource<T>` + interface face,
+        // §6.5 (v0.187)), so detection is on the receiver's static type, not
+        // on an EventSymbol; `subscribeArgIsSharedEvent` discriminates the
+        // diagnostic text below from the §22.12-rule-5 `static event`
+        // message. The check intentionally admits a constrained generic
+        // receiver (spec §28.14 "the check applies wherever a call resolves
+        // to a subscribe position declared on the pair, a constrained
+        // generic receiver included") and applies uniformly to .Subscribe,
+        // .Add, and the += desugaring (the += desugar is handled in
+        // ExprTypecheck.cpp's compound-assignment arm; this arm covers
+        // .Subscribe / .Add directly).
+        bool subscribeArgIsSharedEvent = false;
         if (auto* maCallee = ce->callee
                 ? dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())
                 : nullptr) {
@@ -8381,6 +8399,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // MethodDecl, which carry a generic modifiers list.
                     if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
                         subscribeArgNeedsCaptureFree = ed->isStatic;
+                }
+                // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14 (v0.307):
+                // receiver-keyed detection — the receiver is a value of
+                // static type ISharedEvent<T> or SharedEventSource<T>
+                // (declaration-less Named refs whose head name is the
+                // registered builtin; same shape as the codegen-side
+                // `isISharedEventTypeName` / `isSharedEventSourceTypeName`
+                // predicates in LlvmBackend_Calls2.cpp:4252/4260). The pair
+                // is not a `static event` (which is the §22.12-rule-5
+                // member-kind-keyword syntax covered by the EventSymbol arm
+                // above), so the rule-5 diagnostic text is wrong here —
+                // emit the §6.5 wording keyed on subscribeArgIsSharedEvent
+                // below.
+                else if (const TypeRef* recvTy =
+                            ctx_.exprType(*maCallee->target)) {
+                    if (recvTy->kind == TypeRef::Kind::Named &&
+                        !recvTy->declaration) {
+                        std::string_view hn = recvTy->headName();
+                        if (hn == "ISharedEvent" ||
+                            hn == "SharedEventSource") {
+                            subscribeArgNeedsCaptureFree = true;
+                            subscribeArgIsSharedEvent = true;
+                        }
+                    }
                 }
             }
         }
@@ -9236,15 +9278,39 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // lambda's captures.
                 if (pos2 == 0 && subscribeArgNeedsCaptureFree &&
                     !isCaptureFreeEntry(a.value.get())) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, a.value->span.begin,
-                        "handler subscribed to a `static event` must be "
-                        "capture-free: a non-capturing lambda or a static "
-                        "method reference — a capturing lambda is rejected "
-                        "because the process-global subscriber list "
-                        "transports it to whichever domain raises, and its "
-                        "captures are borrows of the origin domain "
-                        "(\xC2\xA7""22.12 rule 5, #1542)");
+                    if (subscribeArgIsSharedEvent) {
+                        // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
+                        // (v0.307): the ISharedEvent<T>/SharedEventSource<T>
+                        // cross-domain pair admits only a capture-free
+                        // handler — a non-capturing lambda or a static
+                        // method reference. Stdlib §6.5 sentence 2 ("forming
+                        // a method reference over a capture-free-register
+                        // position is a compile error") is the closer
+                        // against the capture-free register; the actual
+                        // method-reference formation is a SEPARATE check
+                        // (out of scope here — #4920 is the capture-
+                        // freedom admission at Subscribe/Add/+=).
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "handler subscribed to an ISharedEvent<T> or "
+                            "SharedEventSource<T> must be capture-free: a "
+                            "non-capturing lambda or a static method "
+                            "reference — a capturing handler is rejected "
+                            "because the cross-domain subscriber list "
+                            "transports it to whichever domain raises "
+                            "(stdlib \xC2\xA7""6.5, v0.307 / spec "
+                            "\xC2\xA7""28.14, v0.307)");
+                    } else {
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "handler subscribed to a `static event` must be "
+                            "capture-free: a non-capturing lambda or a static "
+                            "method reference — a capturing lambda is rejected "
+                            "because the process-global subscriber list "
+                            "transports it to whichever domain raises, and its "
+                            "captures are borrows of the origin domain "
+                            "(\xC2\xA7""22.12 rule 5, #1542)");
+                    }
                 }
                 currentLiteralWideningHint_ = savedArgHint;
                 pendingLambdaParamType_ = savedPending;

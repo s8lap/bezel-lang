@@ -18091,6 +18091,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // capture-freedom check runs below, after `as->value` is visited, so
         // isCaptureFreeEntry can see the visited lambda's captures.
         bool assignTargetIsStaticEvent = false;
+        // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14 (v0.307): a
+        // SharedEventSource<T> `+=` desugars to .Add and inherits the
+        // capture-free admission (a non-capturing lambda or a static method
+        // reference). Discriminator for the diagnostic text below. Note:
+        // `ISharedEvent<T>` is NOT included — stdlib §6.5 declares Add ONLY
+        // on SharedEventSource<T>, not on the ISharedEvent<T> face (an
+        // ISharedEvent<T> `+=` is rejected at the resolution stage, the
+        // sentence in this arm's sibling comment).
+        bool assignTargetIsSharedEventSource = false;
         if ((as->op == "+=" || as->op == "-=") && as->target) {
             if (auto* es = dynamic_cast<EventSymbol*>(
                     ctx_.exprSymbol(*as->target))) {
@@ -18137,6 +18146,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if (hn == "EventSource" || hn == "AsyncEventSource" ||
                         hn == "SharedEventSource") {
                         eventPayload = tgtTy->genericArgs[0];
+                        // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
+                        // (v0.307): the SharedEventSource<T> half of the
+                        // capture-free register — the += desugars to
+                        // .Add, which on SharedEventSource<T> admits only a
+                        // capture-free handler. EventSource<T> /
+                        // AsyncEventSource<T> are scoped (§28.14's ordinary
+                        // capture regime, with `scoped` storage-bounded
+                        // admission), so we explicitly name
+                        // SharedEventSource here. The check is enforced on
+                        // the value side (`as->value`) below — same shape
+                        // as the §22.12-rule-5 `static event` arm a few
+                        // lines down, with the diagnostic text branching
+                        // on `assignTargetIsSharedEventSource`.
+                        if (hn == "SharedEventSource")
+                            assignTargetIsSharedEventSource = true;
                     }
                 }
             }
@@ -18223,16 +18247,34 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // subscriber list transports the handler to whichever domain
             // raises, and a capture-bearing closure carries borrows of its
             // origin domain's scopes.
-            if (as->op == "+=" && assignTargetIsStaticEvent &&
+            if (as->op == "+=" &&
+                (assignTargetIsStaticEvent || assignTargetIsSharedEventSource) &&
                 !isCaptureFreeEntry(as->value.get())) {
-                ctx_.diagnostics().report(
-                    Severity::Error, as->value->span.begin,
-                    "handler subscribed to a `static event` must be capture-"
-                    "free: a non-capturing lambda or a static method "
-                    "reference — a capturing lambda is rejected because the "
-                    "process-global subscriber list transports it to "
-                    "whichever domain raises, and its captures are borrows "
-                    "of the origin domain (\xC2\xA7""22.12 rule 5, #1542)");
+                if (assignTargetIsSharedEventSource) {
+                    // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
+                    // (v0.307): SharedEventSource<T> `+=` (which desugars
+                    // to `.Add`) requires a capture-free handler. Pair with
+                    // the call-expression check in ExprTypecheck_Exprs.cpp
+                    // (Subscribe / Add sites); this arm covers the `+=`
+                    // desugaring, per spec §17.2.
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        "handler subscribed to a SharedEventSource<T> via "
+                        "`+=` must be capture-free: a non-capturing lambda "
+                        "or a static method reference — the cross-domain "
+                        "subscriber list transports it to whichever domain "
+                        "raises (stdlib \xC2\xA7""6.5, v0.307 / spec "
+                        "\xC2\xA7""28.14, v0.307)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        "handler subscribed to a `static event` must be capture-"
+                        "free: a non-capturing lambda or a static method "
+                        "reference — a capturing lambda is rejected because the "
+                        "process-global subscriber list transports it to "
+                        "whichever domain raises, and its captures are borrows "
+                        "of the origin domain (\xC2\xA7""22.12 rule 5, #1542)");
+                }
             }
             currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
