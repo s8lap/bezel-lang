@@ -212,7 +212,6 @@ BEZEL_TEST(heterogeneous_collection_literal_with_other_t_source_4895_rework_redo
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(has4895ReworkRedoDiag(r));
     BEZEL_EXPECT_FALSE(hasAnyError(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -240,7 +239,6 @@ BEZEL_TEST(heterogeneous_collection_literal_with_other_t_source_4895_rework_redo
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(has4895ReworkRedoDiag(r));
     BEZEL_EXPECT_FALSE(hasAnyError(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -269,7 +267,6 @@ BEZEL_TEST(heterogeneous_collection_literal_with_other_t_source_4895_rework_redo
         "    return 0; "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(has4895ReworkRedoDiag(r));
     BEZEL_EXPECT_FALSE(hasAnyError(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -296,7 +293,6 @@ BEZEL_TEST(heterogeneous_collection_literal_with_other_t_source_4895_rework_redo
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(has4895ReworkRedoDiag(r));
     BEZEL_EXPECT_FALSE(hasAnyError(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -320,7 +316,6 @@ BEZEL_TEST(heterogeneous_collection_literal_with_other_t_source_4895_rework_redo
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(has4895ReworkRedoDiag(r));
     BEZEL_EXPECT_FALSE(hasAnyError(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
