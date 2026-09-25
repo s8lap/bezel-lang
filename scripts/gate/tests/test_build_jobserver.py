@@ -7,7 +7,8 @@ Pin groups:
      more than 2 + 2 (implicit) jobs at once, and both finish.
   3. Self-repair — a token lost outside make is restored once the pool is idle;
      an over-returned token is drained back to exactly N.
-  4. Liveness — `alive` is false without a daemon; a second daemon on the same
+  4. Busy surplus — stray tokens are drained back to N while a make still runs.
+  5. Liveness — `alive` is false without a daemon; a second daemon on the same
      dir is refused (two holders would each publish N).
 Everything runs in a TemporaryDirectory; nothing touches the production pool.
 """
@@ -139,6 +140,34 @@ class RepairTest(DaemonTestBase):
             os.close(fd)
         self.assertTrue(_wait_for(lambda: _avail(self.dir) == self.TOKENS),
                         "an over-returned token was never drained")
+
+
+@unittest.skipUnless(shutil.which("make"), "GNU make not installed")
+class BusySurplusTest(DaemonTestBase):
+    def test_surplus_is_drained_while_a_make_is_running(self):
+        # A daemon restarted under live builds publishes a fresh N while the
+        # old holders still return theirs. Model it: one make holding the
+        # FIFO with a long job, plus two stray tokens. The pool must come back
+        # to N while that make is still running, not only once it is idle.
+        mk = os.path.join(self.dir, "Makefile")
+        with open(mk, "w") as f:
+            f.write("all:\n\t@sleep 6\n")
+        env = dict(os.environ, MAKEFLAGS=f"-j --jobserver-auth=fifo:{self.dir}/fifo")
+        p = subprocess.Popen(["make", "-s", "-f", mk], env=env, cwd=self.dir)
+        try:
+            self.assertTrue(_wait_for(lambda: bj.expected_outstanding(
+                os.path.join(self.dir, "fifo"), os.getpid())[1] == 1),
+                "the make never joined the pool")
+            fd = os.open(os.path.join(self.dir, "fifo"), os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"++")
+            finally:
+                os.close(fd)
+            self.assertTrue(_wait_for(lambda: _avail(self.dir) == self.TOKENS, timeout=4.0),
+                            "a surplus was not drained while the pool was busy")
+            self.assertIsNone(p.poll(), "the make finished before the check was meaningful")
+        finally:
+            self.assertEqual(p.wait(timeout=30), 0)
 
 
 class LivenessTest(unittest.TestCase):

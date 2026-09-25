@@ -225,6 +225,21 @@ artifacts (probe binaries, big logs, scratch build trees) go in
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 80G (a full 40G cache thrashes under multi-worktree churn).
 
+**The slice bounds cpu+mem, not the NUMBER of compiles** — N lanes × `-j16`
+put 100+ clang on 18 cores in R20 (134 measured). The optional fix is the
+machine-wide build jobserver: `scripts/jobserver_ctl.sh start` (a systemd
+--user service, default 20 tokens; `status`, `stop`). While it runs, every
+`dev_heavy.sh build cmake|make …` joins one shared GNU-make token pool (its
+`-j` is stripped); each build keeps one implicit job, so none starves and a
+one-TU relink never queues behind a cold build. With no daemon, builds behave
+exactly as before; `gate.sh` always opts out (`BEZEL_JOBSERVER=off`). ⚠ It is
+a **memory safety valve, not a speed-up** (measured R20: capped builds kept
+MemAvailable ≥11G where uncapped fell to 4.9G, but took ~40% longer each).
+Lanes must build through `dev_heavy.sh`/`agent_check.sh` — a bare `cmake
+--build -j16` bypasses the pool — and must NOT add their own "wait until fewer
+than K builds" gate on top: a hand-rolled gate that other lanes ignore starved
+one lane for 70 min in R20.
+
 **Producer/fix lanes: build+test your change with `scripts/agent_check.sh`.** It
 is the single, opinionated entry-point that encodes the correct lane protocol so
 you cannot get it wrong — it reconfigures (so a *new* test `.cpp` is picked up;

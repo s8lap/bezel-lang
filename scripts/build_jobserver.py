@@ -190,6 +190,7 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
     if new_file:
         log.write("epoch\tavailable\texpected_held\tmakes\tclang\tmem_avail_mb\trepaired\n")
     streak: list[int] = []   # per-audit deficits while the pool looks short
+    surplus_streak: list[int] = []  # per-audit surpluses while it looks over-full
     idle_audits = 0
     try:
         while not stop:
@@ -199,7 +200,12 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
             # quick sub-samples, and repair only the minimum that persisted
             # across `confirm` consecutive audits: a transient never inflates
             # the pool, a real leak (it never comes back) is repaired.
+            # The mirror case: a make whose child just exited has returned its
+            # token before the zombie is reaped, so `held` briefly over-counts
+            # and the pool looks OVER-full. Take the surplus as the minimum
+            # over the same sub-samples (the maximum d_k), for the same reason.
             deficit = None
+            dmax = None
             for k in range(5):
                 if k:
                     time.sleep(0.05)
@@ -207,11 +213,13 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
                 held, makes = expected_outstanding(p["fifo"], os.getpid())
                 d_k = tokens - avail - held  # >0: tokens nobody holds
                 deficit = d_k if deficit is None else min(deficit, d_k)
+                dmax = d_k if dmax is None else max(dmax, d_k)
             repaired = 0
             if makes == 0:
                 # Idle: the pool must hold exactly N. Restore it both ways
                 # (a lost token, or an over-return) once idle is confirmed.
                 streak.clear()
+                surplus_streak.clear()
                 idle_audits += 1
                 if idle_audits >= 2 and avail != tokens:
                     if avail < tokens:
@@ -233,6 +241,23 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
                         streak.clear()
                 else:
                     streak.clear()
+                # Over-full while busy: a daemon restarted under live builds
+                # publishes a fresh N while the old holders still return
+                # theirs, so the box would run N + (held) jobs until the next
+                # idle moment, which a long wave may never reach. Drain the
+                # confirmed surplus; never try to read more than is in the pipe.
+                if dmax < 0:
+                    surplus_streak.append(-dmax)
+                    if len(surplus_streak) >= confirm:
+                        want = min(min(surplus_streak), available_tokens(fd))
+                        if want > 0:
+                            try:
+                                repaired = -len(os.read(fd, want))
+                            except BlockingIOError:
+                                pass
+                        surplus_streak.clear()
+                else:
+                    surplus_streak.clear()
             log.write(
                 f"{int(time.time())}\t{avail}\t{held}\t{makes}\t"
                 f"{_count_procs(('clang', 'clang++', 'cc1plus'))}\t"
