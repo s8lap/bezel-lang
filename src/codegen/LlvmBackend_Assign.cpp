@@ -13448,6 +13448,17 @@ bool Emitter::fillOmittedParamDefaults(
                                        expectedSt->getElementType(1)) {
                                 ordered[j] =
                                     wrapNullableValue(formalTy, ordered[j]);
+                            } else if (ordered[j]->getType()->isIntegerTy() ||
+                                       ordered[j]->getType()
+                                           ->isFloatingPointTy()) {
+                                // fix #4922 (§5.1 `S → T → T?`, v0.307): the
+                                // omitted-default twin of the explicit-arg
+                                // widen-then-wrap in buildOrderedArgs —
+                                // `c: long? := 7` lowers its default at i32.
+                                ordered[j] = coerceReturnToNullableValue(
+                                    ordered[j], formalTy,
+                                    isUnsignedTargetExpr(*dv),
+                                    /*sourceIsNullableRef=*/false, dv);
                             }
                         }
                     }
@@ -14172,6 +14183,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         v = nullableValueNull(formalTy);
                     } else if (v->getType() == expectedSt->getElementType(1)) {
                         v = wrapNullableValue(formalTy, v);
+                    } else if (v->getType()->isIntegerTy() ||
+                               v->getType()->isFloatingPointTy()) {
+                        // fix #4922 (§5.1 "Nullable conversions", v0.307):
+                        // `S` converts to `T?` via `S → T → T?`, so an `int`
+                        // argument at a `long?` formal must first widen to the
+                        // payload and THEN wrap. Only the exact-payload case
+                        // wrapped here, so the bare value escaped: the call
+                        // site's per-arg `coerceExprValueToSlot` widened it to
+                        // i64 but never wraps (`call @F(i64 5)` against
+                        // `{i8, i64}` — IR verify failure), and a `new` took
+                        // the inline-ctor path on the type mismatch, bound the
+                        // formal in a scalar slot, and `a ?? -1` then ran
+                        // `extractvalue` on an i64 — a bezelc SEGFAULT.
+                        // `coerceReturnToNullableValue` is the existing
+                        // widen-then-wrap for exactly this composition (#843,
+                        // sema-gated narrowing per #2925), as #4904 uses at a
+                        // ctor-chain argument; it leaves `v` unchanged for a
+                        // pair §5.1 does not cover.
+                        v = coerceReturnToNullableValue(
+                            v, formalTy,
+                            a.value ? isUnsignedTargetExpr(*a.value) : false,
+                            /*sourceIsNullableRef=*/false, a.value.get());
                     }
                 }
             } else if (formalTy) {
