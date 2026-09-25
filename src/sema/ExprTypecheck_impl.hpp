@@ -3529,6 +3529,15 @@ private:
     void checkEventVisibilityFence(EventSymbol* es, std::string_view op,
                                    SourceLocation loc);
 
+    // fix #4869 (§17.2 / §27.1.1 / §5.1, v0.307; stdlib §6.5): the handler
+    // of an event-subscription form `lhs += h` / `lhs -= h` is the argument
+    // of the desugared `lhs.Add(h)` / `lhs.Remove(h)`, whose parameter is
+    // `(T) -> ()` (`(T) -> Task` on AsyncEventSource<T>). Checks the
+    // already-visited handler `as.value` against that parameter's slot
+    // shape given the payload type `payload`. Defined in ExprTypecheck.cpp.
+    void checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
+                                       TypeRef* payload);
+
     // §13.1 member-visibility enforcement (issue #432). Checks that the
     // member `msym` accessed at `loc` is visible from the current type
     // context `currentType_`. Reports a diagnostic and returns true when

@@ -16123,6 +16123,140 @@ void ExprTC::checkLoopJumpTarget(std::string_view label, bool isBreak,
     }
 }
 
+// fix #4869 (§17.2, §27.1.1, §5.1, v0.307; stdlib §6.5): per §17.2 the
+// event-subscription forms are "a fixed, language-defined desugaring: `lhs +=
+// h` rewrites to `lhs.Add(h)` and `lhs -= h` to `lhs.Remove(h)`", and stdlib
+// §6.5 declares both parameters as `(T) -> ()` (`(T) -> Task` on
+// AsyncEventSource<T>). So the handler is checked exactly as that argument
+// would be. The pre-fix `+=`/`-=` arm threaded the payload into an UNTYPED
+// lambda parameter (§27.4) but checked nothing: the §6.6 compound-assignment
+// block below is (correctly) skipped for the subscription forms, and a lambda
+// literal's EXPLICIT parameter annotation wins over the seeded payload in the
+// lambda visitor, so `EventSource<int> += lambda(n: string) => …` compiled and
+// the handler read the `int` payload as a string pointer at runtime.
+//
+// The return slot is not examined here: it is the handler's own (the
+// expected type below copies it), so this check adds no return-slot rule.
+void ExprTC::checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
+                                           TypeRef* payload) {
+    if (!as.value || !payload) return;
+    TypeRef* h = ctx_.exprType(*as.value);
+    if (!h || h->kind != TypeRef::Kind::Function) return;
+    const char* callee = as.op == "-=" ? "Remove" : "Add";
+    auto spell = [](const TypeRef* t) -> std::string {
+        if (!t) return "?";
+        std::string s;
+        if (t->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (t->primitive) {
+                case P::Bool:    s = "bool";    break;
+                case P::Char:    s = "char";    break;
+                case P::String:  s = "string";  break;
+                case P::Byte:    s = "byte";    break;
+                case P::SByte:   s = "sbyte";   break;
+                case P::Short:   s = "short";   break;
+                case P::UShort:  s = "ushort";  break;
+                case P::Int:     s = "int";     break;
+                case P::UInt:    s = "uint";    break;
+                case P::Long:    s = "long";    break;
+                case P::ULong:   s = "ulong";   break;
+                case P::Float:   s = "float";   break;
+                case P::Double:  s = "double";  break;
+                case P::Decimal: s = "decimal"; break;
+                case P::Object:  s = "Object";  break;
+                default:         s = "?";       break;
+            }
+        } else if (t->kind == TypeRef::Kind::Named) {
+            s = t->declaration ? std::string(t->declaration->name)
+                               : std::string(t->headName());
+            if (s.empty()) s = "?";
+        } else if (t->kind == TypeRef::Kind::Unit) {
+            s = "()";
+        } else if (t->kind == TypeRef::Kind::Function) {
+            s = "function type";
+        } else {
+            s = "?";
+        }
+        if (t->nullable) s += "?";
+        return s;
+    };
+    const std::string payloadSp = spell(payload);
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(as.value.get())) {
+        // A lambda literal is typed at the site (§27.3/§27.4): its untyped
+        // parameters took the payload type from the seed, so only the ARITY,
+        // the modifier slots, and any EXPLICITLY annotated parameter can
+        // disagree with the `(T) -> …` position.
+        if (lam->params.size() != 1) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "event handler lambda has " +
+                std::to_string(lam->params.size()) + " parameters, but `" +
+                std::string(as.op) + "` on an event source is `" + callee +
+                "(handler)` whose handler type takes exactly one parameter "
+                "(the payload `" + payloadSp + "`) \xe2\x80\x94 a function "
+                "value is never usable at a function type with a different "
+                "number of parameter slots (\xc2\xa7""17.2, \xc2\xa7""27.1.1, "
+                "v0.307; stdlib \xc2\xa7""6.5)");
+            return;
+        }
+        const auto& p = lam->params[0];
+        if (!p.modifier.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "event handler lambda parameter `" + std::string(p.name) +
+                "` carries the `" + std::string(p.modifier) + "` modifier, "
+                "but the `" + callee + "` handler slot `(" + payloadSp +
+                ") -> \xe2\x80\xa6` has none \xe2\x80\x94 modifier slots are "
+                "part of a function signature's identity (\xc2\xa7""27.1, "
+                "\xc2\xa7""27.1.1, \xc2\xa7""17.2, v0.307)");
+            return;
+        }
+        if (!p.type || p.destructure) return;  // seeded, or §27.4 head check
+        TypeRef* annotated =
+            !h->funcParams.empty() ? h->funcParams[0].type : nullptr;
+        if (!annotated) annotated = ctx_.resolvedType(*p.type);
+        if (!annotated) return;
+        // §27.1.1: "everything else requires an exact match" — the one
+        // variance a parameter slot admits is the contravariant reference
+        // conversion (payload -> annotated) for class/interface slots. The
+        // only site-typed bridge a lambda literal gets is its RETURN slot
+        // (§27.3 "Admission at a target-typed non-call position"); nothing
+        // bridges a parameter, and codegen passes the payload through
+        // unconverted — so e.g. an `int?`- or `double`-annotated handler on
+        // an EventSource<int> would read the raw `int` bits (measured:
+        // garbage / 0). Value-typed and primitive slots are invariant.
+        if (functionSlotConvertible(payload, annotated, isSubtype))
+            return;
+        ctx_.diagnostics().report(
+            Severity::Error, as.value->span.begin,
+            "event handler lambda parameter `" + std::string(p.name) +
+            "` is annotated `" + spell(annotated) + "`, which does not "
+            "accept the event payload type `" + payloadSp + "` \xe2\x80\x94 `" +
+            std::string(as.op) + "` on an event source is `" + callee +
+            "(handler)` with handler type `(" + payloadSp + ") -> \xe2\x80\xa6` "
+            "(\xc2\xa7""17.2, \xc2\xa7""27.1.1, \xc2\xa7""5.1, v0.307; stdlib "
+            "\xc2\xa7""6.5); drop the annotation to take the payload type "
+            "(\xc2\xa7""27.4)");
+        return;
+    }
+    // A function value or a method reference: the ordinary argument check
+    // against `(T) -> R`, where R is the handler's own return slot (§27.1.1
+    // for a value; §27.6 formation for a method reference — checkAssignable
+    // distinguishes them from `as.value`).
+    TypeRef* expected = ctx_.makeTypeRef();
+    expected->kind = TypeRef::Kind::Function;
+    TypeRef::FuncParam fp;
+    fp.type = payload;
+    expected->funcParams.push_back(fp);
+    expected->funcReturn = h->funcReturn;
+    expected->funcReturnOwned = h->funcReturnOwned;
+    checkAssignable(h, expected, as.value->span.begin,
+                    std::string("handler of `") + std::string(as.op) +
+                    "` (the argument of the desugared `" + callee + "`, "
+                    "\xc2\xa7""17.2)",
+                    as.value.get());
+}
+
 void ExprTC::visitStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // Initializer evaluates BEFORE the local comes into scope.
@@ -17892,6 +18026,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 narrowings_[narrowedTargetSym] = narrowedTargetTy;
             visitExpr(*as->value);
             if (narrowedTargetSym) narrowings_.erase(narrowedTargetSym);
+            if (eventPayload)
+                checkEventSubscriptionHandler(*as, eventPayload);
             // per §22.12 rule 5 (v0.180, #1542): a handler subscribed to a
             // `static event` — the rule names `+=`/`Add`/`Subscribe`, not
             // `-=`/`Remove` — must be capture-free: a non-capturing lambda or
