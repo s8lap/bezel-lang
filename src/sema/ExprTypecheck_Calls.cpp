@@ -4931,7 +4931,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // (The #509 explicit-typeArgs path above takes priority; this
                 // path only runs when typeArgs is empty — i.e., type inference
                 // from arguments is needed.)
-                if (!md->genericParams.empty()) {
+                // fix #4935 (§14.5 v0.307): the guard above is aspirational
+                // but was never actually applied — the block runs even when
+                // explicit type arguments were given. That spuriously rejects
+                // valid calls like `Map<int?>(5, lambda(y: int?) => "n")`
+                // because arg-vs-param unification against `T` (rather than
+                // the substituted `int?`) produces an "inconsistent
+                // type-argument inference" conflict between `int` (the
+                // value 5's type) and `int?` (the substituted formal). With
+                // explicit args the inference block is unnecessary — the
+                // ordinary arg-vs-param §5.1 check that runs later in
+                // typeCall/checkCallArity handles non-convertible cases
+                // (e.g. `Merge<int>(5, true)`).
+                if (!md->genericParams.empty() && !hadExplicitTypeArgs) {
                     // §14.1 (#785): build the argument-inferred substitution map
                     // by STRUCTURALLY unifying each value parameter's declared
                     // type against the call argument's type — so a generic-typed
