@@ -6207,10 +6207,51 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 builder_.CreateStore(obj, tmp);
                 obj = tmp;
             }
-            auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                dynamic_cast<sema::PropertySymbol*>(
-                    ctx_.exprSymbol(*ma))->decl);
+            auto* ps2 = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps2 ? ps2->decl : nullptr);
+            // fix #4973 (§14.1 / §23 / §2.8.3 rule 4, v0.307): an INHERITED
+            // NAMED BLOCK-FORM PROPERTY on a generic base reached through a
+            // non-generic derived receiver (`e.Val` where `e: E: B<string>` and
+            // `Val` is in `B<T>` with declared type `T`). The expression-bodied
+            // twin at ~5989 installs the substitution via
+            // `computeAncestorGenericSubst` BEFORE inlining the getter body
+            // (#3346/#3348 fix). The BLOCK-form twin was missed because the
+            // body lowers as a STANDALONE function — `ensurePropertyBlockGetter`
+            // names the erased template `bz$prop$<name>$get` with `lowerType(T)`
+            // falling back to `i32()` when no subst is active. The call passes
+            // `obj` (which has the receiver's actual struct layout) to a
+            // function expecting the erased layout: p7_direct prints
+            // `x x <empty> <empty>` for `x x y y` because the getter returns
+            // i32 from a T=string field's first 4 bytes (and the SETTER twin
+            // silently corrupts `_v` by writing 8 bytes into a 4-byte slot).
+            //
+            // Mirror the expression-bodied twin. Save+restore the subst so
+            // nothing leaks past this read into the enclosing expression.
+            const sema::TypeRef* recvTy2 = ctx_.exprType(*ma->target);
+            std::unordered_map<std::string_view, llvm::Type*> savedSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> savedSema;
+            bool substInstalled = false;
+            if (recvTy2 && ps2 &&
+                recvTy2->kind == sema::TypeRef::Kind::Named &&
+                recvTy2->declaration &&
+                recvTy2->declaration != ps2->parent &&
+                !ps2->parent->genericParams.empty()) {
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+                if (computeAncestorGenericSubst(recvTy2, ps2->parent,
+                                                ancSubst, ancSema)) {
+                    savedSubst = std::move(genericSubst_);
+                    savedSema = std::move(genericSubstSemaTy_);
+                    genericSubst_ = std::move(ancSubst);
+                    genericSubstSemaTy_ = std::move(ancSema);
+                    substInstalled = true;
+                }
+            }
             llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+            if (substInstalled) {
+                genericSubst_ = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSema);
+            }
             llvm::Value* res = builder_.CreateCall(getterFn->getFunctionType(),
                                                    getterFn, {obj});
             // §31.1/§31.2 (FINDING [4]): a block-form getter is a standalone
