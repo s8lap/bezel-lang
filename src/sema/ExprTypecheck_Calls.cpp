@@ -1022,25 +1022,26 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             return res;
         }
     }
-    // Per-candidate: if any parameter is unjudgeable, mark this candidate
-    // inapplicable and skip its classification. This allows other candidates
-    // with judgeable params to still be ranked, while arityFallback will not
-    // select a candidate whose params could not be judged.
-    for (std::size_t c = 0; c < nCand; ++c) {
-        for (std::size_t i = 0; i < nArg; ++i) {
-            if (!judgeable(paramTypes[c][i])) {
-                res.applicable[c] = false;
-                break;
-            }
-        }
-    }
-
     // Classify every (candidate, argument) cell. ArgMatch::NotApplicable in
     // any cell removes that candidate from the applicable set (§22.6 step 1).
-    // Skip classification for candidates already marked inapplicable (unjudgeable
-    // param types above).
+    // fix #4825 (§5.1 / §22.6 / §22.7, v0.307): the per-candidate guard that
+    // skipped classification when a parameter type was "unjudgeable" (generic /
+    // inline-array / function type) is removed here. That guard correctly
+    // deferred on types where classifyArg's Exact/Convert/NotApplicable grid
+    // cannot be trusted (§22.6 spec: "primitive↔primitive and non-generic
+    // named↔named"), BUT it also removed candidates whose param types have
+    // generic instantiations (e.g. IComparable<int>) even though the conversion
+    // from a primitive argument to such a type CAN be classified correctly:
+    // implicitlyConvertible handles int→IComparable<int> via the §5.1 boxing
+    // branch (primitive boxes into a builtin generic interface it implements,
+    // stdlib §9.1 / §14.2 clause 5) and returns Convert — which is exactly
+    // the right ranking. The guard's preservation of "judgeable candidates can
+    // still be ranked" is unchanged; the removal means unjudgeable candidates
+    // now go through classifyArg too, which either classifies correctly (for
+    // boxing conversions to generic interfaces) or returns NotApplicable (for
+    // truly unrankable type pairs), which is the same outcome the guard gave
+    // them — just reached through the normal classification path.
     for (std::size_t c = 0; c < nCand; ++c) {
-        if (!res.applicable[c]) continue;  // already marked inapplicable above
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
             // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
