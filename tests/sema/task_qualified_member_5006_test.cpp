@@ -58,6 +58,34 @@
 //     not on the resolved sema symbol, so a sema-only fix would be inert.
 //     Fixing it for real needs a codegen change, out of scope for this
 //     sema/module-only lane.
+//
+// FOLLOW-UP (non-author review, MEASURED A/B against 7e044595): the
+// alias-qualified arm's `importAliases_.find(aid->name)` check above
+// matched by NAME ONLY, with no check for whether `aid` had been
+// SHADOWED by a local/parameter/field of the same spelling in the
+// current scope (§2.7 rule 1: a local outranks an import alias). Repro:
+// `import System.Threading as T; var T := w;` (`w` a `Wrapper` whose
+// OWN `Task` field is unrelated to the builtin) — `T.Task.Label` should
+// resolve as an ordinary field access on the local `T`, but the gate's
+// name-only alias lookup fired anyway and rejected `.Label` under the
+// closed Task surface. MEASURED: compiles+runs at 8d8e6534 (pre-#5006),
+// incorrectly rejected at 7e044595 (post-#5006, pre-this-fix). Fixed by
+// guarding the alias lookup with `!lookupName(aid->name)`, mirroring the
+// identical precedent already used by the pre-existing module-qualified-
+// path-extension code a few lines above (Case (b), `partialModulePaths_`
+// construction) — so an `aid` that resolves to a real scope symbol is
+// never treated as the alias. Parts 7-8 below pin this: Part 7 is the
+// bug's own repro (alias shadowed by a local), asserting the runtime
+// VALUE read through the shadowing local, not just `r.ran`. Part 8
+// checks the SIBLING module-qualified arm for the analogous hole (a
+// local named `System`) — investigation showed it does NOT share the
+// bug, because that arm depends entirely on `partialModulePaths_`, which
+// the pre-existing Case (b) code above already gates with the same
+// `lookupName` guard, so a locally-shadowed `System` never gets recorded
+// as a "System.Threading" partial path in the first place. Part 8 is
+// therefore a protective/confirming regression test (no code change was
+// needed for it), pinning that already-correct behavior against future
+// regressions in that arm.
 
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"   // runAot — the real bezelc AOT oracle
@@ -262,4 +290,82 @@ BEZEL_TEST(task_qualified_member_5006,
         "  end Main;\n"
         "end C;\n";
     BEZEL_EXPECT_EQ(42, buildAndRunWithLib5006(libSrc, mainSrc));
+}
+
+// ── Part 7: alias SHADOWED by a local — the fix-forward regression ──
+//
+// `import System.Threading as T;` followed by `var T := w;` (a local of an
+// unrelated `Wrapper` type whose OWN `Task` field is an `Inner` with a
+// `Label` property, nothing to do with the builtin `Task`). Per §2.7 rule
+// 1 a local outranks an import alias, so `T.Task.Label` must resolve as an
+// ordinary field/property read on the LOCAL `T`, not trip the closed-Task-
+// surface gate. MEASURED (non-author review, A/B against 7e044595): this
+// program compiles and returns 99 at 8d8e6534 (pre-#5006) but was
+// incorrectly rejected at 7e044595 (post-#5006, pre-this-fix) with the
+// closed-surface `Task` diagnostic. Asserts the runtime VALUE (99), not
+// merely `r.ran`, so the test cannot pass by accidentally discarding the
+// read to a zero-initialized value (the same #2434 degrade class #4977/
+// #5006 exist to catch).
+BEZEL_TEST(task_qualified_member_5006,
+           alias_shadowed_by_local_resolves_to_local_field) {
+    const std::string program =
+        "module M;\n"
+        "import System.Threading as T;\n"
+        "class Inner\n"
+        "  public readonly property Label: int := 99;\n"
+        "end Inner;\n"
+        "class Wrapper\n"
+        "  public owned readonly Task: Inner := new Inner();\n"
+        "end Wrapper;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var w := new Wrapper();\n"
+        "    var T := w;\n"
+        "    return T.Task.Label;\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(99, r.exitCode);
+}
+
+// ── Part 8: module-qualified sibling arm, local named `System` — protective
+//    confirming test (investigation showed this arm does NOT share Part 7's
+//    hole) ──
+//
+// Same shadowing shape as Part 7, but for the MODULE-qualified arm: a local
+// named `System` (no alias involved) whose own `Threading.Task.Label` path
+// is an ordinary field chain on the local, unrelated to the builtin. Unlike
+// Part 7, this arm was NOT regressed: it depends entirely on
+// `partialModulePaths_`, populated only by the pre-existing Case (b) code
+// (a few lines above in this file), which already guards multi-segment
+// path-building with `!lookupName(name)` — so a locally-shadowed `System`
+// never gets recorded as a "System.Threading" partial path, and this
+// gate's module-qualified branch correctly never fires. MEASURED: compiles
+// and returns 99 both before and after the Part 7 fix. Pinned here as a
+// regression guard against a future change to that shared machinery.
+BEZEL_TEST(task_qualified_member_5006,
+           module_qualified_local_named_system_resolves_to_local_field) {
+    const std::string program =
+        "module M;\n"
+        "import System.Threading;\n"
+        "class Inner\n"
+        "  public readonly property Label: int := 99;\n"
+        "end Inner;\n"
+        "class Level2\n"
+        "  public owned readonly Task: Inner := new Inner();\n"
+        "end Level2;\n"
+        "class Level1\n"
+        "  public owned readonly Threading: Level2 := new Level2();\n"
+        "end Level1;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var level1 := new Level1();\n"
+        "    var System := level1;\n"
+        "    return System.Threading.Task.Label;\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(99, r.exitCode);
 }

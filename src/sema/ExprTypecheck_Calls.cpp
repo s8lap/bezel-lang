@@ -20849,19 +20849,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (!isBuiltinTask) {
                 if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
                         tkma->target.get())) {
-                    auto qualAliasIt =
-                        importAliases_.find(std::string(aid->name));
-                    if (qualAliasIt != importAliases_.end() &&
-                        qualAliasIt->second == "System.Threading") {
-                        isBuiltinTask = true;
-                        qualifierNote =
-                            std::string("; note: `Task` here is the "
-                            "always-available builtin type, referenced "
-                            "through `") +
-                            std::string(aid->name) +
-                            ".Task`, where `" + std::string(aid->name) +
-                            "` is an import alias for module "
-                            "`System.Threading` (\xC2\xA7""2.7 rule 1)";
+                    // #5006 non-author review (MEASURED A/B, 7e044595):
+                    // `importAliases_` is a pure NAME table populated
+                    // per-file from `import ... as <alias>` — it knows
+                    // nothing about lexical shadowing. Mirror Case (b)'s
+                    // own precedent guard just above (and its identical
+                    // use at the module-path-extension site, line ~19600)
+                    // — per §2.7 rule 1, a local/parameter/field with the
+                    // same spelling as the alias outranks the alias, so
+                    // `aid` names the alias ONLY when it does not already
+                    // resolve to a real scope symbol. Without this guard,
+                    // `import System.Threading as T; var T := w;` (a
+                    // Wrapper with an unrelated `Task` field) had
+                    // `T.Task.Label` incorrectly rejected under the
+                    // closed Task surface instead of resolving as an
+                    // ordinary field access on the local `T`.
+                    if (!lookupName(std::string_view(aid->name))) {
+                        auto qualAliasIt =
+                            importAliases_.find(std::string(aid->name));
+                        if (qualAliasIt != importAliases_.end() &&
+                            qualAliasIt->second == "System.Threading") {
+                            isBuiltinTask = true;
+                            qualifierNote =
+                                std::string("; note: `Task` here is the "
+                                "always-available builtin type, referenced "
+                                "through `") +
+                                std::string(aid->name) +
+                                ".Task`, where `" + std::string(aid->name) +
+                                "` is an import alias for module "
+                                "`System.Threading` (\xC2\xA7""2.7 rule 1)";
+                        }
                     }
                 }
             }
