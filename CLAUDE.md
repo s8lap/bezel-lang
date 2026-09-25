@@ -241,6 +241,10 @@ Lanes must build through `dev_heavy.sh`/`agent_check.sh` — a bare `cmake
 --build -j16` bypasses the pool — and must NOT add their own "wait until fewer
 than K builds" gate on top: a hand-rolled gate that other lanes ignore starved
 one lane for 70 min in R20.
+`start` refuses to run from a linked worktree. A *dedicated* daemon worktree (e.g.
+`/mnt/fast/wt-jobserver21`) needs `BEZEL_JOBSERVER_ALLOW_WORKTREE=1`. The unit name is
+`bezel-jobserver` for the default token dir, and `bezel-jobserver-<hash8>` for any other
+`BEZEL_JOBSERVER_DIR` (override with `BEZEL_JOBSERVER_UNIT`, #4990).
 
 **Producer/fix lanes: build+test your change with `scripts/agent_check.sh`.** It
 is the single, opinionated entry-point that encodes the correct lane protocol so

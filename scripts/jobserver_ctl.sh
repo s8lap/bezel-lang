@@ -47,7 +47,34 @@
 # new builds fall back to a private pool.
 set -euo pipefail
 
-UNIT=bezel-jobserver
+# #4990: the systemd unit name follows the token dir instead of being fixed.
+# With a fixed name, any real `start` against another --dir (a test, a lane,
+# a second pool) targeted the production daemon's unit; systemd refused the
+# duplicate, but the collision was structural. Rules:
+#   BEZEL_JOBSERVER_UNIT set      -> that name, verbatim
+#   token dir is the default      -> bezel-jobserver  (unchanged, so status/stop
+#                                    still find the instance already running)
+#   any other token dir           -> bezel-jobserver-<sha256(dir)[:8]>
+# Several pools can then run at once, one unit per dir, and a running default
+# instance needs no migration. This reads BEZEL_JOBSERVER_DIR with the same
+# default as `dir` below; trailing slashes are ignored so ".../jobserver/"
+# still maps to the default unit.
+_default_dir=/var/tmp/bezel-scratch/jobserver
+_unit_dir="${BEZEL_JOBSERVER_DIR:-$_default_dir}"
+while [ "${#_unit_dir}" -gt 1 ] && [ "${_unit_dir%/}" != "$_unit_dir" ]; do
+  _unit_dir="${_unit_dir%/}"
+done
+if [ -n "${BEZEL_JOBSERVER_UNIT:-}" ]; then
+  UNIT="$BEZEL_JOBSERVER_UNIT"
+elif [ "$_unit_dir" = "$_default_dir" ]; then
+  UNIT=bezel-jobserver
+else
+  UNIT="bezel-jobserver-$(printf '%s' "$_unit_dir" | sha256sum | cut -c1-8)"
+fi
+if ! [[ "$UNIT" =~ ^[A-Za-z0-9:_.@-]+$ ]]; then
+  echo "jobserver_ctl: invalid systemd unit name '$UNIT' (BEZEL_JOBSERVER_UNIT)" >&2
+  exit 64
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 js="$here/build_jobserver.py"
 dir="${BEZEL_JOBSERVER_DIR:-/var/tmp/bezel-scratch/jobserver}"
