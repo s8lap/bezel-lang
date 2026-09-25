@@ -13842,13 +13842,15 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         if (isRule4GovernedReference(rt)) {
             if (isInSynchronizedSet(rt) || isInReadonlySuppressionSet(rt))
                 return;
+            // per §22.12 rule 4 (v0.307); stdlib §6.9 / §6.11 require the
+            // "warning" word so the conformance runner's WARNING_RE matches.
             ctx_.diagnostics().report(
                 Severity::Warning, loc,
                 std::string("static readonly ") + std::string(what) + " `" +
                 std::string(name) + "` has class type `" + staticRefTypeName(rt) +
-                "` which is reachable from every domain; confine its use to one "
-                "domain or ensure its own internal synchronization "
-                "(§22.12 rule 4, #1363)");
+                "` which is reachable from every domain — a warning: "
+                "confine its use to one domain or ensure its own internal "
+                "synchronization (§22.12 rule 4, #1363)");
             return;
         }
 
@@ -13936,13 +13938,16 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         else if (isChoiceTypeRef(rt)) kindDesc = "choice";
         else if (rt->kind == TypeRef::Kind::Unit) kindDesc = "unit";
         else kindDesc = "value";
+        // per §22.12 rule 4 residual (v0.307); stdlib §6.9 / §6.11 require
+        // the "warning" word so the conformance runner's WARNING_RE matches.
         ctx_.diagnostics().report(
             Severity::Warning, loc,
             std::string("static readonly ") + std::string(what) + " `" +
             std::string(name) + "` has " + std::string(kindDesc) + " type `"
             + describeStaticValueType(rt) + "` which is reachable from every "
-            "domain; confine its use to one domain or ensure its own internal "
-            "synchronization (§22.12 rule 4 residual, v0.265, #3273 / #3290)");
+            "domain — a warning: confine its use to one domain or ensure its "
+            "own internal synchronization (§22.12 rule 4 residual, v0.265, "
+            "#3273 / #3290)");
     };
     // §22.12 rule 2 forms (iii)/(iv) + residual (#1393 warned-admission
     // ruling): a mutable static NOT governed by the class/interface path
