@@ -124,6 +124,31 @@ case "$kind" in
       -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
 esac
 
+# Machine-wide build jobserver (scripts/build_jobserver.py). The slice bounds
+# total cpu+mem but not the NUMBER of compiles: N lanes x `-j16` put 100+ clang
+# on 18 cores (134 measured, 2026-09-25). When a jobserver daemon is live, a
+# build joins its shared token pool instead of starting a private -jN one: every
+# build keeps one implicit job (no build starves, a one-TU relink never queues
+# behind a cold build) and takes extra jobs from N shared tokens, so the whole
+# box runs <= N + #builds compiles. -j/--parallel are stripped because an
+# explicit -jN makes GNU make ignore an inherited pool. Opt out per call with
+# BEZEL_JOBSERVER=off (gate.sh does: a gate runs with zero other builders, and
+# its build must not depend on a daemon). With no live daemon nothing changes.
+if [ "$kind" = build ] && [ "${BEZEL_JOBSERVER:-on}" != off ] \
+   && [ -z "${MAKEFLAGS:-}" ] \
+   && case "$(basename "$1")" in cmake|make|gmake|ninja) true;; *) false;; esac; then
+  _js="$(dirname "$0")/build_jobserver.py"
+  _jsdir="${BEZEL_JOBSERVER_DIR:-/var/tmp/bezel-scratch/jobserver}"
+  if [ -f "$_js" ] && python3 "$_js" alive --dir "$_jsdir" 2>/dev/null; then
+    mapfile -d '' _args < <(python3 "$_js" rewrite-args -- "$@")
+    if [ "${#_args[@]}" -gt 0 ]; then
+      set -- "${_args[@]}"
+      export MAKEFLAGS="-j --jobserver-auth=fifo:$_jsdir/fifo"
+      unset CMAKE_BUILD_PARALLEL_LEVEL
+    fi
+  fi
+fi
+
 exec systemd-run --user --scope -q \
   -p Slice="$SLICE" -p MemoryMax="$mem" -p MemorySwapMax=0 \
   -p CPUWeight="$cw" -p IOWeight="$iw" \

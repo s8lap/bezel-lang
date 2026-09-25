@@ -191,6 +191,10 @@ case "$MODE" in
     exit 64 ;;
 esac
 DH=scripts/dev_heavy.sh
+# The gate builds with its own -j16 and never joins the shared build jobserver
+# (scripts/build_jobserver.py): it runs with zero other builders, and a gate
+# build must not depend on a daemon's health.
+export BEZEL_JOBSERVER=off
 
 # Zero-builders preflight (cold-cache flake defense): a --full gate run
 # concurrently with even one producer build can stall a shard and trigger the
