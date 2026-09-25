@@ -1034,6 +1034,58 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                         expRT->primitive != sema::PrimitiveType::None) {
                         lambdaParamTypeHint_[par] = expRT;
                     }
+                    // fix #4896 (§18.5 interpolated strings / §14.5 phase
+                    // 2, v0.307): when
+                    // the formal param type is itself an unresolved
+                    // type-parameter reference (Named, no declaration,
+                    // single-part name) and genericSubstSemaTy_ has a
+                    // CONCRETE substitution recorded for that same name
+                    // (the Calls2.cpp pre-pass's char/enum i32-collision
+                    // workaround — see the `lt == i32()` arm there), use
+                    // that concrete TypeRef as the hint. Without this, an
+                    // inferred lambda param specialized at `char` or an
+                    // `enum` keeps the bare formal TypeRef, so `y.ToString()`
+                    // inside `$"<{y}>"` dispatches on the int path (§17.5
+                    // hole dispatch uses the receiver's static type) and
+                    // prints the code point / ordinal instead of the
+                    // character / enum name.
+                    //
+                    // genericSubstSemaTy_ can ALSO hold a still-bare entry
+                    // (the pre-#4896 non-i32 pre-pass branch records the
+                    // unsubstituted TypeRef verbatim when it is nested
+                    // inside another generic method's own monomorphization
+                    // — e.g. `W → T` while Go<T>'s own `T` is resolved
+                    // elsewhere) — using THAT as a hint would regress the
+                    // pre-existing, working path for those types (measured:
+                    // a nested `Go<string>` call printed a raw pointer
+                    // value instead of the string once this arm stopped
+                    // gating on bareness). Require `!isBareTypeParamRef` on
+                    // the STORED entry too, so this arm only fires when the
+                    // stored substitution is genuinely concrete.
+                    //
+                    // Skip a NULLABLE substitution (`int?`, `Color?`, …):
+                    // the interpolation dispatch already special-cases a
+                    // null receiver as the empty string without calling
+                    // `T?.ToString()`; injecting a nullable hint here would
+                    // route the lambda body through the non-nullable
+                    // primitive dispatch, mismatching the caller's actual
+                    // (nullable-wrapped) value and risking an IR
+                    // verification failure. Leaving the hint unset here
+                    // preserves the pre-existing nullable-path behavior.
+                    else if (expRT->kind == sema::TypeRef::Kind::Named &&
+                             !expRT->declaration && expRT->astNode &&
+                             expRT->astNode->name &&
+                             expRT->astNode->name->parts.size() == 1 &&
+                             !genericSubstSemaTy_.empty()) {
+                        auto sit = genericSubstSemaTy_.find(
+                            expRT->headName());
+                        if (sit != genericSubstSemaTy_.end() &&
+                            sit->second && !sit->second->nullable &&
+                            !isBareTypeParamRef(sit->second)) {
+                            lambdaParamTypeHint_[par] =
+                                const_cast<sema::TypeRef*>(sit->second);
+                        }
+                    }
                 }
             }
             // fix #747 R43 / §27.1: a `ref`/`out` lambda parameter is passed by

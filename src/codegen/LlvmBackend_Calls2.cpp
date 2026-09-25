@@ -11671,9 +11671,44 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (!at) continue;
                             llvm::Type* lt = lowerTypeRef(at);
                             if (lt != i32()) {
+                                // Unchanged pre-#4896 behavior: `at` may
+                                // itself still be a bare outer-method type
+                                // parameter (e.g. `v`'s sema type is Go's
+                                // bare `T` when this call is nested inside
+                                // Go<T>'s body), but lowerTypeRef already
+                                // resolved it to a concrete non-i32 LLVM
+                                // type (e.g. `ptr` for `string`). Since
+                                // #4813 the sema entry is substituted
+                                // through the active context; it must not
+                                // be gated on bareness.
                                 preSubst[gp.name] = lt;
                                 preSema[gp.name] = substituteTypeRefLocal(
                                     at, genericSubstSemaTy_);
+                            } else {
+                                // fix #4896 (§14.5 phase 2, §18.5
+                                // interpolated strings, v0.307): `lt ==
+                                // i32()` is ambiguous — it
+                                // covers a genuinely still-unresolved
+                                // placeholder AND a type parameter resolved
+                                // to `char`/an `enum` (both of which lower
+                                // to i32). Substitute `at` against the
+                                // ACTIVE genericSubstSemaTy_ (this call's
+                                // enclosing generic method's own
+                                // monomorphization, e.g. Go<T>'s T → char)
+                                // to tell the two apart: if the result is
+                                // still bare, `at` really is unresolved and
+                                // we skip, matching the original behavior;
+                                // if it resolved to something concrete,
+                                // record ONLY the sema substitution — the
+                                // LLVM type is still i32, so recording
+                                // preSubst would be indistinguishable from
+                                // no entry.
+                                const sema::TypeRef* atSub =
+                                    substituteTypeRefLocal(
+                                        at, genericSubstSemaTy_);
+                                if (!isBareTypeParamRef(atSub)) {
+                                    preSema[gp.name] = atSub;
+                                }
                             }
                             break;
                         }
@@ -11711,14 +11746,31 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (!concreteArg) continue;
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             if (lt != i32()) {
+                                // Unchanged pre-#4896 behavior (see the
+                                // non-lambda arg loop above for the
+                                // rationale).
                                 preSubst[pname] = lt;
                                 preSema[pname] = substituteTypeRefLocal(
                                     concreteArg, genericSubstSemaTy_);
+                            } else {
+                                // fix #4896: same substitute-then-gate as
+                                // the non-lambda arg loop above — an
+                                // explicit type argument can itself be a
+                                // bare outer-method type-parameter
+                                // reference (e.g. `Map<T>(v, lambda(y) =>
+                                // …)` inside `Go<T>`'s body).
+                                const sema::TypeRef* concreteArgSub =
+                                    substituteTypeRefLocal(
+                                        concreteArg, genericSubstSemaTy_);
+                                if (!isBareTypeParamRef(concreteArgSub)) {
+                                    preSema[pname] = concreteArgSub;
+                                }
                             }
                         }
                     }
                     }
-                    if (preSubst != genericSubst_) {
+                    if (preSubst != genericSubst_ ||
+                        preSema != genericSubstSemaTy_) {
                         preSavedSubst = genericSubst_;
                         preSavedSema  = genericSubstSemaTy_;
                         genericSubst_ = std::move(preSubst);
