@@ -532,10 +532,12 @@ private:
     void checkTopLevelVisibility();
 
     // Slice S19: the overload-distinguishing form of a parameter
-    // modifier (§22.6). `owned` on an ordinary parameter does NOT
-    // distinguish overloads — it normalizes to the plain value form —
-    // so two overloads differing only by ordinary `owned` collide.
-    // `out owned` IS distinct from `out`.
+    // modifier (§22.6). `owned` on an ordinary parameter is a CANDIDATE
+    // for distinguishability under the declaration guard below; it
+    // carries its own key until the guard check (signaturesIndistinguishable)
+    // runs. `scoped` never distinguishes (no call-site marker, §28.14)
+    // and collapses to the plain form. `out owned` IS distinct from `out`
+    // (collapses to `out`).
     static std::string_view overloadModifier(std::string_view mod);
 
     // Slice S19 (§22.6): within a type, two same-named methods (or two
@@ -549,7 +551,25 @@ private:
     void checkTypeOverloads(TypeSymbol* t);
 
     bool signaturesIndistinguishable(const std::vector<Symbol*>& a,
-                                     const std::vector<Symbol*>& b);
+                                     const std::vector<Symbol*>& b,
+                                     const MemberSymbol* enclosing);
+
+    // §22.6 (v0.250, proposal 0091) declaration guard helpers. A pair
+    // differing only by ordinary `owned` is *distinguishable* at a
+    // position whose declared type passes `positionTypePassesDeclarationGuard`;
+    // at a failing position the pair still collides under §11.3. Both
+    // helpers err on the side of rejecting (returning `false`) — see
+    // the per-helper comments for the per-branch classification. `pa`
+    // is the parameter the TypeRef belongs to; `enclosing` is the
+    // owning member (method/ctor/indexer) — ParameterSymbol itself has
+    // no back-pointer, so the caller passes the member in. Both are
+    // required for the bare-type-parameter case (`T` resolves to a
+    // Named TypeRef whose `declaration` is null — see `bareTypeParamRef`
+    // in ExprTypecheck_Calls.cpp:17597).
+    bool positionTypePassesDeclarationGuard(const TypeRef* tr,
+                                            const ParameterSymbol* pa,
+                                            const MemberSymbol* enclosing);
+    bool typeParamConstraintSetQualifies(const GenericParamSymbol* gp);
 
     // Slice S17 (§11.7): `abstract` and `static` are mutually exclusive;
     // `sealed` and `static` are mutually exclusive. v0.242 (#3052): the
