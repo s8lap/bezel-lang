@@ -7152,6 +7152,22 @@ const ast::IdentifierExpr* MethodOwnership::findOwningMatchCaptureInLambdas(
                 if (cd->thenValue) findLambdas(*cd->thenValue);
                 if (cd->elseValue) findLambdas(*cd->elseValue);
             }
+            // fix #4818 (§28.3 K7.2/K2.2, v0.307): the other two
+            // value-selecting forms select a closure exactly as a
+            // conditional does, so the capture route follows them too —
+            // matching `collectOwningMatchSourceRoots` on the borrow route.
+            if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&x)) {
+                for (const ast::CaseArm& arm : cx->arms)
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                        arm.exprBody)
+                        findLambdas(*arm.exprBody);
+            }
+            if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&x)) {
+                if (be->op == "??") {
+                    if (be->left) findLambdas(*be->left);
+                    if (be->right) findLambdas(*be->right);
+                }
+            }
         };
     findLambdas(e);
     for (const ast::LambdaExpr* lam : lambdas) {
@@ -7239,41 +7255,76 @@ void MethodOwnership::collectOwningMatchArmAliasInits(
 }
 
 // fix #4715 (§17.15, §28.3 K8.4, v0.307): see the declaration.
-const ast::IdentifierExpr* MethodOwnership::owningMatchAliasPeel(
+// fix #4818 (§28.3 K7.2/K2.2, K8.4, §35.5, v0.307): FANS OUT at the
+// value-selecting forms. See the declaration.
+void MethodOwnership::collectOwningMatchSourceRoots(
         const ast::Expr& e,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases) {
-    // Register the binding-atom clauses on the peel path. This mirrors
-    // `identifierRoot`'s own peel arms rather than sharing them, because it
-    // needs the BindExpr nodes themselves; the ROOT, though, still comes from
-    // `identifierRoot` below, so a future arm added there cannot make the two
-    // disagree about where a value roots — at worst a clause under a newly
-    // peelable node goes unregistered, which under-rejects rather than
-    // mis-rejects.
-    std::function<void(const ast::Expr&)> registerClauses =
-        [&](const ast::Expr& x) {
-            if (auto* bx = dynamic_cast<const ast::BindExpr*>(&x)) {
-                for (const auto& cl : bx->clauses)
-                    if (cl && cl->initializer)
-                        aliases.emplace(cl.get(), cl->initializer.get());
-                if (bx->body) registerClauses(*bx->body);
-                return;
-            }
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&x)) {
-                if (ma->target) registerClauses(*ma->target);
-            } else if (auto* nm =
-                           dynamic_cast<const ast::NullCondMemberExpr*>(&x)) {
-                if (nm->target) registerClauses(*nm->target);
-            } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&x)) {
-                if (ce->callee) registerClauses(*ce->callee);
-            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&x)) {
-                if (ix->target) registerClauses(*ix->target);
-            }
-        };
-    registerClauses(e);
-    return identifierRoot(e);
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        std::vector<const ast::IdentifierExpr*>& out) {
+    // The chain arms mirror `identifierRoot`'s one for one (identifier,
+    // binding atom, member access, null-conditional member, call callee,
+    // index target) so a single-leaf value roots exactly where it did before
+    // #4818; the binding-atom arm additionally registers its clauses (#4715).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        out.push_back(id);
+        return;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses)
+            if (cl && cl->initializer)
+                aliases.emplace(cl.get(), cl->initializer.get());
+        if (bx->body) collectOwningMatchSourceRoots(*bx->body, aliases, out);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectOwningMatchSourceRoots(*ma->target, aliases, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) collectOwningMatchSourceRoots(*nm->target, aliases, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) collectOwningMatchSourceRoots(*ce->callee, aliases, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) collectOwningMatchSourceRoots(*ix->target, aliases, out);
+        return;
+    }
+    // ---- fix #4818: the value-selecting forms (K7's joins) -----------------
+    // K7.2: borrowed ⊓ borrowed carries "the union of the arms' source sets
+    // (K2.2)" at `??`, `if` expressions and expression-position `case` arms.
+    // So each SELECTED value is a source — never the condition, the
+    // scrutinee, or a guard, which are only read. `null`/`throw` arms
+    // (K7.5) contribute nothing because they root at no identifier.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->thenValue)
+            collectOwningMatchSourceRoots(*cd->thenValue, aliases, out);
+        if (cd->elseValue)  // an elif chain nests here (§20/A.7)
+            collectOwningMatchSourceRoots(*cd->elseValue, aliases, out);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        for (const ast::CaseArm& arm : cx->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody)
+                collectOwningMatchSourceRoots(*arm.exprBody, aliases, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op == "??") {
+            if (be->left) collectOwningMatchSourceRoots(*be->left, aliases, out);
+            if (be->right)
+                collectOwningMatchSourceRoots(*be->right, aliases, out);
+        }
+        return;
+    }
 }
 
 // fix #4715 (§28.3 K8.4, §35.5, v0.307): see the declaration.
+// fix #4818: a WORKLIST over source roots instead of a single chain, so every
+// selected branch of a value-selecting form is traced (see the declaration).
 const ast::IdentifierExpr* MethodOwnership::owningMatchEscapeRoot(
         const ast::Expr& value,
         const std::vector<const sema::Symbol*>& transferred,
@@ -7281,32 +7332,38 @@ const ast::IdentifierExpr* MethodOwnership::owningMatchEscapeRoot(
         const OwningMatchArmTaint* tainted) {
     constexpr int kMaxOwningMatchAliasHops = 32;  // see the declaration
     std::set<const sema::Symbol*> seen;
-    const ast::Expr* cur = &value;
-    for (int hop = 0; hop < kMaxOwningMatchAliasHops; ++hop) {
-        const ast::IdentifierExpr* root = owningMatchAliasPeel(*cur, aliases);
-        if (!root) return nullptr;
-        sema::Symbol* rootSym = ctx_.exprSymbol(*root);
-        if (!rootSym) return nullptr;
-        for (const sema::Symbol* b : transferred)
-            if (b == rootSym) return root;  // the escape, named as the author
-                                            // must spell the `move` (§35.5)
-        auto* ls = dynamic_cast<sema::LocalSymbol*>(rootSym);
-        // fix #4720 (§28.3 K8.4, v0.307): the ASSIGNMENT-sourced hop. An
-        // arm-local that reached the payload by assignment is excluded from
-        // `aliases` on purpose (see that map's declaration), so the chain
-        // below cannot continue through it; the ordered walk's taint set is
-        // the program-point fact that can. The identifier returned names the
-        // TRANSFERRED BINDING, not this local, so the diagnostic and its
-        // `move w` remedy read exactly as the direct route's do.
-        if (tainted && ls && ls->decl) {
-            auto t = tainted->find(ls->decl);
-            if (t != tainted->end() && t->second) return t->second;
+    std::vector<const ast::Expr*> work{&value};
+    for (int hop = 0; hop < kMaxOwningMatchAliasHops && !work.empty(); ++hop) {
+        const ast::Expr* cur = work.back();
+        work.pop_back();
+        std::vector<const ast::IdentifierExpr*> roots;
+        collectOwningMatchSourceRoots(*cur, aliases, roots);
+        for (const ast::IdentifierExpr* root : roots) {
+            sema::Symbol* rootSym = ctx_.exprSymbol(*root);
+            if (!rootSym) continue;
+            for (const sema::Symbol* b : transferred)
+                if (b == rootSym) return root;  // the escape, named as the
+                                                // author must spell the
+                                                // `move` (§35.5)
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(rootSym);
+            // fix #4720 (§28.3 K8.4, v0.307): the ASSIGNMENT-sourced hop. An
+            // arm-local that reached the payload by assignment is excluded
+            // from `aliases` on purpose (see that map's declaration), so the
+            // chain below cannot continue through it; the ordered walk's
+            // taint set is the program-point fact that can. The identifier
+            // returned names the TRANSFERRED BINDING, not this local, so the
+            // diagnostic and its `move w` remedy read exactly as the direct
+            // route's do.
+            if (tainted && ls && ls->decl) {
+                auto t = tainted->find(ls->decl);
+                if (t != tainted->end() && t->second) return t->second;
+            }
+            if (!seen.insert(rootSym).second) continue;
+            if (!ls || !ls->decl) continue;
+            auto it = aliases.find(ls->decl);
+            if (it == aliases.end() || !it->second) continue;
+            work.push_back(it->second);  // trace into the alias's initializer
         }
-        if (!seen.insert(rootSym).second) return nullptr;
-        if (!ls || !ls->decl) return nullptr;
-        auto it = aliases.find(ls->decl);
-        if (it == aliases.end() || !it->second) return nullptr;
-        cur = it->second;  // trace into the alias's own initializer
     }
     return nullptr;
 }

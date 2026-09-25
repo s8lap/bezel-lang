@@ -3132,16 +3132,32 @@ private:
         std::unordered_map<const ast::Node*, const ast::Expr*>& out);
 
     // fix #4715: peel `e` to its root identifier EXACTLY as `identifierRoot`
-    // does — by delegating to it, so the two can never disagree about the
-    // root — while registering every §17.15 binding-atom clause met on the
+    // does (#4715 delegated to it; since #4818 the chain arms are mirrored
+    // instead, see below) while registering every §17.15 binding-atom clause met on the
     // peel path into `aliases`. The binding atom `(var c := w; c)` is the
     // EXPRESSION-position spelling of the same indirection an arm-body
     // `const`/`var` is in statement position, and `identifierRoot` peels a
     // `BindExpr` straight to its body, so without this the trace stops dead
     // at `c`. // per §17.15, §28.3 K8.4, v0.307
-    const ast::IdentifierExpr* owningMatchAliasPeel(
+    //
+    // fix #4818 (§28.3 K7.2/K2.2, K8.4, §35.5, v0.307): renamed from
+    // `owningMatchAliasPeel` and widened from ONE root to a SET. The peel was
+    // `identifierRoot`, which stops dead at a value-selecting form, so
+    // `(if p then w else other)`, `(case k of 1 => w, _ => other)`,
+    // `(… ) ?? other` and a derived `(if p then w.In() else other)` rooted at
+    // nothing and escaped the arm unchecked — measured accepted, and a
+    // heap-use-after-free under #4634's arm-end drop. K7.2 gives such a
+    // value "the union of the arms' source sets (K2.2)", so this now FANS
+    // OUT at a `ConditionalExpr` (both values), an expression-position
+    // `CaseExpr` (every arm's result) and a `??` (both operands) — never
+    // into a condition, scrutinee or guard, which are only read — and
+    // appends every root identifier reached to `out`. Its chain arms mirror
+    // `identifierRoot`'s one for one, so a value with no selecting form in
+    // it roots exactly where it did before. // per §28.3 K7.2, K8.4, v0.307
+    void collectOwningMatchSourceRoots(
         const ast::Expr& e,
-        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        std::vector<const ast::IdentifierExpr*>& out);
 
     // fix #4715: `identifierRoot`'s one-hop resolution, extended into a
     // BOUNDED trace through same-arm local aliases. Returns the identifier
@@ -3169,6 +3185,10 @@ private:
     // the identifier naming the TRANSFERRED BINDING that tainted the local
     // (not the local), so the diagnostic names `w` and its `move w` remedy
     // exactly as the direct and initializer-aliased routes already do.
+    // fix #4818: the trace is a WORKLIST, fed by
+    // `collectOwningMatchSourceRoots`' root SET, so every selected branch is
+    // followed (and each branch's aliases in turn); the hop cap now bounds
+    // total worklist pops rather than one chain's length.
     const ast::IdentifierExpr* owningMatchEscapeRoot(
         const ast::Expr& value,
         const std::vector<const sema::Symbol*>& transferred,
