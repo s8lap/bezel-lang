@@ -13809,6 +13809,29 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // Only applied to interface dispatch (isIfaceMethod) where the
         // generic-T erasure mismatch can arise.
         if (isIfaceMethod) {
+            // fix #4900 (§13 / §14.1 / §7 / §7.10, v0.307): the itable slot
+            // of an implementor instantiated at a nullable value type
+            // (`Holder<int?>` implementing `IId<int?>`) is the specialization
+            // that takes the tagged `{i8, T}` carrier for a bare `v: T`
+            // formal — the same carrier emitGenericSpecialization builds for
+            // the direct call (#4830). This arm passed the argument as the
+            // bare payload (`i32 5`) and then, below, retyped the call from
+            // the argument types, so the callee read an `{i8, i32}` from an
+            // `i32` register: layout-dependent garbage. Shape each argument
+            // for its interface formal under the active substitution (the
+            // receiver's `IId<int?>` binds the interface's `T`) first.
+            std::size_t ifThisOff = isStaticMethod(ms) ? 0u : 1u;
+            for (std::size_t ai = ifThisOff; ai < args.size(); ++ai) {
+                std::size_t pi = ai - ifThisOff;
+                if (pi >= ms->params.size()) break;
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        ms->params[pi])) {
+                    const sema::TypeRef* formal =
+                        ps->declType ? ctx_.resolvedType(*ps->declType)
+                                     : ps->resolvedDeclType;
+                    args[ai] = wrapArgForNullableValueFormal(args[ai], formal);
+                }
+            }
             bool needsConcrete = false;
             for (std::size_t ai = 0; ai < args.size(); ++ai)
                 if (args[ai]->getType() != fnTy->getParamType(ai))
