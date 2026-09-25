@@ -6951,6 +6951,39 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return;
             }
         }
+        // fix #4807 (§4.6/§3.5, v0.307): `-`, `*`, `/`, `mod` carry no
+        // operator on a `string` operand — §3.5 enumerates arithmetic
+        // (`+`/`-`/`*`/`/` and unary `+`/`-`) BY OPERAND TYPE, on
+        // "byte…decimal", and §4.6 names `+` as the sole string operator
+        // (concatenation). Before this, `s - t` / `s * 1` / `s / 1` /
+        // `s mod 1` (and the symmetric operand order) fell through to the
+        // `result follows lt` rule, typed `string`, and reached codegen,
+        // which emitted `sub ptr` / `mul ptr` etc. on string pointers —
+        // LLVM IR verification rejected the module ("Integer arithmetic
+        // operators only work with integral types! sub ptr", the issue's
+        // exact symptom). Reject the string operand here, naming §4.6's
+        // same-wording remedy the §4.6 `+` arm above already uses.
+        if (op == "-" || op == "*" || op == "/" || op == "mod") {
+            TypeRef* rtStr = be.right ? ctx_.exprType(*be.right) : nullptr;
+            auto isStr = [](const TypeRef* t) {
+                return t && t->kind == TypeRef::Kind::Primitive &&
+                       t->primitive == PrimitiveType::String;
+            };
+            if (isStr(lt) || isStr(rtStr)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    std::string("operator `") + std::string(op) +
+                    "` is not defined on a `string` operand \xE2\x80\x94 only `+` "
+                    "(concatenation) is defined on `string` (\xC2\xA7""4.6); the "
+                    "operation `s " + std::string(op) + " t` has no result "
+                    "(\xC2\xA7""4.6/\xC2\xA7""3.5)");
+                auto* sTy = ctx_.makeTypeRef();
+                sTy->kind = TypeRef::Kind::Primitive;
+                sTy->primitive = PrimitiveType::String;
+                ctx_.setExprType(&be, sTy);
+                return;
+            }
+        }
         // §2.5 (stdlib L264–265): TimeSpan + TimeSpan → TimeSpan and
         // TimeSpan - TimeSpan → TimeSpan are compiler-intrinsic operators
         // (TimeSpan is a builtin value type backed by a scalar i64 tick count;
@@ -7097,6 +7130,47 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         //     `string`). `char mod char` is also rejected (narrow #3109), but
         //     `char mod <int>` and `<int> mod char` are admitted via §5.1's
         //     char→int widening — the cast pattern `s[0] mod 256` is canonical.
+        //
+        //   • fix #4807 (§6.5, v0.307): `decimal` is NOT in §6.5's enumeration
+        //     of bitwise operands — "on `byte`, `sbyte`, `short`, `ushort`,
+        //     `int`, `uint`, `long`, `ulong`: `&`, `|`, `^`, `~`" — and the
+        //     sister clause names it among the forbidden kinds alongside the
+        //     floating-point types ("not valid on `bool`, `char`, or
+        //     floating-point types"). Before this, the bitwise backstop listed
+        //     `Float`/`Double` only, so a `decimal & int` pair slipped through
+        //     the check, was type-fitted under §6.2's `int → decimal`
+        //     promotion, and reached codegen where the integer-side bitwise
+        //     intrinsic died on a decimal slot (LLVM `IRBuilderBase::CreateAnd`
+        //     rejected the `%decimal` operand); the #2434 lower-to-zero
+        //     backstop then degraded the result to a zero-initialized value
+        //     and emitted the misleading "degraded to a zero-initialized
+        //     value" warning. Reject here, before that path. The compound form
+        //     (`o &= 1` over a narrowed `Object` after #4711 desugars it to
+        //     `o := o & 1` — §6.6) reaches this same gate through the binary
+        //     typer; the §6.6 compound typer's RHS-kind check in
+        //     ExprTypecheck.cpp already rejected decimal on the right, so
+        //     closing this gap closes the compound path's "decimal LEFT,
+        //     int RIGHT" silence too.
+        //
+        //   • fix #4807 (§4.6/§3.5, v0.307): `+` is the sole arithmetic
+        //     operator defined on `string` (concatenation, §4.6). The
+        //     `-`/`*`/`/`/`mod` operators carry the same non-arithmetic
+        //     disposition §3.5's "arithmetic on the numeric types" bullet
+        //     settles for strings: there is no `-`/`*`/`/`/`mod` defined on
+        //     a string operand. Before this, `string - string` (and any
+        //     `string * int`, etc.) fell through to the `result follows lt`
+        //     fallback, typed `string`, and reached codegen which emitted
+        //     `sub ptr` / `mul ptr` etc. on string pointers — LLVM IR
+        //     verification then rejected the module ("Integer arithmetic
+        //     operators only work with integral types! sub ptr"). The §4.6
+        //     check above for `+` admits the both-string concat and rejects
+        //     the mixed pair; for `-`/`*`/`/`/`mod`, every string operand is
+        //     a compile error, named against §3.5's enumeration. The §6.6
+        //     compound form (`s -= "x"`) is rejected by the §4.6 compound
+        //     backstop in ExprTypecheck.cpp; closing the binary gap closes
+        //     the same form reached through §6.6 desugaring of a narrowed
+        //     `Object` after #4711.
+        //
         // (String/reference bitwise keeps its existing concatenation hint.)
         {
             const bool isBitwise = (op == "&" || op == "|" || op == "^" ||
@@ -7106,6 +7180,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return (t && t->kind == TypeRef::Kind::Primitive)
                            ? t->primitive : PrimitiveType::None;
             };
+            // `mod` (§6.1) is valid on `decimal` — keep this predicate
+            // narrowly Float/Double so the `mod` check below does not reject
+            // `decimal mod decimal`. The wider grouping (Float/Double/Decimal)
+            // is inlined in the bitwise backstop, which §6.5 enumerates per
+            // integer kind.
             auto isFloatPrim = [](PrimitiveType p) {
                 return p == PrimitiveType::Float || p == PrimitiveType::Double;
             };
@@ -7122,9 +7201,19 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             if (isBitwise) {
                 for (TypeRef* o : {lt, rt0}) {
                     PrimitiveType p = primOf(o);
-                    // §6.5: not valid on bool, char, or floating-point.
+                    // §6.5: not valid on bool, char, decimal, or float/double.
+                    // `decimal` is grouped with the floating-point kinds per
+                    // the compound-assignment typer's existing convention
+                    // (#2153, #2163, ExprTypecheck.cpp ~18560): it is not in
+                    // §6.5's enumeration of allowed bitwise operand types
+                    // either way, so this is the same rejection under the
+                    // same wording. The narrower isFloatPrim (Float/Double
+                    // only) is what the `mod` check below needs.
                     const char* badKind =
-                        isFloatPrim(p)               ? "floating-point types"
+                        (p == PrimitiveType::Float ||
+                         p == PrimitiveType::Double ||
+                         p == PrimitiveType::Decimal)
+                            ? "floating-point types"
                         : (p == PrimitiveType::Bool) ? "`bool` (boolean operations "
                                                        "use `and`/`or`/`not`)"
                         : (p == PrimitiveType::Char)  ? "`char`"
