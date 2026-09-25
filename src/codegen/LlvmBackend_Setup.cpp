@@ -13388,19 +13388,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     std::vector<llvm::Value*> chainArgBoxReleases;
     for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
         const auto& a = call->args[ai];
-        if (!a.value) {
-            // fix #2579: the call never runs — release any bracket pins
-            // recorded by earlier args so their refcount isn't stranded.
-            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
-            genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
-            return;
-        }
         // The bound parameter index for this source argument. A `continue`
-        // above (unknown-name defensive branch) leaves `paramToArg` with no
+        // below (unknown-name defensive branch) leaves `paramToArg` with no
         // entry for this `ai`, so skip — no formal to consult, no slot to
         // fill, and a duplicate-name call's first write is silently dropped
         // in favour of the last (sema-rejected; the failure mode is the same
         // as the pre-fix positional pairing on those unreachable shapes).
+        //
+        // fix #4956 (§17.13 "the discard `_`" / §22.6 "out _" / §12.8,
+        // v0.307): computed BEFORE the `!a.value` branch further down,
+        // because an admitted `out _` argument has a null `a.value` BY
+        // DESIGN (Node.hpp `CallArgument::value`: "null when isDiscard")
+        // and still needs its BOUND formal to size the discard's scratch
+        // slot below.
         int pi = -1;
         for (std::size_t j = 0; j < paramToArg.size(); ++j) {
             if (paramToArg[j] == static_cast<int>(ai)) {
@@ -13416,7 +13416,45 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 target->params[pi]))
             formalMod = ps->modifier;
         llvm::Value* v = nullptr;
-        if (isByRefMod(a.modifier) || isByRefMod(formalMod)) {
+        if (a.isDiscard) {
+            // fix #4956: `this(out _, n)` / `base(out _, n)` against a sole
+            // `(out y: int, x: int)` chain target used to fall into the
+            // `!a.value` branch below (fix #2579, predating this discard
+            // form's admission into chain-call argument position) and
+            // RETURN WITHOUT EMITTING THE CALL AT ALL — so the target ctor's
+            // entire body (`y := 9; Tag := $"O{x}"`) never ran and `Tag`
+            // observed empty where §12.8's "the chained-to constructor runs
+            // to completion" promises `O3`.
+            //
+            // §17.13: "`out _` does not introduce a variable; the receiving
+            // slot is internal to the compiler and is not observable" — the
+            // same rescue `buildOrderedArgs` performs for an ordinary call's
+            // `out _` (LlvmBackend_Assign.cpp, fix #1301) and `lowerNew`'s
+            // own `out _` admission (fix #2658/#3081), sized here from the
+            // CHAIN TARGET's own formal (`target->params[pi]`) since a chain
+            // call has no ordinary imported/local parameter list to read.
+            //
+            // Every OTHER discard shape (`ref _`, `out var _`, an
+            // unmodified `_`, ...) is already a parse-time Severity::Error
+            // (Parser_Decls.cpp) and never reaches codegen at all
+            // (Driver.cpp gates `emitModule` on `!diagnostics.hasErrors()`),
+            // so `formalMod == "out"` is the only shape reachable here; the
+            // `else` chain below preserves the pre-fix silent-return for any
+            // other (unreachable, defensive) modifier rather than risk a new
+            // path through unverified territory.
+            if (formalMod == "out") {
+                llvm::Type* slotTy = i32();
+                if (const sema::TypeRef* fty = paramTypeOf(target->params[pi]))
+                    slotTy = lowerTypeRef(fty);
+                v = entryAlloca(slotTy);
+            }
+        } else if (!a.value) {
+            // fix #2579: the call never runs — release any bracket pins
+            // recorded by earlier args so their refcount isn't stranded.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
+            return;
+        } else if (isByRefMod(a.modifier) || isByRefMod(formalMod)) {
             // §22.3 alias path: a true-alias location has an address the
             // callee writes through directly.
             llvm::Type* et = nullptr;
@@ -13517,9 +13555,17 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         }
         if (!v) {
             // #1386: ICE — the expression kind is not yet handled by codegen.
+            // fix #4956 defensive note: `a.value` is null for a discard
+            // argument (Node.hpp: "value: null when isDiscard"), and the
+            // `a.isDiscard` branch above only ever leaves `v` null for a
+            // discard shape that parsing already rejects before codegen runs
+            // (see that branch's comment) — but should that invariant ever
+            // be wrong, fall back to the call's own span rather than
+            // dereference a null `a.value`.
             emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             ctx_.diagnostics().report(
-                Severity::Error, a.value->span.begin,
+                Severity::Error,
+                a.value ? a.value->span.begin : call->span.begin,
                 "internal: lowerExpr returned null for base-constructor "
                 "argument — #1386");
             genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
