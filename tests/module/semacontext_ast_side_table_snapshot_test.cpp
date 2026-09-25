@@ -346,8 +346,11 @@ const Entry kAstKeyedTables[] = {
      "the consumer then finds no entry and runs its pre-#4853 search "
      "(`ctorForArgs`'s proxy tiers), i.e. exactly today's behaviour for that "
      "site. The consumer also adopts an entry only when the symbol is a "
-     "non-static constructor MEMBER of the class being resolved, so a stale "
-     "or foreign entry is never lowered. The value is owned by the "
+     "non-static constructor MEMBER of the class being resolved; that "
+     "guards class identity only. The key's soundness rests on every "
+     "`NewExpr::args` vector outliving the compile (AST nodes are never "
+     "freed mid-compile, so an address is never reused for another site's "
+     "arguments). The value is owned by the "
      "`SemaContext` whose arena produced it — the one the entry lives in."},
 };
 

@@ -407,7 +407,12 @@ public:
     // other vector (a chain call's `CallExpr::args`, a synthesized list)
     // finds no entry and keeps the proxy: a miss costs the fix, never a
     // wrong pick. The consumer also checks the symbol is a member of the
-    // class it is resolving, so a disagreement is never adopted.
+    // class it is resolving. That check guards CLASS identity only: it
+    // cannot tell whether an entry belongs to the `new` expression now
+    // being lowered. Soundness of the key itself rests on every `NewExpr`
+    // (and so its `args` vector) outliving the compile — no AST node is
+    // freed while sema and codegen run, so no address is reused for another
+    // site's arguments.
     void setResolvedNewCtor(const std::vector<ast::CallArgument>* newArgs,
                             ConstructorSymbol* ctor) {
         if (newArgs && ctor) resolvedNewCtors_[newArgs] = ctor;

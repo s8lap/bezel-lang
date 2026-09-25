@@ -268,3 +268,29 @@ BEZEL_TEST(sema_ctor_overload_exact_match_ranking_4853,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "5\n50\n");
 }
+
+// Primary-constructor class (§22.10): `C(d: double)` beside a body
+// `(n: int)` that chains `this(1000.0)`. A run-time `long` argument widens to
+// `double` (§5.1) and is INAPPLICABLE to `(n: int)` (a narrowing is never
+// implicit), so the primary binds and `d` holds 5e9. Pre-fix the type-class
+// proxy treated `long`/`int` as one integral class, ran `(n: int)`, and
+// printed the chained `1000` (rendered `1e+03`).
+BEZEL_TEST(sema_ctor_overload_exact_match_ranking_4853,
+           primary_double_binds_long_over_body_int_ctor_spec_22_6_5_1) {
+    auto r = runAot(
+        "module M; "
+        "public class C(d: double) "
+        "  public constructor(n: int) this(1000.0); end constructor; "
+        "  public method Get(): double return d; end Get; "
+        "end C; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var big: long := 5000000000; "
+        "    Console.WriteLine(new C(big).Get()); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "5e+09\n");
+}
