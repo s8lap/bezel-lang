@@ -250,6 +250,17 @@ class R5CoverageFloorDisabledTest(unittest.TestCase):
         _, findings = trend.judge([rec])
         self.assertIn(trend.RULES[4], _fired_rules(findings))
 
+    def test_floor_enforced_false_on_a_fail_result_does_not_fire(self):
+        # fix #3737, the historical misfire: pre-split records wrote the
+        # value-based coverage_floor_enforced=false on a coverage-short FAIL,
+        # and the old R5 (`floor is False`, unscoped to result) flagged that
+        # already-correct fail as "the gate ran without the #3002 floor". R5
+        # is scoped to PASS and must stay silent on it.
+        rec = _rec(expected_gtests=20575, gtests=20573, result="fail",
+                    coverage_floor_enforced=False)
+        _, findings = trend.judge([rec])
+        self.assertNotIn(trend.RULES[4], _fired_rules(findings))
+
     def test_floor_absent_on_fail_does_not_fire(self):
         # Scoped to PASS, matching R4's precedent: a gate that failed/retried
         # for an unrelated reason before ever reaching the coverage floor

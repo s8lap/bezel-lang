@@ -177,11 +177,17 @@ class FloorOkTest(unittest.TestCase):
         self.assertEqual(v.per_binary_expected, {"codegen": 60, "sema": 40})
 
     def test_issue_3737_repro_stays_coverage_short_pending_3002_ruling(self):
-        # #3737's own shape: TOTAL 20573 passed, 2 failed, both arbitrated
-        # FLAKY. The floor compares PASSED, not attempted — #3002's deliberate
-        # choice (a cleared failure also leaves passed < expected). The ask to
-        # fold arbitration suspects into `ran` was declined-with-reasons
-        # pending a #3002 policy ruling, so this must stay coverage-short.
+        # DOCUMENTATION pin of #3002 behaviour, NOT a regression pin: it
+        # passes on 466a28e2 and on the rejected fold (75959349) alike, since
+        # the fold only acted through the accepted_flaky side channel. The
+        # actual fold guards are its three siblings:
+        # test_floor_takes_no_accepted_flaky_fold,
+        # test_check_rejects_accepted_flaky_flag and
+        # test_gate_sh_feeds_passed_count_and_keeps_gtests_meaning.
+        # What it records: #3737's own shape (TOTAL 20573 passed, 2 failed,
+        # both arbitrated FLAKY) is coverage-short, because the floor compares
+        # PASSED, not attempted (#3002's deliberate choice). The fold ask was
+        # declined-with-reasons pending a #3002 policy ruling.
         v = coverage.floor_ok(20573, 20575, {}, {})
         self.assertFalse(v.ok)
         self.assertEqual(v.verdict, "coverage-short")
