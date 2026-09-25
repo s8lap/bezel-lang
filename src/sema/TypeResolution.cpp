@@ -98,16 +98,20 @@ constexpr bool isAlwaysAvailableBareName(std::string_view n) {
         n == "Shared" || n == "Weak" ||
         // Row 9 (System.Text).
         n == "StringBuilder" || n == "Encoding" || n == "ReadOnlyStringSpan" ||
-        // Row 10 (System.Collections.Generic).
+        // Row 10 (System.Collections.Generic — the whole of stdlib §4).
         n == "Array" || n == "OwningArray" ||
         n == "Stack" || n == "OwningStack" ||
         n == "Queue" || n == "OwningQueue" ||
         n == "Set" || n == "OwningSet" || n == "SortedSet" ||
-        n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary" ||
+        n == "Dictionary" || n == "OwningDictionary" ||
+        n == "DictionaryEntry" || n == "DrainedEntry" ||
+        n == "SortedDictionary" ||
         n == "LinkedList" || n == "OwningLinkedList" || n == "LinkedListNode" ||
         n == "OwningBuffer" || n == "FrozenArray" ||
         n == "Span" || n == "ReadOnlySpan" ||
+        n == "BitReader" || n == "BitWriter" ||
         n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+        n == "ArrayBitReader" || n == "ArrayBitWriter" ||
         n == "IEnumerable" || n == "IEnumerator" ||
         n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
         n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
@@ -116,6 +120,7 @@ constexpr bool isAlwaysAvailableBareName(std::string_view n) {
         n == "ICollection" || n == "IList" ||
         n == "IOwningCollection" || n == "IOwningList" ||
         n == "IReadOnlySpan" || n == "IEqualityComparer" ||
+        n == "Counter" || n == "OwningSlotMap" || n == "SlotHandle" ||
         // Row 11 (System.Collections.Linq).
         n == "IGrouping" || n == "IOrderedEnumerable";
 }

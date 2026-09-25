@@ -178,3 +178,162 @@ BEZEL_TEST(sema_import_alias_collision_5003,
     // imported bare name here, so the alias is acceptable.
     BEZEL_EXPECT_TRUE(runs(13, src));
 }
+
+// §2.2 / §2.3 (v0.307) #5020 — follow-up to #5003. The
+// `isAlwaysAvailableBareName` table introduced by #5003 (spec §2.3 row 10,
+// "the whole of stdlib §4") was INCOMPLETE: 9 names from the row's
+// "stated in full" enumeration were omitted, so `import X as <Name>;`
+// for those 9 was silently accepted. Per spec §2.2 (v0.307), each of
+// them must be rejected with the alias-collision diagnostic, just like
+// T1's `import System.Threading as Task;`. The 9 names below are
+// exactly the set §2.3 row 10 lists that were not in the #5003 table:
+//
+//   BitReader, BitWriter, DictionaryEntry, DrainedEntry, Counter,
+//   OwningSlotMap, SlotHandle, ArrayBitReader, ArrayBitWriter
+//
+// (KeyNotFoundException is also named in §2.3 row 10, but it is already
+// enumerated in the §2.3 row 7 set — every §31.4 standard exception —
+// so it was already covered by the #5003 fix; it is not retested here.)
+//
+// Each test below uses the T1 shape (`import System.Threading as <Name>;`)
+// because the always-available check fires at the alias DECLARATION
+// (line 2) regardless of what the imported module is — the check is on
+// `imp->alias`, not on the imported module's contents. System.Threading
+// is used uniformly for clarity. The diagnostic needle is
+// "always-available bare name", the canonical §2.2 alias-collision
+// diagnostic from the always-available branch of the #5003 fix.
+
+// T9: `import System.Threading as BitReader;` — BitReader is always-
+// available per §2.3 row 10 (stdlib §4.21, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_bit_reader_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as BitReader; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "BitReader"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T10: `import System.Threading as BitWriter;` — BitWriter is always-
+// available per §2.3 row 10.
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_bit_writer_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as BitWriter; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "BitWriter"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T11: `import System.Threading as DictionaryEntry;` — DictionaryEntry is
+// always-available per §2.3 row 10 (stdlib §4.18, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_dictionary_entry_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as DictionaryEntry; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "DictionaryEntry"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T12: `import System.Threading as DrainedEntry;` — DrainedEntry is
+// always-available per §2.3 row 10 (stdlib §4.18, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_drained_entry_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as DrainedEntry; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "DrainedEntry"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T13: `import System.Threading as Counter;` — Counter is always-
+// available per §2.3 row 10 (stdlib §4, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_counter_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as Counter; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "Counter"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T14: `import System.Threading as OwningSlotMap;` — OwningSlotMap is
+// always-available per §2.3 row 10 (stdlib §4, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_owning_slot_map_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as OwningSlotMap; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "OwningSlotMap"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T15: `import System.Threading as SlotHandle;` — SlotHandle is always-
+// available per §2.3 row 10 (stdlib §4, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_slot_handle_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as SlotHandle; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "SlotHandle"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T16: `import System.Threading as ArrayBitReader;` — ArrayBitReader is
+// always-available per §2.3 row 10 (stdlib §4.21, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_array_bit_reader_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as ArrayBitReader; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "ArrayBitReader"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T17: `import System.Threading as ArrayBitWriter;` — ArrayBitWriter is
+// always-available per §2.3 row 10 (stdlib §4.21, "stated in full" list).
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_always_available_array_bit_writer_rejected_5020) {
+    const char* src =
+        "module Conf; "
+        "import System.Threading as ArrayBitWriter; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "always-available bare name"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "ArrayBitWriter"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
