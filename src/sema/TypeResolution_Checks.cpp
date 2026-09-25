@@ -15662,21 +15662,6 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             continue;
         }
 
-        // ---- DestructorDecl ------------------------------------------------
-        if (dynamic_cast<DestructorSymbol*>(m)) {
-            // A destructor carries no modifiers vector in the AST, so `pure`
-            // on a destructor cannot reach sema via the modifier-collection
-            // loop. Still, defend against the case: if a future change stores
-            // modifiers on DestructorDecl, the rule still applies.
-            if (hasMod(dynamic_cast<MemberSymbol*>(m), "pure")) {
-                ctx_.diagnostics().report(
-                    Severity::Error, m->declLoc,
-                    "`pure` is not admitted on a destructor — disposal is the "
-                    "effect context purity fences off (\xC2\xA7""22.15)");
-            }
-            continue;
-        }
-
         // ---- PropertyDecl / IndexerDecl -----------------------------------
         if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
             if (!hasMod(ps, "pure")) continue;
