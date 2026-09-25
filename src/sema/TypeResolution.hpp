@@ -129,6 +129,26 @@ bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 // TYPE-based rows only — constant narrowing is value-based and not modelled.
 bool primitiveImplicitlyWidens(PrimitiveType from, PrimitiveType to);
 
+// §14.2 (fix #4863, v0.307): does the candidate `arg` satisfy the type-bound
+// `bound` as an INTERFACE INSTANTIATION — not merely as a declaration match.
+// `arg` and `bound` are full TypeRefs with genericArgs preserved; the
+// function walks `arg`'s transitive baseTypeRefs (`baseTypeRefs` is the
+// parallel-instantiation vector to `baseTypes`, populated by
+// SymbolCollection/ModuleLoader and used by override-signature checking) and
+// accepts only when a base's TypeRef equals the bound under `typeRefEqual`.
+// Non-generic bounds (e.g. `where T: IDisposable`) admit any instantiation
+// of the bound's declaration — the no-generic-args specialization of the
+// §14.2 constraint table. Bare-parameter markers in the bound's args
+// (Named with declaration=nullptr, the §14.2 type-parameter marker) name
+// the GENERIC OWNER's type parameter; the single-entry substitution
+// {constraint's param → candidate} applies (see the body comment for the
+// multi-param gap). Exposed as a free function so ExprTypecheck_Calls.cpp's
+// call-site constraint check (the OTHER half of #4863 — the wrapping-form
+// `Resolver::checkGenericConstraints` only fires at instantiation sites,
+// not at method-call sites like `H.F<C>(c, …)`) can call it without
+// depending on Resolver directly.
+bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
+
 // #2787 / spec §14.2 rule 3 + §12.9 / stdlib §2.2 §4.4 §5.1: does the INTERFACE
 // type `t` satisfy the self-recurrent bound `where T: IComparable<T>` — i.e.
 // does it name `IComparable<t>` (ITSELF) in its extension clause?

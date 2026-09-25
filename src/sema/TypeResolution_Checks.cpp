@@ -8717,28 +8717,86 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
     return TypeCategory::Unknown;
 }
 
-bool Resolver::argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
+bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
     if (!arg || !bound) return false;
     if (arg->kind != TypeRef::Kind::Named || !arg->declaration) return false;
     if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
         return false;
     }
     // BFS over the argument's transitive base/interface set, cycle-guarded.
-    // The argument conforms when `bound`'s declaration is the argument
-    // itself or any of its (transitive) bases. (Generic-argument matching of
-    // the bound — e.g. distinguishing IComparable<int> from IComparable<long>
-    // — is left to the variance/substitution slice; this check is by
-    // declaration identity, which is sound for the common monomorphic and
-    // single-instantiation cases and never over-rejects a true subtype.)
+    // §14.2 (fix #4863, v0.307): the constraint is an interface
+    // INSTANTIATION — `where T: IEquatable<Other>` requires T to conform to
+    // THAT instantiation, not merely to "some instantiation of IEquatable".
+    // Pre-fix this matched by declaration identity only, so a candidate
+    // conforming to `IEquatable<Self>` was wrongly accepted for
+    // `IEquatable<Other>` and the body's `a.Equals(o)` was then called with
+    // an `Other` argument against a `Self`-typed `Equals` (type confusion).
+    // Walk `baseTypeRefs` in parallel with `baseTypes` so the candidate's
+    // actual instantiation is visible at the comparison; require
+    // `typeRefEqual` on the full TypeRef — not just declaration match —
+    // whenever the bound carries type arguments.
+    //
+    // The bound's generic args may name the GENERIC OWNER's type parameters
+    // — a bare-parameter marker (Named with declaration=nullptr). The §14.2
+    // recurrence constraint `where T: INum<T>` resolves the bound as
+    // `INum<T_param>`; substituting T → candidate gives `INum<candidate>`,
+    // and only THAT instantiation is what the candidate must conform to
+    // (per §14.2's type-parameter-bounds paragraph and the worked example
+    // for `where T: U`). Treat a bare-parameter marker at the bound's arg
+    // position as the candidate itself: this matches the substitution
+    // single-entry substitution {constraint's param → candidate}, which is
+    // correct for every current constraint shape (every `where T:
+    // IFoo<T>` / `where T: IEquatable<T>` in the corpus is single-param).
+    // Multi-param generics where the bound names a NON-constrained
+    // parameter (`where T: IFoo<U>` on `class G<T, U>`) remain a documented
+    // gap; the deferred-recheck path stores only the candidate for the
+    // constraint's own param.
     TypeSymbol* target = bound->declaration;
     std::vector<TypeSymbol*> frontier{arg->declaration};
+    std::vector<const TypeRef*> frontierRef{arg};  // parallel: instantiation
     std::unordered_set<TypeSymbol*> seen{arg->declaration};
     std::size_t i = 0;
     while (i < frontier.size()) {
-        TypeSymbol* t = frontier[i++];
-        if (t == target) return true;
-        for (TypeSymbol* b : t->baseTypes) {
-            if (b && seen.insert(b).second) frontier.push_back(b);
+        TypeSymbol* t = frontier[i];
+        const TypeRef* tRef = frontierRef[i];
+        ++i;
+        if (t == target) {
+            // Declaration matches. A non-generic bound (e.g. `IDisposable`)
+            // admits any instantiation of its declaration — fall through to
+            // accept (legacy behaviour, also matches the no-generic-args
+            // specialization of the §14.2 constraint table). For a bound
+            // carrying type arguments, demand structural equality of the
+            // candidate's instantiation against the bound's; a missing
+            // `tRef` for a generic bound is treated as "cannot confirm" and
+            // rejected rather than silently admitted.
+            if (bound->genericArgs.empty()) return true;
+            if (!tRef) continue;
+            if (bound->genericArgs.size() != tRef->genericArgs.size()) continue;
+            bool allMatch = true;
+            for (std::size_t j = 0; j < bound->genericArgs.size(); ++j) {
+                const TypeRef* bArg = bound->genericArgs[j];
+                // §14.2 substitution (single-entry): a bare-parameter marker
+                // in the bound names the constraint's own type parameter;
+                // under substitution it equals the candidate.
+                if (bArg && bArg->kind == TypeRef::Kind::Named &&
+                    !bArg->declaration) {
+                    bArg = arg;
+                }
+                if (!typeRefEqual(bArg, tRef->genericArgs[j])) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) return true;
+        }
+        for (std::size_t k = 0; k < t->baseTypes.size(); ++k) {
+            TypeSymbol* b = t->baseTypes[k];
+            if (!b || !seen.insert(b).second) continue;
+            const TypeRef* bRef = (k < t->baseTypeRefs.size())
+                                      ? t->baseTypeRefs[k]
+                                      : nullptr;
+            frontier.push_back(b);
+            frontierRef.push_back(bRef);
         }
     }
     return false;

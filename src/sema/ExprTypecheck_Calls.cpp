@@ -4566,7 +4566,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     report(std::string(bn));
                                 continue;
                             }
-                            if (!isSubtype(argDecl, bound->declaration))
+                            if (!argSatisfiesTypeBound(argRef, bound))
                                 report(std::string(
                                     bound->declaration->name));
                         } else if (item.kind == "class") {

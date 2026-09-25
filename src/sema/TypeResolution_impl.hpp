@@ -13,6 +13,8 @@
 // namespace scope here would be a program-wide ODR clash. As a nested type it
 // cannot collide.
 
+#include "sema/TypeResolution.hpp"  // argSatisfiesTypeBound (free fn, #4863)
+
 #include <functional>
 #include <optional>
 #include <set>
@@ -1315,9 +1317,19 @@ private:
     TypeCategory categorize(const TypeRef* a);
 
     // §14.2 interface/base conformance: does `arg` (a Named TypeRef with a
-    // resolved declaration) have `bound`'s declaration in its transitive
-    // base/interface set, or equal it? BFS over baseTypes, cycle-guarded.
-    bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
+    // resolved declaration) conform to `bound`'s instantiation (not just
+    // its declaration — fix #4863, v0.307)? BFS over baseTypes and
+    // baseTypeRefs in parallel; structural equality on TypeRef (incl. the
+    // bound's generic args) decides the candidate's instantiation match.
+    // Thin wrapper over the free function in TypeResolution.hpp so the
+    // existing `this->argSatisfiesTypeBound(...)` call sites in this class
+    // (the deferred-recheck / use-site / wrapping-form paths) stay
+    // unchanged. The free function is callable directly from
+    // ExprTypecheck_Calls.cpp's call-site constraint check, which the
+    // Resolver's class method can't reach.
+    bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
+        return ::bezel::sema::argSatisfiesTypeBound(arg, bound);
+    }
 
     // §11.8 / §14.2 (v0.176, #807): a type-bound constraint failure recorded
     // DURING base-list resolution, re-checked after every type's baseTypes are
