@@ -7891,14 +7891,35 @@ static std::string_view builtinParamVariance(std::string_view name,
 // covariant/contravariant generic conversion?
 // Value types in Bezel: numeric primitives, bool, char (PrimitiveType except
 // Object and String), enums, and records.  String and Object are reference types.
+// fix #4932 (§12.9, v0.307): the original predicate required `t->declaration`
+// to be non-null so the Enum/Record-kind check could fire, but a BUILTIN
+// value-type (DateTime/TimeSpan/DateOnly/TimeOnly/Guid/CancellationToken —
+// `isValueBuiltinByName` in SemaContext.hpp:1291) reaches this gate with
+// `declaration == null` (they keep it null on purpose so `new T(...)` lowering
+// keys off the absence, #1463/§4.2). The downstream variance check accepted
+// `IO<DateTime?>` where `IO<DateTime>` was the source — a §12.9 violation.
+// Augment the predicate to consult `isValueBuiltinByName` on the resolved
+// short name for a null-declaration Named ref. The `kind == InlineArray` and
+// `kind == Function` shapes are value-typed at the slot but are never the
+// arg of a generic interface instantiation (their arity is structural, not
+// generic), so they are not part of the §12.9 reference-vs-value-type gate.
 static bool isValueTypeArg(const TypeRef* t) {
     if (!t) return false;
     if (t->kind == TypeRef::Kind::Primitive)
         return t->primitive != PrimitiveType::Object &&
                t->primitive != PrimitiveType::String;
-    if (t->kind == TypeRef::Kind::Named && t->declaration)
-        return t->declaration->kind == ast::TypeDeclKind::Enum ||
-               t->declaration->kind == ast::TypeDeclKind::Record;
+    if (t->kind == TypeRef::Kind::Named) {
+        if (t->declaration)
+            return t->declaration->kind == ast::TypeDeclKind::Enum ||
+                   t->declaration->kind == ast::TypeDeclKind::Record;
+        // Builtin value types (DateTime, TimeSpan, …): no user declaration,
+        // so the Enum/Record check above cannot fire — consult the stdlib
+        // name list. Spans/Buffer/IntPtr/UIntPtr are also value-typed but
+        // are not §12.9 generic-interface type arguments in practice (their
+        // identity is structural), and the conservative `false` here would
+        // just leave them to the reference-type branch — same as today.
+        return isValueBuiltinByName(namedTypeSimpleName(t));
+    }
     return false;
 }
 
@@ -8339,18 +8360,63 @@ static bool variantGenericAssignable(
             // recursively through nested generic arguments (§12.9 — a nested
             // invariant base such as Array requires argument identity, so
             // `IEnumerable<Array<Dog>>` does NOT admit `IEnumerable<Array<Animal>>`).
-            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn,
-                                            freeNames);
+            //
+            // fix #4932 (§12.9, v0.307): variance applies only to REFERENCE-
+            // TYPED arguments. A value-type argument (including its nullable
+            // form — `isValueTypeArg` returns true for `int?`) admits IDENTITY
+            // ONLY. `int` and `int?` are NOT identical: `int` lowers to bare
+            // `i32`, `int?` to a tagged `{i8, i32}` wrapper struct (§7.2). The
+            // downstream `typeArgCovariantAssignable` short-circuits on
+            // `typeArgIdentical(fromArg, toArg)` BEFORE the value-type gate,
+            // and `typeArgIdentical`'s base check (`typeArgSameBase`) ignores
+            // nullability — so `IO<int?> := ci` where `ci: IO<int>` slipped
+            // through (the sibling shapes `IO<long>` and `IO<Object>` were
+            // already rejected by #4892; the `int?` widening was the residual).
+            // Pre-check here: when either side is a value type, require
+            // identity (same base AND same nullability).
+            if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
+                ok = fromArg && toArg &&
+                     fromArg->nullable == toArg->nullable &&
+                     typeArgIdentical(fromArg, toArg, freeNames);
+            } else {
+                ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn,
+                                                freeNames);
+            }
         } else if (variance == "in") {
             // Contravariant: toArg must reference-convert to fromArg (operands
             // swapped), same recursive composition.
-            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn,
-                                            freeNames);
+            //
+            // fix #4932: same value-type identity-only restriction as the
+            // covariant arm above — the operand swap is immaterial to the gate
+            // (value types admit identity only regardless of direction).
+            if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
+                ok = fromArg && toArg &&
+                     fromArg->nullable == toArg->nullable &&
+                     typeArgIdentical(fromArg, toArg, freeNames);
+            } else {
+                ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn,
+                                                freeNames);
+            }
         } else {
             // Invariant (or unknown variance): recursive argument identity —
             // NOT a shallow same-base check, which would ignore nested args and
             // treat `Array<Dog>` as identical to `Array<Animal>` (§12.9).
-            ok = typeArgIdentical(fromArg, toArg, freeNames);
+            //
+            // fix #4932 (§12.9, v0.307): for value-type arguments, identity
+            // must also distinguish nullability — `int` is NOT identical to
+            // `int?` (§7.2, different lowering). The same predicate in the
+            // `out`/`in` arms above covers the variant case; here it covers
+            // the invariant case (classes, records, and any interface whose
+            // parameter is declared without `in`/`out`). Without this the
+            // invariance of `II<T>` over `T` admits `II<int?>` where
+            // `II<int>` is the source — also a §12.9 violation.
+            if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
+                ok = fromArg && toArg &&
+                     fromArg->nullable == toArg->nullable &&
+                     typeArgIdentical(fromArg, toArg, freeNames);
+            } else {
+                ok = typeArgIdentical(fromArg, toArg, freeNames);
+            }
         }
 
         if (!ok) return false;
