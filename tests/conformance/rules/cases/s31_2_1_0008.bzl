@@ -7,7 +7,7 @@
 //!   compile error at the arm, checked at the generic declaration.
 //! cites: 31.2.1
 //! expect: reject
-//! diagnostic: exception-derived
+//! diagnostic: `Exception`-derived
 module Conf;
 
 public class Classifier
