@@ -14552,7 +14552,8 @@ private:
     sema::ConstructorSymbol* ctorForArgs(
         const sema::TypeSymbol* cls,
         const std::vector<ast::CallArgument>& args,
-        const sema::ConstructorSymbol* exclude = nullptr) {
+        const sema::ConstructorSymbol* exclude = nullptr,
+        bool chainCall = false) {
         if (!cls) return nullptr;
         // fix #3760 (§22.10 / §12.8 / §22.8, v0.287): a SINGLE explicit
         // constructor whose arity matches the chain call still has to
@@ -14771,8 +14772,27 @@ private:
             }
             return true;
         };
+        // fix #4924 (§22.3 / §22.6, v0.307): at a `this(...)` / `base(...)`
+        // chain call (`chainCall`) the call-site `ref`/`out` modifier is part
+        // of APPLICABILITY — a `ref` formal is filled only by a `ref`
+        // argument, an `out` formal only by an `out`-family one, any other
+        // formal only by an argument with neither. Without it, `this(n, 5)`
+        // beside `(ref y: int, x: int)` and `(y: long, x: int)` took the FIRST
+        // type-class match, the inapplicable `ref` overload (printed `R5,3`,
+        // not `V5,3`). The predicate is sema's own (`callSiteRefOutMatches`,
+        // the one #4905's chain-call check uses), so the pick is always a
+        // candidate that check admits: it accepts a chain only when some
+        // binding candidate, or the modifier-free primary list, matches.
+        // Every return of `searchOnce` goes through this per-slot check.
+        // Scoped to chain calls: the `new` sites have the same gap, but there
+        // the #4805 codegen diagnostic and the pending §9.3 ruling (#4775)
+        // decide what a primary-vs-`ref`-ctor record means (#4949).
         auto slotTypeMatches = [&](sema::ConstructorSymbol* cs, std::size_t pi,
                                    const ast::CallArgument& arg) -> bool {
+            if (chainCall &&
+                !sema::callSiteRefOutMatches(
+                    arg.modifier, sema::formalParamModifier(*cs, pi)))
+                return false;
             return argMatchesParamType(arg.value.get(), paramTypeAt(cs, pi));
         };
         auto ctorTypeMatches = [&](sema::ConstructorSymbol* cs) -> bool {
@@ -14875,6 +14895,19 @@ private:
         // or #2516's synthetic imported one), each bound slot type-checked
         // against `storageComponentType` (null → unknown → admitted).
         auto primaryStrictlyApplicable = [&]() -> bool {
+            // fix #4924 (§22.3, v0.307): a primary parameter is never
+            // `ref`/`out`, so under a chain call a `ref`/`out` argument makes
+            // the primary inapplicable — the modifier-free primary list
+            // #4905's sema check matches against. Checked over EVERY argument
+            // up front: both bind-primary exits (the #4852 short-circuit in
+            // `searchOnce` and the post-strict check below it) go through this
+            // lambda, and with a defaulted tail on the explicit sibling
+            // (`constructor(ref y: int, k: int := 7)` vs `class B(p: int)`) the
+            // `ref` argument is otherwise bound to slot `p` and type-matches.
+            if (chainCall)
+                for (const ast::CallArgument& a : args)
+                    if (!sema::callSiteRefOutMatches(a.modifier, ""))
+                        return false;
             const std::vector<const sema::Symbol*> pf =
                 sema::recordPositionalFieldSymbols(cls);
             const std::size_t n = pf.size();

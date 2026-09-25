@@ -1852,6 +1852,17 @@ std::string_view formalParamName(const ConstructorSymbol& cs, std::size_t pos);
 // Arity of the constructor's formal list, same dual sourcing.
 std::size_t formalParamCount(const ConstructorSymbol& cs);
 
+// fix #4924 (§22.3 / §22.6, v0.307): the §22.3 call-site `ref`/`out`
+// applicability rule for ONE argument/formal pair. A `ref` formal is filled
+// only by a `ref` argument, an `out`/`out owned` formal only by an
+// `out`-family argument (§22.4), and any other formal only by an argument
+// carrying no `ref`/`out`. Shared by sema's chain-call check
+// (`ExprTC::checkChainRefOutModifiers`, fix #4905) and codegen's
+// constructor selector (`ctorForArgs`), so the candidate codegen picks is one
+// sema's rule admits.
+bool callSiteRefOutMatches(std::string_view argModifier,
+                           std::string_view paramModifier);
+
 // narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307): the leading
 // `this(...)` chain call of constructor `cs` (declared by `cd` in type `t`)
 // when the resolver's arity-only self-chain check (#3793,

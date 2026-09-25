@@ -5208,7 +5208,8 @@ void Emitter::prePopulateBasePositionalFields(
             // the mispairing for exactly the shapes it is meant to exclude.
             const bool baseCallChainsThis =
                 chainCall && !isThis && !chainCall->args.empty() &&
-                ctorChainsViaThis(ctorForArgs(baseTs, chainCall->args));
+                ctorChainsViaThis(ctorForArgs(baseTs, chainCall->args,
+                                              nullptr, /*chainCall=*/true));
             if (baseCallChainsThis) chainedPrimaryOwnsSlots = true;
             if (chainCall && !isThis && !chainCall->args.empty() &&
                 !baseCallChainsThis) {

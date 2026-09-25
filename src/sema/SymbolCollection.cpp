@@ -670,6 +670,18 @@ std::string_view formalParamName(const ConstructorSymbol& cs,
     return {};
 }
 
+// fix #4924 (§22.3 / §22.4 / §22.6, v0.307): see Symbol.hpp.
+bool callSiteRefOutMatches(std::string_view argModifier,
+                           std::string_view paramModifier) {
+    const bool argRef = argModifier == "ref";
+    const bool argOut = argModifier == "out" || argModifier == "out var" ||
+                        argModifier == "out using var" ||
+                        argModifier == "out owned var";  // per §22.4
+    if (paramModifier == "ref") return argRef;
+    if (paramModifier == "out" || paramModifier == "out owned") return argOut;
+    return !argRef && !argOut;
+}
+
 std::size_t formalParamCount(const ConstructorSymbol& cs) {
     if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl))
         return d->params.size();

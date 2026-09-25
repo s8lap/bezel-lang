@@ -13150,7 +13150,8 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // decides — a named-arg chain call was the one shape where the actual
     // selector used here disagreed with that lookahead.
     sema::ConstructorSymbol* target =
-        ctorForArgs(targetCls, call->args, isThis ? cs : nullptr);
+        ctorForArgs(targetCls, call->args, isThis ? cs : nullptr,
+                    /*chainCall=*/true);  // fix #4924: §22.3 modifiers
     if (!target) {
         // Explicit `base(...)` with no matching base CONSTRUCTOR symbol. This is
         // the primary-ctor / no-explicit-ctor base case (e.g. `class ED: Base`

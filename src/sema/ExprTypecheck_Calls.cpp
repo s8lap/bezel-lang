@@ -14216,16 +14216,10 @@ void ExprTC::checkChainRefOutModifiers(const ast::ConstructorDecl& cd) {
     const std::string desc = "`" + spelling +
                              "` constructor chain call in `" +
                              std::string(currentType_->name) + "`";
-    auto isOut = [](std::string_view m) {
-        return m == "out" || m == "out var" || m == "out using var" ||
-               m == "out owned var";  // per §22.4
-    };
-    auto refOutMatch = [&](std::string_view argMod,
-                           std::string_view paramMod) -> bool {
-        const bool argRef = argMod == "ref", argOut = isOut(argMod);
-        if (paramMod == "ref") return argRef;
-        if (paramMod == "out" || paramMod == "out owned") return argOut;
-        return !argRef && !argOut;
+    // fix #4924: the one §22.3 predicate codegen's `ctorForArgs` also uses.
+    auto refOutMatch = [](std::string_view argMod,
+                          std::string_view paramMod) -> bool {
+        return sema::callSiteRefOutMatches(argMod, paramMod);
     };
     bool anyArgMod = false;
     for (const ast::CallArgument& a : chain->args)
