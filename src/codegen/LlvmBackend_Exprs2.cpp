@@ -900,6 +900,15 @@ llvm::GlobalVariable* Emitter::getFreedSlotGlobal() {
 
 llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     const std::vector<sema::Symbol*>* paramSyms = ctx_.lambdaParams(&lam);
+    // fix #4813 (§14.1 / §14.5, v0.307): snapshot the hint map BEFORE this
+    // lambda's own parameter hints are set below, so the restore on exit drops
+    // them. A hint is resolved through the ACTIVE specialization's
+    // substitution; taken after the loop, the snapshot kept it, and the next
+    // specialization of the same lambda AST found the stale hint (the
+    // find-then-insert below, or a path that sets none — an `int` binding):
+    // `Go<bool>(true)` then `Go<int>(5)` printed `<True>` twice, and a
+    // string/double hint on the int specialization failed the IR verifier.
+    auto savedLambdaParamHints = lambdaParamTypeHint_;  // restore after body
 
     // Build user-visible parameter type list.
     std::vector<llvm::Type*> userParamTys;
@@ -1273,7 +1282,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     std::vector<CaptureEntry> captures;
 
     // Save state (needed for capture slot access and restoration).
-    auto savedLambdaParamHints = lambdaParamTypeHint_;  // restore after body
+    // (The hint map is snapshotted at function entry — fix #4813.)
+    // fix #4813 (§14.1 / §14.5, v0.307): entries recorded past this mark
+    // are this lambda's hint-injected expression types; cleared on exit below.
+    const std::size_t hintInjectedMark = lambdaHintInjectedExprs_.size();
     // #731: this lambda's own retTy/params were just derived from
     // expectedFunctionType_. If the body is itself a lambda (a nested
     // higher-order lambda, `(x) => (y) => x` under a `(int)->(int)->int`
@@ -3728,6 +3740,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
+    // fix #4813 (§14.1 / §14.5, v0.307): a hint-injected type belongs to THIS
+    // specialization of the enclosing generic body (it was resolved through
+    // the active substitution). `ctx_` outlives the specialization, so leaving
+    // it made the next specialization of the same lambda read the previous
+    // one's type (`if (!exprType) inject` never refires): wrong-typed IR or a
+    // silently wrong value. Reset to "no sema type", the pre-injection state.
+    for (std::size_t i = hintInjectedMark;
+         i < lambdaHintInjectedExprs_.size(); ++i)
+        ctx_.setExprType(lambdaHintInjectedExprs_[i], nullptr);
+    lambdaHintInjectedExprs_.resize(hintInjectedMark);
     // fix #4261 (§28.3, v0.298): restore outer function's closure-release
     // eligibility (sync path; async path restores at its own site, lines 2677).
     closureReleaseEligible_ = std::move(savedClosureRelEligOuter);

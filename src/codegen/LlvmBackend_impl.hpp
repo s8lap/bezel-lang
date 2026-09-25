@@ -2926,6 +2926,25 @@ private:
     // node).  Used in identifier lookup to supply the missing sema type so that
     // string subscript, member access, etc. work on inferred-type params.
     std::unordered_map<const sema::Symbol*, sema::TypeRef*> lambdaParamTypeHint_;
+    // fix #4813 (§14.1 / §14.5, v0.307): every expression whose sema type
+    // was INJECTED from lambdaParamTypeHint_ (the three `if (!exprType) …
+    // setExprType(hint)` sites). The hint is resolved through the ACTIVE
+    // monomorphization, so the injected type is only valid for the current
+    // specialization; lowerLambda clears the entries it recorded on exit so
+    // the next specialization of the same lambda AST re-derives them instead
+    // of reading the first specialization's type (`Go<long>` then
+    // `Go<string>` over `Map(v, lambda(y) => $"<{y}>")` printed an address).
+    std::vector<const ast::Expr*> lambdaHintInjectedExprs_;
+    // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): the CALLEE's own method
+    // type-parameter bindings for the call whose `buildOrderedArgs` is running
+    // over `calleeFormalSubstParams_`. A collection-literal argument has no
+    // type of its own (§15.4: it is typed by the parameter), so it is built
+    // against the FORMAL `Array<T>` — and that `T` is the callee's, which the
+    // active (caller's) maps do not bind, or bind to the caller's same-named
+    // `T`. Set by lowerCallDispatch; read only when `params` is that callee's.
+    const std::vector<ast::Param>* calleeFormalSubstParams_ = nullptr;
+    std::unordered_map<std::string_view, const sema::TypeRef*>
+        calleeFormalSemaSubst_;
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
@@ -20353,8 +20372,21 @@ private:
     // `.` path installed this substitution, so an explicit-type-arg `?.`
     // generic call reached emitMethodCall with an empty genericSubst_ and
     // called the unspecialized i32-placeholder body (malformed IR).
-    void applyMethodGenericSubst(const ast::CallExpr& call,
-                                 sema::MethodSymbol* ms);
+    //
+    // fix #4813 (§14.1 / §14.5, v0.307): the callee's own type parameters are
+    // scoped to the callee, so any same-NAMED binding in the active maps (the
+    // CALLER's `T` inside `Go<T>` calling `Id<T>`) is dropped before the
+    // callee's are bound, and everything the CALL SITE supplies — explicit
+    // type arguments, argument types, the call's result type — is resolved in
+    // the caller's substitution first. `callerSubst` / `callerSema` name that
+    // substitution when the active maps have already been replaced by a
+    // receiver-class one (lowerCall); null means the active maps are it.
+    void applyMethodGenericSubst(
+        const ast::CallExpr& call, sema::MethodSymbol* ms,
+        const std::unordered_map<std::string_view, llvm::Type*>* callerSubst =
+            nullptr,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            callerSema = nullptr);
 
     // fix #4899 (§14.1 / §7 / §7.10, v0.307): once the callee's class- and
     // method-level substitution is installed (after applyMethodGenericSubst),

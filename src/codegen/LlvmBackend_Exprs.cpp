@@ -1232,8 +1232,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 ma->target.get())) {
                             sema::Symbol* sym = ctx_.exprSymbol(*tid);
                             auto hit = lambdaParamTypeHint_.find(sym);
-                            if (hit != lambdaParamTypeHint_.end())
+                            if (hit != lambdaParamTypeHint_.end()) {
                                 ctx_.setExprType(ma->target.get(), hit->second);
+                                lambdaHintInjectedExprs_.push_back(
+                                    ma->target.get());  // fix #4813
+                            }
                         }
                     }
                     auto* tt = ctx_.exprType(*ma->target);
@@ -2106,6 +2109,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     auto hit = lambdaParamTypeHint_.find(sym);
                     if (hit != lambdaParamTypeHint_.end()) {
                         ctx_.setExprType(ix->target.get(), hit->second);
+                        lambdaHintInjectedExprs_.push_back(
+                            ix->target.get());  // fix #4813
                         tt = hit->second;
                     }
                 }
@@ -6686,8 +6691,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (!ctx_.exprType(e)) {
             sema::Symbol* sym = ctx_.exprSymbol(e);
             auto hit = lambdaParamTypeHint_.find(sym);
-            if (hit != lambdaParamTypeHint_.end())
+            if (hit != lambdaParamTypeHint_.end()) {
                 ctx_.setExprType(&e, hit->second);
+                lambdaHintInjectedExprs_.push_back(&e);  // fix #4813
+            }
         }
         // CG9: `this` (and `base`, same instance) is the receiver ptr.
         if (id->name == "this" || id->name == "base") return currentThis_;

@@ -6043,6 +6043,51 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     return v;
 }
 
+// fix #4813 (§14.1 / §14.5 / §26.4, v0.307): the generic-parameter NAMES the
+// callee's own declaring type binds -- the class/record/interface parameters
+// for a member method, or the extension block's type variables (its `where`
+// parameters plus every bare null-declaration name in its target type, the
+// same scan sema's extension matcher performs) for an extension method.
+// Codegen's substitution maps are keyed by NAME, so when a method type
+// parameter SHADOWS one of these (`class Box<T> … method Pick<T>(x: T)`), one
+// map cannot bind both: erasing the name to bind the method's `T` loses the
+// class `T` that the body still reads (a `_v: T` field, a non-generic `Show()`
+// that reads it), which is silent wrong code. The erase sites below therefore
+// keep such a name and leave the shadowing shape at its pre-#4813 behaviour;
+// the owner-qualified identity it actually needs is tracked by #4862 / #4847.
+static std::unordered_set<std::string_view> calleeOwnerTypeParamNames(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    std::unordered_set<std::string_view> names;
+    if (!ms) return names;
+    if (ms->parent) {
+        for (std::string_view n : sema::genericParamNames(ms->parent))
+            if (!n.empty()) names.insert(n);
+    }
+    if (const ast::ExtensionDecl* ext = ms->extensionDecl) {
+        for (const auto& gc : ext->genericConstraints)
+            names.insert(gc.typeParam);
+        const sema::TypeRef* target =
+            ext->targetType ? ctx.resolvedType(*ext->targetType) : nullptr;
+        std::function<void(const sema::TypeRef*)> scan =
+            [&](const sema::TypeRef* tr) {
+            if (!tr) return;
+            if (tr->kind == sema::TypeRef::Kind::Named && !tr->declaration &&
+                tr->genericArgs.empty()) {
+                std::string_view vname;
+                if (tr->astNode && tr->astNode->name &&
+                    !tr->astNode->name->parts.empty())
+                    vname = tr->astNode->name->parts.back();
+                else if (!tr->importedName.empty())
+                    vname = tr->importedName;
+                if (!vname.empty()) names.insert(vname);
+            }
+            for (const sema::TypeRef* ga : tr->genericArgs) scan(ga);
+        };
+        scan(target);
+    }
+    return names;
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): capture the
@@ -11498,10 +11543,60 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // (the imported else-branch records no entries).
     const std::vector<ast::Param>* bareTParamUnwrapParams = nullptr;
     {
+        // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): a collection-literal
+        // argument is built at the callee's FORMAL type (see buildOrderedArgs),
+        // so give that arm the callee's own type-parameter bindings. They are
+        // exactly what applyMethodGenericSubst installs for the callee body
+        // below; it is run here on a scratch copy of the (caller's) maps and
+        // only the callee's own, non-owner names are kept. Saved and restored
+        // around this call so a nested call's arguments see their own callee.
+        const std::vector<ast::Param>* savedFormalParams =
+            calleeFormalSubstParams_;
+        auto savedFormalSema = std::move(calleeFormalSemaSubst_);
+        calleeFormalSubstParams_ = nullptr;
+        calleeFormalSemaSubst_.clear();
+        struct FormalSubstRestore {
+            Emitter& e;
+            const std::vector<ast::Param>* params;
+            std::unordered_map<std::string_view, const sema::TypeRef*>& sema;
+            ~FormalSubstRestore() {
+                e.calleeFormalSubstParams_ = params;
+                e.calleeFormalSemaSubst_ = std::move(sema);
+            }
+        } formalSubstRestore{*this, savedFormalParams, savedFormalSema};
+        // One read of the callee's declaration serves both pre-passes in this
+        // block (the literal-formal bindings here and the lambda pre-pass
+        // below); fix #4813 adds no new MemberSymbol::decl classification.
+        const auto* prePassMd = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (auto* md = prePassMd) {
+            bool hasLiteralArg = false;
+            for (const auto& a : call.args)
+                if (a.value && dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                   a.value.get())) {
+                    hasLiteralArg = true;
+                    break;
+                }
+            if (hasLiteralArg && !md->genericParams.empty()) {
+                auto scratchSubst = genericSubst_;
+                auto scratchSema = genericSubstSemaTy_;
+                applyMethodGenericSubst(call, ms);
+                const auto ownerNames = calleeOwnerTypeParamNames(ctx_, ms);
+                for (const auto& gp : md->genericParams) {
+                    if (ownerNames.count(gp.name)) continue;
+                    auto it = genericSubstSemaTy_.find(gp.name);
+                    if (it != genericSubstSemaTy_.end() && it->second)
+                        calleeFormalSemaSubst_[gp.name] = it->second;
+                }
+                genericSubst_ = std::move(scratchSubst);
+                genericSubstSemaTy_ = std::move(scratchSema);
+                if (!calleeFormalSemaSubst_.empty())
+                    calleeFormalSubstParams_ = &md->params;
+            }
+        }
         bool didPrePass = false;
         std::unordered_map<std::string_view, llvm::Type*> preSavedSubst;
         std::unordered_map<std::string_view, const sema::TypeRef*> preSavedSema;
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (auto* md = prePassMd) {
             if (!md->genericParams.empty()) {
                 // Check whether any argument is a lambda (function-type formal).
                 bool hasLambdaArg = false;
@@ -11518,6 +11613,23 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     std::unordered_map<std::string_view,
                                        const sema::TypeRef*> preSema =
                         genericSubstSemaTy_;
+                    // fix #4813 (§14.1 / §14.5, v0.307): the callee's type
+                    // parameters are its own — drop a same-NAMED caller
+                    // binding so the `count` guards below cannot mistake it
+                    // for the callee's (see applyMethodGenericSubst). The
+                    // bindings made here are resolved in the caller's
+                    // substitution, which is the active one at this point.
+                    // A name the callee's declaring type also binds is kept
+                    // (calleeOwnerTypeParamNames; #4862).
+                    {
+                        const auto ownerNames =
+                            calleeOwnerTypeParamNames(ctx_, ms);
+                        for (const auto& gp : md->genericParams) {
+                            if (ownerNames.count(gp.name)) continue;
+                            preSubst.erase(gp.name);
+                            preSema.erase(gp.name);
+                        }
+                    }
                     for (const auto& gp : md->genericParams) {
                         if (preSubst.count(gp.name)) continue;
                         for (std::size_t pi = 0;
@@ -11536,11 +11648,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 continue;
                             sema::TypeRef* at =
                                 ctx_.exprType(*call.args[pi].value);
+                            // fix #4813 (§14.5 phase 1, §27.4, v0.307): an
+                            // enclosing lambda's inferred parameter (`y` in
+                            // `Map(v, lambda(y) => Map(y, lambda(z) => …))`)
+                            // has no sema expression type until lowerExpr
+                            // injects its hint, which runs AFTER this
+                            // pre-pass. Read the hint directly; without it
+                            // the callee's own `W` (just erased above) stayed
+                            // unbound and the inner lambda's `z` was lowered
+                            // at the i32 placeholder (a string printed as an
+                            // address).
+                            if (!at) {
+                                if (auto* aid =
+                                        dynamic_cast<const ast::IdentifierExpr*>(
+                                            call.args[pi].value.get())) {
+                                    auto hit = lambdaParamTypeHint_.find(
+                                        ctx_.exprSymbol(*aid));
+                                    if (hit != lambdaParamTypeHint_.end())
+                                        at = hit->second;
+                                }
+                            }
                             if (!at) continue;
                             llvm::Type* lt = lowerTypeRef(at);
                             if (lt != i32()) {
                                 preSubst[gp.name] = lt;
-                                preSema[gp.name] = at;
+                                preSema[gp.name] = substituteTypeRefLocal(
+                                    at, genericSubstSemaTy_);
                             }
                             break;
                         }
@@ -11579,7 +11712,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             if (lt != i32()) {
                                 preSubst[pname] = lt;
-                                preSema[pname] = concreteArg;
+                                preSema[pname] = substituteTypeRefLocal(
+                                    concreteArg, genericSubstSemaTy_);
                             }
                         }
                     }
@@ -11651,6 +11785,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         std::unordered_map<std::string_view,
                                            const sema::TypeRef*>
                             preSema = genericSubstSemaTy_;
+                        // fix #4813: as in the lambda pre-pass above,
+                        // keeping a name the declaring type binds (#4862).
+                        {
+                            const auto ownerNames =
+                                calleeOwnerTypeParamNames(ctx_, ms);
+                            for (const auto& gp : md->genericParams) {
+                                if (ownerNames.count(gp.name)) continue;
+                                preSubst.erase(gp.name);
+                                preSema.erase(gp.name);
+                            }
+                        }
                         for (std::size_t gi = 0;
                              gi < md->genericParams.size() &&
                              gi < callTAs->size(); ++gi) {
@@ -11663,7 +11808,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (!concreteArg) continue;
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             preSubst[pname] = lt;
-                            preSema[pname] = concreteArg;
+                            preSema[pname] = substituteTypeRefLocal(
+                                concreteArg, genericSubstSemaTy_);
                         }
                         if (preSubst != genericSubst_) {
                             if (!didPrePass) {
@@ -12248,7 +12394,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the actual argument types, explicit call-site type args, or the call's
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
-    applyMethodGenericSubst(call, ms);
+    // fix #4813 (§14.1, v0.307): `savedSubst`/`savedSemaTy` are the CALLER's
+    // maps; the receiver-class block above may have replaced the active ones
+    // wholesale, and the call site's type arguments are written in the caller.
+    applyMethodGenericSubst(call, ms, &savedSubst, &savedSemaTy);
     // fix #4899 (§14.1 / §7 / §7.10, v0.307): with the class- and method-level
     // substitution now installed, a bare `v: T` formal at `T := int?` is known
     // to be a nullable value type — restore the {i8,T} carrier the argument
@@ -12922,14 +13071,67 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
 // trigger as lowerCall (`.`) — previously only `.` installed this, so an
 // explicit-type-arg `?.` generic call reached emitMethodCall with an empty
 // genericSubst_ and called the unspecialized i32-placeholder body.
-void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
-                                      sema::MethodSymbol* ms) {
+void Emitter::applyMethodGenericSubst(
+        const ast::CallExpr& call, sema::MethodSymbol* ms,
+        const std::unordered_map<std::string_view, llvm::Type*>* callerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            callerSema) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || md->genericParams.empty()) return;
     std::unordered_map<std::string_view, llvm::Type*> newSubst =
         genericSubst_;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
         genericSubstSemaTy_;
+    // fix #4813 (§14.1 / §14.5, v0.307): a method's type parameters are
+    // scoped to that method. `newSubst` starts as a copy of the active maps
+    // (it must keep, e.g., the receiver class's bindings the callee body
+    // reads), so a caller binding that merely shares a NAME with one of the
+    // callee's own parameters used to survive into the callee: every
+    // `if (newSubst.count(pname)) continue;` / `!subst.count(nm)` guard below
+    // then treated the callee's `T` as already bound, and the callee body was
+    // monomorphized at the CALLER's `T`. Measured: `Id<int>(4)` and `Id(5)`
+    // inside `Go<T>` at T = string built `Id$spec(i32): ptr` — IR verifier
+    // abort; renaming Id's parameter to `V` printed 9. Drop the callee's own
+    // names so each is bound only from what THIS call site supplies.
+    //
+    // EXCEPT a name the callee's own declaring type (or extension block) also
+    // binds: there the method `T` SHADOWS the class `T`, the map is keyed by
+    // name and cannot hold both, and the callee body may read the class `T`
+    // (a `_v: T` field, or a non-generic method that reads one). Erasing it
+    // turned `Box<string>.Pick<T>(x: T) => $"{x}+{_v}"` from `5+z` into
+    // `5+0` — silent wrong code — so such a name keeps its receiver-class
+    // binding, which is the pre-#4813 behaviour. The shadowing shape needs
+    // owner-qualified type-parameter identity (#4862; sema side #4847).
+    {
+        const auto ownerNames = calleeOwnerTypeParamNames(ctx_, ms);
+        for (const auto& gp : md->genericParams) {
+            if (ownerNames.count(gp.name)) continue;
+            newSubst.erase(gp.name);
+            newSema.erase(gp.name);
+        }
+    }
+    // Everything the call site supplies is written in the CALLER's scope, so
+    // it is resolved in the caller's substitution — an explicit `Id<T>(v)` /
+    // `Count<T>(xs)` inside `Go<T>` names the caller's `T`, and an argument
+    // or result type may mention it too. Resolving it to a concrete type
+    // before binding is what lets the callee's `T` be erased above without
+    // losing it: the old map reached the caller's `T` only by a chained NAME
+    // lookup, which the shadowing broke. Lowering runs with the caller's
+    // maps active, so the LLVM and sema sides of each binding agree.
+    std::unordered_map<std::string_view, llvm::Type*> cSubst =
+        callerSubst ? *callerSubst : genericSubst_;
+    std::unordered_map<std::string_view, const sema::TypeRef*> cSema =
+        callerSema ? *callerSema : genericSubstSemaTy_;
+    auto inCallerScope = [&](const sema::TypeRef* t) {
+        return substituteTypeRefLocal(t, cSema);
+    };
+    auto underCallerSubst = [&](auto&& fn) {
+        std::swap(genericSubst_, cSubst);
+        std::swap(genericSubstSemaTy_, cSema);
+        fn();
+        std::swap(genericSubst_, cSubst);
+        std::swap(genericSubstSemaTy_, cSema);
+    };
     // fix #1894 #1895 / §14.1: EXPLICIT call-site type arguments
     // (`Make<long, long>(...)`) are AUTHORITATIVE and must be bound FIRST,
     // before any argument-driven inference. An argument's own expression type
@@ -12970,8 +13172,11 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
             sema::TypeRef* concreteArg =
                 ctx_.resolvedType(*(*callTAs)[gi]);
             if (!concreteArg) continue;
-            newSubst[pname] = lowerTypeRef(concreteArg);
-            newSema[pname] = concreteArg;
+            // fix #4813: the written argument is resolved in the caller.
+            const sema::TypeRef* boundArg = inCallerScope(concreteArg);
+            underCallerSubst(
+                [&] { newSubst[pname] = lowerTypeRef(concreteArg); });
+            newSema[pname] = boundArg;
         }
     }
     }
@@ -13001,12 +13206,58 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
             ctx_.resolvedType(*md->params[pi].type);
         sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
         if (!declPt || !at) continue;
+        // fix #4813: the argument's type is a caller-side type.
+        const sema::TypeRef* atCaller = inCallerScope(at);
         bool added = false;
-        unifyMethodReturnTypeArg(declPt, at, md->genericParams,
-                                 newSubst, newSema, added);
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declPt, atCaller, md->genericParams,
+                                     newSubst, newSema, added);
+        });
     }
-    genericSubst_ = std::move(newSubst);
-    genericSubstSemaTy_ = std::move(newSema);
+    // fix #4813 (§14.1 / §15.4, v0.307): a sequence collection literal
+    // (`C([11, 22])` against `xs: Array<T>`) has no expression type of its
+    // own, so the loop above cannot bind `T` from it — the callee body was
+    // then specialized at the unbound i32 placeholder whatever the elements
+    // were. Bind a STILL-unbound parameter from the literal's elements when
+    // they all agree on one type; run after every typed argument so a typed
+    // argument keeps priority. A dictionary literal is left alone.
+    for (std::size_t pi = 0; pi < md->params.size() &&
+         pi < call.args.size(); ++pi) {
+        if (!md->params[pi].type || !call.args[pi].value) continue;
+        auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+            call.args[pi].value.get());
+        if (!cl || cl->isDict || cl->elements.empty()) continue;
+        if (ctx_.exprType(*cl)) continue;
+        const sema::TypeRef* declPt =
+            ctx_.resolvedType(*md->params[pi].type);
+        if (!declPt || declPt->kind != sema::TypeRef::Kind::Named ||
+            declPt->genericArgs.size() != 1 || !declPt->genericArgs[0])
+            continue;
+        const sema::TypeRef* elemCaller = nullptr;
+        bool agree = true;
+        for (const auto& el : cl->elements) {
+            sema::TypeRef* et = el ? ctx_.exprType(*el) : nullptr;
+            if (!et) { agree = false; break; }
+            const sema::TypeRef* etc = inCallerScope(et);
+            if (!elemCaller) { elemCaller = etc; continue; }
+            // Agreement is SEMA type identity (§14.5 *Agreement*: "the same
+            // type"), never the lowered LLVM type: `string` and a class `A`
+            // both lower to `ptr`, so `Show(["s", new A()])` bound `T` to
+            // `string` and the body read the `A` element as a string (ASan
+            // heap-buffer-overflow in `Util$Show$spec`).
+            if (!sema::typeRefEqual(etc, elemCaller)) {
+                agree = false;
+                break;
+            }
+        }
+        if (!agree || !elemCaller) continue;
+        bool added = false;
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declPt->genericArgs[0], elemCaller,
+                                     md->genericParams, newSubst, newSema,
+                                     added);
+        });
+    }
     // per §14.1/§14.2 + §26.5 (issue #391): a method type parameter
     // that appears *only* in the return type — `Create<T>(): T` — is
     // bound by no argument, so the loop above leaves it unset and
@@ -13018,28 +13269,30 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
     // parameter here by unifying the method's *declared* return type
     // against that concrete result type, then prime the substitution
     // before the body is emitted.
+    //
+    // fix #4813: the call's result type is a caller-side type too, so it is
+    // resolved in the caller and unified BEFORE the callee's substitution is
+    // installed (formerly after, with the result lowered under the callee's
+    // maps — where a caller `T` read the callee's same-named `T`).
     sema::TypeRef* resultTy = ctx_.exprType(call);
     sema::TypeRef* declRet = md->returnType
                                  ? ctx_.resolvedType(*md->returnType)
                                  : nullptr;
     if (resultTy && declRet) {
-        std::unordered_map<std::string_view, llvm::Type*> retSubst =
-            genericSubst_;
-        std::unordered_map<std::string_view, const sema::TypeRef*>
-            retSema = genericSubstSemaTy_;
+        const sema::TypeRef* resultCaller = inCallerScope(resultTy);
         bool added = false;
         // Unify the declared return TypeRef against the concrete result
         // TypeRef, binding any still-unbound method type parameter to
         // the matching concrete component. Handles a bare `T` return as
         // well as a constructed `Box<T>` whose nested parameter is
         // solved from the result's generic argument (§26.5).
-        unifyMethodReturnTypeArg(declRet, resultTy, md->genericParams,
-                                 retSubst, retSema, added);
-        if (added) {
-            genericSubst_ = std::move(retSubst);
-            genericSubstSemaTy_ = std::move(retSema);
-        }
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declRet, resultCaller, md->genericParams,
+                                     newSubst, newSema, added);
+        });
     }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
 }
 
 // fix #3143 (§14.1 / §2.5, v0.254): `genericParamNamesOf` used to live here as

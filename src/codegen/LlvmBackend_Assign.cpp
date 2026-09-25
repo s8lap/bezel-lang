@@ -13967,6 +13967,19 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // scope exit (on the normal AND unwind paths via disposeStack_).
             const sema::TypeRef* pt =
                 params[idx].type ? ctx_.resolvedType(*params[idx].type) : nullptr;
+            // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): the literal is built
+            // at the FORMAL's type, and a generic callee's own type parameter
+            // in it (`xs: Array<T>` of `C<T>`) belongs to the callee. The
+            // active maps are the caller's, so lowering it here read an unbound
+            // placeholder (i32 for any element type), or the caller's same-named
+            // `T`, while the callee body is specialized at its real `T`:
+            // `C<int>([11, 22])` inside `B<T>` at T = string built 8-byte
+            // elements the body read as 4-byte ones (ASan stack-buffer-overflow
+            // in bz_array_add; `11,0`). Resolve it through the callee's own
+            // bindings, computed from the same call by lowerCallDispatch.
+            if (pt && calleeFormalSubstParams_ == &params &&
+                !calleeFormalSemaSubst_.empty())
+                pt = substituteTypeRefLocal(pt, calleeFormalSemaSubst_);
             // fix #1382 / §15.4: an INLINE-ARRAY parameter `[N]T` receiving a
             // collection literal `[e1, …, eN]`. materializeCollectionLiteralForArg
             // only handles heap collections; for a value-type inline array it
