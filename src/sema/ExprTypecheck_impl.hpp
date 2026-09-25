@@ -3574,8 +3574,31 @@ private:
     // `(T) -> ()` (`(T) -> Task` on AsyncEventSource<T>). Checks the
     // already-visited handler `as.value` against that parameter's slot
     // shape given the payload type `payload`. Defined in ExprTypecheck.cpp.
+    // fix #4968: `payload` null is a no-payload event (handler `() -> ()`);
+    // `isAsync` selects the `Task` return slot, checked only when
+    // `asyncKnown`.
     void checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
-                                       TypeRef* payload);
+                                       TypeRef* payload, bool isAsync,
+                                       bool asyncKnown);
+
+    // fix #4968 (stdlib §6.5; spec §27.1.1/§27.6, v0.307): the handler check
+    // shared by the `+=`/`-=` forms and the direct Subscribe/Add/Remove calls
+    // on a plain event. `op` is the operator for the `+=`/`-=` forms and
+    // empty for a call; `callee` names the resolved method. Defined in
+    // ExprTypecheck.cpp.
+    void checkEventHandlerArgument(const ast::Expr* value, TypeRef* payload,
+                                   bool isAsync, bool asyncKnown,
+                                   std::string_view op,
+                                   std::string_view callee);
+
+    // fix #4968: if `callee` is `Subscribe`/`Add`/`Remove` on a plain event
+    // (an `event` member, EventSource<T>/AsyncEventSource<T>, or — for
+    // `Subscribe` only — IEvent<T>/IAsyncEvent<T>), fill the handler slot's
+    // payload (null for no payload), async-ness and whether that is known,
+    // and return true. The shared pair is excluded: codegen's #4901 gate
+    // owns it. Defined in ExprTypecheck_Calls.cpp.
+    bool plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
+                               bool& isAsync, bool& asyncKnown);
 
     // §13.1 member-visibility enforcement (issue #432). Checks that the
     // member `msym` accessed at `loc` is visible from the current type

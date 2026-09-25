@@ -17536,6 +17536,62 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     return nullptr;
 }
 
+// fix #4968 (stdlib §6.5, v0.307): is `callee` a subscribe-family position on
+// a PLAIN event — `Subscribe`/`Add`/`Remove` on an `event` member or on a value
+// of static type EventSource<T>/AsyncEventSource<T>, or `Subscribe` on the
+// IEvent<T>/IAsyncEvent<T> face (the only member stdlib §6.5 gives the face)?
+// Fills the handler slot: `payload` (null for a no-payload event, whose
+// handler is `() -> ()`), `isAsync` (handler returns `Task`) and `asyncKnown`
+// (false only for an imported `event`, whose declaration — and so its `async`
+// marker — ModuleLoader does not reconstruct; see eventHandlerPayloadType).
+// ISharedEvent<T>/SharedEventSource<T> are deliberately NOT matched: their
+// Subscribe/Add/Remove are admitted by codegen's #4901 gate
+// (sharedEventHandlerAdmissible), which already rejects every ill-typed
+// handler, and their capture-freedom by #4920 above.
+bool ExprTC::plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
+                                   bool& isAsync, bool& asyncKnown) {
+    payload = nullptr;
+    isAsync = false;
+    asyncKnown = false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const bool subscribe = ma->member == "Subscribe";
+    const bool addRemove = ma->member == "Add" || ma->member == "Remove";
+    if (!subscribe && !addRemove) return false;
+    if (auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target))) {
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
+            if (ed->type) {
+                payload = ctx_.resolvedType(*ed->type);
+                if (!payload) return false;  // unresolved: reported elsewhere
+            }
+            isAsync = ed->isAsync;
+            asyncKnown = true;
+            return true;
+        }
+        if (es->decl != nullptr) return false;
+        // Imported event (decl null): the payload survives on the wire; a
+        // Unit type is the exporter's encoding of an omitted `: T`.
+        TypeRef* rt = ctx_.importedMemberType(es);
+        if (!rt) return false;
+        if (rt->kind != TypeRef::Kind::Unit) payload = rt;
+        return true;
+    }
+    const TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        recvTy->declaration || !recvTy->astNode || !recvTy->astNode->name ||
+        recvTy->astNode->name->parts.empty() || recvTy->genericArgs.empty() ||
+        !recvTy->genericArgs[0])
+        return false;
+    std::string_view hn = recvTy->headName();
+    const bool source = hn == "EventSource" || hn == "AsyncEventSource";
+    const bool face = hn == "IEvent" || hn == "IAsyncEvent";
+    if (!(source || (face && subscribe))) return false;
+    payload = recvTy->genericArgs[0];
+    isAsync = hn == "AsyncEventSource" || hn == "IAsyncEvent";
+    asyncKnown = true;
+    return true;
+}
+
 // §21.9 / §17.13 / §2.11 (#949): is `e` an `<event>.Subscribe(...)` call whose
 // owned-`Subscription` result is being dropped/discarded? The Subscribe call
 // result is not typed by sema (codegen recognizes it structurally for disposal,

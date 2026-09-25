@@ -8359,6 +8359,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // parameter is typed as `T`, letting its body resolve `e.Field`.
         TypeRef* eventPayload = ce->callee
             ? eventHandlerPayloadType(ce->callee.get()) : nullptr;
+        // fix #4968 (stdlib §6.5; spec §27.1.1/§27.6, v0.307): a direct
+        // `Subscribe(h)` / `Add(h)` / `Remove(h)` on a plain event checks its
+        // handler against the declared `(T) -> ()` (`(T) -> Task` async) slot
+        // exactly as the `+=`/`-=` desugaring does — checked in the arg loop
+        // below, once the handler has been visited. Pre-fix nothing checked
+        // it: an arity-2, `owned`-formal or wrong-typed static handler
+        // compiled and read garbage / freed the payload / SEGV'd.
+        TypeRef* evSlotPayload = nullptr;
+        bool evSlotAsync = false;
+        bool evSlotAsyncKnown = false;
+        const bool evHandlerCall =
+            ce->callee && ce->args.size() == 1 &&
+            plainEventHandlerSlot(ce->callee.get(), evSlotPayload,
+                                  evSlotAsync, evSlotAsyncKnown);
         // per §22.12 rule 5 (v0.180, #1542): if callee is `<static event>
         // .Subscribe(...)` / `.Add(...)`, the handler argument (arg 0) must
         // be capture-free — the rule names `+=`/`Add`/`Subscribe`, not
@@ -9311,6 +9325,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "captures are borrows of the origin domain "
                             "(\xC2\xA7""22.12 rule 5, #1542)");
                     }
+                }
+                // fix #4968: the plain-event handler slot (see evHandlerCall).
+                if (pos2 == 0 && evHandlerCall && a.modifier.empty() &&
+                    a.name.empty()) {
+                    const auto* evMa =
+                        static_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get());
+                    checkEventHandlerArgument(a.value.get(), evSlotPayload,
+                                              evSlotAsync, evSlotAsyncKnown,
+                                              std::string_view(),
+                                              evMa->member);
                 }
                 currentLiteralWideningHint_ = savedArgHint;
                 pendingLambdaParamType_ = savedPending;

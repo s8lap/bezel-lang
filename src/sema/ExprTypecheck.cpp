@@ -16437,15 +16437,53 @@ void ExprTC::checkLoopJumpTarget(std::string_view label, bool isBreak,
 // literal's EXPLICIT parameter annotation wins over the seeded payload in the
 // lambda visitor, so `EventSource<int> += lambda(n: string) => …` compiled and
 // the handler read the `int` payload as a string pointer at runtime.
-//
-// The return slot is not examined here: it is the handler's own (the
-// expected type below copies it), so this check adds no return-slot rule.
 void ExprTC::checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
-                                           TypeRef* payload) {
-    if (!as.value || !payload) return;
-    TypeRef* h = ctx_.exprType(*as.value);
-    if (!h || h->kind != TypeRef::Kind::Function) return;
-    const char* callee = as.op == "-=" ? "Remove" : "Add";
+                                           TypeRef* payload, bool isAsync,
+                                           bool asyncKnown) {
+    if (!as.value) return;
+    checkEventHandlerArgument(as.value.get(), payload, isAsync, asyncKnown,
+                              as.op, as.op == "-=" ? "Remove" : "Add");
+}
+
+// fix #4968 (stdlib §6.5; spec §27.1, §27.1.1, §27.6, §17.2, v0.307): the one
+// handler check shared by the `+=`/`-=` desugaring (above) and the direct
+// `Subscribe(h)` / `Add(h)` / `Remove(h)` calls on a plain event — an `event`
+// member, a value of static type EventSource<T>/AsyncEventSource<T>, or the
+// IEvent<T>/IAsyncEvent<T> face. Stdlib §6.5 declares every one of those
+// parameters as `(T) -> ()` (`(T) -> Task` on the async pair). `payload` is
+// null only for the retired payload-less `event X;` form (§24; #1727), which
+// has no normative handler type: the codebase has always admitted both the
+// `(()) -> ()` shape stdlib §6.5 gives `EventSource<()>` and a zero-parameter
+// `() -> ()` handler there, and both run correctly (the unit payload carries
+// no bits), so both stay admitted and only other arities / parameter types
+// are rejected. Pre-fix only the `+=`
+// spelling reached any check, so a direct call admitted an arity-2 handler
+// (garbage second argument), an `owned` formal (heap-use-after-free on the
+// second subscriber), a wrong-typed overload (SEGV) or a lambda annotated with
+// the wrong parameter type — and codegen lowered the handler unconverted.
+//
+// `op` is the operator spelling for the `+=`/`-=` forms and empty for a
+// direct call; `callee` is the method the form resolves to.
+//
+// Beyond the ordinary argument check (checkAssignable, as before), a formed
+// method reference or function value is held to the shape codegen actually
+// lowers at an event position, which synthesizes NO formation adapter
+// (Emitter::lowerEventHandlerClosure passes the payload through unconverted):
+//   * each parameter slot must accept the payload under §27.1.1's
+//     function-VALUE rule (identity, or a class/interface reference
+//     conversion) — §27.6's adapter-bridged formation (`On(x: double)` on an
+//     `int` event) is rejected here, a deliberate spurious reject (#4978);
+//   * the return slot must be `()` on a synchronous event — §27.6 formation
+//     unifies return types under §5.1 and no conversion reaches `()` — and
+//     exactly `Task` on an asynchronous one (RaiseAsync awaits the returned
+//     value, so a `()`-returning handler was a SEGV).
+// A lambda literal is typed at the site (§27.3/§27.4), so only its arity,
+// its modifier slots and an explicit annotation are examined.
+void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
+                                       TypeRef* payload, bool isAsync,
+                                       bool asyncKnown, std::string_view op,
+                                       std::string_view callee) {
+    if (!value) return;
     auto spell = [](const TypeRef* t) -> std::string {
         if (!t) return "?";
         std::string s;
@@ -16483,40 +16521,71 @@ void ExprTC::checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
         if (t->nullable) s += "?";
         return s;
     };
-    const std::string payloadSp = spell(payload);
-    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(as.value.get())) {
-        // A lambda literal is typed at the site (§27.3/§27.4): its untyped
-        // parameters took the payload type from the seed, so only the ARITY,
-        // the modifier slots, and any EXPLICITLY annotated parameter can
-        // disagree with the `(T) -> …` position.
-        if (lam->params.size() != 1) {
-            ctx_.diagnostics().report(
-                Severity::Error, as.value->span.begin,
-                "event handler lambda has " +
-                std::to_string(lam->params.size()) + " parameters, but `" +
-                std::string(as.op) + "` on an event source is `" + callee +
-                "(handler)` whose handler type takes exactly one parameter "
-                "(the payload `" + payloadSp + "`) \xe2\x80\x94 a function "
-                "value is never usable at a function type with a different "
-                "number of parameter slots (\xc2\xa7""17.2, \xc2\xa7""27.1.1, "
-                "v0.307; stdlib \xc2\xa7""6.5)");
+    const bool isCall = op.empty();
+    // "`+=` on an event source is `Add(handler)`" (the pre-#4968 wording,
+    // kept byte-identical for the operator forms) or
+    // "`Subscribe` on an event source is `Subscribe(handler)`".
+    const std::string form =
+        "`" + std::string(isCall ? callee : op) + "` on an event source is `" +
+        std::string(callee) + "(handler)`";
+    const std::string what =
+        isCall ? "handler argument of `" + std::string(callee) +
+                     "` (stdlib \xc2\xa7""6.5, v0.307)"
+               : std::string("handler of `") + std::string(op) +
+                     "` (the argument of the desugared `" +
+                     std::string(callee) + "`, \xc2\xa7""17.2)";
+    const std::string payloadSp = payload ? spell(payload) : "()";
+    const std::string slotSp = payload ? "(" + payloadSp + ")" : "()";
+    const std::string retSp = isAsync ? "Task" : "()";
+    const std::size_t wantParams = payload ? 1 : 0;
+    // The retired payload-less form (see the header) also admits one
+    // parameter of type `()`.
+    const bool unitLegacy = !payload;
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(value)) {
+        if (lam->params.size() != wantParams &&
+            !(unitLegacy && lam->params.size() == 1)) {
+            if (payload) {
+                ctx_.diagnostics().report(
+                    Severity::Error, value->span.begin,
+                    "event handler lambda has " +
+                    std::to_string(lam->params.size()) + " parameters, but " +
+                    form + " whose handler type takes exactly one parameter "
+                    "(the payload `" + payloadSp + "`) \xe2\x80\x94 a function "
+                    "value is never usable at a function type with a different "
+                    "number of parameter slots (\xc2\xa7""17.2, \xc2\xa7""27.1.1, "
+                    "v0.307; stdlib \xc2\xa7""6.5)");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, value->span.begin,
+                    "event handler lambda has " +
+                    std::to_string(lam->params.size()) + " parameters, but " +
+                    form + " on an event with no payload, whose handler type "
+                    "`() -> " + retSp + "` takes none (or the one unit payload "
+                    "`()`) \xe2\x80\x94 a function "
+                    "value is never usable at a function type with a different "
+                    "number of parameter slots (\xc2\xa7""27.1.1, v0.307; "
+                    "stdlib \xc2\xa7""6.5, fix #4968)");
+            }
             return;
         }
+        if (lam->params.empty()) return;
         const auto& p = lam->params[0];
         if (!p.modifier.empty()) {
             ctx_.diagnostics().report(
-                Severity::Error, as.value->span.begin,
+                Severity::Error, value->span.begin,
                 "event handler lambda parameter `" + std::string(p.name) +
                 "` carries the `" + std::string(p.modifier) + "` modifier, "
-                "but the `" + callee + "` handler slot `(" + payloadSp +
-                ") -> \xe2\x80\xa6` has none \xe2\x80\x94 modifier slots are "
-                "part of a function signature's identity (\xc2\xa7""27.1, "
-                "\xc2\xa7""27.1.1, \xc2\xa7""17.2, v0.307)");
+                "but the `" + std::string(callee) + "` handler slot `(" +
+                payloadSp + ") -> \xe2\x80\xa6` has none \xe2\x80\x94 modifier "
+                "slots are part of a function signature's identity "
+                "(\xc2\xa7""27.1, \xc2\xa7""27.1.1, \xc2\xa7""17.2, v0.307)");
             return;
         }
         if (!p.type || p.destructure) return;  // seeded, or §27.4 head check
+        TypeRef* h = ctx_.exprType(*value);
         TypeRef* annotated =
-            !h->funcParams.empty() ? h->funcParams[0].type : nullptr;
+            (h && h->kind == TypeRef::Kind::Function && !h->funcParams.empty())
+                ? h->funcParams[0].type : nullptr;
         if (!annotated) annotated = ctx_.resolvedType(*p.type);
         if (!annotated) return;
         // §27.1.1: "everything else requires an exact match" — the one
@@ -16528,36 +16597,92 @@ void ExprTC::checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
         // unconverted — so e.g. an `int?`- or `double`-annotated handler on
         // an EventSource<int> would read the raw `int` bits (measured:
         // garbage / 0). Value-typed and primitive slots are invariant.
-        if (functionSlotConvertible(payload, annotated, isSubtype))
+        // The retired payload-less form's one slot is the unit payload.
+        if (unitLegacy ? annotated->kind == TypeRef::Kind::Unit
+                       : functionSlotConvertible(payload, annotated, isSubtype))
             return;
         ctx_.diagnostics().report(
-            Severity::Error, as.value->span.begin,
+            Severity::Error, value->span.begin,
             "event handler lambda parameter `" + std::string(p.name) +
             "` is annotated `" + spell(annotated) + "`, which does not "
-            "accept the event payload type `" + payloadSp + "` \xe2\x80\x94 `" +
-            std::string(as.op) + "` on an event source is `" + callee +
-            "(handler)` with handler type `(" + payloadSp + ") -> \xe2\x80\xa6` "
+            "accept the event payload type `" + payloadSp + "` \xe2\x80\x94 " +
+            form + " with handler type `(" + payloadSp + ") -> \xe2\x80\xa6` "
             "(\xc2\xa7""17.2, \xc2\xa7""27.1.1, \xc2\xa7""5.1, v0.307; stdlib "
             "\xc2\xa7""6.5); drop the annotation to take the payload type "
             "(\xc2\xa7""27.4)");
         return;
     }
+    TypeRef* h = ctx_.exprType(*value);
+    if (!h || h->kind != TypeRef::Kind::Function) return;
     // A function value or a method reference: the ordinary argument check
     // against `(T) -> R`, where R is the handler's own return slot (§27.1.1
     // for a value; §27.6 formation for a method reference — checkAssignable
-    // distinguishes them from `as.value`).
+    // distinguishes them from `value`). The return slot is judged separately
+    // below, so it is copied here and this call adds no return-slot rule.
+    const std::size_t errorsBefore = ctx_.diagnostics().errorCount();
     TypeRef* expected = ctx_.makeTypeRef();
     expected->kind = TypeRef::Kind::Function;
-    TypeRef::FuncParam fp;
-    fp.type = payload;
-    expected->funcParams.push_back(fp);
+    if (payload) {
+        TypeRef::FuncParam fp;
+        fp.type = payload;
+        expected->funcParams.push_back(fp);
+    } else if (h->funcParams.size() == 1) {
+        // The retired payload-less form's `(()) -> ()` shape (header).
+        TypeRef* unit = ctx_.makeTypeRef();
+        unit->kind = TypeRef::Kind::Unit;
+        TypeRef::FuncParam fp;
+        fp.type = unit;
+        expected->funcParams.push_back(fp);
+    }
     expected->funcReturn = h->funcReturn;
     expected->funcReturnOwned = h->funcReturnOwned;
-    checkAssignable(h, expected, as.value->span.begin,
-                    std::string("handler of `") + std::string(as.op) +
-                    "` (the argument of the desugared `" + callee + "`, "
-                    "\xc2\xa7""17.2)",
-                    as.value.get());
+    checkAssignable(h, expected, value->span.begin, what, value);
+    if (ctx_.diagnostics().errorCount() != errorsBefore) return;
+    // fix #4968: the parameter slot under the function-VALUE rule (see the
+    // header) — checkAssignable admitted every §5.1 conversion for a formed
+    // method reference, which no event-position adapter performs.
+    if (payload && h->funcParams.size() == 1 &&
+        !functionSlotConvertible(payload, h->funcParams[0].type, isSubtype)) {
+        ctx_.diagnostics().report(
+            Severity::Error, value->span.begin,
+            std::string("the ") + what + " takes `" +
+            spell(h->funcParams[0].type) + "`, which accepts the event "
+            "payload `" + payloadSp + "` only through a representation-"
+            "changing conversion; an event handler position forms no "
+            "adapter, so its parameter must be the payload type itself or, "
+            "for a class or interface payload, a base of it (\xc2\xa7""27.1.1, "
+            "\xc2\xa7""27.6, v0.307; stdlib \xc2\xa7""6.5, fix #4968)");
+        return;
+    }
+    // fix #4968: the return slot. Unknown async-ness (an imported `event`
+    // whose declaration is not reconstructed) skips only this half.
+    if (!asyncKnown) return;
+    const TypeRef* ret = h->funcReturn;
+    const bool retIsUnit = !ret || ret->kind == TypeRef::Kind::Unit;
+    const bool retIsTask = ret && ret->kind == TypeRef::Kind::Named &&
+                           !ret->nullable && !h->funcReturnOwned &&
+                           ret->genericArgs.empty() &&
+                           ret->headName() == "Task";
+    if (isAsync ? retIsTask : retIsUnit) return;
+    // The synchronous `()` rule is applied to a formed method reference
+    // (`H.On`) only. A function-typed local may carry a lambda whose
+    // untargeted return was inferred non-unit (a `do … end` body assigning a
+    // field reads as `int`, measured on the #841 bound-local fixtures), and a
+    // discarded synchronous return is harmless at runtime, so rejecting there
+    // would be a spurious reject with no soundness gain. The async `Task`
+    // rule stays universal: RaiseAsync awaits what the handler returns.
+    if (!isAsync && !dynamic_cast<const ast::MemberAccessExpr*>(value))
+        return;
+    ctx_.diagnostics().report(
+        Severity::Error, value->span.begin,
+        std::string("the ") + what + " returns `" +
+        (retIsUnit ? std::string("()") : spell(ret)) + "`, but " + form +
+        " with handler type `" + slotSp + " -> " + retSp + "`" +
+        (isAsync ? " \xe2\x80\x94 RaiseAsync awaits the task each handler "
+                   "returns"
+                 : " \xe2\x80\x94 no conversion reaches the `()` return slot") +
+        " (\xc2\xa7""27.1, \xc2\xa7""27.6, v0.307; stdlib \xc2\xa7""6.5, fix "
+        "#4968)");
 }
 
 void ExprTC::visitStmt(const ast::Stmt& s) {
@@ -18201,6 +18326,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // handler lambda's param as the event payload `T` (these forms desugar
         // to Add/Remove; they are not real compound assignments).
         TypeRef* eventPayload = nullptr;
+        // fix #4968 (stdlib §6.5, v0.307): the handler slot's remaining
+        // shape — a no-payload `event` (handler `() -> ()`, eventPayload
+        // stays null) and whether the source is asynchronous (handler
+        // returns `Task`). `eventHandlerSite` is set wherever eventPayload
+        // could be, so a no-payload event is still checked.
+        bool eventHandlerSite = false;
+        bool eventHandlerAsync = false;
         // per §22.12 rule 5 (v0.180, #1542): `+=` on a `static event` requires
         // a capture-free handler. Remember whether the target is a static
         // event here (target's symbol is available now); the actual
@@ -18227,6 +18359,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 checkEventVisibilityFence(es, as->op, as->span.begin);
                 if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
                     if (ed->type) eventPayload = ctx_.resolvedType(*ed->type);
+                    // fix #4968: a declared event, payload or not.
+                    eventHandlerSite = !ed->type || eventPayload;
+                    eventHandlerAsync = ed->isAsync;
                     // per §22.12 rule 5 (v0.180, #1542): staticness lives on
                     // ast::EventDecl::isStatic directly — unlike
                     // Field/Property/MethodDecl, EventDecl has no generic
@@ -18262,6 +18397,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if (hn == "EventSource" || hn == "AsyncEventSource" ||
                         hn == "SharedEventSource") {
                         eventPayload = tgtTy->genericArgs[0];
+                        eventHandlerSite = true;
+                        eventHandlerAsync = hn == "AsyncEventSource";
                         // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
                         // (v0.307): the SharedEventSource<T> half of the
                         // capture-free register — the += desugars to
@@ -18353,8 +18490,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 narrowings_[narrowedTargetSym] = narrowedTargetTy;
             visitExpr(*as->value);
             if (narrowedTargetSym) narrowings_.erase(narrowedTargetSym);
-            if (eventPayload)
-                checkEventSubscriptionHandler(*as, eventPayload);
+            if (eventHandlerSite)
+                checkEventSubscriptionHandler(*as, eventPayload,
+                                              eventHandlerAsync,
+                                              /*asyncKnown=*/true);
             // per §22.12 rule 5 (v0.180, #1542): a handler subscribed to a
             // `static event` — the rule names `+=`/`Add`/`Subscribe`, not
             // `-=`/`Remove` — must be capture-free: a non-capturing lambda or
