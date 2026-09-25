@@ -1095,7 +1095,14 @@ say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamacces
 # phase instead of quietly joining them.
 say "gate-selftest phase: scripts/gate/tests (#3415)"
 _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
-_gs_floor=560
+# Bumped 560 -> 824 (r21-jobserver, non-author review follow-up): the floor
+# had sat at its introduction value for months while the directory grew to
+# 809 tests unbanked, then +15 for three new jobserver test modules/cases
+# added alongside this comment. Same discipline as the rule-corpus floor
+# below ("the floor is the harness's current test count, so headroom cannot
+# accumulate unbanked. It only ever moves up") — measured via
+# `python3 -m unittest discover -s scripts/gate/tests`, not guessed.
+_gs_floor=824
 _gs_skip_cap=4
 # fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
 #
