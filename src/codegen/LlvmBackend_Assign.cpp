@@ -8183,27 +8183,61 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
 }
 
 
-// per §24: inside the declaring class, `event += handler` and
-// `event -= handler` are a fixed, language-defined desugaring to
-// `event.Add(handler)` and `event.Remove(handler)`. They are NOT the
-// compound-assignment statements of §17 (they neither read nor assign the
-// event), and `event` here has static type EventSource<T>, available only
-// inside the declaring class. Returns true when handled.
+// per §24 / §6.5: `event += handler` and `event -= handler` are a fixed,
+// language-defined desugaring to `event.Add(handler)` and
+// `event.Remove(handler)`. They are NOT the compound-assignment statements of
+// §17 (they neither read nor assign the event). The form is available wherever
+// the source is in scope, i.e. to the declaring class for an owned field, and
+// for either of two shapes the codegen must recognize:
+//
+//   1. The legacy member-kind form (`public event Clicked: Ev;` — retired in
+//      v1) — `eventSymbolOf(*as.target)` returns a non-null `EventSymbol`. The
+//      source pointer comes from `eventSourcePtr` (which loads the EventSymbol
+//      backing source via the field slot / itable accessor / static global).
+//   2. The v1 §6.5 pattern (an `owned [readonly] EventSource<T>` /
+//      `AsyncEventSource<T>` / `SharedEventSource<T>` field, with or without a
+//      separate `IEvent<T>` property face) — the target expression carries a
+//      regular VariableSymbol/MemberSymbol with static type one of the three
+//      event-source classes. There is no EventSymbol; the runtime rep IS the
+//      field's loaded value (a bz_event_source_t*, the same `lowerExpr`
+//      produces for any other field/parameter of the same type).
+//
+// Returns true when handled.
 bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
     if (as.op != "+=" && as.op != "-=") return false;
-    const sema::EventSymbol* es = eventSymbolOf(*as.target);
-    if (!es) return false;
-    llvm::Value* src = eventSourcePtr(*as.target);
-    if (!src) return false;
+    const sema::TypeRef* payloadTy = nullptr;
+    llvm::Value* src = nullptr;
+    if (const sema::EventSymbol* es = eventSymbolOf(*as.target)) {
+        // Legacy member-kind event (§24, retired in v1).
+        src = eventSourcePtr(*as.target);
+        if (!src) return false;
+        payloadTy = eventPayloadType(es);
+    } else {
+        // v1 §6.5 pattern: target's STATIC type identifies the field as an
+        // event source. The runtime value is the loaded field — load via
+        // lowerExpr exactly as any other field/parameter of the type would
+        // be read; the runtime rep (bz_event_source_t*) is the same one
+        // `eventSourcePtr` would produce for the legacy form, and the same
+        // one `dispatchEventMethods` consumes for a method-call spelling
+        // (`_e.Add(h)`). genericArgs[0] carries the payload type, matching
+        // the sema branch at #4792 (the parameter-inference fix whose
+        // payload source this codegen reads from — ExprTypecheck.cpp).
+        const sema::TypeRef* tgtTy = ctx_.exprType(*as.target);
+        if (!isEventSourceTypeName(tgtTy) && !isSharedEventSourceTypeName(tgtTy))
+            return false;
+        if (tgtTy && !tgtTy->genericArgs.empty()) payloadTy = tgtTy->genericArgs[0];
+        src = lowerExpr(*as.target);
+        if (!src) return true;  // error path; avoid bad fallthrough
+    }
     // Lower the handler to a closure, hinting the expected (payload)->() type
     // so an untyped lambda param resolves the payload type.
     const sema::TypeRef* saved = expectedFunctionType_;
     sema::TypeRef handlerTy;
     handlerTy.kind = sema::TypeRef::Kind::Function;
-    if (const sema::TypeRef* pt = eventPayloadType(es)) {
+    if (payloadTy) {
         sema::TypeRef::FuncParam p;
-        p.type = const_cast<sema::TypeRef*>(pt);
+        p.type = const_cast<sema::TypeRef*>(payloadTy);
         handlerTy.funcParams.push_back(p);
     }
     expectedFunctionType_ = &handlerTy;
