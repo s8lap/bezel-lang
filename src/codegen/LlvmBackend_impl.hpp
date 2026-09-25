@@ -9415,6 +9415,24 @@ private:
     // nullptr for imported (no body available — conservatively leak).
     const ast::Member* currentCallee_ = nullptr;
 
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): the {i8,T} nullable-value
+    // carriers buildOrderedArgs's §7.4 narrowed-read unwrap
+    // (unwrapNarrowedNullable) stripped for a formal that is a BARE type
+    // parameter (`v: T`). At argument-lowering time the callee's substitution
+    // is not yet installed, so that formal lowers to the i32 placeholder and a
+    // `x: int?` argument's tag was dropped even when `T := int?` — the callee
+    // then saw a present 0 for a null. Each entry is (parameter index, the
+    // unwrapped value placed in the argument list, the original carrier).
+    // Consumed by restoreBareTParamNullableCarriers once the substitution is
+    // known; saved/restored around each such call so a nested call inside an
+    // argument cannot clobber the outer call's entries.
+    struct BareTParamNarrowUnwrap {
+        std::size_t paramIdx;
+        llvm::Value* unwrapped;
+        llvm::Value* carrier;
+    };
+    std::vector<BareTParamNarrowUnwrap> bareTParamNarrowUnwraps_;
+
     // fix #2952: is the callee's parameter at `paramIdx` provably NON-ESCAPING
     // the callee body? Returns true only when the walker proves the parameter
     // is never assigned to a static/instance field, passed to another call,
@@ -20206,6 +20224,20 @@ private:
     // called the unspecialized i32-placeholder body (malformed IR).
     void applyMethodGenericSubst(const ast::CallExpr& call,
                                  sema::MethodSymbol* ms);
+
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): once the callee's class- and
+    // method-level substitution is installed (after applyMethodGenericSubst),
+    // put back the tagged {i8,T} carrier for every argument whose bare-`T`
+    // formal resolves to a nullable value type and whose tag buildOrderedArgs
+    // stripped (`entries`, taken from bareTParamNarrowUnwraps_). `args` is index-aligned
+    // with `params` after a leading receiver offset (args.size() -
+    // params.size()). A no-op for every argument not recorded, for a formal
+    // that resolves to a non-nullable type (the narrowed unwrap was right), and
+    // for an argument a later step already replaced.
+    void restoreBareTParamNullableCarriers(
+        const std::vector<ast::Param>& params,
+        const std::vector<BareTParamNarrowUnwrap>& entries,
+        std::vector<llvm::Value*>& args);
 
     // per §24: events. `eventSourcePtr` lowers an event-access expression
     // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /

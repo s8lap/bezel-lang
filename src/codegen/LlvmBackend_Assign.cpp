@@ -14183,7 +14183,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 // the parameter's bare value here — mirroring the unwrap local-init
                 // / return / assignment already apply. A no-op when `v` is not that
                 // struct (reference args and already-scalar values pass through).
+                llvm::Value* carrier = v;
                 v = unwrapNarrowedNullable(v, lowerTypeRef(formalTy));
+                // fix #4899 (§14.1 / §7 / §7.10, v0.307): a BARE type-parameter
+                // formal (`v: T`) lowers here to the i32 placeholder, because the
+                // callee's substitution is not installed until after argument
+                // lowering — so this unwrap also fires when `T := int?`, where
+                // the carrier's tag is the value. Record it so the call site can
+                // restore the carrier once `T` is known
+                // (restoreBareTParamNullableCarriers).
+                if (v != carrier && isBareTypeParamRef(formalTy))
+                    bareTParamNarrowUnwraps_.push_back({idx, v, carrier});
             }
             // §8.6: a value-typed argument bound to an Object/interface
             // parameter is boxed, so a later `is`/`as` or virtual dispatch on

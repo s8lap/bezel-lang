@@ -11142,6 +11142,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // (emitFunctionBody for the unspecialized generic would then use T=ptr for
     // its closure call type, producing a i32(ptr,ptr) fnTy with an i32 arg →
     // IR verification failure).
+    //
+    // fix #4899: entries buildOrderedArgs records for THIS call start here; a
+    // nested call inside an argument truncates back to its own base.
+    const std::size_t bareTParamUnwrapBase = bareTParamNarrowUnwraps_.size();
+    // fix #4899: the formals buildOrderedArgs bound against — captured in the
+    // local-MethodDecl arm below so the restore need not re-read ms->decl
+    // (the imported else-branch records no entries).
+    const std::vector<ast::Param>* bareTParamUnwrapParams = nullptr;
     {
         bool didPrePass = false;
         std::unordered_map<std::string_view, llvm::Type*> preSavedSubst;
@@ -11336,6 +11344,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // walk `md`'s body. Cleared on every exit below (success, early
             // bail-out, post-CreateCall release emission).
             currentCallee_ = md;
+            bareTParamUnwrapParams = &md->params;
             if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                                   /*nullTransferredOwned=*/true,
                                   &accessorRefArgs)) {
@@ -11893,6 +11902,21 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
     applyMethodGenericSubst(call, ms);
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): with the class- and method-level
+    // substitution now installed, a bare `v: T` formal at `T := int?` is known
+    // to be a nullable value type — restore the {i8,T} carrier the argument
+    // binding stripped before `T` was known.
+    if (bareTParamUnwrapParams &&
+        bareTParamNarrowUnwraps_.size() > bareTParamUnwrapBase) {
+        std::vector<BareTParamNarrowUnwrap> mine(
+            bareTParamNarrowUnwraps_.begin() +
+                static_cast<std::ptrdiff_t>(bareTParamUnwrapBase),
+            bareTParamNarrowUnwraps_.end());
+        bareTParamNarrowUnwraps_.resize(bareTParamUnwrapBase);
+        restoreBareTParamNullableCarriers(*bareTParamUnwrapParams, mine, args);
+    }
+    if (bareTParamNarrowUnwraps_.size() > bareTParamUnwrapBase)
+        bareTParamNarrowUnwraps_.resize(bareTParamUnwrapBase);
     // fix #2901 (§8.6 / §14.1, v0.240): §8.6 states, verbatim: "When a value
     // type is used where `Object` (or an interface implemented by the value
     // type) is expected, the value is **boxed**: a heap-allocated wrapper holds
@@ -12674,6 +12698,27 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
 // fix #3143 (§14.1 / §2.5, v0.254): `genericParamNamesOf` used to live here as
 // a file-static. It is now `sema::genericParamNames` (sema/GenericParams.hpp) —
 // the ONE both-sources walk the whole family calls, sema included.
+
+void Emitter::restoreBareTParamNullableCarriers(
+        const std::vector<ast::Param>& params,
+        const std::vector<BareTParamNarrowUnwrap>& entries,
+        std::vector<llvm::Value*>& args) {
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): see the declaration comment.
+    if (genericSubstSemaTy_.empty() || args.size() < params.size()) return;
+    const std::size_t off = args.size() - params.size();
+    for (const auto& u : entries) {
+        if (u.paramIdx >= params.size() || !params[u.paramIdx].type) continue;
+        const std::size_t ai = u.paramIdx + off;
+        if (args[ai] != u.unwrapped) continue;  // later step replaced it
+        const sema::TypeRef* formal =
+            ctx_.resolvedType(*params[u.paramIdx].type);
+        const sema::TypeRef* resolved = resolveTypeParamRef(formal);
+        if (!resolved || resolved == formal || !isNullableValueTy(resolved))
+            continue;  // T bound non-nullable: the §7.4 unwrap was right
+        if (u.carrier->getType() != nullableValueStructTy(resolved)) continue;
+        args[ai] = u.carrier;
+    }
+}
 
 // §14.1 / §2.5 (fix #711): is `arg` a BARE generic-parameter reference (as
 // opposed to a concrete or constructed type)? Locally that is a single-part
