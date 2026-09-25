@@ -22,10 +22,12 @@
 // Cited: Bezel_Language_Spec.md §7.9 (v0.299, default initialization),
 // §17.11 (defaultable).
 
+#include "support/aot_support.hpp"
 #include "support/da_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckDA;
+using bezel::test::runAot;
 
 namespace {
 
@@ -163,4 +165,189 @@ BEZEL_TEST(sema_da,
     auto r = parseAndCheckDA(wrap(
         "var a: [3]int; _ := a[0];"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// =====================================================================
+// RUN-AOT PIN — the DA-acceptance rows above prove the §7.9 admit, but
+// DA marking alone does not prove codegen actually zero-initialises the
+// local slot. These rows compile, RUN, and assert the §17.11 default
+// observable in stdout. A defect that turns the read of unassigned local
+// from a compile error into silent garbage or a UAF would show up here.
+//
+// Every row asserts exact stdout AND `r.ran == true` AND `r.exitCode == 0`.
+// If codegen leaves a slot uninitialised, the printed value diverges from
+// the §17.11 default and the row fails — pinning the bug the DA-only
+// tests could not.
+// =====================================================================
+
+// RT1 — `int n;` then `Console.WriteLine(n);` must print "0".
+BEZEL_TEST(sema_da,
+           rundaot_int_local_no_init_reads_zero_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var n: int; "
+        "  Console.WriteLine(n); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+}
+
+// RT2 — `double d;` then `Console.WriteLine(d);` must print "0".
+BEZEL_TEST(sema_da,
+           rundaot_double_local_no_init_reads_zero_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var d: double; "
+        "  Console.WriteLine(d); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+}
+
+// RT3 — `bool b;` then `Console.WriteLine(b);` must print "False".
+BEZEL_TEST(sema_da,
+           rundaot_bool_local_no_init_reads_false_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var b: bool; "
+        "  Console.WriteLine(b); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+}
+
+// RT4 — `string? s;` then null check must print "null".
+BEZEL_TEST(sema_da,
+           rundaot_nullable_string_local_no_init_is_null_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var s: string?; "
+        "  if s = null then Console.WriteLine(\"null\"); "
+        "  else Console.WriteLine(\"notnull\"); "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("null\n"));
+}
+
+// RT5 — `SomeClass? o;` (a user class) — same null check must print
+// "null". A user class with `?` is a nullable reference; its §17.11
+// default is null.
+BEZEL_TEST(sema_da,
+           rundaot_nullable_class_local_no_init_is_null_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class SomeClass "
+        "  public X: int; "
+        "  public constructor() X := 0; end constructor; "
+        "end SomeClass; "
+        "class C public static method Main(): int "
+        "  var o: SomeClass?; "
+        "  if o = null then Console.WriteLine(\"null\"); "
+        "  else Console.WriteLine(\"notnull\"); "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("null\n"));
+}
+
+// RT6 — a defaultable record/struct value local — its fields read as
+// their own §17.11 defaults: `I: int` → 0, `S: string?` → null.
+BEZEL_TEST(sema_da,
+           rundaot_defaultable_record_local_fields_zero_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "public record R(I: int, S: string?); "
+        "class C public static method Main(): int "
+        "  var r: R; "
+        "  Console.WriteLine(r.I); "
+        "  if r.S = null then Console.WriteLine(\"null\"); "
+        "  else Console.WriteLine(\"notnull\"); "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\nnull\n"));
+}
+
+// RT7 — `[3]int a;` then `$"{a[0]},{a[1]},{a[2]}"` must print "0,0,0".
+// Inline-array of all-defaultable elements (§17.11 narrows the previous
+// over-permissive carve-out to defaultability of the element type).
+BEZEL_TEST(sema_da,
+           rundaot_inline_array_int_local_zero_each_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var a: [3]int; "
+        "  Console.WriteLine($\"{a[0]},{a[1]},{a[2]}\"); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0,0,0\n"));
+}
+
+// RT8 — the issue's headline shape: a defaultable local assigned on ONE
+// branch but read on a path that may not have executed. The read must
+// observe the §17.11 default (0), NOT garbage or a runtime error.
+BEZEL_TEST(sema_da,
+           rundaot_one_branch_assign_unassigned_reads_zero_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method someCondition(): bool return false; end someCondition; "
+        "  public static method Main(): int "
+        "    var n: int; "
+        "    if someCondition() then n := 42; end if; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+}
+
+// RT9 — 200-iteration loop-carried shape — the STALE-SLOT oracle. A
+// local declared inside a per-iteration body must be re-initialised to
+// its §17.11 default on each iteration; if the slot is reused from a
+// previous iteration's leftover, an iteration that does NOT assign would
+// observe a stale non-zero value and this row would print "STALE at iter
+// I" and exit 1.
+BEZEL_TEST(sema_da,
+           rundaot_loop_carried_local_reinitialized_each_iter_spec_7_9_4419) {
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  for var i in 0..200 do "
+        "    var x: int; "
+        "    if i mod 2 = 0 then x := i; end if; "
+        "    if i mod 2 <> 0 then "
+        "      if x <> 0 then "
+        "        Console.WriteLine($\"STALE at iter {i}: x={x}\"); "
+        "        return 1; "
+        "      end if; "
+        "    end if; "
+        "  end for; "
+        "  Console.WriteLine(\"loop-carried OK\"); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("loop-carried OK\n"));
 }
