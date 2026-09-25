@@ -20238,6 +20238,17 @@ private:
         const std::vector<ast::Param>& params,
         const std::vector<BareTParamNarrowUnwrap>& entries,
         std::vector<llvm::Value*>& args);
+    // fix #4945 (§14.1 / §7 / §7.10, v0.307): the constructor sibling. A `new`
+    // site lowers its arguments under the ENCLOSING substitution (#597), so the
+    // constructed type's `T := int?` is not visible to buildOrderedArgs. After
+    // the call, take the entries recorded since `base`, and restore the
+    // carriers under `calleeSemaTy` (the constructed type's substitution).
+    // Always truncates bareTParamNarrowUnwraps_ back to `base`.
+    void restoreCtorBareTParamCarriers(
+        const std::vector<ast::Param>& params, std::size_t base,
+        std::vector<llvm::Value*>& args,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            calleeSemaTy);
 
     // per §24: events. `eventSourcePtr` lowers an event-access expression
     // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /

@@ -12720,6 +12720,23 @@ void Emitter::restoreBareTParamNullableCarriers(
     }
 }
 
+void Emitter::restoreCtorBareTParamCarriers(
+        const std::vector<ast::Param>& params, std::size_t base,
+        std::vector<llvm::Value*>& args,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            calleeSemaTy) {
+    // fix #4945 (§14.1 / §7 / §7.10, v0.307): see the declaration comment.
+    if (bareTParamNarrowUnwraps_.size() <= base) return;
+    std::vector<BareTParamNarrowUnwrap> mine(
+        bareTParamNarrowUnwraps_.begin() + static_cast<std::ptrdiff_t>(base),
+        bareTParamNarrowUnwraps_.end());
+    bareTParamNarrowUnwraps_.resize(base);
+    auto savedSemaTy = std::move(genericSubstSemaTy_);
+    genericSubstSemaTy_ = calleeSemaTy;
+    restoreBareTParamNullableCarriers(params, mine, args);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+}
+
 // §14.1 / §2.5 (fix #711): is `arg` a BARE generic-parameter reference (as
 // opposed to a concrete or constructed type)? Locally that is a single-part
 // Named ref with no declaration; an IMPORTED base ref has no astNode at all and

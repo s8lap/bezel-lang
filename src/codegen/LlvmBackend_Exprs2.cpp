@@ -8190,10 +8190,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // has returned NORMALLY. Same plumbing as lowerCall's
                     // method-call path; the helpers themselves are unchanged.
                     std::vector<AccessorRefArg> accessorRefArgs;
+                    const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
                     bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
                                               &eArgExprs,
                                               /*nullTransferredOwned=*/true,
                                               &accessorRefArgs);
+                    // fix #4945 (§14.1 / §7.10, v0.307): restore bare-`T`
+                    // nullable carriers under the constructed type's subst.
+                    restoreCtorBareTParamCarriers(earlyCd->params, bareTBase,
+                                                  eArgs, ctorArgSemaSave);
                     unwindTarget_ = savedArgUT;
                     currentThis_ = savedThisForArgs;
                     if (ok) {
@@ -8327,10 +8332,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // skips the write-back per §22.3's "on an exception exit no write-
             // back occurs". Mirrors lowerCall's method-call path; helpers unchanged.
             std::vector<AccessorRefArg> accessorRefArgs;
+            const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
             bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
                                               /*nullTransferredOwned=*/true,
                                               &accessorRefArgs);
+            // fix #4945 (§14.1 / §7.10, v0.307): see restoreCtorBareTParamCarriers.
+            restoreCtorBareTParamCarriers(cd->params, bareTBase, args,
+                                          ctorArgSemaTy);
             unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
@@ -9182,10 +9191,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // fix #2319 / §22.3: pass an accessor-ref-arg sink so buildOrderedArgs
             // emits the §22.3 copy-IN bracket for an indexer-slot / property
             // `ref`/`out` argument. Flushed below.
+            const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
             builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
                                               /*nullTransferredOwned=*/true,
                                               &accessorRefArgs);
+            // fix #4945 (§14.1 / §7.10, v0.307): see restoreCtorBareTParamCarriers.
+            restoreCtorBareTParamCarriers(cd->params, bareTBase, args,
+                                          ctorArgSemaTy);
             unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
@@ -11151,9 +11164,12 @@ llvm::Value* Emitter::buildRecordValue(
         // record's inlined ctor body) returns NORMALLY. Mirrors lowerCall's
         // method-call path; helpers themselves unchanged.
         std::vector<AccessorRefArg> accessorRefArgs;
+        const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
         bool builtRecArgs = buildOrderedArgs(cd->params, args, ordered, nullptr,
                                              /*nullTransferredOwned=*/true,
                                              &accessorRefArgs);
+        // fix #4945 (§14.1 / §7.10, v0.307): see restoreCtorBareTParamCarriers.
+        restoreCtorBareTParamCarriers(cd->params, bareTBase, ordered, recSemaTy);
         genericSubst_ = std::move(recSubst);
         genericSubstSemaTy_ = std::move(recSemaTy);
         if (!builtRecArgs) {
