@@ -121,6 +121,14 @@ bool checkStaticReadonlyNullSource(SemaContext& ctx);
 // other passes (e.g. §22.6 overload resolution).
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
+// §5.1 "Implicit conversions" numeric/char widening table (fix #4853, v0.307):
+// true iff `from` implicitly widens to `to` (distinct primitives; identity is
+// the caller's). Exposes sema's one copy of the table (`ExprTC::
+// primitiveWidens`) so codegen's `ctorForArgs` can prefer a §5.1-admitted
+// conversion over a narrowing without a second, drifting copy. Covers the
+// TYPE-based rows only — constant narrowing is value-based and not modelled.
+bool primitiveImplicitlyWidens(PrimitiveType from, PrimitiveType to);
+
 // #2787 / spec §14.2 rule 3 + §12.9 / stdlib §2.2 §4.4 §5.1: does the INTERFACE
 // type `t` satisfy the self-recurrent bound `where T: IComparable<T>` — i.e.
 // does it name `IComparable<t>` (ITSELF) in its extension clause?

@@ -211,9 +211,15 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
 // explicit ctor is `constructor(v: int?)` — arity 1, same as the positional
 // field, but a DIFFERENT parameter list (`int?`, not `int`), which §9.3
 // permits (only an IDENTICAL parameter list to the auto-generated primary
-// constructor is forbidden). `ctorForArgs` treats a non-nullable primitive
-// argument and its `?` form as the same type class (fix #3760), so this
-// explicit ctor — not the primary — is selected for `new Combo4039T2(5)`.
+// constructor is forbidden). The argument is an `int?` local, so the explicit
+// ctor is the EXACT candidate and the primary `(x: int)` is inapplicable
+// (`int?` does not implicitly convert to `int`, §5.1). fix #4853 (§22.6 stage
+// 5, v0.307): this row used to pass a bare `5`, for which the primary is the
+// exact candidate and the `int?` ctor merely converting — so §22.6 selects
+// the PRIMARY there (value 5, pinned in
+// tests/sema/ctor_overload_exact_match_ranking_4853_test.cpp). The old
+// expectation (50) came from `ctorForArgs`'s type-class proxy treating `int`
+// and `int?` as one class (fix #3760), not from the spec.
 // ===========================================================================
 BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
            explicit_ctor_matching_ctorforargs_still_used_control_spec_9_3) {
@@ -222,7 +228,7 @@ BEZEL_TEST(codegen_combined_record_secondary_ctor_arity_4039,
             "  public constructor(v: int?) this.x := (v ?? 0) * 10; end constructor; "
             "end Combo4039T2; "
             "class C public static method Main(): int "
-            "  var c := new Combo4039T2(5); return c.x; "
+            "  var n: int? := 5; var c := new Combo4039T2(n); return c.x; "
             "end Main; end C;"),
         50);
 }

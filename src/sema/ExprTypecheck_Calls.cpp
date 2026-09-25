@@ -16659,6 +16659,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // Collect the candidates this call's arguments can bind to (§22.5)
         // and record each binding so ranking operates on the bound positions.
         std::vector<const ast::ConstructorDecl*> decls;
+        // fix #4853: the ConstructorSymbol behind each `decls[c]`, so the
+        // selected candidate can be published for codegen (below).
+        std::vector<ConstructorSymbol*> declSyms;
         std::vector<BindResult> binds;
         for (ConstructorSymbol* cs : ctors) {
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
@@ -16668,11 +16671,18 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                                             /*emit=*/false);
             if (!b.ok) continue;
             decls.push_back(cd);
+            declSyms.push_back(cs);
             binds.push_back(std::move(b));
         }
         if (decls.empty()) return;  // no bindable ctor — defer (no check)
         if (decls.size() == 1) {
             if (emitModifierMismatch(decls[0]->params, binds[0])) return;
+            // fix #4853 (§22.5 / §22.6 stage 1, v0.307): the §22.5 binder
+            // admitted exactly one candidate, so it is the call's constructor
+            // (checkArgsAgainstParams below rejects the program if it is not
+            // also §5.1-applicable). Publish it so codegen's `ctorForArgs`
+            // lowers the constructor sema checked rather than re-deriving one.
+            ctx_.setResolvedNewCtor(&ne.args, declSyms[0]);
             checkArgsAgainstParams(
                 decls[0]->params, ne.args, ne.span.begin,
                 std::string("`new ") + std::string(t->name) + "`",
@@ -16750,7 +16760,19 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // for the constructor overload's parameter, matching the method-call
         // dispatch's behaviour (`new Pick(3)` against `new(byte)` /
         // `new(string)` resolves uniquely by §5.1, exactly like `Pick(3)`).
-        resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
+        //
+        // fix #4853 (§22.6 "Implicit conversions and tie-breaking", v0.307):
+        // the winner is PUBLISHED for codegen (`ctx_.setResolvedNewCtor`),
+        // which lowers it instead of re-deriving the choice through
+        // `ctorForArgs`'s type-class proxy. Before this the result was
+        // discarded, and the proxy chose the first declared candidate in the
+        // argument's type class: `(a: Animal)` over an exact `(d: Dog)`,
+        // `(n: long)` over an exact `(n: int)`, and — silent wrong code — a
+        // `(n: int)` candidate that §5.1 makes INAPPLICABLE to a `long`
+        // argument, truncating it. Only a `Resolved` outcome is published;
+        // on Undecidable (unjudgeable types) codegen keeps the proxy.
+        OverloadResult newRes = resolveOverload(
+                        paramTypes, argTypes, fillsDefault, candNames,
                         ne.span.begin,
                         std::string("`new ") + std::string(t->name) + "`",
                         /*extraNote=*/std::string(),
@@ -16766,6 +16788,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                                 es.push_back(a.value.get());
                             return es;
                         }());
+        if (newRes.outcome == OverloadOutcome::Resolved &&
+            newRes.winnerIndex < declSyms.size())
+            ctx_.setResolvedNewCtor(&ne.args, declSyms[newRes.winnerIndex]);
         return;
     }
     if (ctors.empty()) {

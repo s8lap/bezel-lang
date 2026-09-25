@@ -3558,7 +3558,10 @@ void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
 // Slice T1: §5.1 numeric/char implicit-widening table. Returns
 // true iff `from` implicitly widens to `to` (both primitives,
 // distinct). Identity is handled by the caller.
-bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
+// fix #4853 (§5.1, v0.307): the table is a free function so codegen's
+// `ctorForArgs` can consult it through TypeResolution.hpp; `ExprTC::
+// primitiveWidens` (private) delegates to it below — one copy of the table.
+bool primitiveImplicitlyWidens(PrimitiveType from, PrimitiveType to) {
     using P = PrimitiveType;
     auto isAny = [&](std::initializer_list<P> set) {
         for (P p : set) if (p == to) return true;
@@ -3595,6 +3598,10 @@ bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
         default:
             return false;
     }
+}
+
+bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
+    return primitiveImplicitlyWidens(from, to);
 }
 
 // fix #4655 (§5.1 "Implicit conversions", v0.307): names the specific §5.1

@@ -388,6 +388,36 @@ public:
         return it == inheritanceClauseCtorBindings_.end() ? nullptr
                                                           : &it->second;
     }
+    // fix #4853 (§22.6 "Implicit conversions and tie-breaking" / §22.7,
+    // v0.307): the constructor sema's §22.6 resolution SELECTED for a
+    // `new T(...)` over an overloaded local constructor set
+    // (`ExprTC::checkNewExprArgs`'s `ctors.size() > 1` arm — a unique
+    // `resolveOverload` winner, or the only candidate the §22.5 binder
+    // admitted). Codegen's `Emitter::ctorForArgs` consumes it instead of
+    // re-deriving the choice through its type-class proxy, which cannot
+    // express §22.6's exact-match ranking (`(a: Animal)` declared before
+    // `(d: Dog)` won for a `Dog` argument) and admitted a §5.1 narrowing
+    // (`new C(big)` with `big: long` ran a `(n: int)` constructor and
+    // truncated the value).
+    //
+    // Keyed by the ADDRESS of the `NewExpr::args` vector, the one handle
+    // `ctorForArgs(cls, args)` has on its call site (every `new`-site caller
+    // passes `ne.args` by reference) — the same key shape, for the same
+    // reason, as `inheritanceClauseBindings_` above. A caller that passes any
+    // other vector (a chain call's `CallExpr::args`, a synthesized list)
+    // finds no entry and keeps the proxy: a miss costs the fix, never a
+    // wrong pick. The consumer also checks the symbol is a member of the
+    // class it is resolving, so a disagreement is never adopted.
+    void setResolvedNewCtor(const std::vector<ast::CallArgument>* newArgs,
+                            ConstructorSymbol* ctor) {
+        if (newArgs && ctor) resolvedNewCtors_[newArgs] = ctor;
+    }
+    ConstructorSymbol* resolvedNewCtor(
+        const std::vector<ast::CallArgument>* newArgs) const {
+        if (!newArgs) return nullptr;
+        auto it = resolvedNewCtors_.find(newArgs);
+        return it == resolvedNewCtors_.end() ? nullptr : it->second;
+    }
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
     // for the rationale. Populated by the typecheck pass from
@@ -1112,6 +1142,15 @@ private:
     std::unordered_map<const std::vector<ast::CallArgument>*,
                        InheritanceClauseCtorBinding>
         inheritanceClauseCtorBindings_;
+    // fix #4853 (§22.6 / §22.7, v0.307): sema's selected constructor for an
+    // overloaded local `new T(...)`, keyed by the address of `NewExpr::args`.
+    // Written by `ExprTC::checkNewExprArgs`, read by codegen's
+    // `Emitter::ctorForArgs`. See the setter's comment for the rationale and
+    // tests/module/semacontext_ast_side_table_snapshot_test.cpp for the
+    // reconstruction disposition.
+    std::unordered_map<const std::vector<ast::CallArgument>*,
+                       ConstructorSymbol*>
+        resolvedNewCtors_;
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs. Populated by the typecheck pass at the
     // SAME site it computes `substituteMemberType` for the §7

@@ -14555,6 +14555,27 @@ private:
         const sema::ConstructorSymbol* exclude = nullptr,
         bool chainCall = false) {
         if (!cls) return nullptr;
+        // fix #4853 (§22.6 "Implicit conversions and tie-breaking" / §22.7,
+        // v0.307): when sema's §22.6 resolution already SELECTED this `new`
+        // site's constructor (`ExprTC::checkNewExprArgs` publishes it, keyed
+        // by the address of `NewExpr::args` — see
+        // `SemaContext::setResolvedNewCtor`), lower that constructor. The
+        // search below is a proxy that cannot express §22.6's exact-match
+        // ranking; re-deriving the choice with it picked the first declared
+        // candidate in the argument's type class — `(a: Animal)` over an
+        // exact `(d: Dog)`, and a `(n: int)` constructor, INAPPLICABLE under
+        // §5.1, for a `long` argument (silent truncation). Adopted only when
+        // it is a non-static constructor of `cls` itself and not `exclude`;
+        // any other shape keeps the proxy. Never consulted for a chain call,
+        // whose argument vector is not a `new` site's.
+        if (!chainCall) {
+            if (sema::ConstructorSymbol* rc = ctx_.resolvedNewCtor(&args)) {
+                if (!rc->isStatic && rc != exclude) {
+                    for (sema::Symbol* m : cls->members)
+                        if (m == rc) return rc;
+                }
+            }
+        }
         // fix #3760 (§22.10 / §12.8 / §22.8, v0.287): a SINGLE explicit
         // constructor whose arity matches the chain call still has to
         // type-match the call's positional args before we can adopt it as
@@ -14698,7 +14719,56 @@ private:
         // sibling `(v: IComparable<int>)` for `new C(5)` whatever their
         // declaration order); only when it finds nothing does the RELAXED
         // pass also admit the §5.1 conversions the class proxy cannot see.
+        //
+        // fix #4853 (§22.6 stage 5 "exact beats converting" / §5.1, v0.307):
+        // two tiers now run BEFORE that strict pass, for every call sema did
+        // not resolve for us (a chain call, a class with a §22.10 primary, an
+        // imported class, an undecidable overload set):
+        //   * `Exact` — a candidate is admitted only when every supplied
+        //     argument's static type IS its parameter type. Such a candidate
+        //     is better-or-equal at every position than any other applicable
+        //     one, so it is §22.6's winner (the three arms' order supplies the
+        //     defaulted-arity tie-break among exact candidates);
+        //   * `NoNarrow` — the class proxy minus a numeric pair that is not a
+        //     §5.1 widening (`long` → `int`, `double` → `float`), so a
+        //     converting candidate §5.1 admits outranks one it does not.
+        // The later tiers keep the pre-#4853 verdicts (the `Proxy` tier also
+        // admits an integer CONSTANT narrowed by value, which the proxy cannot
+        // tell from a run-time narrowing), so these tiers only ever change
+        // WHICH admitted candidate is chosen, never whether one is.
+        enum class Tier { Exact, NoNarrow, Proxy, Relaxed };
+        Tier tier = Tier::Proxy;
         bool relaxedPass = false;
+        // fix #4853: exact static-type identity for the `Exact` tier —
+        // deliberately narrower than `sema::typeRefEqual` (which compares a
+        // Named ref by `declaration` alone, so every generic parameter and
+        // builtin head compares equal): a primitive pair, or a non-generic
+        // Named pair with the same resolved declaration, same nullability.
+        // Anything else is "not provably exact" and waits for a later tier.
+        auto exactType = [](const sema::TypeRef* a,
+                            const sema::TypeRef* b) -> bool {
+            if (!a || !b || a->kind != b->kind || a->nullable != b->nullable)
+                return false;
+            if (a->kind == sema::TypeRef::Kind::Primitive)
+                return a->primitive != sema::PrimitiveType::None &&
+                       a->primitive == b->primitive;
+            if (a->kind == sema::TypeRef::Kind::Named)
+                return a->declaration && a->declaration == b->declaration &&
+                       a->genericArgs.empty() && b->genericArgs.empty();
+            return false;
+        };
+        auto isNumericPrim = [](const sema::TypeRef* t) -> bool {
+            if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
+            using P = sema::PrimitiveType;
+            switch (t->primitive) {
+            case P::SByte: case P::Byte: case P::Short: case P::UShort:
+            case P::Int:   case P::UInt: case P::Long:  case P::ULong:
+            case P::Char:  case P::Float: case P::Double: case P::Decimal:
+                return true;
+            default:
+                return false;
+            }
+        };
         // §14.2 clause 5 / §5.1 / stdlib §9.1–§9.5 (v0.307): a primitive
         // value boxes into the builtin `IComparable<P>` / `IEquatable<P>` at
         // its own type exactly (non-nullable type argument; `bool` has
@@ -14734,6 +14804,10 @@ private:
             auto* argTy = ctx_.exprType(*argExpr);
             bool argIsNull =
                 dynamic_cast<const ast::NullLiteralExpr*>(argExpr) != nullptr;
+            // fix #4853: the `Exact` tier admits identity only (a `null`
+            // literal is never exact — it converts).
+            if (tier == Tier::Exact)
+                return !argIsNull && exactType(argTy, paramTy);
             int paramCls = typeClassOf(paramTy);
             // fix #3760 follow-up: a `null` arg against a NULLABLE param is a
             // valid match — a `null` literal carries no typeClass information
@@ -14770,6 +14844,14 @@ private:
                 if (argCls == 1 && paramCls == 2) return true;
                 return false;
             }
+            // fix #4853 (§5.1, v0.307): the `NoNarrow` tier rejects a numeric
+            // pair that is neither identity nor a §5.1 widening-table row.
+            if (tier == Tier::NoNarrow && isNumericPrim(argTy) &&
+                isNumericPrim(paramTy) &&
+                argTy->primitive != paramTy->primitive &&
+                !sema::primitiveImplicitlyWidens(argTy->primitive,
+                                                 paramTy->primitive))
+                return false;
             return true;
         };
         // fix #4924 (§22.3 / §22.6, v0.307): at a `this(...)` / `base(...)`
@@ -15084,17 +15166,33 @@ private:
             }
             return nullptr;
         };
-        if (sema::ConstructorSymbol* hit = searchOnce()) return hit;
-        // fix #4790 rework (§22.10 / §22.6 stage 5, v0.307): for a class with
-        // a §22.10 primary constructor a null result MEANS "the call binds
-        // the primary" (`directPrimaryNew`, `emitChainCall`'s primary arm) —
-        // the primary has no `ConstructorSymbol` of its own. When the primary
-        // is applicable to these arguments at the STRICT tier, it outranks
-        // any explicit constructor the relaxed pass could only reach through
-        // a boxing conversion (§22.6 stage 5 exact-match preference), so the
-        // strict null stands.
-        if (cls->hasPositionalFields && primaryStrictlyApplicable())
-            return nullptr;
+        // fix #4853: the `Exact` and `NoNarrow` tiers are skipped for a `new`
+        // site whose arguments carry a call-site `ref`/`out` (or a discard):
+        // those modifiers are checked per slot only for a chain call
+        // (`slotTypeMatches`, #4924; the `new`-site half awaits #4949), so a
+        // tier that preferred a type-exact candidate could newly prefer one
+        // whose modifiers do not match. Such a call keeps the pre-#4853 pick.
+        bool anyModifier = false;
+        for (const ast::CallArgument& a : args)
+            if (!a.modifier.empty() || a.isDiscard) anyModifier = true;
+        for (Tier t : {Tier::Exact, Tier::NoNarrow, Tier::Proxy}) {
+            if (t != Tier::Proxy && anyModifier && !chainCall) continue;
+            tier = t;
+            if (sema::ConstructorSymbol* hit = searchOnce()) return hit;
+            // fix #4790 rework (§22.10 / §22.6 stage 5, v0.307): for a class
+            // with a §22.10 primary constructor a null result MEANS "the call
+            // binds the primary" (`directPrimaryNew`, `emitChainCall`'s
+            // primary arm) — the primary has no `ConstructorSymbol` of its
+            // own. When the primary is applicable to these arguments at the
+            // STRICT tier, it outranks any explicit constructor the relaxed
+            // pass could only reach through a boxing conversion (§22.6 stage 5
+            // exact-match preference), so the strict null stands. fix #4853:
+            // the same holds tier by tier — a primary exact where every
+            // explicit candidate converts wins at the `Exact` tier.
+            if (cls->hasPositionalFields && primaryStrictlyApplicable())
+                return nullptr;
+        }
+        tier = Tier::Proxy;
         relaxedPass = true;
         sema::ConstructorSymbol* relaxed = searchOnce();
         relaxedPass = false;

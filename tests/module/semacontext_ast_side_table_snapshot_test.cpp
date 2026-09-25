@@ -334,6 +334,21 @@ const Entry kAstKeyedTables[] = {
      "exit 0, post-fix. Reproducers: "
      "/var/tmp/bezel-scratch/c16-basedefer/repro/p_clause_explicit_named.bzl, "
      "probe/x_conv.bzl and probe/xm2/{lib,app}.bzl."},
+    {"resolvedNewCtors_",
+     "NOT carried; a miss is SAFE BY CONSTRUCTION, not argued safe. fix #4853 "
+     "(§22.6 / §22.7, v0.307): the constructor sema's §22.6 resolution "
+     "selected for an overloaded LOCAL `new T(...)` "
+     "(`ExprTC::checkNewExprArgs`), keyed by the address of `NewExpr::args` "
+     "— the one handle codegen's `Emitter::ctorForArgs(cls, args)` has on its "
+     "call site, hence the second needle's key shape, as for "
+     "`inheritanceClauseBindings_`. A `new` inside a re-parsed dependency "
+     "body may publish into `freshCtx`'s copy, which codegen does not read; "
+     "the consumer then finds no entry and runs its pre-#4853 search "
+     "(`ctorForArgs`'s proxy tiers), i.e. exactly today's behaviour for that "
+     "site. The consumer also adopts an entry only when the symbol is a "
+     "non-static constructor MEMBER of the class being resolved, so a stale "
+     "or foreign entry is never lowered. The value is owned by the "
+     "`SemaContext` whose arena produced it — the one the entry lives in."},
 };
 
 // Every member name declared as an AST-keyed `std::unordered_map`, in
