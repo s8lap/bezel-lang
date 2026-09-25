@@ -13353,6 +13353,48 @@ bool Emitter::fillOmittedParamDefaults(
         const std::vector<ast::Param>& params,
         std::vector<llvm::Value*>& ordered,
         std::vector<const ast::Expr*>* orderedExprs) {
+    // fix #4967 (§5.1 "Nullable conversions", v0.307): the `S? → T?` lifted
+    // widening at a CALL ARGUMENT. §5.1: "The two rules compose through at
+    // most one `?` on each side", so an `int?` argument binds a `long?`
+    // formal (and `float?` a `double?` one). The argument is already the
+    // tagged `{i8, S}` struct, so neither the exact-payload wrap nor the
+    // #4922 widen-then-wrap applied, and it reached the call as `{i8, i32}`
+    // against `{i8, i64}` — IR verification failure. Rebuild the struct with
+    // the payload WIDENED and the hasValue tag kept, as lowerLocalDecl does
+    // (#840). `coerceNumericToType` is §5.1's widening direction only, so no
+    // narrowing pair is produced; nullptr for any shape not covered (a
+    // non-`{i8, numeric}` source or formal, or a pair §5.1 does not widen).
+    // A lambda, not a member, to keep LlvmBackend_impl.hpp (160 includers)
+    // untouched; buildOrderedArgs below carries the same body — keep the two
+    // in step.
+    auto widenNullableArgPayload = [this](llvm::Value* v,
+                                          llvm::StructType* expectedSt,
+                                          const ast::Expr* srcExpr)
+        -> llvm::Value* {
+        auto* vSt = v ? llvm::dyn_cast<llvm::StructType>(v->getType())
+                      : nullptr;
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (!vSt || !expectedSt || vSt == expectedSt ||
+            vSt->getNumElements() != 2 ||
+            vSt->getElementType(0) != nullablePrimHasValTy() ||
+            expectedSt->getNumElements() != 2 ||
+            expectedSt->getElementType(0) != nullablePrimHasValTy() ||
+            !numeric(vSt->getElementType(1)) ||
+            !numeric(expectedSt->getElementType(1)))
+            return nullptr;
+        llvm::Type* dstPay = expectedSt->getElementType(1);
+        llvm::Value* conv = coerceNumericToType(
+            builder_.CreateExtractValue(v, {1u}, "arg.lift.in"), dstPay,
+            srcExpr && isUnsignedTargetExpr(*srcExpr));
+        if (conv->getType() != dstPay) return nullptr;
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(expectedSt),
+            builder_.CreateExtractValue(v, {0u}, "arg.lift.has"), {0u});
+        return builder_.CreateInsertValue(res, conv, {1u});
+    };
     // §22.5: a default-value expression may reference an EARLIER parameter
     // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
     // already lowered into `ordered[k]` (k < j). To make a reference to such a
@@ -13448,6 +13490,13 @@ bool Emitter::fillOmittedParamDefaults(
                                        expectedSt->getElementType(1)) {
                                 ordered[j] =
                                     wrapNullableValue(formalTy, ordered[j]);
+                            } else if (llvm::Value* lifted =
+                                           widenNullableArgPayload(
+                                               ordered[j], expectedSt, dv)) {
+                                // fix #4967 (§5.1 `S? → T?`, v0.307): the
+                                // omitted-default twin — `b: long? := a` with
+                                // an earlier `a: int?` formal (§22.5).
+                                ordered[j] = lifted;
                             } else if (ordered[j]->getType()->isIntegerTy() ||
                                        ordered[j]->getType()
                                            ->isFloatingPointTy()) {
@@ -13481,6 +13530,36 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       std::vector<const ast::Expr*>* outExprs,
                       bool nullTransferredOwned,
                       std::vector<AccessorRefArg>* accessorRefArgs) {
+    // fix #4967 (§5.1 `S? → T?`, v0.307): the same lifted widening as the
+    // identically-named lambda in fillOmittedParamDefaults above — see there.
+    auto widenNullableArgPayload = [this](llvm::Value* v,
+                                          llvm::StructType* expectedSt,
+                                          const ast::Expr* srcExpr)
+        -> llvm::Value* {
+        auto* vSt = v ? llvm::dyn_cast<llvm::StructType>(v->getType())
+                      : nullptr;
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (!vSt || !expectedSt || vSt == expectedSt ||
+            vSt->getNumElements() != 2 ||
+            vSt->getElementType(0) != nullablePrimHasValTy() ||
+            expectedSt->getNumElements() != 2 ||
+            expectedSt->getElementType(0) != nullablePrimHasValTy() ||
+            !numeric(vSt->getElementType(1)) ||
+            !numeric(expectedSt->getElementType(1)))
+            return nullptr;
+        llvm::Type* dstPay = expectedSt->getElementType(1);
+        llvm::Value* conv = coerceNumericToType(
+            builder_.CreateExtractValue(v, {1u}, "arg.lift.in"), dstPay,
+            srcExpr && isUnsignedTargetExpr(*srcExpr));
+        if (conv->getType() != dstPay) return nullptr;
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(expectedSt),
+            builder_.CreateExtractValue(v, {0u}, "arg.lift.has"), {0u});
+        return builder_.CreateInsertValue(res, conv, {1u});
+    };
     std::vector<llvm::Value*> ordered(params.size(), nullptr);
     // issue #421 / #410: parallel source expression per parameter position, so
     // the caller can recover each argument's signedness for numeric widening.
@@ -14183,6 +14262,12 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         v = nullableValueNull(formalTy);
                     } else if (v->getType() == expectedSt->getElementType(1)) {
                         v = wrapNullableValue(formalTy, v);
+                    } else if (llvm::Value* lifted = widenNullableArgPayload(
+                                   v, expectedSt, a.value.get())) {
+                        // fix #4967 (§5.1 "Nullable conversions", v0.307):
+                        // `S?` → `T?` — an `int?` argument at a `long?` formal
+                        // arrives as `{i8, i32}`; see widenNullableArgPayload.
+                        v = lifted;
                     } else if (v->getType()->isIntegerTy() ||
                                v->getType()->isFloatingPointTy()) {
                         // fix #4922 (§5.1 "Nullable conversions", v0.307):
