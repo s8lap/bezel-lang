@@ -679,7 +679,8 @@ std::vector<const ConstMemberSymbol*> collectLocalConstMembers(
         auto* cm = dynamic_cast<const ConstMemberSymbol*>(sym.get());
         if (!cm || !cm->parent) continue;
         if (ctx.isImported(cm)) continue;
-        // SEAM-DEBT: #4911 imported consts skipped on the line above
+        // SEAM-DEBT: #4911 imported consts skipped on the line above;
+        // confirmed by seam_debt_4911_imported_symbol_audit.test 3 (cyclic_const_detector_local_only_site3, PASS at 2230399c)
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cm->decl);
         if (!cd) continue;
         out.push_back(cm);
@@ -692,7 +693,8 @@ void collectConstRefs(
         const ConstMemberSymbol* cm,
         std::unordered_map<const ConstMemberSymbol*, SourceLocation>& edges) {
     ConstRefCollector c{ctx, cm, edges, {}};
-    // SEAM-DEBT: #4911 local-only const (collectLocalConstMembers skips imported)
+    // SEAM-DEBT: #4911 local-only const (collectLocalConstMembers skips imported);
+    // confirmed by seam_debt_4911_imported_symbol_audit.test 3 (cyclic_const_detector_local_only_site3, PASS at 2230399c)
     auto* cd = dynamic_cast<const ast::ConstDecl*>(cm->decl);
     if (cd && cd->value) c.expr(cd->value.get());
 }

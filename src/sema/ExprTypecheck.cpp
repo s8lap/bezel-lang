@@ -4085,7 +4085,8 @@ bool ExprTC::isCurrentScopeTypeParamConstrained(std::string_view name)
     // `where T: …` clauses don't belong to this translation unit anyway —
     // the instantiation-time check is invoked separately there).
     if (currentType_ && currentType_->decl)
-        // SEAM-DEBT: #4911 null for an imported type; its constraints are checked at instantiation
+        // SEAM-DEBT: #4911 null for an imported type; its constraints are checked at instantiation;
+        // confirmed by seam_debt_4911_imported_symbol_audit.test 1 (imported_interface_is_check_where_clause_site1, PASS at 2230399c)
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             if (inAny(td)) return true;
     if (inAny(currentMethodDecl_)) return true;

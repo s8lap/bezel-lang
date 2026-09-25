@@ -2973,7 +2973,8 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
                             cv = bl2->value;
                     }
                 } else if (auto* cd =
-                               // SEAM-DEBT: #4911 imported const falls through to the ConstMemberSymbol arm
+                               // SEAM-DEBT: #4911 imported const falls through to the ConstMemberSymbol arm;
+                               // confirmed by seam_debt_4911_imported_symbol_audit.test 2 (imported_bool_const_if_folding_site2, PASS at 2230399c)
                                dynamic_cast<const ast::ConstDecl*>(s->decl)) {
                     if (cd->value) {
                         if (auto* bl2 = dynamic_cast<
