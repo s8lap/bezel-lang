@@ -13127,21 +13127,30 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // x)` against `constructor(a: int, b: int)` stores `x` into `a` and `9`
     // into `b`, where the pre-fix positional pairing stored `9` into `a` and
     // `x` into `b` (the silent-wrong-object case the #3777 commit's "STILL
-    // EXCLUDED, deliberately" paragraph #f flagged on its own). The exact-
-    // arity SELECTOR above is kept: widening it to admit an omitted defaulted
-    // tail through a named-arg call is the same shape `ctorForArgs` already
-    // admits (#3777 / §22.6 / §22.5) and is left for the next change, so a
-    // named chain call whose target has more parameters than the call
-    // supplied still falls through to `ctorByArity`'s exact-arity answer
-    // rather than the §22.10 primary arm below (no behavioural shift from
-    // today; the chain path below can NOW lower what the selector picked).
-    bool chainArgsAllPositional = true;
-    for (const auto& a : call->args)
-        if (!a.name.empty()) { chainArgsAllPositional = false; break; }
+    // EXCLUDED, deliberately" paragraph #f flagged on its own).
+    //
+    // narrow #4791 (§22.5 / §22.6 stage 1, v0.307): the exact-arity SELECTOR
+    // #3791 kept — `ctorByArity(targetCls, n, ...)` for any chain call with a
+    // named argument — is REMOVED. `ctorByArity` matches on parameter COUNT
+    // alone; it has no notion of names or defaults, so `base(y := n)` against
+    // `constructor(x: int := 1, y: int)` (arity 2) with a one-argument call
+    // (n == 1) matched NOTHING, `target` came back null, and the chain fell
+    // through to the §22.10 primary-ctor arm below with the named argument
+    // simply dropped — `y` silently zero-filled. `ctorForArgs` — the general
+    // resolver every other call in this file already uses (`new`, sibling
+    // `this(...)`/`base(...)` chains with all-positional args) — performs
+    // exactly the §22.5 binding-with-defaults `ctorByArity` cannot: it binds
+    // `y := n` by name, admits the omitted `x` because it has a default, and
+    // returns the arity-2 constructor. Always calling it here removes the
+    // special case #3791 deferred ("left for the next change") rather than
+    // widening `ctorByArity` to duplicate `ctorForArgs`'s own binding logic.
+    // This also makes the chain-call TARGET this code lowers agree with
+    // `ctorChainsViaThis(ctorForArgs(...))`'s lookahead at the call sites in
+    // LlvmBackend_Exprs2.cpp, which already assumed `ctorForArgs` alone
+    // decides — a named-arg chain call was the one shape where the actual
+    // selector used here disagreed with that lookahead.
     sema::ConstructorSymbol* target =
-        chainArgsAllPositional
-            ? ctorForArgs(targetCls, call->args, isThis ? cs : nullptr)
-            : ctorByArity(targetCls, n, isThis ? cs : nullptr);
+        ctorForArgs(targetCls, call->args, isThis ? cs : nullptr);
     if (!target) {
         // Explicit `base(...)` with no matching base CONSTRUCTOR symbol. This is
         // the primary-ctor / no-explicit-ctor base case (e.g. `class ED: Base`
@@ -13432,27 +13441,42 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         }
         sourceVals[ai] = v;
     }
-    // Build `args` in PARAMETER order. `args[0]` is the receiver; `args[1..]`
-    // are the target's parameters in declaration order, with each bound slot
-    // pulling its lowered value from `sourceVals[paramToArg[pi]]` and the
-    // omitted slots left null for `fillOmittedCtorArgs` below.
+    // Build the per-slot argument vector. `byFormal[pi]` holds the target's
+    // parameter `pi`'s lowered value, or null while it is still omitted —
+    // filled from `sourceVals[paramToArg[pi]]` for a bound slot, and left for
+    // `fillOmittedCtorSlots` below otherwise.
+    //
+    // narrow #4791 (§22.5 "Optional parameters and named arguments" /
+    // §22.6 stage 1 binding / §22.8 step 1, v0.307): a NAMED chain argument
+    // that skips a leading/interior default (`base(y := n)` against
+    // `constructor(x: int := 1, y: int := 0)`) leaves a HOLE, not a trailing
+    // run — parameter 0 (`x`) is omitted while parameter 1 (`y`) is supplied.
+    // The pre-fix code here `push_back`ed only the BOUND slots' values in
+    // parameter order, so the omitted slot simply vanished from `args`
+    // instead of being represented as a hole: the one supplied value (`n`)
+    // landed at `args[1]` — the position `x` would have occupied — and the
+    // OLD `fillOmittedCtorArgs` trailing-run wrapper then appended `y`'s
+    // default right after it. The named argument was silently rebound to the
+    // WRONG formal (`x = n, y = 0` instead of the correct `x = 1, y = n`).
+    // Addressing `byFormal` by the BOUND slot index `pi` (never by push
+    // order) and filling holes with `fillOmittedCtorSlots` — the #4550
+    // per-slot fill the §22.10 inheritance-clause call below already uses for
+    // exactly this "hole, not tail" shape — keeps every value at its own
+    // parameter index regardless of which slots are supplied vs. defaulted.
+    std::vector<llvm::Value*> byFormal(target->params.size(), nullptr);
     for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
         int ai = paramToArg[pi];
-        if (ai >= 0) args.push_back(sourceVals[ai]);
-        // else: leave the position for fillOmittedCtorArgs.
+        if (ai >= 0) byFormal[pi] = sourceVals[ai];
+        // else: leave null for fillOmittedCtorSlots.
     }
     // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1
     // / §12.8, v0.286): the target was selected with an omitted §22.5-defaulted
-    // tail ADMITTED, so this site now owes those slots their defaults — exactly
-    // what a `new` site owes them. `fillOmittedCtorArgs` is the ONE fill for a
-    // constructor call in this file, shared with the §22.10 inheritance-clause
-    // call in `emitImplicitBase`; it also answers the LOCAL/IMPORTED question
-    // once, which the generic-inline gate below then reads instead of asking
-    // the AST a second time.
-    //
-    // Only the TRAILING tail can be omitted at this site: the selection above
-    // is gated on the call being all-positional, so the supplied arguments
-    // occupy slots `[0, call->args.size())` and the omitted ones are the rest.
+    // slot ADMITTED, so this site now owes those slots their defaults — exactly
+    // what a `new` site owes them. `fillOmittedCtorSlots` is the per-slot fill
+    // for a constructor call in this file (fix #4550), shared with the §22.10
+    // inheritance-clause call below; it also answers the LOCAL/IMPORTED
+    // question, which the generic-inline gate below then reads instead of
+    // asking the AST a second time.
     //
     // Evaluation order is §22.5's: the supplied arguments were lowered above in
     // source order, and each default is lowered after them, in parameter order,
@@ -13468,11 +13492,10 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // for a generic one `it->second` is the T→i32 TEMPLATE and the inline path
     // below binds each value at the formal's own SPECIALIZED lowered type, so
     // the template signature is not the authority.
-    bool chainTargetIsLocal = false;
-    if (!fillOmittedCtorArgs(*target, it->second->getFunctionType(),
-                             /*coerceNumericDefaults=*/
-                             targetCls->genericParams.empty(), args,
-                             &chainTargetIsLocal)) {
+    bool chainTargetIsLocal = localCtorDeclOf(*target) != nullptr;
+    if (!fillOmittedCtorSlots(*target, it->second->getFunctionType(),
+                              /*coerceNumericDefaults=*/
+                              targetCls->genericParams.empty(), byFormal)) {
         // No default for some omitted slot (or it failed to lower, which
         // already reported). The call cannot be made — release the §22.3
         // bracket pins and leave, exactly as the `!a.value` edge above does.
@@ -13480,6 +13503,27 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
         return;
     }
+    // Every slot must now hold a value — checked here so a partial binding
+    // can never push a null into `args` (LLVM would take that as a malformed
+    // call), mirroring the same guard on the §22.10 inheritance-clause fill
+    // below. `fillOmittedCtorSlots` returning true promises every slot is
+    // filled, so reaching a null here is a codegen defect, and returning
+    // quietly would skip the chained constructor body — the fields it assigns
+    // keep their defaults. Report it (`internal:`, the #2434 / #2658
+    // degradation convention) rather than miscompile silently.
+    for (llvm::Value* v : byFormal) {
+        if (v) continue;
+        if (!ctx_.diagnostics().hasErrors())
+            ctx_.diagnostics().report(
+                Severity::Warning, call->span.begin,
+                "internal: a constructor-chain argument slot is still unfilled "
+                "after default filling, so the chained constructor body does "
+                "not run — #4791");
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+        genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
+        return;
+    }
+    for (llvm::Value* v : byFormal) args.push_back(v);
     // fix #3501: the carried unit bindings cover the ARGUMENT loop ONLY. The
     // #617 block immediately below captures `genericSubstSemaTy_` into
     // `savedSemaTyForBase` and rebuilds the base substitution from scratch, so
