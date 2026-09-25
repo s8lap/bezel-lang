@@ -2835,6 +2835,11 @@ private:
     // with a specific diagnostic otherwise. See the definition in
     // ExprTypecheck_Calls.cpp.
     void checkDeferredNamedThisChain(const ast::ConstructorDecl& cd);
+    // fix #4905 (§22.3 / §22.5 / §22.6, v0.307): the §22.3 call-site
+    // `ref`/`out` rule at a `this(...)` / `base(...)` chain call — reports a
+    // mismatch only when no candidate constructor binding the call accepts
+    // its modifiers. See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainRefOutModifiers(const ast::ConstructorDecl& cd);
     // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
     // of the above — the §22.5 binding of a derived constructor's leading
     // `base(...)` arguments to the BASE class's primary-constructor parameter

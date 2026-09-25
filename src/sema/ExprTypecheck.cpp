@@ -15459,6 +15459,9 @@ void ExprTC::visitMember(const ast::Member& m) {
         // narrow #4791 (§12.8 / §22.5 / §22.6, v0.307): the typed half of the
         // #3793 self-chain check, for the named chains the resolver defers.
         checkDeferredNamedThisChain(*cd);
+        // fix #4905 (§22.3, v0.307): the call-site `ref`/`out` rule at the
+        // chain call, which no other check applies to a chain.
+        checkChainRefOutModifiers(*cd);
         returnCtx_ = saveRet;
         inStaticMember_ = saveStatic;
         inConstructor_ = saveCtor;

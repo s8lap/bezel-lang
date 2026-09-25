@@ -14033,6 +14033,135 @@ void ExprTC::checkDeferredNamedThisChain(const ast::ConstructorDecl& cd) {
     }
 }
 
+// fix #4905 (§22.3 "Parameter modifiers" / §22.5 / §22.6, v0.307): the
+// §22.3 call-site `ref`/`out` rule at a `this(...)` / `base(...)` constructor
+// chain call. "The caller writes `ref` at the call site", `out` likewise, and
+// only for a `ref`/`out` parameter; §22.5 makes a `ref`/`out` argument
+// positional-only. A method call (`resolveOverload`) and a `new` expression
+// (`checkNewArgs`) enforce this; a chain call reached no such check —
+// `checkDeferredNamedThisChain`'s condition (2) inspects the ARGUMENT's
+// modifier but never the chosen constructor's FORMAL's — so `this(42)` or
+// `this(y := 42)` against `constructor(ref y: int, …)` was accepted and
+// reached codegen's `emitChainCall`, where `lvalueAddr` of the literal is
+// null: "internal: lowerExpr returned null for base-constructor argument —
+// #1386" (measured on 216b1cb8).
+//
+// Sema does not resolve a chain call's target here (codegen's `ctorForArgs`
+// does), so the check is phrased so it can only reject a program NO
+// candidate could accept: every constructor of the target type (the
+// containing constructor excepted for `this(...)`) that §22.5-binds the call
+// is tried, plus the modifier-free primary parameter list; if any of them
+// binds with matching modifiers, or none binds at all (the binding checks
+// own that), nothing is reported. Otherwise the §22.3 mismatch is reported
+// in the method / `new` wording, from the first binding candidate.
+void ExprTC::checkChainRefOutModifiers(const ast::ConstructorDecl& cd) {
+    if (!currentType_ || cd.isStatic || cd.body.empty() || !cd.body[0])
+        return;
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
+    if (!chain) return;
+    const TypeSymbol* target = nullptr;
+    if (isThis) {
+        target = currentType_;
+    } else {
+        for (TypeSymbol* b : currentType_->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { target = b; break; }
+    }
+    if (!target) return;
+    const std::string spelling = isThis ? "this(...)" : "base(...)";
+    const std::string desc = "`" + spelling +
+                             "` constructor chain call in `" +
+                             std::string(currentType_->name) + "`";
+    auto isOut = [](std::string_view m) {
+        return m == "out" || m == "out var" || m == "out using var" ||
+               m == "out owned var";  // per §22.4
+    };
+    auto refOutMatch = [&](std::string_view argMod,
+                           std::string_view paramMod) -> bool {
+        const bool argRef = argMod == "ref", argOut = isOut(argMod);
+        if (paramMod == "ref") return argRef;
+        if (paramMod == "out" || paramMod == "out owned") return argOut;
+        return !argRef && !argOut;
+    };
+    bool anyArgMod = false;
+    for (const ast::CallArgument& a : chain->args)
+        if (!a.modifier.empty()) anyArgMod = true;
+    // The primary parameter list declares no `ref`/`out` formal, so a
+    // modifier-free call that binds it is a matching candidate.
+    if (!anyArgMod && target->hasPositionalFields) {
+        const std::vector<const Symbol*> fields =
+            recordPositionalFieldSymbols(target);
+        if (!fields.empty() &&
+            bindArgsToParams(sema::FormalsView::of(fields), chain->args,
+                             chain->span.begin, desc, /*emit=*/false)
+                .ok)
+            return;
+    }
+    const ConstructorSymbol* first = nullptr;
+    BindResult firstBind;
+    for (Symbol* m : target->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        if (isThis && cs->decl == &cd) continue;  // §12.8: another ctor
+        BindResult b = bindArgsToParams(sema::FormalsView::of(*cs),
+                                        chain->args, chain->span.begin, desc,
+                                        /*emit=*/false);
+        if (!b.ok) continue;
+        bool match = true;
+        const std::size_t np = sema::formalParamCount(*cs);
+        for (std::size_t j = 0; j < np && match; ++j) {
+            const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+            const std::string_view argMod =
+                ai >= 0 ? chain->args[static_cast<std::size_t>(ai)].modifier
+                        : std::string_view{};
+            if (!refOutMatch(argMod, sema::formalParamModifier(*cs, j)))
+                match = false;
+        }
+        if (match) return;
+        if (!first) { first = cs; firstBind = std::move(b); }
+    }
+    if (!first) return;
+    std::string detail;
+    const std::size_t np = sema::formalParamCount(*first);
+    for (std::size_t j = 0; j < np; ++j) {
+        const int ai =
+            j < firstBind.paramToArg.size() ? firstBind.paramToArg[j] : -1;
+        const ast::CallArgument* a =
+            ai >= 0 ? &chain->args[static_cast<std::size_t>(ai)] : nullptr;
+        const std::string_view argMod =
+            a ? a->modifier : std::string_view{};
+        const std::string pm(sema::formalParamModifier(*first, j));
+        if (refOutMatch(argMod, pm)) continue;
+        const std::string pname(sema::formalParamName(*first, j));
+        const std::string am(argMod);
+        const bool paramRefOut =
+            pm == "ref" || pm == "out" || pm == "out owned";
+        if (paramRefOut && am.empty()) {
+            detail = "parameter `" + pname + "` is `" + pm +
+                     "` — pass the argument with `" +
+                     (pm == "out owned" ? std::string("out owned var") : pm) +
+                     "` at the call site";
+            if (a && !a->name.empty())
+                detail += ", positionally (a `ref`/`out` argument has no "
+                          "named form, §22.5)";
+        } else if (!paramRefOut && !am.empty()) {
+            detail = "parameter `" + pname +
+                     "` is not `ref`/`out` — remove the `" + am +
+                     "` at the call site";
+        } else {
+            detail = "the `" + am + "` argument does not match parameter `" +
+                     pname + "`'s `" + pm + "` modifier";
+        }
+        break;
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, chain->span.begin,
+        "call to `" + spelling + "` has a call-site `ref`/`out` mismatch: " +
+            detail +
+            " (§22.3 — the caller writes `ref`/`out` at the call site, and "
+            "only for a `ref`/`out` parameter)");
+}
+
 // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
 // §22.10, v0.306): the `base(...)` twin of `publishPrimaryCtorChainBinding`
 // above — publish the §22.5 argument BINDING for an explicit derived
