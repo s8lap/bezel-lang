@@ -17813,14 +17813,27 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     // genericArgs[0], so an untyped handler lambda's `(e)` param is typed as T
     // and its body resolves `e.Field` — the same seeding the direct-event path
     // provides above.
+    //
+    // fix #4898 (narrow): the SharedEventSource<T> / ISharedEvent<T> cross-
+    // domain publication-point pair is added here for the same reason — an
+    // un-annotated handler lambda on `.Subscribe` / `.Add` / `+=` would
+    // otherwise stay untyped and the §27.4 "no target type" reject would fire
+    // before #4920's capture-freedom check (or the handler-slot check in
+    // plainEventHandlerSlot below, fix #4898 commit 1). The handler TYPE is
+    // `(T) -> ()` (capture-free), the same shape as the plain pair, and
+    // `T = genericArgs[0]`. `Remove` takes the same `(T) -> ()` shape (call-
+    // bounded; the lambda is just compared against the subscriber list) so
+    // it seeds the parameter too.
     const TypeRef* recvTy = ctx_.exprType(*ma->target);
     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
         !recvTy->declaration && recvTy->astNode &&
         recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
-        (recvTy->headName() == "EventSource" ||
-         recvTy->headName() == "AsyncEventSource") &&
-        !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
-        return recvTy->genericArgs[0];
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+        const std::string_view hn = recvTy->headName();
+        if (hn == "EventSource" || hn == "AsyncEventSource" ||
+            hn == "SharedEventSource" || hn == "ISharedEvent")
+            return recvTy->genericArgs[0];
+    }
     return nullptr;
 }
 
@@ -17832,10 +17845,16 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
 // handler is `() -> ()`), `isAsync` (handler returns `Task`) and `asyncKnown`
 // (false only for an imported `event`, whose declaration — and so its `async`
 // marker — ModuleLoader does not reconstruct; see eventHandlerPayloadType).
-// ISharedEvent<T>/SharedEventSource<T> are deliberately NOT matched: their
-// Subscribe/Add/Remove are admitted by codegen's #4901 gate
-// (sharedEventHandlerAdmissible), which already rejects every ill-typed
-// handler, and their capture-freedom by #4920 above.
+//
+// fix #4898 (narrow, stdlib §6.5; spec §27.1.1/§27.6/§28.14, v0.307): the
+// SharedEventSource<T> / ISharedEvent<T> cross-domain publication-point pair is
+// added here too — the §6.5 handler signature is the same `(T) -> ()` (with
+// the capture-free admission; see #4920), and §6.5 sentence 2's "forming a
+// method reference over a capture-free-register position is a compile error"
+// (a separate rule, #4961) is enforced at formation site, NOT here. So this
+// arm is the parameter-shape check only. SharedEventSource<T> admits all
+// three (Subscribe/Add/Remove); ISharedEvent<T> is the subscribe-only face
+// and admits Subscribe only — same shape rule as IEvent<T>/IAsyncEvent<T>.
 bool ExprTC::plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
                                    bool& isAsync, bool& asyncKnown) {
     payload = nullptr;
@@ -17871,8 +17890,10 @@ bool ExprTC::plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
         !recvTy->genericArgs[0])
         return false;
     std::string_view hn = recvTy->headName();
-    const bool source = hn == "EventSource" || hn == "AsyncEventSource";
-    const bool face = hn == "IEvent" || hn == "IAsyncEvent";
+    const bool source = hn == "EventSource" || hn == "AsyncEventSource" ||
+                        hn == "SharedEventSource";
+    const bool face = hn == "IEvent" || hn == "IAsyncEvent" ||
+                      hn == "ISharedEvent";
     if (!(source || (face && subscribe))) return false;
     payload = recvTy->genericArgs[0];
     isAsync = hn == "AsyncEventSource" || hn == "IAsyncEvent";
