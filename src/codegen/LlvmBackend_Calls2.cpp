@@ -4454,6 +4454,7 @@ bool sharedEventHandlerAdmissible(
         paramTy = sema::formalParamResolvedType(*ms, 0);
     if (!paramTy || !sharedEventTypeEq(paramTy, payload)) return false;
     if (sema::methodReturnsOwned(*ms, ctx)) return false;
+    // SEAM-DEBT: #4988 no both-sources declared-return-type accessor exists yet; AST arm then importedReturnType below
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         if (md->returnType) {
             const sema::TypeRef* rt = ctx.resolvedType(*md->returnType);
