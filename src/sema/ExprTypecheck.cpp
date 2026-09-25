@@ -15675,6 +15675,9 @@ void ExprTC::visitMember(const ast::Member& m) {
         // fix #4905 (§22.3, v0.307): the call-site `ref`/`out` rule at the
         // chain call, which no other check applies to a chain.
         checkChainRefOutModifiers(*cd);
+        // fix #4824 (§22.5 / §12.8, v0.307): a chain call no candidate
+        // constructor binds (the silent zero-fill).
+        checkChainCallBinding(*cd);
         returnCtx_ = saveRet;
         inStaticMember_ = saveStatic;
         inConstructor_ = saveCtor;

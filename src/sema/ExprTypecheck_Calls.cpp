@@ -14429,6 +14429,149 @@ void ExprTC::checkChainRefOutModifiers(const ast::ConstructorDecl& cd) {
             "only for a `ref`/`out` parameter)");
 }
 
+// fix #4824 (§22.5 "Optional parameters and named arguments" / §22.6 /
+// §12.8, v0.307): §22.5 binding at a `this(...)` / `base(...)` chain call
+// whose target is an EXPLICIT constructor. §22.5: "Every parameter that
+// declares no default must be bound … leaving one unbound … makes the
+// candidate inapplicable ([§22.6]), so at an overloaded name an applicable
+// sibling still resolves and the error is reported only where no candidate
+// survives", and it applies at "every construction site in the language".
+// The `new` form got that rejection; a chain call got none. Measured on
+// 466a28e2: `base(y := n)` into `constructor(x: int, y: int := 0)` and
+// `this(y := 6)` into the same sibling compiled clean and printed an empty
+// line — codegen's `ctorForArgs` found no target, skipped the chain, and the
+// object stayed calloc-zero. `this(zzz := 99)` (a name no constructor
+// declares), `base(z := 1)` and `base(1, 2)` with no arity-2 constructor
+// behaved the same way (#4824's comments, #4854).
+//
+// The question asked is the one §22.5 states: does ANY candidate bind the
+// call? Candidates are every non-static constructor of the target type (the
+// containing constructor excepted for `this(...)`, §12.8 "another
+// constructor"), plus its §22.10/§9.1 primary parameter list when it has one.
+// If one binds, nothing is reported here — §5.1 applicability and the §22.6
+// ranking of a chain call are #4854's wider work, `ref`/`out` is
+// `checkChainRefOutModifiers`'. So this can only reject a call NO candidate
+// could accept, and every such call was a silent zero-fill.
+//
+// Calls another check already owns are skipped, so no program gets a second
+// diagnostic for one defect:
+//   * a `this(...)` chain the resolver's #3793 self-chain check judges (or
+//     defers to `checkDeferredNamedThisChain`) — same predicate as there;
+//   * a chain that `publishPrimaryCtorChainBinding` /
+//     `publishBaseChainPrimaryBinding` binds LOUDLY against the primary list
+//     (no explicit constructor of the call's arity);
+//   * a zero-argument `base()` into a base with no primary list
+//     (`reportNoParameterlessBaseCtor`, #4549);
+//   * a misplaced or duplicated chain call (the resolver's §12.8 errors).
+// An imported target with a primary list is skipped too: no per-field
+// default crosses the wire for it (#3202), so the binder would call a
+// defaulted primary parameter required.
+// // per §22.5, fix #4824
+void ExprTC::checkChainCallBinding(const ast::ConstructorDecl& cd) {
+    if (!currentType_ || cd.isStatic || cd.body.empty() || !cd.body[0])
+        return;
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
+    if (!chain) return;
+    for (std::size_t i = 1; i < cd.body.size(); ++i) {
+        bool ignored = false;
+        if (cd.body[i] && ast::chainCallOfStmt(*cd.body[i], ignored)) return;
+    }
+    const ConstructorSymbol* self = nullptr;
+    for (Symbol* m : currentType_->members) {
+        auto* c = dynamic_cast<ConstructorSymbol*>(m);
+        if (c && c->decl == &cd) { self = c; break; }
+    }
+    TypeSymbol* target = nullptr;
+    if (isThis) {
+        target = currentType_;
+    } else {
+        for (TypeSymbol* b : currentType_->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { target = b; break; }
+    }
+    if (!target) return;
+    if (target->hasPositionalFields && ctx_.isImported(target)) return;
+    const std::size_t n = chain->args.size();
+
+    std::vector<ConstructorSymbol*> ctors;
+    bool arityMatch = false;
+    for (Symbol* m : target->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        if (isThis && cs->decl == &cd) continue;  // §12.8: another ctor
+        ctors.push_back(cs);
+        if (cs->params.size() == n) arityMatch = true;
+    }
+    if (isThis) {
+        // The #3793 self-chain domain (TypeResolution_Checks.cpp), including
+        // the named part it defers to `checkDeferredNamedThisChain`.
+        const bool classHasPrimary =
+            target->kind == ast::TypeDeclKind::Class &&
+            target->hasPositionalFields;
+        if (!classHasPrimary && self && n == self->params.size() &&
+            !arityMatch)
+            return;
+        // `publishPrimaryCtorChainBinding`'s loud primary arm.
+        if (classHasPrimary && !arityMatch) return;
+    } else {
+        // `publishBaseChainPrimaryBinding`'s loud primary arm, and #4549.
+        if (target->hasPositionalFields && !arityMatch) return;
+        if (!target->hasPositionalFields && n == 0) return;
+    }
+
+    const std::string spelling = isThis ? "this(...)" : "base(...)";
+    const std::string desc = "`" + spelling +
+                             "` constructor chain call in `" +
+                             std::string(currentType_->name) + "`";
+    const std::vector<ast::CallArgument>& args = chain->args;
+    const SourceLocation loc = chain->span.begin;
+    std::vector<const Symbol*> fields;
+    if (target->hasPositionalFields) {
+        fields = recordPositionalFieldSymbols(target);
+        if (!fields.empty() &&
+            bindArgsToParams(sema::FormalsView::of(fields), args, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return;
+    }
+    // §22.7: a class declaring no constructor at all has the implicit
+    // parameterless one (only reachable as a `base(...)` target here).
+    if (ctors.empty() && !target->hasPositionalFields &&
+        target->kind == ast::TypeDeclKind::Class && n == 0)
+        return;
+    for (ConstructorSymbol* cs : ctors)
+        if (bindArgsToParams(sema::FormalsView::of(*cs), args, loc, desc,
+                             /*emit=*/false)
+                .ok)
+            return;
+
+    // No candidate binds. With a single candidate (or a single one of the
+    // call's arity) report the binder's own §22.5 reason — the text a
+    // `new T(...)` of the same shape gets; otherwise name the failure.
+    const ConstructorSymbol* reportOn = nullptr;
+    if (ctors.size() == 1 && fields.empty()) {
+        reportOn = ctors[0];
+    } else {
+        for (ConstructorSymbol* cs : ctors) {
+            if (cs->params.size() != n) continue;
+            if (reportOn) { reportOn = nullptr; break; }
+            reportOn = cs;
+        }
+    }
+    if (reportOn) {
+        (void)bindArgsToParams(sema::FormalsView::of(*reportOn), args, loc,
+                               desc, /*emit=*/true);
+        return;
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        desc + ": no " + (isThis ? "other " : "") + "constructor of `" +
+            std::string(target->name) +
+            "` can bind these arguments — each candidate leaves a required "
+            "parameter unbound, lacks a parameter the call names, or takes "
+            "fewer arguments (§12.8, §22.5, §22.6)");
+}
+
 // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
 // §22.10, v0.306): the `base(...)` twin of `publishPrimaryCtorChainBinding`
 // above — publish the §22.5 argument BINDING for an explicit derived

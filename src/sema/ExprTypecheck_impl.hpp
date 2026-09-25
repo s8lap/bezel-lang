@@ -2840,6 +2840,11 @@ private:
     // mismatch only when no candidate constructor binding the call accepts
     // its modifiers. See the definition in ExprTypecheck_Calls.cpp.
     void checkChainRefOutModifiers(const ast::ConstructorDecl& cd);
+    // fix #4824 (§22.5 / §22.6 / §12.8, v0.307): reject a `this(...)` /
+    // `base(...)` chain call that NO candidate constructor of the target
+    // type §22.5-binds (an unbound required parameter, an unknown name, too
+    // many arguments). See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainCallBinding(const ast::ConstructorDecl& cd);
     // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
     // of the above — the §22.5 binding of a derived constructor's leading
     // `base(...)` arguments to the BASE class's primary-constructor parameter
