@@ -11998,9 +11998,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // buildOrderedArgs exactly: a `null` literal becomes the
                 // all-zero `{i8 0, T 0}` (nullableValueNull); a bare T
                 // becomes `{i8 1, T}` (wrapNullableValue); a value already
-                // shaped is left alone. No-op for ref/out (the `byRef` arm
-                // passes an address, which the callee receives as a pointer
-                // and never a tagged struct).
+                // shaped is left alone.
+                //
+                // fix #4940 / §5.1 (v0.307): add the S? → T? lift-widen
+                // buildOrderedArgs's #4967 fix added. The earlier three-line
+                // mirror matched the SHAPE only — an `int?` argument at a
+                // `long?` formal left the i32 carrier untouched, and
+                // `verifyModule` rejected the call (`{i8, i32}` supplied
+                // against `{i8, i64}` declared). Without the lift the local
+                // ctor / method path was right but every cross-module call
+                // crashed the IR verifier (a 4294967295 read on the non-null
+                // arm if the bad IR made it to the linker — exactly the
+                // symptom #4940 reports on a single-module probe). Extract
+                // the payload, sign/zero-extend per §5.1, re-wrap into the
+                // expected struct. Same widening shape as the local twin,
+                // gated on numeric payloads so a `record?` to `record?`
+                // pass is still a no-op.
                 if (!byRef && formalTy && isNullableValueTy(formalTy)) {
                     auto* expectedSt = nullableValueStructTy(formalTy);
                     if (v->getType() != expectedSt) {
@@ -12010,6 +12023,41 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         } else if (v->getType() ==
                                    expectedSt->getElementType(1)) {
                             v = wrapNullableValue(formalTy, v);
+                        } else if (auto* vSt =
+                                       llvm::dyn_cast<llvm::StructType>(
+                                           v->getType())) {
+                            // S? → T? widening (mirrors buildOrderedArgs
+                            // widenNullableArgPayload #4967).
+                            auto numeric = [](llvm::Type* t) {
+                                return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                                       t->isFloatingPointTy();
+                            };
+                            if (vSt != expectedSt &&
+                                vSt->getNumElements() == 2 &&
+                                vSt->getElementType(0) == nullablePrimHasValTy() &&
+                                expectedSt->getNumElements() == 2 &&
+                                expectedSt->getElementType(0) ==
+                                    nullablePrimHasValTy() &&
+                                numeric(vSt->getElementType(1)) &&
+                                numeric(expectedSt->getElementType(1))) {
+                                llvm::Type* dstPay =
+                                    expectedSt->getElementType(1);
+                                llvm::Value* conv = coerceNumericToType(
+                                    builder_.CreateExtractValue(
+                                        v, {1u}, "imp.arg.lift.in"),
+                                    dstPay,
+                                    a.value &&
+                                        isUnsignedTargetExpr(*a.value));
+                                if (conv && conv->getType() == dstPay) {
+                                    llvm::Value* res = builder_.CreateInsertValue(
+                                        llvm::UndefValue::get(expectedSt),
+                                        builder_.CreateExtractValue(
+                                            v, {0u}, "imp.arg.lift.has"),
+                                        {0u});
+                                    v = builder_.CreateInsertValue(
+                                        res, conv, {1u}, "imp.arg.lift");
+                                }
+                            }
                         }
                     }
                 }

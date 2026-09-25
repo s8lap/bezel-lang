@@ -8826,10 +8826,59 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 // §5.1: widen an int argument to a wider numeric parameter, as
                 // the in-module ctor-call path does, so the ABI matches.
-                if (ai + 1 < fnTy->getNumParams())
-                    v = coerceNumericToType(
-                        v, fnTy->getParamType(ai + 1),
-                        isUnsignedTargetExpr(*ne.args[ai].value));
+                //
+                // fix #4940 / §5.1 (v0.307): add the S? → T? lift-widen the
+                // local buildOrderedArgs path's #4967 fix added. `coerceNumericToType`
+                // alone widens a bare i32 to i64 but leaves an `{i8, i32}`
+                // carrier untouched — an `int?` arg at a `long?` imported
+                // formal then hit `verifyModule` ("Call parameter type does
+                // not match function signature", `{i8,i32}` vs `{i8,i64}`),
+                // and on the happy path the callee read the non-null bit as
+                // 1 against the i32 zero, returning 4294967295 instead of null.
+                // Mirror buildOrderedArgs's widenNullableArgPayload: extract
+                // the i32 payload, coerce to i64, re-wrap into the expected
+                // `{i8, i64}` struct. Numeric-only — leaves a `record?` arg
+                // at a `record?` formal as a no-op (the local twin accepts
+                // the same shape as-is).
+                if (ai + 1 < fnTy->getNumParams()) {
+                    llvm::Type* expectedArgTy = fnTy->getParamType(ai + 1);
+                    if (auto* vSt = llvm::dyn_cast<llvm::StructType>(v->getType())) {
+                        auto numeric = [](llvm::Type* t) {
+                            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                                   t->isFloatingPointTy();
+                        };
+                        if (auto* eSt =
+                                llvm::dyn_cast<llvm::StructType>(expectedArgTy)) {
+                            if (vSt != eSt &&
+                                vSt->getNumElements() == 2 &&
+                                vSt->getElementType(0) == nullablePrimHasValTy() &&
+                                eSt->getNumElements() == 2 &&
+                                eSt->getElementType(0) == nullablePrimHasValTy() &&
+                                numeric(vSt->getElementType(1)) &&
+                                numeric(eSt->getElementType(1))) {
+                                llvm::Type* dstPay = eSt->getElementType(1);
+                                llvm::Value* conv = coerceNumericToType(
+                                    builder_.CreateExtractValue(
+                                        v, {1u}, "imp.ctor.arg.lift.in"),
+                                    dstPay,
+                                    isUnsignedTargetExpr(*ne.args[ai].value));
+                                if (conv && conv->getType() == dstPay) {
+                                    llvm::Value* res = builder_.CreateInsertValue(
+                                        llvm::UndefValue::get(eSt),
+                                        builder_.CreateExtractValue(
+                                            v, {0u}, "imp.ctor.arg.lift.has"),
+                                        {0u});
+                                    v = builder_.CreateInsertValue(
+                                        res, conv, {1u}, "imp.ctor.arg.lift");
+                                }
+                            }
+                        }
+                    }
+                    if (v->getType() != expectedArgTy)
+                        v = coerceNumericToType(
+                            v, expectedArgTy,
+                            isUnsignedTargetExpr(*ne.args[ai].value));
+                }
                 args.push_back(v);
             }
             // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor
