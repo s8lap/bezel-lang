@@ -109,8 +109,9 @@ class CapTest(DaemonTestBase):
               for _ in range(2)]
         for p in ps:
             self.assertEqual(p.wait(timeout=60), 0)
-        events = sorted((float(t), 1 if s == "+" else -1)
-                        for s, t in (line.split() for line in open(log)))
+        with open(log) as f:
+            events = sorted((float(t), 1 if s == "+" else -1)
+                            for s, t in (line.split() for line in f))
         running = peak = 0
         for _, delta in events:
             running += delta
