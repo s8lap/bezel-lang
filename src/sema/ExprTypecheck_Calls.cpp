@@ -20448,6 +20448,94 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // stdlib §6.7 (v0.307) / issue #4977: `Task` has NO static PROPERTIES —
+    // its entire documented surface is static METHODS (Delay, FromResult,
+    // FromOwnedResult, FromException, FromCancelled, WhenAll/WhenAllOwned,
+    // WhenAny, WhenEach/WhenEachOwned, FireAndForget). `Task.CompletedTask`
+    // does not exist (`Bezel_For_Code_Generation.md` §5 lists it explicitly
+    // among the invented APIs a model reaches for, with `Task.FromResult`
+    // as the real replacement); the stdlib §6.7 `Task` class declares no
+    // such member either.
+    //
+    // A bare (uncalled) `Task.<member>` reference reaches THIS function
+    // (resolveMemberAccess), not the CallExpr-specific `kStaticSurfaces`
+    // closed-surface table (#3021/#3024, further below in this file) —
+    // that table only runs for the CALL form (`Task.FromResult(...)`),
+    // whose callee MemberAccessExpr is visited here FIRST but is exempted
+    // below via `calleeOfCallCtx_`. Before this fix, an unrecognized bare
+    // reference like `Task.CompletedTask` matched nothing in this entire
+    // function and fell through to the final silent `return;` — no
+    // exprType, no diagnostic. The `return Task.CompletedTask;` statement
+    // then failed to lower in codegen and silently degraded to a zero/null
+    // return value (the #2491 "degraded to a zero/null return value"
+    // INTERNAL warning) instead of a compile error; the caller then awaits
+    // that zero/null value as if it were a real `Task` and SIGSEGVs
+    // (issue #4977). Reject it here instead, mirroring the
+    // `CancellationToken.None` / `Encoding.<X>` closed-surface rejects
+    // above/below.
+    //
+    // BUILTIN-ONLY GATE (mirrors #3024's `isBuiltinStatic` gate on the
+    // CALL-form table): a user class legitimately named `Task` (pinned by
+    // `tests/sema/static_class_closed_surface_3024_test.cpp`'s
+    // `user_class_with_same_name_as_builtin_is_unaffected` case) has a
+    // TypeSymbol with `decl != nullptr` (a real backing ast::TypeDecl);
+    // the built-in `Task`'s synthetic TypeSymbol (set by
+    // `ExprTypecheck_Exprs.cpp`'s `setExprSymbol(&e, builtinClassSym(name))`)
+    // has `decl == nullptr`. Only fire when the receiver is the builtin.
+    if (ma.target && &ma != calleeOfCallCtx_) {
+        if (auto* tkid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (tkid->name == "Task") {
+                auto* tkSym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tkid));
+                bool isBuiltinTask = tkSym && tkSym->decl == nullptr;
+                if (isBuiltinTask) {
+                    static const std::string_view kTaskStaticMembers[] = {
+                        "Delay", "FromResult", "FromOwnedResult",
+                        "FromException", "FromCancelled", "WhenAll",
+                        "WhenAllOwned", "WhenAny", "WhenEach",
+                        "WhenEachOwned", "FireAndForget"};
+                    bool known = false;
+                    for (auto km : kTaskStaticMembers)
+                        if (ma.member == km) { known = true; break; }
+                    if (!known) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("no member `") +
+                                std::string(ma.member) +
+                            "` on `Task`; documented surface: "
+                            "Delay(int)|Delay(TimeSpan)|Delay(int, "
+                            "CancellationToken)|Delay(TimeSpan, "
+                            "CancellationToken) -> Task; "
+                            "FromResult<T>(value: T) -> Task<T>; "
+                            "FromOwnedResult<T>(owned value: T) -> "
+                            "OwningTask<T> (Pattern B, \xC2\xA7""30.5); "
+                            "FromException<T>(exc) -> Task<T>; "
+                            "FromCancelled<T>() -> Task<T>; "
+                            "WhenAll(tasks: Array<Task>) -> Task; "
+                            "WhenAll<T>(tasks: Array<Task<T>>) -> "
+                            "Task<Array<T>>; "
+                            "WhenAllOwned<T>(owned tasks: "
+                            "OwningArray<OwningTask<T>>) -> "
+                            "OwningTask<OwningArray<T>> (\xC2\xA7""30.10); "
+                            "WhenAny(tasks: Array<Task>) -> "
+                            "Task<int> (winner index, \xC2\xA7""6.7); "
+                            "WhenEach(tasks: Array<Task>) -> "
+                            "IAsyncEnumerable<Task> (\xC2\xA7""30.10); "
+                            "WhenEach<T>(tasks: Array<Task<T>>) -> "
+                            "IAsyncEnumerable<Task<T>>; "
+                            "WhenEachOwned<T>(owned tasks: "
+                            "OwningArray<OwningTask<T>>) -> "
+                            "IOwningAsyncEnumerable<OwningTask<T>> "
+                            "(\xC2\xA7""30.10); "
+                            "FireAndForget(owned task) (\xC2\xA7""30.9) "
+                            "(stdlib \xC2\xA7""6.7); `Task` has no static "
+                            "properties — use `Task.FromResult(...)` for "
+                            "an already-completed task");
+                        return;
+                    }
+                }
+            }
+        }
+    }
     // §32.7 / stdlib §10 (#1512): `IntPtr.Zero` / `UIntPtr.Zero` — the null
     // pointer, a compiler-provided static `const` on the FFI value type. The
     // target `IntPtr`/`UIntPtr` identifier carries no symbol (silently passed at
