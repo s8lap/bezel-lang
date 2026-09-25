@@ -4795,8 +4795,17 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   // `argIdx` is the §22.5 binding's bound argument index
                   // for the slot, not the slot's positional index — the
                   // caller may have bound a NAMED argument).
+                  // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): a positional
+                  // `(v: T)` field of the instantiation being constructed at
+                  // `T = string` (the new type's substitution is the active
+                  // one here) takes the same +1. `argExpr` is the CALL-SITE
+                  // expression, typed in the caller's terms, so the producer
+                  // test keeps its meaning: a `string`-typed producer argument
+                  // is transferred, a `U`-typed one from a generic caller is
+                  // never a recognised producer and is retained.
                   if (v->getType()->isPointerTy() &&
-                      isStringStorageMember(fs) &&
+                      (isStringStorageMember(fs) ||
+                       isTypeParamStringStorageMember(fs)) &&
                       !isPlusOneStringProducer(argExpr))
                       emitStringRetain(v);
                   builder_.CreateStore(

@@ -6072,7 +6072,17 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 bool classField = cls && cls->kind == ast::TypeDeclKind::Class;
                 bool strField = classField && isStringStorageMember(ps) &&
                                 valArg.getType()->isPointerTy();
-                bool closureField = classField && !strField &&
+                // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): a bare-`T`
+                // auto-property at `T = string` (this accessor is emitted per
+                // instantiation with its substitution active). Retain the new
+                // value so the backing field owns the +1 the specialized
+                // disposer releases; keep the old value (leak) rather than
+                // release it — a caller in a generic body may hold it in a
+                // `T` local that owns no +1 (see isTypeParamBoundToString).
+                bool tpStrField = classField && !strField &&
+                                  isTypeParamStringStorageMember(ps) &&
+                                  valArg.getType()->isPointerTy();
+                bool closureField = classField && !strField && !tpStrField &&
                                     isClosureStorageMember(ps) &&
                                     valArg.getType()->isPointerTy();
                 // fix #2500 (§23.3/§28.9): box-typed (Object/interface) CLASS
@@ -6082,8 +6092,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // confirms the field ONLY ever holds boxes, so bz_box_retain/
                 // release are type-correct here (never called on a class-ref
                 // pointer, which lacks a box header).
-                bool boxField = classField && !strField && !closureField &&
-                                isBoxStorageMember(ps) &&
+                bool boxField = classField && !strField && !tpStrField &&
+                                !closureField && isBoxStorageMember(ps) &&
                                 valArg.getType()->isPointerTy();
                 if (strField) {
                     llvm::Value* oldVal = builder_.CreateLoad(
@@ -6091,6 +6101,9 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                     emitStringRetain(&valArg);
                     builder_.CreateStore(&valArg, slot);
                     emitStringRelease(oldVal);
+                } else if (tpStrField) {
+                    emitStringRetain(&valArg);
+                    builder_.CreateStore(&valArg, slot);
                 } else if (closureField) {
                     llvm::Value* oldVal = builder_.CreateLoad(
                         ptrTy(), slot, "propset.clo.old");

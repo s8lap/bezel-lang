@@ -11820,6 +11820,57 @@ private:
                rt->primitive == sema::PrimitiveType::String;
     }
 
+    // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): closes the class-side gap the
+    // #3964 comment above left open — a CLASS field / auto-property whose
+    // declared type is a bare type parameter (`_v: T`, `property Q: T`,
+    // positional `(v: T)`, or `T?`) instantiated at `string`. Before this fix
+    // the class's retain/release pair was blind to it EXCEPT at one site: a
+    // store whose TARGET is typed `string` at the use site (`e.Q := x` on a
+    // `B<string>` receiver — sema substitutes there, so isStringFieldLvalue
+    // fires) released the old value. The constructor store (`Q := v` inside
+    // B<T>'s body, typed `T`) never retained it, so that release freed the
+    // CALLER's string (heap-use-after-free), and the disposer never released
+    // the final value (leak).
+    //
+    // The balanced policy this predicate drives, and why each half is shaped
+    // as it is:
+    //   * EVERY store whose target is such a member retains the new value
+    //     (the ctor / generic-body `:=` and `??=`, the auto-property setter
+    //     body, the positional primary-ctor store, the field initializer). So
+    //     the member always owns a +1 of its current value.
+    //   * The per-instantiation disposer (emitted with the substitution
+    //     active — `layoutDiffers` forces the specialized disposer at every
+    //     pointer-sized instantiation, Setup.cpp needsSpecDispose) releases it.
+    //   * The existing string-typed external store keeps its release-old.
+    //   * A store that is only string AFTER substitution (inside the generic
+    //     body, or the shared auto setter) does NOT release the old value: a
+    //     `T`-typed local / parameter in a generic body takes no +1 of its own
+    //     at `string` (the string-local refcount arming is sema-typed), so
+    //     `var old := _v; _v := x; return old;` would dangle `old` if this
+    //     store released. The old +1 leaks instead — never a UAF or a double
+    //     free. Making `T` locals refcounted at `string` is a broader
+    //     retain-policy change, filed as #4980.
+    //
+    // Resolution goes through resolveTypeParamRef (the ACTIVE substitution),
+    // so this is only ever true while a body / disposer / accessor of the
+    // member's instantiation is being emitted with its substitution
+    // installed; with none active (the shared, i32-erased template) it is
+    // false and nothing changes. Declared-type read is the same bare
+    // recordMemberType as isStringStorageMember (an IMPORTED member has no
+    // AST-typed declaration and stays blind on BOTH halves — the #3964
+    // "consistently blind" balance is preserved for it). An `int`/class
+    // instantiation resolves to a non-string and is untouched.
+    bool isTypeParamBoundToString(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        const sema::TypeRef* r = resolveTypeParamRef(rt);
+        return r && r != rt && r->kind == sema::TypeRef::Kind::Primitive &&
+               r->primitive == sema::PrimitiveType::String;
+    }
+    bool isTypeParamStringStorageMember(const sema::Symbol* m) {
+        return isTypeParamBoundToString(recordMemberType(m));
+    }
+
     // fix #3945 / #3964 review (§9.7 / §28.9 / §14.1, v0.294): the
     // substitution-aware twin of isStringStorageMember just above, used ONLY
     // by the RECORD string-field walk — recordHasStringFields and
@@ -16154,6 +16205,16 @@ private:
     // record field)? Only such a location owns an independent +1 released on the
     // owner's disposal — see lowerStringFieldStore / emitOwnedFieldDisposals.
     bool isStringFieldLvalue(const ast::Expr& target);
+    // fix #4965 (§4.6 / §28.9 / §14.1): the substitution-only twin of
+    // isStringFieldLvalue — `target` is a CLASS instance field / auto-property
+    // lvalue whose use-site type is a bare type parameter the ACTIVE
+    // substitution binds to `string` (a store inside a generic body lowered at
+    // `string`). Mutually exclusive with isStringFieldLvalue (that one requires
+    // the sema type itself to be `string`). See isTypeParamBoundToString for
+    // the retain-new / keep-old policy such a store follows.
+    bool isTypeParamStringFieldLvalue(const ast::Expr& target);
+    // fix #4965: the class-field-storage half of the two predicates above.
+    bool isClassFieldStorageLvalue(const ast::Expr& target);
     // #429 / §4.6 / §28.9: REASSIGNMENT `x := newVal` where `x` is a string-typed
     // LOCAL/parameter SLOT. Retain-new (transfer a producer) / store / release-
     // old, so the slot keeps owning an independent +1 across the reassignment and

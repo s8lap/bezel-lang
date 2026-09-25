@@ -12505,6 +12505,13 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (v->getType()->isPointerTy() && isStringStorageMember(m) &&
             !isPlusOneStringProducer(init))
             emitStringRetain(v);
+        // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): a bare-`T` field
+        // initializer at `T = string` — the initializer is `T`-typed, so it is
+        // never a recognised producer: always retain (a spurious retain only
+        // leaks). The specialized disposer releases it.
+        else if (v->getType()->isPointerTy() &&
+                 isTypeParamStringStorageMember(m))
+            emitStringRetain(v);
         // #429 (closure FIELD-STORE category) / §27.5 / §28.9: a CLASS closure
         // field / auto-property initializer gives the field its own reference,
         // like a later assignment. The field is calloc-zeroed (null) before
@@ -24373,6 +24380,24 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
 // (they keep the plain-store / leak behaviour).
 bool Emitter::isStringFieldLvalue(const ast::Expr& target) {
     if (!isStringExprType(target)) return false;
+    return isClassFieldStorageLvalue(target);
+}
+
+// fix #4965 (§4.6 / §28.9 / §14.1, v0.307): see the declaration comment. The
+// use-site type (`ctx_.exprType(target)`) is expressed in the terms of the body
+// being lowered, whose own substitution is the active one — so resolving it
+// through resolveTypeParamRef is exact for `_v := v` / `Q := v` in B<T>'s
+// constructor, methods and accessors at B<string>.
+bool Emitter::isTypeParamStringFieldLvalue(const ast::Expr& target) {
+    if (isStringExprType(target)) return false;  // the sema-string twin's case
+    if (!isTypeParamBoundToString(ctx_.exprType(target))) return false;
+    return isClassFieldStorageLvalue(target);
+}
+
+// fix #4965: the storage classification (everything after the type test),
+// shared by isStringFieldLvalue and isTypeParamStringFieldLvalue so the two can
+// never disagree about WHICH locations are class field storage.
+bool Emitter::isClassFieldStorageLvalue(const ast::Expr& target) {
     if (localSlot(target)) return false;       // a plain local / parameter
     {
         llvm::Type* dummy = nullptr;
@@ -24412,6 +24437,22 @@ bool Emitter::lowerStringFieldStore(const ast::Expr& target,
                                     llvm::Value* fieldAddr,
                                     llvm::Value* newVal,
                                     const ast::Expr* valueExpr) {
+    // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): a bare-`T` class field stored
+    // from inside the generic body at `T = string` (B<T>'s constructor
+    // `Q := v`, a method's `_v := x`). RETAIN the new value unconditionally
+    // (a `T`-typed value expression is never a recognised +1 producer, and a
+    // spurious retain can only leak) so the field owns the +1 its specialized
+    // disposer — and a later string-typed external store — releases. Do NOT
+    // release the old value: a `T` local in this same body holds no +1 of its
+    // own (see isTypeParamBoundToString), so `var old := _v; _v := x;` would
+    // dangle `old`. The old value's +1 leaks — never a UAF / double free.
+    if (isTypeParamStringFieldLvalue(target)) {
+        if (!fieldAddr || !newVal || !newVal->getType()->isPointerTy())
+            return false;
+        emitStringRetain(newVal);
+        builder_.CreateStore(newVal, fieldAddr);
+        return true;
+    }
     if (!isStringFieldLvalue(target)) return false;
     if (!fieldAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;
@@ -24488,7 +24529,18 @@ bool Emitter::lowerStringRefParamStore(const ast::Expr& target,
     if (!slotAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;
     if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
-    if (!isStringExprType(target)) return false;            // not string-typed
+    // fix #4965 (§22.3 / §28.9 / §14.1, v0.307): a `ref`/`out` parameter typed
+    // by a bare type parameter the active substitution binds to `string`
+    // (`Put<U>(ref x: U, v: U) x := v;` at U = string). The alias may name a
+    // bare-`T` class field at `string`, which now owns a +1 its specialized
+    // disposer releases — so the store must retain, or that release frees a
+    // value nobody minted. Retain-only, never release the old value, for the
+    // reason isTypeParamBoundToString gives: whatever the alias names may be
+    // a `T` local holding no +1. Worst case the old value leaks.
+    const bool tpString = !isStringExprType(target) &&
+                          isTypeParamBoundToString(ctx_.exprType(target));
+    if (!isStringExprType(target) && !tpString)
+        return false;                                       // not string-typed
     // Confirm the target is a `ref`/`out` param — a local-slot reassignment
     // would have been caught by lowerStringLocalReassign; this helper exists
     // for the ref/out alias shape specifically.
@@ -24496,6 +24548,11 @@ bool Emitter::lowerStringRefParamStore(const ast::Expr& target,
     sema::Symbol* sym = ctx_.exprSymbol(target);
     if (!sym) return false;
     if (refParams_.find(sym) == refParams_.end()) return false;
+    if (tpString) {
+        emitStringRetain(newVal);
+        builder_.CreateStore(newVal, slotAddr);
+        return true;
+    }
     if (const sema::TypeRef* tt = ctx_.exprType(target))
         if (tt->nullable) return false;  // mirror local-reassign restriction
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strrp.old");

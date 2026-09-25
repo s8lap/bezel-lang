@@ -1432,6 +1432,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     rhs->getType()->isPointerTy() &&
                     !isPlusOneStringProducer(as->value.get()))
                     emitStringRetain(rhs);
+                // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): the bare-`T`
+                // field at `T = string` twin — always retain (see
+                // lowerStringFieldStore); the slot is null here, so there is
+                // no old value either way.
+                else if (isTypeParamStringFieldLvalue(*as->target) &&
+                         rhs->getType()->isPointerTy())
+                    emitStringRetain(rhs);
                 builder_.CreateStore(rhs, addr);
                 // §22.16's "throw exits check nothing": a store sequence that
                 // left the current block terminated (an unwind edge) must not

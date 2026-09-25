@@ -1674,8 +1674,21 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            if (!isStringStorageMember(m)) continue;
+            // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): also a bare-`T`
+            // member at `T = string` — this walk runs inside the
+            // per-instantiation disposer (needsSpecDispose's layoutDiffers
+            // clause forces one at every pointer-sized instantiation) with the
+            // substitution active, and every store into such a member now
+            // retains (see isTypeParamBoundToString). The slot-type check keeps
+            // the release off anything that is not a pointer slot in the
+            // struct actually being walked.
+            if (!isStringStorageMember(m) &&
+                !isTypeParamStringStorageMember(m))
+                continue;
             unsigned idx = fieldIndex_[m];
+            if (!isStringStorageMember(m) &&
+                !sst->getElementType(idx)->isPointerTy())
+                continue;
             llvm::Value* addr = builder_.CreateStructGEP(sst, currentThis_, idx,
                                                          "strf.addr");
             llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "strf.val");
