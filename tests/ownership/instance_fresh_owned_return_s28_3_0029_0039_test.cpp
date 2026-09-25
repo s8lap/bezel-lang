@@ -18,9 +18,8 @@
 // on the fix).
 //
 // This is issue #1538's other still-open half ("reject owned-LHS := borrow")
-// sibling defect at the RETURN site rather than the reassignment site — see
-// instance_state_match_reassign_s28_3_0006_test.cpp for the reassignment
-// half.
+// sibling defect at the RETURN site rather than the reassignment site — the
+// reassignment half is still open; s28_3_0006 is pinned to #4842/#4846.
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
