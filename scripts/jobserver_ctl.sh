@@ -13,9 +13,27 @@
 # Restart=on-failure brings it back if it dies.
 #
 # The start limit stops a restart loop (e.g. another daemon already serves the
-# dir, or the worktree holding this script was removed): 3 failed starts in
-# 2 min leave the unit failed; `start` resets it. Start it from the main
-# checkout, not a lane worktree, so a later restart still finds the script.
+# dir): 3 failed starts in 2 min leave the unit failed; `start` resets it.
+#
+# `start` embeds $js (below) in the transient unit's ExecStart, and a later
+# Restart=on-failure restart re-execs that SAME path. A linked worktree (any
+# `git worktree add`, including a lane) can be torn down while the daemon it
+# started keeps running — python already read the whole file into memory once
+# `serve` starts, so the daemon PROCESS survives (see build_jobserver.py's
+# module docstring) — but the NEXT automatic restart would then try to exec a
+# path that no longer exists, and the daemon would silently stop coming back.
+# A first attempt at fixing this tried "resolve $js to a stable path instead"
+# (git's common dir, shared by every worktree, i.e. the main checkout) —
+# that turned out NOT to be simpler or more robust: this repo routinely runs
+# several worktrees on independent branches/commits at once (see CLAUDE.md,
+# "Dual-coordinator runs"), so the main checkout's OWN working tree can be
+# sitting on a branch that predates this very script, or holds a stale copy
+# of it (measured while building this fix: the main checkout here had no
+# scripts/build_jobserver.py at all). So instead: `start` REFUSES from a
+# linked worktree, with a clear message and nonzero exit; `stop`/`status`
+# are unaffected (they never touch ExecStart). A worktree meant to be the
+# daemon's dedicated, long-lived home (not a lane that will be reaped) opts
+# in with BEZEL_JOBSERVER_ALLOW_WORKTREE=1.
 #
 # Why 20 tokens: the heavy slice has ~18 cores, and every joined build keeps
 # one implicit job on top of the shared tokens, so 20 tokens with a handful of
@@ -33,6 +51,26 @@ UNIT=bezel-jobserver
 here="$(cd "$(dirname "$0")" && pwd)"
 js="$here/build_jobserver.py"
 dir="${BEZEL_JOBSERVER_DIR:-/var/tmp/bezel-scratch/jobserver}"
+
+# See the header comment: refuse `start` from a linked worktree unless the
+# operator opts in explicitly. A linked worktree's --git-dir lives under the
+# common dir's worktrees/ subdirectory; the main checkout's --git-dir IS the
+# common dir. `--path-format=absolute` (git >= 2.31) sidesteps the relative-
+# vs-absolute spelling difference between the two ("./.git" vs
+# "/path/.git/worktrees/name") so the comparison cannot be fooled by that.
+if [ "${1:-status}" = start ] && [ -z "${BEZEL_JOBSERVER_ALLOW_WORKTREE:-}" ]; then
+  _gd="$(git -C "$here" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
+  _gcd="$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$_gd" ] && [ -n "$_gcd" ] && [ "$_gd" != "$_gcd" ]; then
+    echo "jobserver_ctl: refusing to start from a LINKED worktree ($here)." >&2
+    echo "  A linked worktree (this includes a lane) can be torn down while the" >&2
+    echo "  daemon runs, breaking its Restart=on-failure path silently later." >&2
+    echo "  Start it from the main checkout, or set" >&2
+    echo "  BEZEL_JOBSERVER_ALLOW_WORKTREE=1 if this worktree is a dedicated," >&2
+    echo "  long-lived home for the daemon (not a lane that will be reaped)." >&2
+    exit 1
+  fi
+fi
 
 case "${1:-status}" in
   start)
