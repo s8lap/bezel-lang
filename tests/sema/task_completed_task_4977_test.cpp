@@ -40,10 +40,18 @@
 // form) must be unaffected for the BARE-reference form too; this file adds
 // that pin.
 
+#include "driver/Driver.hpp"
 #include "support/aot_support.hpp"   // runAot — the real bezelc AOT oracle
+#include "support/scratch_dir.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <sys/wait.h>
+#include <vector>
 
 using bezel::test::runAot;
 
@@ -68,6 +76,42 @@ bool rejectedAsUnknownTaskMember(const std::string& program,
     }
     return false;
 }
+
+// Cross-module harness for the imported-user-`Task` rows (Parts 6–8):
+// compile `libSrc` to a library object, compile `mainSrc` against it as a
+// dependency (§2.5), link, run, and return the exit code — -1 on any
+// compile, link or run failure. Scratch lives under the worktree scratch
+// dir, never /tmp.
+struct TempFile4977 {
+    std::string path;
+    explicit TempFile4977(std::string p) : path(std::move(p)) {}
+    ~TempFile4977() { std::remove(path.c_str()); }
+};
+
+int buildAndRunWithLib(const std::string& libSrc, const std::string& mainSrc) {
+    const std::filesystem::path& dir = wtScratchDir("wt-4977");
+    const std::string stem = unique_stem("bezel_4977_");
+    TempFile4977 libBzl((dir / (stem + "_lib.bzl")).string());
+    TempFile4977 libObj((dir / (stem + "_lib.o")).string());
+    TempFile4977 mainBzl((dir / (stem + "_main.bzl")).string());
+    TempFile4977 exe((dir / stem).string());
+    { std::ofstream(libBzl.path) << libSrc; }
+    { std::ofstream(mainBzl.path) << mainSrc; }
+    bezel::Driver driver;
+    if (!driver.compileObject(libBzl.path, libObj.path).success) return -1;
+    std::vector<bezel::Dependency> deps;
+    deps.push_back(bezel::Dependency{libObj.path, libObj.path});
+    if (!driver.compileFile(mainBzl.path, exe.path, deps).success) return -1;
+    int status = std::system(exe.path.c_str());
+    if (status == -1 || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+const char* const kLibWithUserTask =
+    "module Lib;\n"
+    "public static class Task\n"
+    "  public static readonly property Answer: int := 42;\n"
+    "end Task;\n";
 
 }  // namespace
 
@@ -167,4 +211,111 @@ BEZEL_TEST(task_completed_task_4977,
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
     if (r.ran) BEZEL_EXPECT_EQ(42, r.exitCode);
+}
+
+// ── Part 5: an import alias named `Task` does NOT shadow the builtin ──
+//
+// narrow #4977. Spec §2.7 rule 1 (v0.307): a chain head resolves through
+// "local scope, then the enclosing type's accessible members ..., then the
+// current module's declarations, then unambiguous imported bare names (per
+// §2.2's collision rule), then import **aliases**", with no backtracking.
+// `Task` is a public of `System.Threading` (stdlib §6, §6.7) and is always
+// available (§2.3), and §2.2 says the aliased module's "publics are still
+// visible by bare name" — so in `import System.Threading as Task;` the head
+// `Task` names the builtin TYPE, the alias is unreachable, and
+// `Task.CancellationToken` asks the builtin `Task` for a member it lacks.
+// (§2.2 makes the alias declaration itself an error — "an alias may not
+// collide with ... an unambiguously imported public bare name"; that
+// declaration-site check is tracked separately, not in this fix.)
+//
+// Before this narrowing the reject fired but read as if `Task` were the
+// module ("no member `CancellationToken` on `Task` ... Task has no static
+// properties"). The diagnostic must now say that `Task` names the builtin
+// and that the alias does not shadow it (§2.7), naming the aliased module.
+// On origin/main 466a28e2 this program compiled with only an INTERNAL
+// "degraded to a zero-initialized value" warning — the same silent
+// fall-through as the issue itself — so the reject is the spec verdict.
+BEZEL_TEST(task_completed_task_4977,
+           import_alias_named_task_does_not_shadow_builtin_spec_2_7) {
+    const std::string program =
+        "module M;\n"
+        "import System.Threading as Task;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var t := Task.CancellationToken.None;\n"
+        "    _ := t;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = runAot(program);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawAliasNote = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("no member `CancellationToken` on `Task`") ==
+            std::string::npos)
+            continue;
+        if (d.message.find("always-available builtin type `Task`") !=
+                std::string::npos &&
+            d.message.find("import alias `Task` for module "
+                           "`System.Threading`") != std::string::npos &&
+            d.message.find("\xC2\xA7" "2.7 rule 1") != std::string::npos &&
+            d.message.find("does not shadow the builtin") != std::string::npos)
+            sawAliasNote = true;
+    }
+    BEZEL_EXPECT_TRUE(sawAliasNote);
+}
+
+// ── Part 6: a user type named `Task` IMPORTED from another module ──
+//
+// narrow #4977. `import Lib;` makes Lib's public `Task` visible by bare name
+// (§2.2); the IdentifierExpr visitor finds it by scope lookup ahead of the
+// builtin fallback. ModuleLoader's imported TypeSymbol carries
+// `decl == nullptr`, so 9debb70c's `decl == nullptr` gate misread it as the
+// builtin and rejected `Task.Answer` — a program origin/main 466a28e2
+// accepts and runs to 42. This row pins that base behaviour; the gate is now
+// pointer identity with the builtin's symbol. (Whether a user module's
+// `Task` should instead make the bare name ambiguous against the
+// always-available one is a separate spec question — §2.3 states that
+// ambiguity rule only for the `System.Collections.Generic` row — and this
+// row does not decide it; it only keeps #4977 from flipping the verdict.)
+BEZEL_TEST(task_completed_task_4977,
+           imported_user_task_bare_static_property_is_unaffected) {
+    const std::string mainSrc =
+        "module M;\n"
+        "import Lib;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    return Task.Answer;\n"
+        "  end Main;\n"
+        "end C;\n";
+    BEZEL_EXPECT_EQ(42, buildAndRunWithLib(kLibWithUserTask, mainSrc));
+}
+
+// ── Part 7: module-qualified user `Task` (§2.7 rule 2) ──
+BEZEL_TEST(task_completed_task_4977,
+           module_qualified_user_task_static_property_is_unaffected) {
+    const std::string mainSrc =
+        "module M;\n"
+        "import Lib;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    return Lib.Task.Answer;\n"
+        "  end Main;\n"
+        "end C;\n";
+    BEZEL_EXPECT_EQ(42, buildAndRunWithLib(kLibWithUserTask, mainSrc));
+}
+
+// ── Part 8: alias-qualified user `Task` (§2.2 `Alias.Type`) ──
+BEZEL_TEST(task_completed_task_4977,
+           alias_qualified_user_task_static_property_is_unaffected) {
+    const std::string mainSrc =
+        "module M;\n"
+        "import Lib as L;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    return L.Task.Answer;\n"
+        "  end Main;\n"
+        "end C;\n";
+    BEZEL_EXPECT_EQ(42, buildAndRunWithLib(kLibWithUserTask, mainSrc));
 }

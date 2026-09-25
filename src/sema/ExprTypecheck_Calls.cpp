@@ -20482,11 +20482,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // the built-in `Task`'s synthetic TypeSymbol (set by
     // `ExprTypecheck_Exprs.cpp`'s `setExprSymbol(&e, builtinClassSym(name))`)
     // has `decl == nullptr`. Only fire when the receiver is the builtin.
+    //
+    // narrow #4977: the gate is POINTER IDENTITY with the builtin's cached
+    // symbol (`ctx_.builtinClassSym("Task")`), not `decl == nullptr`. A type
+    // named `Task` IMPORTED from a user module (`import Lib;` + bare
+    // `Task.Answer`) is found by the scope lookup ahead of the builtin
+    // fallback in the IdentifierExpr visitor, and ModuleLoader's imported
+    // TypeSymbol also carries `decl == nullptr` — so the `decl` test
+    // misread it as the builtin and rejected a program the base accepted.
+    //
+    // §2.7 rule 1 (v0.307) resolves a chain head through "local scope, ...
+    // the current module's declarations, then unambiguous imported bare
+    // names ..., then import **aliases**", and §2.2 makes `Task` a public
+    // bare name of `System.Threading` (stdlib §6, §6.7) that is always
+    // available (§2.3). So under `import System.Threading as Task;` the head
+    // `Task` IS the builtin type and the alias is unreachable — §2.2: "an
+    // alias may not collide with ... an unambiguously imported public bare
+    // name ... the collision is an error at the alias declaration". The
+    // reject below therefore stays correct for that file; when such an alias
+    // exists, the diagnostic says so instead of reading as if `Task` were
+    // the module.
     if (ma.target && &ma != calleeOfCallCtx_) {
         if (auto* tkid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (tkid->name == "Task") {
                 auto* tkSym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tkid));
-                bool isBuiltinTask = tkSym && tkSym->decl == nullptr;
+                bool isBuiltinTask =
+                    tkSym && tkSym == ctx_.builtinClassSym("Task");
                 if (isBuiltinTask) {
                     static const std::string_view kTaskStaticMembers[] = {
                         "Delay", "FromResult", "FromOwnedResult",
@@ -20497,6 +20518,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     for (auto km : kTaskStaticMembers)
                         if (ma.member == km) { known = true; break; }
                     if (!known) {
+                        // per §2.7 rule 1 / §2.2 (v0.307): an import alias
+                        // named `Task` ranks below the always-available
+                        // builtin, so it does not shadow it here.
+                        std::string taskAliasNote;
+                        auto aliasIt = importAliases_.find("Task");
+                        if (aliasIt != importAliases_.end()) {
+                            taskAliasNote =
+                                std::string("; note: `Task` here names the "
+                                "always-available builtin type `Task`, not "
+                                "the import alias `Task` for module `") +
+                                aliasIt->second +
+                                "` — \xC2\xA7""2.7 rule 1 resolves imported "
+                                "bare names before import aliases with no "
+                                "backtracking, so an alias named `Task` does "
+                                "not shadow the builtin and may not be "
+                                "declared (\xC2\xA7""2.2) — choose a "
+                                "different alias, or name `" +
+                                std::string(ma.member) +
+                                "` by its bare name if it is "
+                                "always available (\xC2\xA7""2.3)";
+                        }
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
                             std::string("no member `") +
@@ -20529,7 +20571,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             "FireAndForget(owned task) (\xC2\xA7""30.9) "
                             "(stdlib \xC2\xA7""6.7); `Task` has no static "
                             "properties — use `Task.FromResult(...)` for "
-                            "an already-completed task");
+                            "an already-completed task" +
+                            taskAliasNote);
                         return;
                     }
                 }
