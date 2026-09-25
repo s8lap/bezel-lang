@@ -7227,6 +7227,43 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     // check is emitted before the method body (`emitFunctionBody`).
     const sema::TypeSymbol* invCls4614 = instrumentedSetterClass(target, ps, pd);
     if (invCls4614) emitInvariantCheck(recv, invCls4614);
+    // fix #4973 (§14.1 / §23 / §2.8.3 rule 4, v0.307): the SETTER twin of the
+    // block-form property GETTER fix on branch 4973-getter-draft (commit
+    // 9dcc51d7). Mirror the expression-bodied getter path at
+    // LlvmBackend_Exprs.cpp:5989 — an INHERITED NAMED BLOCK-FORM PROPERTY on
+    // a generic base reached through a non-generic derived receiver
+    // (`e.Val := v` where `e: E`, `E: B<T>`, `Val: T` declared on `B<T>`)
+    // was lowering the inlined setter body against the erased T->i32
+    // placeholder. Without the ancestor subst, `_v := value` would write the
+    // 8-byte `value` into a 4-byte slot (opaque-ptr store), corrupting the
+    // upper 4 bytes of `_v`. Install `computeAncestorGenericSubst` BEFORE the
+    // inline body; save+restore keeps the subst from leaking past this write
+    // into the enclosing statement. The same gate as the getter fix:
+    // explicit receiver (`ma->target` non-null), Named type, declaration !=
+    // ps->parent, declaring class has genericParams. The implicit `this`
+    // case (`currentThis_` is the declaring class itself) is correctly
+    // skipped by the `declaration != ps->parent` arm.
+    const sema::TypeRef* setRecvTy4973 = nullptr;
+    if (auto* ma4973 = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+        if (ma4973->target) setRecvTy4973 = ctx_.exprType(*ma4973->target);
+    std::unordered_map<std::string_view, llvm::Type*> savedGSubstSet;
+    std::unordered_map<std::string_view, const sema::TypeRef*> savedGSemaSet;
+    bool substInstalledSet = false;
+    if (setRecvTy4973 && setRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+        setRecvTy4973->declaration &&
+        setRecvTy4973->declaration != ps->parent &&
+        !ps->parent->genericParams.empty()) {
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (computeAncestorGenericSubst(setRecvTy4973, ps->parent,
+                                        ancSubst, ancSema)) {
+            savedGSubstSet = std::move(genericSubst_);
+            savedGSemaSet = std::move(genericSubstSemaTy_);
+            genericSubst_ = std::move(ancSubst);
+            genericSubstSemaTy_ = std::move(ancSema);
+            substInstalledSet = true;
+        }
+    }
     // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
     llvm::AllocaInst* slot = entryAlloca(v->getType());
     builder_.CreateStore(v, slot);
@@ -7265,6 +7302,12 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     // same record-UAF reason. See the long comment above the static branch
     // for the full rationale and LSan reproduction.
     if (classOwned) emitProducerRelease();
+    // fix #4973 restore: drop the ancestor subst installed at the top of
+    // this instance branch before the inline body emission.
+    if (substInstalledSet) {
+        genericSubst_ = std::move(savedGSubstSet);
+        genericSubstSemaTy_ = std::move(savedGSemaSet);
+    }
     return true;
 }
 
