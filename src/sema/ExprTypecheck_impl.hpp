@@ -1239,6 +1239,20 @@ private:
         std::vector<TypeRef*>& out,
         std::vector<std::unique_ptr<TypeRef>>& owned);
 
+    // fix #4892 (§5.1 reference conversions, §12.9, v0.307): does the
+    // user-declared Named type `from` reach an instantiation of the BUILTIN
+    // generic interface head of `to` (null declaration, e.g. `IEnumerable<T>`)
+    // that converts to `to` under §12.9? Walks `from`'s user ancestors with
+    // substitution (as collectAncestorInstantiationsOf), their no-TypeSymbol
+    // builtin bases, and the builtin hierarchy table from each. Returns true
+    // (conservative accept) when no instantiation of the head is found — base
+    // conformance is userTypeImplementsBuiltinIface's question, not this one's
+    // — or when an unmodeled builtin base leaves the closure incomplete; false
+    // only when every instantiation found is provably incompatible.
+    bool userTypeBuiltinInstantiationConverts(
+        const TypeRef* from, const TypeRef* to,
+        const std::unordered_set<std::string_view>* freeNames);
+
     // §14.1/§14.5 phase 1 (#785, #850, #896, #4089/#4183): structurally
     // unify a value parameter's declared type (`pt`, AST) against the call
     // argument's resolved type (`argTy`), binding each method type

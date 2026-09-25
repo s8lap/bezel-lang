@@ -3685,6 +3685,22 @@ static bool variantGenericAssignable(
     const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
     const std::unordered_set<std::string_view>* freeNames);
 
+// fix #4892 (§5.1, §12.9, v0.307): the reason clause for a conversion whose
+// target head `from` does reach, but only at other type arguments — the
+// generic "not implicitly convertible" line alone reads as though `from` did
+// not implement the interface at all.
+static std::string genericIfaceInstantiationMismatchReason(const TypeRef* from,
+                                                           const TypeRef* to) {
+    std::string_view fromN = namedTypeSimpleName(from);
+    std::string_view toN = namedTypeSimpleName(to);
+    return "`" + std::string(fromN) + "` reaches `" + std::string(toN) +
+           "` only at other type arguments — a type converts to a generic "
+           "interface only at an instantiation it implements, and type "
+           "arguments may differ only where the interface declares the "
+           "parameter `in`/`out` and the arguments are reference types "
+           "(§12.9)";
+}
+
 // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
 // `from`'s transitive base-type chain (base class or implemented
 // interface)? BFS, cycle-guarded.
@@ -4485,8 +4501,39 @@ void ExprTC::checkAssignable(
                 reportNotConvertible();
                 return;
             }
-            // Base conformance established: conservative skip (the per-argument
-            // variance is the residual).
+            // fix #4892 (§5.1 reference conversions, §11.2, §12.9, v0.307):
+            // base conformance is necessary but NOT sufficient. §5.1 converts
+            // a type "to an interface it implements", and what a class
+            // implements is an INSTANTIATION (`C: IEquatable<C>` implements
+            // `IEquatable<C>`, not `IEquatable<D>`); the only cross-argument
+            // conversions are §12.9's declared `in`/`out` ones. Checking the
+            // head alone accepted `var e: IEquatable<D> := c` and dispatched
+            // `C.Equals` with a `D` (runtime type confusion). Collect every
+            // instantiation of `to`'s declaration that `from` reaches —
+            // substituted through base classes and interface-inheritance
+            // chains (collectAncestorInstantiationsOf) — and require that SOME
+            // one converts to `to` under §12.9 (identity for an invariant
+            // parameter, per the declared variance otherwise). An empty
+            // collection (an uncomposable chain the walk cannot follow) keeps
+            // the prior conservative accept rather than over-rejecting.
+            if (!to->genericArgs.empty()) {
+                std::vector<TypeRef*> impls;
+                collectAncestorInstantiationsOf(from, to->declaration, impls);
+                if (!impls.empty()) {
+                    bool anyConverts = false;
+                    for (TypeRef* impl : impls)
+                        if (variantGenericAssignable(impl, to, isSubtype,
+                                                     freeTypeParamNames)) {
+                            anyConverts = true;
+                            break;
+                        }
+                    if (!anyConverts) {
+                        reportNotConvertible(
+                            genericIfaceInstantiationMismatchReason(from, to));
+                        return;
+                    }
+                }
+            }
             return;
         }
         if (from->nullable && !to->nullable) { reportNullable(); return; }
@@ -4602,6 +4649,19 @@ void ExprTC::checkAssignable(
         if (from->declaration &&
             !userTypeImplementsBuiltinIface(from, namedTypeSimpleName(to))) {
             reportNotConvertible();
+            return;
+        }
+        // fix #4892 (§5.1, §12.9, v0.307): the builtin-target counterpart of
+        // the declared-interface instantiation check above — a user
+        // `A: IEnumerable<int>` must not convert to `IEnumerable<string>`.
+        // variantGenericAssignable leaves a user `from` to its conservative
+        // accept (no candidate), so compare the instantiations `from`
+        // actually reaches here.
+        if (from->declaration &&
+            !userTypeBuiltinInstantiationConverts(from, to,
+                                                  freeTypeParamNames)) {
+            reportNotConvertible(
+                genericIfaceInstantiationMismatchReason(from, to));
             return;
         }
         if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
@@ -8339,6 +8399,75 @@ void ExprTC::collectAncestorInstantiationsOf(const TypeRef* classTy,
                 work.push_back(subst.empty() ? br
                                              : substituteReturnType(br, subst));
     }
+}
+
+// fix #4892 (§5.1, §12.9, v0.307): see the header comment. BFS `from`'s user
+// ancestor graph exactly as collectAncestorInstantiationsOf does, and at each
+// level re-express the bases that carry NO TypeSymbol (the builtin interfaces,
+// `nonSymbolBaseRefsOf`) in the level's concrete args, then expand each through
+// the builtin hierarchy table to the instantiations of `to`'s builtin head.
+bool ExprTC::userTypeBuiltinInstantiationConverts(
+    const TypeRef* from, const TypeRef* to,
+    const std::unordered_set<std::string_view>* freeNames) {
+    if (!from || from->kind != TypeRef::Kind::Named || !from->declaration ||
+        !to || to->kind != TypeRef::Kind::Named || to->declaration ||
+        to->genericArgs.empty())
+        return true;
+    std::string_view toName = namedTypeSimpleName(to);
+    if (toName.empty()) return true;
+    std::vector<TypeRef*> impls;
+    std::vector<std::unique_ptr<TypeRef>> owned;
+    // A builtin base outside the fully-modeled family has an unknown builtin
+    // super-closure, so a mismatch among the instantiations found is not proof
+    // that no conforming instantiation exists — keep the conservative accept.
+    bool sawUnmodeled = false;
+    std::vector<TypeRef*> work{const_cast<TypeRef*>(from)};
+    std::unordered_set<const TypeSymbol*> seenNonGeneric;
+    std::vector<TypeRef*> seenGeneric;
+    const std::size_t kMaxWalk = 4096;  // defensive; ancestor sets are shallow
+    std::size_t walked = 0;
+    while (!work.empty()) {
+        if (++walked > kMaxWalk) return true;  // malformed cycle: no verdict
+        TypeRef* cur = work.back();
+        work.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named || !cur->declaration)
+            continue;
+        TypeSymbol* d = cur->declaration;
+        if (cur->genericArgs.empty()) {
+            if (!seenNonGeneric.insert(d).second) continue;
+        } else {
+            bool dup = false;
+            for (TypeRef* s : seenGeneric)
+                if (typeRefEqual(s, cur)) { dup = true; break; }
+            if (dup) continue;
+            seenGeneric.push_back(cur);
+        }
+        std::unordered_map<std::string_view, TypeRef*> subst;
+        const auto& params = d->genericParams;
+        if (params.size() == cur->genericArgs.size())
+            for (std::size_t i = 0; i < params.size(); ++i)
+                if (params[i]) subst[params[i]->name] = cur->genericArgs[i];
+        for (TypeRef* br : d->baseTypeRefs)
+            if (br)
+                work.push_back(subst.empty() ? br
+                                             : substituteReturnType(br, subst));
+        for (TypeRef* nb : nonSymbolBaseRefsOf(d)) {
+            if (!nb || nb->kind != TypeRef::Kind::Named || nb->declaration) {
+                sawUnmodeled = true;
+                continue;
+            }
+            TypeRef* b = subst.empty() ? nb : substituteReturnType(nb, subst);
+            std::string_view bn = namedTypeSimpleName(b);
+            if (bn != toName && !builtinBorrowingCollectionFullyModeled(bn))
+                sawUnmodeled = true;
+            collectBuiltinAncestorInstantiationsOf(b, toName, impls, owned);
+        }
+    }
+    if (impls.empty()) return true;  // conformance is userTypeImplements…'s job
+    for (TypeRef* impl : impls)
+        if (variantGenericAssignable(impl, to, isSubtype, freeNames))
+            return true;
+    return sawUnmodeled;
 }
 
 // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): see the header comment. The
