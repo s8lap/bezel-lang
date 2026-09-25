@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
@@ -15,6 +16,109 @@ namespace bezel::sema {
 // units (TypeResolution_Names.cpp for type/name resolution,
 // TypeResolution_Checks.cpp for the well-formedness checks). This file holds
 // the public entry function plus the resolver's top-level driver.
+
+// fix #5003 (§2.2 / §2.3, v0.307): is `n` the simple name of an §2.3
+// always-available bare name — a name visible in every source file WITHOUT
+// an explicit `import`? Per spec §2.3 (table), the always-available set is:
+//   - Row 3: `Object`, `Type`
+//   - Row 4: `IDisposable`, `IAsyncDisposable`
+//   - Row 5: `Task`, `OwningTask` (Task family)
+//   - Row 6: `Subscription`, `CancellationToken`, `IEvent`, `IAsyncEvent`,
+//     `EventSource`, `AsyncEventSource`, `ISharedEvent`, `SharedEventSource`
+//   - Row 7: every §31.4 standard exception type
+//   - Row 8: System auto-imports — `Console`, `Math`, `Convert`,
+//     `Environment`, `DateTime`, `TimeSpan`, `Guid`, `Random`,
+//     `IComparable`, `IEquatable`, `ISerializer`, `IDeserializer`,
+//     `ISerializable`, `IDeserializable`, `IntPtr`, `UIntPtr`, `CString`,
+//     `WString`, `RawBytes`, plus stdlib §2's System-resident types
+//     (`Boolean`, `BitConverter`, `Shared`, `Weak`, `Encoding`,
+//     `ReadOnlyStringSpan`, `IFormattable`, `INumber`, `ISteppable`,
+//     `IParsable`, the stdlib §2.19 static abstractions)
+//   - Row 9: System.Text — `StringBuilder`, `Encoding`, `ReadOnlyStringSpan`
+//   - Row 10: System.Collections.Generic — the whole of stdlib §4
+//   - Row 11: System.Collections.Linq — `IGrouping`, `IOrderedEnumerable`
+//
+// `builtinTypeArity`'s table is BROADER than this (it also admits
+// `Mutex`, `Lock`, `Semaphore`, `SemaphoreToken`, `Atomic`,
+// `AtomicInteger`, `TaskCompletionSource`, `OwningTaskCompletionSource`,
+// `TaskScope`, `CancellationTokenSource`, `Channel`, `ChannelSender`,
+// `Domain`, `File`, `Directory`, `Path`, `FileStream`, `Stopwatch`,
+// `Debug`, `BinarySerializer`, `BinaryDeserializer`, `JsonSerializer`,
+// `JsonDeserializer`, `JsonOptions`, `Linq` — every name in stdlib §6
+// through §9 that requires `import System.Threading` / `System.IO` /
+// `System.Diagnostics` / `System.Serialization` per spec §2.3 L160). Use
+// the explicit `kAlwaysAvailableNames` table below to enforce the right
+// boundary; consult it BEFORE `builtinTypeArity`'s broader union.
+//
+// The spec §2.3 wording "every file sees these names" is what makes them
+// "imported" for the purpose of §2.2's "unambiguously imported public
+// bare name" rule — §2.7 rule 1 resolves imported bare names before
+// aliases with no backtracking, so a same-named alias is unreachable in
+// every chain-head position.
+//
+// Note: the §2.3 keyword-aliased primitives (`bool`, `int`, `string`, …)
+// are NOT included here — they are unshadowable per §3.4, but the lexer
+// rejects any `import Foo as bool;` at parse time (an alias would be a
+// parse error long before reaching this check), so they need not be
+// enumerated.
+constexpr bool isAlwaysAvailableBareName(std::string_view n) {
+    return
+        // Row 3 / 4 / 5 (core types, disposal interfaces, Task family).
+        n == "Object" || n == "Type" ||
+        n == "IDisposable" || n == "IAsyncDisposable" ||
+        n == "Task" || n == "OwningTask" ||
+        // Row 6 (events / subscription / cancellation).
+        n == "Subscription" || n == "CancellationToken" ||
+        n == "IEvent" || n == "IAsyncEvent" ||
+        n == "EventSource" || n == "AsyncEventSource" ||
+        n == "ISharedEvent" || n == "SharedEventSource" ||
+        // Row 7 (§31.4 standard exceptions — also in builtinTypeArity).
+        n == "Exception" || n == "ArgumentException" ||
+        n == "ArgumentNullException" || n == "ArgumentOutOfRangeException" ||
+        n == "ArithmeticException" || n == "OverflowException" ||
+        n == "DivideByZeroException" || n == "InvalidOperationException" ||
+        n == "DisposedAccessException" || n == "NotImplementedException" ||
+        n == "NullReferenceException" || n == "IndexOutOfRangeException" ||
+        n == "KeyNotFoundException" || n == "MatchFailureException" ||
+        n == "OperationCanceledException" || n == "TypeInitializationException" ||
+        n == "FormatException" || n == "StackOverflowException" ||
+        n == "SerializationException" || n == "ContractViolationException" ||
+        n == "ExceptionInfo" ||
+        // Row 8 (System auto-imports).
+        n == "Console" || n == "Math" || n == "Convert" || n == "Environment" ||
+        n == "DateTime" || n == "TimeSpan" || n == "DateOnly" || n == "TimeOnly" ||
+        n == "Guid" || n == "Random" ||
+        n == "IComparable" || n == "IEquatable" ||
+        n == "ISerializer" || n == "IDeserializer" ||
+        n == "ISerializable" || n == "IDeserializable" ||
+        n == "IFormattable" ||
+        n == "IntPtr" || n == "UIntPtr" ||
+        n == "CString" || n == "WString" || n == "RawBytes" ||
+        n == "Boolean" || n == "BitConverter" ||
+        n == "Shared" || n == "Weak" ||
+        // Row 9 (System.Text).
+        n == "StringBuilder" || n == "Encoding" || n == "ReadOnlyStringSpan" ||
+        // Row 10 (System.Collections.Generic).
+        n == "Array" || n == "OwningArray" ||
+        n == "Stack" || n == "OwningStack" ||
+        n == "Queue" || n == "OwningQueue" ||
+        n == "Set" || n == "OwningSet" || n == "SortedSet" ||
+        n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary" ||
+        n == "LinkedList" || n == "OwningLinkedList" || n == "LinkedListNode" ||
+        n == "OwningBuffer" || n == "FrozenArray" ||
+        n == "Span" || n == "ReadOnlySpan" ||
+        n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+        n == "IEnumerable" || n == "IEnumerator" ||
+        n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
+        n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
+        n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
+        n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
+        n == "ICollection" || n == "IList" ||
+        n == "IOwningCollection" || n == "IOwningList" ||
+        n == "IReadOnlySpan" || n == "IEqualityComparer" ||
+        // Row 11 (System.Collections.Linq).
+        n == "IGrouping" || n == "IOrderedEnumerable";
+}
 
 PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "bool")    return PrimitiveType::Bool;
@@ -282,16 +386,42 @@ void Resolver::run(const ast::SourceFile& src) {
                 continue;
             }
             auto originIt = importedNameOrigin.find(imp->alias);
-            if (originIt == importedNameOrigin.end()) continue;
-            if (ambiguousImportNames_.count(imp->alias)) continue;
-            ctx_.diagnostics().report(
-                Severity::Error, imp->span.begin,
-                std::string("import alias `") + imp->alias +
-                "` collides with the unambiguously imported public bare name `" +
-                imp->alias + "` (from module `" + originIt->second +
-                "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
-                "aliases with no backtracking, so the alias would be "
-                "unreachable — choose a different alias (\xC2\xA7""2.2)");
+            if (originIt != importedNameOrigin.end() &&
+                !ambiguousImportNames_.count(imp->alias)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the unambiguously imported public bare name `" +
+                    imp->alias + "` (from module `" + originIt->second +
+                    "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                    "aliases with no backtracking, so the alias would be "
+                    "unreachable — choose a different alias (\xC2\xA7""2.2)");
+                continue;
+            }
+            // fix #5003 (§2.2 / §2.3, v0.307): always-available bare name
+            if (isAlwaysAvailableBareName(imp->alias)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the always-available bare name `" +
+                    imp->alias +
+                    "` (spec \xC2\xA7""2.3); \xC2\xA7""2.7 rule 1 resolves "
+                    "imported bare names before aliases with no backtracking, "
+                    "so the alias would be unreachable — choose a different "
+                    "alias (\xC2\xA7""2.2)");
+                continue;
+            }
+            // fix #5003 (§2.2 / §2.3, v0.307): public of imported stdlib pseudo-module
+            if (common::builtinClassModulePathOf(imp->alias) == dotted) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the public `" + imp->alias +
+                    "` of the imported stdlib module `" + dotted +
+                    "`; \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                    "aliases with no backtracking, so the alias would be "
+                    "unreachable — choose a different alias (\xC2\xA7""2.2)");
+            }
         }
     }
     // per §32.13 clause 1 / §32.5 (v0.306): an `extern` signature's
