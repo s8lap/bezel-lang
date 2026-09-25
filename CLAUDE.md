@@ -229,8 +229,10 @@ tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 put 100+ clang on 18 cores in R20 (134 measured). The optional fix is the
 machine-wide build jobserver: `scripts/jobserver_ctl.sh start` (a systemd
 --user service, default 20 tokens; `status`, `stop`). While it runs, every
-`dev_heavy.sh build cmake|make …` joins one shared GNU-make token pool (its
-`-j` is stripped); each build keeps one implicit job, so none starves and a
+`dev_heavy.sh build cmake|make|gmake|ninja …` joins one shared GNU-make token
+pool (its `-j` is stripped); two exceptions do NOT join: `cmake --build
+--preset …` (cmake adds the preset's `jobs` itself) and a caller whose
+`MAKEFLAGS` is already set. Each build keeps one implicit job, so none starves and a
 one-TU relink never queues behind a cold build. With no daemon, builds behave
 exactly as before; `gate.sh` always opts out (`BEZEL_JOBSERVER=off`). ⚠ It is
 a **memory safety valve, not a speed-up** (measured R20: capped builds kept

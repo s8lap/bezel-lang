@@ -12,6 +12,11 @@
 # not change the cgroup. A transient --user unit has its own cgroup and
 # Restart=on-failure brings it back if it dies.
 #
+# The start limit stops a restart loop (e.g. another daemon already serves the
+# dir, or the worktree holding this script was removed): 3 failed starts in
+# 2 min leave the unit failed; `start` resets it. Start it from the main
+# checkout, not a lane worktree, so a later restart still finds the script.
+#
 # Why 20 tokens: the heavy slice has ~18 cores, and every joined build keeps
 # one implicit job on top of the shared tokens, so 20 tokens with a handful of
 # concurrent builds runs ~22–26 compiles: enough to keep the cores busy, far
@@ -41,6 +46,7 @@ case "${1:-status}" in
     # cannot break the running daemon.
     systemd-run --user --unit="$UNIT" -q \
       -p Restart=on-failure -p RestartSec=5 \
+      -p StartLimitIntervalSec=120 -p StartLimitBurst=3 \
       -E BEZEL_JOBSERVER_DIR="$dir" \
       python3 "$js" serve --dir "$dir" --tokens "$tokens"
     for _ in $(seq 1 50); do

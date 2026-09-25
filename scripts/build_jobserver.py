@@ -200,10 +200,11 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
             # quick sub-samples, and repair only the minimum that persisted
             # across `confirm` consecutive audits: a transient never inflates
             # the pool, a real leak (it never comes back) is repaired.
-            # The mirror case: a make whose child just exited has returned its
-            # token before the zombie is reaped, so `held` briefly over-counts
-            # and the pool looks OVER-full. Take the surplus as the minimum
-            # over the same sub-samples (the maximum d_k), for the same reason.
+            # A surplus (pool OVER-full) is real only if it persists: take it
+            # as the minimum over the same sub-samples (the maximum d_k). The
+            # /proc scan is not an atomic snapshot, so a single sample can
+            # skew either way; make itself reaps a child before releasing its
+            # token, so the zombie window reads as a deficit, not a surplus.
             deficit = None
             dmax = None
             for k in range(5):

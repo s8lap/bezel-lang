@@ -134,6 +134,8 @@ esac
 # explicit -jN makes GNU make ignore an inherited pool. Opt out per call with
 # BEZEL_JOBSERVER=off (gate.sh does: a gate runs with zero other builders, and
 # its build must not depend on a daemon). With no live daemon nothing changes.
+# Not routed: `cmake --build --preset …` (cmake adds the preset's jobs itself,
+# after this rewrite) and a caller that already set MAKEFLAGS.
 if [ "$kind" = build ] && [ "${BEZEL_JOBSERVER:-on}" != off ] \
    && [ -z "${MAKEFLAGS:-}" ] \
    && case "$(basename "$1")" in cmake|make|gmake|ninja) true;; *) false;; esac; then
