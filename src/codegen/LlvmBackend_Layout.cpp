@@ -1856,13 +1856,30 @@ bool Emitter::instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t)
 // For each itable of a NON-GENERIC local class, each METHOD / PROPERTY /
 // INDEXER slot whose implementation is declared on a GENERIC ancestor is
 // re-lowered under that ancestor's substitution (derived from the base-clause
-// chain by computeAncestorGenericSubst) whenever the body can differ: the
-// signature changes (`T` in a parameter or return) or the declaring class's
-// instance layout changes (#1240's GEP-offset reason). The same two questions,
-// and the same builders, `specializedVtableFor` uses for a generic class.
-// Only a slot still holding the erased template is replaced, so a #1139
-// nullable-widening thunk or an override declared on a non-generic class is
-// never touched. The `int` twin keeps its slot: the erased body is exact there.
+// chain by computeAncestorGenericSubst), using the same builders
+// `specializedVtableFor` uses for a generic class. Only a slot still holding
+// the erased template is replaced, so a #1139 nullable-widening thunk or an
+// override declared on a non-generic class is never touched.
+//
+// WHICH SLOTS — fix #4950 (§22.12 "Each distinct instantiation has its own
+// static state", §14.1, §2.8.3 rule 4, v0.307): EVERY such slot, with no
+// "signature or instance layout differs" prefilter. #4933 re-lowered a slot
+// only when `T` moved the signature or the layout, on the premise that the
+// erased body is otherwise exact. It is not: `T` can reach the body without
+// touching either, and the one measured case is a §22.12 per-instantiation
+// static. `B<T>.Bump()` doing `B<T>._c := B<T>._c + 1` compiles, erased, to
+// the placeholder-level cell `bz$M.B$_c`, which belongs to no instantiation;
+// only a body lowered under `{T -> string}` reaches `bz$M.B$string$_c`
+// (staticFieldGlobal's per-instantiation redirect). So `E: B<string>` bumped
+// through `I<string>` wrote the wrong cell. Worse, the erased body's own
+// ensureinit ran the template sfinit, which also re-zeroes the instantiation
+// cells a direct `e.Bump()` had already advanced, so the issue printed
+// `1, 1, 0, 0` for `1, 2, 2, 0`. The `int` twin is wrong the same way:
+// `bz$M.B$_c` is not `bz$M.B$int$_c` even though every LLVM type agrees, so
+// a type-valued predicate cannot see it. Nothing short of inspecting the body
+// can prove the erased body exact, and a per-(class, slot) specialization is
+// cheap and already shared with the call-site specialization through
+// buildSpecializedMethodFn's cache.
 //
 // Runs after every ordinary method body is emitted: a specialization is a full
 // body emission, and #2759 records why no body may be lowered before Pass D has
@@ -1938,10 +1955,9 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
             llvm::Function* specFn = nullptr;
             llvm::FunctionType* concFnTy = methodFnType(impl);
             CallableInfo ci;
-            if (concFnTy &&
-                (concFnTy != mit->second->getFunctionType() ||
-                 instanceLayoutDiffersFromErasedTemplate(impl->parent)) &&
-                callableInfo(impl, ci)) {
+            // fix #4950 (§22.12 / §14.1, v0.307): no signature / layout
+            // prefilter. See the "WHICH SLOTS" note above.
+            if (concFnTy && callableInfo(impl, ci)) {
                 std::vector<llvm::Type*> paramTys(concFnTy->param_begin(),
                                                   concFnTy->param_end());
                 specFn = buildSpecializedMethodFn(impl, ci, paramTys);
@@ -1965,19 +1981,10 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
             // No AST read here (the #3152 imported-symbol seam): an accessor
             // declared on an IMPORTED generic base must be patched too, and
             // the only guards are templateAccessorFn / buildSpecializedAccessorFn
-            // answering null or the template itself. Whether a slot needs a
-            // specialized body is decided from LLVM signatures alone: the
-            // specialized accessor's function type vs the erased template's,
-            // or a differing instance layout. The prefilter skips building
-            // when every substituted argument lowers to the erased placeholder
-            // (i32, e.g. `B<int>`) and the layout is the template's, since the
-            // template body is then exact.
+            // answering null or the template itself. fix #4950: like the
+            // METHOD slots, no signature / layout / "argument erases to i32"
+            // prefilter — see the "WHICH SLOTS" note above.
             if (!installAncestorSubst(ts, pimpl->parent)) continue;
-            bool layoutDiffers =
-                instanceLayoutDiffersFromErasedTemplate(pimpl->parent);
-            bool substChangesErasure = false;
-            for (const auto& [name, ty] : genericSubst_)
-                if (ty != i32()) substChangesErasure = true;
             auto patchSlot = [&](bool isSet, unsigned si) {
                 if (si >= numSlots) return;
                 llvm::Function* canon = templateAccessorFn(pimpl, isSet);
@@ -1986,20 +1993,15 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
                 llvm::Function* specFn =
                     buildSpecializedAccessorFn(ts, pimpl, isSet);
                 if (!specFn || specFn == canon) return;
-                if (!layoutDiffers &&
-                    specFn->getFunctionType() == canon->getFunctionType())
-                    return;
                 elems[si] = llvm::cast<llvm::Constant>(specFn);
                 changed = true;
             };
-            if (substChangesErasure || layoutDiffers) {
-                if (auto git = ifacePropertyGetIndex_.find(ip);
-                    git != ifacePropertyGetIndex_.end())
-                    patchSlot(/*isSet=*/false, git->second);
-                if (auto sit = ifacePropertySetIndex_.find(ip);
-                    sit != ifacePropertySetIndex_.end())
-                    patchSlot(/*isSet=*/true, sit->second);
-            }
+            if (auto git = ifacePropertyGetIndex_.find(ip);
+                git != ifacePropertyGetIndex_.end())
+                patchSlot(/*isSet=*/false, git->second);
+            if (auto sit = ifacePropertySetIndex_.find(ip);
+                sit != ifacePropertySetIndex_.end())
+                patchSlot(/*isSet=*/true, sit->second);
             restore();
         }
 
