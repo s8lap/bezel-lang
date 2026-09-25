@@ -151,6 +151,19 @@ if [ "$kind" = build ] && [ "${BEZEL_JOBSERVER:-on}" != off ] \
   fi
 fi
 
+# Test seam (BEZEL_DEV_HEAVY_DRY_RUN=1): print the argv/env this would exec
+# instead of calling systemd-run, so a test can assert whether the jobserver
+# rewrite above fired (or correctly did not) without a live systemd --user
+# session and without actually launching a build. See
+# scripts/gate/tests/test_dev_heavy_jobserver_hook.py.
+if [ -n "${BEZEL_DEV_HEAVY_DRY_RUN:-}" ]; then
+  printf 'DRY_RUN kind=%s mem=%s cw=%s iw=%s\n' "$kind" "$mem" "$cw" "$iw"
+  printf 'DRY_RUN argv:'; printf ' %q' "$@"; printf '\n'
+  printf 'DRY_RUN MAKEFLAGS=%s\n' "${MAKEFLAGS-<unset>}"
+  printf 'DRY_RUN CMAKE_BUILD_PARALLEL_LEVEL=%s\n' "${CMAKE_BUILD_PARALLEL_LEVEL-<unset>}"
+  exit 0
+fi
+
 exec systemd-run --user --scope -q \
   -p Slice="$SLICE" -p MemoryMax="$mem" -p MemorySwapMax=0 \
   -p CPUWeight="$cw" -p IOWeight="$iw" \
