@@ -5402,6 +5402,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 substituteReturnType(rt, explicitSubstImported);
                     }
                 }
+                // fix #4937 (§14.1 / §2.5 / §2.8.2 / §14.2, v0.307):
+                // an IMPORTED method's return type carries the receiver's
+                // parent type-parameter substitution when the local path
+                // would have. The local arm (the `md && md->returnType`
+                // block ~L4240 above) applies `substituteMemberType(rt,
+                // ma->target, ms->parent)` for the parent's instantiation
+                // map (T := receiver's concrete type arg) — f4cb60c2's
+                // opus-4919 fix added the same gate for the
+                // NullCondMemberExpr callee. The imported arm runs the
+                // method's-own substitution (#4611/#4622 above) but
+                // deliberately stops there: an imported `Peek(): T` on
+                // `IO<out T>` reached through `var io: IO<Dog>` was left
+                // at the bare `T`, and `io.Peek().Name()` then dispatched
+                // the §25 operator on a receiver of unknown type, which
+                // #2477 ("cannot dispatch member `Name` on receiver of
+                // type T") silently dropped — and #3079's "argument failed
+                // to lower to a value, so the whole statement emits
+                // nothing" then dropped the surrounding Console.WriteLine.
+                // Walk the parent's instantiation map onto `callTy` the
+                // same way the local arm does, gated only on the receiver
+                // being extractable (MemberAccessExpr/NullCondMemberExpr
+                // callees) and `ms->parent` having generic params (the
+                // helper's own early-out makes the non-generic case a
+                // no-op). The substituted `callTy` then flows into the
+                // #783/#1937 diagnostic checks below via `rt` only by
+                // design — that gate keys on the DECLARED shape to keep
+                // its predicate tripwire from drifting into the
+                // substituted-result space.
+                if (ms->parent && !ms->parent->genericParams.empty()) {
+                    const ast::Expr* recvTarget = nullptr;
+                    if (auto* iMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get()))
+                        recvTarget = iMa->target.get();
+                    else if (auto* iNcm =
+                                 dynamic_cast<const
+                                              ast::NullCondMemberExpr*>(
+                                                  ce.callee.get()))
+                        recvTarget = iNcm->target.get();
+                    if (recvTarget)
+                        callTy = substituteMemberType(callTy, recvTarget,
+                                                     ms->parent);
+                }
                 // The #783 and #1937 declines below deliberately read the
                 // UNSUBSTITUTED `rt`: each classifies the DECLARED return
                 // shape (a class type parameter / a generic record
