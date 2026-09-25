@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 namespace bezel::codegen {
@@ -4289,6 +4290,222 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
     return closure;
 }
 
+// fix #4901 (stdlib §6.5 "Capture-freedom at every subscribe position",
+// spec §28.14, v0.307): the admission gate for the shared pair
+// (`ISharedEvent<T>` / `SharedEventSource<T>`). Sema has NO member surface for
+// this pair: #4920 rejects a capturing handler at Subscribe / Add / `+=`, but
+// nothing checks the handler / payload against the declared `(T) -> ()` /
+// `Raise(payload: T)` signatures, and Remove is unchecked entirely — so every
+// call codegen claims here would otherwise be lowered unchecked. Before #4901 the gap was papered over by the #2457
+// "no dispatch arm emitted any code" backstop, which rejected every call on
+// the pair. These helpers claim a call ONLY when codegen can prove it both
+// capture-free and exactly well-typed; everything else keeps the #2457 reject
+// (a spurious reject is recoverable, a mis-typed handler is a SEGV / UAF).
+namespace {
+
+// Structural type identity, stricter than sema::typeRefEqual: that helper
+// compares a Named ref by `declaration` alone, and every builtin head AND every
+// generic type parameter has a null declaration — so it answers `true` for
+// `T` vs `U`, or `T` vs `Subscription`. Compare the alias-transparent head too.
+bool sharedEventTypeEq(const sema::TypeRef* a, const sema::TypeRef* b) {
+    if (!sema::typeRefEqual(a, b)) return false;
+    switch (a->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (!a->declaration && a->headName() != b->headName()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!sharedEventTypeEq(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            return true;
+        case sema::TypeRef::Kind::InlineArray:
+            return sharedEventTypeEq(a->arrayElement, b->arrayElement);
+        case sema::TypeRef::Kind::Function:
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i)
+                if (!sharedEventTypeEq(a->funcParams[i].type,
+                                       b->funcParams[i].type))
+                    return false;
+            if (!a->funcReturn || !b->funcReturn)
+                return a->funcReturn == b->funcReturn;
+            return sharedEventTypeEq(a->funcReturn, b->funcReturn);
+        default:
+            return true;
+    }
+}
+
+// True when `t` mentions a generic TYPE PARAMETER anywhere (a Named ref with no
+// declaration whose head is not a registered builtin). Such a name is only
+// meaningful relative to the scope that binds it, so the head comparison in
+// sharedEventTypeEq alone cannot prove two of them the same binding.
+bool sharedEventMentionsTypeParam(
+        const sema::TypeRef* t,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!t) return false;
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (!t->declaration && !isBuiltinName(t->headName())) return true;
+            for (const sema::TypeRef* g : t->genericArgs)
+                if (sharedEventMentionsTypeParam(g, isBuiltinName)) return true;
+            return false;
+        case sema::TypeRef::Kind::InlineArray:
+            return sharedEventMentionsTypeParam(t->arrayElement, isBuiltinName);
+        case sema::TypeRef::Kind::Function:
+            for (const auto& fp : t->funcParams)
+                if (sharedEventMentionsTypeParam(fp.type, isBuiltinName))
+                    return true;
+            return sharedEventMentionsTypeParam(t->funcReturn, isBuiltinName);
+        default:
+            return false;
+    }
+}
+
+// True when another method named `ms->name` is visible on `ts` or a base —
+// i.e. the handler spelling names an overload GROUP. Sema resolves a bare
+// method reference to one member of the group without consulting the
+// `(T) -> ()` target (measured: `H.On` with On(string)/On(int) on an int feed
+// bound the string overload — SEGV), so a group is never admitted.
+bool sharedEventMethodIsOverloaded(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* ts,
+        std::unordered_set<const sema::TypeSymbol*>& seen) {
+    if (!ts || !seen.insert(ts).second) return false;
+    for (const sema::Symbol* m : ts->members) {
+        if (m != ms && m && m->name == ms->name &&
+            dynamic_cast<const sema::MethodSymbol*>(m))
+            return true;
+    }
+    for (const sema::TypeSymbol* b : ts->baseTypes)
+        if (sharedEventMethodIsOverloaded(ms, b, seen)) return true;
+    return false;
+}
+
+// True when `e` is a bare identifier naming a member of `owner` — the one
+// receiver/handler shape in which a type parameter named in the member's type
+// is provably the SAME binding as one named by another member of `owner`.
+bool sharedEventIsBareMemberOf(sema::SemaContext& ctx, const ast::Expr* e,
+                               const sema::TypeSymbol* owner) {
+    if (!e || !owner || !dynamic_cast<const ast::IdentifierExpr*>(e))
+        return false;
+    auto* m = dynamic_cast<const sema::MemberSymbol*>(ctx.exprSymbol(*e));
+    return m && m->parent == owner;
+}
+
+}  // namespace
+
+// fix #4901: may a `Subscribe`/`Add` (or `+=`) on the shared pair, whose
+// receiver expression is `receiver` and payload type is `payload`, claim
+// `handler`? Only when ALL of the following hold; otherwise the caller leaves
+// the call on the #2457 backstop (or, for `+=`, reports its own error).
+//   1. Capture-free — a STATIC method reference, decided on the RESOLVED
+//      symbol, never the AST spelling: a bare `OnX`, or `Bus.OnX` /
+//      `Alias.OnX` qualified by a type or type alias. §6.5 admits "a
+//      non-capturing lambda or a static method reference"; an INSTANCE method
+//      reference (`box.OnI`, bare `OnI` / `this.OnI` inside an instance method)
+//      is NOT capture-free — §28.14: a method reference's "capture is the
+//      receiver" — and a local / field / call result / conditional may hold a
+//      capturing closure codegen cannot see. Kept even though #4920 now
+//      rejects capturing handlers in sema: it is the only check at Remove,
+//      and lambda literals — even the capture-free ones §6.5 and #4920
+//      admit — are not lowered on this pair yet (#4972, a spurious reject).
+//      Mirrors sema's `ExprTC::isCaptureFreeEntry` arm (a) (§30.14).
+//   2. Exactly the handler type `(T) -> ()` (stdlib §6.5), because nothing
+//      else checks it: not an overload group, not generic, not an operator or
+//      extension method, not async; exactly one formal, with NO modifier
+//      (an `owned` formal would free the payload each handler borrows —
+//      measured heap-use-after-free; `ref`/`out`/`scoped` change the ABI),
+//      whose type is identical to T; a unit, non-`owned` return.
+//   3. If T or the formal mentions a generic type parameter, the receiver and
+//      the handler are both bare members of the same type, so the two names
+//      are one binding.
+bool sharedEventHandlerAdmissible(
+        sema::SemaContext& ctx, const ast::Expr* handler,
+        const ast::Expr* receiver, const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!handler || !payload) return false;
+    // (1) capture-free: a static method reference.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(handler);
+    if (!ma && !dynamic_cast<const ast::IdentifierExpr*>(handler)) return false;
+    if (ma) {
+        // The qualifier must name a TYPE (or a type alias), never a value: a
+        // value qualifier would be evaluated and is a receiver by construction.
+        if (!ma->target) return false;
+        sema::Symbol* tgt = ctx.exprSymbol(*ma->target);
+        if (!dynamic_cast<sema::TypeSymbol*>(tgt) &&
+            !dynamic_cast<sema::TypeAliasSymbol*>(tgt))
+            return false;
+    }
+    auto* ms = dynamic_cast<const sema::MethodSymbol*>(ctx.exprSymbol(*handler));
+    if (!ms || ms->extensionDecl || ms->isOperator || !ms->parent ||
+        !ms->genericParams.empty())
+        return false;
+    auto hasMod = [&](std::string_view m) {
+        return std::find(ms->modifiers.begin(), ms->modifiers.end(), m) !=
+               ms->modifiers.end();
+    };
+    if (!hasMod("static") || hasMod("async")) return false;
+    // (2) exactly `(T) -> ()`.
+    {
+        std::unordered_set<const sema::TypeSymbol*> seen;
+        if (sharedEventMethodIsOverloaded(ms, ms->parent, seen)) return false;
+    }
+    if (sema::formalParamCount(*ms) != 1) return false;
+    if (!sema::formalParamModifier(*ms, 0).empty()) return false;
+    const sema::TypeRef* paramTy = nullptr;
+    if (const ast::Type* dt = sema::formalParamDeclType(*ms, 0))
+        paramTy = ctx.resolvedType(*dt);
+    else
+        paramTy = sema::formalParamResolvedType(*ms, 0);
+    if (!paramTy || !sharedEventTypeEq(paramTy, payload)) return false;
+    if (sema::methodReturnsOwned(*ms, ctx)) return false;
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (md->returnType) {
+            const sema::TypeRef* rt = ctx.resolvedType(*md->returnType);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Unit) return false;
+        }
+    } else if (ms->decl) {
+        return false;  // not a plain method declaration
+    } else if (const sema::TypeRef* rt = ctx.importedReturnType(ms)) {
+        if (rt->kind != sema::TypeRef::Kind::Unit) return false;
+    }
+    // (3) type parameters: one binding only.
+    if (sharedEventMentionsTypeParam(payload, isBuiltinName) ||
+        sharedEventMentionsTypeParam(paramTy, isBuiltinName)) {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(handler) ||
+            !sharedEventIsBareMemberOf(ctx, receiver, ms->parent))
+            return false;
+    }
+    return true;
+}
+
+// fix #4901: may `SharedEventSource<T>.Raise(...)` claim this argument list?
+// Same reason as above — nothing else checks it (measured: `Raise("hello")` on
+// an int feed printed garbage, `Raise()` on a class-typed feed SEGV'd in the
+// handler, `Raise(1, 2)` was accepted). Admitted: exactly one positional
+// argument whose static type is identical to T, or — for a unit payload —
+// `Raise()` / `Raise(())` (stdlib §6.5's no-argument overload).
+static bool sharedEventRaiseAdmissible(
+        sema::SemaContext& ctx, const ast::CallExpr& call,
+        const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!payload) return false;
+    for (const auto& a : call.args)
+        if (!a.value || !a.name.empty()) return false;
+    if (payload->kind == sema::TypeRef::Kind::Unit) {
+        if (call.args.empty()) return true;
+        if (call.args.size() != 1) return false;
+        const sema::TypeRef* at = ctx.exprType(*call.args[0].value);
+        return at && at->kind == sema::TypeRef::Kind::Unit;
+    }
+    if (call.args.size() != 1) return false;
+    const sema::TypeRef* at = ctx.exprType(*call.args[0].value);
+    if (!at || !sharedEventTypeEq(at, payload)) return false;
+    // A payload that mentions a type parameter is never admitted: whether the
+    // argument's `T` and the source's `T` are one binding depends on the
+    // enclosing method, and codegen's current-method state is not reliable
+    // for that while it emits a generic instantiation (measured: a Raise in
+    // `G<T>.Arm` is lowered with `Main` as the current method). A spurious
+    // reject (#4971).
+    if (sharedEventMentionsTypeParam(payload, isBuiltinName)) return false;
+    return true;
+}
+
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     // fix #3225 (§24 / §2.5, v0.254): the §24 raise-syntax BARE-CALL
@@ -4512,6 +4729,57 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         return std::optional<llvm::Value*>(
             builder_.CreateCall(subFn, {src, closure}, "subscription"));
     }
+    // fix #4901 / stdlib §6.5 (v0.307): `.Subscribe` on a STORED
+    // ISharedEvent<T> value — the cross-domain publication point's public,
+    // subscribe-only interface face. Mirrors the IEvent<T> arm immediately
+    // above: ISharedEvent<T> has no itable, but its runtime value IS the
+    // same bz_event_source_t* a SharedEventSource<T> field gives up (via the
+    // event-as-value read), so dispatch directly to bz_event_subscribe. The
+    // payload is the receiver type's genericArgs[0]. Stdlib §6.5 declares
+    // ISharedEvent<T> with ONLY `Subscribe` ("ISharedEvent deliberately has
+    // no Add/Remove/Raise") and states the interface deliberately does NOT
+    // extend IEvent<T> (so it is never reached via isIEventTypeName above) —
+    // so no other member name is admitted here.
+    //
+    // §6.5 / §28.14: every subscribe position on the shared pair admits ONLY
+    // a capture-free handler — a non-capturing lambda or a static method
+    // reference. Sema enforces the capture half (#4920); it does NOT check
+    // the handler against `(T) -> ()`, because the pair has no sema member
+    // surface. So this arm claims the call ONLY when the handler is a STATIC
+    // method reference of exactly the handler type `(T) -> ()`
+    // (sharedEventHandlerAdmissible, keyed on the resolved MethodSymbol).
+    // An instance method reference captures its receiver (§28.14: a method
+    // reference's "capture is the receiver") and a local/field/conditional/
+    // call-result handler may hold a capturing closure (both now also
+    // rejected by #4920, so this is defence in depth). An ill-typed static
+    // (overload group, wrong arity, `owned` formal, wrong type) would be
+    // lowered unchecked — measured SEGV / garbage / heap-use-after-free — and
+    // a lambda literal is not lowered on this pair yet (#4972). All of those
+    // fall through to the SAME #2457 backstop as before.
+    const sema::TypeRef* sharedPayload =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                 : nullptr;
+    auto builtinName = [this](std::string_view n) {
+        return isBuiltinTypeRefName(n);
+    };
+    if (ma->member == "Subscribe" && call.args.size() == 1 &&
+        call.args[0].value && isISharedEventTypeName(recvTy) &&
+        sharedEventHandlerAdmissible(ctx_, call.args[0].value.get(),
+                                     ma->target.get(), sharedPayload,
+                                     builtinName)) {
+        llvm::Value* src = lowerExpr(*ma->target);
+        if (!src) return std::optional<llvm::Value*>(nullptr);
+        const sema::TypeRef* payload = sharedPayload;
+        llvm::Value* closure =
+            lowerEventHandlerClosure(call.args[0].value.get(), payload);
+        if (!closure) return std::optional<llvm::Value*>(nullptr);
+        // No lastLambdaCapturedCells_ consume (cf. the IEvent<T> arm above):
+        // the handler is never a lambda literal here.
+        auto* subFn =
+            declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
+        return std::optional<llvm::Value*>(
+            builder_.CreateCall(subFn, {src, closure}, "subscription"));
+    }
     // §6.5 / §24 (#1610): a value held in a local/param/field of static type
     // EventSource<T>/AsyncEventSource<T>. Its runtime value is the same
     // bz_event_source_t* a direct event access yields (via the event-as-value
@@ -4524,6 +4792,67 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         const sema::TypeRef* payload =
             (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
         return dispatchEventMethods(src, payload);
+    }
+    // fix #4901 / stdlib §6.5 (v0.307): a value held in a local/param/field of
+    // static type SharedEventSource<T> — the cross-domain publication
+    // point's producer-side sealed class. Its runtime value is the same
+    // bz_event_source_t* an EventSource<T> field gives up (both are
+    // registered heap-pointer-reference builtins with the identical
+    // representation, common::BuiltinRegistry.cpp), so Subscribe/Add/Remove/
+    // Raise dispatch through the SAME dispatchEventMethods used for
+    // EventSource<T> just above. RaiseAsync is deliberately EXCLUDED even
+    // though dispatchEventMethods itself would recognize that name: stdlib
+    // §6.5 does not declare RaiseAsync on SharedEventSource<T> ("the shared
+    // async twin is deferred" — ISharedAsyncEvent<T>/SharedAsyncEventSource<T>
+    // do not exist), and — unlike EventSource<T>/AsyncEventSource<T>, which
+    // are gated by sema's `rcn == "EventSource"` block
+    // (ExprTypecheck_Calls.cpp) rejecting any undocumented member name before
+    // codegen ever runs — there is no equivalent sema gate for
+    // SharedEventSource<T> today, so a bogus `.RaiseAsync()` call reaches
+    // here unrejected. This arm therefore names the four real methods
+    // explicitly, rather than forwarding every method name the way the
+    // EventSource<T> arm does, so an out-of-surface call falls through to
+    // ordinary (itable) dispatch instead of being mis-lowered as an async
+    // raise.
+    //
+    // §6.5 / §28.14: `Subscribe` and `Add` on the shared pair admit ONLY a
+    // capture-free handler (a non-capturing lambda or a static method
+    // reference). Sema enforces the capture half (#4920) but not the
+    // `(T) -> ()` / `Raise(payload: T)` typing for this type (see the
+    // ISharedEvent<T> arm's comment above), so every member is claimed only
+    // when codegen can prove the call
+    // well-formed; anything else falls through to the pre-existing #2457
+    // "not implemented" backstop rather than silently accepting it:
+    //   * Subscribe / Add — sharedEventHandlerAdmissible (static, exactly
+    //     `(T) -> ()`).
+    //   * Remove — the SAME gate. §6.5 exempts Remove from capture-freedom
+    //     ("call-bounded: compares only"), but a lambda-literal argument is a
+    //     fresh closure that can never compare equal to a subscribed handler,
+    //     and a capturing one leaks its environment; until lambda handlers
+    //     are lowered on this pair (#4972), Remove takes what Subscribe/Add
+    //     take. (Even a static Remove leaks its closure record, #4970.)
+    //   * Raise — sharedEventRaiseAdmissible (one argument of type exactly T,
+    //     or none for a unit payload). Unchecked, `Raise("s")` on an int
+    //     feed, `Raise()` on a class feed and `Raise(1, 2)` all compiled.
+    if (isSharedEventSourceTypeName(recvTy)) {
+        const bool handlerMember = ma->member == "Subscribe" ||
+                                   ma->member == "Add" ||
+                                   ma->member == "Remove";
+        const bool ok =
+            handlerMember
+                ? (call.args.size() == 1 && call.args[0].value &&
+                   call.args[0].name.empty() &&
+                   sharedEventHandlerAdmissible(
+                       ctx_, call.args[0].value.get(), ma->target.get(),
+                       sharedPayload, builtinName))
+                : (ma->member == "Raise" &&
+                   sharedEventRaiseAdmissible(ctx_, call, sharedPayload,
+                                              builtinName));
+        if (ok) {
+            llvm::Value* src = lowerExpr(*ma->target);
+            if (!src) return std::optional<llvm::Value*>(nullptr);
+            return dispatchEventMethods(src, sharedPayload);
+        }
     }
     return std::nullopt;
 }
@@ -4577,8 +4906,25 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
             return false;
         // A direct event access OR a stored IEvent<T>/IAsyncEvent<T> value
         // (#747): both produce an owned Subscription that must be disposed.
+        // fix #4901 / stdlib §6.5 (v0.307): a stored ISharedEvent<T> value
+        // (interface face) or a stored SharedEventSource<T> value (producer
+        // class) ALSO produce an owned Subscription via `.Subscribe`, and —
+        // unlike EventSource<T>/AsyncEventSource<T> — sema has no
+        // `rcn == "SharedEventSource"` block that types the call result as
+        // `Subscription` (no equivalent block exists for the shared pair), so
+        // this structural fallback is the ONLY recognition path for them,
+        // exactly the #747/#3591 gap this lambda already exists to close for
+        // IEvent<T>. Without this, `var sub := face.Subscribe(h); sub.Dispose();`
+        // through an ISharedEvent<T>/SharedEventSource<T> receiver dispatched
+        // the explicit `.Dispose()` through the generic vtable path against
+        // Subscription's vtable-less handle — SIGSEGV (measured with this
+        // fix's own probe: `App.Feed.Subscribe(OnTick); sub.Dispose();` through
+        // a SharedEventSource<T>-backed ISharedEvent<T> property crashes
+        // without this arm and disposes cleanly with it).
         return eventSymbolOf(*ma->target) != nullptr ||
-               isIEventTypeName(ctx_.exprType(*ma->target));
+               isIEventTypeName(ctx_.exprType(*ma->target)) ||
+               isISharedEventTypeName(ctx_.exprType(*ma->target)) ||
+               isSharedEventSourceTypeName(ctx_.exprType(*ma->target));
     };
     if (isSubscribeCall(e)) return true;
     if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {

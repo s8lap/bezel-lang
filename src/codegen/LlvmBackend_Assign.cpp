@@ -1,7 +1,15 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901)
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 
 namespace bezel::codegen {
+
+// fix #4901: defined in LlvmBackend_Calls2.cpp beside the `.Subscribe`/`.Add`
+// arms it also gates; shared with tryLowerEventCompound's `+=` route below.
+bool sharedEventHandlerAdmissible(
+        sema::SemaContext& ctx, const ast::Expr* handler,
+        const ast::Expr* receiver, const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName);
 
 namespace {
 // §23.4 (#774): exact structural match between an indexer's first parameter
@@ -8227,6 +8235,36 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
         if (!isEventSourceTypeName(tgtTy) && !isSharedEventSourceTypeName(tgtTy))
             return false;
         if (tgtTy && !tgtTy->genericArgs.empty()) payloadTy = tgtTy->genericArgs[0];
+        // fix #4901 (stdlib §6.5 "Capture-freedom at every subscribe
+        // position", spec §28.14, v0.307): `+=` on a SharedEventSource<T> is
+        // the desugaring of `.Add(handler)` (spec §17.2), a subscribe position
+        // of the shared pair. Sema (#4920) rejects a capturing handler here,
+        // and its assignability check rejects a wrong arity, a mismatched
+        // parameter type or an `owned` formal, but it judges an overload group
+        // by the overload it happens to bind and admits a non-capturing
+        // lambda. Codegen lowers only what it has measured sound,
+        // so apply the SAME gate the `.Subscribe`/`.Add` call arms use
+        // (sharedEventHandlerAdmissible, LlvmBackend_Calls2.cpp): a static,
+        // non-overloaded method reference of exactly `(T) -> ()`. Unlike those
+        // arms there is no #2457 backstop behind this statement, so reject
+        // here. Lowering a capture-free lambda on this pair is #4972 (a
+        // spurious reject today). `-=` (Remove, "call-bounded: compares only")
+        // is not a subscribe position and is left as it was; its per-call
+        // closure-record leak is #4970.
+        if (as.op == "+=" && isSharedEventSourceTypeName(tgtTy) &&
+            !sharedEventHandlerAdmissible(
+                ctx_, as.value.get(), as.target.get(), payloadTy,
+                [this](std::string_view n) { return isBuiltinTypeRefName(n); })) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "`+=` on a `SharedEventSource<T>` is lowered only for a "
+                "static, non-overloaded method reference whose signature is "
+                "exactly `(T) -> ()` for the source's payload type `T` "
+                "(stdlib §6.5); this handler is not one — a lambda handler on "
+                "this pair is not yet lowered (#4972), and an overloaded, "
+                "`owned`-formal or mistyped method group is rejected");
+            return true;
+        }
         src = lowerExpr(*as.target);
         if (!src) return true;  // error path; avoid bad fallthrough
     }

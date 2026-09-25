@@ -53,6 +53,12 @@
 // §6.5; post-fix the row carries §6.5, not #2457). The CAPTURE-FREE rows
 // assert the EXACT #2457 needle — pre-fix and post-fix both — to pin the
 // intermediate state (sema admits, codegen rejects).
+//
+// Updated by #4901 v3 (stacked on this fix): its codegen claim lowers a
+// static method reference, so p9_static_ctl and pe_static now RUN and assert
+// stdout "9"; pe_free (Subscribe of a capture-free lambda) still hits #2457,
+// and pe_free_pe (`+=` of one) hits the codegen `+=` gate's own diagnostic —
+// both pending #4972 (lambda handlers on the shared pair).
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
@@ -465,11 +471,11 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
         "    return 0; "
         "  end Main; "
         "end C4920p9;");
-    // CONTROL: sema admits (capture-free), codegen rejects with #2457.
-    // Intermediate state — flips to RUN-with-stdout="9" when L24b widens
-    // the codegen claim for SharedEventSource<T>.Subscribe.
-    BEZEL_EXPECT_TRUE(rejectedWithNeedle(r,
-        "produced no value, and no dispatch arm emitted any code"));
+    // Sema admits (capture-free). Flipped from the #2457 CONTROL to
+    // RUN-with-stdout="9" by #4901 v3, whose codegen claim lowers a static,
+    // non-overloaded `(T) -> ()` method reference on SharedEventSource<T>.
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }
 
 // pe_free: capture-free lambda literal on Subscribe. Sema admits
@@ -554,9 +560,9 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
         "    return 0; "
         "  end Main; "
         "end C4920pes;");
-    // CONTROL: same intermediate state as p9_static_ctl above.
-    BEZEL_EXPECT_TRUE(rejectedWithNeedle(r,
-        "produced no value, and no dispatch arm emitted any code"));
+    // Flipped to RUN-with-stdout="9" by #4901 v3 (see p9_static_ctl).
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }
 
 // pe_free_pe: capture-free lambda literal via +=. Desugars to .Add per
@@ -577,7 +583,12 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
         "    return 0; "
         "  end Main; "
         "end C4920pefp;");
-    // CONTROL: same intermediate state as p9_static_ctl above.
+    // CONTROL: sema admits (capture-free). Under #4901 v3 codegen's `+=`
+    // gate rejects it (it lowers only a static `(T) -> ()` method reference;
+    // lambda handlers on the pair are #4972), with its own text rather than
+    // #2457. Flips to RUN-with-stdout="9" when #4972 lands.
     BEZEL_EXPECT_TRUE(rejectedWithNeedle(r,
+        "`+=` on a `SharedEventSource<T>` is lowered only for a static"));
+    BEZEL_EXPECT_TRUE(diagnosticAbsent(r,
         "produced no value, and no dispatch arm emitted any code"));
 }
