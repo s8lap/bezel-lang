@@ -15,6 +15,16 @@ std::string wrap(const std::string& body) {
         "class C public method M(cond: bool) ") + body + " end M; end C;";
 }
 
+// Scan diagnostics for the DA pass's "read of unassigned local" text —
+// needed early in this file because the #4419 controls reuse it to confirm
+// the rejection carries the §7.9-cited message (not some unrelated cascade).
+bool mentionsUnassignedRead(const bezel::test::DAResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("read of unassigned local") != std::string::npos)
+            return true;
+    return false;
+}
+
 } // namespace
 
 BEZEL_TEST(sema_da, local_with_init_is_assigned) {
@@ -22,9 +32,32 @@ BEZEL_TEST(sema_da, local_with_init_is_assigned) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_da, local_without_init_read_diagnoses) {
+// §7.9 (v0.299, #4419): a local of DEFAULTABLE type declared without an
+// initializer (`var x: int;`) holds the type's default (`0` for int) from
+// its declaration and may be read from any reaching path. Replaces the
+// pre-#4419 over-strict verdict (which rejected every no-init local
+// unconditionally). Pair with `local_nondefaultable_no_init_still_diagnoses`
+// below, which preserves the rejection for non-defaultable types.
+BEZEL_TEST(sema_da, local_defaultable_no_init_read_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(wrap("var x: int; _ := x;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.9 (v0.299, #4419): a NON-defaultable local declared without an
+// initializer (non-nullable `string`) still requires explicit assignment
+// before read — the §17.11 "defaultable" glossary entry admits only
+// nullable references and recursively-defaultable value types, so plain
+// `string` stays over the line.
+BEZEL_TEST(sema_da, local_nondefaultable_no_init_still_diagnoses_spec_7_9_4419) {
+    auto r = parseAndCheckDA(
+        "module M; class C "
+        "  public static method Make(): string return \"hi\"; end Make; "
+        "  public method M() "
+        "    var s: string; _ := s; "
+        "  end M; "
+        "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
 }
 
 BEZEL_TEST(sema_da, local_assigned_before_read_is_clean) {
@@ -40,12 +73,39 @@ BEZEL_TEST(sema_da, both_branches_assign_is_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_da, only_one_branch_assigns_diagnoses) {
+// §7.9 (v0.299, #4419) variant: a DEFAULTABLE-typed no-init local
+// (`var x: int;`) reads the §17.11 default (`0`) on the if-branch that
+// did not assign it — the read past the `if` is no longer a DA error.
+// Replaces the pre-#4419 over-strict verdict (which rejected every
+// no-init local unconditionally, regardless of how many branches assigned).
+// Pair with `only_one_branch_assigns_nondefaultable_still_diagnoses` below,
+// which preserves the rejection for a non-defaultable type.
+BEZEL_TEST(sema_da,
+           only_one_branch_assigns_defaultable_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(wrap(
         "var x: int; "
         "if cond then x := 1; end; "
         "_ := x;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.9 (v0.299, #4419) companion: the same one-branch shape with a
+// NON-defaultable type — non-nullable `Object` is not in §17.11's
+// defaultable list, so the unassigned branch keeps the `read of
+// unassigned` rejection.
+BEZEL_TEST(sema_da,
+           only_one_branch_assigns_nondefaultable_still_diagnoses_spec_7_9_4419) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public method M(cond: bool) "
+        "    var o: Object; "
+        "    if cond then o := new Object(); end; "
+        "    _ := o; "
+        "  end M; "
+        "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
 }
 
 BEZEL_TEST(sema_da, elif_branches_all_assign_clean) {
@@ -59,13 +119,39 @@ BEZEL_TEST(sema_da, elif_branches_all_assign_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_da, while_body_assigns_doesnt_count_after_loop) {
+// §7.9 (v0.299, #4419) variant: a DEFAULTABLE-typed no-init local
+// (`var x: int;`) reads the §17.11 default (`0`) on the path where the
+// while body never executed — the post-loop read is no longer a DA error.
+// Replaces the pre-#4419 over-strict verdict (which rejected every
+// no-init local unconditionally, regardless of how many loop iterations
+// ran). Pair with `while_body_assigns_nondefaultable_doesnt_count_after`
+// below, which preserves the rejection for a non-defaultable type.
+BEZEL_TEST(sema_da,
+           while_body_defaultable_no_assign_after_loop_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(wrap(
         "var x: int; "
         "while cond do x := 1; end; "
         "_ := x;"));
-    // While body may not execute → x is not definitely assigned post.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.9 (v0.299, #4419) companion: the same while shape with a
+// NON-defaultable type — non-nullable `Object` is not in §17.11's
+// defaultable list, so the post-loop read on the zero-iteration path
+// keeps the `read of unassigned` rejection.
+BEZEL_TEST(sema_da,
+           while_body_assigns_nondefaultable_doesnt_count_after_spec_7_9_4419) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public method M(cond: bool) "
+        "    var o: Object; "
+        "    while cond do o := new Object(); end; "
+        "    _ := o; "
+        "  end M; "
+        "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
 }
 
 BEZEL_TEST(sema_da, while_body_read_after_assign_clean) {
@@ -126,9 +212,15 @@ BEZEL_TEST(sema_da, out_arg_predeclared_local_is_assigned_spec_22_3) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL §22.3: a genuinely unassigned local read (no `out` write) still
-// diagnoses — the out-arg relaxation must not mask a real unassigned read.
-BEZEL_TEST(sema_da, plain_unassigned_read_still_diagnoses_after_out_fix) {
+// §7.9 (v0.299, #4419) variant of the §22.3 control: a DEFAULTABLE-typed
+// no-init local (`var v: int;`) reads the §17.11 default (`0`), so the
+// plain `return v` after the declaration is NOT a definite-assignment
+// error — the out-arg relaxation (which the original control was meant to
+// confirm had not over-broadened into a free pass) does not even need to
+// apply. Pair with `plain_nondefaultable_no_init_return_still_diagnoses`
+// below, which preserves the rejection for non-defaultable types.
+BEZEL_TEST(sema_da,
+           plain_defaultable_no_init_return_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
@@ -137,13 +229,53 @@ BEZEL_TEST(sema_da, plain_unassigned_read_still_diagnoses_after_out_fix) {
         "    return v; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL: a `ref` argument is read-write — the variable must be assigned
-// BEFORE the call, so an unassigned `ref v` still diagnoses (only `out` is a
-// pure write).
-BEZEL_TEST(sema_da, ref_arg_unassigned_still_diagnoses_spec_22_3) {
+// §7.9 (v0.299, #4419) companion: a NON-defaultable no-init local
+// (non-nullable `string`) still requires explicit assignment before
+// `return v` — the §17.11 glossary entry excludes non-nullable references,
+// so the `return v` is a genuine read-of-unassigned.
+BEZEL_TEST(sema_da,
+           plain_nondefaultable_no_init_return_still_diagnoses_spec_7_9_4419) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Main(): string "
+        "    var v: string; "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
+
+// §22.3 control (companion to the plain-read pair above): a `ref` argument
+// is read-write — the variable must be assigned BEFORE the call, so an
+// unassigned `ref v` still diagnoses (only `out` is a pure write). Updated
+// #4419 (#7.9/v0.299) variant uses a NON-defaultable type
+// (non-nullable `Object`) so the §7.9 default-init relaxation does NOT
+// apply — the original `int` shape no longer diagnoses after the fix.
+BEZEL_TEST(sema_da, ref_arg_nondefaultable_still_diagnoses_spec_22_3) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Inc(ref v: Object) v := v; end Inc; "
+        "  public static method Main(): int "
+        "    var v: Object; "
+        "    Inc(ref v); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
+
+// §7.9 (v0.299, #4419) companion: `ref` on a DEFAULTABLE no-init local
+// (`var v: int;`) — v has the §17.11 default (`0`) at the call, so the
+// read side of the `ref` is satisfied and the call is legal. (This is the
+// pre-#4419 case that the prior text over-rejected.)
+BEZEL_TEST(sema_da, ref_arg_defaultable_no_init_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
@@ -154,7 +286,7 @@ BEZEL_TEST(sema_da, ref_arg_unassigned_still_diagnoses_spec_22_3) {
         "    return v; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ---- fix #925: callee-side out-parameter definite-assignment (§22.3) -------
@@ -261,14 +393,10 @@ BEZEL_TEST(sema_da, callee_ref_param_not_reassigned_is_clean_spec_22_3_925) {
 // remain readable on every path.
 // -----------------------------------------------------------------------------
 
-namespace {
-bool mentionsUnassignedRead(const bezel::test::DAResult& r) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("read of unassigned local") != std::string::npos)
-            return true;
-    return false;
-}
-}  // namespace
+// (The mentionsUnassignedRead helper now lives in the top namespace near
+// `wrap` — its definition was moved there so the #4419 controls near the
+// top of the file can reuse it before the §22.4 section that originally
+// introduced it.)
 
 // (a) REJECT: `if flag and TryGet(out var s) then ... end; _ := s;` — on the
 // `flag == false` path the call never ran, so a read of the non-nullable
@@ -532,10 +660,15 @@ BEZEL_TEST(sema_da, if_else_throws_read_after_is_assigned_accepted_spec_17_1753)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// REJECT — under-reject guard: the else branch is LIVE (falls through) and does
-// NOT assign `x`, so `x` is not definitely assigned on that reaching path. The
-// terminated-branch exclusion must not swallow this genuine error.
-BEZEL_TEST(sema_da, if_else_live_without_assign_still_rejected_spec_17_1753) {
+// §7.9 (v0.299, #4419) variant of the §17 under-reject guard: a
+// DEFAULTABLE no-init local (`var x: int;`) reads the §17.11 default (`0`)
+// on the reaching path that did not assign it — the if/else
+// terminated-branch-exclusion logic itself is unchanged, but the per-path
+// assignment check no longer fires for a defaultable local. Pair with
+// `if_else_live_nondefaultable_without_assign_still_rejected` below,
+// which preserves the rejection for a non-defaultable type.
+BEZEL_TEST(sema_da,
+           if_else_live_defaultable_without_assign_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
@@ -543,6 +676,26 @@ BEZEL_TEST(sema_da, if_else_live_without_assign_still_rejected_spec_17_1753) {
         "    var x: int; "
         "    if c then x := 1; else _ := c; end; "
         "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.9 (v0.299, #4419) companion: the same shape with a NON-defaultable
+// type — non-nullable `string` is not in §17.11's defaultable list, so a
+// live else branch that does not assign `s` keeps the `read of unassigned`
+// rejection (this is the case the original §17 control was written to
+// pin). The terminated-branch exclusion must not swallow this genuine
+// error.
+BEZEL_TEST(sema_da,
+           if_else_live_nondefaultable_without_assign_still_rejected_spec_17) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(c: bool): string "
+        "    var s: string; "
+        "    if c then s := \"a\"; else _ := c; end; "
+        "    return s; "
         "  end Pick; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -568,10 +721,15 @@ BEZEL_TEST(sema_da, case_terminated_arm_excluded_read_after_accepted_spec_19_175
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// REJECT — under-reject guard for the `case` join: one arm falls through
-// without assigning `x` (it is NOT terminated), so `x` is not definitely
-// assigned after the case.
-BEZEL_TEST(sema_da, case_live_arm_without_assign_still_rejected_spec_19_1753) {
+// §7.9 (v0.299, #4419) variant of the §19 under-reject guard: a
+// DEFAULTABLE no-init local (`var x: int;`) reads the §17.11 default
+// (`0`) on the live arm that did not assign it — the `case` join's
+// terminated/live-arm accounting itself is unchanged, but the per-path
+// assignment check no longer fires for a defaultable local. Pair with
+// `case_live_arm_nondefaultable_without_assign_still_rejected` below,
+// which preserves the rejection for a non-defaultable type.
+BEZEL_TEST(sema_da,
+           case_live_arm_defaultable_without_assign_accepted_spec_7_9_4419) {
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
@@ -582,6 +740,28 @@ BEZEL_TEST(sema_da, case_live_arm_without_assign_still_rejected_spec_19_1753) {
         "      _ => do x := 1; end "
         "    end; "
         "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.9 (v0.299, #4419) companion: the same `case` join shape with a
+// NON-defaultable type — non-nullable `string` is not in §17.11's
+// defaultable list, so a live arm that does not assign `s` keeps the
+// `read of unassigned` rejection (this is the case the original §19
+// control was written to pin).
+BEZEL_TEST(sema_da,
+           case_live_arm_nondefaultable_without_assign_still_rejected_spec_19) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(n: int): string "
+        "    var s: string; "
+        "    case n of "
+        "      2 => do _ := n; end, "
+        "      _ => do s := \"x\"; end "
+        "    end; "
+        "    return s; "
         "  end Pick; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());

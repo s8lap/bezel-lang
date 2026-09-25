@@ -12,6 +12,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
+#include "sema/TypeResolution.hpp"  // typeHasNoDefault — §7.9 / §17.11 defaultable, #4419
 
 namespace bezel::sema {
 
@@ -1210,11 +1211,27 @@ private:
                 if (ld->initializer) {
                     assigned_.insert(ld->name);
                 } else if (ld->type) {
-                    // §15.1: inline arrays are zero-initialized when declared
-                    // without an initializer (the declaration is the init);
-                    // treat them as definitely assigned.
+                    // §7.9 (v0.299, #4419): a local of DEFAULTABLE type
+                    // (§17.11 "defaultable" glossary entry) declared without an
+                    // initializer holds that type's default from its
+                    // declaration and may be read — `int`→0, `bool`→false,
+                    // `char`→'\0', nullable types→null, records with all
+                    // defaultable fields→all-fields-default, inline arrays of
+                    // defaultable elements→per-slot default, the unit `()`→`()`.
+                    // A non-defaultable type (a non-nullable reference type
+                    // like `string`/`Object`/a class, a choice, a record or
+                    // inline array with a non-defaultable component) still
+                    // requires explicit assignment before read.
+                    //
+                    // Replaces the previous InlineArray-only carve-out, which
+                    // silently admitted `var a: [3]NonDefaultable;` (non-
+                    // defaultable element slots left as garbage) and over-
+                    // rejected every other defaultable type — including `int`
+                    // and `string?`, both admitted by the v0.298/§7.9 prose.
+                    // `typeHasNoDefault` recurses into inline-array element
+                    // types, so `[N]T` is admitted iff `T` is defaultable.
                     if (auto* rt = ctx_.resolvedType(*ld->type)) {
-                        if (rt->kind == sema::TypeRef::Kind::InlineArray)
+                        if (!typeHasNoDefault(rt, ctx_))
                             assigned_.insert(ld->name);
                     }
                 }
