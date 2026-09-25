@@ -13577,11 +13577,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // quietly would skip the chained constructor body — the fields it assigns
     // keep their defaults. Report it (`internal:`, the #2434 / #2658
     // degradation convention) rather than miscompile silently.
+    //
+    // fix #4989 (#2924's disposition, §22.5 / §22.6, v0.307): Error, not
+    // Warning. Skipping the chained constructor body leaves every field it
+    // assigns at its calloc-zero default, so a string / class / collection
+    // field is a null pointer the program then reads as an object — the
+    // #2658 shape (UnsafePointer), and the #2922-measured SIGSEGV at 0x8.
+    // Shipping a binary here would be a memory-safety hazard inside a
+    // successful compile; the #4790 lowerNew twin made the same call.
     for (llvm::Value* v : byFormal) {
         if (v) continue;
         if (!ctx_.diagnostics().hasErrors())
             ctx_.diagnostics().report(
-                Severity::Warning, call->span.begin,
+                Severity::Error, call->span.begin,
                 "internal: a constructor-chain argument slot is still unfilled "
                 "after default filling, so the chained constructor body does "
                 "not run — #4791");

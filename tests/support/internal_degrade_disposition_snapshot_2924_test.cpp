@@ -318,6 +318,16 @@ const Entry kWarningDegrades[] = {
 // #2922 shape). Per this file's instructions it was made an Error instead of
 // being recorded as a shipped hazard. It is therefore outside the Warning
 // population this test pins, and the count stays 9.
+//
+// #4791 (v0.307) is the same judgement, reached the same way (#4989): its
+// emitChainCall site in src/codegen/LlvmBackend_Setup.cpp ("a
+// constructor-chain argument slot is still unfilled after default filling,
+// so the chained constructor body does not run — #4791") landed as a
+// Warning and this test caught it at the R20 gate. Disposition
+// UnsafePointer: skipping the chained constructor body leaves every field it
+// assigns at its calloc-zero default — the #2658 shape, a null string / class
+// / collection field the program reads as an object. It was made an Error, so
+// it too is outside the Warning population, and the count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 struct Site {
