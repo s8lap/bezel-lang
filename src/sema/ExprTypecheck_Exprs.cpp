@@ -6262,9 +6262,10 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     if (op == "<" || op == ">" || op == "<=" || op == ">=") {
         for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
             TypeSymbol* ts = memberTargetType(operand);
-            // Exclude the value-builtins (DateTime/TimeSpan/Guid/…): they carry
-            // a kind==Class TypeSymbol but support a built-in relational compare
-            // with no user overload (§2.5).
+            // Exclude the value-builtins that DO carry a built-in relational
+            // compare (Guid — lex order on the 16-byte UUID, .NET parity).
+            // DateTime and TimeSpan are intentionally NOT excluded here: see
+            // the dedicated block immediately below for the #4917 reject.
             if (ts && !ts->isValueBuiltin &&
                 (ts->kind == ast::TypeDeclKind::Record ||
                  ts->kind == ast::TypeDeclKind::Class ||
@@ -6278,6 +6279,41 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 return;
             }
+        }
+    }
+    // fix #4917 (stdlib §2.5, v0.307; §25): DateTime and TimeSpan declare NO
+    // relational operators — only `CompareTo` (an `IComparable<T>` member,
+    // returns int) and `=`/`<>` equality auto-generated per §9.2. The earlier
+    // value-builtin exclusion in the record/class/choice guard above was
+    // wrong for these two: it assumed "scalar i64 tick count" implies
+    // `<,>,<=,>=` are defined, but the spec is explicit (§2.5: "Ordering is
+    // CompareTo only: DateTime declares no <,>,<=,>= overloads"). Without
+    // this reject, `t > 621355968000000000L` (DateTime > long) and
+    // `(t2 - t1) >= 0L` (TimeSpan >= long) passed sema and reached codegen,
+    // which silently emitted a tick-count `icmp` — semantically legal but
+    // spec-disallowed. Reject here before the fallback. Equality is
+    // unchanged (`=`/`<>` continue to work, auto-gen per §9.2). The fix is
+    // tighter than the value-builtin exclusion: only DateTime/TimeSpan are
+    // affected, Guid keeps its built-in relational (lex order on the 16-byte
+    // UUID — .NET parity, stdlib §2.6).
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+        auto isDateTimeOrTimeSpan = [&](const ast::Expr* operand) {
+            if (!operand) return std::string_view{};
+            TypeRef* t = ctx_.exprType(*operand);
+            std::string_view n = namedTypeName(t);
+            return (n == "DateTime" || n == "TimeSpan") ? n : std::string_view{};
+        };
+        std::string_view badName =
+            isDateTimeOrTimeSpan(be.left.get());
+        if (badName.empty()) badName = isDateTimeOrTimeSpan(be.right.get());
+        if (!badName.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) +
+                "` is not defined for type `" + std::string(badName) +
+                "` (stdlib §2.5, v0.307; use CompareTo or .Ticks)");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
         }
     }
     // fix #3929 (§25/§11.8, v0.294): an Interface operand gets a DEDICATED

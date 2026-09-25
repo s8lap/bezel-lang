@@ -45,19 +45,24 @@ std::string prog(const std::string& mainBody) {
 
 // stdlib §2.5: UtcNow ticks must be > 0 (after the epoch 0001-01-01).
 // The POSIX epoch is tick 621355968000000000; any current UTC time is larger.
+// Migrated to `.Ticks` form per #4917 (DateTime declares no relational
+// operators per stdlib §2.5, v0.307 — `.Ticks` returns long and is the
+// canonical way to inspect a DateTime's tick count).
 BEZEL_TEST(codegen_datetime_2_5, utcnow_ticks_positive) {
     BEZEL_EXPECT_EQ(run(prog(
         "var t := DateTime.UtcNow; "
-        "if t > 621355968000000000L then return 1; end; "
+        "if t.Ticks > 621355968000000000L then return 1; end; "
         "return 0; ")), 1);
 }
 
 // stdlib §2.5: two successive UtcNow calls are non-decreasing.
+// Migrated to `.Ticks` form per #4917 (TimeSpan declares no relational
+// operators — `(t2 - t1).Ticks` returns long).
 BEZEL_TEST(codegen_datetime_2_5, utcnow_monotone) {
     BEZEL_EXPECT_EQ(run(prog(
         "var t1 := DateTime.UtcNow; "
         "var t2 := DateTime.UtcNow; "
-        "if t2 - t1 >= 0L then return 1; end; "
+        "if (t2 - t1).Ticks >= 0L then return 1; end; "
         "return 0; ")), 1);
 }
 
