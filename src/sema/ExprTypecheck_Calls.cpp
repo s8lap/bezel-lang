@@ -19800,6 +19800,66 @@ bool selfCallSiblingWhereSatisfiedByCaller(
 }  // namespace
 
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
+    // fix #4961 (spec §28.14, v0.307): "forming a method reference over
+    // a capture-free-register position is a compile error". The capture-free
+    // register covers `ISharedEvent<T>.Subscribe` and
+    // `SharedEventSource<T>.{Subscribe, Add}` (stdlib §6.5; #4920 enforces
+    // the same admission at the handler side — a non-capturing lambda or a
+    // static method reference). Forming a bare method reference over a
+    // register position erases the admission: the resulting plain function
+    // value is a `(T) -> ()` indistinguishable from a plain
+    // `EventSource<T>` handler (no capture-free annotation), and an
+    // `es.Add(f)` on it later would launder the cross-domain subscriber-list
+    // entry through a value-type that the register was meant to refuse.
+    // Reject at the formation site (call-position usage is unaffected —
+    // only the bare-reference expression itself is the violation, not its
+    // later call). The `calleeOfCallCtx_` gate below distinguishes bare
+    // references from `Bus.Feed.Subscribe(h)` / `src.Subscribe(h)` call
+    // sites, which resolve through this same branch but reach the
+    // call-form reject via the #4920 capture-free admission (their handler
+    // value is still checked against the `(T) -> ()` slot).
+    //
+    // This check fires BEFORE the no-member fall-through path (the
+    // SharedEventSource<T>/ISharedEvent<T> pair has no MethodSymbol for
+    // Subscribe/Add — the member name resolves only on the call site, not
+    // on the bare-reference site — so without this pre-check a bare
+    // `src.Subscribe` reaches `lowerLocalDecl` with no exprType at all
+    // and degrades to the #2434 zero-initialized warning rather than a
+    // clear rejection). Detection: `ma.target`'s static type is
+    // `ISharedEvent<T>` or `SharedEventSource<T>` (declaration-less
+    // Named refs whose head name is the registered builtin, the same
+    // shape #4920 / #4898 use at the call site). `+=` does not appear
+    // here because it desugars to a call, not a reference formation; the
+    // `Bus.Feed.Subscribe` / `SharedEventSource<T>.Subscribe` / `.Add`
+    // bare-reference spellings are the only formations this row rejects.
+    if (&ma != calleeOfCallCtx_ &&
+        (ma.member == "Subscribe" || ma.member == "Add") && ma.target) {
+        if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+            if (recvTy->kind == TypeRef::Kind::Named &&
+                !recvTy->declaration && recvTy->astNode &&
+                recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty()) {
+                const std::string_view hn = recvTy->headName();
+                if (hn == "ISharedEvent" || hn == "SharedEventSource") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("forming a method reference over "
+                            "the capture-free-register subscribe position `") +
+                            std::string(hn) + "." +
+                            std::string(ma.member) +
+                            "` is a compile error — the formed plain "
+                            "function value would erase the §28.14 "
+                            "capture-free admission of `ISharedEvent<T>` / "
+                            "`SharedEventSource<T>` and admit a plain "
+                            "`(T) -> ()` to any later `Subscribe` / `Add` "
+                            "site (spec §28.14, v0.307; stdlib §6.5); "
+                            "call the subscribe position directly with a "
+                            "capture-free handler instead");
+                    return;
+                }
+            }
+        }
+    }
     // per §24: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
     // `Add`, `Remove`) are only in scope inside the declaring class (and inside
