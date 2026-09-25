@@ -2721,6 +2721,62 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
 }
 
 
+// narrow #4858 (§12.7 / §8.1 / §3.1, v0.307; stdlib §9.6): the ONE table of
+// what a `string` IS. `string` is a sealed reference type (stdlib §9.6 declares
+// `public class String: IEnumerable<char>, IComparable<string>,
+// IEquatable<string>`), so a runtime string is an instance of exactly: `string`
+// itself, `Object` (§8.1, "the universal root … `string` … reaching `Object`
+// via [its] reference-type heap representation"), and the three interfaces the
+// §9.6 declaration lists — and of nothing else (no class can derive from it, no
+// value type is a string). The compiler has no parsed `String` declaration to
+// derive the list from, so it is encoded here once, keyed the way the front-end
+// keys the same types: `IComparable`/`IEquatable` are the synthesized builtin
+// interfaces (matched by the `isSynthesizedBuiltinInterface` identity flag, the
+// discriminator ExprTC::primitiveBoxesIntoBuiltinIface uses so a USER interface
+// of the same name never matches — #3022/#3139), at exactly `<string>` (both
+// invariant, §12.9 — stdlib §2.8/§2.9 "at their own type only"); `IEnumerable`
+// is a declaration-less builtin Named ref at exactly `<char>`. Target
+// nullability is irrelevant to the instance question (the null case is decided
+// on the operand, not the target).
+static bool stringIsInstanceOf(const sema::TypeRef* rt) {
+    if (!rt) return false;
+    if (rt->kind == sema::TypeRef::Kind::Primitive)
+        return rt->primitive == sema::PrimitiveType::String ||
+               rt->primitive == sema::PrimitiveType::Object;
+    if (rt->kind != sema::TypeRef::Kind::Named || rt->genericArgs.size() != 1)
+        return false;
+    const sema::TypeRef* arg = rt->genericArgs[0];
+    if (!arg || arg->kind != sema::TypeRef::Kind::Primitive || arg->nullable)
+        return false;
+    if (rt->declaration) {
+        if (!rt->declaration->isSynthesizedBuiltinInterface) return false;
+        const auto& n = rt->declaration->name;
+        return (n == "IComparable" || n == "IEquatable") &&
+               arg->primitive == sema::PrimitiveType::String;
+    }
+    return rt->headName() == "IEnumerable" &&
+           arg->primitive == sema::PrimitiveType::Char;
+}
+
+// narrow #4858 (§12.7 / §8.6, v0.307): can a value whose STATIC type is `opTy`
+// be a bare `bz_string*` at run time? A string stored in a reference slot keeps
+// its vtable-less representation (#1071, #2752), so every static type a string
+// converts to — `Object`, a user/builtin interface, and the declaration-less
+// `IEnumerable<char>` stdlib §9.6 gives it — may hold one. Pre-fix only
+// `Object` and declared interfaces were listed, so `e: IEnumerable<char>`
+// holding a string ran emitIsA on the string's `char* data` (SIGSEGV).
+static bool staticTypeMightHoldBareString(const sema::TypeRef* opTy) {
+    if (!opTy) return false;
+    if (opTy->kind == sema::TypeRef::Kind::Primitive)
+        return opTy->primitive == sema::PrimitiveType::Object;
+    if (opTy->kind != sema::TypeRef::Kind::Named) return false;
+    if (opTy->declaration)
+        return opTy->declaration->kind == ast::TypeDeclKind::Interface;
+    sema::TypeRef bare = *opTy;
+    bare.nullable = false;
+    return stringIsInstanceOf(&bare);
+}
+
 llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!te.operand || !te.testType) return nullptr;
     // fix #2865 (§8.6 "Boxing" / §28.9 / §28.3, v0.240): an UNBOUND +1 box
@@ -2939,6 +2995,43 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         const sema::TypeRef* opTy = operandStaticTy();
         return opTy && isObjectOrInterfaceTarget(opTy);
     };
+    // narrow #4858 (§12.7, v0.307; stdlib §9.6): a `string`-TYPED operand is
+    // decided STATICALLY. `string` is sealed, so its runtime type is its static
+    // type and `stringIsInstanceOf` is the whole answer — no descriptor walk
+    // (the #1071 hazard: pre-fix `s is IShape` / `s is Dog` / `s is int` / even
+    // `s is IEquatable<string>` fell through to emitIsA on the bare
+    // `bz_string*` and SIGSEGV'd, because `mightHoldString` below only covers
+    // Object/interface operands). A nullable `s: string?` is an instance only
+    // when non-null (§12.7 — `null` is an instance of no type). `as` yields the
+    // operand (a borrow, §17.4) on a match and `null` otherwise; a value target
+    // (`s as int`) is never a match, so its `T?` is the all-zero null struct.
+    // The narrowed-carrier and generic-carrier shapes do not reach here: a
+    // narrowed identifier reports its DECLARED type (Object/interface) through
+    // operandStaticTy, and a `v: T` carrier's sema type is the type parameter.
+    if (const sema::TypeRef* opTy = operandStaticTy();
+        opTy && opTy->kind == sema::TypeRef::Kind::Primitive &&
+        opTy->primitive == sema::PrimitiveType::String &&
+        obj->getType()->isPointerTy() &&
+        (te.op == "is" || te.op == "is not" || te.op == "as")) {
+        const bool instance = stringIsInstanceOf(rt);
+        llvm::Value* holds = builder_.getInt1(instance);
+        if (instance && opTy->nullable)
+            holds = builder_.CreateICmpNE(
+                obj, llvm::ConstantPointerNull::get(ptrTy()), "is.str.nonnull");
+        if (te.op == "is") return holds;
+        if (te.op == "is not") return builder_.CreateXor(holds, builder_.getInt1(true));
+        if (!instance && isBoxableValueType(rt) &&
+            rt->kind != sema::TypeRef::Kind::Unit) {
+            sema::TypeRef tmp = *rt;
+            tmp.nullable = true;
+            return llvm::Constant::getNullValue(nullableValueStructTy(&tmp));
+        }
+        if (!instance) return llvm::ConstantPointerNull::get(ptrTy());
+        return opTy->nullable
+            ? builder_.CreateSelect(holds, obj,
+                                    llvm::ConstantPointerNull::get(ptrTy()))
+            : obj;
+    }
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
     // emitIsA's descriptor walk cannot run on it. Recognize it via
@@ -3127,16 +3220,17 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // concrete type, so when the operand could be a string, gate emitIsA on
     // bz_obj_is_string: a string yields isA=false (`is`→false, `is not`→true,
     // `as`→null) and only a genuine box/class runs the descriptor walk.
-    bool mightHoldString = false;
-    if (const sema::TypeRef* opTy = operandStaticTy()) {  // fix #3090
-        if (opTy->kind == sema::TypeRef::Kind::Primitive &&
-            opTy->primitive == sema::PrimitiveType::Object) {
-            mightHoldString = true;
-        } else if (opTy->kind == sema::TypeRef::Kind::Named && opTy->declaration &&
-                   opTy->declaration->kind == ast::TypeDeclKind::Interface) {
-            mightHoldString = true;
-        }
-    }
+    // fix #3090: the operand's DECLARED type (operandStaticTy) is consulted;
+    // narrow #4858 adds the declaration-less `IEnumerable<char>` carrier.
+    // The string arm deliberately stays a flat `false` even for the stdlib §9.6
+    // conformances (`IEquatable<string>` / `IComparable<string>`):
+    // bz_obj_is_string is a whitelist NEGATION (any vtable-less object — an
+    // Array, a lazy pipeline, a StringBuilder, a lambda — reads as a string),
+    // so answering `true` here would admit those and let `as` dispatch string
+    // Equals/CompareTo on them. `true` waits on a positive string
+    // identification (#4885).
+    const bool mightHoldString =
+        staticTypeMightHoldBareString(operandStaticTy());  // narrow #4858
     llvm::Value* isA;
     if (mightHoldString) {
         auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
