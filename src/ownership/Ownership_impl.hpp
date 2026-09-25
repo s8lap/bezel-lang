@@ -4072,6 +4072,30 @@ private:
     // Returns null if the root isn't a bare identifier.
     const ast::IdentifierExpr* identifierRoot(const ast::Expr& e);
 
+    // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): `identifierRoot`
+    // that ALSO peels the two source-preserving operators, `x as T` and the
+    // postfix `x!`, at any depth of the chain — so `(x as W)!.Self()` roots at
+    // `x`. Neither operator is a new source (§28.3: `x as T` is "Borrowed
+    // (source: same as `x`'s source …; `x` itself if `x` is owned)"; §17.8: `x!`
+    // carries `x`'s ownership state and source). Deliberately a SEPARATE entry
+    // point rather than a change to `identifierRoot`: its 24 callers include
+    // three that treat "no root" as the conservative answer (§30.1 frame
+    // residence, §28.14 scoped admission, §28.14 reachability), where a peel
+    // would ADMIT programs, so it is used only at the escape checks #4948
+    // measured as heap-use-after-frees. Caller beware: `x!` over an OWNED bare
+    // identifier is the owned value itself (a move-out at a return), not a
+    // borrow of it — see `isBangOverBareIdentifier`.
+    const ast::IdentifierExpr* identifierRootThroughCastBang(
+        const ast::Expr& e);
+    // fix #4948: strip `x!` and `x as T` layers off the TOP of `e` only.
+    // Returns `e` itself when there is none.
+    static const ast::Expr* peelTopCastBang(const ast::Expr* e);
+    // fix #4948 (§17.8): true iff `e` is one or more postfix `!` directly over
+    // a bare identifier (`x!`, `x!!`). Such a value has `x`'s own ownership
+    // state — an owned `x!` is `x` — so return-site borrow checks leave it to
+    // the bare-identifier path exactly as they leave `x`.
+    static bool isBangOverBareIdentifier(const ast::Expr& e);
+
     // §28.3 join. Per the spec the join is asymmetric: matching states
     // carry forward (with their auxiliary data, e.g. Owned's discharge
     // obligation), but mismatched owned-vs-borrowed is rejected (the

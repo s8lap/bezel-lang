@@ -8622,6 +8622,31 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // regard to the declared return type — the double-free this closes).
     // // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(e);
+    // fix #4948 (§17.8, §28.3, §28.10, v0.307): `return x!;` — §17.8: "if `x`
+    // has ownership state owned …, `x!` is owned", i.e. the bare `x` itself,
+    // so for a `using var` it is the same move-out of a scope-bound local the
+    // bare-identifier arm below rejects (and, read as a borrow, the same
+    // escape). Only the `using var` arm is routed here: an owned plain local's
+    // `return y!;` is a spec-legal transfer and keeps its existing handling.
+    if (isBangOverBareIdentifier(e)) {
+        const auto* bid =
+            dynamic_cast<const ast::IdentifierExpr*>(peelTopCastBang(&e));
+        if (bid) {
+            if (auto* st = lookupState(bid->name)) {
+                if (st->implicitDischarge) {
+                    report(
+                        Severity::Error, bid->span.begin,
+                        std::string("cannot return `using var` `") +
+                        std::string(bid->name) +
+                        "`; a `using var` is scope-bound — it cannot be moved "
+                        "out of (only borrowed from, and a borrow of it may "
+                        "not escape its scope) (§28.3 / §28.10)");
+                    st->state = OwnershipState::Poisoned;
+                    return;
+                }
+            }
+        }
+    }
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement

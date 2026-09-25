@@ -3637,7 +3637,15 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
 }
 
 void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
-    const ast::IdentifierExpr* root = identifierRoot(e);
+    // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): root THROUGH
+    // `x as T` and `x!` — neither is a new source, so `return (x as W)!;` and
+    // `return (x as W)!.Self();` borrow `x` exactly as `return x.Self();`
+    // does. The one exception is `x!` directly over a bare identifier: by
+    // §17.8 an owned `x!` IS `x` (a move-out, not a borrow), so it stays with
+    // handleReturn's bare-identifier path, which rejects the `using var` form
+    // and discharges an owned local — never a borrow escape here.
+    if (isBangOverBareIdentifier(e)) return;
+    const ast::IdentifierExpr* root = identifierRootThroughCastBang(e);
     if (!root) return;
     // A value-typed return is a copy, not a borrow of the local — it
     // cannot outlive its source (§28.3: a borrowed local "may not be
@@ -6284,12 +6292,21 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     // `r`. returnedExprMayBorrow is exactly the borrow-vs-copy predicate
     // (sema-typed; value-typed projection → false), so gating on it keeps a
     // value-typed local from ever being flagged later. // per §28.3
-    if (dynamic_cast<const ast::IdentifierExpr*>(&rhs) ||
-        dynamic_cast<const ast::MemberAccessExpr*>(&rhs) ||
-        dynamic_cast<const ast::NullCondMemberExpr*>(&rhs) ||
-        dynamic_cast<const ast::IndexExpr*>(&rhs)) {
+    //
+    // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): the same four
+    // forms under `x as T` / `x!` wrappers, rooted THROUGH those wrappers at
+    // any depth — `var b := (r as W)!;` and `_items.Add(r!)` re-borrow `r`
+    // exactly as `var b := r;` / `_items.Add(r)` do (neither operator is a new
+    // source), so the store-escape and return-escape checks that consume this
+    // source now see them.
+    const ast::Expr* shape1Core = peelTopCastBang(&rhs);
+    if (dynamic_cast<const ast::IdentifierExpr*>(shape1Core) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(shape1Core) ||
+        dynamic_cast<const ast::NullCondMemberExpr*>(shape1Core) ||
+        dynamic_cast<const ast::IndexExpr*>(shape1Core)) {
         if (returnedExprMayBorrow(rhs)) {
-            if (const ast::IdentifierExpr* root = identifierRoot(rhs)) {
+            if (const ast::IdentifierExpr* root =
+                    identifierRootThroughCastBang(rhs)) {
                 sema::Symbol* sym = ctx_.exprSymbol(*root);
                 if (isOwnedTrackedLocal(sym)) return sym;
                 // Multi-hop alias chain (#386 case 3): the re-borrow's root is
@@ -6475,8 +6492,12 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // holder's provenance is collected by the same handleLocalDecl →
     // collectRecordBorrowSource path, so the carried-source guard below
     // applies verbatim).
+    //
+    // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): likewise peel
+    // `h as T` and `h!` — neither is a new source, so `return (h as W)!;`
+    // returns the holder's carried borrow exactly as `return h;` does.
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-        common::peelBindAtomToBody(&e));
+        peelTopCastBang(common::peelBindAtomToBody(&e)));
     if (!id) return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
 
@@ -10705,6 +10726,70 @@ const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
         return ix->target ? identifierRoot(*ix->target) : nullptr;
     return nullptr;
+}
+
+// fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): see the
+// declaration. The chain arms mirror `identifierRoot`'s one for one and each
+// recurses into THIS function, so a cast or `!` nested anywhere in the chain
+// (`(x as W)!.Self()`) is peeled; `is` / `is not` yield a `bool` — a read,
+// never a source — so only the `as` spelling of TypeTestExpr peels (the same
+// rule #4942 applied in `collectOwningMatchSourceRoots`).
+const ast::IdentifierExpr* MethodOwnership::identifierRootThroughCastBang(
+        const ast::Expr& e) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return id;
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return pb->operand ? identifierRootThroughCastBang(*pb->operand)
+                           : nullptr;
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e))
+        return tt->op == "as" && tt->operand
+                   ? identifierRootThroughCastBang(*tt->operand)
+                   : nullptr;
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e))
+        return bx->body ? identifierRootThroughCastBang(*bx->body) : nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return ma->target ? identifierRootThroughCastBang(*ma->target)
+                          : nullptr;
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
+        return nm->target ? identifierRootThroughCastBang(*nm->target)
+                          : nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+        return ce->callee ? identifierRootThroughCastBang(*ce->callee)
+                          : nullptr;
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        return ix->target ? identifierRootThroughCastBang(*ix->target)
+                          : nullptr;
+    return nullptr;
+}
+
+// fix #4948: see the declaration. // per §17.4, §17.8, v0.307
+const ast::Expr* MethodOwnership::peelTopCastBang(const ast::Expr* e) {
+    while (e) {
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            if (!pb->operand) return e;
+            e = pb->operand.get();
+            continue;
+        }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            if (tt->op != "as" || !tt->operand) return e;
+            e = tt->operand.get();
+            continue;
+        }
+        return e;
+    }
+    return e;
+}
+
+// fix #4948: see the declaration. // per §17.8, v0.307
+bool MethodOwnership::isBangOverBareIdentifier(const ast::Expr& e) {
+    const ast::Expr* cur = &e;
+    bool sawBang = false;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(cur)) {
+        if (!pb->operand) return false;
+        sawBang = true;
+        cur = pb->operand.get();
+    }
+    return sawBang && dynamic_cast<const ast::IdentifierExpr*>(cur) != nullptr;
 }
 
 // fix #4312/#4313 (§28.3, v0.298): the four OwnershipState values that carry
