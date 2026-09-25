@@ -3500,6 +3500,17 @@ private:
     bool inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
                                    bool* outNeedsInfer);
 
+    // fix #4895 (§14.5 phase 3 + §15.4, v0.307): true iff the collection
+    // literal argument `cl` at a generic-method parameter position actually
+    // binds the method's type parameter named `tpName`. A literal binds T
+    // only when its elements share a single DETERMINED type — the element
+    // type is what unifies with the parameter's element type and
+    // substitutes in for T. Heterogeneous elements (`["s", new A()]`),
+    // empty literals, dictionary literals (`[k: v]`), and elements whose
+    // typecheck cascaded to Error all leave T unbound.
+    bool collectionLiteralBindsTypeParam(const ast::CollectionLiteralExpr& cl,
+                                         std::string_view tpName);
+
     // Recursive unification of a declared return TypeRef against a concrete
     // target TypeRef, binding any type-parameter names in `paramNames` into
     // `solved`. Returns false on a structural mismatch that prevents solving.

@@ -5129,6 +5129,69 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             return;
                         }
+                        // fix #4895 (§14.5 phase 3 + §15.4, v0.307): even when
+                        // every generic parameter IS bound by the argument
+                        // inference loop above, the binding is unsound if
+                        // every binding source for a parameter is a
+                        // collection literal whose elements do not all share
+                        // a single determined type. The parameter type
+                        // `Array<T>` is not closed (T is the very parameter
+                        // we are trying to bind), so per §15.4 the literal
+                        // has no determinable target type and per §14.5
+                        // phase 3 the call is a compile error naming the
+                        // parameter. Without this check, the binder's
+                        // element-by-element `checkAssignable` runs in the
+                        // order elements appear, binds T to the first
+                        // element's type, then fails on later elements —
+                        // but the call still typechecks and codegen proceeds
+                        // with T wrong (truncated pointer values, measured:
+                        // issue #4895's `Show(["s", new A()])` printed
+                        // `4435344|381342640`). Detect the unsound shape
+                        // here: walk each parameter position that mentions
+                        // a still-resolvable method type parameter, and for
+                        // each one whose actual argument is a collection
+                        // literal that fails to determine T's element type,
+                        // reject. The diagnostic text names the parameter
+                        // and the §14.5 / §15.4 authority.
+                        if (md && !md->genericParams.empty()) {
+                            for (const auto& gp : md->genericParams) {
+                                std::unordered_set<std::string_view> single{gp.name};
+                                for (std::size_t pi = 0;
+                                     pi < md->params.size(); ++pi) {
+                                    const auto& p = md->params[pi];
+                                    if (!p.type) continue;
+                                    if (auto* pty =
+                                            ctx_.resolvedType(*p.type)) {
+                                        if (!refOutParamTypeMentionsTypeParam(
+                                                pty, single))
+                                            continue;
+                                    } else {
+                                        continue;
+                                    }
+                                    if (pi >= ce.args.size() ||
+                                        !ce.args[pi].value)
+                                        continue;
+                                    auto* lit =
+                                        dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                            ce.args[pi].value.get());
+                                    if (!lit) continue;
+                                    if (!collectionLiteralBindsTypeParam(
+                                            *lit, gp.name)) {
+                                        ctx_.diagnostics().report(
+                                            Severity::Error, ce.span.begin,
+                                            "cannot infer the type argument `"
+                                            + std::string(gp.name) + "` of `"
+                                            + std::string(md->name) + "`'s "
+                                            "call — phase 3 of §14.5: the only "
+                                            "source is a collection literal "
+                                            "and no target type supplies `"
+                                            + std::string(gp.name)
+                                            + "` (§14.5, §15.4, v0.307)");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ctx_.setExprType(&ce, rt);
@@ -17907,6 +17970,52 @@ static void collectBoundParamNames(
     collectBoundParamNames(pt->funcReturn.get(), paramNames, boundByArg);
     for (const auto& fp : pt->funcParams)
         collectBoundParamNames(fp.type.get(), paramNames, boundByArg);
+}
+
+// fix #4895 (§14.5 phase 3 + §15.4, v0.307): local TypeRef-equality helper
+// for collection-literal element comparison. The literal's element type is
+// what unifies with the parameter's element type and substitutes in for T;
+// when two elements share the SAME TypeRef (the same resolved identity, not
+// just a structural match), T binds. Heterogeneous elements leave T unbound.
+static bool sameTypeRef(const TypeRef* a, const TypeRef* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->nullable != b->nullable) return false;
+    if (a->kind == TypeRef::Kind::Primitive)
+        return a->primitive == b->primitive;
+    if (a->kind == TypeRef::Kind::Named) {
+        if (a->declaration && b->declaration)
+            return a->declaration == b->declaration;
+        // Fall back to headName spelling for unresolved / imported types.
+        return a->headName() == b->headName();
+    }
+    return false;
+}
+
+bool ExprTC::collectionLiteralBindsTypeParam(
+    const ast::CollectionLiteralExpr& cl, std::string_view /*tpName*/) {
+    // Dictionary form: K and V are independent slots; a single T cannot be
+    // bound from both. Sequence form only.
+    if (!cl.keys.empty()) return false;
+    // Empty literal: no element type can be determined from elements.
+    if (cl.elements.empty()) return false;
+    // Walk every element; all must resolve to the SAME TypeRef. Elements
+    // that resolved to Kind::Error (cascade from a prior failure) or that
+    // have no exprType set yet leave T unbound. The literal's per-element
+    // exprType is the resolved view sema has after the binder ran.
+    const TypeRef* commonTy = nullptr;
+    for (const auto& el : cl.elements) {
+        if (!el) return false;
+        const TypeRef* elTy = ctx_.exprType(*el);
+        if (!elTy || elTy->kind == TypeRef::Kind::Error) return false;
+        if (!commonTy) {
+            commonTy = elTy;
+            continue;
+        }
+        if (!sameTypeRef(elTy, commonTy)) return false;
+    }
+    return commonTy != nullptr;
 }
 
 // per §14.1/§14.2 + §A.7 (issue #391) — see the header comment. Solve a
