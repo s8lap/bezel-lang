@@ -1194,7 +1194,7 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 82> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 85> kBuiltinClassModulePaths = {{
     // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
     // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
     // is in the §8.5 default path, so they belong here too.
@@ -1302,6 +1302,13 @@ constexpr std::array<BuiltinClassModulePath, 82> kBuiltinClassModulePaths = {{
     {"Domain", "System.Threading"},
     // stdlib §7 (System.IO): FileStream.
     {"FileStream", "System.IO"},
+    // stdlib §7.1 (System.IO): Stream — abstract base class for byte I/O.
+    // fix #4867.
+    {"Stream", "System.IO"},
+    // stdlib §7.4 (System.IO): TextReader / TextWriter — abstract base classes
+    // for character input / output. fix #4867.
+    {"TextReader", "System.IO"},
+    {"TextWriter", "System.IO"},
     // stdlib §8 (System.Diagnostics): Stopwatch.
     {"Stopwatch", "System.Diagnostics"},
     // stdlib §2.15 (#687): concrete serializers/deserializers; class heads

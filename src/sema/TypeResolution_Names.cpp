@@ -472,6 +472,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // they are ordinary Bezel enums injected by the stdlib prelude
         // (Driver.cpp), so they carry real TypeDecls.
         n == "FileStream" ||
+        // fix #4867 / stdlib §7.1: Stream — abstract base for byte I/O.
+        n == "Stream" ||
+        // fix #4867 / stdlib §7.4: TextReader / TextWriter — abstract bases for
+        // character input / output.
+        n == "TextReader" || n == "TextWriter" ||
         n == "Encoding" || n == "Linq" ||
         // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque
         // runtime handles; require `import System.Serialization` per spec, but
