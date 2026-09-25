@@ -3407,8 +3407,24 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 // general Object/interface operand; this arm covers the
                 // concrete-value-typed operand where the match is decided at
                 // the operand's static type.
+                //
+                // fix #4958 (§17.4, v0.307): `rt` here is the testType's
+                // NON-NULLABLE TypeRef — sema publishes `Pt` for `as Pt`, not
+                // `Pt?`, because the nullable promotion is the TypeTestExpr's
+                // own exprType, not `te.testType`'s. nullableValueStructTy
+                // gates every dispatch on `rt->nullable` (record → {i8, T};
+                // primitive → {i8, primitive}; etc.), so passing non-nullable
+                // `Pt` made it return the WRONG struct — the i32 primitive
+                // layout — and the insertValue at `as.wrap` failed IR
+                // verification with "Invalid InsertValueInst operands"
+                // (%record.Pt into {i8, i32}). The same bug applied to the
+                // mismatched-type `null` return below (line 3419). Build a
+                // nullable copy for the type-shape queries; the operand value
+                // `obj` already carries its own (non-nullable) type.
                 if (sameTy) {
-                    auto* st = nullableValueStructTy(rt);
+                    sema::TypeRef nullableRt = *rt;
+                    nullableRt.nullable = true;
+                    auto* st = nullableValueStructTy(&nullableRt);
                     llvm::Value* wrapped = llvm::UndefValue::get(st);
                     wrapped = builder_.CreateInsertValue(
                         wrapped, builder_.getInt8(1), 0, "as.hasv");
@@ -3416,7 +3432,9 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                         wrapped, obj, 1, "as.wrap");
                     return wrapped;
                 }
-                return nullableValueNull(rt);
+                sema::TypeRef nullableRt = *rt;
+                nullableRt.nullable = true;
+                return nullableValueNull(&nullableRt);
             }
             return nullptr;
         }
