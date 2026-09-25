@@ -9415,6 +9415,31 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             if (const LocalOwnership* rst = lookupState(rid->name))
                 if (rst->state == OwnershipState::Owned) return false;
         }
+        // fix #4989 (§28.3 consume table K3.1 / §28.5 / §28.8.1 / §17.8,
+        // v0.307): #4948 taught `ownedLocalBorrowSource` to root THROUGH
+        // `x!` / `x as T`, so `this.f := x!` over an Owned local now resolves
+        // a scope-bound source here and the borrowed-field wording below
+        // pre-empted the owned-sink diagnostic that `handleOwnedFieldAssignment`
+        // gives this store (#1983/#1985). An `owned` field is not a borrowed-
+        // field store at all — it is an owned SINK (K3.1), and the owned-sink
+        // text names the actual remedy (`move x!`). So, exactly when that
+        // owned-sink check is guaranteed to reject this RHS as a borrow
+        // (`ownedArgSourceIsBorrow`), defer to it — the verdict is unchanged
+        // (still rejected), only the owned-field diagnostic is restored. When
+        // the owned-sink check would NOT reject, fall through and keep #4948's
+        // escape rejection, so no program is newly admitted.
+        if (!dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+            const ast::Expr* core = peelTopCastBang(as.value.get());
+            if (core != as.value.get()) {
+                if (const auto* cid =
+                        dynamic_cast<const ast::IdentifierExpr*>(core)) {
+                    if (const LocalOwnership* cst = lookupState(cid->name))
+                        if (cst->state == OwnershipState::Owned &&
+                            ownedArgSourceIsBorrow(*as.value))
+                            return false;
+                }
+            }
+        }
     }
 
     // fix #3706 (§28.3 clause 1 / §28.9 / §28.11 / §29.2, v0.294): a `var` /
