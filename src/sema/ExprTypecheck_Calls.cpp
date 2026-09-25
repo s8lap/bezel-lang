@@ -21201,6 +21201,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         //     `readonly property … : int`.
         // Bare reads and 0-arity calls only, mirroring the `Count` arm; a
         // call with arguments keeps its existing handling.
+        //
+        // fix #4833: the two heads sets below are consolidated onto
+        // `isBuiltinIntLengthPropertyHead` / `isBuiltinIntCountPropertyHead`
+        // (common/BuiltinRegistry.{hpp,cpp}) so future builtins are added in
+        // one place rather than at this inline list.
         if (ma.target && currentCallArity_ <= 0 &&
             (ma.member == "Length" || ma.member == "Count")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
@@ -21211,18 +21216,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 std::string_view cn = isBuiltin
                     ? std::string_view(tt->headName())
                     : std::string_view();
-                // GRID-DEBT: #4833 a property-type list, not a wrap claim;
-                // consolidate onto the builtin member table.
-                bool intLength =
-                    cn == "Array" || cn == "OwningArray" ||
-                    cn == "Stack" || cn == "OwningStack" ||
-                    cn == "Queue" || cn == "OwningQueue" ||
-                    cn == "StringBuilder" || cn == "FrozenArray" ||
-                    cn == "OwningBuffer";
-                bool intCount =
-                    cn == "SortedDictionary" || cn == "SortedSet" ||
-                    cn == "Channel";
-                if (ma.member == "Length" ? intLength : intCount) {
+                bool isIntProperty =
+                    ma.member == "Length"
+                        ? common::isBuiltinIntLengthPropertyHead(cn)
+                        : common::isBuiltinIntCountPropertyHead(cn);
+                if (isIntProperty) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                     return;

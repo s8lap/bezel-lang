@@ -823,6 +823,52 @@ constexpr std::array<std::string_view, 5> kLazyReverseDirectReceiverHeads = {
     "Set", "OwningSet", "SortedSet", "LinkedList", "OwningLinkedList",
 };
 
+// fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type heads that declare
+// a `readonly property Length : int` per the stdlib. Transcribed verbatim from
+// the narrow #4766 typing arm that lived inline at
+// ExprTypecheck_Calls.cpp's `resolveMemberAccess`; the consolidation
+// (BuiltinRegistry hand-list removal) is #4833.
+//
+// Heads:
+//   - §4.4 Array, §4.5 OwningArray, §4.11 Stack/OwningStack/Queue/OwningQueue
+//     (the structural Count alias; #4811 tracks whether it should exist);
+//   - §3.1 StringBuilder;
+//   - §4.14 OwningBuffer<T>;
+//   - §4.19 FrozenArray<T> (annotation shape only).
+// ⚠ `Set`/`OwningSet`/`LinkedList`/`OwningLinkedList` declare no `Length`
+// property — they declare `Count`, handled by the upper arm at
+// ExprTypecheck_Calls.cpp:~20867. See `isBuiltinIntCountPropertyHead` for the
+// `.Count` analog. Two different questions over overlapping name sets is
+// exactly why both predicates exist and are each named for their own question.
+constexpr std::array<std::string_view, 9> kBuiltinIntLengthPropertyHeads = {
+    "Array", "OwningArray",
+    "Stack", "OwningStack",
+    "Queue", "OwningQueue",
+    "StringBuilder",
+    "OwningBuffer",
+    "FrozenArray",
+};
+
+// fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type heads that declare
+// a `readonly property Count : int` per the stdlib but that the upper
+// ExprTypecheck_Calls.cpp `Count` arm (~line 20867) does NOT type. Transcribed
+// verbatim from the narrow #4766 arm; the consolidation is #4833.
+//
+// Heads:
+//   - §4.17 SortedDictionary<K, V>;
+//   - §4.18 SortedSet<T>;
+//   - §6.9 Channel<T>.
+// ⚠ `Dictionary`/`OwningDictionary`/`Set`/`OwningSet`/`LinkedList`/
+// `OwningLinkedList` are typed by the upper arm (Array/Dictionary set
+// expansion). `Array`/`OwningArray`/`Stack`/`OwningStack`/`Queue`/
+// `OwningQueue` are also typed by the upper arm (those names happen to be in
+// BOTH the upper arm's collection set AND this narrow Count set is empty for
+// them — they declare `Count` and the upper arm handles it). See header for
+// the full split.
+constexpr std::array<std::string_view, 3> kBuiltinIntCountPropertyHeads = {
+    "SortedDictionary", "SortedSet", "Channel",
+};
+
 }  // namespace
 
 bool isOwningPrefixedName(std::string_view head) {
@@ -1480,5 +1526,13 @@ bool isLinqLazyPassthroughOperatorName(std::string_view m) {
 bool isLazyReverseDirectReceiverHead(std::string_view head) {
     return contains(kLazyReverseDirectReceiverHeads, head);
 }  // per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763
+
+bool isBuiltinIntLengthPropertyHead(std::string_view head) {
+    return contains(kBuiltinIntLengthPropertyHeads, head);
+}  // per §5.1 / §3.1 / §4.4 / §4.5 / §4.11 / §4.14 / §4.19, fix #4766 + #4833
+
+bool isBuiltinIntCountPropertyHead(std::string_view head) {
+    return contains(kBuiltinIntCountPropertyHeads, head);
+}  // per §5.1 / §4.17 / §4.18 / §6.9, fix #4766 + #4833
 
 }  // namespace bezel::common

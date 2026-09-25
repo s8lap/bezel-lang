@@ -1019,3 +1019,60 @@ BEZEL_TEST(builtin_registry_snapshot,
                                "AsReadOnly", "ForEach", ""})
         BEZEL_EXPECT_FALSE(isBuiltinCollectionLinqOperatorName(n));
 }
+
+// --- isBuiltinIntLengthPropertyHead (fix #4766 / #4833, §5.1, v0.307): the
+//     builtin heap-type heads that declare `readonly property Length : int`
+//     and that the narrow #4766 typing arm in `ExprTypecheck_Calls.cpp`
+//     `resolveMemberAccess` answers for. Transcribed verbatim from the inline
+//     name list the #4833 consolidation removed; the negatives are heads that
+//     the UPPER arm at ~20867 handles (Set/OwningSet/LinkedList/OwningLinkedList/
+//     Dictionary/OwningDictionary declare `Count`, not `Length`), plus the
+//     builtins the property-type axis intentionally excludes (Channel, the
+//     §2.x value records, the task family, the FFI/value types). ---
+BEZEL_TEST(builtin_registry_snapshot, builtin_int_length_property_head_set) {
+    static constexpr std::array<std::string_view, 9> kSnapshot = {
+        "Array", "OwningArray",
+        "Stack", "OwningStack",
+        "Queue", "OwningQueue",
+        "StringBuilder",
+        "OwningBuffer",
+        "FrozenArray",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isBuiltinIntLengthPropertyHead(n));
+    // Heads that declare `Count` (not `Length`) — handled by the upper arm
+    // and/or by `isBuiltinIntCountPropertyHead` below — must stay OUT.
+    for (std::string_view n : {"Set", "OwningSet", "LinkedList",
+                               "OwningLinkedList", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "SortedSet", "Channel", "CString", "WString",
+                               "RawBytes", "string", "int", "Task", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinIntLengthPropertyHead(n));
+}
+
+// --- isBuiltinIntCountPropertyHead (fix #4766 / #4833, §5.1, v0.307): the
+//     builtin heap-type heads that declare `readonly property Count : int`
+//     but that the upper ExprTypecheck_Calls.cpp `Count` arm (~20867) does
+//     NOT cover (which handles Array/OwningArray/Stack/OwningStack/Queue/
+//     OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList/Dictionary/
+//     OwningDictionary/OwningBuffer). Transcribed verbatim from the inline
+//     name list #4833 removed; the negatives are heads that declare `Length`
+//     (not `Count`), plus the heads the upper arm handles. ---
+BEZEL_TEST(builtin_registry_snapshot, builtin_int_count_property_head_set) {
+    static constexpr std::array<std::string_view, 3> kSnapshot = {
+        "SortedDictionary", "SortedSet", "Channel",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isBuiltinIntCountPropertyHead(n));
+    // Heads handled by the upper arm (declare `Count` and are typed there),
+    // heads that declare `Length` instead of `Count`, and assorted non-
+    // collections.
+    for (std::string_view n : {"Array", "OwningArray", "Stack", "OwningStack",
+                               "Queue", "OwningQueue", "Set", "OwningSet",
+                               "LinkedList", "OwningLinkedList", "Dictionary",
+                               "OwningDictionary", "OwningBuffer",
+                               "StringBuilder", "FrozenArray",
+                               "CString", "WString", "RawBytes",
+                               "string", "int", "Task", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinIntCountPropertyHead(n));
+}
