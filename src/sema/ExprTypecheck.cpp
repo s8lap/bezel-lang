@@ -17790,6 +17790,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     assignTargetIsStaticEvent = ed->isStatic;
                 }
             }
+            // §6.5 / §27.4 (v0.307, #4792): the event pattern — events are
+            // NOT a member kind (spec §24 "Events (retired member kind)";
+            // §6.5 + stdlib §6.5 declare them as `owned readonly EventSource<T>`
+            // + an `IEvent<T>`/`IAsyncEvent<T>` property). The EventSymbol
+            // branch above is dead in v1, so `_e += lambda(n) => …` on the
+            // field itself falls through silently and the lambda's single
+            // untyped parameter gets no target type — the §27.4 "no target
+            // type to infer from" reject. The `+=` / `-=` desugar to
+            // `Add(handler)` / `Remove(handler)`, with handler signature
+            // `(T) -> ()` (sync, on EventSource<T>), `(T) -> Task` (async, on
+            // AsyncEventSource<T>), or `(T) -> ()` (capture-free, on
+            // SharedEventSource<T>); the lambda's first parameter inherits
+            // T positionally. Key on the TARGET's TYPE — the field is
+            // declared as one of the three event-source classes — and take
+            // the first generic argument. (IEvent<T> / IAsyncEvent<T> /
+            // ISharedEvent<T> have no `Add` so `+=` is rejected there by
+            // resolution; if it reached here, we still wouldn't extract a
+            // meaningful T because the target's type is the interface face —
+            // we skip those names deliberately.)
+            else if (TypeRef* tgtTy = ctx_.exprType(*as->target)) {
+                if (tgtTy->kind == TypeRef::Kind::Named &&
+                    !tgtTy->genericArgs.empty() && tgtTy->genericArgs[0]) {
+                    std::string_view hn = tgtTy->headName();
+                    if (hn == "EventSource" || hn == "AsyncEventSource" ||
+                        hn == "SharedEventSource") {
+                        eventPayload = tgtTy->genericArgs[0];
+                    }
+                }
+            }
         }
         if (as->value) {
             TypeRef* savedPending = pendingLambdaParamType_;
