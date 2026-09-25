@@ -101,6 +101,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time as _time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE = ROOT / 'scripts' / 'internal_residual.baseline'
@@ -165,12 +166,32 @@ RE_EMIT_SITE = re.compile(
 # bezelc discovery - build-free: never builds the compiler, only USES one.
 # ---------------------------------------------------------------------------
 
-def find_bezelc(explicit=None):
+# File extensions considered "source" for the staleness check. Matches
+# the gate_full_cycle.sh preflight's set so the two predicates agree on
+# what counts as a source-of-truth edit.
+_SRC_EXTS = ('.cpp', '.hpp', '.h', '.cc', '.cxx', '.c')
+
+
+def find_bezelc(explicit=None, root=ROOT):
     """Return an absolute path to a usable bezelc, or raise SystemExit(2).
 
-    Order: --bezelc flag, $BEZELC env, ROOT/build/bezelc, lane-build
-    fast-disk locations. Refuses to guess; a detector run against a
-    stale binary is the worst possible false-green.
+    Order: --bezelc flag, $BEZELC env, <root>/build/bezelc. Refuses
+    any other fallback.
+
+    WHY no lane-build scan (#5011): a lane worktree's `build/` is a
+    symlink into /var/tmp/bezel-scratch/lane-builds/<lane>/ (see
+    scripts/lane_setup.sh), so <root>/build/bezelc IS the lane's own
+    bezelc. Scanning SIBLING lane-build dirs when the current lane has
+    none silently picks up another lane's stale binary and certifies a
+    tree against a different compiler than the one that produced it -
+    the silent-wrong-code class of defect this script exists to
+    detect. The pre-fix behaviour reported RED for the wrong reason in
+    R21 (#4990 review) and could just as easily report GREEN when the
+    other lane's binary is fresh enough to miss a regression that
+    THIS lane's edits introduced.
+
+    The `root` parameter exists so the gate self-test (#5011) can drive
+    a synthetic tree without colliding with the production build/.
     """
     candidates = []
     if explicit:
@@ -178,17 +199,7 @@ def find_bezelc(explicit=None):
     env = os.environ.get('BEZELC')
     if env:
         candidates.append(pathlib.Path(env))
-    candidates.append(ROOT / 'build' / 'bezelc')
-    # Lane build dirs from scripts/lane_setup.sh.
-    for d in ('/var/tmp/bezel-scratch/lane-builds',
-              '/mnt/fast/lane-builds'):
-        p = pathlib.Path(d)
-        if not p.is_dir():
-            continue
-        for sub in sorted(p.iterdir(), key=lambda x: -x.stat().st_mtime):
-            cand = sub / 'bezelc'
-            if cand.is_file() and os.access(cand, os.X_OK):
-                candidates.append(cand)
+    candidates.append(root / 'build' / 'bezelc')
     for cand in candidates:
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand
@@ -198,7 +209,78 @@ def find_bezelc(explicit=None):
         sys.stderr.write('  %s\n' % c)
     sys.stderr.write(
         '  Pass --bezelc=/path/to/bezelc or set $BEZELC, or build one '
-        '(cmake --build build --target bezelc).\n')
+        '(cmake --build build --target bezelc).\n'
+        '  NOTE: this script deliberately does NOT scan '
+        '/var/tmp/bezel-scratch/lane-builds/* - a sibling lane\'s '
+        'bezelc is not this lane\'s binary (#5011).\n')
+    raise SystemExit(2)
+
+
+def _newest_src(root=ROOT):
+    """Return (relpath, mtime) of the newest source file under root/src/.
+
+    Walks .cpp/.hpp/.h/.cc/.cxx/.c - same set the gate_full_cycle.sh
+    preflight uses. Returns (None, 0.0) if root/src/ is missing or
+    empty. The mtime is seconds-since-epoch, comparable to
+    bezelc.stat().st_mtime.
+    """
+    src = root / 'src'
+    if not src.is_dir():
+        return (None, 0.0)
+    newest_path = None
+    newest_mtime = 0.0
+    for p in src.rglob('*'):
+        if not p.is_file():
+            continue
+        if p.suffix not in _SRC_EXTS:
+            continue
+        m = p.stat().st_mtime
+        if m > newest_mtime:
+            newest_mtime = m
+            newest_path = p
+    if newest_path is None:
+        return (None, 0.0)
+    return (str(newest_path.relative_to(root)), newest_mtime)
+
+
+def check_staleness(bezelc, root=ROOT):
+    """Refuse to certify the tree when bezelc is older than newest src/.
+
+    Raises SystemExit(2) with a clear stderr message naming the
+    offending source file. Silent on success.
+
+    WHY this is the second guard (#5011): dropping the lane-build scan
+    closes the cross-lane leak, but the LANE'S OWN bezelc can still go
+    stale after a src/ edit (a lane that edited src/ but did not
+    rebuild). Detecting that is the same vacuous-oracle class - the
+    binary no longer reflects the tree under test - so we fail closed
+    before measuring anything.
+
+    The set of source extensions matches the gate_full_cycle.sh
+    preflight so the two predicates agree on what counts as a
+    source-of-truth edit. CMakeLists.txt is intentionally NOT in the
+    set: a build-config change alone cannot change the compiler's
+    silent-wrong-code behaviour, only what gets relinked.
+    """
+    bezelc = pathlib.Path(bezelc)
+    if not bezelc.is_file():
+        # find_bezelc() has already gated this; belt-and-suspenders.
+        sys.stderr.write(
+            'check_internal_residual: bezelc not found at %s\n' % bezelc)
+        raise SystemExit(2)
+    rel, newest_mtime = _newest_src(root=root)
+    if rel is None or newest_mtime <= bezelc.stat().st_mtime:
+        return
+    age = int(newest_mtime - bezelc.stat().st_mtime)
+    sys.stderr.write(
+        'check_internal_residual: build/bezelc is STALE (%d s older '
+        'than %s).\n'
+        '  A detector run against a stale binary measures a different '
+        'compiler than the tree under test; the verdict would be '
+        'vacuous (#5011).\n'
+        '  Rebuild with: cmake --build build --target bezelc\n'
+        '  (or pass --bezelc=/path/to/fresh/bezelc explicitly).\n'
+        % (age, rel))
     raise SystemExit(2)
 
 
@@ -817,6 +899,46 @@ def self_test():
         chk('main cases iterator skips `expectation=rejects`',
             len(cases) == 1 and 'ok_1' in cases[0][0].name)
 
+        # ----- #5011 fail-closed guards: find_bezelc + check_staleness.
+        # The synthetic tree has no build/bezelc by construction, so
+        # find_bezelc() must exit 2 without picking up any sibling
+        # lane-build fallback (which it no longer does).
+        try:
+            find_bezelc(root=root)
+            chk('find_bezelc fails closed when ROOT/build/bezelc is '
+                'absent (#5011 - no lane-build scan fallback)', False)
+        except SystemExit as e:
+            chk('find_bezelc fails closed when ROOT/build/bezelc is '
+                'absent (#5011 - no lane-build scan fallback)', e.code == 2)
+
+        # check_staleness: a bezelc newer than every source file is
+        # silent; one older than ANY source fails closed.
+        fresh_bezelc = _mk(root, 'build/bezelc',
+                           '#!/bin/sh\necho bezelc\n')
+        fresh_bezelc.chmod(0o755)
+        # Newer than the synthetic src/codegen/Fake.cpp planted above
+        # by setting a future mtime.
+        future = _time.time() + 600
+        os.utime(fresh_bezelc, (future, future))
+        try:
+            check_staleness(fresh_bezelc, root=root)
+            chk('check_staleness is silent when bezelc is newer than '
+                'every src/ file', True)
+        except SystemExit:
+            chk('check_staleness is silent when bezelc is newer than '
+                'every src/ file', False)
+
+        # Now flip the ordering: bezelc OLDER than Fake.cpp. Must fail.
+        past = _time.time() - 600
+        os.utime(fresh_bezelc, (past, past))
+        try:
+            check_staleness(fresh_bezelc, root=root)
+            chk('check_staleness fails closed when bezelc is older '
+                'than a src/ file (#5011)', False)
+        except SystemExit as e:
+            chk('check_staleness fails closed when bezelc is older '
+                'than a src/ file (#5011)', e.code == 2)
+
     print('check_internal_residual --self-test: '
           + ('PASS' if ok else 'FAIL'))
     return 0 if ok else 1
@@ -859,6 +981,12 @@ def main():
         return self_test()
 
     bezelc = find_bezelc(a.bezelc)
+    # Fail-closed staleness guard (#5011): a bezelc older than the
+    # newest src/ file measures a different compiler than the tree
+    # under test, which is the silent-wrong-code class this script
+    # exists to detect. Run BEFORE any measurement; the message names
+    # the offending source so an operator knows what to rebuild.
+    check_staleness(bezelc)
 
     if a.list_silent:
         n = 0
