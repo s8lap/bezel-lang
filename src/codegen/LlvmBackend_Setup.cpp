@@ -13456,6 +13456,43 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 }
                 lastBoxMint_ = savedBoxMint;
             }
+            // fix #4904 (§5.1 "Implicit conversions" / §22.6 stage 3 / §12.8,
+            // v0.307): sema admits a chain argument by §5.1 applicability, so
+            // an `int` argument bound to a `long`/`double`/... formal is
+            // legal, and the widening it implies is this site's to emit —
+            // exactly what `buildOrderedArgs` does at a `new`/method call and
+            // `fillOmittedCtorSlots` below already does for the omitted
+            // slots' DEFAULTS. This loop never did it for a SUPPLIED
+            // argument, so `this(y := 3)` into `y: double` passed `i32 3` to
+            // a `double` parameter: MEASURED `bezelc: codegen error: IR
+            // verification failed` ("Call parameter type does not match
+            // function signature"), positional and named alike. Keyed on the
+            // BOUND slot `pi` (the #3791 binding). Only for a NON-generic
+            // target, for the reason the default fill gives: for a generic
+            // one `it->second` is the T→i32 template, not the authority.
+            // A no-op for any non-numeric pair (a boxed `ptr`, a string).
+            //
+            // §5.1 "Nullable conversions" is the same obligation one `?`
+            // further: `S` converts to `T?` via `S → T → T?`, so an `int`
+            // bound to a `long?` / `int?` formal is widened and then wrapped
+            // in the tagged `{i8, T}` payload — MEASURED pre-fix as the same
+            // IR verification failure. `coerceReturnToNullableValue` is the
+            // existing widen-then-wrap for exactly that composition (and a
+            // no-op for a non-nullable formal or an already-tagged value).
+            if (v && targetCls->genericParams.empty()) {
+                const sema::TypeRef* fty = paramTypeOf(target->params[pi]);
+                const bool srcUns = isUnsignedTargetExpr(*a.value);
+                llvm::FunctionType* fnTy = it->second->getFunctionType();
+                if (fty && isNullableValueTy(fty))
+                    v = coerceReturnToNullableValue(
+                        v, fty, srcUns, /*sourceIsNullableRef=*/false,
+                        a.value.get());
+                else if (static_cast<std::size_t>(pi) + 1 <
+                         fnTy->getNumParams())
+                    v = coerceNumericToType(
+                        v, fnTy->getParamType(static_cast<unsigned>(pi) + 1),
+                        srcUns);
+            }
         }
         if (!v) {
             // #1386: ICE — the expression kind is not yet handled by codegen.
