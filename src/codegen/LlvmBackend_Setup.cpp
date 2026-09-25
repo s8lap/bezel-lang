@@ -8345,15 +8345,30 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // set of instantiations reachable there is not statically enumerable — so the
     // body has to be right in the SLOT.
     //
-    // THE QUESTION ASKED IS PER DECLARING CLASS, not per method shape:
-    // `instanceLayoutDiffersFromErasedTemplate(impl->parent)` (#2019's predicate,
-    // exposed by #2896) — "was the compiled body emitted against the struct this
-    // object actually has?" — asked about the class that DECLARES the
-    // implementation, which is the class whose `classStruct` that body GEPs. It
-    // is false for a non-generic declarer (`class Plain` whose virtual `G<T>`
-    // inherits without overriding — its prefix does not move), for `T = int`, and
-    // for every generic class whose storage sequence does not move, so all of
-    // those keep the shared slot with no behaviour change.
+    // fix #4966 (§22.12 / §14.1 / §2.8.3 rule 4, v0.307; #4950 sibling):
+    // #4950 (f13bde4f) closed the itable twin. The vtable twin — condition (c)
+    // here — was missed because #2019's `instanceLayoutDiffersFromErasedTemplate`
+    // predicate, which was the gate under the original #2906 fix, asks about
+    // INSTANCE storage: B<T> has no instance fields, every LLVM struct layout
+    // agrees, and the predicate is therefore false. The defect is not in the
+    // LAYOUT — it is in the BODY. `D<T>: B<T>`'s override reads
+    // `B<T>._c` (a STATIC field whose global name is `bz$M.B$_c` and is
+    // re-emitted under the active substitution at `bz$M.B$T$_c`); the
+    // ERASED body GEPs the per-instantiation cell for `T -> i32`, but every
+    // dispatch through `B<T>`'s vtable reaches it. Layout-equal does not mean
+    // body-equal.
+    //
+    // The predicate is removed. Every inherited virtual-method slot of the
+    // generic class that still holds the generic ancestor's ERASED template
+    // body is now re-lowered under the active substitution. The signature-ABI
+    // guard below (`concFnTy == mit->second->getFunctionType()`) stays — a
+    // specialization whose signature MOVES under the substitution
+    // (`virtual method Get(): T`) cannot go in a fixed-ABI slot, and the
+    // indirect call at the receiver's static method type would mistype it.
+    // Non-generic declarers and storage-equal generics keep the shared slot
+    // because `declareVtables` lowers against the SAME concrete type, so the
+    // `sharedInitPeek->getAggregateElement(slot) != mit->second` check below
+    // already gates them out.
     std::vector<std::pair<unsigned, sema::MethodSymbol*>> virtualSlotsToSpec;
     {
         auto vmIt = vtableMethods_.find(ts);
@@ -8380,8 +8395,6 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 // to replace.
                 if (sharedInitPeek->getAggregateElement(slot) !=
                     llvm::cast<llvm::Constant>(mit->second))
-                    continue;
-                if (!instanceLayoutDiffersFromErasedTemplate(impl->parent))
                     continue;
                 // The slot's ABI is fixed by the receiver's static method type at
                 // every call site, so a specialization whose signature MOVES
