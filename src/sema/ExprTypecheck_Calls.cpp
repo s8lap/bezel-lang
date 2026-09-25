@@ -20802,79 +20802,142 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // exists, the diagnostic says so instead of reading as if `Task` were
     // the module.
     if (ma.target && &ma != calleeOfCallCtx_) {
-        if (auto* tkid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
-            if (tkid->name == "Task") {
-                auto* tkSym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tkid));
-                bool isBuiltinTask =
-                    tkSym && tkSym == ctx_.builtinClassSym("Task");
-                if (isBuiltinTask) {
-                    static const std::string_view kTaskStaticMembers[] = {
-                        "Delay", "FromResult", "FromOwnedResult",
-                        "FromException", "FromCancelled", "WhenAll",
-                        "WhenAllOwned", "WhenAny", "WhenEach",
-                        "WhenEachOwned", "FireAndForget"};
-                    bool known = false;
-                    for (auto km : kTaskStaticMembers)
-                        if (ma.member == km) { known = true; break; }
-                    if (!known) {
-                        // per §2.7 rule 1 / §2.2 (v0.307): an import alias
-                        // named `Task` ranks below the always-available
-                        // builtin, so it does not shadow it here.
-                        std::string taskAliasNote;
-                        auto aliasIt = importAliases_.find("Task");
-                        if (aliasIt != importAliases_.end()) {
-                            taskAliasNote =
-                                std::string("; note: `Task` here names the "
-                                "always-available builtin type `Task`, not "
-                                "the import alias `Task` for module `") +
-                                aliasIt->second +
-                                "` — \xC2\xA7""2.7 rule 1 resolves imported "
-                                "bare names before import aliases with no "
-                                "backtracking, so an alias named `Task` does "
-                                "not shadow the builtin and may not be "
-                                "declared (\xC2\xA7""2.2) — choose a "
-                                "different alias, or name `" +
-                                std::string(ma.member) +
-                                "` by its bare name if it is "
-                                "always available (\xC2\xA7""2.3)";
-                        }
-                        ctx_.diagnostics().report(
-                            Severity::Error, ma.span.begin,
-                            std::string("no member `") +
-                                std::string(ma.member) +
-                            "` on `Task`; documented surface: "
-                            "Delay(int)|Delay(TimeSpan)|Delay(int, "
-                            "CancellationToken)|Delay(TimeSpan, "
-                            "CancellationToken) -> Task; "
-                            "FromResult<T>(value: T) -> Task<T>; "
-                            "FromOwnedResult<T>(owned value: T) -> "
-                            "OwningTask<T> (Pattern B, \xC2\xA7""30.5); "
-                            "FromException<T>(exc) -> Task<T>; "
-                            "FromCancelled<T>() -> Task<T>; "
-                            "WhenAll(tasks: Array<Task>) -> Task; "
-                            "WhenAll<T>(tasks: Array<Task<T>>) -> "
-                            "Task<Array<T>>; "
-                            "WhenAllOwned<T>(owned tasks: "
-                            "OwningArray<OwningTask<T>>) -> "
-                            "OwningTask<OwningArray<T>> (\xC2\xA7""30.10); "
-                            "WhenAny(tasks: Array<Task>) -> "
-                            "Task<int> (winner index, \xC2\xA7""6.7); "
-                            "WhenEach(tasks: Array<Task>) -> "
-                            "IAsyncEnumerable<Task> (\xC2\xA7""30.10); "
-                            "WhenEach<T>(tasks: Array<Task<T>>) -> "
-                            "IAsyncEnumerable<Task<T>>; "
-                            "WhenEachOwned<T>(owned tasks: "
-                            "OwningArray<OwningTask<T>>) -> "
-                            "IOwningAsyncEnumerable<OwningTask<T>> "
-                            "(\xC2\xA7""30.10); "
-                            "FireAndForget(owned task) (\xC2\xA7""30.9) "
-                            "(stdlib \xC2\xA7""6.7); `Task` has no static "
-                            "properties — use `Task.FromResult(...)` for "
-                            "an already-completed task" +
-                            taskAliasNote);
-                        return;
+        // issue #5006 (stdlib §6.7, §2.2/§2.7, v0.307): the SAME
+        // closed-surface check must fire not only for a bare
+        // `Task.<member>` head (the original `tkid` arm below) but also
+        // for a QUALIFIED head that names the identical builtin —
+        // `System.Threading.Task.<member>` (module-qualified, §2.7 rule 2)
+        // and, via an alias, `<Alias>.Task.<member>` (§2.7 rule 1 applied
+        // to the alias itself, e.g. `import System.Threading as T;`). In
+        // both qualified shapes `ma.target` is a MemberAccessExpr — never
+        // the bare IdentifierExpr the pre-#5006 gate required — whose OWN
+        // target names the `System.Threading` pseudo-module, either
+        // directly (recorded in `partialModulePaths_` by the
+        // module-qualified-name Case (b)/(c) arms above) or through an
+        // import alias (`importAliases_`). `System.Threading` never
+        // registers a real loaded artifact (§2.7/#1365 above: a stdlib
+        // pseudo-module resolved through the always-available-builtin-name
+        // tables, not `importedTypesOf`), so those qualified-name arms
+        // always fall through WITHOUT typing `ma.target` — this re-derives
+        // the same fact directly at the gate rather than mutating
+        // `ma.target`'s exprType/exprSymbol, so the qualified CALL form
+        // (`System.Threading.Task.Delay(1)`, already accepted and working
+        // — MEASURED) is left completely untouched.
+        const auto* tkid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+        const auto* tkma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get());
+        bool isBuiltinTask = false;
+        std::string qualifierNote;
+        if (tkid && tkid->name == "Task") {
+            auto* tkSym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tkid));
+            isBuiltinTask = tkSym && tkSym == ctx_.builtinClassSym("Task");
+        } else if (tkma && tkma->member == "Task" && tkma->target) {
+            if (auto* innerMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                    tkma->target.get())) {
+                auto pathIt = partialModulePaths_.find(innerMa);
+                if (pathIt != partialModulePaths_.end() &&
+                    pathIt->second == "System.Threading") {
+                    isBuiltinTask = true;
+                    qualifierNote =
+                        "; note: `Task` here is the always-available "
+                        "builtin type, referenced through the "
+                        "module-qualified head `System.Threading.Task` "
+                        "(\xC2\xA7""2.7 rule 2)";
+                }
+            }
+            if (!isBuiltinTask) {
+                if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                        tkma->target.get())) {
+                    auto qualAliasIt =
+                        importAliases_.find(std::string(aid->name));
+                    if (qualAliasIt != importAliases_.end() &&
+                        qualAliasIt->second == "System.Threading") {
+                        isBuiltinTask = true;
+                        qualifierNote =
+                            std::string("; note: `Task` here is the "
+                            "always-available builtin type, referenced "
+                            "through `") +
+                            std::string(aid->name) +
+                            ".Task`, where `" + std::string(aid->name) +
+                            "` is an import alias for module "
+                            "`System.Threading` (\xC2\xA7""2.7 rule 1)";
                     }
                 }
+            }
+        }
+        if (isBuiltinTask) {
+            static const std::string_view kTaskStaticMembers[] = {
+                "Delay", "FromResult", "FromOwnedResult",
+                "FromException", "FromCancelled", "WhenAll",
+                "WhenAllOwned", "WhenAny", "WhenEach",
+                "WhenEachOwned", "FireAndForget"};
+            bool known = false;
+            for (auto km : kTaskStaticMembers)
+                if (ma.member == km) { known = true; break; }
+            if (!known) {
+                // per §2.7 rule 1 / §2.2 (v0.307): an import alias
+                // named `Task` ranks below the always-available
+                // builtin, so it does not shadow it here. Only
+                // applicable to the bare-`Task` head — a qualified head
+                // (`qualifierNote` non-empty) already names its own
+                // module/alias explicitly, so there is no collision to
+                // explain.
+                std::string taskAliasNote;
+                if (tkid) {
+                    auto aliasIt = importAliases_.find("Task");
+                    if (aliasIt != importAliases_.end()) {
+                        taskAliasNote =
+                            std::string("; note: `Task` here names the "
+                            "always-available builtin type `Task`, not "
+                            "the import alias `Task` for module `") +
+                            aliasIt->second +
+                            "` — \xC2\xA7""2.7 rule 1 resolves imported "
+                            "bare names before import aliases with no "
+                            "backtracking, so an alias named `Task` does "
+                            "not shadow the builtin and may not be "
+                            "declared (\xC2\xA7""2.2) — choose a "
+                            "different alias, or name `" +
+                            std::string(ma.member) +
+                            "` by its bare name if it is "
+                            "always available (\xC2\xA7""2.3)";
+                    }
+                }
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("no member `") +
+                        std::string(ma.member) +
+                    "` on `Task`; documented surface: "
+                    "Delay(int)|Delay(TimeSpan)|Delay(int, "
+                    "CancellationToken)|Delay(TimeSpan, "
+                    "CancellationToken) -> Task; "
+                    "FromResult<T>(value: T) -> Task<T>; "
+                    "FromOwnedResult<T>(owned value: T) -> "
+                    "OwningTask<T> (Pattern B, \xC2\xA7""30.5); "
+                    "FromException<T>(exc) -> Task<T>; "
+                    "FromCancelled<T>() -> Task<T>; "
+                    "WhenAll(tasks: Array<Task>) -> Task; "
+                    "WhenAll<T>(tasks: Array<Task<T>>) -> "
+                    "Task<Array<T>>; "
+                    "WhenAllOwned<T>(owned tasks: "
+                    "OwningArray<OwningTask<T>>) -> "
+                    "OwningTask<OwningArray<T>> (\xC2\xA7""30.10); "
+                    "WhenAny(tasks: Array<Task>) -> "
+                    "Task<int> (winner index, \xC2\xA7""6.7); "
+                    "WhenEach(tasks: Array<Task>) -> "
+                    "IAsyncEnumerable<Task> (\xC2\xA7""30.10); "
+                    "WhenEach<T>(tasks: Array<Task<T>>) -> "
+                    "IAsyncEnumerable<Task<T>>; "
+                    "WhenEachOwned<T>(owned tasks: "
+                    "OwningArray<OwningTask<T>>) -> "
+                    "IOwningAsyncEnumerable<OwningTask<T>> "
+                    "(\xC2\xA7""30.10); "
+                    "FireAndForget(owned task) (\xC2\xA7""30.9) "
+                    "(stdlib \xC2\xA7""6.7); `Task` has no static "
+                    "properties — use `Task.FromResult(...)` for "
+                    "an already-completed task" +
+                    taskAliasNote + qualifierNote);
+                return;
             }
         }
     }
