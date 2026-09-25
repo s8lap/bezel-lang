@@ -3154,6 +3154,13 @@ private:
     // appends every root identifier reached to `out`. Its chain arms mirror
     // `identifierRoot`'s one for one, so a value with no selecting form in
     // it roots exactly where it did before. // per §28.3 K7.2, K8.4, v0.307
+    //
+    // fix #4942 (§28.3 producer table, §17.4, §17.8, v0.307): the chain arms
+    // are now a SUPERSET of `identifierRoot`'s — this also peels `x as T`
+    // and `x!`, which carry `x`'s source unchanged, so `(w as Widget)!` and
+    // `(w as Widget) ?? other` root at `w` instead of at nothing.
+    // `identifierRoot` itself is left alone: widening it moves every one of
+    // its callers at once, which is its own §18 blast radius.
     void collectOwningMatchSourceRoots(
         const ast::Expr& e,
         std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,

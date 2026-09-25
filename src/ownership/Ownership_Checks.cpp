@@ -7292,6 +7292,26 @@ void MethodOwnership::collectOwningMatchSourceRoots(
         if (ix->target) collectOwningMatchSourceRoots(*ix->target, aliases, out);
         return;
     }
+    // ---- fix #4942: the source-preserving operators ------------------------
+    // §28.3's producer table: `x as T` is "Borrowed (source: same as `x`'s
+    // source …; `x` itself if `x` is owned)", and §17.8: "if `x` is
+    // borrowed, `x!` is borrowed with the same source". Neither is a new
+    // source, so `(w as Widget)!` and `(w as Widget) ?? other` carry `w`
+    // exactly as a bare `w` does. `is` / `is not` yield a `bool` — a read,
+    // never a source — so only the `as` spelling of TypeTestExpr peels.
+    // Deliberately NOT added to `identifierRoot` (its 24 call sites are a
+    // separate §18 radius; see #4942's commit). // per §28.3, §17.4, §17.8,
+    // v0.307
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand)
+            collectOwningMatchSourceRoots(*pb->operand, aliases, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->op == "as" && tt->operand)
+            collectOwningMatchSourceRoots(*tt->operand, aliases, out);
+        return;
+    }
     // ---- fix #4818: the value-selecting forms (K7's joins) -----------------
     // K7.2: borrowed ⊓ borrowed carries "the union of the arms' source sets
     // (K2.2)" at `??`, `if` expressions and expression-position `case` arms.
