@@ -4235,6 +4235,673 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+                // fix #4624 (§14.2 / §30.1, v0.307): hoisted out of the
+                // `if (md && md->returnType)` block below (was nested one
+                // level deeper, gated on a LOCAL method's return type) so
+                // both `checkMethodGenericConstraints` and
+                // `checkAsyncInstantiationBorrowBearing` — and the
+                // both-sources `methodGenericConstraints` normalization
+                // they read — are reachable from the `!md &&
+                // ctx_.isImported(ms)` arm below too (~L5600), not just the
+                // local arm. Nothing here reads `rt`/`ma`/`ncm`/`bnd`
+                // (verified: those are all declared inside the `if (auto*
+                // rt = ...)` scope this block used to sit in, and this
+                // block never referenced them) — only `md`, `ms`, `ce`,
+                // `ctx_`, and free functions, all already in scope here.
+        auto refKindOf = [&](const TypeRef* a) -> int {
+            if (!a) return -1;
+            switch (a->kind) {
+                case TypeRef::Kind::Primitive:
+                    return (a->primitive == PrimitiveType::String ||
+                            a->primitive == PrimitiveType::Object) ? 1 : 0;
+                case TypeRef::Kind::Function: return 1;
+                case TypeRef::Kind::InlineArray:
+                case TypeRef::Kind::Unit: return 0;
+                case TypeRef::Kind::Named:
+                    if (a->declaration) {
+                        auto k = a->declaration->kind;
+                        if (k == ast::TypeDeclKind::Class ||
+                            k == ast::TypeDeclKind::Interface) return 1;
+                        // #2476 / §14.2: choices are value types, same
+                        // as records/enums — "records, enums, choices
+                        // ([§35](#sec-choices)), primitives, inline
+                        // arrays (all forms, including owning forms),
+                        // and the unit type." Before this fix, Choice
+                        // fell through this if-chain to the `return 1`
+                        // built-in-named fallback below, so a CALL-SITE
+                        // generic method (`F(Color.Red)` / `F<Color>(…)`,
+                        // inferred or explicit — both route through this
+                        // lambda via checkMethodGenericConstraints) with
+                        // a `where T: value`/`where T: class` constraint
+                        // misclassified every choice type argument as a
+                        // REFERENCE type: `where T: value` wrongly
+                        // rejected it and `where T: class` would have
+                        // wrongly ACCEPTED it (untested — no reachable
+                        // choice-as-class-arg repro, since a choice
+                        // never satisfies §14.2's class bound on any
+                        // other check). This lambda's own comment above
+                        // claims to mirror `Resolver::categorize` (the
+                        // declaration-site / explicit-type-argument-list
+                        // check, TypeResolution_Checks.cpp), which
+                        // already classifies Choice as Value — so this
+                        // was a drift between the two duplicate
+                        // classifiers, not a deliberate omission.
+                        if (k == ast::TypeDeclKind::Record ||
+                            k == ast::TypeDeclKind::Enum ||
+                            k == ast::TypeDeclKind::Choice) return 0;
+                    }
+                    return 1;  // built-in named (Array/IEnumerable/…) → ref
+                default: return -1;  // Error/unresolved → defer
+            }
+        };
+        auto argNameOf = [&](const TypeRef* a) -> std::string {
+            std::string base;
+            if (a && a->declaration) base = std::string(a->declaration->name);
+            else if (a && a->astNode && a->astNode->name &&
+                     !a->astNode->name->parts.empty())
+                base = std::string(a->astNode->name->parts.back());
+            else return "the type argument";
+            // §7.1 (#741/f13): a nullable type argument displays with its
+            // `?` so the diagnostic names the actual offending type
+            // (`int?` does not satisfy `value`, not `int`).
+            if (a->nullable) base += "?";
+            return base;
+        };
+        // fix #4624 (§14.2, v0.307; family of umbrella #4539): both-
+        // sources view of THIS method's own `where` constraints, keyed
+        // by type-param name, each item carrying a PRE-RESOLVED bound
+        // (or none) rather than an unresolved ast::Type — so the loop
+        // in `checkMethodGenericConstraints` below can walk either
+        // source with the SAME body, unchanged apart from reading
+        // `item.bound`/`item.boundParamName` instead of resolving
+        // `item.typeArg` inline.
+        //
+        // LOCAL (`md` non-null): md->genericConstraints, resolved
+        // here exactly as the pre-fix inline code did.
+        //
+        // IMPORTED (`md` null): `ModuleLoader` never assigns
+        // `MethodSymbol::decl`, so `md->genericConstraints` is
+        // unreachable. Read the symbol-side channel instead —
+        // `GenericParamSymbol::constraints`, populated on BOTH sides
+        // by fix #3146 (SymbolCollection::collectGenericParams for a
+        // local param, ModuleLoader::convertGenericParams for an
+        // imported one from MetaGenericParam's constraintTypes /
+        // specialConstraints) — the same "both-sources accessor"
+        // shape #4539 asks this whole defect class to use, alongside
+        // `formalParamResolvedType` / `formalOutParamType2` /
+        // `formalCtorOutParamType` (#2668/#3772). An imported "type"
+        // bound (`GenericParamConstraint::importedBound`) is already
+        // a resolved TypeRef (ModuleLoader.cpp's `convert(ct)`) —
+        // nothing to resolve. When the bound names another of THIS
+        // method's own type parameters (`where T: U`), `convert`
+        // cannot resolve "U" to a declared type, so per §2.5/§29.3's
+        // importedName carriage (ModuleLoader.cpp:353-354) the bound
+        // TypeRef has declaration=nullptr and importedName="U" —
+        // `headName()` recovers "U" exactly as the local arm's
+        // `item.typeArg->name->parts.back()` does for the syntactic
+        // case.
+        struct MethodConstraintItem {
+            std::string_view kind;
+            TypeRef* bound = nullptr;         // "type" kind only
+            std::string_view boundParamName;  // set when `bound` is
+                // itself an unresolved bare single-identifier (a
+                // sibling type parameter of this same method) —
+                // empty otherwise.
+        };
+        struct MethodGenericConstraint {
+            std::string_view typeParam;
+            std::vector<MethodConstraintItem> items;
+        };
+        std::vector<MethodGenericConstraint> methodGenericConstraints;
+        if (md) {
+            for (const auto& gc : md->genericConstraints) {
+                MethodGenericConstraint mgc;
+                mgc.typeParam = gc.typeParam;
+                for (const auto& item : gc.items) {
+                    MethodConstraintItem mi;
+                    mi.kind = item.kind;
+                    if (item.kind == "type" && item.typeArg) {
+                        mi.bound = ctx_.resolvedType(*item.typeArg);
+                        if (item.typeArg->name &&
+                            item.typeArg->name->parts.size() == 1)
+                            mi.boundParamName =
+                                item.typeArg->name->parts.back();
+                    }
+                    mgc.items.push_back(mi);
+                }
+                methodGenericConstraints.push_back(std::move(mgc));
+            }
+        } else if (ms) {
+            for (Symbol* gp : ms->genericParams) {
+                auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+                if (!gps) continue;
+                MethodGenericConstraint mgc;
+                mgc.typeParam = gps->name;
+                for (const auto& c : gps->constraints) {
+                    MethodConstraintItem mi;
+                    mi.kind = c.kind;
+                    if (c.kind == "type") {
+                        mi.bound = c.importedBound;
+                        if (mi.bound && !mi.bound->declaration)
+                            mi.boundParamName = mi.bound->headName();
+                    }
+                    mgc.items.push_back(mi);
+                }
+                methodGenericConstraints.push_back(std::move(mgc));
+            }
+        }
+        // §14.2 (#729 / #746 R41-C): enforce a generic METHOD's
+        // `where T: …` constraints at the CALL SITE. #729 covered only
+        // `type` (interface/class) bounds; the `class`/`value`/`notnull`
+        // KIND constraints were skipped (and a primitive arg, having no
+        // declaration, was dropped entirely) — `Clone<int>()` with
+        // `where T: class` was silently accepted (a soundness hole).
+        auto checkMethodGenericConstraints =
+            [&](const std::unordered_map<std::string_view,
+                                         TypeRef*>& subst) {
+                // fix #3044 (§17.11 / §3.6 rule 2, v0.242): record this
+                // instantiation's bindings. If `md`'s body takes
+                // `default(T)` of one of these parameters under
+                // `where T: value`, the end-of-pass join
+                // (checkDeferredDefaultInstantiations) rejects any
+                // binding whose `default` is not well-defined — HERE, at
+                // the instantiation site, per §17.11's closing rule.
+                // Every binding is recorded, constrained or not: the
+                // obligation comes from the BODY, not from the
+                // constraint list this loop walks.
+                for (const auto& sb : subst) {
+                    if (!sb.second) continue;
+                    recordGenericInstantiationSite(
+                        md, sb.first, sb.second, argNameOf(sb.second),
+                        ce.span.begin);
+                }
+                for (const auto& gc : methodGenericConstraints) {
+                    auto ai = subst.find(gc.typeParam);
+                    if (ai == subst.end() || !ai->second) continue;
+                    TypeRef* argRef = ai->second;
+                    TypeSymbol* argDecl = argRef->declaration;  // may be null
+                    auto report = [&](const std::string& reason,
+                                      const std::string& detail = {}) {
+                        // §3.6 rule 4 (sharpened v0.201, #2059):
+                        // a derived-property constraint failure may
+                        // carry a component-path fragment naming the
+                        // offending field/element + the failing sub-
+                        // rule. APPENDED after the §14.2 citation
+                        // (the fragment carries its own backticks).
+                        std::string msg =
+                            "type argument `" + argNameOf(argRef) +
+                            "` does not satisfy the constraint `where " +
+                            std::string(gc.typeParam) + ": " + reason +
+                            "` (§14.2)";
+                        if (!detail.empty()) msg += detail;
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin, msg);
+                    };
+                    for (const auto& item : gc.items) {
+                        if (item.kind == "type") {
+                            // fix #4624: pre-resolved by the
+                            // both-sources normalization above
+                            // (methodGenericConstraints) — for a
+                            // local method this is the identical
+                            // `ctx_.resolvedType(*item.typeArg)` the
+                            // pre-fix code computed inline.
+                            TypeRef* bound = item.bound;
+                            // #1867 / §14.2 clause 5 + §28.2/§9.7: a
+                            // PRIMITIVE argument against `IDisposable`/
+                            // `IAsyncDisposable` — which only classes
+                            // implement — can never conform. These
+                            // resolve to a Named TypeRef WITHOUT a
+                            // synthesized declaration, so without this
+                            // they would fall through the type-parameter-
+                            // bound branch below to a silent defer.
+                            if (argRef->kind ==
+                                    TypeRef::Kind::Primitive &&
+                                bound && !bound->declaration &&
+                                primitiveNeverConformsToBuiltinIface(
+                                    bound->headName())) {
+                                report(std::string(bound->headName()));
+                                continue;
+                            }
+                            // §14.2 type-parameter bound (`where T: U`):
+                            // the bound is another type parameter of this
+                            // method, so it carries no declaration of its
+                            // own. Its concrete bound is U's substitution
+                            // (looked up in `subst`); T's substitution
+                            // must be non-nullable and assignable to it —
+                            // identical, a subclass, or an interface
+                            // conformance — else the instantiation is
+                            // rejected (closes the soundness hole where
+                            // an unrelated type was silently accepted).
+                            if ((!bound || !bound->declaration) &&
+                                !item.boundParamName.empty()) {
+                                auto ui = subst.find(
+                                    item.boundParamName);
+                                if (ui != subst.end() && ui->second) {
+                                    TypeRef* uSubst = ui->second;
+                                    std::string uName =
+                                        uSubst->declaration
+                                            ? std::string(
+                                                  uSubst->declaration->name)
+                                            : std::string(
+                                                  item.boundParamName);
+                                    if (argRef->nullable) {
+                                        report(uName);
+                                    } else if (uSubst->declaration &&
+                                               argDecl &&
+                                               !isSubtype(
+                                                   argDecl,
+                                                   uSubst->declaration)) {
+                                        report(uName);
+                                    }
+                                    // else: U's or T's substitution is not
+                                    // a user declaration → defer (no
+                                    // diagnostic), mirroring the concrete-
+                                    // bound defer below.
+                                }
+                                continue;
+                            }
+                            if (!bound || !bound->declaration) continue;
+                            if (!argDecl) {
+                                // stdlib §2.19 / §11.8 (v0.176, #807):
+                                // a PRIMITIVE type argument against a
+                                // static-abstraction bound is decided
+                                // by the compiler-provided conformance
+                                // table (numeric tower → all three;
+                                // char → ISteppable/IParsable only).
+                                if (argRef->kind !=
+                                    TypeRef::Kind::Primitive)
+                                    continue;
+                                std::string_view bn =
+                                    bound->declaration->name;
+                                if ((bn == "INumber" ||
+                                     bn == "ISteppable" ||
+                                     bn == "IParsable") &&
+                                    bound->declaration ==
+                                        ctx_.builtinInterfaceSym(bn)) {
+                                    if (argRef->nullable ||
+                                        !primitiveConformsToStaticIface(
+                                            argRef->primitive, bn))
+                                        report(std::string(bn));
+                                    continue;
+                                }
+                                // per §14.2 clause 5 v0.196: a primitive
+                                // conforms ONLY to the interfaces its
+                                // stdlib declaration lists plus the §11.8
+                                // compiler-provided abstractions (handled
+                                // above) — every one of which is a
+                                // compiler-known builtin interface
+                                // (IComparable/IEquatable/IEqualityComparer/
+                                // IReadOnlySpan carry a synthesized decl
+                                // via builtinInterfaceSym). A bound whose
+                                // declaration is any OTHER type — a
+                                // USER-declared interface or class, or a
+                                // builtin class — is one a primitive can
+                                // never conform to: primitives cannot
+                                // declare conformances. Reject rather than
+                                // defer (closes the soundness hole where
+                                // `M<int>()` under `where T: IShape` was
+                                // silently accepted and then dispatched a
+                                // bad itable slot).
+                                if (bound->declaration !=
+                                    ctx_.builtinInterfaceSym(bn)) {
+                                    report(std::string(bn));
+                                    continue;
+                                }
+                                // #1867: the bound IS a synthesized builtin
+                                // interface. Blanket-accepting by decl/name
+                                // was too lenient — it admitted a WRONG
+                                // generic argument (`int` vs
+                                // `IComparable<long>`) and interfaces no
+                                // primitive implements (`int` vs
+                                // `IEqualityComparer<int>`/`IReadOnlySpan<int>`).
+                                // Verify the exact §14.2-clause-5
+                                // conformance (correct head + generic arg);
+                                // Defer keeps the historical conservative
+                                // accept when the arg is not a decided
+                                // concrete primitive.
+                                if (primitiveConformsToBuiltinInstanceIface(
+                                        argRef->primitive, bn,
+                                        bound->genericArgs) ==
+                                    PrimBuiltinIfaceConformance::Rejects)
+                                    report(std::string(bn));
+                                continue;
+                            }
+                            if (!isSubtype(argDecl, bound->declaration))
+                                report(std::string(
+                                    bound->declaration->name));
+                        } else if (item.kind == "class") {
+                            // §14.2: non-nullable reference type only.
+                            int r = refKindOf(argRef);
+                            if (argRef->nullable || r == 0) report("class");
+                        } else if (item.kind == "value") {
+                            // §14.2: non-nullable value type only.
+                            int r = refKindOf(argRef);
+                            if (argRef->nullable || r == 1) report("value");
+                        } else if (item.kind == "notnull") {
+                            if (argRef->nullable) report("notnull");
+                        } else if (item.kind == "sendable") {
+                            // §14.2 "Derived-property constraints"
+                            // (v0.201, #2050): names the §30.14 sendable
+                            // derived-property. Satisfaction runs through
+                            // the shared isSendableType computation — the
+                            // same evaluation the type-instantiation site
+                            // (Resolver::checkOneConstraint) and the
+                            // call-site arg/result sendable gates use.
+                            // Defer on an Error TypeRef.
+                            //
+                            // §3.6 rule 4 (sharpened v0.201, #2059): the
+                            // diagnostic NAMES the structural reason "as
+                            // a component path" — the offending field /
+                            // element chain + the failing §30.14 rule.
+                            // The component-path fragment is APPENDED
+                            // after the §14.2 citation only when the
+                            // shared walk confidently pins the failure
+                            // to a single component; ambiguous verdicts
+                            // fall back to the flat message.
+                            if (argRef->kind != TypeRef::Kind::Error &&
+                                !isSendableType(argRef, ctx_))
+                                report("sendable",
+                                       sendableFailureComponentPath(
+                                           argRef, ctx_));
+                        } else if (item.kind == "hashable") {
+                            // §14.2 "Derived-property constraints"
+                            // (v0.214, #2087): names the §3.6
+                            // hashable derived-property.
+                            // Satisfaction runs through the shared
+                            // isEqualityBearing computation — the same
+                            // evaluation the type-instantiation site
+                            // (Resolver::checkOneConstraint), the
+                            // §3.6 rule-2 hash-container-key check, and
+                            // the use-site `=`/`<>` equality error use.
+                            // Defer on an Error TypeRef.
+                            //
+                            // §3.6 rule 4: the diagnostic NAMES the
+                            // structural reason as a component path —
+                            // the offending record/choice + the failing
+                            // §9.2/§35.7 reason, APPENDED when the type
+                            // is that failure shape (else flat).
+                            if (argRef->kind != TypeRef::Kind::Error &&
+                                !isEqualityBearing(argRef, ctx_))
+                                report("hashable",
+                                       hashableFailureComponentPath(
+                                           argRef, ctx_));
+                        } else if (item.kind == "new") {
+                            // §14.2 (#864 part 2): `where T: new()`
+                            // requires an accessible parameterless ctor.
+                            // Mirrors Resolver::argSatisfiesNew for the
+                            // method-call-site check.
+                            if (!argDecl) continue;  // built-in/unresolved: defer
+                            bool satisfied = false;
+                            bool decided = false;
+                            if (argDecl->kind == ast::TypeDeclKind::Enum) {
+                                // fix #3044 (§17.11 / §14.2, v0.242):
+                                // `new T()` at a value substitution IS
+                                // `default(T)`, which §17.11 rejects for
+                                // an enum with no declared constant of
+                                // underlying value 0. Decide only when
+                                // the declared-value set is known; an
+                                // enum WITH a zero constant defers to
+                                // Resolver::argSatisfiesNew exactly as
+                                // before.
+                                std::optional<bool> hasZero =
+                                    enumHasZeroConstant(*argDecl);
+                                if (!hasZero || *hasZero) continue;
+                                decided = true;
+                                satisfied = false;
+                            } else if (argDecl->kind ==
+                                       ast::TypeDeclKind::Record) {
+                                // Records (positional fields
+                                // default-constructible when no non-nullable
+                                // ref field) satisfy new(); conservatively
+                                // accept — the exhaustive check is in
+                                // Resolver::argSatisfiesNew. Defer (decided=false).
+                                //
+                                // fix #4699 (§9.9, v0.307, proposal 0107):
+                                // a constructor-only record is the ONE
+                                // record case the previous deferral
+                                // dropped on the floor — the §14.2
+                                // value-substitution-is-default rule
+                                // (§17.11's "Not defaultable" list
+                                // names it directly) makes the
+                                // substitution unsatisfiable. The
+                                // shared `sema::typeHasNoDefault`
+                                // authority closes it: it short-circuits
+                                // before its per-field walk when the
+                                // record itself is constructor-only.
+                                // See the parallel fix at
+                                // `Resolver::argSatisfiesNew`
+                                // (TypeResolution_Checks.cpp).
+                                if (recordIsConstructorOnly(argDecl)) {
+                                    decided = true;
+                                    satisfied = false;
+                                    // Override the generic §14.2
+                                    // report (see `report` lambda
+                                    // above) with one that names the
+                                    // §9.9 reason — a constructor-only
+                                    // record has no well-defined
+                                    // default value, so the
+                                    // substitution is unsatisfiable
+                                    // not because `T` lacks a
+                                    // parameterless ctor but because
+                                    // the property §9.9 names
+                                    // forbids producing one at all.
+                                    report("new()",
+                                           std::string(" — `") +
+                                               argNameOf(argRef) +
+                                               "` is a constructor-only "
+                                               "record (\xC2\xA7""9.9), "
+                                               "which has no well-defined "
+                                               "default value");
+                                    continue;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            // §35.10 (v0.200, #2044): "Choices never
+                            // satisfy the value-type arm — `default(C)`
+                            // is undefined for every choice type." The
+                            // new() value-type arm keys off default, so
+                            // a choice substitution always fails. The
+                            // DECLARATION-site check is in
+                            // Resolver::argSatisfiesNew + ExprTC::
+                            // groundSatisfiesNew; this is the call-site
+                            // re-check.
+                            if (argDecl->kind == ast::TypeDeclKind::Choice) {
+                                decided = true;
+                                satisfied = false;
+                            } else if (argDecl->kind == ast::TypeDeclKind::Interface) {
+                                decided = true;
+                                satisfied = false;  // §14.2: interface substitutions
+                                                    // never satisfy `new()`
+                            } else if (argDecl->kind == ast::TypeDeclKind::Class) {
+                                // fix #3141 (family F3 of umbrella
+                                // #3152, §2.8.3 rule 4): the primary
+                                // parameter list is read off the
+                                // TypeSymbol — `hasPositionalFields`
+                                // (#501) plus the FieldSymbols that
+                                // survive an import (#2516). Through
+                                // `argDecl->decl` an imported
+                                // primary-constructor class looked
+                                // parameterless and so satisfied
+                                // `new()` at this call-site re-check.
+                                decided = true;
+                                // fix #4472 (§14.2, v0.302; follow-up
+                                // to fix #4446 — this arm was the
+                                // un-fixed duplicate "Site B" the
+                                // issue names, the direct-call-site
+                                // re-check for the issue's own
+                                // `Make<Shape>()` repro): an
+                                // `abstract`/`closed` class never
+                                // satisfies `new()`, regardless of
+                                // the ctor scan below. Shared with
+                                // `ExprTC::groundSatisfiesNew` and
+                                // `Resolver::argSatisfiesNew` through
+                                // ONE function — see
+                                // `sema::isAbstractOrClosedClass`
+                                // (TypeResolution.hpp).
+                                if (isAbstractOrClosedClass(argDecl)) {
+                                    satisfied = false;
+                                } else if (argDecl->hasPositionalFields &&
+                                    !recordPositionalFieldSymbols(argDecl)
+                                         .empty()) {
+                                    satisfied = false;  // primary ctor has params
+                                } else {
+                                    std::vector<const ConstructorSymbol*> ctors;
+                                    for (Symbol* mem : argDecl->members) {
+                                        if (auto* cs =
+                                                dynamic_cast<const ConstructorSymbol*>(
+                                                    mem))
+                                            if (!cs->isStatic)
+                                                ctors.push_back(cs);
+                                    }
+                                    if (ctors.empty()) {
+                                        satisfied = true;  // implicit default ctor
+                                    } else {
+                                        for (const ConstructorSymbol* cs : ctors) {
+                                            if (cs->params.empty() &&
+                                                cs->visibility !=
+                                                    ast::Visibility::Private) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (decided && !satisfied) report("new()");
+                        }
+                    }
+                }
+            };
+        // §30.1 (v0.179, #1438; re-applied at the instantiation site,
+        // #1595): "for a generic async method the check is re-applied
+        // after substitution, so an instantiation whose type argument
+        // makes a parameter borrow-bearing is rejected at the
+        // instantiation site." The DECLARATION-site check
+        // (MethodOwnership::checkAsyncSignatureBorrowBearing,
+        // ownership pass) runs once on the method's unsubstituted
+        // body and sees only the bare method type parameter `T` — it
+        // cannot know whether some future call binds `T` to a
+        // borrow-bearing record or span. This re-applies the SAME
+        // predicate (common::isBorrowBearingRecordOrSpan) to each
+        // parameter's and the result's type, substituted with THIS
+        // call's concrete type argument(s), so the instantiation that
+        // makes the shape unsound is rejected exactly where it is
+        // introduced. No-op for a non-`async` method or an empty
+        // `subst` (nothing to substitute against). // per §30.1
+        auto checkAsyncInstantiationBorrowBearing =
+            [&](const std::unordered_map<std::string_view,
+                                         TypeRef*>& subst) {
+                if (subst.empty()) return;
+                bool isAsync = false;
+                // fix #4624 (§30.1, v0.307): read `ms->modifiers`
+                // rather than `md->modifiers` — `MemberSymbol::
+                // modifiers` mirrors the declared modifier list on
+                // BOTH sides (SymbolCollection.cpp:204 sets it from
+                // `md->modifiers` verbatim for a local method;
+                // ModuleLoader.cpp:6495 sets it from `MetaMember::
+                // modifiers` for an imported one), so this reads
+                // identically to `md->modifiers` when `md` is
+                // non-null and works when it is null (an imported
+                // method has no `ast::MethodDecl` at all).
+                for (std::string_view mod : ms->modifiers)
+                    if (mod == "async") { isAsync = true; break; }
+                if (!isAsync) return;
+                // §35.4 / §9.7 (v0.226, #2183): the re-check reads the
+                // BORROW-BEARING-CHOICE classification too ("record"
+                // read as "record or choice") — a generic async method
+                // whose type argument makes a choice parameter borrow-
+                // bearing (`F.Work<ArraySpan<int>>` binding `Opt<T>` →
+                // `Opt<ArraySpan<int>>`) is rejected at the instantiation
+                // site, the choice-side dual of the record re-check.
+                auto subIsBorrowBearing = [&](TypeRef* t) -> bool {
+                    if (common::isBorrowBearingRecordOrSpan(t, ctx_))
+                        return true;
+                    auto cv = common::classifyChoiceType(t, ctx_);
+                    return cv && *cv == common::ChoiceClassification::
+                                            BorrowBearing;
+                };
+                // fix #4624: both-sources param walk. `formalParamCount`
+                // / `formalParamDeclType` / `formalParamResolvedType` /
+                // `formalParamName` (sema/Symbol.hpp) are the SAME
+                // both-sources accessors `typeCall`'s own overload-
+                // ranking loop already uses (~L2114): AST first (a
+                // local method), the loader's already-resolved TypeRef
+                // second (an imported one, whose `formalParamDeclType`
+                // is null because ModuleLoader never assigns
+                // `MethodSymbol::decl`).
+                std::size_t pCount = formalParamCount(*ms);
+                for (std::size_t pi = 0; pi < pCount; ++pi) {
+                    const ast::Type* pNode =
+                        formalParamDeclType(*ms, pi);
+                    const TypeRef* declTyC =
+                        pNode ? ctx_.resolvedType(*pNode)
+                              : formalParamResolvedType(*ms, pi);
+                    if (!declTyC) continue;
+                    TypeRef* declTy = const_cast<TypeRef*>(declTyC);
+                    TypeRef* subTy = substituteReturnType(declTy, subst);
+                    if (subTy == declTy) continue;  // T not bound here
+                    if (!subIsBorrowBearing(subTy)) continue;
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "instantiating `async` method `" +
+                        std::string(ms->name) + "` with this type "
+                        "argument makes parameter `" +
+                        std::string(formalParamName(*ms, pi)) +
+                        "` borrow-bearing — a "
+                        "span, or a record or choice carrying a non-"
+                        "runtime-managed borrow, may not be a parameter "
+                        "of an `async` method: it is captured into the "
+                        "heap state-machine frame that outlives the "
+                        "synchronous call, so the borrow's source is "
+                        "bounded by no stack frame (§30.1, §35.4, re-"
+                        "checked at the instantiation site)");
+                }
+                // Result/element type: the single generic argument of
+                // the declared async return type (`T` of `Task<T>` /
+                // `OwningTask<T>`, or an async-iterator's element
+                // type). `Task` (unit) has none and is unaffected.
+                //
+                // fix #4624: both-sources declared (UNSUBSTITUTED)
+                // return type. LOCAL: `ctx_.resolvedType(*md->
+                // returnType)` — the identical node the pre-fix code
+                // resolved (its `.genericArgs` are populated by
+                // resolving each ast genericArgs node in order, the
+                // same cache-keyed lookup the pre-fix code performed
+                // directly on `md->returnType->genericArgs.front()`,
+                // so this yields the identical TypeRef*). IMPORTED:
+                // `ctx_.importedReturnType(ms)` is already this exact
+                // declared, unsubstituted return TypeRef (see the
+                // `!md && ctx_.isImported(ms)` arm above, which
+                // substitutes a COPY into `callTy` and leaves this one
+                // untouched).
+                const TypeRef* declReturn =
+                    md ? (md->returnType
+                              ? ctx_.resolvedType(*md->returnType)
+                              : nullptr)
+                       : ctx_.importedReturnType(ms);
+                if (declReturn && !declReturn->genericArgs.empty()) {
+                    TypeRef* declResult = declReturn->genericArgs.front();
+                    if (declResult) {
+                        TypeRef* subResult =
+                            substituteReturnType(declResult, subst);
+                        if (subResult != declResult &&
+                            subIsBorrowBearing(subResult))
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "instantiating `async` method `" +
+                                std::string(ms->name) + "` with this "
+                                "type argument makes its result "
+                                "borrow-bearing — a span, or a record "
+                                "or choice carrying a non-runtime-"
+                                "managed borrow, may not be an `async` "
+                                "method's result: it would escape the "
+                                "state-machine frame with no bounded "
+                                "source (§30.1, §35.4, re-checked at "
+                                "the instantiation site)");
+                    }
+                }
+            };
         if (md && md->returnType) {
             if (auto* rt = ctx_.resolvedType(*md->returnType)) {
                 // per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): a method whose
@@ -4320,535 +4987,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // value-builtin is treated as reference, consistent with the
                 // type-instantiation check). Function/inline-array/unit are
                 // value-ish per §14.2; an unresolved/Error arg is unknown (defer).
-                auto refKindOf = [&](const TypeRef* a) -> int {
-                    if (!a) return -1;
-                    switch (a->kind) {
-                        case TypeRef::Kind::Primitive:
-                            return (a->primitive == PrimitiveType::String ||
-                                    a->primitive == PrimitiveType::Object) ? 1 : 0;
-                        case TypeRef::Kind::Function: return 1;
-                        case TypeRef::Kind::InlineArray:
-                        case TypeRef::Kind::Unit: return 0;
-                        case TypeRef::Kind::Named:
-                            if (a->declaration) {
-                                auto k = a->declaration->kind;
-                                if (k == ast::TypeDeclKind::Class ||
-                                    k == ast::TypeDeclKind::Interface) return 1;
-                                // #2476 / §14.2: choices are value types, same
-                                // as records/enums — "records, enums, choices
-                                // ([§35](#sec-choices)), primitives, inline
-                                // arrays (all forms, including owning forms),
-                                // and the unit type." Before this fix, Choice
-                                // fell through this if-chain to the `return 1`
-                                // built-in-named fallback below, so a CALL-SITE
-                                // generic method (`F(Color.Red)` / `F<Color>(…)`,
-                                // inferred or explicit — both route through this
-                                // lambda via checkMethodGenericConstraints) with
-                                // a `where T: value`/`where T: class` constraint
-                                // misclassified every choice type argument as a
-                                // REFERENCE type: `where T: value` wrongly
-                                // rejected it and `where T: class` would have
-                                // wrongly ACCEPTED it (untested — no reachable
-                                // choice-as-class-arg repro, since a choice
-                                // never satisfies §14.2's class bound on any
-                                // other check). This lambda's own comment above
-                                // claims to mirror `Resolver::categorize` (the
-                                // declaration-site / explicit-type-argument-list
-                                // check, TypeResolution_Checks.cpp), which
-                                // already classifies Choice as Value — so this
-                                // was a drift between the two duplicate
-                                // classifiers, not a deliberate omission.
-                                if (k == ast::TypeDeclKind::Record ||
-                                    k == ast::TypeDeclKind::Enum ||
-                                    k == ast::TypeDeclKind::Choice) return 0;
-                            }
-                            return 1;  // built-in named (Array/IEnumerable/…) → ref
-                        default: return -1;  // Error/unresolved → defer
-                    }
-                };
-                auto argNameOf = [&](const TypeRef* a) -> std::string {
-                    std::string base;
-                    if (a && a->declaration) base = std::string(a->declaration->name);
-                    else if (a && a->astNode && a->astNode->name &&
-                             !a->astNode->name->parts.empty())
-                        base = std::string(a->astNode->name->parts.back());
-                    else return "the type argument";
-                    // §7.1 (#741/f13): a nullable type argument displays with its
-                    // `?` so the diagnostic names the actual offending type
-                    // (`int?` does not satisfy `value`, not `int`).
-                    if (a->nullable) base += "?";
-                    return base;
-                };
-                // §14.2 (#729 / #746 R41-C): enforce a generic METHOD's
-                // `where T: …` constraints at the CALL SITE. #729 covered only
-                // `type` (interface/class) bounds; the `class`/`value`/`notnull`
-                // KIND constraints were skipped (and a primitive arg, having no
-                // declaration, was dropped entirely) — `Clone<int>()` with
-                // `where T: class` was silently accepted (a soundness hole).
-                auto checkMethodGenericConstraints =
-                    [&](const std::unordered_map<std::string_view,
-                                                 TypeRef*>& subst) {
-                        // fix #3044 (§17.11 / §3.6 rule 2, v0.242): record this
-                        // instantiation's bindings. If `md`'s body takes
-                        // `default(T)` of one of these parameters under
-                        // `where T: value`, the end-of-pass join
-                        // (checkDeferredDefaultInstantiations) rejects any
-                        // binding whose `default` is not well-defined — HERE, at
-                        // the instantiation site, per §17.11's closing rule.
-                        // Every binding is recorded, constrained or not: the
-                        // obligation comes from the BODY, not from the
-                        // constraint list this loop walks.
-                        for (const auto& sb : subst) {
-                            if (!sb.second) continue;
-                            recordGenericInstantiationSite(
-                                md, sb.first, sb.second, argNameOf(sb.second),
-                                ce.span.begin);
-                        }
-                        for (const auto& gc : md->genericConstraints) {
-                            auto ai = subst.find(gc.typeParam);
-                            if (ai == subst.end() || !ai->second) continue;
-                            TypeRef* argRef = ai->second;
-                            TypeSymbol* argDecl = argRef->declaration;  // may be null
-                            auto report = [&](const std::string& reason,
-                                              const std::string& detail = {}) {
-                                // §3.6 rule 4 (sharpened v0.201, #2059):
-                                // a derived-property constraint failure may
-                                // carry a component-path fragment naming the
-                                // offending field/element + the failing sub-
-                                // rule. APPENDED after the §14.2 citation
-                                // (the fragment carries its own backticks).
-                                std::string msg =
-                                    "type argument `" + argNameOf(argRef) +
-                                    "` does not satisfy the constraint `where " +
-                                    std::string(gc.typeParam) + ": " + reason +
-                                    "` (§14.2)";
-                                if (!detail.empty()) msg += detail;
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin, msg);
-                            };
-                            for (const auto& item : gc.items) {
-                                if (item.kind == "type" && item.typeArg) {
-                                    TypeRef* bound =
-                                        ctx_.resolvedType(*item.typeArg);
-                                    // #1867 / §14.2 clause 5 + §28.2/§9.7: a
-                                    // PRIMITIVE argument against `IDisposable`/
-                                    // `IAsyncDisposable` — which only classes
-                                    // implement — can never conform. These
-                                    // resolve to a Named TypeRef WITHOUT a
-                                    // synthesized declaration, so without this
-                                    // they would fall through the type-parameter-
-                                    // bound branch below to a silent defer.
-                                    if (argRef->kind ==
-                                            TypeRef::Kind::Primitive &&
-                                        bound && !bound->declaration &&
-                                        primitiveNeverConformsToBuiltinIface(
-                                            bound->headName())) {
-                                        report(std::string(bound->headName()));
-                                        continue;
-                                    }
-                                    // §14.2 type-parameter bound (`where T: U`):
-                                    // the bound is another type parameter of this
-                                    // method, so it carries no declaration of its
-                                    // own. Its concrete bound is U's substitution
-                                    // (looked up in `subst`); T's substitution
-                                    // must be non-nullable and assignable to it —
-                                    // identical, a subclass, or an interface
-                                    // conformance — else the instantiation is
-                                    // rejected (closes the soundness hole where
-                                    // an unrelated type was silently accepted).
-                                    if ((!bound || !bound->declaration) &&
-                                        item.typeArg->name &&
-                                        item.typeArg->name->parts.size() == 1) {
-                                        auto ui = subst.find(
-                                            item.typeArg->name->parts.back());
-                                        if (ui != subst.end() && ui->second) {
-                                            TypeRef* uSubst = ui->second;
-                                            std::string uName =
-                                                uSubst->declaration
-                                                    ? std::string(
-                                                          uSubst->declaration->name)
-                                                    : std::string(
-                                                          item.typeArg->name
-                                                              ->parts.back());
-                                            if (argRef->nullable) {
-                                                report(uName);
-                                            } else if (uSubst->declaration &&
-                                                       argDecl &&
-                                                       !isSubtype(
-                                                           argDecl,
-                                                           uSubst->declaration)) {
-                                                report(uName);
-                                            }
-                                            // else: U's or T's substitution is not
-                                            // a user declaration → defer (no
-                                            // diagnostic), mirroring the concrete-
-                                            // bound defer below.
-                                        }
-                                        continue;
-                                    }
-                                    if (!bound || !bound->declaration) continue;
-                                    if (!argDecl) {
-                                        // stdlib §2.19 / §11.8 (v0.176, #807):
-                                        // a PRIMITIVE type argument against a
-                                        // static-abstraction bound is decided
-                                        // by the compiler-provided conformance
-                                        // table (numeric tower → all three;
-                                        // char → ISteppable/IParsable only).
-                                        if (argRef->kind !=
-                                            TypeRef::Kind::Primitive)
-                                            continue;
-                                        std::string_view bn =
-                                            bound->declaration->name;
-                                        if ((bn == "INumber" ||
-                                             bn == "ISteppable" ||
-                                             bn == "IParsable") &&
-                                            bound->declaration ==
-                                                ctx_.builtinInterfaceSym(bn)) {
-                                            if (argRef->nullable ||
-                                                !primitiveConformsToStaticIface(
-                                                    argRef->primitive, bn))
-                                                report(std::string(bn));
-                                            continue;
-                                        }
-                                        // per §14.2 clause 5 v0.196: a primitive
-                                        // conforms ONLY to the interfaces its
-                                        // stdlib declaration lists plus the §11.8
-                                        // compiler-provided abstractions (handled
-                                        // above) — every one of which is a
-                                        // compiler-known builtin interface
-                                        // (IComparable/IEquatable/IEqualityComparer/
-                                        // IReadOnlySpan carry a synthesized decl
-                                        // via builtinInterfaceSym). A bound whose
-                                        // declaration is any OTHER type — a
-                                        // USER-declared interface or class, or a
-                                        // builtin class — is one a primitive can
-                                        // never conform to: primitives cannot
-                                        // declare conformances. Reject rather than
-                                        // defer (closes the soundness hole where
-                                        // `M<int>()` under `where T: IShape` was
-                                        // silently accepted and then dispatched a
-                                        // bad itable slot).
-                                        if (bound->declaration !=
-                                            ctx_.builtinInterfaceSym(bn)) {
-                                            report(std::string(bn));
-                                            continue;
-                                        }
-                                        // #1867: the bound IS a synthesized builtin
-                                        // interface. Blanket-accepting by decl/name
-                                        // was too lenient — it admitted a WRONG
-                                        // generic argument (`int` vs
-                                        // `IComparable<long>`) and interfaces no
-                                        // primitive implements (`int` vs
-                                        // `IEqualityComparer<int>`/`IReadOnlySpan<int>`).
-                                        // Verify the exact §14.2-clause-5
-                                        // conformance (correct head + generic arg);
-                                        // Defer keeps the historical conservative
-                                        // accept when the arg is not a decided
-                                        // concrete primitive.
-                                        if (primitiveConformsToBuiltinInstanceIface(
-                                                argRef->primitive, bn,
-                                                bound->genericArgs) ==
-                                            PrimBuiltinIfaceConformance::Rejects)
-                                            report(std::string(bn));
-                                        continue;
-                                    }
-                                    if (!isSubtype(argDecl, bound->declaration))
-                                        report(std::string(
-                                            bound->declaration->name));
-                                } else if (item.kind == "class") {
-                                    // §14.2: non-nullable reference type only.
-                                    int r = refKindOf(argRef);
-                                    if (argRef->nullable || r == 0) report("class");
-                                } else if (item.kind == "value") {
-                                    // §14.2: non-nullable value type only.
-                                    int r = refKindOf(argRef);
-                                    if (argRef->nullable || r == 1) report("value");
-                                } else if (item.kind == "notnull") {
-                                    if (argRef->nullable) report("notnull");
-                                } else if (item.kind == "sendable") {
-                                    // §14.2 "Derived-property constraints"
-                                    // (v0.201, #2050): names the §30.14 sendable
-                                    // derived-property. Satisfaction runs through
-                                    // the shared isSendableType computation — the
-                                    // same evaluation the type-instantiation site
-                                    // (Resolver::checkOneConstraint) and the
-                                    // call-site arg/result sendable gates use.
-                                    // Defer on an Error TypeRef.
-                                    //
-                                    // §3.6 rule 4 (sharpened v0.201, #2059): the
-                                    // diagnostic NAMES the structural reason "as
-                                    // a component path" — the offending field /
-                                    // element chain + the failing §30.14 rule.
-                                    // The component-path fragment is APPENDED
-                                    // after the §14.2 citation only when the
-                                    // shared walk confidently pins the failure
-                                    // to a single component; ambiguous verdicts
-                                    // fall back to the flat message.
-                                    if (argRef->kind != TypeRef::Kind::Error &&
-                                        !isSendableType(argRef, ctx_))
-                                        report("sendable",
-                                               sendableFailureComponentPath(
-                                                   argRef, ctx_));
-                                } else if (item.kind == "hashable") {
-                                    // §14.2 "Derived-property constraints"
-                                    // (v0.214, #2087): names the §3.6
-                                    // hashable derived-property.
-                                    // Satisfaction runs through the shared
-                                    // isEqualityBearing computation — the same
-                                    // evaluation the type-instantiation site
-                                    // (Resolver::checkOneConstraint), the
-                                    // §3.6 rule-2 hash-container-key check, and
-                                    // the use-site `=`/`<>` equality error use.
-                                    // Defer on an Error TypeRef.
-                                    //
-                                    // §3.6 rule 4: the diagnostic NAMES the
-                                    // structural reason as a component path —
-                                    // the offending record/choice + the failing
-                                    // §9.2/§35.7 reason, APPENDED when the type
-                                    // is that failure shape (else flat).
-                                    if (argRef->kind != TypeRef::Kind::Error &&
-                                        !isEqualityBearing(argRef, ctx_))
-                                        report("hashable",
-                                               hashableFailureComponentPath(
-                                                   argRef, ctx_));
-                                } else if (item.kind == "new") {
-                                    // §14.2 (#864 part 2): `where T: new()`
-                                    // requires an accessible parameterless ctor.
-                                    // Mirrors Resolver::argSatisfiesNew for the
-                                    // method-call-site check.
-                                    if (!argDecl) continue;  // built-in/unresolved: defer
-                                    bool satisfied = false;
-                                    bool decided = false;
-                                    if (argDecl->kind == ast::TypeDeclKind::Enum) {
-                                        // fix #3044 (§17.11 / §14.2, v0.242):
-                                        // `new T()` at a value substitution IS
-                                        // `default(T)`, which §17.11 rejects for
-                                        // an enum with no declared constant of
-                                        // underlying value 0. Decide only when
-                                        // the declared-value set is known; an
-                                        // enum WITH a zero constant defers to
-                                        // Resolver::argSatisfiesNew exactly as
-                                        // before.
-                                        std::optional<bool> hasZero =
-                                            enumHasZeroConstant(*argDecl);
-                                        if (!hasZero || *hasZero) continue;
-                                        decided = true;
-                                        satisfied = false;
-                                    } else if (argDecl->kind ==
-                                               ast::TypeDeclKind::Record) {
-                                        // Records (positional fields
-                                        // default-constructible when no non-nullable
-                                        // ref field) satisfy new(); conservatively
-                                        // accept — the exhaustive check is in
-                                        // Resolver::argSatisfiesNew. Defer (decided=false).
-                                        //
-                                        // fix #4699 (§9.9, v0.307, proposal 0107):
-                                        // a constructor-only record is the ONE
-                                        // record case the previous deferral
-                                        // dropped on the floor — the §14.2
-                                        // value-substitution-is-default rule
-                                        // (§17.11's "Not defaultable" list
-                                        // names it directly) makes the
-                                        // substitution unsatisfiable. The
-                                        // shared `sema::typeHasNoDefault`
-                                        // authority closes it: it short-circuits
-                                        // before its per-field walk when the
-                                        // record itself is constructor-only.
-                                        // See the parallel fix at
-                                        // `Resolver::argSatisfiesNew`
-                                        // (TypeResolution_Checks.cpp).
-                                        if (recordIsConstructorOnly(argDecl)) {
-                                            decided = true;
-                                            satisfied = false;
-                                            // Override the generic §14.2
-                                            // report (see `report` lambda
-                                            // above) with one that names the
-                                            // §9.9 reason — a constructor-only
-                                            // record has no well-defined
-                                            // default value, so the
-                                            // substitution is unsatisfiable
-                                            // not because `T` lacks a
-                                            // parameterless ctor but because
-                                            // the property §9.9 names
-                                            // forbids producing one at all.
-                                            report("new()",
-                                                   std::string(" — `") +
-                                                       argNameOf(argRef) +
-                                                       "` is a constructor-only "
-                                                       "record (\xC2\xA7""9.9), "
-                                                       "which has no well-defined "
-                                                       "default value");
-                                            continue;
-                                        } else {
-                                            continue;
-                                        }
-                                    }
-                                    // §35.10 (v0.200, #2044): "Choices never
-                                    // satisfy the value-type arm — `default(C)`
-                                    // is undefined for every choice type." The
-                                    // new() value-type arm keys off default, so
-                                    // a choice substitution always fails. The
-                                    // DECLARATION-site check is in
-                                    // Resolver::argSatisfiesNew + ExprTC::
-                                    // groundSatisfiesNew; this is the call-site
-                                    // re-check.
-                                    if (argDecl->kind == ast::TypeDeclKind::Choice) {
-                                        decided = true;
-                                        satisfied = false;
-                                    } else if (argDecl->kind == ast::TypeDeclKind::Interface) {
-                                        decided = true;
-                                        satisfied = false;  // §14.2: interface substitutions
-                                                            // never satisfy `new()`
-                                    } else if (argDecl->kind == ast::TypeDeclKind::Class) {
-                                        // fix #3141 (family F3 of umbrella
-                                        // #3152, §2.8.3 rule 4): the primary
-                                        // parameter list is read off the
-                                        // TypeSymbol — `hasPositionalFields`
-                                        // (#501) plus the FieldSymbols that
-                                        // survive an import (#2516). Through
-                                        // `argDecl->decl` an imported
-                                        // primary-constructor class looked
-                                        // parameterless and so satisfied
-                                        // `new()` at this call-site re-check.
-                                        decided = true;
-                                        // fix #4472 (§14.2, v0.302; follow-up
-                                        // to fix #4446 — this arm was the
-                                        // un-fixed duplicate "Site B" the
-                                        // issue names, the direct-call-site
-                                        // re-check for the issue's own
-                                        // `Make<Shape>()` repro): an
-                                        // `abstract`/`closed` class never
-                                        // satisfies `new()`, regardless of
-                                        // the ctor scan below. Shared with
-                                        // `ExprTC::groundSatisfiesNew` and
-                                        // `Resolver::argSatisfiesNew` through
-                                        // ONE function — see
-                                        // `sema::isAbstractOrClosedClass`
-                                        // (TypeResolution.hpp).
-                                        if (isAbstractOrClosedClass(argDecl)) {
-                                            satisfied = false;
-                                        } else if (argDecl->hasPositionalFields &&
-                                            !recordPositionalFieldSymbols(argDecl)
-                                                 .empty()) {
-                                            satisfied = false;  // primary ctor has params
-                                        } else {
-                                            std::vector<const ConstructorSymbol*> ctors;
-                                            for (Symbol* mem : argDecl->members) {
-                                                if (auto* cs =
-                                                        dynamic_cast<const ConstructorSymbol*>(
-                                                            mem))
-                                                    if (!cs->isStatic)
-                                                        ctors.push_back(cs);
-                                            }
-                                            if (ctors.empty()) {
-                                                satisfied = true;  // implicit default ctor
-                                            } else {
-                                                for (const ConstructorSymbol* cs : ctors) {
-                                                    if (cs->params.empty() &&
-                                                        cs->visibility !=
-                                                            ast::Visibility::Private) {
-                                                        satisfied = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if (decided && !satisfied) report("new()");
-                                }
-                            }
-                        }
-                    };
-                // §30.1 (v0.179, #1438; re-applied at the instantiation site,
-                // #1595): "for a generic async method the check is re-applied
-                // after substitution, so an instantiation whose type argument
-                // makes a parameter borrow-bearing is rejected at the
-                // instantiation site." The DECLARATION-site check
-                // (MethodOwnership::checkAsyncSignatureBorrowBearing,
-                // ownership pass) runs once on the method's unsubstituted
-                // body and sees only the bare method type parameter `T` — it
-                // cannot know whether some future call binds `T` to a
-                // borrow-bearing record or span. This re-applies the SAME
-                // predicate (common::isBorrowBearingRecordOrSpan) to each
-                // parameter's and the result's type, substituted with THIS
-                // call's concrete type argument(s), so the instantiation that
-                // makes the shape unsound is rejected exactly where it is
-                // introduced. No-op for a non-`async` method or an empty
-                // `subst` (nothing to substitute against). // per §30.1
-                auto checkAsyncInstantiationBorrowBearing =
-                    [&](const std::unordered_map<std::string_view,
-                                                 TypeRef*>& subst) {
-                        if (subst.empty()) return;
-                        bool isAsync = false;
-                        for (std::string_view mod : md->modifiers)
-                            if (mod == "async") { isAsync = true; break; }
-                        if (!isAsync) return;
-                        // §35.4 / §9.7 (v0.226, #2183): the re-check reads the
-                        // BORROW-BEARING-CHOICE classification too ("record"
-                        // read as "record or choice") — a generic async method
-                        // whose type argument makes a choice parameter borrow-
-                        // bearing (`F.Work<ArraySpan<int>>` binding `Opt<T>` →
-                        // `Opt<ArraySpan<int>>`) is rejected at the instantiation
-                        // site, the choice-side dual of the record re-check.
-                        auto subIsBorrowBearing = [&](TypeRef* t) -> bool {
-                            if (common::isBorrowBearingRecordOrSpan(t, ctx_))
-                                return true;
-                            auto cv = common::classifyChoiceType(t, ctx_);
-                            return cv && *cv == common::ChoiceClassification::
-                                                    BorrowBearing;
-                        };
-                        for (const ast::Param& p : md->params) {
-                            if (!p.type) continue;
-                            TypeRef* declTy = ctx_.resolvedType(*p.type);
-                            if (!declTy) continue;
-                            TypeRef* subTy = substituteReturnType(declTy, subst);
-                            if (subTy == declTy) continue;  // T not bound here
-                            if (!subIsBorrowBearing(subTy)) continue;
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                "instantiating `async` method `" +
-                                std::string(md->name) + "` with this type "
-                                "argument makes parameter `" +
-                                std::string(p.name) + "` borrow-bearing — a "
-                                "span, or a record or choice carrying a non-"
-                                "runtime-managed borrow, may not be a parameter "
-                                "of an `async` method: it is captured into the "
-                                "heap state-machine frame that outlives the "
-                                "synchronous call, so the borrow's source is "
-                                "bounded by no stack frame (§30.1, §35.4, re-"
-                                "checked at the instantiation site)");
-                        }
-                        // Result/element type: the single generic argument of
-                        // the declared async return type (`T` of `Task<T>` /
-                        // `OwningTask<T>`, or an async-iterator's element
-                        // type). `Task` (unit) has none and is unaffected.
-                        if (md->returnType &&
-                            !md->returnType->genericArgs.empty()) {
-                            const ast::Type* resultNode =
-                                md->returnType->genericArgs.front().get();
-                            TypeRef* declResult =
-                                resultNode ? ctx_.resolvedType(*resultNode)
-                                          : nullptr;
-                            if (declResult) {
-                                TypeRef* subResult =
-                                    substituteReturnType(declResult, subst);
-                                if (subResult != declResult &&
-                                    subIsBorrowBearing(subResult))
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, ce.span.begin,
-                                        "instantiating `async` method `" +
-                                        std::string(md->name) + "` with this "
-                                        "type argument makes its result "
-                                        "borrow-bearing — a span, or a record "
-                                        "or choice carrying a non-runtime-"
-                                        "managed borrow, may not be an `async` "
-                                        "method's result: it would escape the "
-                                        "state-machine frame with no bounded "
-                                        "source (§30.1, §35.4, re-checked at "
-                                        "the instantiation site)");
-                            }
-                        }
-                    };
                 bool hadExplicitTypeArgs = false;
                 // fix #4325 (§5.1 / §11.2, v0.298): the explicit type-
                 // argument substitution map is declared at `typeCall`'s
@@ -5494,25 +5632,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // loop only avoids reading out of bounds rather than
                         // re-diagnosing.
                         //
-                        // Scope decline, recorded rather than silent: the
-                        // local arm additionally runs
-                        // `checkMethodGenericConstraints` and
-                        // `checkAsyncInstantiationBorrowBearing` against the
-                        // explicit substitution (~L3583/3586). Both read
-                        // `md->genericConstraints` — an AST-only list
-                        // `ModuleLoader` never populates for an imported
-                        // method (constraint payloads for an imported
-                        // generic PARAMETER instead live on the differently-
-                        // shaped `GenericParamSymbol::constraints`, #3146) —
-                        // so reusing either closure here would dereference
-                        // the null `md`. #4611 left the identical check
-                        // unrun on the phase-1 arm for the same reason; this
-                        // fix keeps that scope rather than widening it, so
-                        // an imported generic method's `where`-constraints
-                        // and async borrow-bearing rules stay UNCHECKED
-                        // against an explicit list — the pre-existing state,
-                        // not a regression this fix introduces. Filed as a
-                        // follow-up rather than folded in here.
+                        // fix #4624 (§14.2 / §30.1, v0.307): the local arm
+                        // additionally runs `checkMethodGenericConstraints`
+                        // and `checkAsyncInstantiationBorrowBearing` against
+                        // the explicit substitution (~L3583/3586); this
+                        // imported arm previously fell through without
+                        // either, because both closures read `md->
+                        // genericConstraints` / `md->modifiers` / `md->
+                        // params` — AST-only fields `ModuleLoader` never
+                        // populates for an imported method (`Symbol::decl`
+                        // stays null). #4622 (this arm's own substitution,
+                        // directly above) left that gap open, recorded but
+                        // not fixed, as an explicit scope decline.
+                        //
+                        // Both closures were widened by #4624 itself to read
+                        // through the both-sources accessors instead of `md`
+                        // directly: `checkMethodGenericConstraints` now
+                        // normalizes into `methodGenericConstraints` up
+                        // front, from `md->genericConstraints` (local) OR
+                        // `GenericParamSymbol::constraints` (imported,
+                        // populated by `ModuleLoader::convertGenericParams`
+                        // from `MetaGenericParam`, #3146); `checkAsync
+                        // InstantiationBorrowBearing` now reads `ms->
+                        // modifiers` / `formalParamCount`+`formalParamDeclType`
+                        // /`formalParamResolvedType`+`formalParamName`
+                        // (Symbol.hpp, populated on both sides since #2668/
+                        // #3772) and `ctx_.importedReturnType(ms)` in place
+                        // of `md->returnType`. Calling them here closes the
+                        // gap for THIS arm (an explicit type-argument list on
+                        // an imported generic method); #4611's sibling
+                        // argument-INFERRED arm has the identical gap and is
+                        // intentionally left alone — filed as a follow-up,
+                        // since it is a materially separate call site with
+                        // its own substitution map and its own risk of
+                        // widening a milestone's scope beyond one commit.
                         std::unordered_map<std::string_view, TypeRef*>
                             explicitSubstImported;
                         for (std::size_t gi = 0;
@@ -5526,9 +5679,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (concreteArg)
                                 explicitSubstImported[gp->name] = concreteArg;
                         }
-                        if (!explicitSubstImported.empty())
+                        if (!explicitSubstImported.empty()) {
                             callTy =
                                 substituteReturnType(rt, explicitSubstImported);
+                            checkMethodGenericConstraints(explicitSubstImported);
+                            checkAsyncInstantiationBorrowBearing(
+                                explicitSubstImported);
+                        }
                     }
                 }
                 // fix #4937 (§14.1 / §2.5 / §2.8.2 / §14.2, v0.307):
