@@ -3511,6 +3511,19 @@ private:
     bool collectionLiteralBindsTypeParam(const ast::CollectionLiteralExpr& cl,
                                          std::string_view tpName);
 
+    // fix #4895 rework-redo (§14.5 + §15.4, v0.307): true iff the literal's
+    // elements do not all share a single TypeRef (heterogeneous elements).
+    // Empty literals and dict-form literals return false (not
+    // heterogeneous — no element to coerce, or different slots entirely);
+    // elements that resolved to Error cascade as not-heterogeneous (already
+    // failing elsewhere). The heterogeneous-literal classifier catches the
+    // silent binder-coercion class (D1 `F(["s", 1], xs: Array<int>)` printed
+    // v=4435280) where the binder coerces heterogeneous elements against a
+    // type parameter T that another argument has already bound, without
+    // checking that the literal's element types actually fit T.
+    bool collectionLiteralIsHeterogeneous(
+        const ast::CollectionLiteralExpr& cl);
+
     // Recursive unification of a declared return TypeRef against a concrete
     // target TypeRef, binding any type-parameter names in `paramNames` into
     // `solved`. Returns false on a structural mismatch that prevents solving.

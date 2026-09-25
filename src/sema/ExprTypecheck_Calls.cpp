@@ -5149,66 +5149,181 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             return;
                         }
-                        // fix #4895 (§14.5 phase 3 + §15.4, v0.307): even when
-                        // every generic parameter IS bound by the argument
-                        // inference loop above, the binding is unsound if
-                        // every binding source for a parameter is a
-                        // collection literal whose elements do not all share
-                        // a single determined type. The parameter type
-                        // `Array<T>` is not closed (T is the very parameter
-                        // we are trying to bind), so per §15.4 the literal
-                        // has no determinable target type and per §14.5
-                        // phase 3 the call is a compile error naming the
-                        // parameter. Without this check, the binder's
-                        // element-by-element `checkAssignable` runs in the
-                        // order elements appear, binds T to the first
-                        // element's type, then fails on later elements —
-                        // but the call still typechecks and codegen proceeds
-                        // with T wrong (truncated pointer values, measured:
-                        // issue #4895's `Show(["s", new A()])` printed
-                        // `4435344|381342640`). Detect the unsound shape
-                        // here: walk each parameter position that mentions
-                        // a still-resolvable method type parameter, and for
-                        // each one whose actual argument is a collection
-                        // literal that fails to determine T's element type,
-                        // reject. The diagnostic text names the parameter
-                        // and the §14.5 / §15.4 authority.
+                        // fix #4895 rework-redo (§14.5 phase 1 + phase 3,
+                        // §15.4, v0.307):
+                        //
+                        // Original (#4895, commit 335e3849): walked each
+                        // parameter position whose declared type still
+                        // mentioned a method type parameter T and rejected
+                        // the call as soon as ANY parameter received a
+                        // collection literal that failed to determine T's
+                        // element type. That predicate rejected too broadly
+                        // — it fired on the first non-binding literal even
+                        // when another argument bound T via §14.5 phase 1's
+                        // argument-driven unification (a non-literal
+                        // argument's static type, or a homogeneous
+                        // collection literal whose elements share a single
+                        // TypeRef). It over-rejected programs like
+                        // `Pick<T>(xs: Array<T>, x: T)` called as
+                        // `Pick([], 7)` (T bound by `7` per §14.5 phase 1)
+                        // and `Count<T>(a: Array<T>, b: Array<T>)` called as
+                        // `Count(xs, [])` with `xs: Array<int>` (T bound by
+                        // `xs`).
+                        //
+                        // First rework (3f51d766, branch 4895-rework-v2):
+                        // narrowed to "reject ONLY when NO argument that
+                        // mentions T binds it (every such argument is a
+                        // non-binding collection literal)". That fixed
+                        // Pick([], 7) and Count(xs, []), but opened a NEW
+                        // silent-crash class on heterogeneous literals at
+                        // a T-mentioning position WITH another argument
+                        // binding T. Measured: `F<T>(a: Array<T>, b:
+                        // Array<T>)` called as `F(["s", 1], xs)` with
+                        // `xs: Array<int>` printed `v=4435280` (the string
+                        // `"s"` was silently treated as an int via the
+                        // binder's element-by-element `checkAssignable`
+                        // against the now-bound T=int; the binder trusted
+                        // the heterogeneous literal as if it were
+                        // homogeneous). Predicate no longer fires because
+                        // `xs` binds T, but the binder's coercion is
+                        // unsound.
+                        //
+                        // This rework-redo adds a heterogeneous-literal
+                        // classifier that runs in the same arg walk: track
+                        // whether ANY visited collection literal had
+                        // heterogeneous elements (different TypeRefs across
+                        // the elements). Empty literals are NOT
+                        // heterogeneous (no element to coerce); dict-form
+                        // and error-cascade literals are out of scope (the
+                        // binder handles those differently). A
+                        // heterogeneous literal cannot bind T (its elements
+                        // do not share a single TypeRef) AND cannot be
+                        // safely coerced against T once T is determined
+                        // (the binder coerces elements without checking the
+                        // literal's element types), so the predicate
+                        // rejects when ANY visited collection literal is
+                        // heterogeneous. Explicit `<T>` already
+                        // short-circuits the outer `!hadExplicitTypeArgs`
+                        // guard, so `Show<int>(["s", 1])` continues to be
+                        // accepted regardless. A type parameter that
+                        // appears in NO parameter type (only in the return
+                        // type) is bound by §14.5 phase 3's target-typed
+                        // completion, not by any argument — skip it
+                        // (without this skip, every no-arg generic call
+                        // would regress on inference).
                         if (md && !md->genericParams.empty()) {
                             for (const auto& gp : md->genericParams) {
                                 std::unordered_set<std::string_view> single{gp.name};
+                                // Does ANY argument whose formal mentions
+                                // T bind T? A non-literal argument's
+                                // static type unifies with the formal via
+                                // §14.5 phase 1; a collection literal
+                                // binds T iff every element shares a
+                                // single TypeRef (per
+                                // `collectionLiteralBindsTypeParam`).
+                                // Track also whether ANY visited
+                                // collection literal was heterogeneous —
+                                // that is the rework-redo's catch for
+                                // silent binder-coercion (D1/D2/D3 shapes).
+                                bool gpMentionedInArgs = false;
+                                bool tBoundByArg = false;
+                                bool gpHasHeterogeneousLiteral = false;
                                 for (std::size_t pi = 0;
                                      pi < md->params.size(); ++pi) {
                                     const auto& p = md->params[pi];
                                     if (!p.type) continue;
-                                    if (auto* pty =
-                                            ctx_.resolvedType(*p.type)) {
-                                        if (!refOutParamTypeMentionsTypeParam(
-                                                pty, single))
-                                            continue;
-                                    } else {
+                                    TypeRef* pty =
+                                        ctx_.resolvedType(*p.type);
+                                    if (!pty) continue;
+                                    if (!refOutParamTypeMentionsTypeParam(
+                                            pty, single))
                                         continue;
-                                    }
+                                    gpMentionedInArgs = true;
                                     if (pi >= ce.args.size() ||
                                         !ce.args[pi].value)
                                         continue;
-                                    auto* lit =
-                                        dynamic_cast<const ast::CollectionLiteralExpr*>(
-                                            ce.args[pi].value.get());
-                                    if (!lit) continue;
-                                    if (!collectionLiteralBindsTypeParam(
-                                            *lit, gp.name)) {
-                                        ctx_.diagnostics().report(
-                                            Severity::Error, ce.span.begin,
-                                            "cannot infer the type argument `"
-                                            + std::string(gp.name) + "` of `"
-                                            + std::string(md->name) + "`'s "
-                                            "call — phase 3 of §14.5: the only "
-                                            "source is a collection literal "
-                                            "and no target type supplies `"
-                                            + std::string(gp.name)
-                                            + "` (§14.5, §15.4, v0.307)");
-                                        return;
+                                    auto* arg = ce.args[pi].value.get();
+                                    if (auto* lit =
+                                            dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                                arg)) {
+                                        // Heterogeneous-literal classifier
+                                        // (rework-redo): elements do not
+                                        // share a single TypeRef. Run
+                                        // before the binder can silently
+                                        // coerce them.
+                                        if (collectionLiteralIsHeterogeneous(
+                                                *lit)) {
+                                            gpHasHeterogeneousLiteral = true;
+                                        }
+                                        // A binding literal (all elements
+                                        // share a TypeRef) binds T; a
+                                        // non-binding literal (heterogeneous,
+                                        // empty, dict-form, error-cascade)
+                                        // does NOT bind T. Keep scanning:
+                                        // the rework-redo's classifier also
+                                        // needs to inspect subsequent
+                                        // parameter positions for
+                                        // heterogeneous literals.
+                                        if (collectionLiteralBindsTypeParam(
+                                                *lit, gp.name)) {
+                                            tBoundByArg = true;
+                                        }
+                                    } else {
+                                        // Non-literal argument: by §14.5
+                                        // phase 1, its static type unifies
+                                        // with the formal. If we reached
+                                        // this predicate (the prior
+                                        // stillUnbound check passed), T
+                                        // is determined by this argument.
+                                        // Keep scanning: the rework-redo's
+                                        // classifier also needs to inspect
+                                        // subsequent parameter positions
+                                        // for heterogeneous literals.
+                                        tBoundByArg = true;
                                     }
+                                }
+                                if (!gpMentionedInArgs) {
+                                    // T is not mentioned in any parameter
+                                    // type — it's bound by §14.5 phase 3's
+                                    // target-typed completion (the return
+                                    // type ascription) or by lambda return
+                                    // inference, NOT by any argument. The
+                                    // collection-literal-only-source
+                                    // pathology the predicate guards
+                                    // against cannot arise here (there is
+                                    // no argument whose type mentions T),
+                                    // so this type parameter is not the
+                                    // predicate's concern.
+                                    continue;
+                                }
+                                // Two reject arms:
+                                //   (a) original #4895: NO argument binds
+                                //       T (every T-mentioning arg is a
+                                //       non-binding collection literal).
+                                //   (b) rework-redo: ANY visited
+                                //       collection literal is
+                                //       heterogeneous — the binder will
+                                //       silently coerce its elements
+                                //       against T once T is determined
+                                //       (truncated pointer values,
+                                //       measured: D1 `F(["s", 1], xs:
+                                //       Array<int>)` printed `v=4435280`).
+                                if (!tBoundByArg ||
+                                    gpHasHeterogeneousLiteral) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "cannot infer the type argument `"
+                                        + std::string(gp.name) + "` of `"
+                                        + std::string(md->name) + "`'s "
+                                        "call — phase 3 of §14.5: a "
+                                        "collection literal at a T-mentioning "
+                                        "argument position has elements that "
+                                        "do not all share a single determined "
+                                        "type, so it cannot safely bind or "
+                                        "be coerced against `"
+                                        + std::string(gp.name)
+                                        + "` (§14.5, §15.4, v0.307)");
+                                    return;
                                 }
                             }
                         }
@@ -18092,6 +18207,67 @@ bool ExprTC::collectionLiteralBindsTypeParam(
         if (!sameTypeRef(elTy, commonTy)) return false;
     }
     return commonTy != nullptr;
+}
+
+// Helper: infer the literal-or-resolved TypeRef of an arbitrary expression.
+// Used by `collectionLiteralIsHeterogeneous` to peek at inner literal
+// element types when the binder has not yet set exprType on them.
+static const TypeRef* inferExprLiteralTy(const ast::Expr* e, const SemaContext& ctx) {
+    if (!e) return nullptr;
+    if (auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        if (!lit->keys.empty()) return nullptr;
+        if (lit->elements.empty()) return nullptr;
+        const TypeRef* innerCommon = nullptr;
+        for (const auto& el2 : lit->elements) {
+            const TypeRef* el2Ty = inferExprLiteralTy(el2.get(), ctx);
+            if (!el2Ty) return nullptr;
+            if (!innerCommon) {
+                innerCommon = el2Ty;
+                continue;
+            }
+            if (!sameTypeRef(el2Ty, innerCommon)) return nullptr;
+        }
+        return innerCommon;
+    }
+    return ctx.exprType(*e);
+}
+
+bool ExprTC::collectionLiteralIsHeterogeneous(
+    const ast::CollectionLiteralExpr& cl) {
+    // Dict form is a different beast — K and V are independent slots, not
+    // "elements do not share a single TypeRef". Out of scope here; the
+    // binder handles dict-form literals separately.
+    if (!cl.keys.empty()) return false;
+    // Empty literal: no element to coerce. NOT heterogeneous — predicate's
+    // narrowing must accept `Pick([], 7)` (T bound by `7`).
+    if (cl.elements.empty()) return false;
+    // Walk elements: heterogeneous iff at least one pair differs in TypeRef.
+    // An Error-typed element (cascade from a prior failure) leaves the
+    // classifier uncertain — treat as not-heterogeneous so a cascading
+    // failure does not produce a false positive here; the underlying error
+    // is reported elsewhere.
+    //
+    // For a NESTED collection literal whose exprType isn't yet resolved
+    // (the binder runs AFTER this predicate, so an inner literal's
+    // exprType is null when we look), fall back to the AST: recursively
+    // walk the inner literal's elements and compare at the next-inner
+    // level. Without this fallback, `F([[1], ["a"]], xs)` with
+    // `xs: Array<Array<int>>` would slip past the heterogeneous-literal
+    // classifier (the inner literals have no exprType yet) and the binder
+    // would emit a generic #1386 lowerExpr-null ICE instead of the §14.5
+    // / §15.4 diagnostic.
+    const TypeRef* commonTy = nullptr;
+    for (const auto& el : cl.elements) {
+        if (!el) return false;
+        const TypeRef* elTy = inferExprLiteralTy(el.get(), ctx_);
+        if (!elTy || elTy->kind == TypeRef::Kind::Error) return false;
+        if (!commonTy) {
+            commonTy = elTy;
+            continue;
+        }
+        if (!sameTypeRef(elTy, commonTy)) return true;
+    }
+    return false;
 }
 
 // per §14.1/§14.2 + §A.7 (issue #391) — see the header comment. Solve a
