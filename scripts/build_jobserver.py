@@ -304,8 +304,19 @@ def status(d: str) -> int:
     held, makes = expected_outstanding(p["fifo"], os.getpid())
     n = _read(p["tokens"])
     pid = _read(p["pid"])
+    # `clang` is measured HERE, synchronously, not read back from the
+    # daemon's periodic samples.tsv (which can be up to --interval stale and
+    # sits several lines below in the "last audits" table `jobserver_ctl.sh
+    # status` tails). Printing it on the SAME line as `held` is the point: an
+    # orchestrator heartbeat (or a human) can compare the two at a glance —
+    # `held` says how many tokens the pool THINKS are checked out, `clang`
+    # says how many compiler processes actually exist system-wide — without
+    # having to correlate a TSV column against this line by hand. A large,
+    # persistent gap between them (clang far above held + #makes) is the
+    # leak signature this field exists to make visible immediately.
+    clang = _count_procs(("clang", "clang++", "cc1plus"))
     print(f"build_jobserver: pid={pid} tokens={n} available={avail} "
-          f"held~{held} makes={makes} fifo={p['fifo']}")
+          f"held~{held} makes={makes} clang={clang} fifo={p['fifo']}")
     return 0
 
 

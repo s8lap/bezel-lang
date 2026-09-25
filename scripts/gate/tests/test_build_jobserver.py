@@ -10,6 +10,9 @@ Pin groups:
   4. Busy surplus — stray tokens are drained back to N while a make still runs.
   5. Liveness — `alive` is false without a daemon; a second daemon on the same
      dir is refused (two holders would each publish N).
+  6. `status` — reports `held` and a freshly-measured `clang` count on ONE
+     line (non-author review: an orchestrator heartbeat must be able to spot
+     a leak — held vs live clang — at a glance); fails cleanly with no daemon.
 Everything runs in a TemporaryDirectory; nothing touches the production pool.
 """
 
@@ -169,6 +172,33 @@ class BusySurplusTest(DaemonTestBase):
             self.assertIsNone(p.poll(), "the make finished before the check was meaningful")
         finally:
             self.assertEqual(p.wait(timeout=30), 0)
+
+
+class StatusCommandTest(DaemonTestBase):
+    """`status` (scripts/build_jobserver.py status, what jobserver_ctl.sh
+    status's first line is) must report `held` and a freshly-measured
+    `clang` count on the SAME line, so an orchestrator heartbeat can compare
+    the two at a glance instead of correlating held against a possibly-stale
+    samples.tsv column."""
+
+    def test_live_daemon_reports_held_and_clang_on_one_line(self):
+        r = subprocess.run([sys.executable, SCRIPT, "status", "--dir", self.dir],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"held~\d+")
+        self.assertRegex(r.stdout, r"clang=\d+")
+        # Both fields on the SAME line — not one in "held" and the other only
+        # reachable via a separate samples.tsv row.
+        line = next(l for l in r.stdout.splitlines() if l.startswith("build_jobserver:"))
+        self.assertRegex(line, r"held~\d+")
+        self.assertRegex(line, r"clang=\d+")
+
+    def test_no_daemon_reports_no_live_daemon_and_fails(self):
+        with tempfile.TemporaryDirectory() as empty:
+            r = subprocess.run([sys.executable, SCRIPT, "status", "--dir", empty],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("no live daemon", r.stdout)
 
 
 class LivenessTest(unittest.TestCase):
