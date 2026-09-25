@@ -1068,16 +1068,24 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
     // receiver must not be released, the #2717 fail-closed element gate) has
     // no well-typed program yet: the legal spelling `get => (k as T)!;`
     // degrades to a null return (#2491 residual). Restore the leak-but-no-
-    // memory-error and value rows on that spelling once #4914 lands. The
-    // diagnostic wording ("primitive literal … generic field") is
-    // misleading here (#4916); update the needle together with it.
+    // memory-error and value rows on that spelling once #4914 lands.
+    //
+    // fix #4916: the #4810 `checkAssignable` arm's diagnostic was rewritten
+    // for the GENERAL arm (return / argument / assignment) so it does not
+    // falsely claim "a primitive literal cannot initialize a generic field"
+    // (no literal here, and this site is not a field). The new wording
+    // names the source primitive type and cites §3.6 rule 2 (§5.1, §14.2
+    // remain). The visitMember FieldDecl / PropertyDecl arms keep the OLD
+    // wording — those sites are the field case the OLD wording describes.
     JitResult r = runAot(kBareGenericElementViaThisResidual);
     BEZEL_EXPECT_TRUE(!r.ran);
-    // The #4810 arm's own wording, unique in src/sema/ExprTypecheck.cpp.
+    // The #4810 / #4916 general-arm wording — `string` is the source
+    // primitive (`k: string`) and `T` is the type parameter the getter
+    // declares. Unique to the GENERAL arm: the visitMember arms prepend
+    // "initializer for …" and don't say "value of primitive type".
     const std::string needle =
-        "`T` is a type parameter, and a primitive literal cannot initialize "
-        "a generic field whose type parameter may resolve to a class, "
-        "record, or non-int primitive";
+        "a value of primitive type `string` does not implicitly convert to "
+        "the type parameter `T`";
     // The program is one source line; the diagnostic must sit on the `k` of
     // `get => k;` (1-based column), not merely somewhere in the file. runAot
     // surfaces the compiler's "<path>:<line>:<col>: " prefix in the message

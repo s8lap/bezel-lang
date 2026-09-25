@@ -49,18 +49,57 @@ namespace {
 // Distinctive substring of this fix's diagnostic — the source-side mirror of
 // #4768's wording. The arm names the conversion's missing target/permission
 // and points at the legal alternative (`default(T)` or a constrained bound).
-constexpr const char* kRuleWording =
+//
+// fix #4916: the #4810 GENERAL `checkAssignable` arm's wording was rewritten
+// to name the SOURCE PRIMITIVE TYPE and cite §3.6 rule 2 (§5.1, §14.2 remain).
+// The OLD wording ("a primitive literal cannot initialize a generic field")
+// was misleading at non-field sites and for non-literal sources — see the
+// 2717 test's `get => k;` repro. The visitMember FieldDecl / PropertyDecl
+// arms KEEP the OLD wording; those sites ARE fields, and the OLD wording
+// describes them accurately.
+//
+// Two distinct needles, one per arm:
+//   * `kFieldArmWording` — visitMember FieldDecl / PropertyDecl arms. The
+//     OLD wording, UNCHANGED by #4916. Field-reject rows pin it.
+//   * `kGeneralArmWording` — the GENERAL `checkAssignable` arm. The NEW
+//     wording from #4916. The local_var row pins it (pre-#4916 the local
+//     var passed `kFieldArmWording` because the general arm ALSO emitted
+//     the old wording; post-#4916 the general arm emits the new wording,
+//     so the local_var row matches `kGeneralArmWording`).
+constexpr const char* kFieldArmWording =
     "is a type parameter, and a primitive literal cannot initialize a "
     "generic field whose type parameter may resolve to a class, record, "
     "or non-int primitive";
+constexpr const char* kGeneralArmWording =
+    "does not implicitly convert to the type parameter";
 
-bool rejectedByRule(const std::string& program, const char* paramName) {
+// Match against the visitMember FIELD-INIT arms' diagnostic (OLD wording).
+// Field / property initializers go through this arm FIRST, so even after
+// the #4916 split these sites still emit the OLD wording — the field arm
+// IS a field, and the OLD wording describes it accurately.
+bool rejectedByFieldRule(const std::string& program) {
     auto r = runAot(program);
     if (r.ran) return false;
-    const std::string head = std::string("`") + paramName + "` ";
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != bezel::Severity::Error) continue;
-        if (d.message.find(head + kRuleWording) != std::string::npos)
+        if (d.message.find(kFieldArmWording) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// Match against the GENERAL `checkAssignable` arm's NEW wording. Local
+// variables, returns, and argument sites go through this arm; the FIELD
+// arms don't apply. This row pins the #4916 diagnostic-text split: pre-fix
+// the local_var site emits the OLD wording (which is NOT this needle), so
+// this row fails; post-fix the GENERAL arm emits the NEW wording, so this
+// row passes.
+bool rejectedByGeneralRule(const std::string& program) {
+    auto r = runAot(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find(kGeneralArmWording) != std::string::npos)
             return true;
     }
     return false;
@@ -74,7 +113,7 @@ bool rejectedByRule(const std::string& program, const char* paramName) {
 // where `U` is an unconstrained type parameter of the enclosing class.
 BEZEL_TEST(field_init_type_param_4810,
            class_field_primitive_into_type_param_rejected_spec_5_1) {
-    BEZEL_EXPECT_TRUE(rejectedByRule(R"BZ(
+    BEZEL_EXPECT_TRUE(rejectedByFieldRule(R"BZ(
 module Conf;
 public class Holder<U>
   public dv: U := 99;
@@ -82,7 +121,7 @@ public class Holder<U>
     return 0;
   end Main;
 end Holder;
-)BZ", "U"));
+)BZ"));
 }
 
 // Same shape on a generic RECORD body-field (positional record variant uses
@@ -91,7 +130,7 @@ end Holder;
 // pinned at sema-time, not codegen-time).
 BEZEL_TEST(field_init_type_param_4810,
            record_body_field_primitive_into_type_param_rejected_spec_5_1) {
-    BEZEL_EXPECT_TRUE(rejectedByRule(R"BZ(
+    BEZEL_EXPECT_TRUE(rejectedByFieldRule(R"BZ(
 module Conf;
 public record Box<T>(X: T)
   public F: T := 7;
@@ -102,14 +141,14 @@ public class Program
     return b.F;
   end Main;
 end Program;
-)BZ", "T"));
+)BZ"));
 }
 
 // Same shape on a record auto-property (the §9.2 readonly auto-property form
 // — the #3944 codegen-side row's sema equivalent).
 BEZEL_TEST(field_init_type_param_4810,
            record_auto_property_primitive_into_type_param_rejected_spec_5_1) {
-    BEZEL_EXPECT_TRUE(rejectedByRule(R"BZ(
+    BEZEL_EXPECT_TRUE(rejectedByFieldRule(R"BZ(
 module Conf;
 public record Box<T>(X: T)
   public readonly property D: T := 5;
@@ -120,15 +159,20 @@ public class Program
     return b.D;
   end Main;
 end Program;
-)BZ", "T"));
+)BZ"));
 }
 
-// Method-level type parameter: a method-local field (records have them as
-// record-positional; here a `var` local at a `U`-typed annotation with a
-// primitive initializer — same direction as the field-init case).
+// Method-level type parameter: a method-local var (no field-init deferral
+// applies — `var v: U := 99;` goes through the GENERAL `checkAssignable`
+// arm directly). This row pins the #4916 diagnostic-text split: pre-fix
+// the general arm emits the OLD wording ("is a type parameter, and a
+// primitive literal cannot initialize a generic field …"), so this needle
+// (the NEW wording's distinctive substring) does not match and the row
+// fails; post-fix the general arm emits the NEW wording and the row
+// passes.
 BEZEL_TEST(field_init_type_param_4810,
            local_var_primitive_into_method_type_param_rejected_spec_5_1) {
-    BEZEL_EXPECT_TRUE(rejectedByRule(R"BZ(
+    BEZEL_EXPECT_TRUE(rejectedByGeneralRule(R"BZ(
 module Conf;
 public class Holder
   public static method Make<U>(): U
@@ -141,7 +185,7 @@ public class Program
     return 0;
   end Main;
 end Program;
-)BZ", "U"));
+)BZ"));
 }
 
 // Constraint DOES relax the rule: `where T: value` admits primitive

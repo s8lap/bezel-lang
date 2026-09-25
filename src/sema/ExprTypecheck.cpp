@@ -4096,6 +4096,38 @@ bool ExprTC::isCurrentScopeTypeParamConstrained(std::string_view name)
     return false;
 }
 
+// fix #4916 (§3.6 rule 2, §5.1, §14.2, v0.307): the #4810 `checkAssignable`
+// arm's diagnostic must name the SOURCE TYPE — `from->primitive` — so the
+// user knows WHICH primitive the rule is rejecting (the OLD wording said
+// "a primitive literal" which is misleading when the source is a variable
+// like the #2717 program's `k: string` returned via `get => k;`, and
+// misleading when the source is itself a primitive literal in a context
+// that is not a generic field). Shared spelling, all 14 primitives, Object
+// included for symmetry. (Same table as `spellExtHeadTypeRef` at line 9128;
+// keeping a second copy here is the smaller change than threading the
+// spelling helper across the sema boundary.)
+static std::string spellPrimitiveName(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        case P::Decimal: return "decimal";
+        case P::Object:  return "Object";
+    }
+    return "?";
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -5439,12 +5471,28 @@ void ExprTC::checkAssignable(
             // pinned behaviour and the fix's narrow issuance must NOT
             // collide with it.
             !isCurrentScopeTypeParamConstrained(toTpHead)) {
+            // fix #4916 (§3.6 rule 2, §5.1, §14.2, v0.307): the GENERAL
+            // `checkAssignable` arm must NOT use the FIELD wording
+            // ("a primitive literal cannot initialize a generic field") —
+            // this arm fires at every §5.1 conversion site, including
+            // return and argument sites, and for non-literal sources
+            // (the #2717 repro is `get => k;` where `k: string` is a
+            // variable, not a literal; #4916's headline is "no literal,
+            // no field"). Name the SOURCE TYPE so the user sees which
+            // primitive is being rejected, cite §3.6 rule 2 (a generic
+            // body type-checks under the weakest assumption its
+            // constraints establish), and keep the legal spelling
+            // (`default(T)`) as the remedy. The FIELD wording stays on
+            // the visitMember FieldDecl/PropertyDecl arms at lines
+            // ~15079 and ~15474 — those are the sites the OLD wording
+            // actually describes.
             reportNotConvertible(
-                std::string("`") + std::string(toTpHead) +
-                "` is a type parameter, and a primitive literal cannot "
-                "initialize a generic field whose type parameter may resolve "
-                "to a class, record, or non-int primitive (§5.1, §14.2) — use a "
-                "`default(" + std::string(toTpHead) +
+                std::string("a value of primitive type `") +
+                spellPrimitiveName(from->primitive) +
+                "` does not implicitly convert to the type parameter `" +
+                std::string(toTpHead) +
+                "` (§3.6 rule 2, §5.1, §14.2) — for a literal "
+                "initializer use a `default(" + std::string(toTpHead) +
                 ")` expression, or constrain `" + std::string(toTpHead) +
                 "` to an interface that exposes the value you need");
             return;
