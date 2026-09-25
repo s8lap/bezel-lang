@@ -4095,6 +4095,20 @@ private:
     // state — an owned `x!` is `x` — so return-site borrow checks leave it to
     // the bare-identifier path exactly as they leave `x`.
     static bool isBangOverBareIdentifier(const ast::Expr& e);
+    // fix #4948 (§28.3 K7.2/K2.2, §17.4, §17.8, v0.307): the return-borrow
+    // root set. Walks `identifierRoot`'s chain arms plus `x as T` and `x!`,
+    // and FANS OUT at `??` (both operands can be the returned value), so
+    // `((x as W) ?? g).Self()` yields `x` and `g`. Each root carries HOW it
+    // was reached: kRootTop (only `!` / binding atoms — the pre-#4948 single
+    // root, whose verdict is unchanged), kRootCoalesceOperand (a `??` operand
+    // reached without a deriving step, i.e. the local's own value, not a
+    // borrow of it), or kRootDerived (through member / call / index / `as`).
+    static constexpr int kRootTop = 0;
+    static constexpr int kRootCoalesceOperand = 1;
+    static constexpr int kRootDerived = 2;
+    void collectReturnBorrowRoots(
+        const ast::Expr& e, int how,
+        std::vector<std::pair<const ast::IdentifierExpr*, int>>& out);
 
     // §28.3 join. Per the spec the join is asymmetric: matching states
     // carry forward (with their auxiliary data, e.g. Owned's discharge

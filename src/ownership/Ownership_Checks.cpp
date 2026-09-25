@@ -3645,13 +3645,23 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     // handleReturn's bare-identifier path, which rejects the `using var` form
     // and discharges an owned local — never a borrow escape here.
     if (isBangOverBareIdentifier(e)) return;
-    const ast::IdentifierExpr* root = identifierRootThroughCastBang(e);
-    if (!root) return;
+    // fix #4948 (§28.3 K7.2/K2.2, v0.307): `a ?? b` FANS OUT, at the top or
+    // anywhere in the chain (`((x as W) ?? g).Self()`) — the result borrows
+    // "the union of the arms' source sets", so every operand's root is a
+    // source. `collectReturnBorrowRoots` also records whether a root is a
+    // bare `??` OPERAND (reached through `??` and only `!` / a binding atom,
+    // never a deriving member/call/index/`as` step) — see the loop below.
+    std::vector<std::pair<const ast::IdentifierExpr*, int>> roots;
+    collectReturnBorrowRoots(e, kRootTop, roots);
+    if (roots.empty()) return;
     // A value-typed return is a copy, not a borrow of the local — it
     // cannot outlive its source (§28.3: a borrowed local "may not be
     // returned from a method at all unless ... value-typed returns ...";
     // a value-typed projection is a copy, so it is never a borrow escape).
     if (!returnedExprMayBorrow(e)) return;
+    std::set<std::string_view> reported;
+    for (const auto& [root, how] : roots) {
+    if (reported.count(root->name)) continue;
     for (const auto& [sym, st] : states_) {
         if (sym->name != root->name) continue;
         // §28.3 borrow-lifetime rule (#1960): a borrow whose source is a scope-
@@ -3674,6 +3684,14 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
         const bool plainOwnedLocal = st.state == OwnershipState::Owned &&
                                      everOwnedPlainLocals_.count(sym) != 0;
         if (!usingVar && !plainOwnedLocal) continue;
+        // fix #4948: a `??` operand that is the bare local (or `y!` over it)
+        // is the local's own value, not a borrow derived from it. For a
+        // `using var` that is illegal on either reading (§28.3/§28.10: never
+        // moved out of, and no borrow of it may escape). For an owned plain
+        // local, whether `p ?? y` moves `y` out is a K7 owned/borrowed join
+        // question outside this rule, so it is left exactly as before.
+        if (how == kRootCoalesceOperand && !usingVar) break;
+        reported.insert(root->name);
         report(
             Severity::Error, root->span.begin,
             std::string("borrow returned from `") +
@@ -3689,8 +3707,52 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
                  : "` is auto-dropped at scope end (§28.3 borrow-lifetime "
                    "rule; bind the source in the caller's scope and "
                    "return the borrow from there instead)"));
+        break;
+    }
+    }
+}
+
+// fix #4948 (§17.4, §17.8, §28.3 producer table and K7.2/K2.2, v0.307): see
+// the declaration. The chain arms mirror `identifierRoot`'s one for one.
+void MethodOwnership::collectReturnBorrowRoots(
+        const ast::Expr& e, int how,
+        std::vector<std::pair<const ast::IdentifierExpr*, int>>& out) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        out.emplace_back(id, how);
         return;
     }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectReturnBorrowRoots(*pb->operand, how, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->op == "as" && tt->operand)
+            collectReturnBorrowRoots(*tt->operand, kRootDerived, out);
+        return;
+    }
+    if (auto* co = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (co->op != "??") return;
+        const int opHow = how == kRootDerived ? kRootDerived
+                                              : kRootCoalesceOperand;
+        if (co->left) collectReturnBorrowRoots(*co->left, opHow, out);
+        if (co->right) collectReturnBorrowRoots(*co->right, opHow, out);
+        return;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        // A binding atom is the value of its body — not a new derivation.
+        if (bx->body) collectReturnBorrowRoots(*bx->body, how, out);
+        return;
+    }
+    const ast::Expr* next = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        next = ma->target.get();
+    else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
+        next = nm->target.get();
+    else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+        next = ce->callee.get();
+    else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        next = ix->target.get();
+    if (next) collectReturnBorrowRoots(*next, kRootDerived, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -6277,6 +6339,20 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             }
         }
     }
+    // fix #4948 (§28.3 K7.2/K2.2, v0.307): `a ?? b` borrows "the union of
+    // the arms' source sets" — either operand may be the value selected (a
+    // `(a ?? b)!` / `as` wrapper is peeled first, as above). This
+    // function reports ONE source, so it reports the first escape-relevant one
+    // the operands carry (left, then right), which is exactly what the
+    // store/return escape checks consuming it need: `var b := (x as W) ?? g;`
+    // and `_items.Add((x as W) ?? g)` re-borrow `x` whenever `x` is selected.
+    if (const auto* co =
+            dynamic_cast<const ast::BinaryExpr*>(peelTopCastBang(&rhs));
+        co && co->op == "??") {
+        if (co->left)
+            if (sema::Symbol* s = borrowSourceForExpr(*co->left)) return s;
+        return co->right ? borrowSourceForExpr(*co->right) : nullptr;
+    }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
     // a local read `r` of an owned local in a borrowing position is a
     // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
@@ -6496,6 +6572,16 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): likewise peel
     // `h as T` and `h!` — neither is a new source, so `return (h as W)!;`
     // returns the holder's carried borrow exactly as `return h;` does.
+    //
+    // fix #4948 (§28.3 K7.2/K2.2, v0.307): `h ?? g` returns either operand, so
+    // each is checked as the returned holder in its own right.
+    if (const auto* co = dynamic_cast<const ast::BinaryExpr*>(
+            peelTopCastBang(common::peelBindAtomToBody(&e)));
+        co && co->op == "??") {
+        if (co->left) checkIndirectEscapeOnReturn(*co->left);
+        if (co->right) checkIndirectEscapeOnReturn(*co->right);
+        return;
+    }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
         peelTopCastBang(common::peelBindAtomToBody(&e)));
     if (!id) return;

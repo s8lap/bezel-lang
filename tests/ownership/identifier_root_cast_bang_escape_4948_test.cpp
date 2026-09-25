@@ -277,3 +277,73 @@ BEZEL_TEST(identifier_root_cast_bang_escape_4948,
            collection_add_cast_forgive_receiver_field_accepted_4948) {
     expectAccepted(storeProgram("_items.Add((_w as Widget)!);"), "field\n");
 }
+
+// ===========================================================================
+// `??` — a FAN-OUT, not a peel. §28.3 K7.2/K2.2 (v0.307): the result borrows
+// the union of the operands' sources, so either operand may be the root of the
+// escaping value. The issue's ret3 row plus its chain, operand-order, holder
+// and store twins.
+// ===========================================================================
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           return_cast_coalesce_using_var_left_rejected_4948_28_3) {
+    expectRejected(retProgram("return (x as Widget) ?? g;"),
+                   kUsingVarReturnNeedle);
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           return_coalesce_using_var_right_operand_rejected_4948_28_3) {
+    expectRejected(retProgram("return (_w as Widget) ?? x;"),
+                   kUsingVarReturnNeedle);
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           return_coalesce_inside_chain_rejected_4948_28_3) {
+    expectRejected(retProgram("return ((x as Widget) ?? g).Self();"),
+                   kUsingVarReturnNeedle);
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           holder_bound_from_cast_coalesce_returned_rejected_4948_28_3) {
+    expectRejected(retProgram("var b := (x as Widget) ?? g; return b;"),
+                   kHolderReturnNeedle);
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           holder_returned_through_cast_coalesce_rejected_4948_28_3) {
+    expectRejected(retProgram("var b := x; return (b as Widget) ?? _w;"),
+                   kHolderReturnNeedle);
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           collection_add_cast_coalesce_rejected_4948_28_11) {
+    expectRejected(storeProgram("_items.Add((x as Widget) ?? _w);"),
+                   kStoreNeedle);
+}
+
+// ACCEPT controls for `??`: both operands outlive the return / the store.
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           return_coalesce_receiver_fields_accepted_4948) {
+    expectAccepted(retProgram("return (_w as Widget) ?? _w;"), "field\n");
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           same_scope_coalesce_holder_accepted_4948) {
+    expectAccepted(
+        std::string(kWidget) +
+            "public class Program "
+            "  public static method Main(): int "
+            "    using var x := new Widget(\"x\"); "
+            "    var b := (x as Widget) ?? x; "
+            "    Console.WriteLine(((x as Widget) ?? x).Self().Name() + b.Name()); "
+            "    return 0; "
+            "  end Main; "
+            "end Program;",
+        "xx\n");
+}
+
+BEZEL_TEST(identifier_root_cast_bang_escape_4948,
+           collection_add_coalesce_receiver_field_accepted_4948) {
+    expectAccepted(storeProgram("_items.Add((_w as Widget) ?? _w);"),
+                   "field\n");
+}
