@@ -1,42 +1,64 @@
-// Regression tests for issue #4973 — silent wrong code: direct T-typed
-// BLOCK-FORM PROPERTY GETTER on non-generic `E: B<string>` uses erased
-// accessor (§14.1 / §23 / §2.8.3 rule 4, v0.307; #3346/#3348 sibling).
+// Regression tests for issue #4973 — silent wrong code: direct T-typed property
+// get/set on non-generic `E: B<string>` uses erased accessor (§14.1 / §23 /
+// §2.8.3 rule 4, v0.307).
 //
-// THE DEFECT (silent wrong code, measured). The block-form property getter
-// for a T-typed property inherited from a generic base `B<T>` and called
-// directly on a non-generic receiver `e: E: B<string>` named the function
-// as the ERASED template `bz$prop$<name>$get` (signature `i32(ptr)`), because
+// THE DEFECT (silent wrong code, measured). The block-form property getter for
+// a T-typed property inherited from a generic base `B<T>` and called directly on
+// a non-generic receiver `e: E: B<string>` named the function as the ERASED
+// template `bz$prop$<name>$get` (signature `i32(ptr)`), because
 // `ensurePropertyBlockGetter` builds the name+signature from
 // `lowerType(pd->type.get())` and — when no `genericSubst_` is active — `T`
 // falls back to `i32()`. The receiver is a ptr to the COMPOSED layout (8 bytes
-// for string), but the call type-mismatched it. The i32 return is the first 4
-// bytes of the actual `_v: T` field — empty for a string-typed T.
+// for string), but the call type-mismatched it. The setter twin
+// (`lowerPropertySetValue` in LlvmBackend_Assign.cpp) had the parallel defect:
+// the inlined setter body lowered `_v := value` against the erased B<T> struct
+// (T=i32) while `value` was bound to a ptr slot, so the write succeeded via the
+// opaque-ptr ABI but the upper 4 bytes of `_v` were silently clobbered. The
+// indexer twin (`ensureIndexerBlockGetter` in LlvmBackend_Assign.cpp) had the
+// same erased-accessor defect as the block-form getter.
 //
-// Measured repro from rv-L31: p3c.bzl prints `5835200\n0\n` (a pointer
-// truncated to int, then the wrong §22.12 static slot). The fix must restore
-// `y\n102\n`.
+// Measured repros:
+//   - p3c (block-form getter + §22.12 static): prints `5835200\n0\n` pre-fix
+//     instead of `y\n102\n`.
+//   - p7_direct (setter + getter + indexer, on `E: B<string>`): prints
+//     `x x <empty> <empty>` pre-fix instead of `x x y y`. The two `<empty>`
+//     lines are the i32-typed getter reads returning the first 4 bytes of the
+//     actual `_v` field, with the upper 4 bytes truncated to zero by
+//     `lowerType(T) -> i32()`.
 //
-// THE FIX. The block-form getter call site at LlvmBackend_Exprs.cpp:6208
-// (CG33b arm of `lowerMemberExpr`) now mirrors the expression-bodied getter
-// path at ~5989: when the receiver is a non-generic class whose declared class
-// is not the property's declaring class, and the declaring class has
-// `genericParams`, `computeAncestorGenericSubst` walks the base chain and
-// installs the resulting substitution into `genericSubst_` /
-// `genericSubstSemaTy_` BEFORE `ensurePropertyBlockGetter` runs. Save+restore
-// keeps the subst from leaking into the enclosing expression.
+// THE FIX. The block-form getter call site at LlvmBackend_Exprs.cpp:6208 (CG33b
+// arm of `lowerMemberExpr`) now mirrors the expression-bodied getter path at
+// ~5989: when the receiver is a non-generic class whose declared class is not
+// the property's declaring class, and the declaring class has `genericParams`,
+// `computeAncestorGenericSubst` walks the base chain and installs the resulting
+// substitution into `genericSubst_` / `genericSubstSemaTy_` BEFORE
+// `ensurePropertyBlockGetter` runs. Save+restore keeps the subst from leaking
+// into the enclosing expression. The SETTER twin at LlvmBackend_Assign.cpp:6859
+// has the parallel install-subst-before-inline fix; the INDEXER twin at
+// LlvmBackend_Assign.cpp:6089 has the parallel
+// install-subst-before-`ensureIndexerBlockGetter` fix.
 //
-// SCOPE OF THIS LANE. The block-form getter + §22.12 static case the issue
-// body calls out as p3c. The SETTER twin (`lowerPropertySetValue` in
-// LlvmBackend_Assign.cpp) and the EXPRESSION-BODIED GETTER twin (already
-// fixed by #3346/#3348) are the other arms — the SETTER is fixed on the
-// sibling `4973-twins` lane. The INDEXER twin (`ensureIndexerBlockGetter`)
-// is also a separate audit. The cross-module IMPORTED property path goes
-// through a separate site (CG33b's `importedPropGetterDirectFns_[ps]` route
-// at LlvmBackend_Exprs.cpp:6246), out of scope here.
+// SCOPE OF THIS FIX. The single-module DIRECT CALL cases (p3c + p7_direct).
+// The cross-module import path goes through a separate site (CG33b's
+// `importedPropGetterDirectFns_[ps]` route at LlvmBackend_Exprs.cpp:6246), not
+// exercised here. The static-method and static-field inherited-from-generic-
+// base twins are also separate paths.
+//
+// SUITE LAYOUT. Two suites, by defect arm:
+//   - `codegen_4973_getter` — block-form getter defect (p3c) + the same-class
+//     control that pins the fix doesn't break the already-correct path (this
+//     file's first commit, which lands on the sibling `r21c-4973-getter`
+//     branch).
+//   - `direct_property_call_erased_accessor_4973` — direct setter+getter+indexer
+//     defect (p7_direct) + two control rows. The control row
+//     `control_same_class_no_subst_needed` is renamed to `_twin` here to
+//     disambiguate from the getter branch's same-named control: the body is
+//     functionally identical, but this version lives under this suite because
+//     it also runs `runAotChecked` (the getter control uses only `runAot`).
 
-#include "support/aot_support.hpp"
+#include "support/aot_support.hpp"   // runAot / runAotChecked — AOT test harness
 #include "support/codegen_support.hpp"
-#include "test_harness.hpp"
+#include "test_harness.hpp"          // BEZEL_TEST / BEZEL_EXPECT_*
 
 using bezel::test::runAot;
 
@@ -112,4 +134,131 @@ BEZEL_TEST(codegen_4973_getter, control_same_class_no_subst_needed) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "x\ny\n");
+}
+
+// ===========================================================================
+// P7: direct T-typed property setter on non-generic `E: B<string>`.
+// Pre-fix, the second `e.Ro` after `e.Val := "y"` reads the first 4 bytes
+// of `_v` (now "y" = 8 bytes) and zero-truncates the upper 4 — the
+// `lowerType(T) -> i32()` erased accessor signature's wrong read. Post-fix
+// the getter call sites install the ancestor-generic subst first, so the
+// emitted accessor is `ptr(ptr)` and reads all 8 bytes.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           p7_direct_setter_then_getter) {
+    // Verbatim from /var/tmp/bezel-scratch/r20/rv-l31/p7_direct.bzl
+    // (rv-L31's measurement of the silent-wrong-code defect).
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "  public property Ro: T => _v; "
+        "end B; "
+        "public class E: B<string> "
+        "  public constructor() base(\"x\"); end constructor; "
+        "end E; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var e := new E(); "
+        "    Console.WriteLine(e.Ro); "
+        "    Console.WriteLine(e.Val); "
+        "    e.Val := \"y\"; "
+        "    Console.WriteLine(e.Val); "
+        "    Console.WriteLine(e.Ro); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    auto checked = bezel::test::runAotChecked(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "x\nx\ny\ny\n");
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "x\nx\ny\ny\n");
+}
+
+// ===========================================================================
+// Control: same as the getter branch's `control_same_class_no_subst_needed`,
+// but under this suite and run with `runAotChecked` too. The body is
+// functionally identical (the test pins that the fix doesn't break the
+// already-correct path for the direct setter+getter on the generic base).
+// Named `_twin` to avoid the gtest suite.name collision.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           control_same_class_no_subst_needed_twin) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new B<string>(\"x\"); "
+        "    Console.WriteLine(b.Val); "
+        "    b.Val := \"y\"; "
+        "    Console.WriteLine(b.Val); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    auto checked = bezel::test::runAotChecked(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "x\ny\n");
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "x\ny\n");
+}
+
+// ===========================================================================
+// Control: when the inherited property's declared type is `int` (NOT a
+// generic type-parameter), the layout-move predicate (the #2896 gate the
+// expression-bodied path also uses as a fast-path) is false but the subst
+// gate at ~5989 ALSO evaluates false (`ps->parent->genericParams.empty()`),
+// so the install-subst block is skipped entirely. The test pins that
+// the new fix does not over-install subst for non-generic property types
+// and that the call still works through `ensurePropertyBlockGetter`.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           control_int_field_no_layout_move) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  public _v: int; "
+        "  public constructor() _v := 7; end constructor; "
+        "  public property Val: int "
+        "    get => do return _v; end; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class E: B<string> "
+        "  public constructor() base(); end constructor; "
+        "end E; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var e := new E(); "
+        "    e.Val := 100; "
+        "    Console.WriteLine(e.Val); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    auto checked = bezel::test::runAotChecked(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "100\n");
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "100\n");
 }
