@@ -4698,7 +4698,28 @@ void ExprTC::checkAssignable(
             return;
         }
         if (!variantGenericAssignable(from, to, isSubtype, freeTypeParamNames)) {
-            reportNotConvertible();
+            // fix #4676 (stdlib §6.5, v0.307): EventSource<T> and SharedEventSource<T>
+            // are classes and therefore INVARIANT in their payload type
+            // (§12.9). The variance check above is correctly rejecting the
+            // payload-mismatched assignment; the user-facing diagnostic was
+            // the generic §5.1 "not implicitly convertible" wording, which did
+            // not name the source-class invariance. tests/conformance/rules/
+            // cases/l6_5_0014.bzl's "invariant" substring was therefore
+            // absent — the case passed vacuously. Use headName() (not
+            // declaration->name) because these source classes are stdlib
+            // builtins — their declaration is null and the type name lives in
+            // importedName. headName() reads aliasResolvedHead / astNode->name
+            // / importedName in that order.
+            std::string_view fromName = from->headName();
+            if (fromName == "EventSource" || fromName == "SharedEventSource") {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the source classes `EventSource<T>` / "
+                        "`SharedEventSource<T>` are invariant in their "
+                        "payload type (§6.5)"));
+            } else {
+                reportNotConvertible();
+            }
             return;
         }
     }
