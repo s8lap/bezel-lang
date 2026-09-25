@@ -5326,7 +5326,60 @@ void Emitter::prePopulateBasePositionalFields(
     // to run `for i in [0, min(baseArgVals.size(), basePosFields.size()))` and
     // store `baseArgVals[i]` into `basePosFields[i]`, which is the same thing
     // for an all-positional call and a wrong-slot store for a named one.
+    //
+    // fix #4981 (§14.1 / §22.5 / §22.10 / §22.8 step 0, v0.307): install the
+    // base's generic-parameter substitution (`baseTs->genericParams[i]` →
+    // `lowerTypeRef(t->baseTypeRefs[bi]->genericArgs[i])`) before `classStruct`,
+    // so the returned layout is the SPECIALIZED `class.B$specN` (T→ptr for
+    // `B<string>`) instead of the GENERIC `class.B` (T→i32 placeholder).
+    // Without this, the GEP+store below writes 8 bytes at slot 2 of a struct
+    // whose slot 2 is `i32` — for `class E: B<string> { ctor(s) base(s); }` with
+    // `class B<T>(v: T)`, the 16-byte `%class.B` has slot 2 at offset 12 typed
+    // `i32`, but the actual allocation is 24-byte `%class.E$spec0` with slot 2
+    // at offset 16 typed `ptr`. The 8-byte ptr store writes into padding and
+    // the real slot stays calloc-zero; the BASE then SEGVs in
+    // `bz_string_to_utf8z` reading the zero slot, and #4965's disposer release
+    // for `isTypeParamStringStorageMember` SEGVs in `bz_string_release` when
+    // it tries to release a corrupted pointer. The subst must also be saved
+    // and restored so callers above this site (e.g. the outer `lowerNew` that
+    // lowered ctor args under the caller's subst) are unaffected.
+    auto savedBaseStSubst = genericSubst_;
+    auto savedBaseStSemaTy = genericSubstSemaTy_;
+    if (!baseTs->genericParams.empty()) {
+        // Find the base ref that pins `baseTs` to its concrete type args.
+        const sema::TypeRef* baseRef = nullptr;
+        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+            if (t->baseTypes[bi] == baseTs) {
+                baseRef = (bi < t->baseTypeRefs.size())
+                              ? t->baseTypeRefs[bi] : nullptr;
+                break;
+            }
+        }
+        if (baseRef) {
+            // fix #3143: shared walk — same one the §14.1 classStruct path uses.
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(baseTs);
+            if (!gpNames.empty() &&
+                gpNames.size() == baseRef->genericArgs.size()) {
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                    const sema::TypeRef* arg = baseRef->genericArgs[gi];
+                    if (!arg) continue;
+                    genericSubst_[gpNames[gi]] = lowerTypeRef(arg);
+                    genericSubstSemaTy_[gpNames[gi]] = arg;
+                }
+            }
+        }
+    }
     llvm::StructType* baseSt = classStruct(baseTs);
+    // The subst STAYS installed through the store loops and the recursion
+    // below: `isTypeParamStringStorageMember(fs)` resolves the bare-`T` field
+    // type through the active map (otherwise it stays blind at the
+    // `T → i32` placeholder and never fires the +1 retain); and the
+    // default-fill loop below forwards `genericSubst_` to
+    // `positionalParamDefaultValue` for the same reason. The recursion
+    // inherits it correctly too — its own `baseClassOf(baseTs)` is its own
+    // `t`, so a level deeper sees a fresh subst layered over this one.
+    // The restore is at the very end of the function.
     for (std::size_t i = 0; i < basePosFields.size(); ++i) {
         const int ai = argForField(i);
         if (ai < 0) continue;
@@ -5335,6 +5388,31 @@ void Emitter::prePopulateBasePositionalFields(
         if (idxIt == fieldIndex_.end()) continue;
         llvm::Value* v = baseArgVals[static_cast<std::size_t>(ai)];
         if (!v) continue;
+        // fix #4981 (§4.6 / §28.9 / §14.1, v0.307): the producer's #4965 fix
+        // retains in `storePrimaryCtorPositionalArgs`, which fires for `t`'s
+        // OWN positional fields. For a NON-GENERIC derived class over a
+        // GENERIC base (`class E: B<string> { ctor(s) base(s); }`, with
+        // `class B<T>(v: T)`), `t = E` has no positional fields, that helper
+        // returns early, and the actual write to `B.v` happens HERE — without
+        // a +1 of its own, the dispose-side release for
+        // `isTypeParamStringStorageMember` then over-releases the
+        // caller-owned string (the producer's intermediate crashed with the
+        // same heap-buffer-overflow class but in `bz_string_release`; once
+        // the layout fix above lands, the symptom becomes "refcount
+        // over-release"). The slot is `B`'s positional field `(v: T)`
+        // resolved through the active subst: when `T = string` the receiver
+        // owns the value, and the `isTypeParamStringStorageMember` predicate
+        // is the matching release side (#4965 / Setup.cpp / Disposal.cpp).
+        // Symmetric to that fix's ctor-body retain. The producer-check
+        // (`isPlusOneStringProducer` on the source expr) is conservatively
+        // omitted — the call-shape that reaches this site is a base call
+        // from a `ctor(s: string) base(s)` over a primary-ctor positional
+        // field, and a `+1` producer there is unusual; widening this gate is
+        // filed separately rather than guessed at here.
+        if (v->getType()->isPointerTy() &&
+            (isStringStorageMember(fs) ||
+             isTypeParamStringStorageMember(fs)))
+            emitStringRetain(v);
         llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
         v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
         builder_.CreateStore(v, builder_.CreateStructGEP(baseSt, obj, idxIt->second));
@@ -5451,6 +5529,10 @@ void Emitter::prePopulateBasePositionalFields(
         baseCs = ctorByArity(baseTs, baseArgVals.size(), nullptr);
     }
     prePopulateBasePositionalFields(baseTs, obj, baseArgVals, baseCs);
+    // fix #4981: restore the outer subst before returning (the recursive call
+    // installs its own).
+    genericSubst_ = std::move(savedBaseStSubst);
+    genericSubstSemaTy_ = std::move(savedBaseStSemaTy);
 }
 
 

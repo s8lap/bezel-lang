@@ -222,6 +222,52 @@ end Program;
                 "a99\n");
 }
 
+// The 5th of 5 (#4981): a primary-ctor positional field `(v: T)` reached
+// through a `base(s)` chain in an explicit derived ctor
+// (`E: B<string> { constructor(s: string) base(s); }`). Pre-fix on BASE
+// (r20-c25 / d437bab4): SEGV in bz_string_to_utf8z — the new-site GEP+store
+// for B's positional slot uses the GENERIC `class.B` struct (slot 2 typed
+// `i32` from the T→i32 placeholder layout) while the actual allocation is
+// `class.E$spec0` (slot 2 = `ptr`), so the 8-byte ptr write at offset 12 of
+// `class.B`'s 16-byte layout overwrites the padding / part of slot 2 and
+// the subsequent `e.Q` read dereferences garbage. Pre-fix on the producer's
+// intermediate (#4965 / 703fffdb): SEGV in bz_string_release at dispose —
+// the corrupted slot's i32 read then +1s an unrelated pointer. The fix is
+// in `prePopulateBasePositionalFields` itself: (1) install the base's
+// generic-parameter subst (`B.T → ptr`) from `t->baseTypeRefs[bi]` BEFORE
+// `classStruct(baseTs)`, so the returned layout is the SPECIALIZED
+// `class.B$spec0` (slot 2 = ptr, offset 16) instead of the GENERIC
+// `class.B` (slot 2 = i32, offset 12) — the 8-byte ptr write lands in an
+// 8-byte slot, the read returns the stored pointer; and (2) emit a +1
+// retain at the store when the slot is `isStringStorageMember(fs)` /
+// `isTypeParamStringStorageMember(fs)`, symmetric to the producer's #4965
+// retain in `storePrimaryCtorPositionalArgs` — that helper returns early
+// for the non-generic derived `E`, so the +1 has to come from this
+// function or dispose's #4965 release over-releases the caller's string.
+BEZEL_TEST(generic_ctor_string_field_retain_4965,
+           base_clause_positional_primary_ctor_loop_50) {
+    expectClean(R"BZL(
+module M;
+public class B<T>(v: T)
+  public property Q: T => v;
+end B;
+public class E: B<string>
+  public constructor(s: string) base(s); end constructor;
+end E;
+public class Program
+  public static method Main(): int
+    for var i in 0..<50 do
+      var h := "a" + i.ToString();
+      using var e := new E(h);
+      if i = 49 then Console.WriteLine(h); Console.WriteLine(e.Q); end;
+    end;
+    return 0;
+  end Main;
+end Program;
+)BZL",
+                "a49\na49\n");
+}
+
 // A primary-constructor positional field `(value: T)`. Pre-fix: 3590 B / 200
 // allocations leaked (the +1 producer argument was stored, never released).
 BEZEL_TEST(generic_ctor_string_field_retain_4965, primary_positional_field_loop_100) {
