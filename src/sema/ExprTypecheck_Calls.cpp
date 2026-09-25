@@ -16988,7 +16988,52 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             declSyms.push_back(cs);
             binds.push_back(std::move(b));
         }
-        if (decls.empty()) return;  // no bindable ctor — defer (no check)
+        // fix #4996 (§22.5 "Optional parameters and named arguments" / §22.6,
+        // v0.307): `new T(...)` against this overloaded LOCAL class (2+
+        // explicit constructors) where NO candidate §22.5-binds the call
+        // must report the no-candidate diagnostic HERE, not defer. §22.5:
+        // "Every parameter that declares no default must be bound … leaving
+        // one unbound … makes the candidate inapplicable ([§22.6]) … and the
+        // error is reported only where no candidate survives", at "every
+        // construction site in the language". Before this fix the bare
+        // `return;` left the call silently ACCEPTED by sema; codegen's
+        // `ctorForArgs` then found no target and the #4790 backstop reported
+        // an `internal:` error instead of this diagnostic — MEASURED on
+        // `new B(6)` against `constructor(x: int, y: int)` /
+        // `constructor(s: string, t: string, u: string)`.
+        //
+        // Structure follows #4824's sibling `checkChainCallBinding`'s tail
+        // (same file, same §22.5/§22.6 question asked of a chain call): with
+        // ONE candidate of the call's own raw arity, report that
+        // candidate's own §22.5 binding failure — the text a lone-
+        // constructor `new T(...)` of the same shape already gets
+        // (`checkArgsAgainstParams` a few lines below, `decls.size() == 1`);
+        // otherwise name the failure generically, citing §22.5/§22.6.
+        if (decls.empty()) {
+            const std::size_t n = ne.args.size();
+            const ast::ConstructorDecl* reportOn = nullptr;
+            for (ConstructorSymbol* cs : ctors) {
+                auto* cdecl = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (!cdecl || cdecl->params.size() != n) continue;
+                if (reportOn) { reportOn = nullptr; break; }
+                reportOn = cdecl;
+            }
+            if (reportOn) {
+                checkArgsAgainstParams(
+                    reportOn->params, ne.args, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) + "`",
+                    &ne, t);
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) +
+                    "`: no constructor of `" + std::string(t->name) +
+                    "` can bind these arguments — each candidate leaves a "
+                    "required parameter unbound, lacks a parameter the call "
+                    "names, or takes fewer arguments (§22.5, §22.6)");
+            return;
+        }
         if (decls.size() == 1) {
             if (emitModifierMismatch(decls[0]->params, binds[0])) return;
             // fix #4853 (§22.5 / §22.6 stage 1, v0.307): the §22.5 binder
