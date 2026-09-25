@@ -12645,6 +12645,65 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                         explicitCtorOfThisArity = true;
                 }
             }
+            // fix #4903 (§22.5 / §22.6 / §22.10 / §11.1, v0.307): the base's
+            // §22.10 PRIMARY constructor is a member of its constructor
+            // overload set (§11.1: body constructors are declared "in
+            // addition" to it and chain to it), so a NAMED clause that the
+            // primary list binds and NO explicit constructor binds resolves
+            // to the primary, whatever the explicit constructors' arities.
+            // `explicitCtorOfThisArity` alone is an ARITY test — §22.6 stage
+            // 1 names "named-argument-to-parameter binding" as part of the
+            // same filtering step — so it routed such a clause to the
+            // explicit arm, whose binder declined (the names belong to no
+            // explicit constructor), and nothing was published for either
+            // formal list. Codegen's case (a) then fell back to its
+            // textual-order pairing: MEASURED, `class D(v: int) : B(q := v,
+            // p := 9)` over `class B(p: int, q: int)` with body constructors
+            // `(a: int, b: string)` and `(a: int)` printed `p=4 q=9` where
+            // `p=9 q=4` is correct (silent wrong value); with only the
+            // `(a: int, b: string)` sibling the explicit arm's
+            // sole-candidate binder REJECTED the valid clause ("has no
+            // parameter named `q`").
+            //
+            // Deliberately narrow: only a clause carrying a name, and only
+            // when the primary is the UNIQUE candidate whose §22.5 binding
+            // succeeds. An all-positional clause, or one both formal lists
+            // bind, keeps its current disposition (that choice is §22.6's
+            // type-driven ranking, not a binding question — #4576 gap (c)).
+            if (baseTs && baseTs->hasPositionalFields &&
+                explicitCtorOfThisArity &&
+                td->primaryBaseCtorArgs[0].value) {
+                bool clauseHasName = false;
+                for (const auto& a : td->primaryBaseCtorArgs)
+                    if (!a.name.empty()) { clauseHasName = true; break; }
+                const std::vector<const Symbol*> pf =
+                    recordPositionalFieldSymbols(baseTs);
+                if (clauseHasName && !pf.empty()) {
+                    const std::string probeDesc =
+                        std::string("inheritance-clause base call to `") +
+                        std::string(baseTs->name) + "`";
+                    const auto at =
+                        td->primaryBaseCtorArgs[0].value->span.begin;
+                    bool anyExplicitBinds = false;
+                    for (Symbol* m : baseTs->members) {
+                        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!other || other->isStatic) continue;
+                        if (bindArgsToParams(sema::FormalsView::of(*other),
+                                             td->primaryBaseCtorArgs, at,
+                                             probeDesc, /*emit=*/false)
+                                .ok) {
+                            anyExplicitBinds = true;
+                            break;
+                        }
+                    }
+                    if (!anyExplicitBinds &&
+                        bindArgsToParams(sema::FormalsView::of(pf),
+                                         td->primaryBaseCtorArgs, at,
+                                         probeDesc, /*emit=*/false)
+                            .ok)
+                        explicitCtorOfThisArity = false;  // per §22.6/§22.10
+                }
+            }
             if (baseTs && baseTs->hasPositionalFields) {
                 const std::vector<const Symbol*> fields =
                     recordPositionalFieldSymbols(baseTs);
