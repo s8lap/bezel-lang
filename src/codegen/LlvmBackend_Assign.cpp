@@ -2361,9 +2361,53 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             callArgs.push_back(argVal);
             idxArgVals.push_back(argVal);
         }
+        // fix #4973 (§14.1 / §23.4 / §2.8.3 rule 4, v0.307): the BLOCK-FORM
+        // INDEXER GETTER twin of the property-block-getter fix on
+        // 4973-getter-draft (commit 9dcc51d7) and the setter fix on the same
+        // branch (1c6a95c5). Mirror the expression-bodied indexer pattern at
+        // LlvmBackend_Assign.cpp:4284 (`setupReceiverGenericSubst`). The
+        // block-bodied indexer call was MISSED for the same reason as the
+        // block-form property getter: the body lowers as a STANDALONE function
+        // — `ensureIndexerBlockGetter` builds the signature from
+        // `lowerType(pd->type.get())` which falls back to `i32()` when no subst
+        // is active, so an inherited indexer on a generic base reached through
+        // a non-generic derived receiver (`e[i]` where `e: E`, `E: B<T>`,
+        // `[i]: T` declared on `B<T>`) reads only the first 4 bytes of the
+        // substituted `_v: T` field (where T=string is 8 bytes). Install
+        // `computeAncestorGenericSubst` BEFORE the call; save+restore keeps
+        // the subst from leaking past this read into the enclosing expression.
+        // Same gate as the getter fix: explicit receiver (IndexExpr target is
+        // always explicit for `[i]`), Named type, declaration != ps->parent,
+        // declaring class has genericParams.
+        const sema::TypeRef* idxRecvTy4973 = ctx_.exprType(*ix.target);
+        std::unordered_map<std::string_view, llvm::Type*> savedIdxSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedIdxSema;
+        bool idxSubstInstalled = false;
+        if (idxRecvTy4973 &&
+            idxRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+            idxRecvTy4973->declaration &&
+            idxRecvTy4973->declaration != ps->parent &&
+            !ps->parent->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(idxRecvTy4973, ps->parent,
+                                            ancSubst, ancSema)) {
+                savedIdxSubst = std::move(genericSubst_);
+                savedIdxSema = std::move(genericSubstSemaTy_);
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                idxSubstInstalled = true;
+            }
+        }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         llvm::Value* res =
             builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        // fix #4973 restore: drop the ancestor subst installed above before the
+        // indexer block-getter build/call.
+        if (idxSubstInstalled) {
+            genericSubst_ = std::move(savedIdxSubst);
+            genericSubstSemaTy_ = std::move(savedIdxSema);
+        }
         // §31.1/§31.2: a throw inside the standalone getter leaves the pending
         // exception set and returns; route it to the enclosing unwind target,
         // exactly as an ordinary method call does.
@@ -4273,8 +4317,47 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
             callArgs.push_back(v);
         }
+        // fix #4973 (§14.1 / §23.4 / §2.8.3 rule 4, v0.307): the COMPOUND
+        // INDEXER GETTER twin of the property-block-getter fix on
+        // 4973-getter-draft (9dcc51d7) and the setter fix on the same branch
+        // (1c6a95c5). The expression-bodied twin at line 4284 already uses
+        // `setupReceiverGenericSubst` (the #585/#902/#3347 mechanism); this
+        // block-bodied twin was MISSED for the same reason as the setter and
+        // the read indexer: the body lowers as a STANDALONE function whose
+        // signature is built from `lowerType(pd->type.get())` (falls back to
+        // `i32()` without an active subst), so an inherited indexer on a
+        // generic base reached through a non-generic derived receiver reads
+        // only the first 4 bytes of the substituted `_v: T` field. Install
+        // `computeAncestorGenericSubst` BEFORE the build; save+restore keeps
+        // the subst from leaking past this read into the compound-op dispatch.
+        const sema::TypeRef* cidxRecvTy4973 = ctx_.exprType(*ix->target);
+        std::unordered_map<std::string_view, llvm::Type*> savedCidxSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedCidxSema;
+        bool cidxSubstInstalled = false;
+        if (cidxRecvTy4973 &&
+            cidxRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+            cidxRecvTy4973->declaration &&
+            cidxRecvTy4973->declaration != ps->parent &&
+            !ps->parent->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(cidxRecvTy4973, ps->parent,
+                                            ancSubst, ancSema)) {
+                savedCidxSubst = std::move(genericSubst_);
+                savedCidxSema = std::move(genericSubstSemaTy_);
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                cidxSubstInstalled = true;
+            }
+        }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         cur = builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        // fix #4973 restore: drop the ancestor subst installed above before
+        // the indexer block-getter build/call.
+        if (cidxSubstInstalled) {
+            genericSubst_ = std::move(savedCidxSubst);
+            genericSubstSemaTy_ = std::move(savedCidxSema);
+        }
         emitPendingCheck();
     } else {
         // Expression-body getter: inline against obj and pre-computed params.
