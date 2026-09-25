@@ -333,7 +333,7 @@ BEZEL_TEST(codegen_datetime_2_5, earlier_less_than_later) {
     BEZEL_EXPECT_EQ(run(prog(
         "var a := new DateTime(2024, 1, 1); "
         "var b := new DateTime(2024, 6, 1); "
-        "if a < b then return 1; end; "
+        "if a.CompareTo(b) < 0 then return 1; end; "
         "return 0; ")), 1);
 }
 
@@ -342,14 +342,15 @@ BEZEL_TEST(codegen_datetime_2_5, earlier_less_than_later) {
 // ---------------------------------------------------------------------------
 
 // stdlib §2.5: MinValue < Now (MinValue is the earliest representable tick).
-// We test this as a relational comparison since MinValue.Year (year 1 CE)
+// We test this as a CompareTo ordering (stdlib §2.5 declares no <,>,<=,>= on
+// DateTime, #4917) since MinValue.Year (year 1 CE)
 // requires gmtime to handle a very large negative POSIX offset, which is
 // platform-dependent. The comparison against UtcNow is always stable.
 BEZEL_TEST(codegen_datetime_2_5, minvalue_less_than_now) {
     BEZEL_EXPECT_EQ(run(prog(
         "var minv := DateTime.MinValue; "
         "var now := DateTime.UtcNow; "
-        "if minv < now then return 1; end; "
+        "if minv.CompareTo(now) < 0 then return 1; end; "
         "return 0; ")), 1);
 }
 
@@ -358,7 +359,7 @@ BEZEL_TEST(codegen_datetime_2_5, maxvalue_greater_than_minvalue) {
     BEZEL_EXPECT_EQ(run(prog(
         "var minv := DateTime.MinValue; "
         "var maxv := DateTime.MaxValue; "
-        "if maxv > minv then return 1; end; "
+        "if maxv.CompareTo(minv) > 0 then return 1; end; "
         "return 0; ")), 1);
 }
 
