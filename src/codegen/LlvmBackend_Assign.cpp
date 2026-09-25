@@ -1156,8 +1156,34 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 if (expected && val->getType() != expected) {
                     if (val->getType()->isPointerTy())
                         val = nullableValueNull(elemTyRef);  // null → tagged null
-                    else
+                    else {
+                        // fix #5005 (§5.1 `S → T → T?`, v0.307): a NARROWER
+                        // numeric `val` (e.g. an `int` at an `Array<long?>`
+                        // element, `a[i] := k;`) reached `wrapNullableValue`
+                        // at its source width — `wrapNullableValue`'s
+                        // `reinterpretToType` round-trips through an alloca
+                        // sized to the DESTINATION (payload) type, so an
+                        // undersized `i32` store there left the high bytes
+                        // uninitialized and the subsequent `insertvalue`
+                        // rejected the width mismatch outright: MEASURED
+                        // "Invalid InsertValueInst operands!" / IR
+                        // verification failure on `Array<long?>[i] := k;`
+                        // with `k: int`. Widen against the payload width
+                        // FIRST — the same `coerceNumericToType` widen the
+                        // declaration-initializer path (fix #839) and the
+                        // local/field reassignment path (fix #5005, above in
+                        // LlvmBackend_Stmts.cpp) both perform — so
+                        // `wrapNullableValue` always receives a value already
+                        // at the payload's width.
+                        llvm::Type* payloadTy = expected->getElementType(1);
+                        if ((val->getType()->isIntegerTy() ||
+                             val->getType()->isFloatingPointTy()) &&
+                            val->getType() != payloadTy)
+                            val = coerceNumericToType(
+                                val, payloadTy,
+                                valueExpr && isUnsignedTargetExpr(*valueExpr));
                         val = wrapNullableValue(elemTyRef, val);  // scalar → {1, val}
+                    }
                 }
             }
         }
@@ -1354,6 +1380,22 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 llvm::isa<llvm::ConstantPointerNull>(v)) {
                 v = nullableValueNull(valTy);    // null literal → {i8=0, T=0}
             } else if (!v->getType()->isPointerTy()) {
+                // fix #5005 (§5.1 `S → T → T?`, v0.307): the Dictionary-value
+                // twin of the Array<T> element fix just above — widen a
+                // narrower numeric `v` (e.g. an `int` value stored into a
+                // `Dictionary<K, long?>`, `d[k] := n;`) to the nullable's
+                // payload width BEFORE `wrapNullableValue`, which otherwise
+                // hands an undersized value to its `reinterpretToType`
+                // alloca round-trip.
+                llvm::StructType* nst = nullableValueStructTy(valTy);
+                llvm::Type* payloadTy = nst ? nst->getElementType(1) : nullptr;
+                if (payloadTy &&
+                    (v->getType()->isIntegerTy() ||
+                     v->getType()->isFloatingPointTy()) &&
+                    v->getType() != payloadTy)
+                    v = coerceNumericToType(
+                        v, payloadTy,
+                        valueExpr && isUnsignedTargetExpr(*valueExpr));
                 v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
             }
         }

@@ -754,8 +754,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // value struct `{i8, T}`; wrap the bare inner value so the
                     // hasValue byte is set (this fast path bypasses the general
                     // CG-nullable wrapping below).
+                    // fix #5005 (§5.1 `S → T → T?`, v0.307): thread the RHS
+                    // expression's signedness so a narrower UNSIGNED source
+                    // (e.g. a `byte`/`uint` element assign into a `long?`
+                    // slot) widens via ZExt, not the default SExt — mirrors
+                    // issue #421/#410 at every other widen-then-wrap site.
                     builder_.CreateStore(
-                        coerceToNullableSlot(elemTy2, rhsOnce), addr2);
+                        coerceToNullableSlot(
+                            elemTy2, rhsOnce,
+                            isUnsignedTargetExpr(*as->value)),
+                        addr2);
                     return false;
                 }
             } else if (as->op != "??=") {
@@ -1333,9 +1341,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 // §5.1: numeric widening to the target slot (mirror the `:=`
                 // path's coerceNumericToType, issue #408 / #421 / #410).
+                // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?`
+                // via `S → T → T?` — v0.307): `??=`'s target is nullable by
+                // construction (a non-nullable target returns false at the
+                // `!isNull` check above), so `elemTy` here is always the
+                // CG-nullable tagged struct `{i8 hasValue, T}` for a nullable-
+                // VALUE target. Widening against the whole struct type is a
+                // no-op (neither an integer nor a float type), leaving `rhs`
+                // at its narrower width; the wrap block below then requires an
+                // EXACT payload-width match and silently falls through
+                // unwrapped, storing a bare narrow int over the struct's
+                // leading byte — MEASURED as `x ??= k;` (`k: int`, `x: long?`)
+                // printing `0` instead of the widened `4`. `slotPayloadTy` is
+                // the same unwrap the `:=` arm (a few hundred lines up) and
+                // the declaration-initializer path (fix #839) already use.
+                // A no-op for every non-nullable-value / already-payload-width
+                // / non-numeric `elemTy`.
                 if (elemTy)
                     rhs = coerceNumericToType(
-                        rhs, elemTy, isUnsignedTargetExpr(*as->value));
+                        rhs, slotPayloadTy(elemTy),
+                        isUnsignedTargetExpr(*as->value));
                 // CG-nullable: wrap a plain primitive RHS into the target's
                 // {hasValue, value} struct (or normalize a null literal).
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
@@ -1475,8 +1500,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // issue #421 / #410: thread the RHS signedness so an unsigned source
             // (`d := someUint` with `d: double`) widens via UIToFP/ZExt, not the
             // signed default — otherwise a large uint would store as negative.
+            // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?` via
+            // `S → T → T?` — v0.307): when the slot is a nullable-VALUE struct
+            // `{i8 hasValue, T}` (e.g. `long?`), the width to widen against is
+            // the PAYLOAD `T`, not the tagged struct itself — `slotPayloadTy`
+            // is the one place that unwrap already lives (used by
+            // `coerceInitializerToSlot` / `coerceExprValueToSlot` for the
+            // declaration-initializer and return/argument paths). Before this,
+            // `coerceNumericToType(rhs, elemTy, …)` was called with the WHOLE
+            // struct type as the target — neither an integer nor a float type,
+            // so every one of its §5.1 arms declined and `rhs` reached the
+            // CG-nullable wrap block below still at its narrower width (e.g. a
+            // bare `i32` against a `long?` slot's `i64` payload). The wrap
+            // block's `rhs->getType() == st->getElementType(1)` check then
+            // failed too, so the store fell through UNWRAPPED: a bare `i32`
+            // stored at the struct's address overwrites only the leading
+            // `hasValue` byte (plus padding), leaving the `i64` payload bytes
+            // at their prior value (0 for a freshly-`null`-initialized local)
+            // — MEASURED as `x := k;` (`k: int`, `x: long?`) printing `0`
+            // instead of the widened `4`. The declaration-initializer form
+            // (`var w: long? := k;`) was already correct — fix #839 widens
+            // against the payload there — this mirrors that fix for
+            // REASSIGNMENT. A no-op for every non-nullable / already-payload-
+            // width / non-numeric `elemTy`, since `slotPayloadTy` returns
+            // `elemTy` unchanged unless it IS the tagged struct shape.
             if (elemTy)
-                rhs = coerceNumericToType(rhs, elemTy,
+                rhs = coerceNumericToType(rhs, slotPayloadTy(elemTy),
                                           isUnsignedTargetExpr(*as->value));
             // CG-nullable: if target slot is a nullable-prim struct and
             // rhs is a plain primitive, wrap it (or fix null literal).

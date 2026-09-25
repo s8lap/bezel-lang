@@ -5660,7 +5660,26 @@ private:
     // inline-array literal initializer — store a properly-tagged value rather
     // than the raw inner bytes (which clobber the hasValue byte). Returns `v`
     // unchanged when the slot is not a nullable-value struct or `v` is already it.
-    llvm::Value* coerceToNullableSlot(llvm::Type* elemTy, llvm::Value* v) {
+    //
+    // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?` via
+    // `S → T → T?` — v0.307): a NARROWER numeric `v` (e.g. an `int` at an
+    // inline `[N]long?` element, `a[i] := k;`) used to fail BOTH the
+    // already-struct guard above and the exact-payload-match check below, so
+    // it fell through unwrapped — `v->getType() != elemTy`'s bare `i32` stored
+    // at the struct's address overwrote only the leading `hasValue` byte (plus
+    // padding), leaving the `i64` payload bytes at their prior value. MEASURED:
+    // `a[0] := k;` (`k: int`, `a: [N]long?`) read back `0` instead of the
+    // widened value. Widen `v` against the payload width FIRST — the same
+    // `coerceNumericToType` widen `coerceInitializerToSlot` performs for the
+    // declaration-initializer / return / argument sites that already route
+    // through this helper (e.g. `lowerVirtualPropertySet`, fix #2927) — so the
+    // exact-match check below then succeeds. A no-op for a non-numeric `v`
+    // (record / choice payloads pass through unchanged, as before) and for a
+    // `v` that already matches the payload width. `srcUnsigned` defaults to
+    // `false` (signed widen) for the many call sites with no natural source
+    // expression to derive it from; a caller that has one should pass it.
+    llvm::Value* coerceToNullableSlot(llvm::Type* elemTy, llvm::Value* v,
+                                      bool srcUnsigned = false) {
         auto* st = elemTy ? llvm::dyn_cast<llvm::StructType>(elemTy) : nullptr;
         if (!st || st->getNumElements() != 2 ||
             st->getElementType(0) != nullablePrimHasValTy() || !v ||
@@ -5669,11 +5688,17 @@ private:
         if (v->getType()->isPointerTy() &&
             llvm::isa<llvm::ConstantPointerNull>(v))
             return llvm::ConstantAggregateZero::get(elemTy);
-        if (v->getType() == st->getElementType(1)) {
+        llvm::Value* inner = v;
+        if ((inner->getType()->isIntegerTy() ||
+             inner->getType()->isFloatingPointTy()) &&
+            inner->getType() != st->getElementType(1))
+            inner = coerceNumericToType(inner, st->getElementType(1),
+                                        srcUnsigned);
+        if (inner->getType() == st->getElementType(1)) {
             llvm::Value* res = builder_.CreateInsertValue(
                 llvm::UndefValue::get(elemTy),
                 llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
-            return builder_.CreateInsertValue(res, v, {1u});
+            return builder_.CreateInsertValue(res, inner, {1u});
         }
         return v;
     }
