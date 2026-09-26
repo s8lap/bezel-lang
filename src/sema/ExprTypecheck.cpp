@@ -5075,6 +5075,45 @@ void ExprTC::checkAssignable(
             // above skips it, deferring to whichever generic-argument-inference
             // check (out of this fix's scope — STAY-OUT list: typeCall) already
             // validates the call once T is resolved.
+            //
+            // fix-forward (non-author review of #4897, §27.1.1 v0.307 / §14.5):
+            // the ORIGINAL fix here gated the skip on `refMentionsTypeVariable`,
+            // which answers "does this slot mention a name in
+            // `currentScopeGenericParamNames()`" — the CALLER's OWN enclosing
+            // type/method generic parameters, never the CALLEE's. That is the
+            // wrong scope for this question: whether `to->funcParams[i].type`
+            // is still the callee's unsubstituted type parameter depends on
+            // the callee's declaration, not on what the caller happens to be
+            // generic over. MEASURED (probes in
+            // /var/tmp/bezel-scratch/r21-rv4897/p6*.bzl): calling
+            // `Utils.Apply<T>(f: (T) -> T, x: T)` as
+            // `Utils.Apply(lambda(n: int) => n + 1, 41)` from a NON-generic
+            // `Main()` false-rejected (empty caller scope, so "T" was never
+            // recognised as a type variable); from `Go<Q>(v: Q)` it ALSO
+            // false-rejected (caller scope = {"Q"}, and "T" ∉ {"Q"}); from
+            // `Go<T>(v: T)` it was accepted only because the caller's own
+            // type parameter happens to share the callee's spelling — the
+            // exact defect class `callee_type_param_name_collision_4915`
+            // names elsewhere in this same function (see the
+            // `toIsCalleeFreeParam` arm ~700 lines below, which this mirrors).
+            // The correct ground truth is `freeTypeParamNames` — the CALLEE's
+            // own still-unsubstituted generic parameters for THIS call,
+            // threaded in by the call-argument check site
+            // (ExprTypecheck_Calls.cpp's `calleeFreeParamNames` /
+            // `calleeMethodGenericParamNames`) — walked structurally with the
+            // same `refOutParamTypeMentionsTypeParam` superset walk
+            // `refMentionsTypeVariable` itself delegates to, but against the
+            // CALLEE's names instead of the caller's. A checkAssignable site
+            // that is not itself a call-argument check (a local declaration's
+            // target type, a return-type check, …) passes no
+            // `freeTypeParamNames` at all; there the enclosing body's OWN
+            // scope is genuinely what "still generic" means, and a target
+            // slot naming that scope's own type parameter is not an inference
+            // gap to defer — §3.6 rule 2 / #4810's sibling arms in this same
+            // function already establish that a generic body converting a
+            // concrete-typed value to its own unresolved `T` is a REJECT, not
+            // a skip — so no fallback to `refMentionsTypeVariable` is used
+            // here; `freeTypeParamNames` is the only authority for this skip.
             if (lamFrom) {
                 for (std::size_t i = 0;
                      i < lamFrom->params.size() &&
@@ -5083,7 +5122,9 @@ void ExprTC::checkAssignable(
                      ++i) {
                     const auto& lp = lamFrom->params[i];
                     if (!lp.type || lp.destructure) continue;
-                    if (refMentionsTypeVariable(to->funcParams[i].type))
+                    if (freeTypeParamNames && !freeTypeParamNames->empty() &&
+                        refOutParamTypeMentionsTypeParam(
+                            to->funcParams[i].type, *freeTypeParamNames))
                         continue;
                     if (!functionSlotConvertible(to->funcParams[i].type,
                                                  from->funcParams[i].type,

@@ -318,3 +318,139 @@ BEZEL_TEST(fn_type_param_slot_check_4897,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("42\n"));
 }
+
+// ---------------------------------------------------------------------------
+// fix-forward (non-author review of #4897, §27.1.1 v0.307 / §14.5): the
+// per-parameter loop above skipped a target slot using
+// `refMentionsTypeVariable`, which keys on the CALLER's own enclosing
+// type/method generic-parameter names (`currentScopeGenericParamNames()`),
+// not the CALLEE's still-unsubstituted method type parameter. A non-generic
+// caller — or a generic caller whose own parameter name merely differs from
+// the callee's — has an empty/mismatched caller-scope set, so the callee's
+// free `T` was never recognised as "still a type variable" and a genuinely
+// well-typed annotated-lambda call argument was wrongly rejected; it was
+// accepted only when the caller's own generic parameter happened to share
+// the callee's spelling by coincidence. Fixed by keying the skip on
+// `freeTypeParamNames` (the callee's own free parameters for THIS call,
+// threaded in by the call-argument check site), the same authority the
+// `toIsCalleeFreeParam` arm elsewhere in `checkAssignable` already uses for
+// the identical class of name-collision defect (#4915).
+//
+// ACCEPT 1/4 — a NON-GENERIC caller: `Util.Apply<T>(f: (T) -> T, x: T)`
+// called from `Main()` (no enclosing generic scope at all) with an
+// EXPLICITLY ANNOTATED lambda. Pre-fix: rejected (`currentScopeGenericParamNames()`
+// is empty, so "T" was never recognised as a type variable and the
+// annotation `int` was compared against the bare unsubstituted `T`).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(fn_type_param_slot_check_4897,
+           lambda_annotated_arg_generic_callee_nongeneric_caller_accepted_spec_14_5) {
+    auto r = runAot(
+        "module M; import System; "
+        "static class Util "
+        "  public static method Apply<T>(f: (T) -> T, x: T): T "
+        "    return f(x); "
+        "  end Apply; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Util.Apply(lambda(n: int) => n + 1, 3)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("4\n"));
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPT 2/4 — a GENERIC caller whose OWN type parameter is spelled
+// DIFFERENTLY from the callee's (`Go<Q>` calling `Apply<T>`). Pre-fix:
+// rejected — the caller scope is `{"Q"}`, and "T" ∉ {"Q"}, so the skip never
+// fired; accepted before this test existed only by the accidental
+// `Go<T>`/`Apply<T>` name coincidence
+// (`callee_type_param_name_collision_4915_test.cpp`'s
+// `literal_beside_lambda_to_same_named_callee_param_accepted_spec_14_5`).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(fn_type_param_slot_check_4897,
+           lambda_annotated_arg_generic_callee_differently_named_caller_accepted_spec_14_5) {
+    auto r = runAot(
+        "module M; import System; "
+        "static class Util "
+        "  public static method Apply<T>(f: (T) -> T, x: T): T "
+        "    return f(x); "
+        "  end Apply; "
+        "end Util; "
+        "class C "
+        "  public static method Go<Q>(v: Q): int "
+        "    Console.WriteLine(Util.Apply(lambda(n: int) => n + 1, 3)); "
+        "    return 0; "
+        "  end Go; "
+        "  public static method Main(): int "
+        "    return Go<int>(0); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("4\n"));
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPT 3/4 — TWO callee type parameters (`Map<T, U>(f: (T) -> U, x: T): U`)
+// where the annotated lambda's parameter fixes `T` and its (unannotated)
+// return type fixes `U` to a DIFFERENT concrete type (`bool`) than `T`
+// (`int`) — proving the structural free-type-param walk
+// (`refOutParamTypeMentionsTypeParam`) is not accidentally keying on a
+// single name or position.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(fn_type_param_slot_check_4897,
+           lambda_annotated_arg_two_callee_type_params_accepted_spec_14_5) {
+    auto r = runAot(
+        "module M; import System; "
+        "static class Util "
+        "  public static method Map<T, U>(f: (T) -> U, x: T): U "
+        "    return f(x); "
+        "  end Map; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Util.Map(lambda(n: int) => n > 0, 3)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\n"));
+}
+
+// ---------------------------------------------------------------------------
+// REJECT — the skip must NOT swallow a genuine mismatch once the callee's
+// type parameter IS substituted: an EXPLICIT type argument
+// (`Util.Apply<long>(...)`) binds `T = long` before this call's argument
+// check runs (`explicitSubst`, ExprTypecheck_Calls.cpp), so `f`'s target
+// slot is the CONCRETE `(long) -> long`, not a free variable, and the
+// lambda's `int` annotation is a genuine §27.1.1 parameter-slot mismatch.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(fn_type_param_slot_check_4897,
+           lambda_annotated_arg_explicit_type_arg_mismatch_rejected_spec_27_1_1) {
+    auto r = runAot(
+        "module M; import System; "
+        "static class Util "
+        "  public static method Apply<T>(f: (T) -> T, x: T): T "
+        "    return f(x); "
+        "  end Apply; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Util.Apply<long>(lambda(n: int) => n, 3L)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    const auto* d = findDiag(r, kLambdaParamNeedle);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (!d) return;
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
