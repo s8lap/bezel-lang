@@ -17308,6 +17308,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             const std::size_t n = ne.args.size();
             const ast::ConstructorDecl* reportOn = nullptr;
             for (ConstructorSymbol* cs : ctors) {
+                // SEAM-DEBT: #5042 imported ctor (decl null) is skipped, leaving the generic §22.6 error; no ctor param-list accessor yet
                 auto* cdecl = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
                 if (!cdecl || cdecl->params.size() != n) continue;
                 if (reportOn) { reportOn = nullptr; break; }
@@ -18161,6 +18162,7 @@ bool ExprTC::plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
     const bool addRemove = ma->member == "Add" || ma->member == "Remove";
     if (!subscribe && !addRemove) return false;
     if (auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target))) {
+        // SEAM-DEBT: #5042 imported event (decl null) takes the wire-payload branch below; no both-sources event payload/async accessor yet
         if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
             if (ed->type) {
                 payload = ctx_.resolvedType(*ed->type);

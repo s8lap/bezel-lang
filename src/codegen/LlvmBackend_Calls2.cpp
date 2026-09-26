@@ -13967,6 +13967,7 @@ void Emitter::collectClosureArgBodyIdentifiers(
 static bool importedGenericLacksConstraintBody5009(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms || !ctx.isImported(ms) || ms->genericParams.empty()) return false;
+    // SEAM-DEBT: #5042 imported-only probe (isImported guard above): asks whether the exporter shipped a body AST; no sema body-crossed flag yet
     if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) return false;
     auto isUserType = [&](const sema::TypeSymbol* d) {
         if (!d || d->isSynthesizedBuiltinInterface) return false;

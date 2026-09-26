@@ -4153,6 +4153,7 @@ TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
     if (!ms) return nullptr;
     auto* ft = ctx_.makeTypeRef();
     ft->kind = TypeRef::Kind::Function;
+    // SEAM-DEBT: #4988 no both-sources declared-return-type accessor exists yet; AST arm then importedReturnType below
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     for (auto* psym : ms->params) {
         auto* par = dynamic_cast<ParameterSymbol*>(psym);
