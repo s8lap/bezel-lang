@@ -2893,6 +2893,49 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
     return v;  // shapes incompatible — leave to emitReturn's own coercion.
 }
 
+// fix #5037 (§5.1 / §9.1, v0.307): wrap a bare payload value into a NULLABLE
+// VALUE positional-argument slot (`X: T?`, bound from a `new` call's
+// positional or named argument — class or record, and reached directly or
+// through a primary-ctor `this(...)` chain, #4722a). This is the ONE
+// definition of that wrap, shared by `buildRecordValue`'s positional path and
+// `storePrimaryCtorPositionalArgs`'s (#4722a) copy, which used to each
+// hand-roll it as a bare `CreateSExtOrTrunc(v, valTy)` gated on
+// "both operands are integers". That hand-rolled version was wrong two ways:
+//   * `CreateSExtOrTrunc` always SIGN-extends when widening, so an UNSIGNED
+//     narrower source (`ulong? x` from a `uint 4000000000` argument) read
+//     back sign-extended (`18446744073414584320`) instead of zero-extended
+//     (§5.1: uint→ulong is a zero-extending widening).
+//   * it had no int→float arm at all, so `double? x` from an `int 5` argument
+//     left `v` as a bare i32 and the eventual `coerceNumericToType` call (a
+//     no-op between two already-mismatched types) let a `store i32` land on
+//     the `{i8 hasValue; double}` slot, corrupting both halves — read back as
+//     `0`.
+// Routing through `coerceInitializerToSlot` (§5.1 widen/narrow, int→float via
+// `coerceNumericToType`) then `coerceReturnToNullableValue` (the wrap into the
+// tagged struct) is the same two-step sequence the field-initializer path
+// (LlvmBackend_Setup.cpp, instance field/property initializers) already uses
+// for the identical shape — one conversion body instead of a third copy.
+//
+// A no-op when `fty` is not a nullable value type, or `v` already has the
+// tagged struct's LLVM type (a `T?`-typed argument passed straight through).
+// `srcExpr` may be null — an omitted positional parameter filled from its
+// `:= Expr` default has no call-site expression — and signedness then
+// defaults to signed, matching `storePrimaryCtorPositionalArgs`'s existing
+// `argExpr ? isUnsignedTargetExpr(*argExpr) : false` posture at its later
+// `coerceNumericToType` call.
+llvm::Value* Emitter::wrapNullablePositionalPayload(llvm::Value* v,
+                                                    const sema::TypeRef* fty,
+                                                    const ast::Expr* srcExpr) {
+    if (!v || !isNullableValueTy(fty)) return v;
+    llvm::StructType* expectedSt = nullableValueStructTy(fty);
+    if (v->getType() == expectedSt) return v;
+    if (v->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(v))
+        return nullableValueNull(fty);
+    bool srcUnsigned = srcExpr && isUnsignedTargetExpr(*srcExpr);
+    v = coerceInitializerToSlot(v, expectedSt, srcUnsigned);
+    return coerceReturnToNullableValue(v, fty, srcUnsigned);
+}
+
 
 // narrow #4858 (§12.7 / §8.1 / §3.1, v0.307; stdlib §9.6): the ONE table of
 // what a `string` IS. `string` is a sealed reference type (stdlib §9.6 declares

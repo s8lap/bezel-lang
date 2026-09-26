@@ -4823,25 +4823,14 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   // field read back as `0` (measured for a record chain to
                   // its primary, and for the class twin `new C(5, 3)` over
                   // `class C(x: int?, y: long)`).
-                  {
-                      const sema::TypeRef* fty = recordMemberTypeResolved(fs);
-                      if (isNullableValueTy(fty)) {
-                          auto* expectedSt = nullableValueStructTy(fty);
-                          llvm::Type* valTy = expectedSt->getElementType(1);
-                          if (v->getType() != expectedSt) {
-                              if (v->getType()->isPointerTy() &&
-                                  llvm::isa<llvm::ConstantPointerNull>(v))
-                                  v = nullableValueNull(fty);
-                              else if (v->getType() == valTy)
-                                  v = wrapNullableValue(fty, v);
-                              else if (v->getType()->isIntegerTy() &&
-                                       valTy->isIntegerTy())
-                                  v = wrapNullableValue(
-                                      fty,
-                                      builder_.CreateSExtOrTrunc(v, valTy));
-                          }
-                      }
-                  }
+                  //
+                  // fix #5037 (§5.1 / §9.1, v0.307): the payload width/kind
+                  // conversion is `wrapNullablePositionalPayload`'s job now —
+                  // see its declaration comment for why the previous bare
+                  // `CreateSExtOrTrunc` here sign-extended an unsigned
+                  // narrower source and had no int→float arm.
+                  v = wrapNullablePositionalPayload(
+                      v, recordMemberTypeResolved(fs), argExpr);
                   v = coerceNumericToType(
                       v, fieldTy,
                       argExpr ? isUnsignedTargetExpr(*argExpr) : false);
@@ -11275,28 +11264,15 @@ llvm::Value* Emitter::buildRecordValue(
                 // fires and the value is stored as the tagged `{i8 hasValue; int
                 // value}` struct; the unresolved `T?` was mis-judged, leaving the
                 // field wrong.)
-                if (isNullableValueTy(fty)) {
-                    auto* expectedSt = nullableValueStructTy(fty);
-                    llvm::Type* valTy = expectedSt->getElementType(1);
-                    if (v->getType() != expectedSt) {
-                        if (v->getType()->isPointerTy() &&
-                            llvm::isa<llvm::ConstantPointerNull>(v))
-                            v = nullableValueNull(fty);
-                        else if (v->getType() == valTy)
-                            v = wrapNullableValue(fty, v);
-                        else if (v->getType()->isIntegerTy() &&
-                                 valTy->isIntegerTy())
-                            // #743 / §9.1 / §5.1: a NARROW nullable value field
-                            // (byte?/sbyte?/short?/ushort?) has an i8/i16 value
-                            // half, but an int-typed argument (the literal `7`
-                            // lowers to i32) does not match it. Coerce the
-                            // integer to the value half's width before wrapping —
-                            // without this the raw i32 was stored into the
-                            // {i8, i8} slot, corrupting both the tag and value.
-                            v = wrapNullableValue(
-                                fty, builder_.CreateSExtOrTrunc(v, valTy));
-                    }
-                }
+                // fix #5037 (§5.1 / §9.1, v0.307): the payload width/kind
+                // conversion (widen, narrow, or int→float, per the NARROW
+                // nullable value field comment #743 used to carry here) is
+                // `wrapNullablePositionalPayload`'s job now — see its
+                // declaration comment for why the previous bare
+                // `CreateSExtOrTrunc` sign-extended an unsigned narrower
+                // source and had no int→float arm.
+                v = wrapNullablePositionalPayload(v, fty,
+                                                  fieldArg[i]->value.get());
                 auto idxIt = fieldIndex_.find(posFields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 // §5/§6/§9.1: widen/narrow a numeric positional argument to the

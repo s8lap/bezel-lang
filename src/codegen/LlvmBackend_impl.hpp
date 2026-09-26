@@ -18906,6 +18906,22 @@ private:
     // failure) — the safe direction.
     llvm::Value* coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
                                        const ast::Expr* e, bool srcUnsigned);
+
+    // fix #5037 (§5.1 / §9.1, v0.307): wrap a bare payload value into a
+    // NULLABLE VALUE positional-argument slot (`X: T?` bound from a `new`
+    // call's positional/named argument, class or record, direct or through a
+    // primary-ctor `this(...)` chain, #4722a). Routes the payload through
+    // `coerceInitializerToSlot` + `coerceReturnToNullableValue` — the same
+    // §5.1 widen/narrow/int→float rules the field-initializer path uses —
+    // rather than a hand-rolled `CreateSExtOrTrunc`, which sign-extends an
+    // unsigned narrower source and has no int→float arm. A no-op when `fty`
+    // is not a nullable value type or `v` already has the tagged struct's
+    // LLVM type. `srcExpr` may be null (an omitted positional parameter
+    // filled from its default); signedness then defaults to signed. Defined
+    // in LlvmBackend_Layout.cpp beside its two building blocks.
+    llvm::Value* wrapNullablePositionalPayload(llvm::Value* v,
+                                               const sema::TypeRef* fty,
+                                               const ast::Expr* srcExpr);
     // §6.4: decimal arithmetic for compound-assign / increment (sweep #6).
     llvm::Value* emitDecimalArith(const std::string& op, llvm::Value* lhs,
                                   llvm::Value* rhs);
