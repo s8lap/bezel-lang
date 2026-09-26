@@ -5597,8 +5597,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                           argSubst))
                                 consistent = false;
                         }
-                        if (consistent && !argSubst.empty())
+                        // fix #5008 (§14.2 / §30.1 / §14.5 phase 1 /
+                        // §2.8.3 rule 2, v0.307): the argument-INFERRED
+                        // sibling of #4624's explicit-list wiring. §14.5
+                        // closing paragraph: "§14.2 constraint
+                        // satisfaction is checked after inference
+                        // completes, on the full substitution, exactly as
+                        // for a written type-argument list" — so the
+                        // argument-inferred substitution must run both
+                        // checks the local arm (~L5211) and the imported
+                        // explicit-list arm (~L5685) already run. Both
+                        // closures were widened by #4624 to read through
+                        // the both-sources accessors, so they need no
+                        // `md` here.
+                        if (consistent && !argSubst.empty()) {
                             callTy = substituteReturnType(rt, argSubst);
+                            checkMethodGenericConstraints(argSubst);
+                            checkAsyncInstantiationBorrowBearing(argSubst);
+                        }
                     } else {
                         // fix #4622 (§14.5 "An explicit type-argument list
                         // ... binds the declared type parameters in
