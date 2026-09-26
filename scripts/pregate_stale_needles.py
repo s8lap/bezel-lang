@@ -20,6 +20,12 @@ unless --strict is given and there are hits.
 
 Usage: scripts/pregate_stale_needles.py [--base origin/main] [--head HEAD]
                                         [--min-len 20] [--strict]
+                                        [--repo PATH] [--from-ref]
+
+By default src/ and tests/ are read from the working tree of this script's own
+checkout. --from-ref reads them from the --head commit instead, so a caller in
+one worktree can scan another branch without checking it out
+(scripts/handback_check.sh does this); --repo names the repository to use.
 """
 import argparse
 import os
@@ -63,6 +69,28 @@ def _git(*args):
                           capture_output=True, text=True).stdout
 
 
+def _read_tree_at(ref, rel):
+    """Like _read_tree, but from a commit: {path: text} for every blob under rel."""
+    names = _git('ls-tree', '-r', '--name-only', ref, '--', rel).split('\n')
+    names = [n for n in names if n]
+    if not names:
+        return {}
+    req = ''.join(f'{ref}:{n}\n' for n in names).encode()
+    out = subprocess.run(['git', '-C', REPO, 'cat-file', '--batch'], input=req,
+                         check=True, capture_output=True).stdout
+    texts, pos = {}, 0
+    for n in names:
+        nl = out.index(b'\n', pos)
+        header = out[pos:nl].split()
+        pos = nl + 1
+        if len(header) < 3 or header[1] == b'missing':
+            continue
+        size = int(header[2])
+        texts[n] = out[pos:pos + size].decode('utf-8', errors='replace')
+        pos += size + 1
+    return texts
+
+
 def _read_tree(rel):
     texts = {}
     for root, _dirs, files in os.walk(os.path.join(REPO, rel)):
@@ -82,13 +110,20 @@ def main():
     ap.add_argument('--head', default='HEAD')
     ap.add_argument('--min-len', type=int, default=20)
     ap.add_argument('--strict', action='store_true')
+    ap.add_argument('--repo', help='repository to scan (default: this checkout)')
+    ap.add_argument('--from-ref', action='store_true',
+                    help='read src/ and tests/ from --head, not the working tree')
     a = ap.parse_args()
+    global REPO
+    if a.repo:
+        REPO = os.path.abspath(a.repo)
+    read = (lambda rel: _read_tree_at(a.head, rel)) if a.from_ref else _read_tree
 
     diff = _git('diff', '--unified=0', f'{a.base}..{a.head}', '--', 'src/')
     removed = removed_literals(diff, a.min_len)
-    src = _read_tree('src')
+    src = read('src')
     gone = removed - still_present(removed, src.values())
-    tests = _read_tree('tests')
+    tests = read('tests')
     hits = []
     for s in sorted(gone):
         for path, text in sorted(tests.items()):
