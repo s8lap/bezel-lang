@@ -14947,7 +14947,37 @@ void ExprTC::checkChainCallBinding(const ast::ConstructorDecl& cd) {
     // the primary list alongside `ctors` so two same-arity candidates read
     // as ambiguous and fall back to the generic message below instead of
     // naming the wrong constructor's parameters.
-    const bool primaryArityMatches = !fields.empty() && fields.size() == n;
+    //
+    // fix #5038 (§22.5 / §12.8, v0.307; follow-up to #5000): `fields.size()
+    // == n` is exact for a RECORD, whose grammar's `PositionalField`
+    // (Appendix A) admits no default at all — but a CLASS primary-ctor
+    // parameter list's `Param` DOES (§22.10), so a trailing defaulted slot
+    // can leave `fields.size() > n` while the primary list is STILL a
+    // same-arity CANDIDATE for this heuristic: its missing trailing slots
+    // are all optional. MEASURED: `class C4(X: int, Y: int := 5)` with a
+    // sibling `constructor(a: bool)` and `this(Y := 9)` (arity 1) —
+    // `fields.size()` is 2, so the exact test never counted the primary
+    // list as a candidate, the sibling (the lone `ctors` entry of arity 1)
+    // was named alone, and the report against ITS formals said "has no
+    // parameter named `Y`" — `Y` a real primary field the call supplied.
+    // §22.5 requires every defaulted parameter to be trailing ("every
+    // parameter after the first defaulted parameter must itself have a
+    // default"), so the count of REQUIRED (non-default) slots is the index
+    // of the first defaulted one; a range test on that count is the same
+    // "is this arity coverable" question `fields.size() == n` asked, just
+    // widened to admit defaults. It reads `hasDefault` off `FormalsView`
+    // itself — the one predicate `bindArgsToParams` and every other primary-
+    // list caller already use — so a record's always-false answer (no
+    // `PositionalField` has one) leaves `primaryRequiredCount ==
+    // fields.size()` and this test degenerates back to the old exact match.
+    std::size_t primaryRequiredCount = fields.size();
+    if (!fields.empty()) {
+        const sema::FormalsView fieldsView = sema::FormalsView::of(fields);
+        for (std::size_t i = 0; i < fields.size(); ++i)
+            if (fieldsView.hasDefault(i)) { primaryRequiredCount = i; break; }
+    }
+    const bool primaryArityMatches = !fields.empty() &&
+        primaryRequiredCount <= n && n <= fields.size();
     const ConstructorSymbol* reportOn = nullptr;
     if (ctors.size() == 1 && fields.empty()) {
         reportOn = ctors[0];
