@@ -182,3 +182,25 @@ BEZEL_TEST(event_source_variance_diagnostic_4676, non_source_class_generic_uses_
     BEZEL_EXPECT_FALSE(hasInvarianceDiagnostic(r));
     BEZEL_EXPECT_TRUE(hasGenericNotConvertible(r));
 }
+
+// (8) Scope pin (#4793 regression, stdlib §6.5, v0.307): a source class reaching
+// a DIFFERENT head at the SAME payload — `SharedEventSource<int>` → `IEvent<int>`
+// — is rejected because SharedEventSource<T> does not implement IEvent<T>, not
+// by payload invariance. It keeps the generic §5.1 not-convertible wording and
+// must NOT carry the invariance needle (which would misstate the reason; the
+// #4676 arm first over-fired here and turned
+// shared_event_source_upcast_4793's §5.1 needle red).
+BEZEL_TEST(event_source_variance_diagnostic_4676, sharedeventsource_to_ievent_same_payload_keeps_generic_diagnostic) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "import System.Threading;\n"
+        "public class Program\n"
+        "  public method M()\n"
+        "    using var src := new SharedEventSource<int>();\n"
+        "    var e: IEvent<int> := src;\n"
+        "  end M;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInvarianceDiagnostic(r));
+    BEZEL_EXPECT_TRUE(hasGenericNotConvertible(r));
+}

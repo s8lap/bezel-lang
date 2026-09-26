@@ -4717,8 +4717,17 @@ void ExprTC::checkAssignable(
             // builtins — their declaration is null and the type name lives in
             // importedName. headName() reads aliasResolvedHead / astNode->name
             // / importedName in that order.
+            //
+            // The invariance wording names the rejection only when source and
+            // target are the SAME source class at different payloads
+            // (`EventSource<Dog>` → `EventSource<IAnimal>`). A source class
+            // reaching a different head — `SharedEventSource<int>` →
+            // `IEvent<int>`, same payload — fails because the class does not
+            // implement that interface (stdlib §6.5, #4793), not by payload
+            // invariance, and keeps the §5.1 not-convertible diagnostic.
             std::string_view fromName = from->headName();
-            if (fromName == "EventSource" || fromName == "SharedEventSource") {
+            if ((fromName == "EventSource" || fromName == "SharedEventSource") &&
+                fromName == to->headName()) {
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
                     std::string("the source classes `EventSource<T>` / "
