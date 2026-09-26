@@ -34,10 +34,20 @@
 // Export side (`ModuleMetadataBuilder.cpp`, `isConstraintUsingGenericMethod`):
 // ship `methodBodyText` for a generic method whose own type parameter carries
 // a `new()` bound or a TYPE bound declared in the same module. Import side
-// (`ModuleLoader.cpp`, `parseAndAttachMethodBody`): admit a member call the
-// METHOD's own bound provides into the body-symbol remap, exactly as #4553
-// does for a class-header bound, so `v.Area()` binds to the imported
-// interface member and codegen monomorphizes the call per instantiation.
+// (`ModuleLoader.cpp`, `parseAndAttachMethodBody`):
+//   * a member of ANY public sibling type of the exporting module (and the
+//     sibling type itself, as a qualifier) is carried into the body-symbol
+//     remap by identity. That covers the bound's `v.Area()` and also
+//     `Helper.Bonus()`, `b.V`, `b.Twice()` and `Consts.K`;
+//   * on this route the reconstruction FAILS CLOSED. If any in-body reference
+//     to the reconstructed type, one of its members, or a parameter is left
+//     unbound, the body is not attached and the call keeps the #1943 clean
+//     reject.
+//
+// The first version of this fix (539563d5) admitted only the bound's members.
+// Every other sibling member was dropped, so programs that were previously
+// rejected cleanly compiled and returned wrong values (T11-T13, found by the
+// non-author review). T11-T16 pin that class.
 //
 // Deliberately NOT covered, and pinned as unchanged (T9): a bound on a
 // BUILTIN interface (`INumber<T>`, `IComparable<T>`) — the importer's fresh
@@ -57,6 +67,18 @@
 //   T9   NO-REGRESSION: builtin-bound `GenNum<int>` keeps the template -> 4
 //   T10  NO-REGRESSION: #1943's `Count<T>(x: T): int where T: value` with a
 //        `double` is still REJECTED with its specific diagnostic.
+//   T11 ★ body calls a public sibling's static method, both inline and
+//        through a local                -> 27 each (539563d5: 0 / 7)
+//   T12 ★ body reads a sibling's field, calls its instance method, reads a
+//        sibling's static readonly      -> 11+15+47 = 73 (539563d5: 0 0 0)
+//   T13 ★ the importer's OWN conformer through T11's body -> 23 (539563d5: 3)
+//   T14 ★ `new()`-only bodies calling a sibling's / the own class's static
+//        method, with an importer-side homonym `HelperS5009` -> 27+37 = 64
+//   T15 ★ a self-QUALIFIED static call `GS5009.PubHelp()` -> 37
+//   T16 ★ FAIL CLOSED: a body naming a computed property the remap cannot
+//        bind is REJECTED with #1943's diagnostic (without the fail-closed
+//        check: exit 0 with INTERNAL #2491, measured)
+//   T17   DIFFERENTIAL CONTROL for T11-T15 in ONE module -> 228
 //
 // Every accept row asserts the constraint method's exact VALUE — "compiled"
 // is what the pre-fix T7 also did.
@@ -287,6 +309,95 @@ const char* kArgWidthReject5009 =
     "calling imported generic method `Count5009` with a type argument whose "
     "representation is not the compiled `int` (i32) placeholder";
 
+// ---------------------------------------------------------------------------
+// The second dependency, for T11-T17. Its constraint-using generic bodies
+// reach PUBLIC SIBLINGS of their own class: a static method, a field, an
+// instance method, a static readonly field, and the own class qualified by
+// name. `AccS5009.GenPS5009` reads a COMPUTED property, which the importer's
+// remap cannot bind, so it is the fail-closed row (T16).
+// ---------------------------------------------------------------------------
+const char* kSibDecls5009 =
+    "public interface IShapeS5009 "
+    "  method Area(): int; "
+    "end IShapeS5009; "
+    "public class SqS5009: IShapeS5009 "
+    "  public constructor() end constructor; "
+    "  public method Area(): int return 7; end Area; "
+    "end SqS5009; "
+    "public static class HelperS5009 "
+    "  public static method Bonus(): int return 20; end Bonus; "
+    "end HelperS5009; "
+    "public class BoxS5009 "
+    "  public V: int; "
+    "  public constructor() V := 4; end constructor; "
+    "  public method Twice(): int return V * 2; end Twice; "
+    "end BoxS5009; "
+    "public static class ConstsS5009 "
+    "  public static readonly K: int := 40; "
+    "end ConstsS5009; "
+    "public class AccS5009 "
+    "  public constructor() end constructor; "
+    "  public property P: int => 5; "
+    "  public method GenPS5009<T>(v: T): int where T: IShapeS5009 "
+    "    return v.Area() + P; "
+    "  end GenPS5009; "
+    "end AccS5009; "
+    "public static class GS5009 "
+    "  public static method PubHelp(): int return 30; end PubHelp; "
+    "  public static method Gen<T>(v: T): int where T: IShapeS5009 "
+    "    return v.Area() + HelperS5009.Bonus(); "
+    "  end Gen; "
+    "  public static method Gen2<T>(v: T): int where T: IShapeS5009 "
+    "    var x := HelperS5009.Bonus(); "
+    "    return v.Area() + x; "
+    "  end Gen2; "
+    "  public static method GBox<T>(v: T): int where T: IShapeS5009 "
+    "    using var b := new BoxS5009(); "
+    "    return v.Area() + b.V; "
+    "  end GBox; "
+    "  public static method GTwice<T>(v: T): int where T: IShapeS5009 "
+    "    using var b := new BoxS5009(); "
+    "    return v.Area() + b.Twice(); "
+    "  end GTwice; "
+    "  public static method GK<T>(v: T): int where T: IShapeS5009 "
+    "    return v.Area() + ConstsS5009.K; "
+    "  end GK; "
+    "  public static method QSelf<T>(v: T): int where T: IShapeS5009 "
+    "    return v.Area() + GS5009.PubHelp(); "
+    "  end QSelf; "
+    "  public static method Mk<T>(): int where T: IShapeS5009, new() "
+    "    using var t := new T(); "
+    "    return t.Area() + HelperS5009.Bonus(); "
+    "  end Mk; "
+    "  public static method MkSelf<T>(): int where T: IShapeS5009, new() "
+    "    using var t := new T(); "
+    "    return t.Area() + PubHelp(); "
+    "  end MkSelf; "
+    "end GS5009; ";
+
+std::string depSib5009() {
+    return std::string("module DepS5009; ") + kSibDecls5009;
+}
+
+std::string appSib5009(const std::string& tag, const std::string& decls,
+                       const std::string& mainBody) {
+    return "module AppS5009" + tag + "; import DepS5009; " + decls +
+           "class CS5009 public static method Main(): int " + mainBody +
+           " end Main; end CS5009;";
+}
+
+// Every accepted sibling-reaching body: 27 (Gen) + 27 (Gen2) + 11 (GBox) +
+// 15 (GTwice) + 47 (GK) + 37 (QSelf) + 27 (Mk) + 37 (MkSelf) = 228.
+const char* kSibAllBody5009 =
+    "using var s := new SqS5009(); "
+    "return GS5009.Gen(s) + GS5009.Gen2(s) + GS5009.GBox(s) + "
+    "GS5009.GTwice(s) + GS5009.GK(s) + GS5009.QSelf(s) + "
+    "GS5009.Mk<SqS5009>() + GS5009.MkSelf<SqS5009>();";
+
+const char* kFailClosedReject5009 =
+    "calling imported generic method `GenPS5009` with a type argument whose "
+    "representation is not the compiled `int` (i32) placeholder";
+
 }  // namespace
 
 // ===========================================================================
@@ -444,6 +555,140 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
     if (!r.depOk) return;
     BEZEL_EXPECT_FALSE(r.success);
     BEZEL_EXPECT_TRUE(r.err.find(kArgWidthReject5009) != std::string::npos);
+}
+
+// ===========================================================================
+// T11 — ★ REVIEW REGRESSION q1d. The body calls a PUBLIC sibling's static
+// method, inline and through a local. 539563d5 attached the body but dropped
+// the `HelperS5009` / `Bonus` bindings, and printed `0` and `7` for a program
+// dcb17d57 rejected cleanly. 7 + 20 = 27 for both.
+// // per §14.1 / §2.8.3 rule 2 / rule 4, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           sibling_static_call_in_body_returns_full_value) {
+    int rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T11a", "", "using var s := new SqS5009(); "
+                               "return GS5009.Gen(s);"));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 27);
+    rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T11b", "", "using var s := new SqS5009(); "
+                               "return GS5009.Gen2(s);"));
+    BEZEL_EXPECT_EQ(rc, 27);
+}
+
+// ===========================================================================
+// T12 — ★ REVIEW REGRESSION q1i. A sibling's instance field (`b.V`), instance
+// method (`b.Twice()`) and static readonly field (`ConstsS5009.K`).
+// 539563d5 printed `0 0 0`. 11 + 15 + 47 = 73. Every term is positive, so a
+// dropped one cannot hide in the sum.
+// // per §14.1 / §2.8.3 rule 2 / rule 4, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           sibling_field_method_and_static_field_in_body_return_full_value) {
+    int rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T12", "", "using var s := new SqS5009(); "
+                              "return GS5009.GBox(s) + GS5009.GTwice(s) + "
+                              "GS5009.GK(s);"));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 73);
+}
+
+// ===========================================================================
+// T13 — ★ REVIEW REGRESSION q1f. The importer's OWN conformer (`MineS5009`,
+// Area 3) through the sibling-calling body: 3 + 20 = 23. 539563d5: 3.
+// // per §14.1 / §14.2 / §2.8.3 rule 2, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           importer_own_conformer_through_sibling_calling_body) {
+    int rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T13",
+                   "internal class MineS5009: IShapeS5009 "
+                   "  public constructor() end constructor; "
+                   "  public method Area(): int return 3; end Area; "
+                   "end MineS5009; ",
+                   "using var m := new MineS5009(); return GS5009.Gen2(m);"));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 23);
+}
+
+// ===========================================================================
+// T14 — ★ `new()`-only bodies (no T-typed argument, so #1943 cannot catch a
+// wrong value) calling a sibling's static method and the own class's static
+// method. The importer declares its own `HelperS5009` (Bonus 50), which must
+// NOT capture the dependency's. 27 + 37 = 64.
+// // per §14.1 / §14.2 / §2.8.3 rule 4, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           new_bound_bodies_calling_statics_ignore_importer_homonym) {
+    int rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T14",
+                   "internal static class HelperS5009 "
+                   "  public static method Bonus(): int return 50; end Bonus; "
+                   "end HelperS5009; ",
+                   "return GS5009.Mk<SqS5009>() + GS5009.MkSelf<SqS5009>();"));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 64);
+}
+
+// ===========================================================================
+// T15 — ★ a self-QUALIFIED static call (`GS5009.PubHelp()` inside `GS5009`).
+// The qualifier names the synthetic self type, which is rebound to the
+// imported one. 7 + 30 = 37.
+// // per §14.1 / §2.8.3 rule 4, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           self_qualified_static_call_in_body_returns_full_value) {
+    int rc = buildImportAndRun5009(
+        depSib5009(),
+        appSib5009("T15", "", "using var s := new SqS5009(); "
+                              "return GS5009.QSelf(s);"));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 37);
+}
+
+// ===========================================================================
+// T16 — ★ FAIL CLOSED. `GenPS5009` reads a COMPUTED property of its own
+// class, and the importer's remap has no arm that binds it. The body must NOT
+// be attached, so the call keeps #1943's clean reject. MEASURED with the
+// fail-closed return disabled: the call compiled with an INTERNAL #2491
+// warning and returned 0 instead of 12.
+// // per §14.1 / §2.8.3 / #1943, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           unbindable_body_reference_fails_closed_to_width_reject) {
+    auto r = compileImport5009(
+        depSib5009(),
+        appSib5009("T16", "", "using var s := new SqS5009(); "
+                              "using var a := new AccS5009(); "
+                              "return a.GenPS5009(s);"));
+    if (!r.depOk) return;
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(kFailClosedReject5009) != std::string::npos);
+}
+
+// ===========================================================================
+// T17 — DIFFERENTIAL CONTROL for T11-T15: the same bodies in ONE module and
+// across the boundary must both answer 228.
+// // per §2.8.3 rule 2 / §14.1, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           sibling_reaching_bodies_match_same_module_twin) {
+    BEZEL_EXPECT_EQ(
+        buildLocalAndRun5009(std::string("module LocS5009; ") +
+                             kSibDecls5009 +
+                             "class CS5009 public static method Main(): int " +
+                             kSibAllBody5009 + " end Main; end CS5009;"),
+        228);
+    int rc = buildImportAndRun5009(depSib5009(),
+                                   appSib5009("T17", "", kSibAllBody5009));
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 228);
 }
 
 }  // namespace bezel::module

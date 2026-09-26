@@ -560,7 +560,19 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
 // MEASURED: `GenNum<T>(v: T): int where T: INumber<T> return 4;` called as
 // `GenNum<int>(5)` compiles and returns 4 today and was spuriously rejected
 // with the body shipped. That shape keeps the template path; it is the
-// fresh-context builtin-identity follow-up, not this fix.
+// fresh-context builtin-identity follow-up (#5021), not this fix.
+//
+// Shipping the body is NOT by itself a guarantee of a correct value. The
+// importer attaches it only if its exprSymbol remap binds every reference
+// inside the body to a member of the reconstructed type, to a parameter, or
+// to the reconstructed type itself. Members of the exporting module's public
+// siblings bind by identity. On this route the reconstruction fails closed
+// (`failClosed` in ModuleLoader's `parseAndAttachMethodBody`), and a sema-clean
+// typecheck alone is not enough. When the body is not attached, the call keeps
+// the template: a clean #1943 reject for a non-i32 type-parameter-typed
+// argument, but still the placeholder zero for a call with no such argument or
+// an i32-width one. That is the pre-existing #5022 residual, for example a
+// body that calls a PRIVATE helper the wire does not carry.
 bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
                                     sema::SemaContext& ctx) {
     if (md.genericParams.empty()) return false;

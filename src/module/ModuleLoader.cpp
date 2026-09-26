@@ -3928,6 +3928,14 @@ static bool parseAndAttachMethodBody(
     // never a wrong value). Bodies that touch only own members (the common case:
     // field reads, self-calls, params, control flow over them) sema-clean and
     // monomorphize correctly.
+    //
+    // fix #5009 (§14.1, v0.307): this gate is NECESSARY but NOT SUFFICIENT.
+    // On the non-generic-class path the #3645 registry above DOES put every
+    // public sibling type into the fresh context, so a body naming a sibling
+    // member typechecks cleanly. Whether that member reaches codegen then
+    // depends on the exprSymbol remap below, which drops any symbol no arm
+    // binds. For the constraint-using route, see `failClosed` below: it
+    // re-checks the remap itself instead of relying on this gate.
     if (semaDiag->hasErrors()) return false;
 
     // Locate the fresh TypeSymbol and the fresh target MethodSymbol (by signature
@@ -4060,35 +4068,118 @@ static bool parseAndAttachMethodBody(
     std::unordered_set<const sema::Symbol*> constraintSiblingSyms;
     for (sema::TypeSymbol* sib : constraintSiblings)
         if (sib) constraintSiblingSyms.insert(sib);
-    // fix #5009 (§14.1 / §14.2, v0.307): the same admission for a bound the
-    // METHOD itself declares (`Gen<T>(v: T): int where T: IShape`), which the
-    // header walk above cannot see. The method's `where` clause is part of
-    // the verbatim body text, and on the non-generic-class path every public
-    // sibling is registered into the fresh context as the IMPORTED
-    // `TypeSymbol`, so a bound that resolves to one of those IS the symbol
-    // codegen consumes and `v.Area()` binds to its member by identity.
-    // Restricted to the exporting module's imported siblings: a bound the
-    // fresh context synthesized itself (a builtin interface) is a fresh-context
-    // object mainCtx and codegen know nothing about, so it stays unbound.
-    if (const std::vector<sema::TypeSymbol*>* sibs =
-            moduleName.empty() ? nullptr
-                               : mainCtx.importedTypesOf(moduleName)) {
-        const std::unordered_set<const sema::Symbol*> importedSibs(
-            sibs->begin(), sibs->end());
-        for (sema::Symbol* g : freshMs->genericParams) {
-            auto* gp = dynamic_cast<sema::GenericParamSymbol*>(g);
-            if (!gp) continue;
-            for (const sema::GenericParamConstraint& c : gp->constraints) {
-                if (c.kind != "type" || !c.astBound) continue;
-                const sema::TypeRef* b = freshCtx.resolvedType(*c.astBound);
-                if (b && b->declaration && importedSibs.count(b->declaration))
-                    constraintSiblingSyms.insert(b->declaration);
-            }
+    // fix #5009 (§14.1 / §14.2 / §2.8.3 rule 4, v0.307): the exporting
+    // module's imported sibling types, as a set. On the non-generic-class path
+    // every one of them is registered into the fresh context AS the imported
+    // `TypeSymbol` (#3645 above), and a class-header constraint type is
+    // registered the same way (#4553), so a member whose `parent` is in this
+    // set IS the symbol mainCtx and codegen consume. It is carried over by
+    // identity below, exactly like a body-local (#2818). This covers a
+    // constraint member (`v.Area()` under a method-level `where T: IShape`)
+    // and any other member of a public sibling: `Helper.Bonus()`, `b.V`,
+    // `b.Twice()`, `Consts.K`. Before it, the remap bound only the
+    // constraint types' methods, so every other sibling member was DROPPED,
+    // and codegen lowered its expression to zero (INTERNAL #605 / #2491).
+    // MEASURED: `return v.Area() + Helper.Bonus();` answered 7 instead of 27,
+    // and an importer-side `Mine: IShape` answered 3 instead of 23. A bound
+    // the fresh context synthesized itself (a builtin interface) is a
+    // fresh-context object that mainCtx and codegen know nothing about, so it
+    // is not in this set.
+    std::unordered_set<const sema::Symbol*> importedSibs;
+    if (!moduleName.empty())
+        if (const std::vector<sema::TypeSymbol*>* sibs =
+                mainCtx.importedTypesOf(moduleName))
+            for (sema::TypeSymbol* sib : *sibs)
+                if (sib) importedSibs.insert(sib);
+    for (sema::TypeSymbol* sib : constraintSiblings)
+        if (sib) importedSibs.insert(sib);
+
+    // fix #5009: the route #5009 opened. A generic method whose own type
+    // parameter carries a `new()` bound or a bound the exporting module
+    // declares. This mirrors the exporter's `isConstraintUsingGenericMethod`,
+    // which is why the body text reached this function. On this route the
+    // reconstruction FAILS CLOSED: if any reference to a member of the
+    // reconstructed type, or to a parameter, ends up with no binding in
+    // mainCtx, the body is NOT attached. The call then keeps the exporter's
+    // compiled template and the #1943 argument-width gate, which is a clean
+    // reject for a non-i32 type argument, never a silently dropped
+    // sub-expression.
+    bool failClosed = false;
+    for (sema::Symbol* g : freshMs->genericParams) {
+        auto* gp = dynamic_cast<sema::GenericParamSymbol*>(g);
+        if (!gp) continue;
+        for (const sema::GenericParamConstraint& c : gp->constraints) {
+            if (c.kind == "new") failClosed = true;
+            if (c.kind != "type" || !c.astBound) continue;
+            const sema::TypeRef* b = freshCtx.resolvedType(*c.astBound);
+            if (b && b->declaration && importedSibs.count(b->declaration))
+                failClosed = true;
         }
     }
+    bool unboundReference = false;
+    const std::uint32_t bodyBegin = parsedMdBase->span.begin.offset;
+    const std::uint32_t bodyEnd = parsedMdBase->span.end.offset;
+    // Every binding is collected here first and written into mainCtx only once
+    // the fail-closed check below has passed. The keys are fresh-AST nodes,
+    // and that AST is freed when the body is not attached, so an entry
+    // written before a `return false` would leave a dangling key in mainCtx.
+    std::vector<std::pair<const ast::Expr*, sema::Symbol*>> pendingSymbols;
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
+        // fix #5009 (§14.1 / §2.8.3 rule 4, v0.307): a member of an imported
+        // sibling type is already the imported symbol. Carry it over by
+        // identity, ahead of the name-keyed arms below. In particular, the
+        // FieldSymbol arm's `importedFields` holds the reconstructed type's
+        // OWN fields by name, and must not capture a sibling's field.
+        // The same holds for a reference to the sibling type itself, the
+        // `Helper` of `Helper.Bonus()`. Codegen resolves that static call
+        // through the qualifier's symbol, so dropping it lowered the whole
+        // call to zero.
+        if (auto* mem = dynamic_cast<sema::MemberSymbol*>(freshSym);
+            (mem && mem->parent && importedSibs.count(mem->parent)) ||
+            (dynamic_cast<sema::TypeSymbol*>(freshSym) &&
+             importedSibs.count(freshSym))) {
+            pendingSymbols.emplace_back(expr, freshSym);
+            continue;
+        }
+        // fix #5009: on the fail-closed route, a reference INSIDE the target
+        // body must be bound by one of the arms below if it names a member of
+        // the reconstructed type (its `parent` is the synthetic `freshType`),
+        // the reconstructed type itself, or a parameter. The guard checks this
+        // when the iteration ends, including on the `continue` paths. Other
+        // members' signature stubs are outside the body's span and do not
+        // count: nothing lowers them.
+        bool mustBind = false;
+        if (failClosed && expr->span.begin.offset >= bodyBegin &&
+            expr->span.begin.offset < bodyEnd) {
+            if (auto* mem = dynamic_cast<sema::MemberSymbol*>(freshSym))
+                mustBind = mem->parent == freshType &&
+                           !dynamic_cast<sema::ConstMemberSymbol*>(freshSym);
+            else if (dynamic_cast<sema::ParameterSymbol*>(freshSym) ||
+                     freshSym == freshType)
+                mustBind = true;
+        }
+        bool bound = false;
+        auto bind = [&](const ast::Expr* e, sema::Symbol* sym) {
+            pendingSymbols.emplace_back(e, sym);
+            bound = true;
+        };
+        struct BindCheck {
+            bool active;
+            const bool& bound;
+            bool& unbound;
+            ~BindCheck() { if (active && !bound) unbound = true; }
+        } bindCheck{mustBind, bound, unboundReference};
+        // fix #5009: on the fail-closed route, a qualified self-reference
+        // (`G.PubHelp()` inside `G`) names the synthetic self type. Rebind it
+        // to the imported TypeSymbol, as `rebindSelfTypeRefsIn` below does for
+        // TypeRefs (#2954). The member it qualifies is remapped by the
+        // MethodSymbol arm.
+        if (failClosed && freshSym == freshType) {
+            bind(expr, const_cast<sema::TypeSymbol*>(&importedType));
+            continue;
+        }
         // fix #4514 (§22.12 "Static members" / §14.1 / §2.8.3 rule 3,
         // v0.306): a class-level `const` reference. `buildConstStubs` now
         // declares the type's consts in every synthetic reconstruction source,
@@ -4115,11 +4206,11 @@ static bool parseAndAttachMethodBody(
         // for exactly the reason the local-`var` arm needs them to
         // (ownImportedAst / ownImportedAuxiliary at the tail).
         if (dynamic_cast<sema::ConstMemberSymbol*>(freshSym)) {
-            mainCtx.setExprSymbol(expr, freshSym);
+            bind(expr, freshSym);
         } else if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
-                mainCtx.setExprSymbol(expr, it->second);
+                bind(expr, it->second);
         } else if (auto* freshPs = dynamic_cast<sema::PropertySymbol*>(freshSym)) {
             // fix #3994 (§9.2 / §2.5, v0.295): remap an auto-property
             // reference inside the re-parsed method body to the IMPORTED
@@ -4130,7 +4221,7 @@ static bool parseAndAttachMethodBody(
             // fieldIndex_ entry does not exist).
             auto it = importedAutoPropStorage.find(freshPs->name);
             if (it != importedAutoPropStorage.end())
-                mainCtx.setExprSymbol(expr, it->second);
+                bind(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
             // fix #2839: a LAMBDA parameter is not the enclosing method's — it
             // is declared inside the body and has no importer-side counterpart,
@@ -4140,20 +4231,20 @@ static bool parseAndAttachMethodBody(
             // the positional method-param search that can never match it and
             // then dropping the binding.
             if (freshLambdaParamSyms.count(freshSym)) {
-                mainCtx.setExprSymbol(expr, freshSym);
+                bind(expr, freshSym);
                 continue;
             }
             for (std::size_t pi = 0; pi < freshMs->params.size(); ++pi) {
                 if (freshMs->params[pi] == freshSym &&
                     pi < importedParams.size()) {
-                    mainCtx.setExprSymbol(expr, importedParams[pi]);
+                    bind(expr, importedParams[pi]);
                     break;
                 }
             }
         } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
             auto it = importedMethods.find(freshMethodSigKey(fms));
             if (it != importedMethods.end()) {
-                mainCtx.setExprSymbol(expr, it->second);
+                bind(expr, it->second);
             } else if (fms->parent &&
                        constraintSiblingSyms.count(fms->parent)) {
                 // fix #4553 (§2.8.2 / §14.2, v0.306): a call to a member the
@@ -4168,7 +4259,7 @@ static bool parseAndAttachMethodBody(
                 // the imported `TypeSymbol`, so `fms` already IS the symbol
                 // codegen consumes. Carry it over by identity, exactly as the
                 // body-local arm below does (#2818).
-                mainCtx.setExprSymbol(expr, fms);
+                bind(expr, fms);
             }
         } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
             // fix #2818 (§14.1 monomorphization / §2.5 modules, v0.240): a
@@ -4198,9 +4289,13 @@ static bool parseAndAttachMethodBody(
             // #783 soundness gate above and leaves `decl` unattached — so the
             // call fell back to the exporter's own compiled function and got
             // the right answer by accident. See #2820.
-            mainCtx.setExprSymbol(expr, freshSym);
+            bind(expr, freshSym);
         }
     }
+
+    // fix #5009 (§14.1 / §14.2, v0.307): fail closed. See `failClosed` above.
+    if (unboundReference) return false;
+    for (const auto& [e, sym] : pendingSymbols) mainCtx.setExprSymbol(e, sym);
 
     // §14.1 / #783: copy the body's resolved-type and expr-type entries from the
     // fresh context into mainCtx, so codegen's per-instantiation monomorphization
