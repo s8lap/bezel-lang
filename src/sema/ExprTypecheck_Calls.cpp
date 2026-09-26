@@ -14232,6 +14232,56 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         for (const auto& [nm, ty] : explicitSubst)
             calleeMethodGenericParamNames.erase(nm);
     }
+    // fix #5002 (§14.1 / §14.5, v0.307): mirror the local
+    // `checkArgsAgainstParams` path's class-generic-param shadowing
+    // exclusion. The local path runs `substituteMemberType(paramTy,
+    // classTarget, classParent)` BEFORE its per-argument `checkAssignable`,
+    // which substitutes the receiver class's own type params (e.g. `T` from
+    // `Holder<T>`) into the parameter type so a class-level name is never
+    // still free when `checkAssignable` sees it. The imported path
+    // (`checkImportedCallArity`) skipped this: the per-argument
+    // `checkAssignable` received `pt` with class-level names unsubstituted,
+    // and since those names are NOT in `calleeMethodGenericParamNames` (the
+    // METHOD's own params, which may be empty for a non-generic method),
+    // the local path's invariant — class-level names are not free, only
+    // method-level names are — failed to hold. Result: an imported call
+    // whose parameter type referenced the receiver class's generic param
+    // was under-checked: `checkAssignable(string, T)` reached the
+    // "Mixed / generic-parameter / null-literal cases: skip" catch-all
+    // and SILENTLY ACCEPTED the mismatch; codegen then emitted malformed
+    // LLVM ("Call parameter type does not match function signature!")
+    // and the verifier aborted. The local twin accepts/rejects per
+    // §2.8.3 rule 4; this fix closes the gap.
+    //
+    // ALSO: a method whose OWN type parameter shadows a same-named
+    // receiver-class parameter (`class C<T> { method M<T>(x: T) }`) —
+    // `substituteMemberType` rewrites the formal by NAME, so the method's
+    // own `T` is also rewritten to the receiver's class argument and
+    // must be erased from the free set (#4915's "shadowing exclusion"
+    // rule). Mirrors the local path's
+    //   `if (classParent) calleeFreeParamNames.erase(cgp->name)` step
+    // so a method-level T is the only T that can stay in the free set
+    // when the parameter type was rewritten to the receiver's class arg.
+    //
+    // `recvTarget` is read from `ce.callee`'s `MemberAccessExpr` /
+    // `NullCondMemberExpr` target exactly as the local path's
+    // `checkCallArity` extracts it. `recvParent` is `ms->parent`, the
+    // imported twin of the local path's `classParent`. `substituteMemberType`
+    // is a no-op when `recvParent` is null (free function), when its
+    // `genericParams` is empty (non-generic receiver), or when `recvTarget`
+    // is null (static call on a non-generic receiver) — so this mirrors
+    // the local path's identical guard.
+    const ast::Expr* recvTarget = nullptr;
+    if (auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        recvTarget = ma->target.get();
+    else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+        recvTarget = ncm->target.get();
+    TypeSymbol* recvParent = ms->parent;
+    if (recvParent)
+        for (Symbol* cgp : recvParent->genericParams)
+            if (cgp) calleeMethodGenericParamNames.erase(cgp->name);
     const std::size_t nparams = sema::formalParamCount(*ms);
     for (std::size_t j = 0; j < nparams; ++j) {
         const int ai = b.paramToArg[j];
@@ -14266,6 +14316,14 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         // a non-const pointer.
         auto* pt = const_cast<TypeRef*>(sema::formalParamResolvedType(*ms, j));
         if (!pt) continue;
+        // fix #5002: substitute the receiver class's own generic params
+        // into the parameter type BEFORE `checkAssignable`, mirroring the
+        // local `checkArgsAgainstParams` path's exact same step. See the
+        // pre-loop comment above for the full rationale; the `recvParent`
+        // and `recvTarget` guards make this a no-op for free functions and
+        // non-generic receivers.
+        if (pt && recvTarget && recvParent)
+            pt = substituteMemberType(pt, recvTarget, recvParent);
         if (!explicitSubst.empty())
             pt = substituteReturnType(pt, explicitSubst);  // narrow #4915
         checkAssignable(ctx_.exprType(*a.value), pt,
