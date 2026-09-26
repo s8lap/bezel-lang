@@ -12021,7 +12021,60 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                     builder_.SetInsertPoint(nextBB);
                     continue;
                 }
-                return nullptr;
+                // fix #5032 (§14.1 / §14.2 / §19.3, v0.307): the case has a
+                // CONCRETE, non-void result type (`resultSemaTy` set) but
+                // this arm's body still failed to lower — the shape neither
+                // exemption above covers. This is the DEAD unspecialized
+                // generic-method-template body (issue #490): a `where T:
+                // IShapeN`-constrained method's template emits T erased to a
+                // non-pointer placeholder, so a type-test arm over `v: T`
+                // (`var q: SqN => q.Area() + 10`) has patternMatches decide
+                // the arm statically never matches — but the arm BODY is
+                // still lowered unconditionally to keep the template's IR
+                // complete, and `q.Area()` hits emitMethodCall's #484
+                // non-pointer-receiver guard and returns null. Before this
+                // fix that fell straight through to `return nullptr` here,
+                // which — UNLIKE the value-demanding sites this mirrors
+                // (#2434/#2491/#1386) — is not merely a missing value: this
+                // arm's `bodyBB`/`nextBB` blocks and the shared `case.end`
+                // block (built at function entry) are already live in
+                // `currentFn_` and this bails out WITHOUT terminating any of
+                // them, so the IR verifier rejects `case.end` as having no
+                // terminator with NO diagnostic at all (a silent internal
+                // crash, not even the #1386 ICE text). Only the SPECIALIZED
+                // instantiation ($spec$SqN) is ever called, and there the
+                // receiver is a real pointer and `q.Area()` dispatches
+                // normally. Mirror the LAMBDA-body precedent for this exact
+                // shape (LlvmBackend_Exprs2.cpp's #1255 fix): degrade to a
+                // well-typed zero value for `resultTy` and keep going, so
+                // every block this arm needs gets its terminator — same
+                // three-outcome severity split as the sibling sites, reusing
+                // their shared predicate rather than a new copy of it.
+                std::string member, appliedMember;
+                const std::string builtinRecv = builtinReceiverOfMemberCall(
+                    arm.exprBody.get(), &member, &appliedMember);
+                if (!builtinRecv.empty() && !ctx_.diagnostics().hasErrors()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, arm.exprBody->span.begin,
+                        "`" + member + "` on built-in type `" + builtinRecv +
+                        "` produced no value, so it cannot be this `case` "
+                        "arm's result. `" + builtinRecv +
+                        "` has no user declaration, so its member surface "
+                        "is exactly what the standard library documents "
+                        "for it: either `" + member + "` is not on that "
+                        "surface (a misspelling), or it is documented but "
+                        "yields nothing here (#2935 \xE2\x80\x94 if it is "
+                        "documented and should yield a value, it is "
+                        "unimplemented, #2457)" +
+                        builtinMemberChainNote(member, appliedMember));
+                } else if (!ctx_.diagnostics().hasErrors()) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, arm.exprBody->span.begin,
+                        "internal: case-arm expression body failed to "
+                        "lower to a value (degraded to a zero/null arm "
+                        "result) — #1386");
+                }
+                v = llvm::Constant::getNullValue(resultTy);
             }
             if (resultTy)
                 v = coerceNumericToType(v, resultTy,
