@@ -14472,7 +14472,14 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
     // `this(...)` chain site (#3583) already run, and the channel is the one
     // `SemaContext` table #3583 widened its key to `const ast::Expr*` for.
     if (!isThis) { publishBaseChainPrimaryBinding(*chain); return; }
-    if (currentType_->kind != ast::TypeDeclKind::Class ||
+    // fix #4722 (a) / #4999 (§9.1 / §9.3 / §22.5 / §22.8 step 0, v0.307): a
+    // record with positional fields has a §9.1 primary constructor too, and
+    // §9.3 keeps a body constructor's `this(...)` chain to it "governed by
+    // §12.8 unchanged" — so its chain is bound (and §5.1-checked) against
+    // the positional-field list exactly as a class's §22.10 primary is, and
+    // codegen's `emitChainCall` primary arm stores through this binding.
+    if ((currentType_->kind != ast::TypeDeclKind::Class &&
+         currentType_->kind != ast::TypeDeclKind::Record) ||
         !currentType_->hasPositionalFields)
         return;
     const std::vector<const Symbol*> fields =

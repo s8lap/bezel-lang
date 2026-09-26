@@ -13220,7 +13220,17 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // `this(...)` delegation (expecting the chained ctor to run it), so
             // without this nothing initialized the primary-ctor class — its
             // positional params and field initializers all stayed calloc-zero.
-            llvm::StructType* st = classStruct(targetCls);
+            // fix #4722 (a) (§9.1 / §9.3 / §12.8, v0.307): a combined-form
+            // RECORD's body constructor chaining to its §9.1 primary lands
+            // here too — the primary has no ConstructorSymbol, exactly as a
+            // class's does. A record is laid out by `recordStruct`, never
+            // `classStruct` (`currentThis_` is `buildRecordValue`'s by-value
+            // slot); the store below and `emitOwnFieldInit` must index that
+            // layout.
+            llvm::StructType* st =
+                targetCls->kind == ast::TypeDeclKind::Record
+                    ? recordStruct(targetCls)
+                    : classStruct(targetCls);
             // fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): §22.8 step 0
             // has ONE implementation now. This arm used to carry a second,
             // weaker copy of `storePrimaryCtorPositionalArgs`'s loop, gated on

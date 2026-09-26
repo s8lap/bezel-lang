@@ -4568,7 +4568,19 @@ void Emitter::storePrimaryCtorPositionalArgs(
     // `posParam == &pf` scan over `members` this used to do per argument.
     // The flag is checked FIRST so the vector is built only for a
     // primary-constructor class, not on every `new`.
-    if (t->kind != ast::TypeDeclKind::Class || !t->hasPositionalFields)
+    //
+    // fix #4722 (a) (§9.1 / §9.3 / §12.8 / §22.8 step 0, v0.307): a RECORD
+    // with positional fields is admitted too. Its §9.1 primary constructor
+    // is reached this way only from `emitChainCall`'s primary arm — a body
+    // constructor's `this(...)` chain, which §9.3 keeps "governed by §12.8
+    // unchanged". Every `lowerNew` caller of this helper sits on the class
+    // path, after the record branch has already returned through
+    // `buildRecordValue`, so no `new R(...)` site reaches it. Before this the
+    // gate returned early for a record and the chain stored NOTHING: the
+    // object kept its zero fill and printed `R(X: 0, Y: 0)`.
+    if ((t->kind != ast::TypeDeclKind::Class &&
+         t->kind != ast::TypeDeclKind::Record) ||
+        !t->hasPositionalFields)
         return;
     const std::vector<const sema::Symbol*> posFields =
         sema::recordPositionalFieldSymbols(t);
@@ -4803,6 +4815,33 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   }
                   llvm::Type* fieldTy =
                       st->getElementType(idxIt->second);
+                  // fix #4722 (a) (§9.1 / §23.1 / §22.8 step 0, v0.307): a
+                  // NULLABLE VALUE positional slot (`X: int?`) stores the
+                  // tagged `{i8 hasValue; T value}` struct, never a bare T —
+                  // the same wrap `buildRecordValue`'s positional path does.
+                  // Without it a bare `i32 5` was stored over the tag and the
+                  // field read back as `0` (measured for a record chain to
+                  // its primary, and for the class twin `new C(5, 3)` over
+                  // `class C(x: int?, y: long)`).
+                  {
+                      const sema::TypeRef* fty = recordMemberTypeResolved(fs);
+                      if (isNullableValueTy(fty)) {
+                          auto* expectedSt = nullableValueStructTy(fty);
+                          llvm::Type* valTy = expectedSt->getElementType(1);
+                          if (v->getType() != expectedSt) {
+                              if (v->getType()->isPointerTy() &&
+                                  llvm::isa<llvm::ConstantPointerNull>(v))
+                                  v = nullableValueNull(fty);
+                              else if (v->getType() == valTy)
+                                  v = wrapNullableValue(fty, v);
+                              else if (v->getType()->isIntegerTy() &&
+                                       valTy->isIntegerTy())
+                                  v = wrapNullableValue(
+                                      fty,
+                                      builder_.CreateSExtOrTrunc(v, valTy));
+                          }
+                      }
+                  }
                   v = coerceNumericToType(
                       v, fieldTy,
                       argExpr ? isUnsignedTargetExpr(*argExpr) : false);
