@@ -190,6 +190,134 @@ class KindTest(_Base):
         self.assertRegex(out, r"other\* +#4502")
 
 
+class NoteRecoveryTest(_Base):
+    """Review round 4, BLOCKER 2: a staging rebase without notes.rewriteRef
+    leaves every picked commit without a note by SHA; the ledger recovers the
+    note by patch-id and marks the row `~`."""
+
+    def test_ledger_survives_a_rebase_without_rewrite_ref(self):
+        self.assertEqual(self.pick(self.c1, kind="fix").returncode, 0)
+        self.assertEqual(self.pick(self.c2, kind="test", pool="p2").returncode, 0)
+        self.repo.git("switch", "-q", "main")
+        self.repo.change("z.txt", "unrelated on main\n\n" + WANT)
+        self.repo.git("switch", "-q", "staging")
+        self.repo.git("rebase", "-q", "main", env=dict(self.env, GIT_EDITOR="true"))
+        self.assertNotEqual(self.repo.git("notes", "--ref=bezel-picks", "show", "HEAD",
+                                          check=False).returncode, 0,
+                            "precondition: the rebase dropped the note by SHA")
+        r = run("pick_ledger.sh", "main..staging", cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"\bp1 +lane-a +ACCEPT +fix~ +#4001\b")
+        self.assertRegex(r.stdout, r"\bp2 +lane-a +ACCEPT +test~ +#4003\b")
+        # #4003's subject says "fix", but the RECOVERED kind is test: 1 banked, not 2.
+        self.assertIn("distinct fix issues: 1 (0 from inferred kinds)", r.stdout)
+        self.assertIn("2 row(s)", r.stdout)
+        self.assertIn("UNATTRIBUTED: 0", r.stdout)
+
+    def test_commit_with_no_note_by_sha_or_patch_id_is_unattributed(self):
+        self.repo.change("m.txt", "manual #4600\n\n" + WANT)
+        r = run("pick_ledger.sh", "main..staging", cwd=self.repo.root, env=self.env)
+        self.assertIn("UNATTRIBUTED: 1 commit(s): no refs/notes/bezel-picks note found "
+                      "by SHA or patch-id", r.stdout)
+
+
+class PickFlowTest(_Base):
+    """Review round 4, SHOULD-FIX 3-5: conflict + --continue, empty picks,
+    dirty-tree refusal, trailer-violation advice, value flags at the end."""
+
+    def conflict_setup(self):
+        # staging already has a different a.txt, so picking c1 (adds a.txt) conflicts.
+        self.repo.change("a.txt", "staging a\n\n" + WANT, text="staging\n")
+
+    def test_conflict_prints_recipe_and_remaining_shas(self):
+        self.conflict_setup()
+        r = self.pick(self.c1, self.c2)
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertIn("CONFLICT picking " + self.c1[:10], r.stderr)
+        self.assertIn("Not yet picked: " + self.c2, r.stderr)
+        self.assertRegex(r.stderr, r"pick_stage\.sh --continue --branch staging --pool p1 "
+                         r"--lane lane-a --reviewer rev-1 --verdict ACCEPT --kind fix " + self.c2)
+
+    def _resolve(self):
+        self.repo.write("a.txt", "resolved\n")
+        self.repo.git("add", "--", "a.txt")
+
+    def _assert_finalized(self, rev, orig):
+        msg = self.repo.out("log", "-1", "--format=%B", rev)
+        self.assertNotIn("cherry picked from", msg)
+        self.assertEqual(msg.splitlines()[-1], WANT)
+        self.assertIn("orig: " + orig, self.note(rev))
+
+    def test_continue_finalizes_the_conflicted_pick_and_picks_the_rest(self):
+        self.conflict_setup()
+        self.assertEqual(self.pick(self.c1, self.c2).returncode, 2)
+        self._resolve()
+        r = self.pick("--continue", self.c2)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self._assert_finalized("HEAD~1", self.c1)
+        self._assert_finalized("HEAD", self.c2)
+        self.assertIn("2 commit(s) picked", r.stdout)
+
+    def test_continue_after_a_manual_cherry_pick_continue(self):
+        self.conflict_setup()
+        self.assertEqual(self.pick(self.c1).returncode, 2)
+        self._resolve()
+        self.repo.git("-c", "core.editor=true", "cherry-pick", "--continue")
+        r = self.pick("--continue")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self._assert_finalized("HEAD", self.c1)
+
+    def test_continue_with_nothing_to_continue_is_refused(self):
+        r = self.pick("--continue")
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("nothing to continue", r.stderr)
+
+    def test_a_new_run_during_an_unfinished_pick_is_refused(self):
+        self.conflict_setup()
+        self.assertEqual(self.pick(self.c1).returncode, 2)
+        r = self.pick(self.c2)
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("cherry-pick is in progress", r.stderr)
+
+    def test_empty_pick_is_skipped_not_a_conflict(self):
+        self.assertEqual(self.pick(self.c1).returncode, 0)
+        head = self.repo.out("rev-parse", "HEAD")
+        r = self.pick(self.c1, self.c2)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn(self.c1[:10] + " already applied, skipped", r.stdout)
+        self.assertNotIn("CONFLICT", r.stderr)
+        self.assertEqual(self.repo.out("rev-parse", "HEAD~1"), head)
+        self.assertIn("orig: " + self.c2, self.note())
+        self.assertNotEqual(self.repo.git("rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD",
+                                          check=False).returncode, 0)
+
+    def test_dirty_tree_is_refused(self):
+        self.repo.write("README", "dirty\n")
+        r = self.pick(self.c1)
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("dirty", r.stderr)
+        self.assertEqual(self.repo.out("rev-list", "--count", "main..staging"), "0")
+
+    def test_trailer_violation_advice_names_the_lane_branch(self):
+        self.repo.git("switch", "-q", "lane-a")
+        bad = self.repo.change("c.txt", "fix #4004: bad\n\nno trailer")
+        self.repo.git("switch", "-q", "staging")
+        r = self.pick(bad)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("ON THE LANE BRANCH", r.stderr)
+        self.assertIn("git reset --hard HEAD~1", r.stderr)
+
+    def test_value_flag_with_no_value_errors_instead_of_looping(self):
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        for argv in (["--kind"], ["--branch", "staging", "--pool"],
+                     ["--branch", "staging", "--kind", "--pool", "p"]):
+            r = subprocess.run([str(SCRIPTS / "pick_stage.sh")] + argv, cwd=str(self.repo.root),
+                               env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 64, argv)
+            self.assertIn("needs a value", r.stderr)
+
+
 class InferKindTest(unittest.TestCase):
     CASES = [
         ("fix #4807/#4808: stop batch checks", "fix"),
