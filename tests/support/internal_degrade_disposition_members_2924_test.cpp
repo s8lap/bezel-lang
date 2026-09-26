@@ -157,17 +157,20 @@ const MemberEntry kMemberIssues[] = {
      "narrows the snapshot"},
 };
 
-// The SNAPSHOT TABLE SIZE — twenty-two rows at HEAD b57a712e, derived
-// from the existing snapshot test (kWarningDegrades array — re-measured
-// 2026-09-18, the changelog at line 100 says sixteen at v0.240 and grew
-// through #3079, the two #3157 alarms, #3437, and #4045 to twenty-two).
-// Pinned here so the family-population ratchet AND the snapshot ratchet
-// have to be edited together when either side changes.  When the
-// snapshot's array grows (a new Warning site is added and dispositioned)
-// `kSnapshotTagCount` moves with it; the heuristic in
+// The SNAPSHOT TABLE SIZE — twenty-four rows at HEAD (794e82bb + follow-up),
+// derived from the existing snapshot test (kWarningDegrades array —
+// re-measured 2026-09-18 at twenty-two, the changelog at line 100 says
+// sixteen at v0.240 and grew through #3079, the two #3157 alarms, #3437,
+// and #4045 to twenty-two; #5032 (v0.307) added two more — an
+// interpolation-part and a case-arm degrade, both confined to the DEAD
+// unspecialized generic-template body per #490, both WrongValue — bringing
+// it to twenty-four). Pinned here so the family-population ratchet AND the
+// snapshot ratchet have to be edited together when either side changes.
+// When the snapshot's array grows (a new Warning site is added and
+// dispositioned) `kSnapshotTagCount` moves with it; the heuristic in
 // family_k_shape_snapshot_plus_members_is_self_consistent reads the
 // snapshot file directly and double-checks the heuristic.
-constexpr std::size_t kSnapshotTagCount = 22;
+constexpr std::size_t kSnapshotTagCount = 24;
 constexpr std::size_t kOpenMemberCount = sizeof(kMemberIssues) /
                                           sizeof(MemberEntry);
 
