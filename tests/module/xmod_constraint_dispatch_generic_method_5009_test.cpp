@@ -1216,4 +1216,205 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
     BEZEL_EXPECT_EQ(runBoundLocal5009("T42", kBoundNNew5009), 95);
 }
 
+// ===========================================================================
+// T43-T50 — FIFTH REVIEW (of fix-forward 4, f7554738): a bound declared in a
+// THIRD module. Dep1 declares the interface, a class implementing it and a
+// generic box; Dep2 imports Dep1 and declares generic methods bounded by
+// Dep1's interface, taking `RBox<T>`; the app imports both. The exporter
+// ships a body only for a bound its own module declares, so Dep2 ships none,
+// and `RBox<T>` crosses as a pointer, so the #1943 width gate never fires.
+// MEASURED on b30c6f12, 8575510a and f7554738: the virtual VB3 AND the
+// non-virtual NB3 returned 0 with no diagnostic (single-module twin 127).
+// Fix-forward 5 counts a user-type bound from any module, on the slot call
+// and on the direct call.
+// ===========================================================================
+namespace {
+const char* kThirdDep1_5009 =
+    "public interface IShape3M5009 "
+    "  method Area(): int; "
+    "end IShape3M5009; "
+    "public class Sq3M5009: IShape3M5009 "
+    "  public constructor() end constructor; "
+    "  public method Area(): int return 7; end Area; "
+    "end Sq3M5009; "
+    "public class Box3M5009<U> "
+    "  private _u: U; "
+    "  public constructor(u: U) _u := u; end constructor; "
+    "  public method Get(): U return _u; end Get; "
+    "end Box3M5009; ";
+const char* kThirdDep2_5009 =
+    // 7 + 120 = 127 for both.
+    "public class G3M5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method VB3<T>(b: Box3M5009<T>): int "
+    "      where T: IShape3M5009 "
+    "    return b.Get().Area() + 120; "
+    "  end VB3; "
+    "  public method NB3<T>(b: Box3M5009<T>): int where T: IShape3M5009 "
+    "    return b.Get().Area() + 120; "
+    "  end NB3; "
+    // BUILTIN bounds only: the i32 template is right, so neither is
+    // refused. 45 and 95.
+    "  public method NCls3<T>(b: Box3M5009<T>): int where T: class "
+    "    return 45; "
+    "  end NCls3; "
+    "  public method NOnly3<T>(): int where T: new() "
+    "    var t := new T(); "
+    "    return 95; "
+    "  end NOnly3; "
+    "end G3M5009; ";
+
+const char* kThirdVB3_5009 =
+    "using var g := new G3M5009(); "
+    "var bx := new Box3M5009<Sq3M5009>(new Sq3M5009()); return g.VB3(bx);";
+const char* kThirdNB3_5009 =
+    "using var g := new G3M5009(); "
+    "var bx := new Box3M5009<Sq3M5009>(new Sq3M5009()); return g.NB3(bx);";
+const char* kThirdNCls3_5009 =
+    "using var g := new G3M5009(); "
+    "var bx := new Box3M5009<Sq3M5009>(new Sq3M5009()); return g.NCls3(bx);";
+const char* kThirdNOnly3_5009 =
+    "using var g := new G3M5009(); return g.NOnly3<Sq3M5009>();";
+
+std::string mainThird5009(const std::string& call) {
+    return "class C3M5009 public static method Main(): int " + call +
+           " end Main; end C3M5009;";
+}
+
+// Build Dep1, then Dep2 against it, then compile the app against both; if
+// `run`, link and run it too. `exitCode` is -1 on a compile/link/run failure.
+struct Third5009 {
+    bool depOk = true;
+    bool success = false;
+    int exitCode = -1;
+    std::string err;
+};
+Third5009 buildThird5009(const std::string& tag, const std::string& call,
+                         bool run) {
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz5009t_");
+    TempFile5009 s1((dir / (stem + "_d1.bzl")).string());
+    TempFile5009 o1((dir / (stem + "_d1.o")).string());
+    TempFile5009 s2((dir / (stem + "_d2.bzl")).string());
+    TempFile5009 o2((dir / (stem + "_d2.o")).string());
+    TempFile5009 sa((dir / (stem + "_a.bzl")).string());
+    TempFile5009 exe((dir / stem).string());
+    const std::string m1 = "Dep3A5009" + tag, m2 = "Dep3B5009" + tag;
+    writeSource5009(s1.path, "module " + m1 + "; " + kThirdDep1_5009);
+    writeSource5009(s2.path, "module " + m2 + "; import " + m1 + "; " +
+                                 kThirdDep2_5009);
+    writeSource5009(sa.path, "module App3M5009" + tag + "; import " + m1 +
+                                 "; import " + m2 + "; " +
+                                 mainThird5009(call));
+    auto dep = [](const std::string& obj) {
+        bezel::Dependency d;
+        d.metadataPath = obj;
+        d.objectPath = obj;
+        return d;
+    };
+    Third5009 r;
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(s1.path, o1.path).success ||
+            !std::ifstream(o1.path).good()) {
+            r.depOk = false;
+            return r;
+        }
+    }
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(s2.path, o2.path, {dep(o1.path)}).success ||
+            !std::ifstream(o2.path).good()) {
+            r.depOk = false;
+            return r;
+        }
+    }
+    r.err = captureStderr5009([&] {
+        bezel::Driver driver;
+        r.success = bezel::test::compileFileForTest(
+                        driver, sa.path, exe.path,
+                        {dep(o1.path), dep(o2.path)})
+                        .success;
+    });
+    if (r.success && run) {
+        int status = bezel::test::runProgramForTest(exe.path);
+        r.exitCode =
+            (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    }
+    return r;
+}
+
+void expectThirdReject5009(const std::string& tag, const std::string& call,
+                           const std::string& name) {
+    Third5009 r = buildThird5009(tag, call, /*run=*/false);
+    if (!r.depOk) return;  // dependency toolchain unavailable
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(lowerReject5009(name)) != std::string::npos);
+}
+
+int runThirdImport5009(const std::string& tag, const std::string& call) {
+    Third5009 r = buildThird5009(tag, call, /*run=*/true);
+    if (!r.depOk) return -2;
+    return r.exitCode;
+}
+
+int runThirdLocal5009(const std::string& tag, const std::string& call) {
+    return buildLocalAndRun5009(std::string("module Loc3M5009") + tag + "; " +
+                                kThirdDep1_5009 + kThirdDep2_5009 +
+                                mainThird5009(call));
+}
+}  // namespace
+
+// T43 / T44 — ★ the silent zeros, now located rejects: the slot call and
+// the direct call.
+// // per §14.1 / §14.2 / §2.8.3 rule 4 / #1943, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_bound_virtual_method_is_rejected_not_zero) {
+    expectThirdReject5009("T43", kThirdVB3_5009, "VB3");
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_bound_non_virtual_method_is_rejected_not_zero) {
+    expectThirdReject5009("T44", kThirdNB3_5009, "NB3");
+}
+
+// T45 / T46 — builtin bounds on the direct call keep their values across
+// three modules.
+// // per §14.1 / §14.2 / §2.8.3 rule 4, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_class_bound_direct_call_keeps_value) {
+    int rc = runThirdImport5009("T45", kThirdNCls3_5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 45);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_new_only_bound_direct_call_keeps_value) {
+    int rc = runThirdImport5009("T46", kThirdNOnly3_5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 95);
+}
+
+// T47-T50 — DIFFERENTIAL CONTROLS: in ONE module every call has its value.
+// // per §14.1 / §12 / §2.8.3 rule 2, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_bound_virtual_method_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runThirdLocal5009("T47", kThirdVB3_5009), 127);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_bound_non_virtual_method_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runThirdLocal5009("T48", kThirdNB3_5009), 127);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_class_bound_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runThirdLocal5009("T49", kThirdNCls3_5009), 45);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_new_only_bound_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runThirdLocal5009("T50", kThirdNOnly3_5009), 95);
+}
+
 }  // namespace bezel::module

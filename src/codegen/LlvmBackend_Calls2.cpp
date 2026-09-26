@@ -13917,43 +13917,64 @@ void Emitter::collectClosureArgBodyIdentifiers(
 // fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): an IMPORTED generic
 // method whose body did not cross the module boundary (no attached
 // `ast::MethodDecl`) although one of its own type parameters carries a bound
-// the i32-placeholder template cannot honour — a `new()` bound, or a type
-// bound declared by the exporting module itself. This mirrors the exporter's
-// `isConstraintUsingGenericMethod` (ModuleMetadataBuilder.cpp), which ships
-// exactly such bodies for the statically dispatched inline path and — since
-// fix-forward 3 — never for a virtual, override or abstract method. A slot
-// call to one therefore runs the defining module's template compiled against
-// the placeholder: MEASURED on 8575510a, `virtual Mk<T>() where T: IShape,
-// new()` and `virtual Cnt<T>(n: int) where T: IShape` returned 0 across the
-// boundary (single-module twins 95 / 47 / 48) with no diagnostic, because no
-// argument had type `T` for the #1943 width gate to catch. Builtin bounds
-// (`class`, `value`, `notnull`, a stdlib interface) are sound at i32 and are
-// not counted. When the owning module cannot be identified a type bound is
-// not counted either (only `new()` then fails closed).
+// the i32-placeholder template cannot honour — a `new()` bound, or a bound
+// that is a USER type. The call can then only run the defining module's
+// template compiled against the placeholder. MEASURED on 8575510a,
+// `virtual Mk<T>() where T: IShape, new()` and `virtual Cnt<T>(n: int) where
+// T: IShape` returned 0 across the boundary (single-module twins 95 / 47 /
+// 48) with no diagnostic, because no argument had type `T` for the #1943
+// width gate to catch.
+//
+// fix-forward 5: a user-type bound counts WHEREVER it is declared, not only
+// in the method's own module. The exporter's `isConstraintUsingGenericMethod`
+// ships a body only for a bound its own module declares, so a bound from a
+// THIRD module (`RD2.G.VB3<T>(b: RBox<T>) where T: RD1.IShape`) left no body
+// and, with `T` crossing inside a pointer-width `RBox<T>`, no width
+// mismatch: MEASURED on f7554738, 0 for the virtual VB3 AND the non-virtual
+// NB3 (single-module twin 127). A user type is one some loaded module
+// registered (`importedByModule`); a bound declared by the importing module
+// itself cannot reach an imported method. Builtin bounds (`class`, `value`,
+// `notnull`, a synthesized builtin interface) are sound at i32 and are not
+// counted.
 static bool importedGenericLacksConstraintBody5009(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms || !ctx.isImported(ms) || ms->genericParams.empty()) return false;
     if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) return false;
-    const std::vector<sema::TypeSymbol*>* ownerTypes = nullptr;
-    if (ms->parent)
-        for (const auto& [modName, types] : ctx.importedByModule()) {
+    auto isUserType = [&](const sema::TypeSymbol* d) {
+        if (!d || d->isSynthesizedBuiltinInterface) return false;
+        for (const auto& [modName, types] : ctx.importedByModule())
             for (const sema::TypeSymbol* t : types)
-                if (t == ms->parent) { ownerTypes = &types; break; }
-            if (ownerTypes) break;
-        }
+                if (t == d) return true;
+        return false;
+    };
     for (const sema::Symbol* s : ms->genericParams) {
         auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s);
         if (!gp) continue;
         for (const sema::GenericParamConstraint& c : gp->constraints) {
             if (c.kind == "new") return true;
-            if (c.kind != "type" || !ownerTypes || !c.importedBound ||
-                !c.importedBound->declaration)
-                continue;
-            for (const sema::TypeSymbol* t : *ownerTypes)
-                if (t == c.importedBound->declaration) return true;
+            if (c.kind == "type" && c.importedBound &&
+                isUserType(c.importedBound->declaration))
+                return true;
         }
     }
     return false;
+}
+
+// The located reject for importedGenericLacksConstraintBody5009. It shares
+// the codegen backstop's opening ("its body could not be monomorphized across
+// the module boundary"), so one needle names the whole family.
+static std::string boundBodyReject5009(std::string_view name,
+                                       bool virtualCall) {
+    return "calling imported generic method `" + std::string(name) +
+           "`: its body could not be monomorphized across the module "
+           "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+           "\xE2\x80\x94 a type parameter carries a `new()` bound or a "
+           "user-type bound, and the " +
+           std::string(virtualCall ? "virtual " : "") +
+           "call runs the defining module's template compiled against the "
+           "`int` (i32) placeholder, so it would silently compute a wrong "
+           "value. Call it within the module that defines it" +
+           std::string(virtualCall ? ", or make it non-virtual" : "");
 }
 
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
@@ -14713,17 +14734,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // see importedGenericLacksConstraintBody5009.
         if (!isIfaceMethod &&
             importedGenericLacksConstraintBody5009(ctx_, ms)) {
-            ctx_.diagnostics().report(
-                Severity::Error, callLoc,
-                "calling imported generic method `" + std::string(ms->name) +
-                "`: its body could not be monomorphized across the module "
-                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
-                "\xE2\x80\x94 a type parameter carries a `new()` bound or a "
-                "bound declared by its defining module, and a virtual call "
-                "runs that module's template compiled against the `int` (i32) "
-                "placeholder, so the call would silently compute a wrong "
-                "value. Call it within the module that defines it, or make it "
-                "non-virtual");
+            ctx_.diagnostics().report(Severity::Error, callLoc,
+                                      boundBodyReject5009(ms->name, true));
             if (fnTy->getReturnType()->isVoidTy()) return nullptr;
             return llvm::PoisonValue::get(fnTy->getReturnType());
         }
@@ -15038,6 +15050,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 "monomorphization lands");
             return llvm::PoisonValue::get(callee->getReturnType());
         }
+    }
+    // fix #5009 fix-forward 5 (§14.1 / §2.8.3 rule 4, v0.307): the direct-call
+    // sibling of the slot-call gate in the virtual arm above. The width gate
+    // just above cannot see a `T` that crosses inside a pointer (`RBox<T>`)
+    // or not at all; MEASURED on f7554738 the non-virtual NB3 returned 0
+    // (twin 127). Refuse on the bound — see
+    // importedGenericLacksConstraintBody5009, which never counts a method
+    // whose body is attached.
+    if (importedGenericLacksConstraintBody5009(ctx_, ms)) {
+        ctx_.diagnostics().report(Severity::Error, callLoc,
+                                  boundBodyReject5009(ms->name, false));
+        return llvm::PoisonValue::get(callee->getReturnType());
     }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown
