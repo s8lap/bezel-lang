@@ -83,7 +83,6 @@
 
 #include <string>
 
-#include "support/aot_result_asserts.hpp"   // fix #3895: failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -91,7 +90,6 @@ using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
-using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
@@ -901,47 +899,57 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
 
 // CONTROL: the NEGATION of the fix — a non-narrowed initializer (here
 // `var b: [3]int := o;` where `o` is NOT narrowed at this program point).
-// The walker keeps its conservative escape verdict, the box is NOT
-// released at `o`'s scope end, and the loop leaks 32 B / iter. Pins that
-// the relaxed arm really is conditional on the §12.7 narrowing, not a
-// blanket "value-typed binding from Object is safe".
+// Pins that the relaxed (leak-free) arm really is conditional on the §12.7
+// narrowing, not a blanket "value-typed binding from Object is safe".
 //
-// ⚠ fix #3895 (issue #3892) FINDING: this row's comment describes a leak
-// (32 B / iter, LSan-flagged) pinned with a bare `!ran` claim,
-// which cannot tell that apart from ANY other `!ran` outcome. Measured
-// directly (`bezelc --sanitize=address` on this EXACT program): the box-
-// escape/leak path this row means to exercise is UNREACHABLE — `var o:
-// Object := [1, 2, 3];` is itself rejected by §15.4 ("a collection literal
-// `[...]` cannot target the type `Object`"), a restriction that postdates
-// this test (fix #3090) and was never noticed here because a bare `!ran`
-// cannot distinguish "leaked as described" from "rejected before the box
-// this row is about was ever created". Filed as issue 3904 (this control's
-// program needs re-deriving — e.g. box a `[3]int` local into `Object`
-// rather than target a collection literal directly at `Object` — to
-// actually reach the scenario the row's own comment describes). Pinning the
-// ACTUAL current behavior here (rather than reverting to the disproven bare
-// `!ran`) so this row still catches an actual regression without asserting
-// something the compiler does not do.
+// ⚠ fix #3895 (issue #3892) FINDING, then superseded by fix #5023 (issue
+// #3904): the row originally here (named
+// `unnarrowed_object_to_inline_array_copy_still_leaks_as_expected`) built
+// its unnarrowed source as `var o: Object := [1, 2, 3]; var b: [3]int :=
+// o as [3]int;` and pinned the outcome with the vacuous
+// `failedAtCompileTimeWithRealLocation` helper. #3895 found that program
+// already rejected before it ever reached this test's own point — §15.4
+// bars a collection literal `[...]` from targeting `Object` directly — so
+// the row was pinning an UNRELATED, incidental rejection, not the
+// "unnarrowed value-typed binding from Object" scenario its comment
+// described. #5023 REMOVES THE AMBIGUITY ENTIRELY: extending
+// `checkAssignable`'s §3/§5.1 "Object has no implicit conversion to the
+// value type" gate to inline-array targets (§3.1/§3.2, v0.307) means an
+// unnarrowed `Object → [N]T` binding is now rejected by a SPECIFIC,
+// nameable diagnostic regardless of how the `Object` was produced — there
+// is no longer any unnarrowed path (`:=`, or `as` per §17.4's own
+// degenerate-inline-array-target rule) that reaches a value read of the
+// box, so the leak scenario the row's original name described is
+// categorically unreachable post-fix, not merely incidentally rejected
+// for a different reason. This row is re-derived with issue #3904's own
+// suggested source shape (box a named `[3]int` local into `Object`, i.e.
+// side-step §15.4 entirely) and asserts the #5023 diagnostic text
+// specifically — not `failedAtCompileTimeWithRealLocation`, which cannot
+// distinguish this rejection from a crash (see CLAUDE.md's oracles-that-
+// pass-vacuously catalogue). The narrowed sibling that proves the SAME
+// value, reached through `if o is [3]int then … end`, compiles and runs
+// leak-clean is `narrowed_inline_array_copy_out_loop_does_not_leak_box_spec_12_7_28_9`
+// above (10 000-iteration loop, LSan-clean under `runAotChecked`).
 BEZEL_TEST(codegen_narrowed_value_unbox_3090,
-           unnarrowed_object_to_inline_array_copy_still_leaks_as_expected) {
+           unnarrowed_object_to_inline_array_copy_rejected_spec_3_1_5_1_issue_5023) {
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
-        "    var i := 0; "
-        "    while i < 10000 do "
-        "      var o: Object := [1, 2, 3]; "
-        "      var b: [3]int := o as [3]int; "
-        "      i := i + 1; "
-        "    end; "
-        "    return 0; "
+        "    var arr: [3]int := [1, 2, 3]; "
+        "    var o: Object := arr; "
+        "    var b: [3]int := o; "
+        "    return b[0]; "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
-    // fix #3895 (issue #3892): pins the ACTUAL current rejection (see the
-    // ⚠ finding above, issue 3904) — a genuine §15.4 compile-time reject
-    // with a real source location, not a runtime crash/signal, which a bare
-    // `!ran` cannot distinguish.
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    bool sawDiag = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(
+                "has type `Object` which has no implicit conversion") !=
+            std::string::npos)
+            sawDiag = true;
+    BEZEL_EXPECT_TRUE(sawDiag);
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // CONTROL: a PARAMETER of type `Object` narrowed by an `is [3]int` then
