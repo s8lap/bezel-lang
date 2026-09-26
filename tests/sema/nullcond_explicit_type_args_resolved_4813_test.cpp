@@ -169,6 +169,62 @@ end Program;
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("q|z\nnil|-\n"));
 }
 
+// Issue #5027 N1: pin the silent WRONG VALUE directly in a NON-generic
+// caller. Every accept row above runs inside a generic `Go<T>` — there the
+// pre-fix failure was a compile REJECT (the #4768 "`T` is a type parameter"
+// diagnostic), not a wrong value. Outside a generic caller there is no
+// same-named type parameter to collide with, so pre-fix the unresolved
+// explicit list let argument inference silently backfill the binding from
+// the (unresolved) call, and `var r := b?.Ret<int>(6)` was typed as the
+// bare, unsubstituted `T` and mis-lowered — it compiled and printed an
+// EMPTY LINE instead of `6`.
+BEZEL_TEST(nullcond_explicit_type_args_resolved_4813,
+           explicit_int_into_inferred_local_non_generic_caller_spec_14_5_7_5) {
+    auto r = runAot(R"BZ(module Conf;
+public class Box
+  public method Ret<T>(x: T): T
+    return x;
+  end Ret;
+end Box;
+public class Program
+  public static method Main()
+    var b: Box? := new Box();
+    var n: Box? := null;
+    var r := b?.Ret<int>(6);
+    var s := n?.Ret<int>(6);
+    Console.WriteLine($"{r ?? 0}");
+    Console.WriteLine($"{s ?? 0}");
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n0\n"));
+}
+
+// String variant of the same non-generic-caller shape.
+BEZEL_TEST(nullcond_explicit_type_args_resolved_4813,
+           explicit_string_into_inferred_local_non_generic_caller_spec_14_5_7_5) {
+    auto r = runAot(R"BZ(module Conf;
+public class Box
+  public method Ret<T>(x: T): T
+    return x;
+  end Ret;
+end Box;
+public class Program
+  public static method Main()
+    var b: Box? := new Box();
+    var n: Box? := null;
+    var r := b?.Ret<string>("x");
+    var s := n?.Ret<string>("x");
+    Console.WriteLine(r ?? "-");
+    Console.WriteLine(s ?? "-");
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("x\n-\n"));
+}
+
 // ═════════ Reject rows ═══════════════════════════════════════════════════
 
 // Control: the caller's own `T` returned into `int?` is still rejected by the
