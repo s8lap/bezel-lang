@@ -13914,6 +13914,48 @@ void Emitter::collectClosureArgBodyIdentifiers(
 }
 
 
+// fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): an IMPORTED generic
+// method whose body did not cross the module boundary (no attached
+// `ast::MethodDecl`) although one of its own type parameters carries a bound
+// the i32-placeholder template cannot honour — a `new()` bound, or a type
+// bound declared by the exporting module itself. This mirrors the exporter's
+// `isConstraintUsingGenericMethod` (ModuleMetadataBuilder.cpp), which ships
+// exactly such bodies for the statically dispatched inline path and — since
+// fix-forward 3 — never for a virtual, override or abstract method. A slot
+// call to one therefore runs the defining module's template compiled against
+// the placeholder: MEASURED on 8575510a, `virtual Mk<T>() where T: IShape,
+// new()` and `virtual Cnt<T>(n: int) where T: IShape` returned 0 across the
+// boundary (single-module twins 95 / 47 / 48) with no diagnostic, because no
+// argument had type `T` for the #1943 width gate to catch. Builtin bounds
+// (`class`, `value`, `notnull`, a stdlib interface) are sound at i32 and are
+// not counted. When the owning module cannot be identified a type bound is
+// not counted either (only `new()` then fails closed).
+static bool importedGenericLacksConstraintBody5009(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    if (!ms || !ctx.isImported(ms) || ms->genericParams.empty()) return false;
+    if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) return false;
+    const std::vector<sema::TypeSymbol*>* ownerTypes = nullptr;
+    if (ms->parent)
+        for (const auto& [modName, types] : ctx.importedByModule()) {
+            for (const sema::TypeSymbol* t : types)
+                if (t == ms->parent) { ownerTypes = &types; break; }
+            if (ownerTypes) break;
+        }
+    for (const sema::Symbol* s : ms->genericParams) {
+        auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s);
+        if (!gp) continue;
+        for (const sema::GenericParamConstraint& c : gp->constraints) {
+            if (c.kind == "new") return true;
+            if (c.kind != "type" || !ownerTypes || !c.importedBound ||
+                !c.importedBound->declaration)
+                continue;
+            for (const sema::TypeSymbol* t : *ownerTypes)
+                if (t == c.importedBound->declaration) return true;
+        }
+    }
+    return false;
+}
+
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
@@ -14661,6 +14703,29 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 if (fnTy->getReturnType()->isVoidTy()) return nullptr;
                 return llvm::PoisonValue::get(fnTy->getReturnType());
             }
+        }
+        // fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): the width
+        // gate above only sees a type argument that crosses as an ARGUMENT. A
+        // method whose `T` appears in no parameter (`virtual Mk<T>() where T:
+        // IShape, new()`, `virtual Cnt<T>(n: int) where T: IShape`) passes it
+        // with identical widths and silently returned 0 (MEASURED on
+        // 8575510a; twins 95 / 47 / 48). Fail closed on the BOUND instead —
+        // see importedGenericLacksConstraintBody5009.
+        if (!isIfaceMethod &&
+            importedGenericLacksConstraintBody5009(ctx_, ms)) {
+            ctx_.diagnostics().report(
+                Severity::Error, callLoc,
+                "calling imported generic method `" + std::string(ms->name) +
+                "`: its body could not be monomorphized across the module "
+                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+                "\xE2\x80\x94 a type parameter carries a `new()` bound or a "
+                "bound declared by its defining module, and a virtual call "
+                "runs that module's template compiled against the `int` (i32) "
+                "placeholder, so the call would silently compute a wrong "
+                "value. Call it within the module that defines it, or make it "
+                "non-virtual");
+            if (fnTy->getReturnType()->isVoidTy()) return nullptr;
+            return llvm::PoisonValue::get(fnTy->getReturnType());
         }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         // fix #2752: merge the string-receiver arm back in. Only reached when
@@ -15833,10 +15898,16 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // module boundary picked the base body (#5031). Checked before any
     // instruction is emitted.
     {
-        bool constraintRouteImpl = ctx_.isConstraintRouteBody(ms) ||
-                                   ctx_.isConstraintRouteBody(defaultImpl);
+        // Fix-forward 4: an imported implementation whose bound-carrying body
+        // did not cross the boundary (importedGenericLacksConstraintBody5009)
+        // is refused on the same terms as the slot call in emitMethodCall.
+        auto refused = [&](const sema::MethodSymbol* m) {
+            return ctx_.isConstraintRouteBody(m) ||
+                   importedGenericLacksConstraintBody5009(ctx_, m);
+        };
+        bool constraintRouteImpl = refused(ms) || refused(defaultImpl);
         for (const Branch& b : branches)
-            if (ctx_.isConstraintRouteBody(b.impl)) constraintRouteImpl = true;
+            if (refused(b.impl)) constraintRouteImpl = true;
         if (constraintRouteImpl) {
             ctx_.diagnostics().report(
                 Severity::Error, callSiteLoc_,

@@ -1046,4 +1046,174 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
     BEZEL_EXPECT_EQ(runVirtualLocal5009("T31", kVirtCallC5009), 207);
 }
 
+// ===========================================================================
+// T32-T42 — FOURTH REVIEW (of fix-forward 3, 8575510a). A virtual generic
+// method whose type argument crosses in NO parameter slips past the #1943
+// width gate on the vtable-slot call: every argument has the placeholder's
+// width, the body is not shipped (fix-forward 3), so the slot runs the
+// defining module's i32-placeholder template. MEASURED on 8575510a, with no
+// diagnostic and no internal warning: VNew 0 (twin 95), VCnt 0 (twin 47),
+// VCntSub 0 (twin 48), VCntSubD 0 (twin 48). The non-virtual NNew keeps the
+// constraint route and 95. Fix-forward 4 refuses the call on its BOUND (a
+// `new()` bound or one declared by the exporting module), not its widths.
+// ===========================================================================
+namespace {
+const char* kBoundDecls5009 =
+    "public interface IShapeB5009 "
+    "  method Area(): int; "
+    "end IShapeB5009; "
+    "public class SqB5009: IShapeB5009 "
+    "  public constructor() end constructor; "
+    "  public method Area(): int return 7; end Area; "
+    "end SqB5009; "
+    // VNew: 7 + 88 = 95.
+    "public class GBNew5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method Mk<T>(): int where T: IShapeB5009, new() "
+    "    var t := new T(); "
+    "    return t.Area() + 88; "
+    "  end Mk; "
+    "end GBNew5009; "
+    // VCnt: 7 + 40 = 47; the override 7 + 40 + 1 = 48.
+    "public class GBCnt5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method Cnt<T>(n: int): int where T: IShapeB5009, new() "
+    "    var t := new T(); "
+    "    return t.Area() + n; "
+    "  end Cnt; "
+    "end GBCnt5009; "
+    "public class GBCnt2V5009: GBCnt5009 "
+    "  public constructor() end constructor; "
+    "  public override method Cnt<T>(n: int): int where T: IShapeB5009, new() "
+    "    var t := new T(); "
+    "    return t.Area() + n + 1; "
+    "  end Cnt; "
+    "end GBCnt2V5009; "
+    // NNew (non-virtual, stays on the constraint route): 7 + 88 = 95.
+    "public class GBNNew5009 "
+    "  public constructor() end constructor; "
+    "  public method Mk<T>(): int where T: IShapeB5009, new() "
+    "    var t := new T(); "
+    "    return t.Area() + 88; "
+    "  end Mk; "
+    "end GBNNew5009; "
+    // A BUILTIN bound only: the i32 template is right, so it is not refused.
+    // 40 + 5 = 45.
+    "public class GBCls5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method Tag<T>(n: int): int where T: class "
+    "    return n + 5; "
+    "  end Tag; "
+    "end GBCls5009; ";
+
+const char* kBoundNew5009 =
+    "using var g := new GBNew5009(); return g.Mk<SqB5009>();";
+const char* kBoundCnt5009 =
+    "using var g := new GBCnt5009(); return g.Cnt<SqB5009>(40);";
+const char* kBoundCntSub5009 =
+    "using var g := new GBCnt2V5009(); var b: GBCnt5009 := g; "
+    "return b.Cnt<SqB5009>(40);";
+const char* kBoundCntSubD5009 =
+    "using var g := new GBCnt2V5009(); return g.Cnt<SqB5009>(40);";
+const char* kBoundNNew5009 =
+    "using var g := new GBNNew5009(); return g.Mk<SqB5009>();";
+const char* kBoundCls5009 =
+    "using var g := new GBCls5009(); return g.Tag<SqB5009>(40);";
+
+std::string mainB5009(const std::string& call) {
+    return "class CB5009 public static method Main(): int " + call +
+           " end Main; end CB5009;";
+}
+
+void expectBoundReject5009(const std::string& tag, const std::string& call,
+                           const std::string& name) {
+    auto r = compileImport5009(
+        std::string("module DepB5009; ") + kBoundDecls5009,
+        "module AppB5009" + tag + "; import DepB5009; " + mainB5009(call));
+    if (!r.depOk) return;
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(lowerReject5009(name)) != std::string::npos);
+}
+
+int runBoundImport5009(const std::string& tag, const std::string& call) {
+    return buildImportAndRun5009(
+        std::string("module DepB5009") + tag + "; " + kBoundDecls5009,
+        "module AppB5009" + tag + "; import DepB5009" + tag + "; " +
+            mainB5009(call));
+}
+
+int runBoundLocal5009(const std::string& tag, const std::string& call) {
+    return buildLocalAndRun5009(std::string("module LocB5009") + tag + "; " +
+                                kBoundDecls5009 + mainB5009(call));
+}
+}  // namespace
+
+// T32-T35 — ★ the silent zeros, now located rejects.
+// // per §14.1 / §14.2 new() / §2.8.3 rule 4 / #1943, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_new_bound_method_without_t_argument_is_rejected_not_zero) {
+    expectBoundReject5009("T32", kBoundNew5009, "Mk");
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_bound_method_with_only_int_argument_is_rejected_not_zero) {
+    expectBoundReject5009("T33", kBoundCnt5009, "Cnt");
+}
+
+// // per §14.1 / §12 / §2.8.3 rule 4 / #1943 / #5031, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_bound_method_via_base_receiver_is_rejected_not_zero) {
+    expectBoundReject5009("T34", kBoundCntSub5009, "Cnt");
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_bound_method_via_derived_receiver_is_rejected_not_zero) {
+    expectBoundReject5009("T35", kBoundCntSubD5009, "Cnt");
+}
+
+// T36 — the NON-virtual twin keeps the constraint route and its value.
+// // per §14.1 / §14.2 new() / §2.8.3 rule 4, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           non_virtual_new_bound_method_keeps_value_across_modules) {
+    int rc = runBoundImport5009("T36", kBoundNNew5009);
+    if (rc == -2) return;  // dependency toolchain unavailable
+    BEZEL_EXPECT_EQ(rc, 95);
+}
+
+// T37 — a BUILTIN-only bound is not refused: the i32 template is right.
+// // per §14.1 / §14.2 / §2.8.3 rule 4, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_builtin_bound_method_keeps_value_across_modules) {
+    int rc = runBoundImport5009("T37", kBoundCls5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 45);
+}
+
+// T38-T42 — DIFFERENTIAL CONTROLS: in ONE module every call has its value.
+// // per §14.1 / §12 / §2.8.3 rule 2, v0.307
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_new_bound_method_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runBoundLocal5009("T38", kBoundNew5009), 95);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_bound_method_int_argument_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runBoundLocal5009("T39", kBoundCnt5009), 47);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_bound_method_base_receiver_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runBoundLocal5009("T40", kBoundCntSub5009), 48);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_bound_method_derived_receiver_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runBoundLocal5009("T41", kBoundCntSubD5009), 48);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           non_virtual_new_bound_method_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runBoundLocal5009("T42", kBoundNNew5009), 95);
+}
+
 }  // namespace bezel::module
