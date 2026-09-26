@@ -3747,7 +3747,12 @@ private:
     // fix-forward #4807 (§4.6/§3.5/§6.1, v0.307): the body of `typeBinary`.
     // `typeBinary` runs it, then applies the §4.6 string-operand rule for
     // `-`/`*`/`/`/`mod` only where no more specific rule already rejected.
-    void typeBinaryRules(const ast::BinaryExpr& be);
+    // `stringArithRuleReached` is set when the body reaches the built-in
+    // arithmetic arm's §4.6 position — never on the §25 user-operator path
+    // (§25.2: an overload may pair its type with `string`), so the wrapper
+    // applies the rule exactly where #4807 originally did.
+    void typeBinaryRules(const ast::BinaryExpr& be,
+                         bool& stringArithRuleReached);
 
     // §17.1 result-type table for unary operators (slice 3c).
     // §25: a user-defined unary `operator <op>` (one parameter) declared on

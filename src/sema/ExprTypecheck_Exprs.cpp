@@ -5832,7 +5832,14 @@ bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
 
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     const std::size_t errorsBefore = ctx_.diagnostics().errorCount();
-    typeBinaryRules(be);
+    bool stringArithRuleReached = false;
+    typeBinaryRules(be, stringArithRuleReached);
+    // fix-forward (§25.2, v0.307): only where typeBinaryRules reached the
+    // built-in arithmetic arm. A resolved user operator (`operator *(v: V,
+    // s: string)`, §25.2: "a binary overload may pair the declaring type with
+    // any other type in either position") returns before it and is a call,
+    // not a built-in string arithmetic — neither diagnose it nor retype it.
+    if (!stringArithRuleReached) return;
     // fix #4807 (§4.6/§3.5, v0.307): `-`, `*`, `/`, `mod` carry no operator
     // on a `string` operand — §3.5 enumerates arithmetic (`+`/`-`/`*`/`/`
     // and unary `+`/`-`) BY OPERAND TYPE, on "byte…decimal", and §4.6 names
@@ -5878,7 +5885,8 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
 }
 
-void ExprTC::typeBinaryRules(const ast::BinaryExpr& be) {
+void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
+                             bool& stringArithRuleReached) {
     const auto& op = be.op;
     // §25: a user-defined operator overload takes precedence over the
     // built-in result-type rules; the expression is that method's call.
@@ -6999,6 +7007,10 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be) {
                 return;
             }
         }
+        // fix #4807 (§4.6/§3.5, v0.307): the §4.6 string-operand rule for
+        // `-`/`*`/`/`/`mod` applies from here on; `typeBinary` evaluates it
+        // after this body returns (see there for why it runs last).
+        stringArithRuleReached = true;
         // §2.5 (stdlib L264–265): TimeSpan + TimeSpan → TimeSpan and
         // TimeSpan - TimeSpan → TimeSpan are compiler-intrinsic operators
         // (TimeSpan is a builtin value type backed by a scalar i64 tick count;

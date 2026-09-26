@@ -408,3 +408,38 @@ BEZEL_TEST(sema_binop_operand_typing_4807,
     BEZEL_EXPECT_TRUE(hasDiag4807(r, kBitwiseHead));
     BEZEL_EXPECT_TRUE(hasDiag4807(r, kBitwiseSec65));
 }
+// ===========================================================================
+// T7 — §25.2 (v0.307): "a binary overload may pair the declaring type with
+// any other type in either position". A user operator resolved for a
+// `V op string` / `string op V` pair is a call, not built-in string
+// arithmetic, so the §4.6 string-operand rule must not reach it. Regression
+// for the fix-forward on f0d699db, which ran the rule after EVERY path of
+// typeBinary (including the §25 user-operator return) and rejected all three
+// operators below — plus retyped them `string`, cascading into "string member
+// `.X`" errors. Accepted at 78470f01; RUN and assert the computed values.
+// ===========================================================================
+BEZEL_TEST(sema_binop_operand_typing_4807,
+           t7_user_operator_with_string_operand_accepted_spec_25_2) {
+    auto r = runAot(
+        "module M; "
+        "record V(X: int) "
+        "  public static method operator *(v: V, s: string): V => "
+        "new V(v.X + s.Length); "
+        "  public static method operator -(s: string, v: V): V => "
+        "new V(s.Length - v.X); "
+        "  public static method operator mod(v: V, s: string): int => v.X; "
+        "end V; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var v := new V(1); var w := v * \"abc\"; "
+        "    var z := \"abcd\" - v; var m := v mod \"q\"; "
+        "    Console.WriteLine(w.X); Console.WriteLine(z.X); "
+        "    Console.WriteLine(m); return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "4\n3\n1\n");
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
+        r, "is not defined on a `string` operand"));
+}
