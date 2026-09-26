@@ -10539,7 +10539,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // static handlers an EMPTY `cls` (which matches no class name) when the
     // receiver is non-identifier so they all fall through to the instance
     // handlers. (No code after this point dereferences `id` except `cls`.)
-    const std::string_view cls = id ? id->name : std::string_view{};
+    //
+    // fix #5012 (§2.7, §6.7, v0.307): a module-qualified
+    // (`System.Threading.Task.FromResult(...)`) or alias-qualified
+    // (`<alias>.Task.FromResult(...)`) `Task` receiver is not a bare
+    // IdentifierExpr, so `id` is null and `cls` would otherwise be empty —
+    // matching no class name and silently falling through to the instance
+    // handlers below (which do nothing useful for a class-name receiver, so
+    // the call failed to lower and either degraded to a zero value or
+    // silently no-op'd depending on call context). Sema's
+    // `resolveMemberAccess` stamps this node's exprSymbol with the SAME
+    // builtin TypeSymbol the bare `Task` identifier gets (mirroring
+    // `ExprTypecheck_Exprs.cpp`'s `setExprSymbol`), so recognize it the same
+    // way sema's `colName` does — by symbol identity, not by re-deriving the
+    // qualifier structurally (codegen has no access to sema's private
+    // alias/module-path state).
+    std::string_view cls = id ? id->name : std::string_view{};
+    if (cls.empty()) {
+        if (auto* tsym = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
+            if (tsym == ctx_.builtinClassSym("Task")) cls = "Task";
+        }
+    }
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes

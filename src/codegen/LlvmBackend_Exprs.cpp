@@ -3699,6 +3699,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                 }
             }
+            // fix #5013 (§2.7, §6.1, v0.307): a module-qualified
+            // (`System.Threading.CancellationToken.None`) or alias-qualified
+            // (`<alias>.CancellationToken.None`) receiver is not a bare
+            // IdentifierExpr, so the `id2` check below never matches it and
+            // the access fell through with no lowering. Sema's
+            // `resolveMemberAccess` stamps the qualified node's (`ma->target`)
+            // exprSymbol with the SAME builtin TypeSymbol the bare
+            // `CancellationToken` identifier gets, mirroring the #5012 `Task`
+            // fix — recognize it the same way, by symbol identity.
+            if (ma->member == "None") {
+                if (auto* tsym =
+                        dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
+                    if (tsym == ctx_.builtinClassSym("CancellationToken"))
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                }
+            }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {

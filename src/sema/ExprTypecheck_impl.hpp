@@ -3469,6 +3469,28 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+
+    // §2.7 (v0.307) / fix #5012, #5013: does `headExpr` denote the builtin
+    // `System.Threading.<clsName>` class through a QUALIFIED
+    // (`System.Threading.<clsName>`) or ALIASED (`<alias>.<clsName>` under
+    // `import System.Threading as <alias>;`) spelling? `System.Threading`
+    // is a stdlib pseudo-module with no real loaded artifact
+    // (ctx_.importedTypesOf("System.Threading") is always null), so the
+    // general §2.2/§2.7 machinery in resolveMemberAccess (partialModulePaths_
+    // / sourceImports_, which only track real imported-module metadata)
+    // never recognizes it; this is the narrow additional case for the two
+    // builtin class names that have a static-dispatch special case
+    // elsewhere in this file (`Task`, stdlib §6.7; `CancellationToken`,
+    // stdlib §6.1). Guards against the two shadowing pitfalls named in
+    // #5012/#5013: a user module `System.Threading.Tasks` (plural) never
+    // matches, because it requires the immediate qualifier to be exactly
+    // `System.Threading` (member == "Threading"); and a local declaration
+    // that shadows `System` or the alias name (`!lookupName(...)`) is
+    // preferred over the builtin per §2.7 rule 1 ("local scope ... before
+    // import aliases").
+    bool isQualifiedBuiltinThreadingHead(const ast::Expr* headExpr,
+                                         std::string_view clsName);
+
     // fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §7.5, v0.254): the
     // #2884 + #2943 imported-property access declines, asked ONCE for both
     // the `.` and the `?.` spelling (they are distinct AST nodes and only

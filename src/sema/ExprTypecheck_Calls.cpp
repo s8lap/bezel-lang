@@ -6613,6 +6613,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // symbol but no TypeRef; fall back to reading the identifier name.
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
                         return id->name;
+                    // fix #5012 (§2.7, §6.7, v0.307): a module-qualified
+                    // (`System.Threading.Task.FromResult(...)`) or
+                    // alias-qualified (`<alias>.Task.FromResult(...)`) `Task`
+                    // head carries no TypeRef either, but `resolveMemberAccess`
+                    // stamps its exprSymbol with the SAME builtin TypeSymbol
+                    // the bare `Task` identifier gets — recognize it the same
+                    // way, by symbol identity, so `Task.FromResult`/`Delay`/
+                    // etc. type identically for all three spellings (§2.7:
+                    // a qualified name denotes the same entity).
+                    if (auto* tma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ma->target.get())) {
+                        auto* tsym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tma));
+                        if (tsym && tsym == ctx_.builtinClassSym("Task")) return "Task";
+                    }
                     return {};
                 }();
                 using P = PrimitiveType;
@@ -19885,6 +19899,36 @@ bool selfCallSiblingWhereSatisfiedByCaller(
 }
 }  // namespace
 
+// §2.7 (v0.307) / fix #5012, #5013 — see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale.
+bool ExprTC::isQualifiedBuiltinThreadingHead(const ast::Expr* headExpr,
+                                             std::string_view clsName) {
+    auto* headMa = dynamic_cast<const ast::MemberAccessExpr*>(headExpr);
+    if (!headMa || headMa->member != clsName || !headMa->target) return false;
+    const ast::Expr* qualifier = headMa->target.get();
+    // Alias-qualified: `<alias>.<clsName>` where the alias is
+    // `import System.Threading as <alias>;` (§2.7 rule 1). An alias name
+    // shadowed by a real declaration (a local variable named `T`, say)
+    // resolves to that declaration first, never to the alias.
+    if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(qualifier)) {
+        auto aliasIt = importAliases_.find(std::string(aid->name));
+        return aliasIt != importAliases_.end() &&
+               aliasIt->second == "System.Threading" &&
+               !lookupName(aid->name);
+    }
+    // Module-qualified: `System.Threading.<clsName>` — a literal two-level
+    // identifier chain. A user declaration named `System` would shadow the
+    // pseudo-module prefix (§2.7 rule 1), same discipline as the alias arm.
+    if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(qualifier)) {
+        if (inner->member == "Threading" && inner->target) {
+            if (auto* sid =
+                    dynamic_cast<const ast::IdentifierExpr*>(inner->target.get()))
+                return sid->name == "System" && !lookupName(sid->name);
+        }
+    }
+    return false;
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // fix #4961 (spec §28.14, v0.307): "forming a method reference over
     // a capture-free-register position is a compile error". The capture-free
@@ -20971,7 +21015,55 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, ctTy);
                 return;
             }
+        } else if (ma.member == "None" &&
+                   isQualifiedBuiltinThreadingHead(ma.target.get(),
+                                                   "CancellationToken")) {
+            // fix #5013 (§2.7, §6.1, v0.307): the same builtin property,
+            // reached through a module-qualified
+            // (`System.Threading.CancellationToken.None`) or alias-qualified
+            // (`<alias>.CancellationToken.None`) spelling. §2.7 says a
+            // qualified name denotes the SAME entity as the bare one, so it
+            // must type identically — mirrors the bare arm immediately
+            // above (down to the async-frame-slot-width rationale).
+            //
+            // Also stamp the exprSymbol of the INTERMEDIATE qualified node
+            // (`ma.target`, the "...CancellationToken" MemberAccessExpr)
+            // with the builtin TypeSymbol — codegen has no access to this
+            // pass's private alias/module-path state, so it reads this
+            // public, ctx_-visible fact (mirroring the bare identifier's own
+            // `ExprTypecheck_Exprs.cpp` `setExprSymbol`) instead of
+            // re-deriving the qualifier structurally.
+            ctx_.setExprSymbol(ma.target.get(), builtinClassSym("CancellationToken"));
+            auto* ctTy = ctx_.makeTypeRef();
+            ctTy->kind = TypeRef::Kind::Named;
+            ctTy->declaration = builtinClassSym("CancellationToken");
+            ctx_.setExprType(&ma, ctTy);
+            return;
         }
+    }
+    // fix #5012 (§2.7, §6.7, v0.307): a module-qualified
+    // (`System.Threading.Task`) or alias-qualified (`<alias>.Task` under
+    // `import System.Threading as <alias>;`) reference to the builtin
+    // `Task` static-helper class. §2.2 makes `Task` a public bare name of
+    // `System.Threading` and §2.7 says the qualified spelling denotes the
+    // SAME entity, so this node must carry the SAME exprSymbol the bare
+    // `Task` IdentifierExpr gets from `ExprTypecheck_Exprs.cpp`
+    // (`setExprSymbol(&e, builtinClassSym("Task"))`) — every downstream
+    // consumer (this function's own reject-gate just below, and
+    // `typeCall`'s `colName` lambda that types `Task.FromResult(...)` /
+    // `Task.Delay(...)` / etc.) key off that symbol, by identifier-only
+    // AST shape before this fix. Without it, `System.Threading.Task` typed
+    // to NOTHING (no exprType, no exprSymbol, no diagnostic): `await
+    // System.Threading.Task.FromResult(41)` silently produced a
+    // zero-initialized value (the callee's return type was never resolved)
+    // and `await System.Threading.Task.Delay(1)` silently no-op'd instead
+    // of delaying (the CALL failed to lower and, as a bare
+    // ExpressionStmt, its failure carries no diagnostic at all — a strictly
+    // worse silent failure than #4977's warned degradation).
+    if (ma.member == "Task" &&
+        isQualifiedBuiltinThreadingHead(&ma, "Task")) {
+        ctx_.setExprSymbol(&ma, builtinClassSym("Task"));
+        return;
     }
     // stdlib §6.7 (v0.307) / issue #4977: `Task` has NO static PROPERTIES —
     // its entire documented surface is static METHODS (Delay, FromResult,
