@@ -5831,6 +5831,54 @@ bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
 }
 
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
+    const std::size_t errorsBefore = ctx_.diagnostics().errorCount();
+    typeBinaryRules(be);
+    // fix #4807 (§4.6/§3.5, v0.307): `-`, `*`, `/`, `mod` carry no operator
+    // on a `string` operand — §3.5 enumerates arithmetic (`+`/`-`/`*`/`/`
+    // and unary `+`/`-`) BY OPERAND TYPE, on "byte…decimal", and §4.6 names
+    // `+` as the sole string operator (concatenation). Before #4807, `s - t`
+    // / `s * 1` / `s / 1` / `s mod 1` (and the symmetric operand order) fell
+    // through to the `result follows lt` rule, typed `string`, and reached
+    // codegen, which emitted `sub ptr` / `mul ptr` etc. on string pointers —
+    // LLVM IR verification rejected the module.
+    //
+    // fix-forward (gate on 78470f01): this rule runs AFTER the operator's
+    // other rules, not ahead of them. Run first, it pre-empted the more
+    // specific diagnostics that already rejected most of these programs:
+    // §6.1's "`mod` is not valid on `string`" (#3243) and the §5.1/§6.2
+    // operand-pair rejection (#4501, `string * int`). So: when an earlier
+    // rule has already reported an error for this expression, the §4.6 text
+    // is attached as a NOTE (it adds the fact the earlier text omits — that
+    // no conversion of the other operand could help, since `string` has no
+    // `-`/`*`/`/`/`mod` at all); otherwise (`s - t`, both `string`, which no
+    // other rule rejects) it is the ERROR, and the expression types `string`.
+    const auto& op = be.op;
+    if (op != "-" && op != "*" && op != "/" && op != "mod") return;
+    auto isStr = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::String;
+    };
+    TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+    TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+    if (!isStr(lt) && !isStr(rt)) return;
+    const bool alreadyRejected =
+        ctx_.diagnostics().errorCount() > errorsBefore;
+    ctx_.diagnostics().report(
+        alreadyRejected ? Severity::Note : Severity::Error, be.span.begin,
+        std::string("operator `") + std::string(op) +
+        "` is not defined on a `string` operand \xE2\x80\x94 only `+` "
+        "(concatenation) is defined on `string` (\xC2\xA7""4.6); the "
+        "operation `s " + std::string(op) + " t` has no result "
+        "(\xC2\xA7""4.6/\xC2\xA7""3.5)");
+    if (!alreadyRejected) {
+        auto* sTy = ctx_.makeTypeRef();
+        sTy->kind = TypeRef::Kind::Primitive;
+        sTy->primitive = PrimitiveType::String;
+        ctx_.setExprType(&be, sTy);
+    }
+}
+
+void ExprTC::typeBinaryRules(const ast::BinaryExpr& be) {
     const auto& op = be.op;
     // §25: a user-defined operator overload takes precedence over the
     // built-in result-type rules; the expression is that method's call.
@@ -6944,39 +6992,6 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     "`+` requires both operands to be `string` — the compiler "
                     "does not implicitly convert other types to `string`; use "
                     "interpolation (`$\"...{x}...\"`) or `.ToString()` (§4.6)");
-                auto* sTy = ctx_.makeTypeRef();
-                sTy->kind = TypeRef::Kind::Primitive;
-                sTy->primitive = PrimitiveType::String;
-                ctx_.setExprType(&be, sTy);
-                return;
-            }
-        }
-        // fix #4807 (§4.6/§3.5, v0.307): `-`, `*`, `/`, `mod` carry no
-        // operator on a `string` operand — §3.5 enumerates arithmetic
-        // (`+`/`-`/`*`/`/` and unary `+`/`-`) BY OPERAND TYPE, on
-        // "byte…decimal", and §4.6 names `+` as the sole string operator
-        // (concatenation). Before this, `s - t` / `s * 1` / `s / 1` /
-        // `s mod 1` (and the symmetric operand order) fell through to the
-        // `result follows lt` rule, typed `string`, and reached codegen,
-        // which emitted `sub ptr` / `mul ptr` etc. on string pointers —
-        // LLVM IR verification rejected the module ("Integer arithmetic
-        // operators only work with integral types! sub ptr", the issue's
-        // exact symptom). Reject the string operand here, naming §4.6's
-        // same-wording remedy the §4.6 `+` arm above already uses.
-        if (op == "-" || op == "*" || op == "/" || op == "mod") {
-            TypeRef* rtStr = be.right ? ctx_.exprType(*be.right) : nullptr;
-            auto isStr = [](const TypeRef* t) {
-                return t && t->kind == TypeRef::Kind::Primitive &&
-                       t->primitive == PrimitiveType::String;
-            };
-            if (isStr(lt) || isStr(rtStr)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, be.span.begin,
-                    std::string("operator `") + std::string(op) +
-                    "` is not defined on a `string` operand \xE2\x80\x94 only `+` "
-                    "(concatenation) is defined on `string` (\xC2\xA7""4.6); the "
-                    "operation `s " + std::string(op) + " t` has no result "
-                    "(\xC2\xA7""4.6/\xC2\xA7""3.5)");
                 auto* sTy = ctx_.makeTypeRef();
                 sTy->kind = TypeRef::Kind::Primitive;
                 sTy->primitive = PrimitiveType::String;

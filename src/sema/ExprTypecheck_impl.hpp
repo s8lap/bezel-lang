@@ -3744,6 +3744,10 @@ private:
                                                          std::size_t arity);
 
     void typeBinary(const ast::BinaryExpr& be);
+    // fix-forward #4807 (§4.6/§3.5/§6.1, v0.307): the body of `typeBinary`.
+    // `typeBinary` runs it, then applies the §4.6 string-operand rule for
+    // `-`/`*`/`/`/`mod` only where no more specific rule already rejected.
+    void typeBinaryRules(const ast::BinaryExpr& be);
 
     // §17.1 result-type table for unary operators (slice 3c).
     // §25: a user-defined unary `operator <op>` (one parameter) declared on

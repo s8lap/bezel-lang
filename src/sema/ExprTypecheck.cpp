@@ -19016,7 +19016,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // shift/bitwise/arithmetic split — Object is not integer-kind,
                 // so the shift/bitwise branch's own "integer types" gate misses
                 // it, and the arithmetic branch's Widening path admits it.
-                if (tTy->primitive == P::Object) {
+                // fix-forward (gate on 78470f01): scoped to the forms that
+                // gap actually admitted — every shift/bitwise form, and the
+                // arithmetic form only with an `Object` right-hand operand
+                // (`o += o`, R == T). An arithmetic `Object op= <non-Object>`
+                // (`o += 1`) was already rejected by the arithmetic branch's
+                // §6.6 "has no valid result: `Object + int`" wording below,
+                // which names the computed type; pre-empting it with this
+                // text flipped that pinned diagnostic (#4711's
+                // compound_without_narrowing_still_rejected).
+                if (tTy->primitive == P::Object &&
+                    (isShift || isBitwise || rTy->primitive == P::Object)) {
                     std::string binOp(as->op.substr(0, as->op.size() - 1));
                     ctx_.diagnostics().report(
                         Severity::Error, as->value->span.begin,
