@@ -14624,6 +14624,44 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     fnTy->getReturnType(), concParamTys, /*isVarArg=*/false);
             }
         }
+        // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): the #1943
+        // argument-width gate (below, on the direct-call path), applied to a
+        // CLASS-VIRTUAL slot call of an imported generic method. Such a call
+        // never reaches that gate: with no reconstructed body,
+        // emitVirtualGenericDispatch declines and the call loads the
+        // defining module's i32-placeholder template from the vtable. A
+        // pointer-width type argument then made LLVM's verifier abort the
+        // compile with an unlocated "Call parameter type does not match
+        // function signature" (MEASURED on b30c6f12, `GV.VBox<T>(v: T): int
+        // where T: IShape` called with a class). Report #1943's located
+        // diagnostic instead, as the direct call does. Only a call the
+        // verifier would reject reaches this, so no accepted program changes.
+        if (!isIfaceMethod && ctx_.isImported(ms) &&
+            !ms->genericParams.empty()) {
+            for (std::size_t ai = 0;
+                 ai < args.size() && ai < fnTy->getNumParams(); ++ai) {
+                if (args[ai]->getType() == fnTy->getParamType(ai)) continue;
+                SourceLocation loc = callLoc;
+                if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
+                    loc = (*argExprs)[ai]->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "calling imported generic method `" +
+                    std::string(ms->name) +
+                    "` with a type argument whose representation is not the "
+                    "compiled `int` (i32) placeholder \xE2\x80\x94 e.g. a "
+                    "class, `long`, `double`, `bool`, or a record \xE2\x80\x94 "
+                    "is not yet monomorphized across the module boundary for "
+                    "a virtual call (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, "
+                    "#5009): the method's body was compiled in its defining "
+                    "module against the placeholder layout, so the argument "
+                    "would cross the boundary at the wrong width. Call it "
+                    "within the module that defines it, or have it take a "
+                    "non-generic parameter");
+                if (fnTy->getReturnType()->isVoidTy()) return nullptr;
+                return llvm::PoisonValue::get(fnTy->getReturnType());
+            }
+        }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         // fix #2752: merge the string-receiver arm back in. Only reached when
         // the diamond above was emitted; strDispVal is non-null there because
@@ -15783,6 +15821,38 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         branches = std::move(all);
     }
     if (!defaultImpl) return nullptr;  // no implementation found — bail safely
+
+    // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): SIBLING GUARD of
+    // emitInlineGenericMethod's constraint-route backstop. A constraint-route
+    // body (ModuleLoader, `markConstraintRouteBody`) is proven only for the
+    // statically dispatched inline path, and neither the exporter nor the
+    // importer puts a virtual, override, abstract or interface method on that
+    // route. If one reaches the per-class dispatch anyway, report a located
+    // error rather than lowering it: MEASURED on bd0405e6, such bodies
+    // returned 0 here (twins 107 / 207), and override selection across the
+    // module boundary picked the base body (#5031). Checked before any
+    // instruction is emitted.
+    {
+        bool constraintRouteImpl = ctx_.isConstraintRouteBody(ms) ||
+                                   ctx_.isConstraintRouteBody(defaultImpl);
+        for (const Branch& b : branches)
+            if (ctx_.isConstraintRouteBody(b.impl)) constraintRouteImpl = true;
+        if (constraintRouteImpl) {
+            ctx_.diagnostics().report(
+                Severity::Error, callSiteLoc_,
+                "calling imported generic method `" + std::string(ms->name) +
+                "`: its body could not be monomorphized across the module "
+                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+                "\xE2\x80\x94 a virtual call to it cannot be dispatched to a "
+                "specialized body, so the call would silently compute a wrong "
+                "value. Call it within the module that defines it, or give it "
+                "a non-generic parameter");
+            if (llvm::FunctionType* ft = methodFnType(ms))
+                if (!ft->getReturnType()->isVoidTy())
+                    return llvm::PoisonValue::get(ft->getReturnType());
+            return nullptr;
+        }
+    }
 
     // Re-key the active substitution by the override's own generic-param names.
     // Base::Show<T> and Derived::Show<U> may name the parameter differently; the

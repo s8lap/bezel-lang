@@ -59,6 +59,12 @@
 // nested generic call bound, did not lower, and returned 0 (T18-T23, found by
 // a second non-author review); T24 pins the backstop for the shapes a
 // syntactic refusal cannot enumerate.
+// The third version (bd0405e6) shipped VIRTUAL generic bodies too. Those are
+// lowered by `emitVirtualGenericDispatch`, which neither layer covers, and
+// returned 0 or ran the base body for a derived receiver (T26-T28, found by a
+// third non-author review). Virtual, override, abstract and interface methods
+// are now kept off the route, and their call gets #1943's diagnostic on the
+// vtable-slot path.
 //
 // Deliberately NOT covered, and pinned as unchanged (T9): a bound on a
 // BUILTIN interface (`INumber<T>`, `IComparable<T>`) — the importer's fresh
@@ -96,7 +102,14 @@
 //   T24 ★ CODEGEN BACKSTOP: a body that binds but does not lower (a sibling
 //        generic class at T) is REJECTED at the call site, not 0
 //   T25  DIFFERENTIAL CONTROL for T18-T24 in ONE module -> 99
-//   T17   DIFFERENTIAL CONTROL for T11-T15 in ONE module -> 228
+//   T26 ★ `virtual VBox<T>` (a sibling generic class at T) on its own class
+//        is REJECTED with #1943's diagnostic (bd0405e6: 0, twin 107)
+//   T27 ★ the same through a base-typed receiver on an override
+//        (bd0405e6: 0, twin 207)
+//   T28 ★ a plain `v.Area() + 100 + k` virtual body through a base-typed
+//        receiver on an override (bd0405e6: 107 with NO warning, twin 207;
+//        override selection across modules is #5031)
+//   T29-T31 DIFFERENTIAL CONTROLS for T26-T28 in ONE module -> 107 / 207 / 207
 //
 // Every accept row asserts the constraint method's exact VALUE — "compiled"
 // is what the pre-fix T7 also did.
@@ -884,6 +897,153 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
             "GL5009.IdExplicit(s) + GL5009.GenBox(s) - 500; "
             "end Main; end CL5009;"),
         99);
+}
+
+// ===========================================================================
+// The fourth dependency, for T26-T31 (the third non-author review of
+// bd0405e6). VIRTUAL generic methods whose own type parameter has a sibling
+// bound. A virtual call is lowered by emitVirtualGenericDispatch, not
+// emitInlineGenericMethod, so on bd0405e6 the shipped body bypassed both the
+// pre-attach refusal and the backstop.
+// ===========================================================================
+namespace {
+const char* kVirtDecls5009 =
+    "public interface IShapeV5009 "
+    "  method Area(): int; "
+    "end IShapeV5009; "
+    "public class SqV5009: IShapeV5009 "
+    "  public constructor() end constructor; "
+    "  public method Area(): int return 7; end Area; "
+    "end SqV5009; "
+    "public class BoxV5009<U> "
+    "  private _u: U; "
+    "  public constructor(u: U) _u := u; end constructor; "
+    "  public method Get(): U return _u; end Get; "
+    "end BoxV5009; "
+    // (a): a sibling generic class at T. 7 + 100 = 107.
+    "public class GVA5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method VBox<T>(v: T): int where T: IShapeV5009 "
+    "    var b := new BoxV5009<T>(v); "
+    "    return b.Get().Area() + 100; "
+    "  end VBox; "
+    "end GVA5009; "
+    // (b): the same, overridden. Through a GVB5009 receiver on a GVB2:
+    // 7 + 200 = 207.
+    "public class GVB5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method VBox<T>(v: T): int where T: IShapeV5009 "
+    "    var b := new BoxV5009<T>(v); "
+    "    return b.Get().Area() + 100; "
+    "  end VBox; "
+    "end GVB5009; "
+    "public class GVB2V5009: GVB5009 "
+    "  public constructor() end constructor; "
+    "  public override method VBox<T>(v: T): int where T: IShapeV5009 "
+    "    return v.Area() + 200; "
+    "  end VBox; "
+    "end GVB2V5009; "
+    // (c): a plain body that LOWERS, overridden. Through a GVC5009 receiver
+    // on a GVC2: 7 + 200 = 207.
+    "public class GVC5009 "
+    "  public constructor() end constructor; "
+    "  public virtual method VPlain<T>(v: T): int where T: IShapeV5009 "
+    "    var k := 0; "
+    "    return v.Area() + 100 + k; "
+    "  end VPlain; "
+    "end GVC5009; "
+    "public class GVC2V5009: GVC5009 "
+    "  public constructor() end constructor; "
+    "  public override method VPlain<T>(v: T): int where T: IShapeV5009 "
+    "    return v.Area() + 200; "
+    "  end VPlain; "
+    "end GVC2V5009; ";
+
+const char* kVirtCallA5009 =
+    "using var g := new GVA5009(); return g.VBox(s);";
+const char* kVirtCallB5009 =
+    "using var g := new GVB2V5009(); var b: GVB5009 := g; return b.VBox(s);";
+const char* kVirtCallC5009 =
+    "using var g := new GVC2V5009(); var b: GVC5009 := g; "
+    "return b.VPlain(s);";
+
+std::string mainV5009(const std::string& call) {
+    return "class CV5009 public static method Main(): int "
+           "using var s := new SqV5009(); " + call +
+           " end Main; end CV5009;";
+}
+
+void expectVirtualReject5009(const std::string& tag, const std::string& call,
+                             const std::string& name) {
+    auto r = compileImport5009(
+        std::string("module DepV5009; ") + kVirtDecls5009,
+        "module AppV5009" + tag + "; import DepV5009; " + mainV5009(call));
+    if (!r.depOk) return;
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(widthReject5009(name)) != std::string::npos);
+}
+
+int runVirtualLocal5009(const std::string& tag, const std::string& call) {
+    return buildLocalAndRun5009(std::string("module LocV5009") + tag + "; " +
+                                kVirtDecls5009 + mainV5009(call));
+}
+}  // namespace
+
+// ===========================================================================
+// T26 — ★ THIRD REVIEW, shape (a). A virtual generic method whose body
+// instantiates a sibling generic class at T. On bd0405e6 its body was shipped
+// and lowered by emitVirtualGenericDispatch, outside both of fix-forward 2's
+// layers: exit 0, twin 107 (MEASURED). The body is no longer shipped, and the
+// vtable-slot call gets #1943's located diagnostic (b30c6f12: an unlocated
+// IR-verifier abort).
+// // per §14.1 / §2.8.3 rule 4 / #1943, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_generic_method_body_is_rejected_not_zero) {
+    expectVirtualReject5009("T26", kVirtCallA5009, "VBox");
+}
+
+// ===========================================================================
+// T27 — ★ shape (b): the same body, overridden, called through a base-typed
+// receiver on the derived object. bd0405e6: 0, twin 207 (MEASURED).
+// // per §14.1 / §12 / §2.8.3 rule 4 / #1943, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_virtual_generic_method_is_rejected_not_zero) {
+    expectVirtualReject5009("T27", kVirtCallB5009, "VBox");
+}
+
+// ===========================================================================
+// T28 — ★ shape (c), SILENT WRONG CODE on bd0405e6: a plain body that lowers,
+// overridden, through a base-typed receiver on the derived object. The
+// cross-module dispatch ran the BASE body: 107 with no warning, twin 207
+// (MEASURED). The override-selection hole itself is #5031; here the call is
+// kept off the constraint route, so it is rejected.
+// // per §14.1 / §12 / §2.8.3 rule 4 / #1943 / #5031, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_virtual_plain_body_is_rejected_not_base_value) {
+    expectVirtualReject5009("T28", kVirtCallC5009, "VPlain");
+}
+
+// ===========================================================================
+// T29-T31 — DIFFERENTIAL CONTROLS for T26-T28: in ONE module each virtual
+// call dispatches to the right body with its value.
+// // per §14.1 / §12 / §2.8.3 rule 2, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           virtual_generic_method_body_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runVirtualLocal5009("T29", kVirtCallA5009), 107);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_virtual_generic_method_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runVirtualLocal5009("T30", kVirtCallB5009), 207);
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           overridden_virtual_plain_body_value_in_one_module) {
+    BEZEL_EXPECT_EQ(runVirtualLocal5009("T31", kVirtCallC5009), 207);
 }
 
 }  // namespace bezel::module

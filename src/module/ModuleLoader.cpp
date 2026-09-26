@@ -3825,6 +3825,25 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
     return src;
 }
 
+// fix #5009 fix-forward 3: the loader-side twin of ModuleMetadataBuilder's
+// `astTypeMentionsNames` (#4600): does AST type `t` name one of `names` as a
+// bare type-parameter reference, at any nesting depth?
+static void astTypeMentionsNames5009(
+    const ast::Type* t, const std::unordered_set<std::string_view>& names,
+    std::unordered_set<std::string_view>& out) {
+    if (!t) return;
+    if (t->kind == ast::TypeKind::Named && t->name &&
+        t->name->parts.size() == 1 && t->genericArgs.empty() &&
+        names.count(t->name->parts.back()))
+        out.insert(t->name->parts.back());
+    for (const auto& ga : t->genericArgs)
+        astTypeMentionsNames5009(ga.get(), names, out);
+    astTypeMentionsNames5009(t->arrayElement.get(), names, out);
+    astTypeMentionsNames5009(t->funcReturn.get(), names, out);
+    for (const auto& fp : t->funcParams)
+        astTypeMentionsNames5009(fp.type.get(), names, out);
+}
+
 // §14.1 / #783: parse `target.methodBodyText` for an imported generic class
 // method, run the three sema passes in a FRESH SemaContext, remap the body's
 // exprSymbols (field / param / self-method) into mainCtx keyed on the re-parsed
@@ -4116,6 +4135,44 @@ static bool parseAndAttachMethodBody(
             const sema::TypeRef* b = freshCtx.resolvedType(*c.astBound);
             if (b && b->declaration && importedSibs.count(b->declaration))
                 failClosed = true;
+        }
+    }
+    // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): the route #5009
+    // opened is for STATICALLY DISPATCHED methods only. A virtual, override or
+    // abstract method, or an interface member, is lowered through
+    // `emitVirtualGenericDispatch`, which neither the refusal below nor the
+    // emitInlineGenericMethod backstop covers. MEASURED on bd0405e6: such
+    // bodies returned 0 (twins 107 / 207), and one ran the base body for a
+    // derived receiver, 107 with no warning (twin 207; override selection is
+    // #5031). The exporter no longer ships these bodies for this reason
+    // (`isConstraintUsingGenericMethod`). Defensively, here:
+    // - a body that reached this function for a pre-#5009 reason (a generic
+    //   owner, #783; a return-only type parameter, #4600) keeps that route
+    //   unchanged: it is not treated, or marked, as a constraint-route body;
+    // - any other one (metadata from a writer that still shipped it) is not
+    //   attached, so the call keeps the pre-#5009 template path.
+    if (failClosed) {
+        bool dynamicDispatch = td.kind == MetaTypeDeclKind::Interface;
+        for (const std::string& mod : target.modifiers)
+            if (mod == "virtual" || mod == "override" || mod == "abstract")
+                dynamicDispatch = true;
+        if (dynamicDispatch) {
+            bool preExistingRoute = !td.genericParams.empty();
+            if (const auto* pmd =
+                    dynamic_cast<const ast::MethodDecl*>(parsedMdBase)) {
+                // #4600's recognizer, restated over the fresh AST: a return
+                // type naming a method type parameter no formal names.
+                std::unordered_set<std::string_view> names;
+                for (const auto& gp : pmd->genericParams) names.insert(gp.name);
+                std::unordered_set<std::string_view> byArg, inRet;
+                for (const auto& p : pmd->params)
+                    astTypeMentionsNames5009(p.type.get(), names, byArg);
+                astTypeMentionsNames5009(pmd->returnType.get(), names, inRet);
+                for (std::string_view nm : inRet)
+                    if (!byArg.count(nm)) preExistingRoute = true;
+            }
+            if (!preExistingRoute) return false;
+            failClosed = false;
         }
     }
     bool unboundReference = false;

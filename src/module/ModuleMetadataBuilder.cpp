@@ -580,9 +580,26 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
 // (`emitInlineGenericMethod`) turns the INTERNAL degrade into a located error
 // at the call site. So an attached body either produces the single-module
 // value or fails the compile.
+//
+// fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): ONLY a method whose
+// dispatch is statically resolved. A `virtual`, `override` or `abstract`
+// method, or any member of an interface, is excluded. Its call is lowered by
+// `emitVirtualGenericDispatch` (per-(class, type-argument) bodies selected by
+// the receiver's runtime descriptor), not by `emitInlineGenericMethod`, so
+// neither the importer's pre-attach refusal nor the codegen backstop sees it.
+// MEASURED on bd0405e6: `virtual VBox<T>(v: T): int where T: IShape` returned
+// 0 cross-module (twin 107), the same through an override on a base-typed
+// receiver returned 0 (twin 207), and a plain `v.Area() + 100` virtual body
+// ran the BASE body for a GV2 receiver, 107 with no warning (twin 207). The
+// cross-module override selection that last row exposes is #5031. Keeping the
+// body off the wire leaves the call on the pre-#5009 path.
 bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
                                     sema::SemaContext& ctx) {
     if (md.genericParams.empty()) return false;
+    if (hasModifier(md.modifiers, "virtual") ||
+        hasModifier(md.modifiers, "override") ||
+        hasModifier(md.modifiers, "abstract"))
+        return false;
     std::unordered_set<std::string_view> names;
     for (const auto& gp : md.genericParams)
         if (!gp.name.empty()) names.insert(gp.name);
@@ -1487,7 +1504,11 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // type parameter carries a type or `new()` bound — its placeholder
             // template silently returns zero; see
             // `isConstraintUsingGenericMethod`'s header.
+            // An interface member dispatches through the itable, so it is
+            // excluded like a virtual method (fix-forward 3, see the header).
             const bool isConstraintUsingGeneric =
+                !(m.parent &&
+                  m.parent->kind == ast::TypeDeclKind::Interface) &&
                 isConstraintUsingGenericMethod(*md, ctx);
             if ((isGenericType || isNonGenericClassRecordReturn ||
                  isReturnOnlyGeneric || isConstraintUsingGeneric) &&
