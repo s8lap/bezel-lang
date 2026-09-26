@@ -369,6 +369,21 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
     // moved the codegen gate there.
     const bool classHasPrimaryCtor =
         t->kind == ast::TypeDeclKind::Class && t->hasPositionalFields;
+    // fix #4999 (§9.1 / §9.3 / §12.8 / §22.10, v0.307): a record with
+    // positional fields ALSO has a primary constructor — §9.1 "the compiler
+    // generates: A primary constructor whose parameters are the positional
+    // fields" — and §9.3 keeps "Chaining with `this(...)` to the primary
+    // ... governed by §12.8 unchanged". Like a class's §22.10 primary, it
+    // has no ConstructorSymbol, so the #3793 arity heuristic below, which
+    // counts only ConstructorSymbols as chain candidates, would read a
+    // body constructor's legal chain to the primary as a self-chain
+    // whenever the arities coincide. The #3793 self-chain check therefore
+    // exempts every type with a primary list, class or record; the §22.10
+    // convenience-must-chain rule further down stays CLASS-only (§9.3: it
+    // "is a class rule").
+    const bool typeHasPrimaryCtor =
+        t->hasPositionalFields && (t->kind == ast::TypeDeclKind::Class ||
+                                   t->kind == ast::TypeDeclKind::Record);
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs) continue;
@@ -411,8 +426,8 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
         // stayed calloc-zero with no diagnostic at any severity — silently
         // producing a wrong value.
         //
-        // Apply the rule ONLY to classes without a primary constructor:
-        // when a primary exists (`classHasPrimaryCtor`), the §22.10
+        // Apply the rule ONLY to types without a primary constructor:
+        // when a primary exists (`typeHasPrimaryCtor`, #4999), the §22.10
         // primary arm in `emitChainCall` (LlvmBackend_Setup.cpp:12189,
         // fix #1087) routes the call to the primary — which has no
         // ConstructorSymbol — rather than `cs`, so a self-arithmetic
@@ -427,7 +442,7 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
         // already diagnosed as misplaced/duplicated are skipped — the §12.8
         // diagnostic above already names the defect, and a second one over
         // the same statement would only add noise.
-        if (!classHasPrimaryCtor && !cs->isStatic &&
+        if (!typeHasPrimaryCtor && !cs->isStatic &&
             !misplacedChain && chainCount <= 1 &&
             !cd->body.empty() && cd->body[0]) {
             bool selfLeadingIsThis = false;

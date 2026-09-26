@@ -695,8 +695,12 @@ std::size_t formalParamCount(const ConstructorSymbol& cs) {
 const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
                                             const ConstructorSymbol& cs,
                                             const ast::ConstructorDecl& cd) {
-    // #3793 applies only to a class WITHOUT a §22.10 primary constructor.
-    if (t.kind == ast::TypeDeclKind::Class && t.hasPositionalFields)
+    // #3793 applies only to a type WITHOUT a primary constructor — a
+    // §22.10 class primary or, fix #4999 (§9.1 / §9.3, v0.307), a record's
+    // §9.1 auto-generated primary; the same predicate as
+    // `Resolver::checkTypeConstructorChains`'s `typeHasPrimaryCtor`.
+    if (t.hasPositionalFields && (t.kind == ast::TypeDeclKind::Class ||
+                                  t.kind == ast::TypeDeclKind::Record))
         return nullptr;
     if (cs.isStatic || cd.body.empty() || !cd.body[0]) return nullptr;
     // A misplaced or duplicated chain call is already a §12.8 error.
