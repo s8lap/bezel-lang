@@ -552,8 +552,15 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
 // member surface for the shared pair, so nothing else checks the handler's
 // signature against the payload: before this gate each of these compiled and
 // the handler was invoked through the `(T) -> ()` ABI (review probes p06,
-// p08, p09 — SEGV, garbage second argument, heap-use-after-free). Each keeps
-// the #2457 reject, asserted by its specific text.
+// p08, p09 — SEGV, garbage second argument, heap-use-after-free). Each was
+// first pinned by the codegen gate's #2457 reject; #4898 (sema
+// plainEventHandlerSlot extended to the shared pair, stdlib §6.5 / spec
+// §27.1.1, v0.307) now rejects the Subscribe / Add forms earlier, so these
+// rows assert its handler-slot diagnostic. The `+=` forms below still reach
+// the codegen gate. The overload-group row (p06) is the deliberate SOUND
+// spurious reject of #4978: §27.6 resolves `H.On` against the `(int) -> ()`
+// target to `On(int)`, which the compiler does not implement yet — flip it to
+// an accept-and-run row when #4978 lands.
 // -----------------------------------------------------------------------
 
 // p06: an overload GROUP `H.On` (On(string) / On(int)) on an int feed. Sema
@@ -575,8 +582,8 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    return 0; "
         "  end Main; "
         "end C;",
-        {"`Subscribe` on built-in type `SharedEventSource` produced no value",
-         "(#2457)"}));
+        {"the handler argument of `Subscribe` (stdlib \xC2\xA7""6.5, v0.307)",
+         "not implicitly convertible to the target type (\xC2\xA7""5.1)"}));
 }
 
 // p08: a static of arity 2 on an int feed — admitted, the second parameter
@@ -596,8 +603,8 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    return 0; "
         "  end Main; "
         "end C;",
-        {"`Subscribe` on built-in type `SharedEventSource` produced no value",
-         "(#2457)"}));
+        {"the handler argument of `Subscribe` (stdlib \xC2\xA7""6.5, v0.307)",
+         "not implicitly convertible to the target type (\xC2\xA7""5.1)"}));
 }
 
 // p09: a static whose formal is `owned m: Msg`. Each handler receives a
@@ -626,8 +633,8 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    return 0; "
         "  end Main; "
         "end C;",
-        {"`Subscribe` on built-in type `SharedEventSource` produced no value",
-         "(#2457)"}));
+        {"the handler argument of `Subscribe` (stdlib \xC2\xA7""6.5, v0.307)",
+         "parameter 1 is `owned` but the target's is (none)"}));
 }
 
 // A single, non-overloaded static whose parameter type differs from the
@@ -646,8 +653,8 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    return 0; "
         "  end Main; "
         "end C;",
-        {"`Add` on built-in type `SharedEventSource` produced no value",
-         "(#2457)"}));
+        {"the handler argument of `Add` (stdlib \xC2\xA7""6.5, v0.307)",
+         "not implicitly convertible to the target type (\xC2\xA7""5.1)"}));
 }
 
 // -----------------------------------------------------------------------
