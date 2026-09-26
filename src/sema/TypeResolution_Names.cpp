@@ -4221,6 +4221,26 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
         if (recv->name != "this" && recv->name != currentOuterType_->name)
             return;
         typeArgs = &ma->typeArgs;
+    } else if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(
+                   call.callee.get())) {
+        // fix #5027 (§14.6, v0.307): `this?.M<...>(...)` is a fourth spelling
+        // of the same self-loop as `this.M<...>(...)` — `this` is never null
+        // (§7.9), so the `?.` is a no-op wrapper around the identical access,
+        // yet this branch previously handled only MemberAccessExpr (the `.`
+        // form) and IdentifierExpr (the unqualified form), so the edge went
+        // unrecorded and the expanding-instantiation check never ran on it.
+        // MEASURED: `this?.Go<Pair<T, T>>(p)` inside `Go<T>` compiled past
+        // sema and hung the compiler in monomorphization (unbounded
+        // specialization family, the same pre-#3271 failure mode) rather
+        // than being rejected like its `this.Go<Pair<T, T>>(p)` twin.
+        // Unlike MemberAccessExpr, the enclosing-type-qualified spelling
+        // (`C.M<...>`) has no `?.` counterpart: a type name is not a value
+        // that can be null, so only `this` is admitted here.
+        if (nc->member != currentMethodDecl_->name) return;
+        auto* recv = dynamic_cast<const ast::IdentifierExpr*>(nc->target.get());
+        if (!recv || !recv->typeArgs.empty()) return;
+        if (recv->name != "this") return;
+        typeArgs = &nc->typeArgs;
     } else {
         return;
     }

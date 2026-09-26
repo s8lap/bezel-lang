@@ -402,6 +402,57 @@ BEZEL_TEST(expanding_in_scc_instantiation_3271,
     BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
 }
 
+// REJECTED — the same edge spelled `this?.M<…>` (issue #5027 follow-up:
+// `Resolver::recordGenericMemberSelfEdge` handled IdentifierExpr and
+// MemberAccessExpr callees but not NullCondMemberExpr, so a `?.`-spelled
+// self-call went unrecorded). `this` is never null (§7.9), so `this?.Go<…>`
+// is the identical access as `this.Go<…>` wrapped in a no-op null-conditional
+// — the same expanding instantiation, and MUST be rejected on the same
+// terms. Pre-fix this compiled past sema (no §14.6 diagnostic at all) and,
+// carried into codegen, hung the compiler in monomorphization instead of
+// being rejected at the declaration.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_nullcond_this_qualified_self_call_rejected_spec_14_6_issue_5027) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return this?.Go<Pair<T, T>>(p) ?? 0; "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// LEGAL — the `this?.M<…>` spelling of ordinary uniform self-recursion (the
+// bare-parameter admitted shape, §5027's over-rejection control): the fix
+// must record the edge and let `substitutionIsAdmitted` clear it, not reject
+// every `?.`-spelled self-call outright.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_nullcond_this_qualified_bare_param_admitted_spec_14_6_issue_5027) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Runner "
+        "  public method Depth<T>(x: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + (this?.Depth<T>(x, n - 1) ?? 0); "
+        "  end Depth; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
 // REJECTED — the nullable form on a member self-edge. Spec: "an argument
 // containing an in-scope type parameter other than as the bare argument
 // itself, the nullable form `T?` included".
