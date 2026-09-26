@@ -4024,6 +4024,66 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
             { needsThunk = true; break; }
     if (!needsThunk) return nullptr;
 
+    // fix #4918 (§13 / §14.1 / §7.10, v0.307): `class K: IId<int?>` with
+    // `Id(v: int?): int?` implements `IId<T>.Id(v: T): T` EXACTLY at
+    // `T := int?` — no nullability widening. The interface type above is the
+    // ERASED template (`T` → the i32 placeholder), so a bare-`T` formal whose
+    // substitution is a nullable VALUE type showed up as `i32` vs `{i8, i32}`
+    // and the check below (impl param is `T?`) took it for a §11.2 widening:
+    // the thunk returned the impl's `{i8, i32}` from an `i32` function —
+    // malformed IR. Resolve the interface's type parameters through the
+    // implementing class's OWN base clause for that interface
+    // (`baseTypeRefs`, parallel to `baseTypes`); when EVERY mismatching
+    // parameter is such an erased `T` whose substitution lowers to exactly
+    // the impl's carrier, this is the §14.1 generic-erasure case the
+    // call-site rebuild in emitMethodCall already handles, so no thunk is
+    // emitted. Anything not proven (no direct clause, an open argument, a
+    // mixed mismatch) keeps the widening logic below unchanged.
+    if (implMs->parent && ifaceMs->parent &&
+        !ifaceMs->parent->genericParams.empty()) {
+        const sema::TypeSymbol* implCls = implMs->parent;
+        const sema::TypeRef* ifaceRef = nullptr;
+        for (std::size_t bi = 0; bi < implCls->baseTypes.size(); ++bi)
+            if (implCls->baseTypes[bi] == ifaceMs->parent) {
+                ifaceRef = bi < implCls->baseTypeRefs.size()
+                               ? implCls->baseTypeRefs[bi] : nullptr;
+                break;
+            }
+        const std::vector<std::string_view> ifaceParams =
+            sema::genericParamNames(ifaceMs->parent);
+        if (ifaceRef && ifaceParams.size() == ifaceRef->genericArgs.size()) {
+            bool allErasedNullableSubst = true;
+            for (unsigned ci = 1;
+                 ci < ifaceTy->getNumParams() && allErasedNullableSubst; ++ci) {
+                if (ifaceTy->getParamType(ci) == implTy->getParamType(ci))
+                    continue;
+                unsigned pIdx = ci - 1;
+                const sema::TypeRef* ipr = nullptr;
+                if (pIdx < ifaceMs->params.size()) {
+                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                                   ifaceMs->params[pIdx]);
+                    if (ps) ipr = ps->resolvedDeclType
+                                      ? ps->resolvedDeclType
+                                      : (ps->declType
+                                             ? ctx_.resolvedType(*ps->declType)
+                                             : nullptr);
+                }
+                const sema::TypeRef* sub = nullptr;
+                if (ipr && isBareTypeParamRef(ipr) && !ipr->nullable) {
+                    for (std::size_t gi = 0; gi < ifaceParams.size(); ++gi)
+                        if (ifaceParams[gi] == ipr->headName()) {
+                            sub = ifaceRef->genericArgs[gi];
+                            break;
+                        }
+                }
+                if (!sub || isBareTypeParamRef(sub) || !isNullableValueTy(sub) ||
+                    nullableValueStructTy(sub) != implTy->getParamType(ci))
+                    allErasedNullableSubst = false;
+            }
+            if (allErasedNullableSubst) return nullptr;
+        }
+    }
+
     // #1183 / §11.2 / §12.1: only emit a thunk for NULLABLE-WIDENING
     // mismatches (impl declares T? where iface declares T, e.g. {i8,T}
     // vs T). For GENERIC-T erasure mismatches (iface has i32 as the T
