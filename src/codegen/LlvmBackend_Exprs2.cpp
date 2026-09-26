@@ -5049,6 +5049,11 @@ void Emitter::prePopulateBasePositionalFields(
     // (where primary-param slots for `t` are already populated by the caller).
 
     std::vector<llvm::Value*> baseArgVals;
+    // fix-forward #4981 (§4.6 / §28.9, v0.307): the source expression each
+    // `baseArgVals` entry was lowered from, index-aligned with it, so the
+    // store loop can tell a fresh +1 string (an interpolation, a call) from a
+    // borrowed one before it adds the #4981 retain. Cleared with it.
+    std::vector<const ast::Expr*> baseArgExprs;
 
     // fix #3562 (§22.8 step 0 / §22.5 / §22.10, v0.306): set when the explicit
     // `base(...)` arm below declines to fill `baseArgVals` because the call
@@ -5213,7 +5218,7 @@ void Emitter::prePopulateBasePositionalFields(
         // same split #4484 made on the `base(...)` arm).
         for (std::size_t ai = 0; ai < baseArgs->size(); ++ai) {
             const auto& arg = (*baseArgs)[ai];
-            if (!arg.value) { baseArgVals.clear(); break; }
+            if (!arg.value) { baseArgVals.clear(); baseArgExprs.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);
             // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause
             // face of the same gap — see the `storePrimaryCtorPositionalArgs`
@@ -5234,8 +5239,9 @@ void Emitter::prePopulateBasePositionalFields(
                         v, recordMemberTypeResolved(basePosFields[fi]),
                         arg.value.get());
             }
-            if (!v) { baseArgVals.clear(); break; }
+            if (!v) { baseArgVals.clear(); baseArgExprs.clear(); break; }
             baseArgVals.push_back(v);
+            baseArgExprs.push_back(arg.value.get());
         }
     }
     // --- Case (b): explicit ctor with leading base(...) chain call ---
@@ -5374,7 +5380,7 @@ void Emitter::prePopulateBasePositionalFields(
                 // indexed; only the STORE below is re-keyed by the binding.
                 for (std::size_t ai = 0; ai < chainCall->args.size(); ++ai) {
                     const auto& arg = chainCall->args[ai];
-                    if (!arg.value) { baseArgVals.clear(); break; }
+                    if (!arg.value) { baseArgVals.clear(); baseArgExprs.clear(); break; }
                     llvm::Value* v = lowerExpr(*arg.value);
                     // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the explicit
                     // `base(...)`-chain face of the same gap — same reasoning
@@ -5390,8 +5396,13 @@ void Emitter::prePopulateBasePositionalFields(
                                 v, recordMemberTypeResolved(basePosFields[fi]),
                                 arg.value.get());
                     }
-                    if (!v) { baseArgVals.clear(); break; }
+                    if (!v) {
+                        baseArgVals.clear();
+                        baseArgExprs.clear();
+                        break;
+                    }
                     baseArgVals.push_back(v);
+                    baseArgExprs.push_back(arg.value.get());
                 }
                 paramSlots_ = std::move(savedParams);
                 refParams_ = std::move(savedRefParams);  // fix #2584
@@ -5489,9 +5500,25 @@ void Emitter::prePopulateBasePositionalFields(
         // from a `ctor(s: string) base(s)` over a primary-ctor positional
         // field, and a `+1` producer there is unusual; widening this gate is
         // filed separately rather than guessed at here.
+        //
+        // fix-forward #4981 (§4.6 / §28.9, v0.307): that omission was wrong —
+        // the gate's plain leg caught it. A +1 producer (`$"v={a}"` in
+        // `class DInterp(a: int): BaseS($"v={a}")`) already hands the slot
+        // its one reference; retaining it again made it +2 against the single
+        // dispose-side release and leaked the string on every construction
+        // (row base_clause_new_argument_3742.control_value_shaped_base_clause_
+        // arguments_unchanged, LSan: 32 B direct + 4 B indirect). So the
+        // retain fires only for a BORROWED source — the same
+        // `isPlusOneStringProducer` gate the other string-slot stores use
+        // (e.g. LlvmBackend_Assign.cpp's field-assign path). An entry with no
+        // recorded expression keeps the unconditional retain.
+        const ast::Expr* srcExpr =
+            static_cast<std::size_t>(ai) < baseArgExprs.size()
+                ? baseArgExprs[static_cast<std::size_t>(ai)] : nullptr;
         if (v->getType()->isPointerTy() &&
             (isStringStorageMember(fs) ||
-             isTypeParamStringStorageMember(fs)))
+             isTypeParamStringStorageMember(fs)) &&
+            !(srcExpr && isPlusOneStringProducer(srcExpr)))
             emitStringRetain(v);
         llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
         v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);

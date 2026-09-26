@@ -268,6 +268,61 @@ end Program;
                 "a49\na49\n");
 }
 
+// fix-forward #4981 (§4.6 / §28.9 / §22.8 step 0, v0.307): the #4981 retain
+// in `prePopulateBasePositionalFields` was unconditional, so a +1 producer
+// argument (an interpolated string) was retained a second time and leaked
+// once per construction — the batch gate's plain leg failed
+// base_clause_new_argument_3742.control_value_shaped_base_clause_arguments_
+// unchanged on exactly this (LSan, 32 B + 4 B). These two rows loop the
+// shape through both arms of the function — the explicit `base(...)` chain
+// call over a generic base, and the inheritance clause over a non-generic
+// one — so the leak is amplified past any reachable-stack-slot masking.
+BEZEL_TEST(generic_ctor_string_field_retain_4965,
+           base_chain_plus_one_producer_arg_not_double_retained_loop_50) {
+    expectClean(R"BZL(
+module M;
+public class B<T>(v: T)
+  public property Q: T => v;
+end B;
+public class E: B<string>
+  public constructor(n: int) base($"a{n}"); end constructor;
+end E;
+public class Program
+  public static method Main(): int
+    for var i in 0..<50 do
+      using var e := new E(i);
+      if i = 49 then Console.WriteLine(e.Q); end;
+    end;
+    return 0;
+  end Main;
+end Program;
+)BZL",
+                "a49\n");
+}
+
+BEZEL_TEST(generic_ctor_string_field_retain_4965,
+           base_clause_plus_one_producer_arg_not_double_retained_loop_50) {
+    expectClean(R"BZL(
+module M;
+public class BaseS(s: string)
+  public method Get(): string
+    return s;
+  end Get;
+end BaseS;
+public class DInterp(a: int): BaseS($"v={a}") end DInterp;
+public class Program
+  public static method Main(): int
+    for var i in 0..<50 do
+      using var d := new DInterp(i);
+      if i = 49 then Console.WriteLine(d.Get()); end;
+    end;
+    return 0;
+  end Main;
+end Program;
+)BZL",
+                "v=49\n");
+}
+
 // A primary-constructor positional field `(value: T)`. Pre-fix: 3590 B / 200
 // allocations leaked (the +1 producer argument was stored, never released).
 BEZEL_TEST(generic_ctor_string_field_retain_4965, primary_positional_field_loop_100) {
