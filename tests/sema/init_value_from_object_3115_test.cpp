@@ -43,9 +43,13 @@
 //     (boxing), direct primitive initialization, primitive widening.
 //   * OUT-OF-SCOPE ACCEPT-CONTROLS: the reference-typed cases that the
 //     fix deliberately left on the permissive path (`Object → string`,
-//     `Object → user record`, `Object → interface`) — these pin the
-//     carve-out so a future broadening of the fix would visibly break
-//     these tests, forcing a coordinated update.
+//     `Object → interface`) — these pin the carve-out so a future
+//     broadening of the fix would visibly break these tests, forcing a
+//     coordinated update. (`Object → user record` was closed by fix
+//     #5023, §3.1/§3.2 v0.307 — see
+//     object_into_record_local_rejected_spec_3_1_5_1 in
+//     tests/sema/object_to_value_type_target_5023_test.cpp; the
+//     out-of-scope test below was flipped to REJECT accordingly.)
 //
 // Each test asserts on diagnostic TEXT — `coarse rejects()` cannot
 // distinguish a genuine compile error from a codegen ICE, and the §5.1
@@ -317,19 +321,25 @@ BEZEL_TEST(sema_init_value_from_object_3115,
 // =====================================================================
 // §3 / issue #3115 — SCOPE NOTE: the original brief listed reference-typed
 // targets (`string`, user record, interface) as ALSO requiring rejection.
-// The narrowed fix below addresses only the value-typed targets
-// (Primitive non-Object-non-String, and the value-builtin Named types
-// DateTime/TimeSpan/Guid/CancellationToken/DateOnly/TimeOnly). The
-// reference-typed cases remain on the permissive path because (a) the
-// existing test suite pins that behavior (#2761 function-value thunk,
-// #2752 IEquatable<Object> dispatch, #2766 method-group thunks, #1857
-// bare-T erasure substitution) and (b) iface dispatch handles them at
-// runtime via the vtable, so they are not the static "unbox" defect
-// #3115 is about. See the `out_of_scope_*_accepted` accept-control tests
-// below. The full reference-typed carve-out is filed as a separate spec
-// question (issue TBD; see follow-up issue comment on #3115) — addressing
-// it requires either a separate fix or a coordinated test-suite update
-// across #2752/#2761/#2766/#1857.
+// The narrowed #3115 fix addressed only the Primitive non-Object-non-String
+// and value-builtin Named targets (DateTime/TimeSpan/Guid/
+// CancellationToken/DateOnly/TimeOnly). `string` and `interface` remain on
+// the permissive path because (a) the existing test suite pins that
+// behavior (#2761 function-value thunk, #2752 IEquatable<Object> dispatch,
+// #2766 method-group thunks, #1857 bare-T erasure substitution) and (b)
+// iface dispatch handles them at runtime via the vtable, so they are not
+// the static "unbox" defect #3115 is about — see the two
+// `out_of_scope_*_accepted` tests below.
+//
+// `Object → user record` (and, more generally, every remaining value-type
+// target — records, enums, choices, and inline arrays `[N]T`) was closed
+// by fix #5023 (§3.1/§3.2, v0.307): a record/enum/choice/inline-array is a
+// value type by the same spec definition Primitive/value-builtin targets
+// use, so the identical static-unbox defect (a stored `ptr` reinterpreted
+// as the value's own bytes) applies to it too. The corresponding test
+// below is now a REJECT test; the full #5023 REJECT/ACCEPT matrix for
+// records/enums/choices/inline-arrays lives in
+// tests/sema/object_to_value_type_target_5023_test.cpp.
 // =====================================================================
 
 BEZEL_TEST(sema_init_value_from_object_3115,
@@ -353,7 +363,17 @@ BEZEL_TEST(sema_init_value_from_object_3115,
 }
 
 BEZEL_TEST(sema_init_value_from_object_3115,
-           out_of_scope_object_to_user_record_local_accepted_spec_3_5_1) {
+           object_to_user_record_local_rejected_spec_3_1_5_1_closed_by_5023) {
+    // Flipped by fix #5023 (§3.1/§3.2, v0.307): `Point` is a
+    // TypeDeclKind::Record, which §3.1 classifies as a value type exactly
+    // like the Primitive/value-builtin targets this file's other REJECT
+    // tests cover — so it now gets the same §5.1 "no implicit conversion"
+    // diagnostic as `var i: int := o;` above. This test previously pinned
+    // ACCEPT under the name
+    // `out_of_scope_object_to_user_record_local_accepted_spec_3_5_1`; see
+    // the SCOPE NOTE above and
+    // tests/sema/object_to_value_type_target_5023_test.cpp for the fuller
+    // record/enum/choice/inline-array matrix #5023 introduced.
     auto r = parseSemaAll(
         "module M; "
         "record Point(X: int, Y: int); "
@@ -364,7 +384,7 @@ BEZEL_TEST(sema_init_value_from_object_3115,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(!hasError(r, kIssue3115Diag));
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
 }
 
 BEZEL_TEST(sema_init_value_from_object_3115,

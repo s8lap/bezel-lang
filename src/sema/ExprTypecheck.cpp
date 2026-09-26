@@ -4267,38 +4267,63 @@ void ExprTC::checkAssignable(
         to->primitive == PrimitiveType::Object) {
         return;
     }
-    // §3 / §5.1 / §8.6 / issue #3115 (scope = VALUE-TYPED targets only):
-    // an `Object`-typed SOURCE (a class reference or a §8.6 box pointer)
-    // admits NO implicit conversion to a VALUE-TYPED target — Primitive
-    // non-Object non-String (`int`, `bool`, `char`, `float`, …) and the
-    // Named value-builtins (`DateTime`, `TimeSpan`, `Guid`,
-    // `CancellationToken`, `DateOnly`, `TimeOnly`). The static "unbox"
-    // path this function used to admit on `(!from->nullable ||
-    // to->nullable)` had no runtime counterpart: codegen's
-    // `lowerLocalDecl` stores the `ptr`-typed slot at the value's
-    // storage (LlvmBackend_Setup.cpp `llvm::Type* slotTy = v ? v->
-    // getType() : …`) and a later load reinterprets the box pointer as
-    // the value, so `var i: int := o;` prints the low 32 bits of the
+    // §3 / §5.1 / §8.6 / issue #3115, extended by issue #5023 (scope =
+    // VALUE-TYPED targets only): an `Object`-typed SOURCE (a class
+    // reference or a §8.6 box pointer) admits NO implicit conversion to
+    // a VALUE-TYPED target. §3.1/§3.2 (v0.307) fix the full population
+    // of "value type": primitives (non-`Object`, non-`string`), records,
+    // enums, choices, inline arrays `[N]T` (owning and non-owning
+    // alike), and the unit type `()` — plus the Named value-builtins
+    // (`DateTime`, `TimeSpan`, `Guid`, `CancellationToken`, `DateOnly`,
+    // `TimeOnly`) that are carried as synthetic `kind==Class` symbols
+    // with `isValueBuiltin` rather than as `TypeDeclKind::Record`. The
+    // static "unbox" path this function used to admit on
+    // `(!from->nullable || to->nullable)` had no runtime counterpart:
+    // codegen's `lowerLocalDecl` stores the `ptr`-typed slot at the
+    // value's storage (LlvmBackend_Setup.cpp `llvm::Type* slotTy = v ?
+    // v->getType() : …`) and a later load reinterprets the box pointer
+    // as the value, so `var i: int := o;` prints the low 32 bits of the
     // box's heap address under ASLR instead of `42`, and the assignment
     // form `i := o;` produces the same garbage. The sanctioned
     // spellings carry an explicit runtime check: §12.7
     // (`if o is T then var v: T := o; end;`, the proven-narrowing path
     // #3090 leaves intact) or §17.4 (`var v := o as T;`, yielding `T?`).
     //
+    // issue #5023: this predicate originally covered only Primitive and
+    // the Named value-builtins, so `var b: [3]int := o;` and
+    // `var p: Pt := o;` (Pt a record) were silently admitted — the same
+    // reinterpret-the-box-pointer bug the scalar case above documents,
+    // just unreached for these target kinds. Extended here to
+    // `TypeRef::Kind::InlineArray` (any `[N]T`/`[N owned]T`, §3.2, §8.6
+    // "Boxing of inline arrays") and to `TypeRef::Kind::Named` types
+    // whose declaration is `TypeDeclKind::Record`, `::Enum`, or
+    // `::Choice` (§3.1's value-type list; a choice is a value type on
+    // every classification per §3.1's "Choices — user-defined value
+    // types", so no classification check is needed here). `Unit` is
+    // NOT extended: §4 ("The unit type is a value type and can in
+    // principle be boxed … The result is rarely meaningful") and §8.6
+    // ("Boxing of the unit value") both describe the forward
+    // (`() -> Object`) direction only, boxed `()` carries no payload to
+    // misread (the reinterpret-the-box-pointer defect this predicate
+    // exists to close cannot manifest — there is no bit pattern to get
+    // wrong), and no probe or spec passage was found describing the
+    // reverse; left for a follow-up issue rather than folded in
+    // silently (CLAUDE.md "Decline-with-reasons").
+    //
     // OUT OF SCOPE for this fix (deliberately kept on the permissive
     // path): `Object → reference-typed Primitive` (`string`), `Object →
-    // Named` (class / interface / record / enum / choice), and
-    // `Object → function-typed` (the §27.6 property-getter-as-function-
-    // value re-type). These are surfaces pinned by the existing test
-    // suite (#2761 function-value thunk, #2752 `IEquatable<Object>`
-    // dispatch, #2766 method-group thunks, #1857 bare-T erasure
-    // substitution) and are a separate spec question (does §3 forbid
-    // implicit unchecked downcast to a reference-typed target, or is
-    // the iface dispatch vtable a sufficient runtime check?). The
-    // function-typed carve-out is critical: the §27.6 block below
-    // re-types the source expression as the function type, which
-    // codegen's property-thunk emitter needs; an early-return here
-    // would skip the re-typing and produce a runtime SIGSEGV.
+    // Named` (class / interface), and `Object → function-typed` (the
+    // §27.6 property-getter-as-function-value re-type). These are
+    // surfaces pinned by the existing test suite (#2761 function-value
+    // thunk, #2752 `IEquatable<Object>` dispatch, #2766 method-group
+    // thunks, #1857 bare-T erasure substitution) and are a separate spec
+    // question (does §3 forbid implicit unchecked downcast to a
+    // reference-typed target, or is the iface dispatch vtable a
+    // sufficient runtime check?). The function-typed carve-out is
+    // critical: the §27.6 block below re-types the source expression as
+    // the function type, which codegen's property-thunk emitter needs;
+    // an early-return here would skip the re-typing and produce a
+    // runtime SIGSEGV.
     //
     // Exceptions preserved so existing tests stay green: `null` (typed
     // `Object?`) assigning to a nullable target (`var x: int? := null;`)
@@ -4317,7 +4342,17 @@ void ExprTC::checkAssignable(
         bool toIsValueBuiltinNamed =
             to->kind == TypeRef::Kind::Named &&
             isValueBuiltinByName(to->headName());
-        if (toIsValuePrimitive || toIsValueBuiltinNamed) {
+        // issue #5023 (§3.1/§3.2, v0.307): the rest of the value-type
+        // population — user-declared records/enums/choices, and inline
+        // arrays of any element type or owning-ness.
+        bool toIsValueRecordEnumOrChoice =
+            to->kind == TypeRef::Kind::Named && to->declaration &&
+            (to->declaration->kind == ast::TypeDeclKind::Record ||
+             to->declaration->kind == ast::TypeDeclKind::Enum ||
+             to->declaration->kind == ast::TypeDeclKind::Choice);
+        bool toIsInlineArray = to->kind == TypeRef::Kind::InlineArray;
+        if (toIsValuePrimitive || toIsValueBuiltinNamed ||
+            toIsValueRecordEnumOrChoice || toIsInlineArray) {
             if (from->nullable && to->nullable) {
                 return;  // `null → T?` — the legitimate §5.1 path.
             }
