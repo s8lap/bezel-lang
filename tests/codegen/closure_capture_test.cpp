@@ -131,11 +131,17 @@ BEZEL_TEST(codegen_closures_27_5, independent_counters) {
 // binding, so a lambda captured in the body sees that iteration's value. An
 // array of lambdas, each built in a distinct iteration, returns distinct
 // values rather than all observing the final loop value.
+//
+// The array carries an explicit initializer: a function type is a non-nullable
+// reference type, hence not defaultable (§17.11, v0.307), so `[3]() -> int`
+// without an initializer is rejected (§15.1 / §7.9, v0.307; #4419). The
+// uninitialised form is pinned as a reject in
+// tests/sema/definite_assignment_default_init_4419_test.cpp.
 BEZEL_TEST(codegen_closures_27_5, loop_variable_fresh_binding) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [3]() -> int; "
+        "    var fns: [3]() -> int := [lambda() => 0, lambda() => 0, lambda() => 0]; "
         "    for var i in 1..3 do "
         "      fns[i - 1] := lambda() => i; "  // captures THIS iteration's i
         "    end; "
@@ -148,17 +154,20 @@ BEZEL_TEST(codegen_closures_27_5, loop_variable_fresh_binding) {
 // closure-in-loop bug), all three lambdas would observe the final value (3)
 // and the sum would be 9. Fresh binding gives 6, so this guards against the
 // regression directly.
+//
+// Asserts the exact value (not merely `!= 9`): `run` returns -999 on a compile
+// reject, and a `!= 9` oracle passed vacuously on that (#4419).
 BEZEL_TEST(codegen_closures_27_5, loop_capture_not_all_final_value) {
-    BEZEL_EXPECT_TRUE(run(
+    BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [3]() -> int; "
+        "    var fns: [3]() -> int := [lambda() => 0, lambda() => 0, lambda() => 0]; "
         "    for var i in 1..3 do "
         "      fns[i - 1] := lambda() => i; "
         "    end; "
-        "    return fns[0]() + fns[1]() + fns[2](); "
+        "    return fns[0]() + fns[1]() + fns[2](); "  // 6, never 9
         "  end Main; "
-        "end C;") != 9);
+        "end C;"), 6);
 }
 
 // §27.5: a captured method parameter shares storage too — a write inside the

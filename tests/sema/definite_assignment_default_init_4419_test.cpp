@@ -351,3 +351,67 @@ BEZEL_TEST(sema_da,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("loop-carried OK\n"));
 }
+
+// ---------------------------------------------------------------------------
+// T8 / T9: REJECT pins for the element-store shapes the pre-#4419 carve-out
+// silently admitted — the exact programs several codegen rows used before they
+// were rewritten with explicit initializers (closure_capture_test.cpp
+// `codegen_closures_27_5`, inline_array_equality_test.cpp /
+// inline_array_equals_3091_test.cpp `codegen_inline_array_eq`,
+// lambda_test.cpp `codegen_cg60`).
+//
+// §17.11 (v0.307): a function type and `string` are non-nullable reference
+// types, hence not defaultable, and "an inline array whose element type is not
+// defaultable" is not defaultable either. §15.1 (v0.307): "When the element
+// type is not defaultable … an explicit initializer is required at
+// declaration." §7.9 (v0.307): "a local of non-defaultable type must be
+// assigned before it is read." An element store `a[i] := v` is not an
+// assignment of the local — the uninitialised local holds no value (§28,
+// v0.307) — so the element store itself uses the unassigned local.
+//
+// Pre-#4419 (InlineArray-only carve-out) both programs were ACCEPTED, so both
+// rows fail there; they pass once `[N]T` is admitted only at a defaultable T.
+// ---------------------------------------------------------------------------
+
+namespace {
+bool hasUnassignedRead(const bezel::test::DAResult& r, const std::string& name) {
+    const std::string needle = "read of unassigned local `" + name + "`";
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+} // namespace
+
+// T8: `[3]() -> int` without an initializer, filled by element stores in a
+// loop, then read — rejected with the exact definite-assignment diagnostic.
+BEZEL_TEST(sema_da,
+           inline_array_function_element_no_init_element_store_rejected_spec_15_1_4419) {
+    auto r = parseAndCheckDA(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var fns: [3]() -> int; "
+        "    for var i in 1..3 do "
+        "      fns[i - 1] := lambda() => i; "
+        "    end; "
+        "    return fns[0]() + fns[1]() + fns[2](); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUnassignedRead(r, "fns"));
+}
+
+// T9: `[2]string` without an initializer, filled by element stores, then
+// compared — rejected with the exact definite-assignment diagnostic.
+BEZEL_TEST(sema_da,
+           inline_array_string_element_no_init_element_store_rejected_spec_15_1_4419) {
+    auto r = parseAndCheckDA(
+        "module M; class C public static method Main(): int "
+        "  var a: [2]string; a[0] := \"foo\"; a[1] := \"ba\" + \"r\"; "
+        "  var b: [2]string; b[0] := \"f\" + \"oo\"; b[1] := \"bar\"; "
+        "  return (if a = b then 1 else 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUnassignedRead(r, "a"));
+    BEZEL_EXPECT_TRUE(hasUnassignedRead(r, "b"));
+}

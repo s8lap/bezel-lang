@@ -7,14 +7,24 @@
 //   - storing lambdas in locals and passing them later
 // Captures (closures over outer variables) are deferred.
 
+#include "support/aot_support.hpp"   // runAot — strict AOT oracle for ported rows
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
     auto r = runJit(prog);
+    return r.ran ? r.exitCode : -999;
+}
+// Rows ported off the deprecated lenient JIT oracle (#4419). Only rows that
+// pass the strict AOT path are ported; the file-wide switch also turns
+// method_reference_stored_in_local, once_pattern, partial_application and
+// function_typed_field_call red under runAot, which is out of #4419's scope.
+int runA(const std::string& prog) {
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }
@@ -269,10 +279,13 @@ BEZEL_TEST(codegen_cg60, curried_add) {
 
 BEZEL_TEST(codegen_cg60, array_element_call) {
     // Calling a closure stored in an inline array element: `handlers[i]()`.
-    BEZEL_EXPECT_EQ(run(
+    // Explicit initializer: a function type is not defaultable (§17.11,
+    // v0.307), so an uninitialised `[3](int) -> int` is rejected (§15.1 /
+    // §7.9, v0.307; #4419).
+    BEZEL_EXPECT_EQ(runA(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [3](int) -> int; "
+        "    var fns: [3](int) -> int := [lambda(x: int) => 0, lambda(x: int) => 0, lambda(x: int) => 0]; "
         "    fns[0] := lambda(x: int) => x + 1; "
         "    fns[1] := lambda(x: int) => x * 2; "
         "    fns[2] := lambda(x: int) => x - 1; "
@@ -384,10 +397,10 @@ BEZEL_TEST(codegen_cg60, positional_record_fn_field_second_slot_747) {
 BEZEL_TEST(codegen_cg60, array_element_string_return) {
     // Verify that calling a `(int)->string` through an array element correctly
     // types the result as string (enabling .Length etc.).
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runA(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [2](int) -> string; "
+        "    var fns: [2](int) -> string := [lambda(n: int) => \"\", lambda(n: int) => \"\"]; "
         "    fns[0] := lambda(n: int) => (if n > 0 then \"abc\" else \"xy\"); "
         "    fns[1] := lambda(n: int) => \"hello\"; "
         "    var r0 := fns[0](5); "   // = "abc", length 3
