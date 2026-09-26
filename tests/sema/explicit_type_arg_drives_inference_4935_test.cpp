@@ -126,14 +126,14 @@ BEZEL_TEST(explicit_type_arg_drives_inference_4935,
         "end P;";
     {
         auto r = runAot(prog);
-        BEZEL_EXPECT_FALSE(hasAnyError(r));
+        BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(r.ran);
         BEZEL_EXPECT_EQ(r.exitCode, 0);
         BEZEL_EXPECT_EQ(r.stdoutText, std::string("n\n"));
     }
     {
         auto r = runAotChecked(prog);
-        BEZEL_EXPECT_FALSE(hasAnyError(r));
+        BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(r.ran);
         BEZEL_EXPECT_EQ(r.exitCode, 0);
         BEZEL_EXPECT_EQ(r.stdoutText, std::string("n\n"));
@@ -168,14 +168,14 @@ BEZEL_TEST(explicit_type_arg_drives_inference_4935,
         "end P;";
     {
         auto r = runAot(prog);
-        BEZEL_EXPECT_FALSE(hasAnyError(r));
+        BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(r.ran);
         BEZEL_EXPECT_EQ(r.exitCode, 0);
         BEZEL_EXPECT_EQ(r.stdoutText, std::string("n\n"));
     }
     {
         auto r = runAotChecked(prog);
-        BEZEL_EXPECT_FALSE(hasAnyError(r));
+        BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(r.ran);
         BEZEL_EXPECT_EQ(r.exitCode, 0);
         BEZEL_EXPECT_EQ(r.stdoutText, std::string("n\n"));
