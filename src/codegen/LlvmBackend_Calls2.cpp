@@ -7303,6 +7303,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                             res, conv, {1u}, "cl.arg.lift");
                                     }
                                 }
+                            } else if (args[ai]->getType()->isIntegerTy() ||
+                                       args[ai]->getType()
+                                           ->isFloatingPointTy()) {
+                                // fix #4963 (§5.1 `S → T → T?`, v0.307): a
+                                // NARROWER numeric argument at a closure's
+                                // nullable-value formal (`f(7)` against
+                                // `(long?) -> long`) widens to the payload,
+                                // then wraps — the closure-call twin of
+                                // #4922's buildOrderedArgs fix, through the
+                                // same helper. Before this the bare i32
+                                // reached the `{i8, i64}` parameter: IR
+                                // verification failure.
+                                const ast::Expr* srcE =
+                                    pi < call.args.size()
+                                        ? call.args[pi].value.get()
+                                        : nullptr;
+                                args[ai] = coerceReturnToNullableValue(
+                                    args[ai], formalTy,
+                                    srcE && isUnsignedTargetExpr(*srcE),
+                                    /*sourceIsNullableRef=*/false, srcE);
                             }
                         }
                         continue;  // type is now correct; skip numeric coercions
@@ -12172,6 +12192,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                         res, conv, {1u}, "imp.arg.lift");
                                 }
                             }
+                        } else if (v->getType()->isIntegerTy() ||
+                                   v->getType()->isFloatingPointTy()) {
+                            // fix #4963 (§5.1 `S → T → T?`, v0.307): the
+                            // imported-callee twin of #4922's widen-then-
+                            // wrap (an `int` argument at a `long?` formal).
+                            v = coerceReturnToNullableValue(
+                                v, formalTy, isUnsignedTargetExpr(*a.value),
+                                /*sourceIsNullableRef=*/false, a.value.get());
                         }
                     }
                 }
@@ -13227,6 +13255,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     return result;
 }
 
+// fix #4963 (§5.1 / §14.1, v0.307): set by applyMethodGenericSubst to the
+// callee `ms` when one of its OWN method type parameters was already bound by
+// name in the incoming (caller / receiver) substitution and no explicit
+// call-site type argument confirms that binding — the #4813 same-name
+// shadowing shape, where the name-keyed map resolves the callee's `T` through
+// the CALLER's binding. emitMethodCall (same TU) reads and clears it: its
+// #4963 widen-then-wrap pre-lift resolves formals through genericSubst_, so
+// under a collision it would lift against the caller's `T` and turn #4813's
+// compile-time failure into a silent wrong value; the lift is skipped instead,
+// leaving #4813's behaviour unchanged. File-local (not an Emitter member) so
+// the fix does not touch LlvmBackend_impl.hpp; thread_local because an
+// Emitter is confined to one thread.
+namespace {
+thread_local const sema::MethodSymbol* methodTParamShadowCallee4963 = nullptr;
+}  // namespace
+
 // per §14.1/§14.2 + §26.5/§7.5 (issue #1278): see the header comment in
 // LlvmBackend_impl.hpp. Extracted verbatim from lowerCall's inline block so
 // lowerNullCondCall (`?.`) drives the identical method-generic substitution
@@ -13294,6 +13338,37 @@ void Emitter::applyMethodGenericSubst(
         std::swap(genericSubst_, cSubst);
         std::swap(genericSubstSemaTy_, cSema);
     };
+    // fix #4963 (§5.1 / §14.1, v0.307): record a #4813 same-name collision —
+    // one of the callee's own type parameters is ALREADY bound by name in the
+    // incoming (caller / receiver) substitution, and no explicit call-site
+    // type argument confirms that binding. The name-keyed maps below keep the
+    // incoming binding, so the callee's `T` resolves through the caller's;
+    // emitMethodCall's #4963 pre-lift must not trust it (see
+    // methodTParamShadowCallee4963).
+    {
+        const std::vector<std::unique_ptr<ast::Type>>* shTAs = nullptr;
+        if (auto* shMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get()))
+            shTAs = &shMa->typeArgs;
+        else if (auto* shNcm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     call.callee.get()))
+            shTAs = &shNcm->typeArgs;
+        else if (auto* shId = dynamic_cast<const ast::IdentifierExpr*>(
+                     call.callee.get()))
+            shTAs = &shId->typeArgs;
+        for (std::size_t gi = 0; gi < md->genericParams.size(); ++gi) {
+            auto it = genericSubst_.find(md->genericParams[gi].name);
+            if (it == genericSubst_.end()) continue;
+            bool confirmed = false;
+            if (shTAs && gi < shTAs->size() && (*shTAs)[gi])
+                if (sema::TypeRef* ta = ctx_.resolvedType(*(*shTAs)[gi]))
+                    confirmed = lowerTypeRef(ta) == it->second;
+            if (!confirmed) {
+                methodTParamShadowCallee4963 = ms;
+                break;
+            }
+        }
+    }
     // fix #1894 #1895 / §14.1: EXPLICIT call-site type arguments
     // (`Make<long, long>(...)`) are AUTHORITATIVE and must be bound FIRST,
     // before any argument-driven inference. An argument's own expression type
@@ -13991,6 +14066,50 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return false;
         return isUnsignedTargetExpr(*(*argExprs)[ai]);
     };
+    // fix #4963 (§5.1 `S → T → T?` / §14.1, v0.307): under an active generic
+    // substitution a formal declared `T?` (or a bare `T` bound to a nullable
+    // value type, #4830 case C) is not a nullable value type until it is
+    // resolved, so buildOrderedArgs's CG-nullable block — which reads the
+    // unresolved declaration — leaves a narrower numeric argument bare:
+    // `Id<long>(5)` against `Id<T>(x: T?)` arrives as `i32 5`.
+    // wrapArgForNullableValueFormal (emitGenericSpecialization and the
+    // expression-body binding) wraps only an EXACT-payload argument, so the
+    // specialization was built with an `i32` parameter the body then read as
+    // `{i8, i64}` (bezelc SIGSEGV in lowerCoalesce). Widen, then wrap, HERE,
+    // where the argument's source expression — and so its signedness — is
+    // still known; the downstream wrap then sees the finished carrier. Every
+    // emitInlineGenericMethod/emitGenericSpecialization entry is in this
+    // function, below this point, under the same substitution.
+    // `coerceReturnToNullableValue` resolves the formal exactly as
+    // wrapArgForNullableValueFormal does (cases A/B/C) and returns the value
+    // unchanged for any formal that is not a nullable value type.
+    // Under a #4813 same-name collision (recorded by applyMethodGenericSubst
+    // for exactly this callee) the substitution resolves the callee's `T`
+    // through the caller's binding, so lifting against it would turn #4813's
+    // compile-time failure into a silent wrong value — skip the lift.
+    const bool liftShadowed = methodTParamShadowCallee4963 == ms;
+    methodTParamShadowCallee4963 = nullptr;
+    if (!genericSubst_.empty() && ms && !liftShadowed) {
+        const std::size_t liftOff = isStaticMethod(ms) ? 0u : 1u;
+        if (args.size() == liftOff + ms->params.size()) {
+            for (std::size_t ai = liftOff; ai < args.size(); ++ai) {
+                llvm::Value* a = args[ai];
+                if (!a || !(a->getType()->isIntegerTy() ||
+                            a->getType()->isFloatingPointTy()))
+                    continue;
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    ms->params[ai - liftOff]);
+                if (!ps) continue;
+                const sema::TypeRef* formal =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                args[ai] = coerceReturnToNullableValue(
+                    a, formal, argUnsigned(ai), /*sourceIsNullableRef=*/false,
+                    (argExprs && ai < argExprs->size()) ? (*argExprs)[ai]
+                                                        : nullptr);
+            }
+        }
+    }
     // fix #2821 (§14.1 / §2.5 / §2.8.3, v0.240) — the §14.1/#783 SOUNDNESS GATE,
     // stated as the property it actually needs.
     //
@@ -16983,6 +17102,13 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                     res, conv, {1u}, "nc.arg.lift");
                             }
                         }
+                    } else if (v->getType()->isIntegerTy() ||
+                               v->getType()->isFloatingPointTy()) {
+                        // fix #4963 (§5.1 `S → T → T?`, v0.307): the `?.`
+                        // twin of the widen-then-wrap above.
+                        v = coerceReturnToNullableValue(
+                            v, formalTy, isUnsignedTargetExpr(*a.value),
+                            /*sourceIsNullableRef=*/false, a.value.get());
                     }
                 }
             }
