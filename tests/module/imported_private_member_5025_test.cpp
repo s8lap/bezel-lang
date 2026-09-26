@@ -252,6 +252,20 @@ const char* kApp5MixedPublic =
     "  end Main; "
     "end C5025; ";
 
+// #5049: a LOCAL type named like the imported module shadows the module-name
+// prefix (§2.7, v0.307) — `Lib5025.Foo5049()` is a static call on the local
+// type, not a module-prefix lookup, so the #5025 error must not fire.
+const char* kApp6LocalShadow =
+    "module App5025_Shadow; import Lib5025; "
+    "public class Lib5025 "
+    "  public static method Foo5049(): int => 42; "
+    "end Lib5025; "
+    "public class C5025 "
+    "  public static method Main(): int "
+    "    return Lib5025.Foo5049(); "
+    "  end Main; "
+    "end C5025; ";
+
 // The neutral diagnostic wording, copied verbatim from the spec-derived
 // wording `TypeResolution_Names.cpp:3322` already emits for the same rule in
 // type position — the brief's "REUSE existing binary wording" instruction.
@@ -374,6 +388,29 @@ BEZEL_TEST(imported_private_member_5025, mixed_module_public_accepted) {
     writeSource5025(bSrc.path, kApp5MixedPublic);
     BEZEL_EXPECT_EQ(
         compileImportAndRun5025(bSrc.path, bExe.path, aObj.path), 99);
+}
+
+// ===========================================================================
+// T6 — ACCEPT + VALUE row (#5049). The app declares its own `Lib5025` type,
+// which shadows the imported module-name prefix per §2.7 (v0.307): the local
+// type wins and `Lib5025.Foo5049()` is its static method, returning 42.
+// Before the #5049 guard, #5025's Case (b) reported "module `Lib5025` has no
+// public type `Foo5049`" and the import failed to compile.
+// ===========================================================================
+BEZEL_TEST(imported_private_member_5025, local_type_shadows_module_accepted_5049) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz5025_t6_");
+    TempFile5025 aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile5025 aObj((dir / (stem + "_a.o")).string());
+    writeSource5025(aSrc.path, kLib5025);
+    BEZEL_EXPECT_TRUE(compileLibToObj5025(aSrc.path, aObj.path));
+    if (!std::ifstream(aObj.path).good()) return;
+    TempFile5025 bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile5025 bExe((dir / stem).string());
+    writeSource5025(bSrc.path, kApp6LocalShadow);
+    BEZEL_EXPECT_EQ(
+        compileImportAndRun5025(bSrc.path, bExe.path, aObj.path), 42);
 }
 
 }  // namespace bezel::module

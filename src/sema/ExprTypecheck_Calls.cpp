@@ -20635,7 +20635,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         name == "System.Threading" &&
                         (memberStr5025b == "CancellationToken" ||
                          memberStr5025b == "Task");
-                    if (!exemptSystemThreadingHead5025) {
+                    // #5049: a type (or other symbol) named `name` in scope
+                    // shadows the module-name prefix — the local wins per
+                    // §2.7 (v0.307) and `name.member` is an ordinary member
+                    // access on it, resolved by the regular path below. Same
+                    // `lookupName` guard as the partial-path builder below.
+                    const bool headShadowedByLocal5049 =
+                        lookupName(std::string_view(name)) != nullptr;
+                    if (!exemptSystemThreadingHead5025 &&
+                        !headShadowedByLocal5049) {
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
                             std::string("module `") + name +
