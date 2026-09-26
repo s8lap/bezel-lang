@@ -129,6 +129,78 @@ class OwnershipTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("owner: lane-x", owner.read_text())
 
+    # --- detached HEAD: rebase / bisect / plain detach (review round 4, BLOCKER 1)
+
+    def _env(self, **kw):
+        return dict(self.env, GIT_EDITOR="true", **kw)
+
+    def test_owner_commit_after_resolving_a_rebase_conflict_is_allowed(self):
+        self.repo.change("f.txt", "base f\n\n" + WANT, text="base\n")
+        self.repo.git("switch", "-q", "-c", "side")
+        self.repo.change("f.txt", "side f\n\n" + WANT, text="side\n")
+        self.repo.git("switch", "-q", "main")
+        self.repo.change("f.txt", "mine f\n\n" + WANT, text="mine\n")
+        self.claim()
+        r = self.repo.git("rebase", "side", check=False, env=self._env())
+        self.assertNotEqual(r.returncode, 0, "the rebase must stop on the conflict")
+        self.assertNotIn("OWNED", r.stderr + r.stdout, "no banner for the owner's own rebase")
+        self.repo.write("f.txt", "resolved\n")
+        self.repo.git("add", "--", "f.txt")
+        c = self.repo.git("commit", "-q", "-m", "mine f\n\n" + WANT, check=False, env=self._env())
+        self.assertEqual(c.returncode, 0, c.stderr)
+        r = self.repo.git("rebase", "--continue", check=False, env=self._env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.repo.out("branch", "--show-current"), "main")
+        self.assertEqual((self.repo.root / "f.txt").read_text(), "resolved\n")
+
+    def test_owner_amend_at_a_rebase_edit_stop_is_allowed(self):
+        self.repo.change("g.txt", "g1\n\n" + WANT)
+        self.claim()
+        env = self._env(GIT_SEQUENCE_EDITOR="sed -i 1s/^pick/edit/")
+        r = self.repo.git("rebase", "-i", "HEAD~1", check=False, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.repo.out("branch", "--show-current"), "", "stopped detached")
+        a = self.repo.git("commit", "-q", "--amend", "-m", "g1 amended\n\n" + WANT,
+                          check=False, env=self._env())
+        self.assertEqual(a.returncode, 0, a.stderr)
+        r = self.repo.git("rebase", "--continue", check=False, env=self._env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.repo.out("log", "-1", "--format=%s", "main"), "g1 amended")
+
+    def test_amend_while_rebasing_a_foreign_branch_is_refused(self):
+        self.claim()
+        self.repo.git("switch", "-q", "-c", "intruder")
+        self.repo.write("h.txt", "h\n")
+        self.repo.commit("h1\n\n" + WANT, ["h.txt"], env=dict(self.env, BEZEL_OWNER_OVERRIDE="1"))
+        env = self._env(GIT_SEQUENCE_EDITOR="sed -i 1s/^pick/edit/")
+        r = self.repo.git("rebase", "-i", "HEAD~1", check=False, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = self.repo.git("commit", "-q", "--amend", "-m", "h1 x\n\n" + WANT,
+                          check=False, env=self._env())
+        self.assertNotEqual(a.returncode, 0)
+        self.assertIn("REFUSED", a.stderr)
+        self.assertIn("intruder (being rebased)", a.stderr)
+        self.repo.git("rebase", "--abort", env=self._env())
+
+    def test_commit_on_a_plain_detached_head_is_allowed_and_silent(self):
+        self.claim()
+        sw = self.repo.git("switch", "--detach", "HEAD")
+        self.assertNotIn("OWNED", sw.stderr + sw.stdout)
+        r = self.try_commit("det")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_commit_during_bisect_is_allowed_and_silent(self):
+        for n in ("b1", "b2", "b3"):
+            self.repo.change(n, n + "\n\n" + WANT)
+        self.claim()
+        r = self.repo.git("bisect", "start", "HEAD", "HEAD~3", check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.repo.out("branch", "--show-current"), "")
+        self.assertNotIn("OWNED", r.stderr + r.stdout)
+        c = self.try_commit("bis")
+        self.assertEqual(c.returncode, 0, c.stderr)
+        self.repo.git("bisect", "reset", "-q", check=False)
+
     def test_hooks_are_tracked_in_this_checkout(self):
         for h in ("pre-commit", "post-checkout"):
             self.assertTrue((SCRIPTS / "hooks" / h).is_file())

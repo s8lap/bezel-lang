@@ -12,6 +12,13 @@
 # `git commit --amend`; it does NOT run for `git cherry-pick` (with or without
 # -e), `git rebase`, or `git merge` (which runs pre-merge-commit). So it guards
 # the ordinary commit/amend path, not every way to move a branch.
+#
+# DETACHED HEAD. A rebase detaches HEAD, and the owner's own `git commit` after
+# resolving a conflict (or `--amend` at an `edit` stop) runs this hook. So when
+# HEAD is detached: if a rebase is in progress, the branch being rebased
+# (rebase-merge/head-name or rebase-apply/head-name) must be the claimed one;
+# any other detached HEAD (bisect, a plain `git switch --detach`) is allowed —
+# no branch moves, so there is no other session's branch to protect.
 [ "${BEZEL_OWNER_OVERRIDE:-}" = 1 ] && exit 0
 f="$(git rev-parse --git-dir 2>/dev/null)/bezel-owner"
 [ -f "$f" ] || exit 0
@@ -20,6 +27,16 @@ want="$(sed -n 's/^branch: *//p' "$f" | head -n 1)"
 [ -n "$want" ] || exit 0
 cur="$(git branch --show-current 2>/dev/null)"
 [ "$cur" = "$want" ] && exit 0
+if [ -z "$cur" ]; then
+  gd="$(git rev-parse --git-dir 2>/dev/null)"
+  rebasing=""
+  for hn in "$gd/rebase-merge/head-name" "$gd/rebase-apply/head-name"; do
+    [ -f "$hn" ] && { rebasing="$(head -n 1 "$hn")"; break; }
+  done
+  [ -n "$rebasing" ] || exit 0                       # bisect / plain detached
+  [ "$rebasing" = "refs/heads/$want" ] && exit 0     # the owner's own rebase
+  cur="${rebasing#refs/heads/} (being rebased)"
+fi
 cat >&2 <<EOF
 pre-commit: REFUSED — this worktree is owned by '$owner' and bound to branch
   '$want', but HEAD is on '${cur:-(detached)}'.
