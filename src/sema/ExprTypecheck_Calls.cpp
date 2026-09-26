@@ -14403,24 +14403,43 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
     if (currentType_->kind != ast::TypeDeclKind::Class ||
         !currentType_->hasPositionalFields)
         return;
-    // The chain may target an explicit SIBLING constructor rather than the
-    // primary. Codegen takes its primary-constructor branch exactly when
-    // `ctorByArity` finds no other non-static constructor of the call's arity
-    // (LlvmBackend_Setup.cpp's `emitChainCall`), so the same question is asked
-    // here — publishing a PRIMARY-parameter binding for a call that binds to a
-    // sibling's parameter list would be the very mispairing this fix removes.
-    const std::size_t n = chain->args.size();
-    for (Symbol* m : currentType_->members) {
-        auto* other = dynamic_cast<ConstructorSymbol*>(m);
-        if (!other || other->isStatic || other->decl == &cd) continue;
-        if (other->params.size() == n) return;
-    }
     const std::vector<const Symbol*> fields =
         recordPositionalFieldSymbols(currentType_);
     if (fields.empty()) return;
     const std::string desc =
         std::string("`this(...)` chain to the primary constructor of `") +
         std::string(currentType_->name) + "`";
+    // The chain may target an explicit SIBLING constructor rather than the
+    // primary. Codegen takes its primary-constructor branch exactly when no
+    // other non-static constructor §22.5-binds the call
+    // (LlvmBackend_Setup.cpp's `emitChainCall` uses `ctorForArgs`, the same
+    // binder), so the same question is asked here — publishing a PRIMARY-
+    // parameter binding for a call that binds to a sibling's parameter list
+    // would be the very mispairing this fix removes.
+    //
+    // fix #4997 (§22.5 / §22.10 / §12.8, v0.307): the question is which
+    // candidate §22.5 BINDS, not which shares the call's ARITY. The arity-
+    // only predicate declined to publish whenever a sibling had the same
+    // parameter count, so a sibling whose parameters carry none of the call's
+    // names (`(p: bool, q: bool)` does not bind `this(b := 2, a := 1)`) still
+    // suppressed the primary binding — codegen's `ctorForArgs` then found
+    // no sibling and `emitChainCall` reached its `!target` arm with an empty
+    // `SemaContext::positionalBinding`, so the named-arg fill path returned
+    // without storing anything (LlvmBackend_Exprs2.cpp's `storePrimaryCtor
+    // PositionalArgs`'s named-without-binding refusal) and the object stayed
+    // calloc-zero. The same shape under an omitted defaulted primary
+    // parameter (`this(a := 4)` against `class C(a: int, b: int := 0)` with a
+    // sibling `(p: bool)`) hits the same defect through a different codegen
+    // path: `ctorForArgs` matches the `(p: bool)` sibling positionally, the
+    // chain call routes through it, and the inner `this(7)` chain again sees
+    // no primary binding. The arity question should be the §22.5 question.
+    for (Symbol* m : currentType_->members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic || other->decl == &cd) continue;
+        if (bindArgsToParams(sema::FormalsView::of(*other), chain->args,
+                             chain->span.begin, desc, /*emit=*/false).ok)
+            return;  // a sibling binds — codegen routes through it.
+    }
     BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain->args,
                                     chain->span.begin, desc, /*emit=*/true);
     if (b.ok) {
