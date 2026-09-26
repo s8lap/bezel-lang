@@ -1,4 +1,5 @@
 """scripts/handback_check.sh, against throwaway repos (read-only by design)."""
+import pathlib
 import re
 import tempfile
 import unittest
@@ -101,6 +102,55 @@ class HandbackCheckTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("VERDICT: FAIL", r.stdout)
 
+
+    def test_new_hook_file_with_home_path_fails(self):
+        self.repo.change("scripts/hooks/pre-push", "add hook\n\n" + WANT,
+                         text="#!/bin/sh\nexec /home/someone/checkout/x\n")
+        r = self.check()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("scripts/hooks/pre-push", self.row(r.stdout, "scripts"))
+
+    def test_base_defaults_to_bezel_staging_ref(self):
+        # The temp repo has no origin/main: only the env default can make base PASS.
+        env = dict(self.env, BEZEL_STAGING_REF="main")
+        r = run("handback_check.sh", "lane", "--repo", str(self.repo.root),
+                cwd=self.repo.root, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("main (", self.row(r.stdout, "base"))
+        self.assertTrue(self.row(r.stdout, "base").startswith("PASS"))
+
+    def test_value_flag_with_no_value_exits_64_instead_of_looping(self):
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        for flag in ("--base", "--reported-sha", "--grant", "--author", "--repo"):
+            r = subprocess.run([str(SCRIPTS / "handback_check.sh"), "lane", flag],
+                               cwd=str(self.repo.root), env=self.env,
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 64, flag)
+            self.assertIn("needs a value", r.stderr)
+
+    def _snapshot(self, root):
+        gd = pathlib.Path(self.repo.out("-C", str(root), "rev-parse", "--absolute-git-dir"))
+        return {
+            "refs": self.repo.out("-C", str(root), "for-each-ref", "--format=%(refname) %(objectname)"),
+            "head": (gd / "HEAD").read_text(),
+            "index": (gd / "index").read_bytes() if (gd / "index").exists() else b"",
+            "status": self.repo.out("-C", str(root), "status", "--porcelain", "--untracked-files=all"),
+            "worktrees": self.repo.out("worktree", "list", "--porcelain"),
+        }
+
+    def test_is_read_only(self):
+        # The lane branch is checked out in its own worktree with an untracked
+        # script, as in real use; the check runs from the main checkout.
+        self.repo.git("switch", "-q", "main")
+        wt = self.repo.root.parent / "lane-wt"
+        self.repo.git("worktree", "add", "-q", str(wt), "lane")
+        (wt / "scripts").mkdir()
+        (wt / "scripts" / "u.sh").write_text("#!/bin/sh\n")
+        before = [self._snapshot(self.repo.root), self._snapshot(wt)]
+        r = self.check("--reported-sha", self.tip, "--grant", "src/*")
+        self.assertIn("VERDICT:", r.stdout)
+        self.assertEqual([self._snapshot(self.repo.root), self._snapshot(wt)], before)
 
 if __name__ == "__main__":
     unittest.main()

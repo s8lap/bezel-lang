@@ -18,7 +18,7 @@
 #   gate       pidfile alive (kill -0), donefile, last line of newest *_cycle.log.
 #              FLAG: pidfile present but its pid is dead (stale; see CLAUDE.md).
 #   jobserver  systemctl --user is-active bezel-jobserver (+ jobserver_ctl status).
-#              FLAG: not active.
+#              INFO (not FLAG) when inactive: the jobserver is opt-in.
 #   builders   scripts/no_builders.sh.  FLAG: a gate is running AND builders exist.
 #   memory     MemAvailable.  FLAG: < 6G AND vmstat `so` > 0 in both of the last
 #              two `vmstat 1 3` samples (sustained swap-out, not a blip).
@@ -47,12 +47,18 @@ SKIP=" ${BEZEL_STATUS_SKIP:-} "
 STAGING="" TARGET=60
 while [ $# -gt 0 ]; do
   case "$1" in
-    --staging) STAGING="${2:-}"; shift 2 ;;
-    --target) TARGET="${2:-60}"; shift 2 ;;
+    --staging|--target)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "run_status: $1 needs a value" >&2; exit 64
+      fi
+      if [ "$1" = --staging ]; then STAGING="$2"; else TARGET="$2"; fi
+      shift 2 ;;
     -h|--help) sed -n '13,15p' "$0"; exit 0 ;;
     *) echo "run_status: unknown argument '$1'" >&2; exit 64 ;;
   esac
 done
+
+case "$TARGET" in ''|*[!0-9]*) echo "run_status: --target must be a non-negative integer, got '$TARGET'" >&2; exit 64 ;; esac
 
 ACTIONS=()
 row() { printf '%-10s %-4s  %s\n' "$1" "$2" "$3"; }
@@ -82,9 +88,8 @@ probe_jobserver() {
   if [ -x "$HERE/jobserver_ctl.sh" ]; then
     line="$(timeout 5 "$HERE/jobserver_ctl.sh" status 2>/dev/null | head -n 1 | cut -c1-80)"
   fi
-  if [ "$act" != active ]; then st=FLAG
-    ACTIONS+=("jobserver: not active ($act) — scripts/jobserver_ctl.sh start (from the main checkout)")
-  fi
+  # Opt-in (CLAUDE.md): off is a legitimate state, so INFO without an ACTION.
+  [ "$act" = active ] || st=INFO
   row jobserver "$st" "$act${line:+ | $line}"
 }
 

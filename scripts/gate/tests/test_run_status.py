@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 
-from orch_tools_support import WANT, Repo, git_env, run
+from orch_tools_support import SCRIPTS, WANT, Repo, git_env, run
 
 
 def dead_pid():
@@ -95,6 +95,26 @@ class RunStatusTest(unittest.TestCase):
         self.assertIn("ACTION: staging: 3 fixes banked", out)
         self.assertIn(" OK ", self.row(self.status("--staging", str(repo.root)), "staging"))
 
+
+    def test_inactive_jobserver_is_info_without_an_action(self):
+        # A fake systemctl reports the unit inactive; the jobserver is opt-in.
+        fake = self.d / "fakebin"
+        fake.mkdir()
+        (fake / "systemctl").write_text("#!/bin/sh\necho inactive\nexit 3\n")
+        (fake / "systemctl").chmod(0o755)
+        self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
+        self.env["BEZEL_STATUS_SKIP"] = "builders lanes"
+        out = self.status()
+        js = self.row(out, "jobserver")
+        self.assertIn(" INFO ", js)
+        self.assertIn("inactive", js)
+        self.assertNotIn("ACTION: jobserver", out)
+
+    def test_bad_arguments_exit_64_instead_of_looping(self):
+        for argv in (["--target"], ["--staging"], ["--target", "abc"], ["--target", "-1"]):
+            r = subprocess.run([str(SCRIPTS / "run_status.sh")] + argv, cwd=str(self.d),
+                               env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 64, argv)
 
 if __name__ == "__main__":
     unittest.main()

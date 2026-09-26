@@ -11,9 +11,14 @@
 # them needs judgement, so none of them should need the coordinator.
 #
 # Usage:
-#   scripts/handback_check.sh <lane-branch> [--base REF (default origin/main)]
+#   scripts/handback_check.sh <lane-branch> [--base REF]
 #       [--reported-sha SHA] [--grant GLOB[,GLOB...]] [--author 'Name <email>']
 #       [--repo PATH (default: this script's checkout)]
+#
+# --base defaults to $BEZEL_STAGING_REF when set, else origin/main. Mid-batch,
+# pass the STAGING branch (`--base <staging-branch>`, or export
+# BEZEL_STAGING_REF once): "behind origin/main" is not what an integrator
+# picking onto staging needs to know.
 #
 # One PASS / WARN / FAIL / SKIP row per check, then `VERDICT:`.
 # Exit 0 when nothing FAILed (WARNs are for the reviewer to read), 1 on a FAIL,
@@ -27,15 +32,19 @@ set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(git -C "$HERE/.." rev-parse --show-toplevel 2>/dev/null)" || REPO=""
-BRANCH="" BASE="origin/main" REPORTED="" GRANT="" AUTHOR=""
+BRANCH="" BASE="${BEZEL_STAGING_REF:-origin/main}" REPORTED="" GRANT="" AUTHOR=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --base) BASE="${2:-}"; shift 2 ;;
-    --reported-sha) REPORTED="${2:-}"; shift 2 ;;
-    --grant) GRANT="${2:-}"; shift 2 ;;
-    --author) AUTHOR="${2:-}"; shift 2 ;;
-    --repo) REPO="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '14,25p' "$0"; exit 0 ;;
+    --base|--reported-sha|--grant|--author|--repo)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "handback_check: $1 needs a value" >&2; exit 64
+      fi
+      case "$1" in
+        --base) BASE="$2" ;; --reported-sha) REPORTED="$2" ;; --grant) GRANT="$2" ;;
+        --author) AUTHOR="$2" ;; --repo) REPO="$2" ;;
+      esac
+      shift 2 ;;
+    -h|--help) sed -n '14,30p' "$0"; exit 0 ;;
     -*) echo "handback_check: unknown flag '$1'" >&2; exit 64 ;;
     *) [ -z "$BRANCH" ] || { echo "handback_check: one branch only" >&2; exit 64; }
        BRANCH="$1"; shift ;;
@@ -155,18 +164,18 @@ check_scripts() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     g show "$TIP:$f" 2>/dev/null | grep -qE "$pat" && hits+="$f "
-  done < <(g diff --name-only --diff-filter=AM "$MB" "$TIP" -- 'scripts/*.sh' 'scripts/**/*.sh')
+  done < <(g diff --name-only --diff-filter=AM "$MB" "$TIP" -- 'scripts/*.sh' 'scripts/**/*.sh' 'scripts/hooks/*')
   wt="$(g worktree list --porcelain | awk -v b="refs/heads/$BRANCH" '/^worktree /{w=substr($0,10)} $0=="branch " b {print w}')"
   if [ -n "$wt" ] && [ -d "$wt" ]; then
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       untracked+="$f "
-      case "$f" in *.sh) grep -qE "$pat" "$wt/$f" 2>/dev/null && hits+="$f(untracked) " ;; esac
+      case "$f" in *.sh|scripts/hooks/*) grep -qE "$pat" "$wt/$f" 2>/dev/null && hits+="$f(untracked) " ;; esac
     done < <(git -C "$wt" ls-files --others --exclude-standard -- scripts/)
   fi
   if [ -n "$hits" ]; then row FAIL scripts "hardcoded absolute /home path (#3413): $hits"
   elif [ -n "$untracked" ]; then row WARN scripts "untracked in $wt (not in the handback): $untracked"
-  else row PASS scripts "no new scripts/*.sh with a hardcoded /home path"; fi
+  else row PASS scripts "no new scripts/*.sh or scripts/hooks/* with a hardcoded /home path"; fi
 }
 
 check_needles() {
