@@ -118,7 +118,16 @@ std::string out(const std::string& src) {
 //    review used to isolate this site (IfaceLocal/IfExpr/IsNarrow/CaseE/
 //    Loop/AsNarrow/Nullable/Holder/InterpT), which are not part of this bug.
 //    FAILS before the fix (#1386 Error, does not compile); PASSES after
-//    (103 = "7xy".Length + 100). ──────────────────────────────────────────
+//    ("7xy"). ─────────────────────────────────────────────────────────────
+//
+// per non-author review (2026-09-26): the original oracle here asserted
+// `s.Length + 100` (103), which does not DISCRIMINATE — "7xy" and a
+// hypothetical wrongly-degraded "0xy" are both length 3, so a derived-length
+// oracle passes on either string. Asserting the raw interpolated text
+// instead strengthens the oracle: it can only read "7xy" if the dead
+// template body's real, specialized clone actually dispatched `v.Area()`
+// to `SqN.Area()` and produced 7, not the placeholder 0 a degrade would
+// substitute in the (never-taken) dead-body path.
 
 BEZEL_TEST(generic_template_tparam_member_5032,
            issue_repro_interpolated_t_member_call_spec_14_2) {
@@ -132,9 +141,8 @@ BEZEL_TEST(generic_template_tparam_member_5032,
         "  public method Area(): int return 7; end Area;\n"
         "end SqN;\n"
         "public static class GN\n"
-        "  public static method Interp<T>(v: T): int where T: IShapeN\n"
-        "    var s := $\"{v.Area()}xy\";\n"
-        "    return s.Length + 100;\n"
+        "  public static method Interp<T>(v: T): string where T: IShapeN\n"
+        "    return $\"{v.Area()}xy\";\n"
         "  end Interp;\n"
         "end GN;\n"
         "public class Program\n"
@@ -143,9 +151,11 @@ BEZEL_TEST(generic_template_tparam_member_5032,
         "  end Main;\n"
         "end Program;\n";
     // A hard Error here would leave r.ran false and out() == "<did-not-run>";
-    // getting the correct interpolated value proves the dead template
-    // body's `v.Area()` degraded to a placeholder rather than aborting.
-    BEZEL_EXPECT_EQ(out(program), std::string("103\n"));
+    // getting the raw interpolated string "7xy" (not a derived length that
+    // would collide with a wrongly-degraded "0xy") proves the dead template
+    // body's `v.Area()` degraded to a placeholder rather than aborting, AND
+    // that the real, specialized clone actually dispatched to `SqN.Area()`.
+    BEZEL_EXPECT_EQ(out(program), std::string("7xy\n"));
 }
 
 // ── The issue's own repro (case half), verbatim: `GN.CaseT<T>` is the
