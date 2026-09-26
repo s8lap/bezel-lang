@@ -548,14 +548,81 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         ev = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
                 }
                 if (!ev) {
-                    // #1386: ICE — lowerExpr returned null for a non-null
-                    // interpolated-string expression part; the expression kind
-                    // is not yet handled by codegen.
-                    ctx_.diagnostics().report(
-                        Severity::Error, part.expr->span.begin,
-                        "internal: lowerExpr returned null for "
-                        "interpolated-string expression part — #1386");
-                    continue;
+                    // fix #5032 (§14.1 / §14.2, v0.307): this arm used to be an
+                    // UNCONDITIONAL #1386 Error for any non-unit null, which
+                    // false-rejects a legal generic method constrained on an
+                    // interface (`where T: IShapeN`) that interpolates a
+                    // T-typed receiver's member (`$"{v.Area()}xy"`). Every
+                    // generic method is emitted TWICE (issue #490): once as a
+                    // DEAD "unspecialized template" body where T is erased to
+                    // a placeholder LLVM type (here `i32`, non-pointer), and
+                    // once per call site as a SPECIALIZED instantiation with
+                    // the real concrete type and real vtable dispatch. Only
+                    // the specialized body is ever called; the template body's
+                    // own `v.Area()` hits emitMethodCall's #484 non-pointer-
+                    // receiver guard (LlvmBackend_Calls2.cpp) and returns
+                    // null, which reached this site unconditionally as a hard
+                    // compile error, rejecting the whole program even though
+                    // the real, called body (confirmed via BEZEL_DUMP_IR:
+                    // `$spec$SqN` computes the correct value) never observes
+                    // the failure. `LlvmBackend_Exprs2.cpp`'s lambda-body
+                    // return (fix #1255) hit the identical shape and already
+                    // degrades to a placeholder rather than erroring.
+                    //
+                    // This mirrors the THREE-OUTCOME dispatch #2434/#2491
+                    // established for the sibling value-demanding sites
+                    // (lowerLocalDecl / `return expr;`), sharing their exact
+                    // predicates rather than a fourth copy of them (#2924's
+                    // four-way-mirror finding):
+                    //   (a) UNIT-typed part — exempt, handled above.
+                    //   (b) a member call on a BUILT-IN receiver (closed
+                    //       surface, #2935) that produced no value — that is
+                    //       still a genuine defect (e.g. a real typo) — Error.
+                    //   (c) everything else, including the dead-template-body
+                    //       case above — degrade to a placeholder value and
+                    //       report only a Warning, so the compile keeps going
+                    //       and the diagnostic is visible without failing it.
+                    std::string member, appliedMember;
+                    const std::string builtinRecv = builtinReceiverOfMemberCall(
+                        part.expr.get(), &member, &appliedMember);
+                    if (!builtinRecv.empty() &&
+                        !ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, part.expr->span.begin,
+                            "`" + member + "` on built-in type `" +
+                            builtinRecv +
+                            "` produced no value, so it cannot be "
+                            "interpolated. `" + builtinRecv +
+                            "` has no user declaration, so its member "
+                            "surface is exactly what the standard library "
+                            "documents for it: either `" + member +
+                            "` is not on that surface (a misspelling), or "
+                            "it is documented but yields nothing here "
+                            "(#2935 \xE2\x80\x94 if it is documented and "
+                            "should yield a value, it is unimplemented, "
+                            "#2457)" +
+                            builtinMemberChainNote(member, appliedMember));
+                        continue;
+                    }
+                    const std::string builtinNew =
+                        unconstructedBuiltinNewName(part.expr.get());
+                    if (!builtinNew.empty() &&
+                        !ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, part.expr->span.begin,
+                            unconstructedBuiltinNewNote(builtinNew,
+                                                        "be interpolated"));
+                        continue;
+                    }
+                    if (!ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Warning, part.expr->span.begin,
+                            "internal: lowerExpr returned null for "
+                            "interpolated-string expression part (degraded "
+                            "to a placeholder rendering) — #1386");
+                    }
+                    ev = llvm::Constant::getNullValue(
+                        lowerTypeRef(ctx_.exprType(*part.expr)));
                 }
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
