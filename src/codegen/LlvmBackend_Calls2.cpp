@@ -7241,6 +7241,59 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                        expectedSt->getElementType(1)) {
                                 args[ai] = wrapNullableValue(formalTy,
                                                              args[ai]);
+                            } else if (auto* vSt =
+                                           llvm::dyn_cast<llvm::StructType>(
+                                               args[ai]->getType())) {
+                                // fix #4979 (§5.1 "Nullable conversions",
+                                // v0.307): the closure-call arm's `S? → T?`
+                                // lift-widen, mirroring buildOrderedArgs's
+                                // #4967 fix. An `int?` argument bound to a
+                                // `long?` formal arrives here already tagged
+                                // (`{i8, i32}` against `{i8, i64}`), so neither
+                                // the null wrap nor the bare-T wrap fires, and
+                                // `verifyModule` aborts. Extract the payload,
+                                // widen per §5.1 (sign/zero-extend), re-wrap
+                                // with the hasValue tag kept. Gated on numeric
+                                // payloads so a `record?`→`record?` pass is
+                                // still a no-op. Same shape as the imported-
+                                // callee `.` arm at ~L12017.
+                                auto numeric = [](llvm::Type* t) {
+                                    return (t->isIntegerTy() &&
+                                            !t->isIntegerTy(1)) ||
+                                           t->isFloatingPointTy();
+                                };
+                                if (vSt != expectedSt &&
+                                    vSt->getNumElements() == 2 &&
+                                    vSt->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    expectedSt->getNumElements() == 2 &&
+                                    expectedSt->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    numeric(vSt->getElementType(1)) &&
+                                    numeric(expectedSt->getElementType(1))) {
+                                    llvm::Type* dstPay =
+                                        expectedSt->getElementType(1);
+                                    llvm::Value* conv = coerceNumericToType(
+                                        builder_.CreateExtractValue(
+                                            args[ai], {1u},
+                                            "cl.arg.lift.in"),
+                                        dstPay,
+                                        pi < call.args.size() &&
+                                            isUnsignedTargetExpr(
+                                                *call.args[pi].value));
+                                    if (conv && conv->getType() == dstPay) {
+                                        llvm::Value* res =
+                                            builder_.CreateInsertValue(
+                                                llvm::UndefValue::get(
+                                                    expectedSt),
+                                                builder_.CreateExtractValue(
+                                                    args[ai], {0u},
+                                                    "cl.arg.lift.has"),
+                                                {0u});
+                                        args[ai] = builder_.CreateInsertValue(
+                                            res, conv, {1u}, "cl.arg.lift");
+                                    }
+                                }
                             }
                         }
                         continue;  // type is now correct; skip numeric coercions
@@ -16672,6 +16725,15 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             // cross-module receiver is provably non-null by the time we
             // reach this loop (the `callBB` entry branch null-tests it),
             // so the argument list itself always evaluates.
+            //
+            // fix #4979 (§5.1 "Nullable conversions", v0.307): the `S? → T?`
+            // lift-widen that buildOrderedArgs's #4967 fix and the `.` arm's
+            // #4940 mirror both added — the `?.` arm was left out and crashes
+            // the IR verifier on a closure-typed `?.` call whose argument is
+            // a narrower nullable value (e.g. `int?` → `long?`). Mirror the
+            // `.` arm's widening block exactly: extract the payload, widen
+            // per §5.1, re-wrap with the hasValue tag kept. Gated on numeric
+            // payloads so a `record?`→`record?` pass is still a no-op.
             if (!byRef && formalTy && isNullableValueTy(formalTy)) {
                 auto* expectedSt = nullableValueStructTy(formalTy);
                 if (v->getType() != expectedSt) {
@@ -16681,6 +16743,40 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     } else if (v->getType() ==
                                expectedSt->getElementType(1)) {
                         v = wrapNullableValue(formalTy, v);
+                    } else if (auto* vSt =
+                                   llvm::dyn_cast<llvm::StructType>(
+                                       v->getType())) {
+                        // S? → T? widening (mirror #4967 buildOrderedArgs).
+                        auto numeric = [](llvm::Type* t) {
+                            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                                   t->isFloatingPointTy();
+                        };
+                        if (vSt != expectedSt &&
+                            vSt->getNumElements() == 2 &&
+                            vSt->getElementType(0) ==
+                                nullablePrimHasValTy() &&
+                            expectedSt->getNumElements() == 2 &&
+                            expectedSt->getElementType(0) ==
+                                nullablePrimHasValTy() &&
+                            numeric(vSt->getElementType(1)) &&
+                            numeric(expectedSt->getElementType(1))) {
+                            llvm::Type* dstPay =
+                                expectedSt->getElementType(1);
+                            llvm::Value* conv = coerceNumericToType(
+                                builder_.CreateExtractValue(
+                                    v, {1u}, "nc.arg.lift.in"),
+                                dstPay,
+                                a.value && isUnsignedTargetExpr(*a.value));
+                            if (conv && conv->getType() == dstPay) {
+                                llvm::Value* res = builder_.CreateInsertValue(
+                                    llvm::UndefValue::get(expectedSt),
+                                    builder_.CreateExtractValue(
+                                        v, {0u}, "nc.arg.lift.has"),
+                                    {0u});
+                                v = builder_.CreateInsertValue(
+                                    res, conv, {1u}, "nc.arg.lift");
+                            }
+                        }
                     }
                 }
             }
