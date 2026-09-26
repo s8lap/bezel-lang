@@ -21,7 +21,11 @@
 #
 # Usage:
 #   scripts/pick_stage.sh --branch <expected-staging-branch> --pool <name> \
-#       --lane <lane-branch> --reviewer <id> --verdict <ACCEPT|ACCEPT-W-NOTES> SHA...
+#       --lane <lane-branch> --reviewer <id> --verdict <ACCEPT|ACCEPT-W-NOTES> \
+#       --kind <fix|test|bank|infra> SHA...
+# --kind is RECORDED, not inferred: only kind=fix commits count toward "fixes
+# banked" (pick_ledger.sh, run_status.sh), since banking/test/infra subjects
+# routinely name an issue too. All SHAs in one call share one kind.
 # Runs in the CURRENT worktree and refuses unless its branch is --branch.
 #
 # Exit: 0 all picked · 2 cherry-pick conflict (status printed, pick in progress)
@@ -37,10 +41,10 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TRAILERS="$HERE/check_commit_trailers.py"
 
-usage() { sed -n '22,29p' "$0" >&2; exit 64; }
+usage() { sed -n '22,33p' "$0" >&2; exit 64; }
 die() { echo "pick_stage: $*" >&2; exit 64; }
 
-BRANCH="" POOL="" LANE="" REVIEWER="" VERDICT=""
+BRANCH="" POOL="" LANE="" REVIEWER="" VERDICT="" KIND=""
 SHAS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,16 +53,18 @@ while [ $# -gt 0 ]; do
     --lane) LANE="${2:-}"; shift 2 ;;
     --reviewer) REVIEWER="${2:-}"; shift 2 ;;
     --verdict) VERDICT="${2:-}"; shift 2 ;;
+    --kind) KIND="${2:-}"; shift 2 ;;
     -h|--help) usage ;;
     -*) die "unknown flag '$1'" ;;
     *) SHAS+=("$1"); shift ;;
   esac
 done
 
-for f in BRANCH POOL LANE REVIEWER VERDICT; do
+for f in BRANCH POOL LANE REVIEWER VERDICT KIND; do
   [ -n "${!f}" ] || die "--$(echo "$f" | tr 'A-Z' 'a-z') is required"
 done
 case "$VERDICT" in ACCEPT|ACCEPT-W-NOTES) ;; *) die "--verdict must be ACCEPT or ACCEPT-W-NOTES, got '$VERDICT'" ;; esac
+case "$KIND" in fix|test|bank|infra) ;; *) die "--kind must be fix, test, bank or infra, got '$KIND'" ;; esac
 [ "${#SHAS[@]}" -gt 0 ] || die "no SHA to pick"
 
 cur="$(git branch --show-current)"
@@ -106,6 +112,7 @@ for orig in "${ORIGS[@]}"; do
     echo "orig: $orig"
     echo "reviewer: $REVIEWER"
     echo "verdict: $VERDICT"
+    echo "kind: $KIND"
     echo "picked-at: $(date -Iseconds)"
     echo "issues: $issues"
   } > "$TMP/note"

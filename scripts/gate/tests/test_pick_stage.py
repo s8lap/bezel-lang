@@ -27,7 +27,8 @@ class _Base(unittest.TestCase):
     def pick(self, *shas, **kw):
         args = ["--branch", kw.get("branch", "staging"), "--pool", kw.get("pool", "p1"),
                 "--lane", kw.get("lane", "lane-a"), "--reviewer", "rev-1",
-                "--verdict", kw.get("verdict", "ACCEPT")] + list(shas)
+                "--verdict", kw.get("verdict", "ACCEPT"),
+                "--kind", kw.get("kind", "fix")] + list(shas)
         return run("pick_stage.sh", *args, cwd=self.repo.root, env=self.env)
 
     def note(self, rev="HEAD"):
@@ -96,15 +97,17 @@ class PickLedgerTest(_Base):
         rows = {ln.split()[0]: ln.split() for ln in r.stdout.splitlines() if ln.strip()}
         self.assertEqual(rows["p1"][1:], ["1", "1"])            # #4001 (not body #4002)
         self.assertEqual(rows["p2"][1:], ["2", "1"])            # #4003 only
-        self.assertEqual(rows["UNATTRIBUTED"][1:], ["1", "1"])  # #4005
-        self.assertIn("distinct issues: 3", r.stdout)
+        # "manual #4005" has no note and does not look like a fix: 0 fix issues.
+        self.assertEqual(rows["UNATTRIBUTED"][1:], ["1", "0"])
+        self.assertIn("distinct fix issues: 2 (0 from inferred kinds)", r.stdout)
+        self.assertIn("distinct issues named (all kinds): 3", r.stdout)
         self.assertIn("UNATTRIBUTED: 1 commit(s)", r.stdout)
 
     def test_all_attributed_range_reports_zero_unattributed(self):
         self.assertEqual(self.pick(self.c1, self.c2).returncode, 0)
         r = run("pick_ledger.sh", "main..staging", cwd=self.repo.root, env=self.env)
         self.assertIn("UNATTRIBUTED: 0", r.stdout)
-        self.assertIn("distinct issues: 2", r.stdout)  # #4001 #4003; body #4002 not counted
+        self.assertIn("distinct fix issues: 2 ", r.stdout)  # #4001 #4003; body #4002 not counted
 
 
 
@@ -119,12 +122,12 @@ class SubjectOnlyIssueRuleTest(_Base):
     def test_two_issue_subjects_count_both(self):
         self.repo.change("f", "fix #4807/#4808: slash pair\n\n" + WANT)
         self.repo.change("g", "fix #5023+#3904: plus pair\n\n" + WANT)
-        self.assertIn("distinct issues: 4", self.ledger())
+        self.assertIn("distinct fix issues: 4 ", self.ledger())
 
     def test_body_only_cross_reference_does_not_count(self):
         self.repo.change("h", "bank conformance rows\n\nRegressed by #4501, see #3243.\n\n" + WANT)
         out = self.ledger()
-        self.assertIn("distinct issues: 0", out)
+        self.assertIn("distinct fix issues: 0 ", out)
         self.assertNotIn("#4501", out)
 
     def test_note_issues_field_is_subject_only_for_a_two_issue_subject(self):
@@ -140,6 +143,77 @@ class SubjectOnlyIssueRuleTest(_Base):
         r = subprocess.run([str(SCRIPTS / "pick_issues.sh")], input="fix #1234 and #1234+#77\nbody #9999\n",
                            capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "#1234")  # dedup; #77 is too short; body ignored
+
+
+
+class KindTest(_Base):
+    """--kind is recorded by pick_stage; only kind=fix commits count as banked."""
+
+    def ledger(self):
+        r = run("pick_ledger.sh", "main..HEAD", cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_kind_is_required(self):
+        r = run("pick_stage.sh", "--branch", "staging", "--pool", "p", "--lane", "l",
+                "--reviewer", "r", "--verdict", "ACCEPT", self.c1,
+                cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("--kind is required", r.stderr)
+
+    def test_unknown_kind_is_refused(self):
+        r = self.pick(self.c1, kind="feature")
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("--kind must be", r.stderr)
+        self.assertEqual(self.repo.out("rev-list", "--count", "main..staging"), "0")
+
+    def test_kind_is_written_into_the_note(self):
+        self.assertEqual(self.pick(self.c1, kind="infra").returncode, 0)
+        self.assertIn("kind: infra", self.note())
+
+    def test_recorded_test_kind_is_not_banked_despite_a_fix_subject(self):
+        # c1's subject is "fix #4001: first", but the reviewer recorded kind=test.
+        self.assertEqual(self.pick(self.c1, kind="test").returncode, 0)
+        out = self.ledger()
+        self.assertIn("distinct fix issues: 0 ", out)
+        self.assertIn("distinct issues named (all kinds): 1", out)
+        self.assertRegex(out, r"\btest +#4001\b")      # recorded: no `*`
+
+    def test_fallback_fix_counts_and_bank_subject_does_not(self):
+        self.repo.change("j", "sema: reject Object into record targets (#4500)\n\n" + WANT)
+        self.repo.change("k", "Bank internal_residual rise 81 -> 83 from #4501\n\n" + WANT)
+        self.repo.change("l", "bank conformance row now passing (#4502)\n\n" + WANT)
+        out = self.ledger()
+        self.assertIn("distinct fix issues: 1 (1 from inferred kinds)", out)
+        self.assertRegex(out, r"fix\* +#4500")
+        self.assertRegex(out, r"other\* +#4501")
+        self.assertRegex(out, r"other\* +#4502")
+
+
+class InferKindTest(unittest.TestCase):
+    CASES = [
+        ("fix #4807/#4808: stop batch checks", "fix"),
+        ("Fix-forward #4981: gate the retain", "fix"),
+        ("narrow #4977: gate the bare-Task reject", "fix"),
+        ("close #5014: not a vacuous-pass hole", "fix"),
+        ("sema: narrow #4833: consolidate lists", "fix"),
+        ("codegen test: fix #1234 row", "fix"),
+        ("sema: reject overloaded new T (#4996)", "fix"),
+        ("regression pin for #4995 (fixed by #4825 0526620e)", "other"),
+        ("test #5035 T11: make the fixture conform", "other"),
+        ("lit #5032: pin the two new diagnostics (#5032)", "other"),
+        ("Bank internal_residual drop 82 -> 81 from #5035", "other"),
+        ("fixes a typo in the runbook", "other"),
+        ("jobserver: add a dry-run seam", "other"),
+    ]
+
+    def test_cases(self):
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        for subj, want in self.CASES:
+            r = subprocess.run([str(SCRIPTS / "pick_issues.sh"), "--infer-kind"],
+                               input=subj + "\n\nbody\n", capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), want, subj)
 
 
 if __name__ == "__main__":

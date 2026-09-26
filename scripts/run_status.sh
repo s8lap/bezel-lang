@@ -25,8 +25,8 @@
 #   disk       /mnt/fast use%; aot-bincache and aot-harness must be symlinks.
 #              FLAG: >= 90%, or either is not a symlink.
 #   staging    (with --staging) branch, tip, commits over origin/main, and distinct
-#              issues banked (scripts/pick_ledger.sh; subject-only, see
-#              scripts/pick_issues.sh). FLAG: banked >= --target.
+#              fix issues banked (scripts/pick_ledger.sh: kind=fix commits
+#              only, see scripts/pick_issues.sh). FLAG: banked >= --target.
 #   lanes      active lane count from scripts/lane_status.sh.
 #
 # Env overrides (for tests and other machines):
@@ -143,7 +143,7 @@ probe_staging() {
   tip="$(git -C "$STAGING" rev-parse --short HEAD 2>/dev/null)"
   ahead="$(git -C "$STAGING" rev-list --count origin/main..HEAD 2>/dev/null || echo n/a)"
   banked="$(cd "$STAGING" && "$HERE/pick_ledger.sh" origin/main..HEAD 2>/dev/null \
-              | sed -n 's/^distinct issues: //p')"
+              | sed -n 's/^distinct fix issues: \([0-9]*\).*/\1/p')"
   [ -n "$banked" ] || banked="n/a"
   if [ "$banked" != n/a ] && [ "$banked" -ge "$TARGET" ]; then st=FLAG
     ACTIONS+=("staging: $banked fixes banked (target $TARGET) — run scripts/pregate.sh, then gate")

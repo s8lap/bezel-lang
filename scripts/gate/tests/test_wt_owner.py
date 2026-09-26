@@ -87,7 +87,7 @@ class OwnershipTest(unittest.TestCase):
         self.repo.git("switch", "-q", "-c", "staging", "main")
         self.claim()
         r = run("pick_stage.sh", "--branch", "staging", "--pool", "p", "--lane", "lane",
-                "--reviewer", "r", "--verdict", "ACCEPT", lane_tip,
+                "--reviewer", "r", "--verdict", "ACCEPT", "--kind", "fix", lane_tip,
                 cwd=self.repo.root, env=self.env)
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
 
