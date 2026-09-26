@@ -20261,9 +20261,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // Case (a) + (b): target is a bare identifier (alias or module name).
         if (auto* iid =
                 dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
-            // (a) Import alias
+            // (a) Import alias — #5016: guard against local/parameter/field
+            // shadowing (§2.7 rule 1). `importAliases_` is a pure NAME
+            // table populated per-file from `import ... as <alias>`; it
+            // knows nothing about lexical shadowing. Mirror the identical
+            // precedent already used a few lines below by the module-
+            // qualified-path-extension code (Case (b), `partialModulePaths_`
+            // construction at ~L20151) and the alias-qualified Task gate
+            // (#5006 at ~L20867): `iid` names the alias ONLY when it does
+            // not already resolve to a real scope symbol. Without this
+            // guard, `import OtherMod2 as T; var T := w;` (`w` a Wrapper
+            // whose own unrelated `Widget` member is not in OtherMod2)
+            // had `T.Widget` incorrectly typed as the imported `Widget`
+            // type (and then §5.1-failed on assignment to int), instead
+            // of resolving as an ordinary field access on the local `T`.
             auto aliasIt = importAliases_.find(std::string(iid->name));
-            if (aliasIt != importAliases_.end()) {
+            if (aliasIt != importAliases_.end() &&
+                !lookupName(std::string_view(iid->name))) {
                 const std::string& modName = aliasIt->second;
                 if (const auto* exported = ctx_.importedTypesOf(modName)) {
                     for (TypeSymbol* ts : *exported) {
