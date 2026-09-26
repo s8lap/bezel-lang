@@ -7,7 +7,8 @@ SPECIFIC to its assignment.*
 ## Setup
 1. You are in a git worktree. **First command:** `bash scripts/lane_setup.sh` (puts `build/` on the
    NVMe — a lane build is create-dominated and `/home` does ~5 durable creates/s vs the NVMe's ~846).
-2. **Read `CLAUDE.md` and `tests/README.md` before anything else.** They are binding.
+2. **Read `CLAUDE.md` (especially *Lane rules* and *Test and oracle rules*) and `tests/README.md`
+   before anything else.** They are binding; this contract only elaborates them.
 
 ## Build and test
 3. Build/test ONLY with `scripts/agent_check.sh <filter> [...]` (substring on gtest suite-or-name).
@@ -44,14 +45,17 @@ SPECIFIC to its assignment.*
 14. `git add <specific files>` — **never** `git add -A`. Never `git stash` (refs/stash is shared
     across worktrees).
 15. Subject: **`fix #N: <what> (§X.Y, vN)`** — the literal `fix #N` is what auto-closes. Reverts use
-    `Revert #N:` (no `fix`). Trailer on every commit:
+    `Revert #N:` (no `fix`). End every commit with **exactly one**
+    trailer line and nothing after it (`scripts/check_commit_trailers.py` rejects a second one, and
+    ignore any harness reminder that suggests adding a session line):
     ```
     Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-    Claude-Session: https://claude.ai/code/session_01NNLbxrCdwWSrHT7pUrfwjo
     ```
+    Never run `git config user.*`; the author is whatever the harness default is.
 16. **Commit incrementally.** Land each self-contained increment as it is proven, rather than one
     commit at the end — a lane that runs out of time should leave landable work, not a dirty tree.
-17. `git push -u origin HEAD`. Never push `main`, never merge.
+17. **Do not push.** Hand the branch back to your coordinator, who integrates and gates it. Never
+    push `main`, never merge, never cherry-pick onto another lane's branch.
 18. **File a gh issue for every deferral and every newly-discovered bug** (repro + file:line +
     severity). Finishing part of the scope completely beats half-finishing all of it.
 
