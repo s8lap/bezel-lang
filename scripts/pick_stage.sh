@@ -99,7 +99,7 @@ for orig in "${ORIGS[@]}"; do
     exit 3
   fi
 
-  issues="$(grep -oE '#[0-9]{3,}' "$TMP/msg" | awk '!seen[$0]++' | paste -sd' ' || true)"
+  issues="$("$HERE/pick_issues.sh" < "$TMP/msg")"   # subject-only rule, one place
   {
     echo "pool: $POOL"
     echo "lane: $LANE"

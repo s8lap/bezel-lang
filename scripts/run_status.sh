@@ -25,7 +25,8 @@
 #   disk       /mnt/fast use%; aot-bincache and aot-harness must be symlinks.
 #              FLAG: >= 90%, or either is not a symlink.
 #   staging    (with --staging) branch, tip, commits over origin/main, and distinct
-#              issues banked (scripts/pick_ledger.sh). FLAG: banked >= --target.
+#              issues banked (scripts/pick_ledger.sh; subject-only, see
+#              scripts/pick_issues.sh). FLAG: banked >= --target.
 #   lanes      active lane count from scripts/lane_status.sh.
 #
 # Env overrides (for tests and other machines):

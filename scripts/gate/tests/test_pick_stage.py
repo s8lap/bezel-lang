@@ -40,8 +40,10 @@ class PickStageTest(_Base):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         note = self.note()
         for line in ("pool: p1", "lane: lane-a", "orig: " + self.c1, "reviewer: rev-1",
-                     "verdict: ACCEPT", "issues: #4001 #4002"):
-            self.assertIn(line, note)
+                     "verdict: ACCEPT", "issues: #4001\n"):
+            self.assertIn(line, note + "\n")
+        # #4002 appears only in the body: a cross-reference, not a fix.
+        self.assertNotIn("#4002", note)
         self.assertIn("picked-at: ", note)
         msg = self.repo.out("log", "-1", "--format=%B")
         self.assertNotIn("cherry picked from", msg)
@@ -92,17 +94,52 @@ class PickLedgerTest(_Base):
         r = run("pick_ledger.sh", "main..HEAD", cwd=self.repo.root, env=self.env)
         self.assertEqual(r.returncode, 0, r.stderr)
         rows = {ln.split()[0]: ln.split() for ln in r.stdout.splitlines() if ln.strip()}
-        self.assertEqual(rows["p1"][1:], ["1", "2"])            # #4001 #4002
+        self.assertEqual(rows["p1"][1:], ["1", "1"])            # #4001 (not body #4002)
         self.assertEqual(rows["p2"][1:], ["2", "1"])            # #4003 only
         self.assertEqual(rows["UNATTRIBUTED"][1:], ["1", "1"])  # #4005
-        self.assertIn("distinct issues: 4", r.stdout)
+        self.assertIn("distinct issues: 3", r.stdout)
         self.assertIn("UNATTRIBUTED: 1 commit(s)", r.stdout)
 
     def test_all_attributed_range_reports_zero_unattributed(self):
         self.assertEqual(self.pick(self.c1, self.c2).returncode, 0)
         r = run("pick_ledger.sh", "main..staging", cwd=self.repo.root, env=self.env)
         self.assertIn("UNATTRIBUTED: 0", r.stdout)
-        self.assertIn("distinct issues: 3", r.stdout)
+        self.assertIn("distinct issues: 2", r.stdout)  # #4001 #4003; body #4002 not counted
+
+
+
+class SubjectOnlyIssueRuleTest(_Base):
+    """scripts/pick_issues.sh: a commit's issues are the #NNN in its SUBJECT."""
+
+    def ledger(self):
+        r = run("pick_ledger.sh", "main..HEAD", cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_two_issue_subjects_count_both(self):
+        self.repo.change("f", "fix #4807/#4808: slash pair\n\n" + WANT)
+        self.repo.change("g", "fix #5023+#3904: plus pair\n\n" + WANT)
+        self.assertIn("distinct issues: 4", self.ledger())
+
+    def test_body_only_cross_reference_does_not_count(self):
+        self.repo.change("h", "bank conformance rows\n\nRegressed by #4501, see #3243.\n\n" + WANT)
+        out = self.ledger()
+        self.assertIn("distinct issues: 0", out)
+        self.assertNotIn("#4501", out)
+
+    def test_note_issues_field_is_subject_only_for_a_two_issue_subject(self):
+        self.repo.git("switch", "-q", "lane-a")
+        c = self.repo.change("i", "fix #4807/#4808: pair\n\nAlso touches #3243.\n\n" + WANT)
+        self.repo.git("switch", "-q", "staging")
+        self.assertEqual(self.pick(c).returncode, 0)
+        self.assertIn("issues: #4807 #4808\n", self.note() + "\n")
+
+    def test_script_reads_a_rev_or_stdin(self):
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        r = subprocess.run([str(SCRIPTS / "pick_issues.sh")], input="fix #1234 and #1234+#77\nbody #9999\n",
+                           capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "#1234")  # dedup; #77 is too short; body ignored
 
 
 if __name__ == "__main__":

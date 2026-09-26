@@ -19,11 +19,14 @@
 #     double-count it;
 #   * `distinct issues: N` (the "fixes banked" number run_status.sh reads);
 #   * commits with no note, flagged UNATTRIBUTED. Their issues are still taken
-#     from the commit message and credited to the pseudo-pool UNATTRIBUTED.
-# An issue is `#NNN` or longer (three or more digits), as pick_stage.sh records it.
+#     from the commit SUBJECT and credited to the pseudo-pool UNATTRIBUTED.
+# Which issues a commit counts toward is decided in ONE place,
+# scripts/pick_issues.sh: the #NNN in the SUBJECT only (bodies are full of
+# cross-references). A subject without one counts 0.
 # Read-only. Works from any worktree (notes live in the common git dir).
 set -uo pipefail
 
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RANGE="${1:-origin/main..HEAD}"
 REF=bezel-picks
 
@@ -43,7 +46,7 @@ for sha in $shas; do
     [ -n "$pool" ] || pool="?"
   else
     pool=UNATTRIBUTED; lane=-; verdict=-
-    issues="$(git log -1 --format=%B "$sha" | grep -oE '#[0-9]{3,}' | awk '!s[$0]++' | paste -sd' ')"
+    issues="$("$HERE/pick_issues.sh" "$sha")"
     unattr=$((unattr + 1))
   fi
   COMMITS[$pool]=$(( ${COMMITS[$pool]:-0} + 1 ))
