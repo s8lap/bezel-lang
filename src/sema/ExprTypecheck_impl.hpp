@@ -2850,6 +2850,15 @@ private:
     // type §22.5-binds (an unbound required parameter, an unknown name, too
     // many arguments). See the definition in ExprTypecheck_Calls.cpp.
     void checkChainCallBinding(const ast::ConstructorDecl& cd);
+    // fix #4854 (§12.8 / §22.5 / §22.6 / §5.1, v0.307): the §5.1 / §22.6
+    // applicability of a chain call that `binders` (explicit constructors of
+    // `target`) §22.5-bind — `checkArgsAgainstParams` for one candidate,
+    // `resolveOverload` for several. Called only from `checkChainCallBinding`.
+    // See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainCallApplicability(
+        const ast::CallExpr& chain, const TypeSymbol& target, bool isThis,
+        const std::vector<ConstructorSymbol*>& binders,
+        const std::string& desc);
     // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
     // of the above — the §22.5 binding of a derived constructor's leading
     // `base(...)` arguments to the BASE class's primary-constructor parameter

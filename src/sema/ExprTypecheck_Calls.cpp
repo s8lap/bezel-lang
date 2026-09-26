@@ -14818,10 +14818,11 @@ void ExprTC::checkChainRefOutModifiers(const ast::ConstructorDecl& cd) {
 // call? Candidates are every non-static constructor of the target type (the
 // containing constructor excepted for `this(...)`, §12.8 "another
 // constructor"), plus its §22.10/§9.1 primary parameter list when it has one.
-// If one binds, nothing is reported here — §5.1 applicability and the §22.6
-// ranking of a chain call are #4854's wider work, `ref`/`out` is
-// `checkChainRefOutModifiers`'. So this can only reject a call NO candidate
-// could accept, and every such call was a silent zero-fill.
+// If one binds, nothing is reported here — the §5.1 applicability and §22.6
+// ranking of the binding explicit candidates is `checkChainCallApplicability`'s
+// (fix #4854), `ref`/`out` is `checkChainRefOutModifiers`'. So this can only
+// reject a call NO candidate could accept, and every such call was a silent
+// zero-fill.
 //
 // Calls another check already owns are skipped, so no program gets a second
 // diagnostic for one defect:
@@ -14909,11 +14910,18 @@ void ExprTC::checkChainCallBinding(const ast::ConstructorDecl& cd) {
     if (ctors.empty() && !target->hasPositionalFields &&
         target->kind == ast::TypeDeclKind::Class && n == 0)
         return;
+    // fix #4854: collect EVERY binding candidate, not just the first, so the
+    // §5.1 / §22.6 applicability of the call can be judged over all of them.
+    std::vector<ConstructorSymbol*> binders;
     for (ConstructorSymbol* cs : ctors)
         if (bindArgsToParams(sema::FormalsView::of(*cs), args, loc, desc,
                              /*emit=*/false)
                 .ok)
-            return;
+            binders.push_back(cs);
+    if (!binders.empty()) {
+        checkChainCallApplicability(*chain, *target, isThis, binders, desc);
+        return;
+    }
 
     // No candidate binds. With a single candidate (or a single one of the
     // call's arity) report the binder's own §22.5 reason — the text a
@@ -14940,6 +14948,125 @@ void ExprTC::checkChainCallBinding(const ast::ConstructorDecl& cd) {
             "` can bind these arguments — each candidate leaves a required "
             "parameter unbound, lacks a parameter the call names, or takes "
             "fewer arguments (§12.8, §22.5, §22.6)");
+}
+
+// fix #4854 (§12.8 / §22.5 / §22.6 / §5.1, v0.307): the §5.1 / §22.6
+// applicability of a `this(...)` / `base(...)` chain call that at least one
+// EXPLICIT constructor of the target §22.5-binds. #4824's
+// `checkChainCallBinding` asks only whether some candidate BINDS the call
+// (arity, names, required coverage) and hands every call that binds to this
+// function. Before it, nothing asked whether the bound arguments' TYPES fit:
+// MEASURED on 028fcb34, `base("x")` into `Parent.constructor(y: int)` and
+// `base(y := "x")` compiled clean and printed `hello/0` — codegen's
+// `ctorForArgs` found no type-compatible target, skipped the chain, and the
+// object stayed calloc-zero — and `base(true)` against `(y: int)` /
+// `(y: string)` did the same. §22.6: a call with no applicable candidate, or
+// no unambiguously better one, is an error, and §22.5 says every
+// construction site reaches that rule "through the same binding".
+//
+// So the chain call gets the rule a `new T(...)` gets, through the same
+// shared helpers `checkNewExprArgs` calls (its body is not reused directly:
+// it is keyed on an `ast::NewExpr`):
+//   * one binding candidate — it IS the call's constructor by §22.5, and
+//     `checkArgsAgainstParams` runs the per-argument §5.1 check, with the
+//     exact diagnostics a lone-constructor `new T(...)` of the same shape gets;
+//   * several — `resolveOverload` over the bound argument rows, which reports
+//     "no overload … is applicable" (§22.6 step 1) or the ambiguity.
+// Deliberately NOT checked here, each conservative (it can only leave a
+// program accepted that is accepted today, never add a false reject):
+//   * a call carrying any `ref`/`out`/`owned`/discard argument — §22.3's
+//     call-site rule is `checkChainRefOutModifiers`' (#4905), and `new`'s
+//     overloaded arm skips modifiers the same way; a candidate that binds a
+//     plain argument to a `ref`/`out` formal is dropped as inapplicable;
+//   * several candidates when one declares an `owned`/`scoped` formal —
+//     §22.6 stage 4 is not modelled by `resolveOverload`;
+//   * a `base(...)` into a GENERIC base class — the base's type arguments are
+//     not on `baseTypes`' TypeSymbol, so a `T` parameter cannot be
+//     substituted here;
+//   * a candidate with no `ast::ConstructorDecl` (an imported base) —
+//     `checkArgsAgainstParams` / the §22.6 rows read declared `ast::Param`s;
+//   * the primary parameter list — `checkChainCallBinding` returns before
+//     this when it binds (its §5.1 check is #3623's, via
+//     `checkPositionalArgsAssignable`);
+//   * the winner of a resolved §22.6 ranking is not published for codegen
+//     (the `setResolvedNewCtor` twin of #4853): `ctorForArgs` still selects.
+// // per §22.6, fix #4854
+void ExprTC::checkChainCallApplicability(
+    const ast::CallExpr& chain, const TypeSymbol& target, bool isThis,
+    const std::vector<ConstructorSymbol*>& binders, const std::string& desc) {
+    for (const ast::CallArgument& a : chain.args)
+        if (!a.modifier.empty() || a.isDiscard || !a.value) return;
+    if (!isThis && !target.genericParams.empty()) return;
+    const SourceLocation loc = chain.span.begin;
+    // §22.6 stage 3 counts the `ref`/`out` modifiers: every argument here is
+    // plain, so a candidate binding one to a `ref`/`out` formal is
+    // inapplicable (the one predicate `ctorForArgs` also uses, #4924). With
+    // none left, `checkChainRefOutModifiers` has already reported.
+    std::vector<const ast::ConstructorDecl*> decls;
+    bool anyParamModifier = false;
+    for (ConstructorSymbol* cs : binders) {
+        // SEAM-ACCESSOR: a null decl (imported constructor) defers the check.
+        auto* od = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!od) return;
+        const BindResult b = bindArgsToParams(od->params, chain.args, loc,
+                                              desc, /*emit=*/false);
+        bool refOutOk = b.ok;
+        for (std::size_t j = 0; refOutOk && j < od->params.size(); ++j) {
+            const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+            if (ai >= 0 && !sema::callSiteRefOutMatches(
+                               std::string_view{}, od->params[j].modifier))
+                refOutOk = false;
+        }
+        if (!refOutOk) continue;
+        for (const ast::Param& p : od->params)
+            if (!p.modifier.empty()) anyParamModifier = true;
+        decls.push_back(od);
+    }
+    if (decls.empty()) return;
+    if (decls.size() == 1) {
+        checkArgsAgainstParams(decls[0]->params, chain.args, loc, desc);
+        return;
+    }
+    // §22.6 stage 4 (`owned` / ownership-mode applicability) is not modelled
+    // by `resolveOverload`, so a set with any `owned`/`scoped` formal defers.
+    if (anyParamModifier) return;
+    // §22.6 over the bound rows, built as `checkNewExprArgs`' overloaded arm
+    // builds them (parameter order, defaulted slots dropped).
+    std::vector<std::vector<const TypeRef*>> paramTypes(decls.size());
+    std::vector<std::vector<const TypeRef*>> argTypeRows(decls.size());
+    std::vector<std::vector<int>> argIdxRows(decls.size());
+    std::vector<std::string> candNames(decls.size());
+    std::vector<bool> fillsDefault(decls.size(), false);
+    for (std::size_t c = 0; c < decls.size(); ++c) {
+        const auto& params = decls[c]->params;
+        const BindResult b = bindArgsToParams(params, chain.args, loc, desc,
+                                              /*emit=*/false);
+        if (!b.ok) return;  // cannot happen: `binders` all bound
+        for (std::size_t j = 0; j < params.size(); ++j) {
+            const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+            if (ai < 0) { fillsDefault[c] = true; continue; }
+            const TypeRef* pt =
+                params[j].type ? ctx_.resolvedType(*params[j].type) : nullptr;
+            const ast::Expr* av =
+                chain.args[static_cast<std::size_t>(ai)].value.get();
+            paramTypes[c].push_back(pt);
+            argTypeRows[c].push_back(av ? ctx_.exprType(*av) : nullptr);
+            argIdxRows[c].push_back(ai);
+        }
+        candNames[c] = std::string(isThis ? "this" : "base") +
+                       methodSignatureString("", params);
+    }
+    // resolveOverload shares one argument vector across candidates; defer if
+    // the bound shapes diverge (as `checkNewExprArgs` does).
+    for (std::size_t c = 1; c < decls.size(); ++c)
+        if (argIdxRows[c] != argIdxRows[0]) return;
+    // Row order, so `argExprs[i]` is the argument behind `argTypeRows[0][i]`
+    // (the §5.1 constant-narrowing re-type indexes the two together).
+    std::vector<const ast::Expr*> argExprs;
+    for (int ai : argIdxRows[0])
+        argExprs.push_back(chain.args[static_cast<std::size_t>(ai)].value.get());
+    (void)resolveOverload(paramTypes, argTypeRows[0], fillsDefault, candNames,
+                          loc, desc, /*extraNote=*/std::string(), argExprs);
 }
 
 // fix #4484 (§22.5 "Optional parameters and named arguments" / §22.8 step 0 /
