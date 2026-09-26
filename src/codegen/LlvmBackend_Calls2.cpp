@@ -13255,22 +13255,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     return result;
 }
 
-// fix #4963 (§5.1 / §14.1, v0.307): set by applyMethodGenericSubst to the
-// callee `ms` when one of its OWN method type parameters was already bound by
-// name in the incoming (caller / receiver) substitution and no explicit
-// call-site type argument confirms that binding — the #4813 same-name
-// shadowing shape, where the name-keyed map resolves the callee's `T` through
-// the CALLER's binding. emitMethodCall (same TU) reads and clears it: its
-// #4963 widen-then-wrap pre-lift resolves formals through genericSubst_, so
-// under a collision it would lift against the caller's `T` and turn #4813's
-// compile-time failure into a silent wrong value; the lift is skipped instead,
-// leaving #4813's behaviour unchanged. File-local (not an Emitter member) so
-// the fix does not touch LlvmBackend_impl.hpp; thread_local because an
-// Emitter is confined to one thread.
-namespace {
-thread_local const sema::MethodSymbol* methodTParamShadowCallee4963 = nullptr;
-}  // namespace
-
 // per §14.1/§14.2 + §26.5/§7.5 (issue #1278): see the header comment in
 // LlvmBackend_impl.hpp. Extracted verbatim from lowerCall's inline block so
 // lowerNullCondCall (`?.`) drives the identical method-generic substitution
@@ -13338,37 +13322,6 @@ void Emitter::applyMethodGenericSubst(
         std::swap(genericSubst_, cSubst);
         std::swap(genericSubstSemaTy_, cSema);
     };
-    // fix #4963 (§5.1 / §14.1, v0.307): record a #4813 same-name collision —
-    // one of the callee's own type parameters is ALREADY bound by name in the
-    // incoming (caller / receiver) substitution, and no explicit call-site
-    // type argument confirms that binding. The name-keyed maps below keep the
-    // incoming binding, so the callee's `T` resolves through the caller's;
-    // emitMethodCall's #4963 pre-lift must not trust it (see
-    // methodTParamShadowCallee4963).
-    {
-        const std::vector<std::unique_ptr<ast::Type>>* shTAs = nullptr;
-        if (auto* shMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                call.callee.get()))
-            shTAs = &shMa->typeArgs;
-        else if (auto* shNcm = dynamic_cast<const ast::NullCondMemberExpr*>(
-                     call.callee.get()))
-            shTAs = &shNcm->typeArgs;
-        else if (auto* shId = dynamic_cast<const ast::IdentifierExpr*>(
-                     call.callee.get()))
-            shTAs = &shId->typeArgs;
-        for (std::size_t gi = 0; gi < md->genericParams.size(); ++gi) {
-            auto it = genericSubst_.find(md->genericParams[gi].name);
-            if (it == genericSubst_.end()) continue;
-            bool confirmed = false;
-            if (shTAs && gi < shTAs->size() && (*shTAs)[gi])
-                if (sema::TypeRef* ta = ctx_.resolvedType(*(*shTAs)[gi]))
-                    confirmed = lowerTypeRef(ta) == it->second;
-            if (!confirmed) {
-                methodTParamShadowCallee4963 = ms;
-                break;
-            }
-        }
-    }
     // fix #1894 #1895 / §14.1: EXPLICIT call-site type arguments
     // (`Make<long, long>(...)`) are AUTHORITATIVE and must be bound FIRST,
     // before any argument-driven inference. An argument's own expression type
@@ -14083,13 +14036,12 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // `coerceReturnToNullableValue` resolves the formal exactly as
     // wrapArgForNullableValueFormal does (cases A/B/C) and returns the value
     // unchanged for any formal that is not a nullable value type.
-    // Under a #4813 same-name collision (recorded by applyMethodGenericSubst
-    // for exactly this callee) the substitution resolves the callee's `T`
-    // through the caller's binding, so lifting against it would turn #4813's
-    // compile-time failure into a silent wrong value — skip the lift.
-    const bool liftShadowed = methodTParamShadowCallee4963 == ms;
-    methodTParamShadowCallee4963 = nullptr;
-    if (!genericSubst_.empty() && ms && !liftShadowed) {
+    // A caller type parameter that merely shares a NAME with one of the
+    // callee's own (`Go<T>` at T := int? calling `Id<long>(3)`) needs no
+    // special case here: applyMethodGenericSubst (#4813, §14.1/§14.5) erases
+    // the callee's own names and binds them from THIS call site, so
+    // genericSubst_ already resolves the callee's `T` to `long`.
+    if (!genericSubst_.empty() && ms) {
         const std::size_t liftOff = isStaticMethod(ms) ? 0u : 1u;
         if (args.size() == liftOff + ms->params.size()) {
             for (std::size_t ai = liftOff; ai < args.size(); ++ai) {

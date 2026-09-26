@@ -162,14 +162,14 @@ BEZEL_TEST(nullable_arg_widen_wrap_4963, same_name_caller_T_confirmed_by_explici
         "-9 4000000000 5\n");
 }
 
-// per §5.1 / §14.1 (v0.307), fix #4963 — soundness guard. When the caller's
+// per §5.1 / §14.1 / §14.5 (v0.307), fix #4963 follow-up. The caller's
 // same-named `T` is bound to a DIFFERENT type (`Go<int?>` calling
-// `Id<long>(3)`), codegen's name-keyed substitution resolves the callee's `T`
-// through the caller's binding (#4813, open). The #4963 lift must not act on
-// that wrong binding: before the guard it did, and the program compiled and
-// printed `1` instead of `3` — a silent wrong value. #4813 itself is out of
-// scope here, so the row accepts either outcome that is not a wrong value:
-// the correct output, or a compile-time failure.
+// `Id<long>(3)`). A method's type parameters are scoped to that method
+// (§14.1/§14.5; #4813 is fixed — applyMethodGenericSubst binds the callee's
+// `T` from this call site), so the #4963 widen-then-wrap lift must apply at
+// T := long and the program prints `3`. A stale guard premised on #4813 still
+// being open skipped the lift, and bezelc crashed (SIGSEGV) instead; the row
+// used to accept a compile failure, so it now asserts the program RAN.
 BEZEL_TEST(nullable_arg_widen_wrap_4963, same_name_caller_T_collision_never_wrong_value_4813) {
     auto r = runAot(
         "module M; "
@@ -183,8 +183,8 @@ BEZEL_TEST(nullable_arg_widen_wrap_4963, same_name_caller_T_collision_never_wron
         "    Console.WriteLine(U.Go<int?>(2)); return 0; "
         "  end Main; "
         "end P;");
-    if (r.ran) {
-        BEZEL_EXPECT_EQ(r.exitCode, 0);
-        BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
-    }
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
 }
