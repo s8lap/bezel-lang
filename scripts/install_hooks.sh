@@ -15,6 +15,8 @@
 # Usage:  scripts/install_hooks.sh              # install / update (idempotent)
 #         scripts/install_hooks.sh --uninstall  # remove only OUR wrappers
 # Refuses (exit 1) to overwrite an existing hook it did not write.
+# It acts on the repo of the CURRENT DIRECTORY (plain `git`, no -C), not on the
+# checkout the script lives in: run it from inside the repo you mean to change.
 set -euo pipefail
 
 HOOKS=(pre-commit post-checkout)

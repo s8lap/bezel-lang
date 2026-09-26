@@ -450,15 +450,32 @@ them mechanical. Each script's header has the details and the incident behind it
 | When | Tool | What it replaces |
 |---|---|---|
 | Every heartbeat | `scripts/run_status.sh [--staging <wt>] [--target N]` | eight hand-typed probes: gate pidfile/donefile/cycle log, jobserver unit, builders, MemAvailable + swap-out, `/mnt/fast` use and the aot symlinks, staging count vs target, lane count. Prints `ACTION:` lines only for flagged rows; never acts. |
-| A lane hands back | `scripts/handback_check.sh <lane-branch> [--base REF] [--reported-sha S] [--grant G,…] [--author 'N <e>']` | the manual handback checklist: reported SHA is the tip (else: in the branch, elsewhere, or dangling), base is an ancestor, trailers, `git config` author leak, files outside the grant, `/home` paths in new scripts, stale needles, tests named in commit messages exist. Read-only; FAIL exits 1, WARNs are for the reviewer. It does not replace the non-author review. |
-| Picking onto staging | `scripts/pick_stage.sh --branch … --pool … --lane … --reviewer … --verdict ACCEPT\|ACCEPT-W-NOTES --kind fix\|test\|bank\|infra SHA…` | the scratch pick script and the hand-kept batch ledger. Records pool, lane, orig SHA, reviewer, verdict, kind and issues (the `#NNN` in the subject only) as a note under `refs/notes/bezel-picks`; stops with exit 3 on a trailer violation. |
-| Before a gate, or on a FAIL | `scripts/pick_ledger.sh [RANGE]` | the ledger above: one row per commit, per-pool commit and fix-issue counts (only kind=fix commits bank an issue, credited to the pool of its earliest fix commit; with no recorded kind it is inferred from the subject and marked `*`), and the UNATTRIBUTED count of commits picked without notes. |
-| Dispatching a lane | `scripts/lane_setup.sh --owner <name>` or `scripts/wt_owner.sh claim <name>` | nothing: another session's lane once switched a worktree it did not own to its own branch. With the hooks installed (`scripts/install_hooks.sh`, once per repo, a coordinator decision), a commit in an owned worktree on a different branch is refused and a switch prints a warning. `BEZEL_OWNER_OVERRIDE=1` bypasses it. |
+| A lane hands back | `scripts/handback_check.sh <lane-branch> [--base REF] [--reported-sha S] [--grant G,…] [--author 'N <e>']` | the manual handback checklist: reported SHA is the tip (else: in the branch, elsewhere, or dangling), base is an ancestor, trailers, `git config` author leak, files outside the grant, `/home` paths in new scripts and hooks, stale needles, tests named in commit messages exist. Read-only (pinned by a test); FAIL exits 1, WARNs are for the reviewer. It does not replace the non-author review. **Mid-batch, measure against staging:** `--base <staging-branch>`, or export `BEZEL_STAGING_REF=<staging-branch>` once (the default when set; else `origin/main`). |
+| Picking onto staging | `scripts/pick_stage.sh --branch … --pool … --lane … --reviewer … --verdict ACCEPT\|ACCEPT-W-NOTES --kind fix\|test\|bank\|infra SHA…` | the scratch pick script and the hand-kept batch ledger. Records pool, lane, orig SHA, reviewer, verdict, kind and issues (the `#NNN` in the subject only) as a note under `refs/notes/bezel-picks`. Refuses a dirty tree; skips an already-applied (empty) pick and says so. **Exit 2 = conflict**: it prints the SHAs not yet picked and the exact `pick_stage.sh --continue <same flags> <rest>` line; resolve, `git add`, run it (it finishes the pick, strips the `-x` line, checks the trailer, writes the note, picks the rest). **Exit 3 = trailer violation**: fix the trailer on the lane branch, `git reset --hard HEAD~1` on staging, re-pick. |
+| Before a gate, or on a FAIL | `scripts/pick_ledger.sh [RANGE]` | the ledger above: one row per commit, per-pool commit and fix-issue counts (only kind=fix commits bank an issue, credited to the pool of its earliest fix commit; with no recorded kind it is inferred from the subject and marked `*`), and the UNATTRIBUTED count (no note by SHA or by patch-id). |
+| Dispatching a lane | `scripts/lane_setup.sh --owner <name>` or `scripts/wt_owner.sh claim <name>` | nothing: another session's lane once switched a worktree it did not own to its own branch. With the hooks installed (`scripts/install_hooks.sh`, once per repo, a coordinator decision; it acts on the repo of the **current directory**), a commit in an owned worktree on a different named branch, or while rebasing a different branch, is refused, and switching to one prints a warning. A detached HEAD (bisect, `switch --detach`, the owner's own rebase) is allowed. `BEZEL_OWNER_OVERRIDE=1` bypasses it. |
 
-Limits worth knowing: notes are local refs and are not pushed, so the ledger
-lives on this machine; git 2.55 runs `pre-commit` for `commit` and
-`commit --amend` but **not** for `cherry-pick`, `rebase` or `merge`, so the
-ownership hook guards the ordinary commit path only.
+**Rebasing staging drops the notes** unless git is told to carry them, per
+command (never `git config`):
+
+    git -c notes.rewriteRef=refs/notes/bezel-picks rebase <onto>
+
+If that was forgotten, `pick_ledger.sh` still recovers each note from the
+pre-rebase commit by `git patch-id --stable` and marks the row's kind `~`
+(e.g. `fix~`); it counts as recorded. Recovery fails only if the patch
+changed in the rebase (a conflict resolution) — those rows show UNATTRIBUTED.
+
+Limits worth knowing:
+- notes are local refs and are not pushed, so the ledger lives on this machine;
+- git 2.55 runs `pre-commit` for `commit` and `commit --amend` but **not** for
+  `cherry-pick`, `rebase` or `merge`, so the ownership hook guards the ordinary
+  commit path only;
+- issue credit is the `#NNN` in the subject, so a subject that cross-references
+  another issue (`fix #A (follow-up to #B)`) credits both; the fallback kind
+  inference is a prefix heuristic, which is why rows it classifies carry `*`;
+- handback_check's `named-tests` row greps test-like names out of commit
+  messages, so a name mentioned in prose can WARN falsely. Read it, don't
+  count it.
 
 ## Autonomous run discipline (lanes, gates, tests)
 

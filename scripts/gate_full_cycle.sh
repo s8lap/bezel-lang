@@ -1106,8 +1106,10 @@ _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 # tooling tests, 895 with them (35 added: pick_stage/ledger, handback_check,
 # run_status, worktree ownership), 2 skipped. Then 895 -> 899 for the
 # subject-only issue-rule tests (scripts/pick_issues.sh), then 899 -> 905
-# for the recorded/inferred --kind tests.
-_gs_floor=905
+# for the recorded/inferred --kind tests, then 905 -> 927 for the review
+# round-4 tests (rebase/bisect hooks, patch-id note recovery, --continue,
+# empty picks, trailing-flag hangs, handback read-only).
+_gs_floor=927
 _gs_skip_cap=4
 # fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
 #
