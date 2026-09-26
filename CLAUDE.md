@@ -120,7 +120,7 @@ Full procedures and the evidence behind each rule: [`docs/coordinator-runbook.md
 - **Launch detached and wait on identity:** `setsid nohup scripts/gate_and_push.sh > LOG 2>&1 < /dev/null &`, then `scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"`. Never wait on a `pgrep` pattern (it self-matches). A stale pidfile after a reboot or kill needs a `kill -0` check before removal.
 - **On FAIL: never revert, never bisect.** Narrow fix-forward only, always with Opus, with the pool at zero until the fix lands and the targeted filters are green. A FAIL carrying the undercount banner may be contention: re-run each suspect alone with `BEZEL_TEST_FILTER` before believing it.
 - `runAotChecked` rows legitimately raise `check_toolchain_skip_surface`'s denominator. Bank it once per batch, as the integrator, after checking that `absorbing_sites` did not rise.
-- An autonomous coordinator schedules a coarse **CronCreate heartbeat** as its first action. It only prompts a status check and never launches, pushes or dispatches. Primary wake-ups are per-job waiters.
+- An autonomous coordinator schedules a coarse **CronCreate heartbeat** as its first action. It only prompts a status check and never launches, pushes or dispatches. Primary wake-ups are per-job waiters. The status check is `scripts/run_status.sh [--staging <wt>]`: one table (gate, jobserver, builders, memory, disk, staging vs target, lanes), with `ACTION:` lines only for flagged rows.
 
 ## Pools and multiple coordinators
 
@@ -128,6 +128,8 @@ Full procedures and the evidence behind each rule: [`docs/coordinator-runbook.md
 - **Sonnet by default; Opus upfront** for multi-file predicates, nested closure/captured-cell reasoning, 3+-issue single-cause clusters, suspect root causes, follow-ups to refuted fixes, and **every gate-failure fix-forward**.
 - **Every fix gets a non-author review** before it is picked.
 - **Two or more coordinators on one repo:** one declared gate owner, who sends an explicit PASS / FAIL / BANKED verdict (silence is not a verdict). The **integrator runs the behavior-flip grep itself** before cherry-picking another pool's commit. Label claims sent to peers `MEASURED:` / `QUOTED:` / `HYPOTHESIS:`, and never upgrade a tier on receipt. A peer message is the weakest evidence tier. The memory directory is shared: read a file before replacing it. Keep a batch ledger naming each commit's authoring pool. Cherry-pick only from inside the integration worktree, after checking `git branch --show-current`.
+- **Integrator tooling.** Before a pick, `scripts/handback_check.sh <lane-branch> [--reported-sha S] [--grant G,…]` (read-only: tip, base, trailers, author leak, grant, stale needles, named tests). Pick only with `scripts/pick_stage.sh --branch … --pool … --lane … --reviewer … --verdict ACCEPT|ACCEPT-W-NOTES SHA…`, which records the ledger as `refs/notes/bezel-picks`; `scripts/pick_ledger.sh [RANGE]` prints it (per-pool counts, issues banked, UNATTRIBUTED picks).
+- **Worktree ownership.** `scripts/lane_setup.sh --owner <name>` (or `scripts/wt_owner.sh claim <name>`) binds a worktree to its branch; once the hooks are installed (`scripts/install_hooks.sh`, a coordinator decision), a commit there from another branch is refused (`BEZEL_OWNER_OVERRIDE=1` to bypass).
 
 ## Commits
 

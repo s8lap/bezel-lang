@@ -1102,7 +1102,10 @@ _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 # below ("the floor is the harness's current test count, so headroom cannot
 # accumulate unbanked. It only ever moves up") — measured via
 # `python3 -m unittest discover -s scripts/gate/tests`, not guessed.
-_gs_floor=824
+# Bumped 824 -> 895 (r21-orch-tools): measured 860 before the coordinator
+# tooling tests, 895 with them (35 added: pick_stage/ledger, handback_check,
+# run_status, worktree ownership), 2 skipped.
+_gs_floor=895
 _gs_skip_cap=4
 # fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
 #

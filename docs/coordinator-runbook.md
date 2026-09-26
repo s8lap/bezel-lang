@@ -441,6 +441,25 @@ both from the other pool.
 coordinator** — not per lane and not by both sessions. Two pools adding
 `runAotChecked` rows otherwise collide on the single baseline file.
 
+## Coordinator tooling
+
+*Added 2026-09-26 (R21). In R21 most coordinator time that was not review went
+into manual checks, and each one was skipped at least once. These scripts make
+them mechanical. Each script's header has the details and the incident behind it.*
+
+| When | Tool | What it replaces |
+|---|---|---|
+| Every heartbeat | `scripts/run_status.sh [--staging <wt>] [--target N]` | eight hand-typed probes: gate pidfile/donefile/cycle log, jobserver unit, builders, MemAvailable + swap-out, `/mnt/fast` use and the aot symlinks, staging count vs target, lane count. Prints `ACTION:` lines only for flagged rows; never acts. |
+| A lane hands back | `scripts/handback_check.sh <lane-branch> [--base REF] [--reported-sha S] [--grant G,…] [--author 'N <e>']` | the manual handback checklist: reported SHA is the tip (else: in the branch, elsewhere, or dangling), base is an ancestor, trailers, `git config` author leak, files outside the grant, `/home` paths in new scripts, stale needles, tests named in commit messages exist. Read-only; FAIL exits 1, WARNs are for the reviewer. It does not replace the non-author review. |
+| Picking onto staging | `scripts/pick_stage.sh --branch … --pool … --lane … --reviewer … --verdict ACCEPT\|ACCEPT-W-NOTES SHA…` | the scratch pick script and the hand-kept batch ledger. Records pool, lane, orig SHA, reviewer, verdict and issues as a note under `refs/notes/bezel-picks`; stops with exit 3 on a trailer violation. |
+| Before a gate, or on a FAIL | `scripts/pick_ledger.sh [RANGE]` | the ledger above: one row per commit, per-pool commit and issue counts (an issue is credited to the pool of its earliest commit), and the UNATTRIBUTED count of commits picked without notes. |
+| Dispatching a lane | `scripts/lane_setup.sh --owner <name>` or `scripts/wt_owner.sh claim <name>` | nothing: another session's lane once switched a worktree it did not own to its own branch. With the hooks installed (`scripts/install_hooks.sh`, once per repo, a coordinator decision), a commit in an owned worktree on a different branch is refused and a switch prints a warning. `BEZEL_OWNER_OVERRIDE=1` bypasses it. |
+
+Limits worth knowing: notes are local refs and are not pushed, so the ledger
+lives on this machine; git 2.55 runs `pre-commit` for `commit` and
+`commit --amend` but **not** for `cherry-pick`, `rebase` or `merge`, so the
+ownership hook guards the ordinary commit path only.
+
 ## Autonomous run discipline (lanes, gates, tests)
 
 These rules are not style preferences — every one was paid for in a lost gate
