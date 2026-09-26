@@ -60,6 +60,23 @@
 // so they have no separate test row here — closing the stdlib name list
 // (only `FromOwnedResult` is reachable for the class-T wrong-slot shape
 // that *is* the actual reproducer).
+//
+// fix #4670 / §30.5 "Consumer-side rules" (v0.307, line 8551): the two
+// ACCEPT rows below (`accept_awaited_exprbody_task_fromownedresult_30_5`,
+// `accept_blockbody_task_fromownedresult_30_5`) originally consumed `t:
+// Task<Widget4461>` (a Pattern A borrow-producing await — Widget4461 is a
+// class) with `using var w := await t;`. #4670 added the correct §30.5
+// rejection for exactly that shape ("the borrow produced by `await
+// Task<T>` (Pattern A) may not flow to a `using var` binding") but did not
+// touch these two rows, which predate it — so both started failing to
+// compile (`r.ran == false`) rather than exercising the loop-amplified
+// ctor/dtor oracle they exist to run. Both rows are corrected here to the
+// spec-correct consumer form, `var w := await t;` (§30.5's own "canonical"
+// discharge for a Pattern A borrow local) — the ctor/dtor-count assertions
+// are unchanged and remain exactly as strict. `reject_using_var_await_...`
+// below pins the OLD wrong shape as a compile rejection so the two
+// checks (#4461's producer-side kind-1 rejection above, and #4670's
+// consumer-side `using var` rejection) cannot silently drift apart again.
 
 #include <string>
 
@@ -79,6 +96,15 @@ namespace {
 // the same prefix from silently satisfying this row.
 constexpr const char* kFixDiagFragment =
     "§30.5 Pattern A) may only `return` an OWNED expression";
+
+// fix #4670 / §30.5 (v0.307): the unique text ONLY the consumer-side
+// `using var` await-borrow rejection carries. Distinct from
+// `kFixDiagFragment` above (a different check, in a different file/pass —
+// #4461's producer-side kind-1 rejection vs #4670's consumer-side
+// `using var`-binding rejection).
+constexpr const char* kUsingVarBorrowDiagFragment =
+    "the borrow produced by `await Task<T>` (Pattern A) may not flow to a "
+    "`using var` binding";
 
 constexpr int kLoopIters = 200;
 
@@ -154,7 +180,15 @@ BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
         "      do "
         "        var f: () -> Task<Widget4461> := " + lambda + "; "
         "        using var t := f(); "
-        "        using var w := await t; "
+        // fix #4670 / §30.5 (v0.307): `t: Task<Widget4461>` (class T) is a
+        // Pattern A borrow-producing await source; the borrow `await t`
+        // produces may not flow to a `using var` binding (only to a plain
+        // `var`, per §30.5's consumer-side rules) — `using var w := await
+        // t;` used to be accepted here (pre-#4670) but is now a compile
+        // error (see `reject_using_var_await_task_pattern_a_borrow_30_5`
+        // below). `var w` is the spec-correct discharge; `t` remains the
+        // `using var` that owns the disposal.
+        "        var w := await t; "
         "        i := i + 1; "
         "      end; "
         "    end while; "
@@ -187,6 +221,31 @@ BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
     }
 }
 
+// REJECT-SIDE — fix #4670 / §30.5 (v0.307): pins the OLD wrong shape (the
+// consumer form the two accept rows above used before #4670 landed) as a
+// compile-time rejection, so a future regression to either check cannot
+// silently re-admit it without turning a test red. `t: Task<Widget4461>`
+// is a Pattern A borrow source (Widget4461 is a class); `using var w :=
+// await t;` cannot discharge a borrow's disposal obligation it does not
+// own.
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          reject_using_var_await_task_pattern_a_borrow_30_5) {
+    const std::string lambda = kExprBodyAwaited;
+    const std::string src =
+        std::string("module M; ") + kWidget +
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    var f: () -> Task<Widget4461> := " + lambda + "; "
+        "    using var t := f(); "
+        "    using var w := await t; "
+        "    return Widget4461.ctorCount; "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kUsingVarBorrowDiagFragment));
+}
+
 // CONTROL — the already-working BLOCK-bodied twin (the call site the
 // issue's own text identifies as not regressed) must remain accepted.
 // Pinned identically on both oracles.
@@ -203,7 +262,11 @@ BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
         "      do "
         "        var f: () -> Task<Widget4461> := " + lambda + "; "
         "        using var t := f(); "
-        "        using var w := await t; "
+        // fix #4670 / §30.5 (v0.307): see the identical note on the
+        // expr-body accept row above — `using var w := await t;` (t:
+        // Task<Widget4461>, Pattern A) is rejected post-#4670; `var w` is
+        // the spec-correct borrow-local discharge.
+        "        var w := await t; "
         "        i := i + 1; "
         "      end; "
         "    end while; "
