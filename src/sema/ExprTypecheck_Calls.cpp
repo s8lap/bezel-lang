@@ -15011,29 +15011,38 @@ void ExprTC::publishBaseChainPrimaryBinding(const ast::CallExpr& chain) {
                                           /*implicitSpelling=*/false);
         return;
     }
-    // Only when the call binds the base's PRIMARY parameter list. Codegen
-    // reaches that arm exactly when `ctorForArgs(baseTs, chainCall->args)`
-    // finds no explicit base constructor to bind (whose own §22.8 step 0 then
-    // writes these slots from inside the chained-to primary — fix #3562), so
-    // the same question is asked here by its dominant arity arm. When an
-    // arity match exists this publishes nothing and codegen keeps whichever
-    // disposition it has today: declining the stores outright for a local
-    // base (#3562's guard), or the textual-order fallback for an imported one
-    // (SEAM-DEBT #3625). Publishing a PRIMARY-parameter binding for a call
-    // that binds a convenience constructor's parameter list would be the very
-    // mispairing #3562 removed.
-    const std::size_t n = chain.args.size();
-    for (Symbol* m : base->members) {
-        auto* other = dynamic_cast<ConstructorSymbol*>(m);
-        if (!other || other->isStatic) continue;
-        if (other->params.size() == n) return;
-    }
     const std::vector<const Symbol*> fields =
         recordPositionalFieldSymbols(base);
     if (fields.empty()) return;
     const std::string desc =
         std::string("`base(...)` chain to the primary constructor of `") +
         std::string(base->name) + "`";
+    // Only when the call binds the base's PRIMARY parameter list. Codegen
+    // reaches that arm exactly when `ctorForArgs(baseTs, chainCall->args)`
+    // finds no explicit base constructor to bind (whose own §22.8 step 0 then
+    // writes these slots from inside the chained-to primary — fix #3562), so
+    // the same question is asked here. Publishing a PRIMARY-parameter binding
+    // for a call that binds a convenience constructor's parameter list would
+    // be the very mispairing #3562 removed.
+    //
+    // fix #4998 (§22.5 / §22.10, v0.307; #4484 re-opened by a sibling): the
+    // question is which candidate §22.5 BINDS, not which shares the call's
+    // ARITY. The arity-only predicate declined to publish whenever an
+    // explicit base constructor had the same parameter count, so a sibling
+    // whose parameters carry none of the call's names (`(s: string, t:
+    // string)` does not bind `base(b := n, a := 1)`) still suppressed the
+    // primary binding — codegen's `ctorForArgs` then found no sibling and
+    // `prePopulateBasePositionalFields` fell back to the textual-order
+    // pairing, pairing `b := n` with the primary's first slot (`a`) and
+    // `a := 1` with the second (`b`). The arity question should be the
+    // §22.5 question.
+    for (Symbol* m : base->members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic) continue;
+        if (bindArgsToParams(sema::FormalsView::of(*other), chain.args,
+                             chain.span.begin, desc, /*emit=*/false).ok)
+            return;  // a sibling binds — codegen routes through it.
+    }
     // fix #4496 (§22.5, v0.306): `emit=true` — see the header comment. A
     // binding the rule REJECTS is now reported here instead of publishing
     // nothing and letting codegen store a mispaired object.
