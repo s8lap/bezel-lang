@@ -4342,6 +4342,17 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     }
     if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (nc->target) resolveTypesInExpr(*nc->target, scope);
+        // fix #4813 follow-up (§7.5 / §14.5, v0.307): `recv?.Method<T>(...)`
+        // carries its explicit method type args exactly as the `.` form
+        // does (#1278), so resolve them here too. Unresolved, every
+        // `ctx_.resolvedType(ta)` consumer (typeCall's explicit substitution,
+        // codegen's explicit binding) saw null: the call counted as having an
+        // explicit list but bound nothing, and once #4935 stopped argument
+        // inference from backfilling it, `b?.Ret<int>(6)` was typed as the
+        // callee's bare `T` (and `b?.Ret<long>(6)` was inferred as `int`).
+        for (const auto& ta : nc->typeArgs) {
+            if (ta) resolveType(*ta, scope);
+        }
         return;
     }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
