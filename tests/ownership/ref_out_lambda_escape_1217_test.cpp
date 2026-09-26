@@ -68,6 +68,22 @@ bool rejectsExternOutCallbackCapture(
     return false;
 }
 
+// True iff the diagnostics include the §32.8 (v0.307) plain-callback
+// admission rejection: a capturing lambda / bound method at a plain
+// (un-`env`-paired) extern function-typed parameter (#4671).
+bool rejectsPlainExternCallbackCapture(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("§32.8") == std::string::npos) continue;
+        if (d.message.find("plain (un-`env`-paired) extern function-typed "
+                           "parameter must be capture-free") ==
+            std::string::npos)
+            continue;
+        if (d.message.find("capturing lambda") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -260,11 +276,17 @@ BEZEL_TEST(extern_out_callback_capture_issue_1719,
     BEZEL_EXPECT_TRUE(rejectsExternOutCallbackCapture(r, "x"));
 }
 
-// §32.5 explicitly contrasts `ref`: native receives initialized storage and
-// direct passing intentionally lets a same-call callback observe writes as they
-// land. Capturing a ref argument therefore remains accepted (#1719 control).
+// §32.8 (v0.307): "At a **plain** (un-`env`-paired) function-typed parameter,
+// the callback must be a **static method reference or a non-capturing
+// lambda** ... A **bound instance-method reference** (`obj.Method`) and a
+// **capturing lambda** are rejected there". `cb: () -> int` is plain, so this
+// capturing lambda is rejected (#4671). §32.5's contrast — capturing the very
+// binding passed `ref` to the same call is admitted — applies only at an
+// `env`-paired parameter, the one place §32.8 admits a capturing lambda. This
+// row was an accept control for #1719 and is restored as an env-paired accept
+// row under #5050 once #4561 makes the `env` clause parse.
 BEZEL_TEST(extern_out_callback_capture_issue_1719,
-           direct_lambda_capturing_same_ref_binding_accepted) {
+           direct_lambda_capturing_same_ref_binding_rejected_at_plain_param_spec_32_8) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "extern \"c\" "
@@ -275,13 +297,22 @@ BEZEL_TEST(extern_out_callback_capture_issue_1719,
         "  _ := inspect(ref x, lambda() => x); "
         "  return x; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsPlainExternCallbackCapture(r));
 }
 
-// §32.5 rejects only the intersection. A callback may capture some other
-// initialized binding while the extern fills `x` through out (#1719 control).
+// §32.8 (v0.307): "At a **plain** (un-`env`-paired) function-typed parameter,
+// the callback must be a **static method reference or a non-capturing
+// lambda** ... A **bound instance-method reference** (`obj.Method`) and a
+// **capturing lambda** are rejected there". `cb: () -> int` is plain, so a
+// lambda capturing `y` is rejected (#4671) even though `y` is not the out
+// recipient. §32.5's intersection rule — a callback may capture some other
+// binding while the extern fills `x` through out — applies only at an
+// `env`-paired parameter. This row was an accept control for #1719 and is
+// restored as an env-paired accept row under #5050 once #4561 makes the `env`
+// clause parse.
 BEZEL_TEST(extern_out_callback_capture_issue_1719,
-           callback_capturing_different_binding_accepted) {
+           callback_capturing_different_binding_rejected_at_plain_param_spec_32_8) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "extern \"c\" "
@@ -293,7 +324,8 @@ BEZEL_TEST(extern_out_callback_capture_issue_1719,
         "  _ := fill(out x, lambda() => y); "
         "  return x; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsPlainExternCallbackCapture(r));
 }
 
 // §32.5 (#1719): capture identity is symbol-based, not name-based. A lambda
