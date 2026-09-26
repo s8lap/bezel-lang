@@ -573,6 +573,13 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
 // argument, but still the placeholder zero for a call with no such argument or
 // an i32-width one. That is the pre-existing #5022 residual, for example a
 // body that calls a PRIVATE helper the wire does not carry.
+//
+// Binding is not lowering either. The importer also refuses, on this route, a
+// body containing a lambda, a function-valued local or parameter, or a
+// generic method call; and when an attached body still does not lower, codegen
+// (`emitInlineGenericMethod`) turns the INTERNAL degrade into a located error
+// at the call site. So an attached body either produces the single-module
+// value or fails the compile.
 bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
                                     sema::SemaContext& ctx) {
     if (md.genericParams.empty()) return false;

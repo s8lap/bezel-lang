@@ -3935,7 +3935,9 @@ static bool parseAndAttachMethodBody(
     // member typechecks cleanly. Whether that member reaches codegen then
     // depends on the exprSymbol remap below, which drops any symbol no arm
     // binds. For the constraint-using route, see `failClosed` below: it
-    // re-checks the remap itself instead of relying on this gate.
+    // re-checks the remap itself instead of relying on this gate. Binding in
+    // turn does not prove LOWERING: see the lambda / generic-call refusal
+    // below and the codegen backstop in emitInlineGenericMethod.
     if (semaDiag->hasErrors()) return false;
 
     // Locate the fresh TypeSymbol and the fresh target MethodSymbol (by signature
@@ -4124,6 +4126,61 @@ static bool parseAndAttachMethodBody(
     // and that AST is freed when the body is not attached, so an entry
     // written before a `return false` would leave a dangling key in mainCtx.
     std::vector<std::pair<const ast::Expr*, sema::Symbol*>> pendingSymbols;
+
+    // fix #5009 fix-forward (§14.1 / §14.2 / §27.3, v0.307): the binding
+    // check below proves only that every reference BINDS. It does not prove
+    // that the monomorphized clone LOWERS. MEASURED on 43854953, where every
+    // reference bound: a body containing a lambda (`var g := lambda() =>
+    // v.Area(); return g() + 100;`, and the same with a
+    // `lambda(x: T)` or a captured-free `lambda() => Helper.Bonus()`) and a
+    // body that takes a member of a nested generic call's result
+    // (`Helper.Id(v).Area()`, inferred or with an explicit `<T>`) each
+    // compiled with only an INTERNAL #2491 warning and returned 0. The
+    // single-module twins return the right values, and dcb17d57 rejected all
+    // of them cleanly with #1943. So on this route a body containing any
+    // lambda or function-typed value, or any call to a generic method, is
+    // NOT attached until those shapes are proven, and the call keeps #1943's
+    // reject. This is a deliberately conservative cut: it also refuses
+    // lambda and nested-generic shapes that happen to lower correctly today
+    // (e.g. `lambda(x: int) => x + Helper.Bonus()`), which dcb17d57 rejected
+    // too.
+    if (failClosed) {
+        auto inBody = [&](const ast::Expr* e) {
+            return e && e->span.begin.offset >= bodyBegin &&
+                   e->span.begin.offset < bodyEnd;
+        };
+        for (const auto& [expr, ty] : freshCtx.allExprTypes()) {
+            if (!inBody(expr)) continue;
+            if (dynamic_cast<const ast::LambdaExpr*>(expr)) return false;
+            // A function VALUE held in a local or parameter (a lambda- or
+            // method-reference-holding local, `var f := v.Area;`). A call's
+            // own callee is also function-typed, so only a name bound to a
+            // local or a parameter is refused.
+            if (ty && ty->kind == sema::TypeRef::Kind::Function &&
+                dynamic_cast<const ast::IdentifierExpr*>(expr)) {
+                const sema::Symbol* fs = freshCtx.exprSymbol(*expr);
+                if (dynamic_cast<const sema::LocalSymbol*>(fs) ||
+                    dynamic_cast<const sema::ParameterSymbol*>(fs))
+                    return false;
+            }
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(expr);
+                ma && !ma->typeArgs.empty())
+                return false;
+            if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(expr);
+                nm && !nm->typeArgs.empty())
+                return false;
+        }
+        for (const auto& [expr, sym] : freshCtx.allExprSymbols()) {
+            if (!inBody(expr)) continue;
+            if (dynamic_cast<const ast::LambdaExpr*>(expr)) return false;
+            if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym);
+                ms && !ms->genericParams.empty())
+                return false;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(expr);
+                ma && !ma->typeArgs.empty())
+                return false;
+        }
+    }
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
@@ -4374,6 +4431,10 @@ static bool parseAndAttachMethodBody(
     // backing source + AST alive (string_view fields point into them), plus the
     // fresh context + diagnostics that own the copied TypeRefs.
     importedMs->decl = parsedMdBase;
+    // fix #5009: binding is proven above; LOWERING is not. Mark the body so
+    // codegen escalates an INTERNAL lowering degrade inside it to the #1943
+    // reject (emitInlineGenericMethod).
+    if (failClosed) mainCtx.markConstraintRouteBody(importedMs);
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
     // Keep the fresh context + diagnostics alive. importedAuxiliary_ destroys in

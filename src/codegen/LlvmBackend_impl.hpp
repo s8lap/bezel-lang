@@ -14600,6 +14600,11 @@ private:
     // one that reaches an imported generic); every other emitOwnFieldInit caller
     // leaves it `{}` and reports unlocated, exactly as before.
     SourceLocation importedFieldInitDiagLoc_{};
+    // fix #5009 (§14.1 / §2.8.3, v0.307): the location of the call currently
+    // being lowered (scoped in lowerCall). Only consumer: the constraint-route
+    // backstop in emitInlineGenericMethod, whose shipped body's own nodes carry
+    // fresh-AST coordinates that do not locate anything in the importer.
+    SourceLocation callSiteLoc_{};
 
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and

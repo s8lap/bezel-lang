@@ -43,11 +43,22 @@
 //     to the reconstructed type, one of its members, or a parameter is left
 //     unbound, the body is not attached and the call keeps the #1943 clean
 //     reject.
+//   * a body on this route that contains a lambda, a function-valued local
+//     or parameter, or any generic METHOD call is also not attached (binding
+//     does not prove those lower);
+// Codegen (`emitInlineGenericMethod`): the BACKSTOP. Any INTERNAL degrade
+// reported while a constraint-route body is emitted becomes a located error
+// at the call site, so a body that binds but does not lower is a clean
+// reject, never a silent zero.
 //
 // The first version of this fix (539563d5) admitted only the bound's members.
 // Every other sibling member was dropped, so programs that were previously
 // rejected cleanly compiled and returned wrong values (T11-T13, found by the
 // non-author review). T11-T16 pin that class.
+// The second version (43854953) proved only BINDING. Bodies with a lambda or a
+// nested generic call bound, did not lower, and returned 0 (T18-T23, found by
+// a second non-author review); T24 pins the backstop for the shapes a
+// syntactic refusal cannot enumerate.
 //
 // Deliberately NOT covered, and pinned as unchanged (T9): a bound on a
 // BUILTIN interface (`INumber<T>`, `IComparable<T>`) — the importer's fresh
@@ -78,6 +89,13 @@
 //   T16 ★ FAIL CLOSED: a body naming a computed property the remap cannot
 //        bind is REJECTED with #1943's diagnostic (without the fail-closed
 //        check: exit 0 with INTERNAL #2491, measured)
+//   T17  DIFFERENTIAL CONTROL for T11-T15 in ONE module -> 228
+//   T18-T23 ★ bodies with a lambda (p8b / q1 / q3 / q4) or a member of a
+//        nested generic call's result (p6c / q7) are REJECTED with #1943's
+//        diagnostic (43854953: they bound, did not lower, and returned 0)
+//   T24 ★ CODEGEN BACKSTOP: a body that binds but does not lower (a sibling
+//        generic class at T) is REJECTED at the call site, not 0
+//   T25  DIFFERENTIAL CONTROL for T18-T24 in ONE module -> 99
 //   T17   DIFFERENTIAL CONTROL for T11-T15 in ONE module -> 228
 //
 // Every accept row asserts the constraint method's exact VALUE — "compiled"
@@ -398,6 +416,93 @@ const char* kFailClosedReject5009 =
     "calling imported generic method `GenPS5009` with a type argument whose "
     "representation is not the compiled `int` (i32) placeholder";
 
+// ---------------------------------------------------------------------------
+// The third dependency, for T18-T25 (the second non-author review of
+// 43854953). Every body BINDS, but on 43854953 each one lowered a part of
+// itself to nothing and the call returned 0 with only an INTERNAL #2491
+// warning, where dcb17d57 rejected it cleanly with #1943. The single-module
+// twins return the values in the comments.
+// ---------------------------------------------------------------------------
+const char* kLowDecls5009 =
+    "public interface IShapeL5009 "
+    "  method Area(): int; "
+    "end IShapeL5009; "
+    "public class SqL5009: IShapeL5009 "
+    "  public constructor() end constructor; "
+    "  public method Area(): int return 7; end Area; "
+    "end SqL5009; "
+    "public static class HelperL5009 "
+    "  public static method Bonus(): int return 20; end Bonus; "
+    "  public static method Id<U>(u: U): U return u; end Id; "
+    "end HelperL5009; "
+    "public class BoxL5009<U> "
+    "  private _u: U; "
+    "  public constructor(u: U) _u := u; end constructor; "
+    "  public method Get(): U return _u; end Get; "
+    "end BoxL5009; "
+    "public static class GL5009 "
+    "  public static method PubHelp(): int return 30; end PubHelp; "
+    // p8b: a lambda capturing `v`, calling an own static. 7 + 30 = 37.
+    "  public static method LamCapHelp<T>(v: T): int where T: IShapeL5009 "
+    "    var g := lambda() => v.Area() + PubHelp(); "
+    "    return g(); "
+    "  end LamCapHelp; "
+    // q1: a lambda capturing `v`. 7 + 100 = 107.
+    "  public static method LamCap<T>(v: T): int where T: IShapeL5009 "
+    "    var g := lambda() => v.Area(); "
+    "    return g() + 100; "
+    "  end LamCap; "
+    // q3: a capture-free lambda calling a sibling's static. 20 + 7 = 27.
+    "  public static method LamSib<T>(v: T): int where T: IShapeL5009 "
+    "    var g := lambda() => HelperL5009.Bonus(); "
+    "    return g() + v.Area(); "
+    "  end LamSib; "
+    // q4: a lambda whose parameter is T-typed. 7 + 100 = 107.
+    "  public static method LamParam<T>(v: T): int where T: IShapeL5009 "
+    "    var g := lambda(x: T) => x.Area(); "
+    "    return g(v) + 100; "
+    "  end LamParam; "
+    // p6c: a member of a nested generic call's result, U inferred. 107.
+    "  public static method IdInfer<T>(v: T): int where T: IShapeL5009 "
+    "    return HelperL5009.Id(v).Area() + 100; "
+    "  end IdInfer; "
+    // q7: the same with an explicit `<T>`. 107.
+    "  public static method IdExplicit<T>(v: T): int where T: IShapeL5009 "
+    "    return HelperL5009.Id<T>(v).Area() + 100; "
+    "  end IdExplicit; "
+    // A sibling GENERIC CLASS instantiated at T. No lambda and no generic
+    // METHOD call, so the pre-attach refusal does not see it; the codegen
+    // backstop does. 7 + 100 = 107.
+    "  public static method GenBox<T>(v: T): int where T: IShapeL5009 "
+    "    var b := new BoxL5009<T>(v); "
+    "    return b.Get().Area() + 100; "
+    "  end GenBox; "
+    "end GL5009; ";
+
+std::string depLow5009() {
+    return std::string("module DepL5009; ") + kLowDecls5009;
+}
+
+std::string appLow5009(const std::string& tag, const std::string& call) {
+    return "module AppL5009" + tag +
+           "; import DepL5009; class CL5009 public static method Main(): "
+           "int using var s := new SqL5009(); return " + call +
+           "; end Main; end CL5009;";
+}
+
+// #1943's reject, as the pre-attach refusal leaves it for `name`.
+std::string widthReject5009(const std::string& name) {
+    return "calling imported generic method `" + name +
+           "` with a type argument whose representation is not the compiled "
+           "`int` (i32) placeholder";
+}
+
+// The codegen backstop's reject for `name`.
+std::string lowerReject5009(const std::string& name) {
+    return "calling imported generic method `" + name +
+           "`: its body could not be monomorphized across the module boundary";
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -689,6 +794,96 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
                                    appSib5009("T17", "", kSibAllBody5009));
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, 228);
+}
+
+// ===========================================================================
+// T18-T23 — ★ SECOND REVIEW REGRESSIONS (43854953). A body containing a lambda
+// (p8b / q1 / q3 / q4) or taking a member of a nested generic call's result
+// (p6c inferred / q7 explicit) bound cleanly but did not lower: each returned
+// 0 with an INTERNAL #2491 warning. On the constraint route such a body is now
+// refused before it is attached, so each call keeps #1943's clean reject,
+// exactly as on dcb17d57. Asserting the reject, not the value: the value
+// would need importer-side lambda and nested-generic monomorphization, which
+// is not proven.
+// // per §14.1 / §14.2 / §27.3 / §2.8.3 / #1943, v0.307
+// ===========================================================================
+namespace {
+void expectWidthReject5009(const std::string& tag, const std::string& name) {
+    auto r = compileImport5009(depLow5009(),
+                               appLow5009(tag, "GL5009." + name + "(s)"));
+    if (!r.depOk) return;
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(widthReject5009(name)) != std::string::npos);
+}
+}  // namespace
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           lambda_capturing_bound_value_and_own_static_is_rejected) {
+    expectWidthReject5009("T18", "LamCapHelp");  // p8b
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           lambda_capturing_bound_value_is_rejected) {
+    expectWidthReject5009("T19", "LamCap");  // q1
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           capture_free_lambda_calling_sibling_static_is_rejected) {
+    expectWidthReject5009("T20", "LamSib");  // q3
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           lambda_with_type_parameter_parameter_is_rejected) {
+    expectWidthReject5009("T21", "LamParam");  // q4
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           member_of_inferred_nested_generic_call_result_is_rejected) {
+    expectWidthReject5009("T22", "IdInfer");  // p6c
+}
+
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           member_of_explicit_nested_generic_call_result_is_rejected) {
+    expectWidthReject5009("T23", "IdExplicit");  // q7
+}
+
+// ===========================================================================
+// T24 — ★ THE CODEGEN BACKSTOP. `GenBox` instantiates a sibling generic class
+// at T. It has no lambda and no generic method call, so the pre-attach refusal
+// lets it through, and on the pre-backstop tree it returned 0 with an INTERNAL
+// #2491 warning (MEASURED). Any INTERNAL degrade while a constraint-route body
+// is emitted is now a located error at the call site.
+// // per §14.1 / §2.8.3 rule 2 / #1943, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           body_that_does_not_lower_is_rejected_not_zero) {
+    auto r = compileImport5009(depLow5009(),
+                               appLow5009("T24", "GL5009.GenBox(s)"));
+    if (!r.depOk) return;
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(r.err.find(lowerReject5009("GenBox")) !=
+                      std::string::npos);
+}
+
+// ===========================================================================
+// T25 — DIFFERENTIAL CONTROL for T18-T24: in ONE module every body lowers,
+// so the rejects above are a module-boundary limitation, not a wrong program.
+// 37 + 107 + 27 + 107 + 107 + 107 + 107 = 599; minus 500 to stay within the
+// 8-bit exit status = 99.
+// // per §2.8.3 rule 2 / §14.1 / §27.3, v0.307
+// ===========================================================================
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           non_lowering_bodies_match_values_in_one_module) {
+    BEZEL_EXPECT_EQ(
+        buildLocalAndRun5009(
+            std::string("module LocL5009; ") + kLowDecls5009 +
+            "class CL5009 public static method Main(): int "
+            "using var s := new SqL5009(); "
+            "return GL5009.LamCapHelp(s) + GL5009.LamCap(s) + "
+            "GL5009.LamSib(s) + GL5009.LamParam(s) + GL5009.IdInfer(s) + "
+            "GL5009.IdExplicit(s) + GL5009.GenBox(s) - 500; "
+            "end Main; end CL5009;"),
+        99);
 }
 
 }  // namespace bezel::module

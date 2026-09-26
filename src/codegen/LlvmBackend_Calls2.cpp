@@ -6016,6 +6016,15 @@ static bool importedMemberTypeAdmitsClosureDispatch(
 // Dispose chain), and a nineteenth arm added tomorrow participates for free.
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     const IrFootprint before = irFootprint();
+    // fix #5009: scoped call-site location for emitInlineGenericMethod's
+    // constraint-route backstop (see `callSiteLoc_`).
+    struct CallSiteLocScope {
+        SourceLocation& slot;
+        SourceLocation saved;
+        CallSiteLocScope(SourceLocation& s, SourceLocation v)
+            : slot(s), saved(s) { slot = v; }
+        ~CallSiteLocScope() { slot = saved; }
+    } callSiteLocScope(callSiteLoc_, call.span.begin);
     llvm::Value* v = lowerCallDispatch(call);
     // fix #3421 (§4.7, v0.283): a void-typed result IS "no value" — LLVM `void`
     // has no size and no alignment, so nothing can be done with the `CallInst`
@@ -15920,6 +15929,19 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     if (emitted) *emitted = false;
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return nullptr;
+    // fix #5009 (§14.1 / §14.2 / §2.8.3 rule 4, v0.307): the constraint-route
+    // BACKSTOP. ModuleLoader attaches such a body only once every reference in
+    // it binds, and refuses lambdas and nested generic calls outright, but
+    // binding does not prove the monomorphized body LOWERS. MEASURED on
+    // 43854953: bound bodies lowered a sub-expression to nothing and the call
+    // returned 0 with only an INTERNAL #2491 warning, where dcb17d57 rejected
+    // cleanly with #1943. So any INTERNAL degrade reported while this body is
+    // emitted is escalated to a located error at the call site: the compile
+    // fails, never a silent zero. Checked after the body is emitted (below).
+    const bool constraintRoute = ctx_.isConstraintRouteBody(ms);
+    const SourceLocation constraintRouteSite = callSiteLoc_;
+    const std::size_t constraintRouteDiagMark =
+        ctx_.diagnostics().diagnostics().size();
     // #1059: do NOT bail when `ms->decl` is an OperatorDecl rather than a
     // MethodDecl — an operator overload on a GENERIC record/class must
     // specialize per-instantiation just like a regular method. callableInfo
@@ -16121,6 +16143,25 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628 (phase a)
+
+    // fix #5009: the constraint-route backstop (see the top of this function).
+    if (constraintRoute) {
+        const std::vector<Diagnostic>& ds = ctx_.diagnostics().diagnostics();
+        for (std::size_t di = constraintRouteDiagMark; di < ds.size(); ++di) {
+            if (ds[di].severity != Severity::Warning ||
+                ds[di].message.rfind("internal:", 0) != 0)
+                continue;
+            ctx_.diagnostics().report(
+                Severity::Error, constraintRouteSite,
+                "calling imported generic method `" + std::string(ms->name) +
+                "`: its body could not be monomorphized across the module "
+                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+                "\xE2\x80\x94 a part of it did not lower, so the call would "
+                "silently compute a wrong value. Call it within the module "
+                "that defines it, or give it a non-generic parameter");
+            break;
+        }
+    }
 
     if (emitted) *emitted = bodyEmitted;
     return result;

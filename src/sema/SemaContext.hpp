@@ -774,6 +774,18 @@ public:
         return !importedExtensionsByModule_.empty();
     }
 
+    // fix #5009 (§14.1 / §14.2 / §2.8.3 rule 4, v0.307): an imported generic
+    // method whose body ModuleLoader attached on the constraint route (a
+    // method-level `new()` bound or a bound the exporting module declares).
+    // Codegen turns any INTERNAL lowering degrade inside such a body into the
+    // #1943 reject rather than a silent zero; see emitInlineGenericMethod.
+    void markConstraintRouteBody(const Symbol* ms) {
+        constraintRouteBodies_.insert(ms);
+    }
+    bool isConstraintRouteBody(const Symbol* ms) const {
+        return constraintRouteBodies_.count(ms) != 0;
+    }
+
     // Is `s` an imported (externally-defined) symbol? Codegen consults this to
     // emit an external declaration rather than a definition.
     bool isImported(const Symbol* s) const {
@@ -1203,6 +1215,7 @@ private:
     std::unordered_map<std::string, std::vector<ExtensionSymbol*>>
         importedExtensionsByModule_;
     std::unordered_set<Symbol*> imported_;
+    std::unordered_set<const Symbol*> constraintRouteBodies_;  // fix #5009
     std::vector<std::unique_ptr<std::string>> internedStrings_;
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;
