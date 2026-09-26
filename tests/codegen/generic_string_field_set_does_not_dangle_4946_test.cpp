@@ -33,8 +33,11 @@
 // Rows that are leak-clean with the fix run on the plain AOT path AND under
 // generated-code ASan+LSan (runAotChecked). Rows exercising the generic-body
 // store run under generated-code ASan with LSan off (runAotCheckedLenient):
-// the leaked old value is the recorded policy above, and what they pin is
-// the absence of the use-after-free. Every row asserts exact stdout.
+// the leaked old value is the recorded policy of #4980 (the retain-only policy
+// of #4965; T locals take no +1), and what these rows pin is the absence of
+// the use-after-free. The 7253 B residual under lenient LSan is tracked by
+// issue #4980; pin stays lenient until that issue is fixed and the rows are
+// moved back to runAotChecked. Every row asserts exact stdout.
 
 #include <string>
 
@@ -140,7 +143,7 @@ module M;
 public class B<T>
   private _v: T;
   public constructor(v: T) _v := v; end constructor;
-  public method Put(v: T): T do var old: T := _v; _v := v; return old; end Put;
+  public method Put(v: T): T var old: T := _v; _v := v; return old; end Put;
   public method Get(): T => _v;
 end B;
 public class Program
