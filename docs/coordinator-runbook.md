@@ -455,15 +455,29 @@ them mechanical. Each script's header has the details and the incident behind it
 | Before a gate, or on a FAIL | `scripts/pick_ledger.sh [RANGE]` | the ledger above: one row per commit, per-pool commit and fix-issue counts (only kind=fix commits bank an issue, credited to the pool of its earliest fix commit; with no recorded kind it is inferred from the subject and marked `*`), and the UNATTRIBUTED count (no note by SHA or by patch-id). |
 | Dispatching a lane | `scripts/lane_setup.sh --owner <name>` or `scripts/wt_owner.sh claim <name>` | nothing: another session's lane once switched a worktree it did not own to its own branch. With the hooks installed (`scripts/install_hooks.sh`, once per repo, a coordinator decision; it acts on the repo of the **current directory**), a commit in an owned worktree on a different named branch, or while rebasing a different branch, is refused, and switching to one prints a warning. A detached HEAD (bisect, `switch --detach`, the owner's own rebase) is allowed. `BEZEL_OWNER_OVERRIDE=1` bypasses it. |
 
-**Rebasing staging drops the notes** unless git is told to carry them, per
-command (never `git config`):
+**Rebasing staging drops the notes** unless git is told to carry them. The
+primary path — the only one that is reliable — is, per command (never
+`git config`):
 
     git -c notes.rewriteRef=refs/notes/bezel-picks rebase <onto>
 
-If that was forgotten, `pick_ledger.sh` still recovers each note from the
-pre-rebase commit by `git patch-id --stable` and marks the row's kind `~`
-(e.g. `fix~`); it counts as recorded. Recovery fails only if the patch
-changed in the rebase (a conflict resolution) — those rows show UNATTRIBUTED.
+If that was forgotten, `pick_ledger.sh` falls back, **best effort**, to the
+pre-rebase commit: a noted commit with the same `git patch-id --stable` *and*
+the same subject. Exactly one such commit → its note is used and the row's
+kind is marked `~` (e.g. `fix~`), counting as recorded. It never guesses
+between candidates. A row stays UNATTRIBUTED, with its kind inferred and
+marked `*`, when:
+- **the patch changed** in the rebase (a conflict resolution), so no patch-id
+  matches;
+- **duplicates are ambiguous**: noted commits share the row's patch-id but
+  none, or more than one, has its subject (a fix, its revert and a re-add
+  under another subject have identical diffs; the same subject picked twice).
+  LANE then reads `(ambiguous)`;
+- **the pre-rebase objects were pruned** by `git gc` / `git prune`: a note
+  outlives the commit it annotates, and a pruned target can no longer be
+  matched (it is skipped, so the other notes still recover).
+Recovery computes one patch-id per note in `refs/notes/bezel-picks`, so its
+cost grows with the notes ref; nothing prunes that ref yet.
 
 Limits worth knowing:
 - notes are local refs and are not pushed, so the ledger lives on this machine;

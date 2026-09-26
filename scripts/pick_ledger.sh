@@ -25,11 +25,17 @@
 # NOTE RECOVERY. Notes are keyed by SHA, and a rebase of staging rewrites every
 # SHA; git carries notes across only with
 #     git -c notes.rewriteRef=refs/notes/bezel-picks rebase …
-# (per command — never `git config`). When a commit has no note by SHA, the
-# ledger looks for a noted commit with the same `git patch-id --stable` (the
-# pre-rebase pick, still annotated) and uses that note; such a row's KIND is
-# shown with a trailing `~` and counts as recorded. Only a commit with no note
-# by SHA OR patch-id is UNATTRIBUTED.
+# (per command — never `git config`); that is the primary path. As a
+# BEST-EFFORT fallback, when a commit has no note by SHA the ledger looks for
+# the pre-rebase pick: a noted commit with the same `git patch-id --stable`
+# AND the same subject. Exactly one such commit -> its note is used, the KIND
+# is shown with a trailing `~` and counts as recorded. Otherwise the row is
+# UNATTRIBUTED; if noted commits share its patch-id but none or several have
+# its subject (identical diffs, e.g. a fix, its revert, and a re-add under
+# another subject), LANE reads `(ambiguous)` — it never borrows another
+# commit's note. Recovery also fails when the rebase changed the patch
+# (a conflict resolution) or the pre-rebase commit was pruned by gc; pruned
+# note targets are skipped, not fatal.
 # Which issues a commit counts toward is decided in ONE place,
 # scripts/pick_issues.sh: the #NNN in the SUBJECT only (bodies are full of
 # cross-references). A subject without one counts 0. The KIND column is the
@@ -45,35 +51,59 @@ REF=bezel-picks
 shas="$(git rev-list --reverse "$RANGE" 2>/dev/null)" || {
   echo "pick_ledger: cannot list '$RANGE'" >&2; exit 1; }
 
-declare -A COMMITS=() FIXES=() CREDIT=() ALL=() PID_NOTE=() PID_OF=()
-unattr=0 total=0 inferred_fix_issues=0 recovered=0
+declare -A COMMITS=() FIXES=() CREDIT=() ALL=() PID_CANDS=() PID_OF=() SUBJ=()
+unattr=0 ambiguous=0 total=0 inferred_fix_issues=0 recovered=0
 
 patch_ids() { # SHAs on stdin -> "patchid sha" lines (merges and empty commits give none)
   git log --no-walk=unsorted --stdin -p --format='commit %H' 2>/dev/null | git patch-id --stable 2>/dev/null
 }
 MAP_BUILT=0
-build_patch_map() { # patch-id -> annotated commit, over EVERY note; then the range's own patch-ids
+build_patch_map() {
+  # patch-id -> LIST of noted commits. Note targets whose object is gone (a
+  # pruned pre-rebase commit) are dropped first: `git log --stdin` dies on the
+  # first missing object, which would empty the whole map.
   MAP_BUILT=1
-  local pid c
-  while read -r pid c; do
-    [ -n "${PID_NOTE[$pid]:-}" ] || PID_NOTE[$pid]="$c"
-  done < <(git notes --ref="$REF" list 2>/dev/null | awk '{print $2}' | patch_ids)
-  while read -r pid c; do PID_OF[$c]="$pid"; done < <(printf '%s
-' $shas | patch_ids)
+  local pid c targets
+  targets="$(git notes --ref="$REF" list 2>/dev/null | awk '{print $2}' \
+    | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+    | awk '$2 == "commit" {print $1}')"
+  [ -n "$targets" ] || return 0
+  while IFS=$'\t' read -r c pid; do SUBJ[$c]="$pid"; done \
+    < <(printf '%s\n' "$targets" | git log --no-walk=unsorted --stdin --format='%H%x09%s' 2>/dev/null)
+  while read -r pid c; do PID_CANDS[$pid]+="$c "; done < <(printf '%s\n' "$targets" | patch_ids)
+  while read -r pid c; do PID_OF[$c]="$pid"; done < <(printf '%s\n' $shas | patch_ids)
+}
+recover_note() { # $1 = sha with no note by SHA. Prints the source commit, or
+  # returns 1 (nothing shares its patch-id) / 2 (candidates, but not exactly
+  # one with the same SUBJECT: ambiguous — never guess, a duplicate diff under
+  # another subject is a different pick).
+  local sha="$1" pid c subj n=0 hit="" any=0
+  pid="${PID_OF[$sha]:-}"
+  [ -n "$pid" ] || return 1
+  subj="$(git log -1 --format=%s "$sha")"
+  for c in ${PID_CANDS[$pid]:-}; do
+    [ "$c" = "$sha" ] && continue
+    any=1
+    [ "${SUBJ[$c]:-}" = "$subj" ] && { n=$((n + 1)); hit="$c"; }
+  done
+  [ "$any" = 1 ] || return 1
+  [ "$n" = 1 ] || return 2
+  printf '%s\n' "$hit"
 }
 printf '%-10s %-12s %-22s %-14s %-7s %-18s %s\n' SHA POOL LANE VERDICT KIND ISSUES SUBJECT
 for sha in $shas; do
   total=$((total + 1))
   note="$(git notes --ref="$REF" show "$sha" 2>/dev/null || true)"
   field() { printf '%s\n' "$note" | sed -n "s/^$1: *//p" | head -n 1; }
-  kind="" mark=""
+  kind="" mark="" amb=0
   if [ -z "$note" ]; then
     [ "$MAP_BUILT" = 1 ] || build_patch_map
-    pid="${PID_OF[$sha]:-}"
-    src="${pid:+${PID_NOTE[$pid]:-}}"
-    if [ -n "$src" ] && [ "$src" != "$sha" ]; then
+    src="$(recover_note "$sha")"; rc=$?
+    if [ "$rc" = 0 ]; then
       note="$(git notes --ref="$REF" show "$src" 2>/dev/null || true)"
       [ -n "$note" ] && { mark="~"; recovered=$((recovered + 1)); }
+    elif [ "$rc" = 2 ]; then
+      amb=1
     fi
   fi
   if [ -n "$note" ]; then
@@ -82,6 +112,7 @@ for sha in $shas; do
     [ -n "$pool" ] || pool="?"
   else
     pool=UNATTRIBUTED; lane=-; verdict=-
+    [ "$amb" = 1 ] && { lane="(ambiguous)"; ambiguous=$((ambiguous + 1)); }
     issues="$("$HERE/pick_issues.sh" "$sha")"
     unattr=$((unattr + 1))
   fi
@@ -112,7 +143,8 @@ done
 echo "distinct fix issues: ${#CREDIT[@]} ($inferred_fix_issues from inferred kinds)"
 echo "distinct issues named (all kinds): ${#ALL[@]}"
 if [ "$unattr" -gt 0 ]; then
-  echo "UNATTRIBUTED: $unattr commit(s): no refs/notes/$REF note found by SHA or patch-id"
+  echo "UNATTRIBUTED: $unattr commit(s): no refs/notes/$REF note found by SHA or patch-id" \
+       "($ambiguous ambiguous: a patch-id shared by noted commits, none or several with the same subject)"
 else
   echo "UNATTRIBUTED: 0"
 fi

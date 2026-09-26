@@ -45,7 +45,8 @@
 #
 # REBASING staging drops notes unless you pass, per command (never git config):
 #   git -c notes.rewriteRef=refs/notes/bezel-picks rebase …
-# pick_ledger.sh recovers a lost note by patch-id and marks the row `~`.
+# pick_ledger.sh then recovers notes by patch-id + subject, best effort only
+# (see docs/coordinator-runbook.md for when it cannot), marking rows `~`.
 #
 # Hooks (scripts/hooks/pre-commit, worktree ownership): measured on git 2.55,
 # `git cherry-pick` does NOT run pre-commit, but the `--amend` below DOES. So in
@@ -110,8 +111,10 @@ done
 TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/pick_stage.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-# Flags to repeat on --continue (every value is validated above: no spaces).
-FLAGS="--branch $BRANCH --pool $POOL --lane $LANE --reviewer $REVIEWER --verdict $VERDICT --kind $KIND"
+# Flags to repeat on --continue, shell-quoted (%q) so the printed line can be
+# pasted as-is even when a value (say --reviewer) contains a space.
+FLAGS="$(printf ' %q' --branch "$BRANCH" --pool "$POOL" --lane "$LANE" \
+  --reviewer "$REVIEWER" --verdict "$VERDICT" --kind "$KIND")"
 
 finalize() { # $1 = orig. HEAD is orig's fresh cherry-pick: normalise, check, note.
   local orig="$1" new n_tr last issues
@@ -194,7 +197,7 @@ for idx in "${!ORIGS[@]}"; do
 pick_stage: CONFLICT picking ${orig:0:10}; the pick is in progress ($picked picked before it).
   Not yet picked: ${rest:-(none)}
   To finish: resolve the conflicts, 'git add' the paths, then run
-    $0 --continue $FLAGS${rest:+ $rest}
+    $(printf %q "$0") --continue$FLAGS${rest:+ $rest}
   It completes the cherry-pick, strips the -x line, re-authors, checks the
   trailer, writes the note, then picks the rest. To give up: git cherry-pick --abort
 EOF

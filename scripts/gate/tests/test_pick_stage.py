@@ -26,7 +26,7 @@ class _Base(unittest.TestCase):
 
     def pick(self, *shas, **kw):
         args = ["--branch", kw.get("branch", "staging"), "--pool", kw.get("pool", "p1"),
-                "--lane", kw.get("lane", "lane-a"), "--reviewer", "rev-1",
+                "--lane", kw.get("lane", "lane-a"), "--reviewer", kw.get("reviewer", "rev-1"),
                 "--verdict", kw.get("verdict", "ACCEPT"),
                 "--kind", kw.get("kind", "fix")] + list(shas)
         return run("pick_stage.sh", *args, cwd=self.repo.root, env=self.env)
@@ -221,6 +221,137 @@ class NoteRecoveryTest(_Base):
                       "by SHA or patch-id", r.stdout)
 
 
+class DuplicatePatchIdTest(_Base):
+    """Re-review NEW-1/NEW-2/NEW-4.1: identical diffs under different subjects
+    (a fix, its revert, a re-add) must never borrow each other's note; a pruned
+    note target must not disable recovery; a changed patch stays UNATTRIBUTED."""
+
+    ROW = "row\n"
+
+    def _lane_commit(self, subject, text):
+        self.repo.git("switch", "-q", "lane-d")
+        self.repo.write("f.txt", text)
+        self.repo.commit(subject + "\n\n" + WANT, ["f.txt"])
+        sha = self.repo.out("rev-parse", "HEAD")
+        self.repo.git("switch", "-q", "staging")
+        return sha
+
+    def _start(self):
+        # f.txt exists (empty) on staging; lane-d branches from there.
+        self.repo.write("f.txt", "")
+        self.repo.commit("empty f\n\n" + WANT, ["f.txt"])
+        self.repo.git("branch", "lane-d")
+
+    def _rebase_staging(self):
+        self.repo.git("switch", "-q", "main")
+        self.repo.change("z.txt", "unrelated on main\n\n" + WANT)
+        self.repo.git("switch", "-q", "staging")
+        self.repo.git("rebase", "-q", "main", env=dict(self.env, GIT_EDITOR="true"))
+
+    def ledger(self):
+        r = run("pick_ledger.sh", "main..staging", cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def row(self, out, subject):
+        for ln in out.splitlines():
+            if ln.endswith(subject):
+                return ln.split()
+        self.fail("no row for %r in:\n%s" % (subject, out))
+
+    def _scenario(self, order):
+        # f.txt: "" -> row (A or B), -> "" (revert), -> row (B or A): A and B
+        # have IDENTICAL diffs, so identical patch-ids.
+        self._start()
+        spec = {"A": ("fix #5001: add row", "p1", "fix"),
+                "B": ("Bank baseline row (#5002)", "p2", "bank")}
+        first, second = order
+        s1 = self._lane_commit(spec[first][0], self.ROW)
+        self.assertEqual(self.pick(s1, pool=spec[first][1], kind=spec[first][2]).returncode, 0)
+        rv = self._lane_commit("infra: revert row", "")
+        self.assertEqual(self.pick(rv, pool="p3", kind="infra").returncode, 0)
+        s2 = self._lane_commit(spec[second][0], self.ROW)
+        self.assertEqual(self.pick(s2, pool=spec[second][1], kind=spec[second][2]).returncode, 0)
+        self._rebase_staging()
+        out = self.ledger()
+        self.assertEqual(self.row(out, "fix #5001: add row")[1:5], ["p1", "lane-a", "ACCEPT", "fix~"])
+        self.assertEqual(self.row(out, "Bank baseline row (#5002)")[1:5],
+                         ["p2", "lane-a", "ACCEPT", "bank~"])
+        self.assertEqual(self.row(out, "infra: revert row")[1:5], ["p3", "lane-a", "ACCEPT", "infra~"])
+        self.assertIn("distinct fix issues: 1 (0 from inferred kinds)", out)
+        return out
+
+    def test_fix_then_bank_with_identical_diffs_keep_their_own_notes(self):
+        self._scenario("AB")
+
+    def test_bank_then_fix_with_identical_diffs_keep_their_own_notes(self):
+        self._scenario("BA")
+
+    def test_duplicate_diff_under_a_new_subject_is_ambiguous_not_borrowed(self):
+        self._scenario("AB")
+        # A hand-made commit with the same diff again, no note: it shares the
+        # patch-id of A and B but neither subject.
+        self.repo.write("f.txt", "")
+        self.repo.commit("manual clear\n\n" + WANT, ["f.txt"])
+        self.repo.write("f.txt", self.ROW)
+        self.repo.commit("manual re-add of row\n\n" + WANT, ["f.txt"])
+        out = self.ledger()
+        r = self.row(out, "manual re-add of row")
+        self.assertEqual(r[1:3], ["UNATTRIBUTED", "(ambiguous)"])
+        self.assertTrue(r[4].endswith("*"), r)
+        # "manual clear" shares the revert's patch-id but not its subject.
+        self.assertEqual(self.row(out, "manual clear")[1:3], ["UNATTRIBUTED", "(ambiguous)"])
+        # UNATTRIBUTED: the two manual commits plus staging's own "empty f".
+        self.assertRegex(out, r"UNATTRIBUTED: 3 commit\(s\).*\(2 ambiguous")
+
+    def test_same_subject_and_diff_twice_is_ambiguous(self):
+        # The same fix picked twice (after a revert) under ONE subject: two
+        # candidates match the subject, so neither rebased row may guess.
+        self._start()
+        a1 = self._lane_commit("fix #5001: add row", self.ROW)
+        self.assertEqual(self.pick(a1, pool="p1").returncode, 0)
+        rv = self._lane_commit("infra: revert row", "")
+        self.assertEqual(self.pick(rv, pool="p3", kind="infra").returncode, 0)
+        a2 = self._lane_commit("fix #5001: add row", self.ROW)
+        self.assertEqual(self.pick(a2, pool="p9").returncode, 0)
+        self._rebase_staging()
+        out = self.ledger()
+        rows = [ln.split() for ln in out.splitlines() if ln.endswith("fix #5001: add row")]
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            self.assertEqual(r[1:3], ["UNATTRIBUTED", "(ambiguous)"])
+
+    def test_a_pruned_note_target_does_not_disable_recovery(self):
+        self.assertEqual(self.pick(self.c1).returncode, 0)
+        # Note a commit object that nothing references, then prune it: its note
+        # survives in refs/notes/bezel-picks, its object does not.
+        tree = self.repo.out("rev-parse", "HEAD^{tree}")
+        ghost = self.repo.out("commit-tree", tree, "-p", "HEAD", "-m", "ghost")
+        self.repo.git("notes", "--ref=bezel-picks", "add", "-m", "pool: zz", ghost)
+        self.repo.git("prune", "--expire=now")
+        self.assertNotEqual(self.repo.git("cat-file", "-e", ghost, check=False).returncode, 0,
+                            "precondition: the ghost commit was pruned")
+        self._rebase_staging()
+        out = self.ledger()
+        self.assertEqual(self.row(out, "fix #4001: first")[1:5], ["p1", "lane-a", "ACCEPT", "fix~"])
+        self.assertIn("UNATTRIBUTED: 0", out)
+
+    def test_a_patch_changed_by_the_rebase_stays_unattributed(self):
+        self.assertEqual(self.pick(self.c1).returncode, 0)     # adds a.txt
+        self.repo.git("switch", "-q", "main")
+        self.repo.change("a.txt", "main a\n\n" + WANT, text="main\n")
+        self.repo.git("switch", "-q", "staging")
+        env = dict(self.env, GIT_EDITOR="true")
+        self.assertNotEqual(self.repo.git("rebase", "main", check=False, env=env).returncode, 0)
+        self.repo.write("a.txt", "resolved\n")
+        self.repo.git("add", "--", "a.txt")
+        self.repo.git("rebase", "--continue", env=env)
+        out = self.ledger()
+        r = self.row(out, "fix #4001: first")
+        self.assertEqual(r[1:3], ["UNATTRIBUTED", "-"])
+        self.assertEqual(r[4], "fix*")
+
+
 class PickFlowTest(_Base):
     """Review round 4, SHOULD-FIX 3-5: conflict + --continue, empty picks,
     dirty-tree refusal, trailer-violation advice, value flags at the end."""
@@ -247,6 +378,22 @@ class PickFlowTest(_Base):
         self.assertNotIn("cherry picked from", msg)
         self.assertEqual(msg.splitlines()[-1], WANT)
         self.assertIn("orig: " + orig, self.note(rev))
+
+    def test_printed_continue_recipe_is_shell_quoted_and_runs(self):
+        import re
+        import subprocess
+        self.conflict_setup()
+        r = self.pick(self.c1, self.c2, reviewer="rev one")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        m = re.search(r"^\s*(\S*pick_stage\.sh --continue .*)$", r.stderr, re.M)
+        self.assertIsNotNone(m, r.stderr)
+        self.assertIn("--reviewer rev\\ one", m.group(1))
+        self._resolve()
+        c = subprocess.run(["bash", "-c", m.group(1)], cwd=str(self.repo.root), env=self.env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(c.returncode, 0, c.stderr + c.stdout)
+        self.assertIn("reviewer: rev one\n", self.note("HEAD~1"))
+        self.assertIn("orig: " + self.c2, self.note("HEAD"))
 
     def test_continue_finalizes_the_conflicted_pick_and_picks_the_rest(self):
         self.conflict_setup()
