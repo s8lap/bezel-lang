@@ -386,6 +386,35 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 emitBoxRelease(srcEv);
             }
         };
+        // fix #4934 / #4953 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema
+        // type is a BARE type parameter (`T`, or `T?`) inside a generic body
+        // instantiated at a nullable VALUE type (`T := int?`) lowers to the
+        // tagged `{i8, T}` carrier, but `ctx_.exprType` still answers the
+        // unsubstituted `T`. No arm below matched it, so the struct was
+        // dropped and the hole rendered "" (`Show<int?>(5)` printed "<>";
+        // `new B<int?>(41).Show()` printed an empty line). Resolve the ref
+        // through the ACTIVE substitution — only when the result is a
+        // nullable value type whose carrier is EXACTLY the lowered value's
+        // struct type, so every other hole keeps its sema type unchanged.
+        auto resolveBareTParamNullableHoleTy =
+            [&](const sema::TypeRef* ty, llvm::Value* v,
+                sema::TypeRef& buf) -> const sema::TypeRef* {
+            if (!ty || !v || !v->getType()->isStructTy() ||
+                isNullableValueTy(ty) ||
+                ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
+                genericSubstSemaTy_.empty())
+                return ty;
+            const sema::TypeRef* cand = nullptr;
+            if (ty->nullable) {
+                if (nullableTypeParamConcrete(ty, buf)) cand = &buf;
+            } else {
+                cand = resolveTypeParamRef(ty);
+            }
+            if (!cand || cand == ty || !isNullableValueTy(cand) ||
+                nullableValueStructTy(cand) != v->getType())
+                return ty;
+            return cand;
+        };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
@@ -530,7 +559,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 }
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
-                    auto* frt = ctx_.exprType(*part.expr);
+                    const sema::TypeRef* frt = ctx_.exprType(*part.expr);
+                    sema::TypeRef frtNvBuf4934;
+                    frt = resolveBareTParamNullableHoleTy(frt, ev, frtNvBuf4934);
                     // §18.5 / §7: a nullable VALUE part WITH a format spec —
                     // branch on hasValue (absent → "null"; present → apply the
                     // spec to the UNWRAPPED payload). emitWithFormatSpec expects
@@ -626,7 +657,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                     // emitWithFormatSpec returned null: fall through.
                 }
-                auto* rt = ctx_.exprType(*part.expr);
+                const sema::TypeRef* rt = ctx_.exprType(*part.expr);
+                sema::TypeRef rtNvBuf4934;
+                rt = resolveBareTParamNullableHoleTy(rt, ev, rtNvBuf4934);
                 // CG-nullable: for nullable value types (primitives, and a
                 // nullable enum — issue #364), extract the value. If null,
                 // format as "null"; otherwise format the inner value (an enum's
