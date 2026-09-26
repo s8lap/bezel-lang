@@ -99,6 +99,7 @@ constexpr bool isAlwaysAvailableBareName(std::string_view n) {
         // Row 9 (System.Text).
         n == "StringBuilder" || n == "Encoding" || n == "ReadOnlyStringSpan" ||
         // Row 10 (System.Collections.Generic — the whole of stdlib §4).
+        // GRID-DEBT: #5044 §2.3 alias-collision name table, not a wrap mint/claim site
         n == "Array" || n == "OwningArray" ||
         n == "Stack" || n == "OwningStack" ||
         n == "Queue" || n == "OwningQueue" ||
