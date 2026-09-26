@@ -526,6 +526,71 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
     return false;
 }
 
+// fix #5009 (§14.1 / §14.2 / §2.8.3 rule 2, v0.307): true when `md` declares
+// its OWN type parameters and a `where` clause gives one of them a TYPE bound
+// (`where T: IShape`, `where T: IComparable<T>`) or `new()`. Those are exactly
+// the two §14.2 forms that let a generic body USE a type-parameter-typed value
+// beyond copying/holding it: a type bound admits calls to the bound's members
+// (`v.Area()`), `new()` admits `new T()`. Neither can be lowered against the
+// i32 placeholder the defining module compiles the template with — the body
+// degrades to a zero/null return with the INTERNAL #2491 (or #2477) note — so
+// every call that reaches that template returns a silent zero. The #1943
+// argument-width gate hides it for a pointer-width argument, but not for a
+// call with no type-parameter-typed argument (`Mk<T>(): int where T: IShape,
+// new()`) nor for an i32-width instantiation (`Cmp<int>` over `where T:
+// IComparable<T>`): MEASURED on dcb17d57, both exit 0 where the single-module
+// twin returns the constraint method's value.
+//
+// Shipping the body routes the call through the same importer re-parse and
+// per-instantiation monomorphization #4600 uses for a return-only parameter.
+// Special-only constraints (`class`, `value`, `notnull`) and modifier
+// constraints grant no member access, so a body bounded only by them still
+// treats T opaquely and stays on the template — which is what keeps the #1943
+// (`Count<T>(x: T): int where T: value`) and #1937 (`where A: value`) shapes
+// on their existing clean rejects.
+//
+// DELIBERATELY NARROW on the bound, too: every TYPE bound on the method's own
+// parameters must resolve to a type DECLARED IN THIS MODULE. The importer
+// re-parses the body in a fresh SemaContext; an own-module bound there binds to
+// the IMPORTED TypeSymbol (the #3645 sibling registry), so the importer's
+// §14.2 call-site check and codegen see one identity. A bound on a builtin or
+// stdlib interface (`where T: INumber<T>`, `IComparable<T>`) is instead
+// re-synthesized by the fresh context as a DIFFERENT TypeSymbol, and the
+// identity-keyed conformance check then rejects a conforming argument —
+// MEASURED: `GenNum<T>(v: T): int where T: INumber<T> return 4;` called as
+// `GenNum<int>(5)` compiles and returns 4 today and was spuriously rejected
+// with the body shipped. That shape keeps the template path; it is the
+// fresh-context builtin-identity follow-up, not this fix.
+bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
+                                    sema::SemaContext& ctx) {
+    if (md.genericParams.empty()) return false;
+    std::unordered_set<std::string_view> names;
+    for (const auto& gp : md.genericParams)
+        if (!gp.name.empty()) names.insert(gp.name);
+    std::unordered_set<const sema::Symbol*> ownTypes;
+    if (const sema::ModuleSymbol* mod = ctx.module())
+        for (const sema::Symbol* child : mod->children)
+            if (dynamic_cast<const sema::TypeSymbol*>(child))
+                ownTypes.insert(child);
+    bool usesBound = false;
+    for (const auto& gc : md.genericConstraints) {
+        if (!names.count(gc.typeParam)) continue;
+        for (const auto& item : gc.items) {
+            if (item.kind == "new") {
+                usesBound = true;
+            } else if (item.kind == "type") {
+                if (!item.typeArg) return false;
+                const sema::TypeRef* b = ctx.resolvedType(*item.typeArg);
+                if (!b || !b->declaration ||
+                    !ownTypes.count(b->declaration))
+                    return false;
+                usesBound = true;
+            }
+        }
+    }
+    return usesBound;
+}
+
 std::string qualifiedSymbolName(const sema::Symbol* symbol,
                                 std::string_view moduleName) {
     if (!symbol) return {};
@@ -1399,8 +1464,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // rather than swept in. Ships for a generic method on a generic
             // class too, where `isGenericType` already shipped it.
             const bool isReturnOnlyGeneric = isReturnOnlyGenericMethod(*md);
+            // fix #5009 (§14.1 / §14.2, v0.307): a generic method whose own
+            // type parameter carries a type or `new()` bound — its placeholder
+            // template silently returns zero; see
+            // `isConstraintUsingGenericMethod`'s header.
+            const bool isConstraintUsingGeneric =
+                isConstraintUsingGenericMethod(*md, ctx);
             if ((isGenericType || isNonGenericClassRecordReturn ||
-                 isReturnOnlyGeneric) &&
+                 isReturnOnlyGeneric || isConstraintUsingGeneric) &&
                 !source.empty() &&
                 md->span.begin.offset < md->span.end.offset &&
                 md->span.end.offset <= source.size()) {

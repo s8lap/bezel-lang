@@ -4060,6 +4060,32 @@ static bool parseAndAttachMethodBody(
     std::unordered_set<const sema::Symbol*> constraintSiblingSyms;
     for (sema::TypeSymbol* sib : constraintSiblings)
         if (sib) constraintSiblingSyms.insert(sib);
+    // fix #5009 (§14.1 / §14.2, v0.307): the same admission for a bound the
+    // METHOD itself declares (`Gen<T>(v: T): int where T: IShape`), which the
+    // header walk above cannot see. The method's `where` clause is part of
+    // the verbatim body text, and on the non-generic-class path every public
+    // sibling is registered into the fresh context as the IMPORTED
+    // `TypeSymbol`, so a bound that resolves to one of those IS the symbol
+    // codegen consumes and `v.Area()` binds to its member by identity.
+    // Restricted to the exporting module's imported siblings: a bound the
+    // fresh context synthesized itself (a builtin interface) is a fresh-context
+    // object mainCtx and codegen know nothing about, so it stays unbound.
+    if (const std::vector<sema::TypeSymbol*>* sibs =
+            moduleName.empty() ? nullptr
+                               : mainCtx.importedTypesOf(moduleName)) {
+        const std::unordered_set<const sema::Symbol*> importedSibs(
+            sibs->begin(), sibs->end());
+        for (sema::Symbol* g : freshMs->genericParams) {
+            auto* gp = dynamic_cast<sema::GenericParamSymbol*>(g);
+            if (!gp) continue;
+            for (const sema::GenericParamConstraint& c : gp->constraints) {
+                if (c.kind != "type" || !c.astBound) continue;
+                const sema::TypeRef* b = freshCtx.resolvedType(*c.astBound);
+                if (b && b->declaration && importedSibs.count(b->declaration))
+                    constraintSiblingSyms.insert(b->declaration);
+            }
+        }
+    }
 
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
