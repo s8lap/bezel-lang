@@ -4143,10 +4143,64 @@ static std::string spellPrimitiveName(PrimitiveType p) {
 //   - primitive → primitive: identity or §5.1 widening.
 //   - named → named (non-generic): identity or subclass/interface.
 // A non-nullable target accepting a nullable source is rejected.
+// fix #4897 (§27.1.1 v0.307 / §27.6): builds the Function TypeRef a BARE
+// (unqualified) method-group identifier denotes — the shape
+// resolveMemberAccess (ExprTypecheck_Calls.cpp) already builds for the
+// QUALIFIED spelling `C.OnS`/`obj.OnS`, duplicated here because
+// resolveMemberAccess is out of scope for this fix. See the declaration
+// comment in ExprTypecheck_impl.hpp for why this exists.
+TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
+    if (!ms) return nullptr;
+    auto* ft = ctx_.makeTypeRef();
+    ft->kind = TypeRef::Kind::Function;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    for (auto* psym : ms->params) {
+        auto* par = dynamic_cast<ParameterSymbol*>(psym);
+        if (!par) continue;
+        TypeRef::FuncParam fp;
+        fp.modifier = par->modifier;
+        fp.name = par->name;
+        if (par->declType)
+            fp.type = ctx_.resolvedType(*par->declType);
+        else if (par->resolvedDeclType)
+            fp.type = par->resolvedDeclType;
+        ft->funcParams.push_back(fp);
+    }
+    if (md && md->returnType) {
+        ft->funcReturn = ctx_.resolvedType(*md->returnType);
+        ft->funcReturnOwned = md->returnOwned;
+    } else if (!md && ctx_.importedReturnType(ms)) {
+        ft->funcReturn = ctx_.importedReturnType(ms);
+        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
+    } else {
+        auto* unit = ctx_.makeTypeRef();
+        unit->kind = TypeRef::Kind::Unit;
+        ft->funcReturn = unit;
+    }
+    return ft;
+}
+
 void ExprTC::checkAssignable(
     TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
     const ast::Expr* fromExpr,
     const std::unordered_set<std::string_view>* freeTypeParamNames) {
+    // fix #4897 (§27.1.1 v0.307 / §27.6): a bare (unqualified) method-group
+    // identifier resolves its symbol (ctx_.setExprSymbol, ExprTypecheck_Exprs
+    // .cpp's IdentifierExpr handling) but is never assigned a Function
+    // TypeRef — unlike the qualified `C.OnS`/`obj.OnS` spelling, which
+    // resolveMemberAccess types correctly. Without this, `from` arrives
+    // null here and the entire Function-to-Function slot check below is
+    // skipped, silently accepting a param-type mismatch (`var f: (int) -> ()
+    // := OnS;` against `OnS(s: string)`). Synthesize the same shape
+    // resolveMemberAccess would, only for a BARE IdentifierExpr (a qualified
+    // MemberAccessExpr already arrives with `from` populated, so this is a
+    // no-op there).
+    if (!from && to && to->kind == TypeRef::Kind::Function && fromExpr &&
+        dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
+        if (auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr))) {
+            from = functionTypeFromBareMethodSymbol(ms);
+        }
+    }
     if (!from || !to) return;
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
@@ -4984,6 +5038,72 @@ void ExprTC::checkAssignable(
                     "it never bridges a conversion (\xc2\xa7""27.3 v0.217, "
                     "\xc2\xa7""27.1.1)");
                 return;
+            }
+            // fix #4897 (§27.1.1 v0.307, §27.4): an UNANNOTATED lambda
+            // parameter is genuinely target-typed — ExprTypecheck_Exprs.cpp's
+            // LambdaExpr slice seeds that ParameterSymbol's resolvedDeclType
+            // directly FROM the target's inferred parameter type
+            // (`inferredParamTypes[pi]`), so `from->funcParams[i].type` IS
+            // `to->funcParams[i].type` for that slot and this loop is a
+            // no-op there (functionSlotConvertible is reflexive). An
+            // EXPLICITLY annotated parameter instead takes `ps->declType =
+            // p.type.get()` — its own written type, independent of the
+            // target — so it must be checked exactly as a formed value's
+            // parameter slot is (§27.1.1 first/third bullets: contravariant
+            // for a class/interface slot, invariant — exact match —
+            // otherwise), the same way the return-type ascription above is
+            // judged "as a value's return type under §27.1.1" (§27.3's
+            // *Admission at a target-typed non-call position*): an
+            // annotation is a written declared type and never silently
+            // bridges a conversion the value itself could not. Destructuring
+            // parameters (`p.destructure`) are excluded — their head-type
+            // agreement is already enforced where the destructure is bound
+            // (§27.4 *Lambda-parameter record destructuring*), a check this
+            // fix does not touch.
+            //
+            // Blast-radius fix (found via callee_type_param_name_collision_4915
+            // .literal_beside_lambda_to_same_named_callee_param_accepted_spec_14_5):
+            // when this checkAssignable call is itself checking a lambda ARGUMENT
+            // against a still-GENERIC callee parameter slot (e.g. `f: (T) -> T`
+            // in `Apply<T>(f: (T) -> T, x: T)`, called without an explicit type
+            // argument), `to->funcParams[i].type` is the UNSUBSTITUTED `T` —
+            // typeCall's generic-inference substitution has not necessarily run
+            // yet for this slot. There is no fixed target type to hold the
+            // annotation to at this point, so comparing an explicit `int`
+            // annotation against a bare `T` is not a fair test and must not
+            // reject; skip the slot exactly like the unannotated-parameter case
+            // above skips it, deferring to whichever generic-argument-inference
+            // check (out of this fix's scope — STAY-OUT list: typeCall) already
+            // validates the call once T is resolved.
+            if (lamFrom) {
+                for (std::size_t i = 0;
+                     i < lamFrom->params.size() &&
+                     i < from->funcParams.size() &&
+                     i < to->funcParams.size();
+                     ++i) {
+                    const auto& lp = lamFrom->params[i];
+                    if (!lp.type || lp.destructure) continue;
+                    if (refMentionsTypeVariable(to->funcParams[i].type))
+                        continue;
+                    if (!functionSlotConvertible(to->funcParams[i].type,
+                                                 from->funcParams[i].type,
+                                                 isSubtype)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("the ") + what + " is a lambda whose "
+                            "parameter " + std::to_string(i + 1) +
+                            " type annotation does not agree with the "
+                            "target function type's parameter slot "
+                            "\xe2\x80\x94 an explicit parameter annotation "
+                            "behaves as a declared parameter type and must "
+                            "satisfy \xc2\xa7""27.1.1's contravariant "
+                            "parameter rule (identity, or a reference "
+                            "conversion for a class/interface parameter); "
+                            "it never bridges a conversion (\xc2\xa7""27.4, "
+                            "\xc2\xa7""27.1.1 v0.307)");
+                        return;
+                    }
+                }
             }
         }
         if (!skipShapeCheck) {
@@ -16657,6 +16777,18 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
         return;
     }
     TypeRef* h = ctx_.exprType(*value);
+    // fix #4897 (§27.1.1 v0.307, §27.6): a BARE method-group handler
+    // (`_beep += OnS;`) carries no exprType at all — see the
+    // functionTypeFromBareMethodSymbol declaration comment — so without this
+    // synthesis `h` arrives null here and the handler's param/return shape is
+    // never checked against the payload, silently accepting any mismatch. A
+    // qualified handler (`_beep += Beeper.OnS;`) already has `h` populated by
+    // resolveMemberAccess and is unaffected.
+    if (!h && dynamic_cast<const ast::IdentifierExpr*>(value)) {
+        if (auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*value))) {
+            h = functionTypeFromBareMethodSymbol(ms);
+        }
+    }
     if (!h || h->kind != TypeRef::Kind::Function) return;
     // A function value or a method reference: the ordinary argument check
     // against `(T) -> R`, where R is the handler's own return slot (§27.1.1

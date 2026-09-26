@@ -1692,6 +1692,26 @@ private:
         const std::unordered_set<std::string_view>* freeTypeParamNames =
             nullptr);
 
+    // fix #4897 (§27.1.1 v0.307 / §27.6): a BARE (unqualified) method-group
+    // identifier — `OnS` where `OnS` names an enclosing method, as opposed to
+    // the qualified `C.OnS` / `obj.OnS` spelling — never receives a Function
+    // TypeRef from the ordinary IdentifierExpr name-lookup cascade
+    // (ExprTypecheck_Exprs.cpp's "Slice 3b" symbol-kind arms cover
+    // LocalSymbol/ParameterSymbol/FieldSymbol/PropertySymbol/ConstMemberSymbol
+    // but not MethodSymbol), so `checkAssignable`'s `from` arrives null and
+    // the parameter-slot check is skipped entirely — silently accepting any
+    // param-type mismatch. This helper builds the Function TypeRef a bare
+    // method-group reference denotes, mirroring the MethodSymbol branch
+    // `resolveMemberAccess` already applies for the QUALIFIED spelling
+    // (ExprTypecheck_Calls.cpp, `else if (auto* ms = dynamic_cast<
+    // MethodSymbol*>(member))`) — that function is out of scope for this fix
+    // (a different lane owns chain/ctor applicability), so the shape is
+    // duplicated here rather than refactored out. Called from checkAssignable
+    // and from checkEventHandlerArgument (the `+=`/`-=` desugaring), which
+    // shares the same null-`from`/null-`h` gap for a bare event handler.
+    // Returns nullptr when `ms` is null or has no synthesizable shape.
+    TypeRef* functionTypeFromBareMethodSymbol(MethodSymbol* ms);
+
     // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
     // every §5.1 conversion site. Verbatim (v0.240):
     //
