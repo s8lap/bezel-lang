@@ -292,3 +292,73 @@ BEZEL_TEST(ctor_chain_applicability_4854,
                      "end C;"),
               "q7\n");
 }
+
+// Row 16 (follow-up, non-author review of #4854 / v0.307): a RECORD target
+// whose constructor is an explicit body constructor over plain properties
+// (no primary parameter list) — `checkChainCallApplicability`'s single-
+// candidate branch, `checkArgsAgainstParams`, applied to a `record` rather
+// than the `class` shapes rows 1-15 use. `this(s, n)` binds `(value: int,
+// tag: string)` POSITIONALLY (arity 2), but the argument types are swapped:
+// `s: string` against `value: int`, `n: int` against `tag: string`. MEASURED
+// on the reviewer's probe
+// (/var/tmp/bezel-scratch/r21-rv4854/p6b_record_chain_wrong_type.bzl): the
+// pre-#4854 compiler accepted this and SIGSEGV'd at runtime (exit 139); the
+// #4854 compiler rejects both mismatched arguments (§5.1).
+BEZEL_TEST(ctor_chain_applicability_4854,
+           rejects_record_chain_swapped_types_spec_5_1) {
+    auto r = runAot(
+        "module M; "
+        "record Port "
+        "  public readonly property Value: int; "
+        "  public property Tag: string; "
+        "  public constructor(value: int, tag: string) "
+        "    Value := value; "
+        "    Tag := tag; "
+        "  end constructor; "
+        "  public constructor(s: string, n: int) this(s, n); end constructor; "
+        "end Port; "
+        "class C "
+        "  public static method Main(): int "
+        "    var p := new Port(\"abcd\", 7); "
+        "    Console.WriteLine($\"{p.Value}/{p.Tag}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    expectRejected(r,
+                   "the argument `value` to `this(...)` constructor chain "
+                   "call in `Port` has a type that is not implicitly "
+                   "convertible to the target type (§5.1)");
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "the argument `tag` to `this(...)` constructor chain call in "
+           "`Port` has a type that is not implicitly convertible to the "
+           "target type (§5.1)"));
+}
+
+// Row 17: the record valid-chain twin of row 16 — `this(n, s)` positionally
+// matches `value`/`tag` by TYPE (the arguments are in the other order from
+// row 16). MEASURED on the reviewer's probe
+// (/var/tmp/bezel-scratch/r21-rv4854/p5b_record_chain_valid.bzl): accepted
+// and prints the constructed value on both the pre- and post-#4854
+// compiler.
+BEZEL_TEST(ctor_chain_applicability_4854, accepts_record_chain_valid_spec_12_8) {
+    expectRan(runAot(
+                  "module M; "
+                  "record Port "
+                  "  public readonly property Value: int; "
+                  "  public property Tag: string; "
+                  "  public constructor(value: int, tag: string) "
+                  "    Value := value; "
+                  "    Tag := tag; "
+                  "  end constructor; "
+                  "  public constructor(s: string, n: int) this(n, s); "
+                  "  end constructor; "
+                  "end Port; "
+                  "class C "
+                  "  public static method Main(): int "
+                  "    var p := new Port(\"abcd\", 7); "
+                  "    Console.WriteLine($\"{p.Value}/{p.Tag}\"); "
+                  "    return 0; "
+                  "  end Main; "
+                  "end C;"),
+              "7/abcd\n");
+}
