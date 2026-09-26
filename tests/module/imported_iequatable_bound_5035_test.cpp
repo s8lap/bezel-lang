@@ -590,14 +590,24 @@ BEZEL_TEST(imported_iequatable_bound_5035, long_type_argument_still_rejected) {
 }
 
 // ===========================================================================
-// T11 — ★ NO-REGRESSION: a record type argument (records conform to
-// `IEquatable<T>` implicitly, stdlib §2.9) is still REJECTED — its
-// representation is not the compiled i32 placeholder either.
-// // per §14.1 / §2.8.3 / #1943 / stdlib §2.9, v0.307
+// T11 — ★ NO-REGRESSION: a record type argument that CONFORMS to
+// `IEquatable<T>` is still REJECTED by the width gate — its representation
+// is not the compiled i32 placeholder either. Per §14.2 clause 2 (v0.307) a
+// record conforms only when it lists the interface in its inheritance
+// clause; a record that does not is rejected earlier, by the §14.2
+// constraint check on the imported inferred call (#5008), which would not
+// exercise this gate. The record therefore lists `IEquatable<Rec5035>` and
+// declares `Equals` explicitly (the synthesized `Equals(T)` witness is not
+// yet counted — #5048).
+// // per §14.1 / §14.2 / §2.8.3 / #1943 / stdlib §2.9, v0.307
 // ===========================================================================
 BEZEL_TEST(imported_iequatable_bound_5035, record_type_argument_still_rejected) {
     auto r = compileImport5035(
-        dep5035() + "public record Rec5035(X: int); ",
+        dep5035() + "public record Rec5035(X: int): IEquatable<Rec5035> "
+                    "  public method Equals(other: Rec5035): bool "
+                    "    return X = other.X; "
+                    "  end Equals; "
+                    "end Rec5035; ",
         app5035("T11", "using var g := new RO5035(); "
                        "var p := new Rec5035(5); var q := new Rec5035(5); "
                        "return g.EqC5035(p, q);"));
