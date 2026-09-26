@@ -59,6 +59,9 @@ BEZEL_TEST(iface_generic_nullable_value_impl_4918, issue_repro_iid_int_nullable_
 
 // per §13 / §14.1 (v0.307), fix #4918 — null through the interface, a
 // `long?` payload with a second parameter, and 50 interface calls in a loop.
+// The loop assigns a `long` local (`kl`), not the `int` loop variable: an
+// `int` → `long?` re-assignment (`x := k`) silently stores 0 (#5005, a
+// separate pre-existing defect), which is not what this row pins.
 BEZEL_TEST(iface_generic_nullable_value_impl_4918, null_long_two_params_and_loop_13_14_1) {
     expectPrints4918(
         "module M; "
@@ -82,7 +85,8 @@ BEZEL_TEST(iface_generic_nullable_value_impl_4918, null_long_two_params_and_loop
         "    var sum: long := 0; "
         "    for var k in 0..<50 do "
         "      var x: long? := null; var one: long? := 1; "
-        "      if k mod 2 = 0 then x := k; end; "
+        "      var kl: long := k; "
+        "      if k mod 2 = 0 then x := kl; end; "
         "      sum := sum + (i.Or(x, one) ?? 0); "
         "    end; "
         "    Console.WriteLine(sum); "
