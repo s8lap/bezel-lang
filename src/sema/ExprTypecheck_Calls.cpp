@@ -14933,13 +14933,28 @@ void ExprTC::checkChainCallBinding(const ast::ConstructorDecl& cd) {
     // No candidate binds. With a single candidate (or a single one of the
     // call's arity) report the binder's own §22.5 reason — the text a
     // `new T(...)` of the same shape gets; otherwise name the failure.
+    //
+    // fix #5000 (§22.5/§22.6, v0.307): the primary parameter list is itself
+    // a same-arity candidate whenever `fields.size() == n` — the binding
+    // attempt against `fields` above (`bindArgsToParams(FormalsView::of(
+    // fields), ...)`) has already failed, or `fields` would be empty here,
+    // so a same-arity primary list is a second candidate #4824's uniqueness
+    // test below never counted (it only walks `ctors`). MEASURED: a record
+    // with a primary list `(X: int, Y: int)` and exactly one other same-
+    // arity explicit constructor read as "one candidate" and reported
+    // against that constructor's formals, naming `Y` — a real primary
+    // field the call itself supplied — as though it did not exist. Count
+    // the primary list alongside `ctors` so two same-arity candidates read
+    // as ambiguous and fall back to the generic message below instead of
+    // naming the wrong constructor's parameters.
+    const bool primaryArityMatches = !fields.empty() && fields.size() == n;
     const ConstructorSymbol* reportOn = nullptr;
     if (ctors.size() == 1 && fields.empty()) {
         reportOn = ctors[0];
     } else {
         for (ConstructorSymbol* cs : ctors) {
             if (cs->params.size() != n) continue;
-            if (reportOn) { reportOn = nullptr; break; }
+            if (reportOn || primaryArityMatches) { reportOn = nullptr; break; }
             reportOn = cs;
         }
     }
