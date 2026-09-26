@@ -15,6 +15,72 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #5035 (§14.1 / §2.8.3, v0.307): true when `paramName` names a generic
+// parameter of `currentMethod` (the method whose body is CURRENTLY being
+// lowered) and every "type" constraint on that parameter is one of the bounds
+// #5009 fix-forward 4/5's own comment calls "sound at i32" — `class`,
+// `value`, `notnull`, or a synthesized builtin interface such as
+// `IEquatable<T>` / `IComparable<T>` — i.e. NOT a `new()` bound and NOT a
+// user-type bound. On success returns the canonical `int` primitive TypeRef
+// (ready to drop straight into the `#730` substitution slot); otherwise
+// nullptr.
+//
+// WHY THIS IS NOT `importedGenericLacksConstraintBody5009` RUN BACKWARDS:
+// that helper (LlvmBackend_Calls2.cpp) answers a CALL-SITE question — "does
+// this IMPORTED method's body cross the module boundary at all?" — and reads
+// only `GenericParamConstraint::importedBound`, the wire-loaded TypeRef an
+// IMPORTER sees for an external callee. Here we are inside the DEFINING
+// module's OWN compile of its OWN method body: `currentMethod`'s generic
+// parameters are LOCAL, so a "type" bound lives in `astBound` (an unresolved
+// `ast::Type*`, per Symbol.hpp's GenericParamConstraint), resolved via
+// `ctx.resolvedType`. (`importedBound` is still checked first, defensively,
+// in case a future caller ever reaches this with an imported symbol.)
+//
+// SOUNDNESS: the only way the exporter's placeholder-compiled body of a
+// public generic method ever actually EXECUTES is via a cross-module call
+// that already passed #1943/#428's width gate (rejects a concrete type
+// argument whose representation does not fit the compiled i32 placeholder)
+// and #5009's own gate (rejects a `new()` or user-type bound at the call
+// site, with a located diagnostic, before this body is ever reached). A
+// LOCAL call within the defining module never runs this placeholder at all —
+// it monomorphizes its own specialized version instead (confirmed: the
+// single-module twin already computes correctly, via the pre-existing
+// `genericSubstSemaTy_` substitution). So once we are lowering a call inside
+// this exact placeholder body, treating a still-bare `T` as `int` is not a
+// guess: it is the one representation every possible caller has already been
+// forced into.
+static sema::TypeRef* genericParamSoundAtI32ForPlaceholder(
+        sema::SemaContext& ctx, sema::MethodSymbol* currentMethod,
+        std::string_view paramName) {
+    if (!currentMethod || paramName.empty()) return nullptr;
+    const sema::GenericParamSymbol* gp = nullptr;
+    for (const sema::Symbol* s : currentMethod->genericParams) {
+        auto* cand = dynamic_cast<const sema::GenericParamSymbol*>(s);
+        if (cand && cand->name == paramName) {
+            gp = cand;
+            break;
+        }
+    }
+    if (!gp) return nullptr;
+    bool sawTypeBound = false;
+    for (const sema::GenericParamConstraint& c : gp->constraints) {
+        if (c.kind == "new") return nullptr;
+        if (c.kind != "type") continue;
+        const sema::TypeSymbol* d = nullptr;
+        if (c.importedBound) {
+            d = c.importedBound->declaration;
+        } else if (c.astBound) {
+            const sema::TypeRef* b = ctx.resolvedType(*c.astBound);
+            if (b) d = b->declaration;
+        }
+        if (!d || !d->isSynthesizedBuiltinInterface)
+            return nullptr;  // unresolved, or a genuine user-type bound
+        sawTypeBound = true;
+    }
+    if (!sawTypeBound) return nullptr;
+    return ctx.primitiveTypeRef(sema::PrimitiveType::Int);
+}
+
 // fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): the K8 full-expression
 // boundary hook. `lowerExprInner` (below) is the real lowering; this wrapper
 // tracks nesting depth so that the OUTERMOST lowerExpr call — which is exactly a
@@ -1257,6 +1323,55 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             it->second->kind == sema::TypeRef::Kind::Primitive)
                             tt = const_cast<sema::TypeRef*>(it->second);
                     }
+                    // fix #5035 (§14.1, v0.307): the EXPORTER's own placeholder
+                    // compile of a public generic method (T's LLVM
+                    // representation defaults to i32, #2821) has NO active
+                    // `genericSubstSemaTy_` entry — that map is only populated
+                    // for a per-call-site monomorphization, and the placeholder
+                    // is compiled once, generically, for cross-module linkage.
+                    // So the `#730` substitution above never fires there, `tt`
+                    // stays a bare unresolved `Named` type, the CompareTo/Equals
+                    // primitive fast paths below are skipped, and the general
+                    // interface-dispatch fallback bails (`emitMethodCall`'s
+                    // "#484/§14.2" non-pointer-receiver guard: the placeholder's
+                    // `a: T` is an i32 VALUE, not a pointer) by returning
+                    // nullptr. `Emitter::lowerIf` then (per its own #2775
+                    // comment) treats that null condition as a SILENT `false` —
+                    // measured: `RO.EqC<T>(a, b) where T: IEquatable<T>` called
+                    // cross-module always took the `false` arm regardless of
+                    // `a`/`b`, i.e. `EqC(5, 5)` returned 72 instead of 71 (the
+                    // single-module twin, which DOES monomorphize per call
+                    // site, computed correctly).
+                    //
+                    // #1943/#428's width gate already rejects, at the CALL
+                    // SITE, any cross-module caller whose concrete type
+                    // argument does not fit the compiled i32 placeholder
+                    // (measured: string/long/record all reject with a located
+                    // diagnostic). #5009 fix-forward 4/5's own comment records
+                    // that a `new()` bound or a user-type bound is unsound at
+                    // i32 and blocks those at the call site too — implying (its
+                    // own words) that "builtin bounds (`class`, `value`,
+                    // `notnull`, a synthesized builtin interface) are sound at
+                    // i32". That soundness claim is about REPRESENTATION width,
+                    // and it holds — but nothing made the PLACEHOLDER BODY
+                    // ITSELF exploit it: the fast path above only fires when a
+                    // concrete substitution is already in hand. So when no
+                    // substitution resolved `tt`, but it is a bare parameter of
+                    // the method currently being compiled, and every "type"
+                    // constraint on that parameter is one of the "not counted"
+                    // bounds above (no `new()`, no user-type bound), it is safe
+                    // to treat `tt` as `int` directly: only a call that already
+                    // passed the width gate can ever reach this compiled body,
+                    // and the width gate's own definition of "fits" is exactly
+                    // this i32 placeholder.
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration &&
+                        tt->astNode && tt->astNode->name &&
+                        tt->astNode->name->parts.size() == 1) {
+                        if (auto* p = genericParamSoundAtI32ForPlaceholder(
+                                ctx_, currentMethod_, tt->headName()))
+                            tt = p;
+                    }
                     // fix #2661 (spec §8.5, v0.252): `Range<T>.ToString()` —
                     // §8.5's AUTO-EQUALITY BODY-RECORD default, which §8.5
                     // names for this type by name ("`Range<T>` (a compiler-
@@ -1676,6 +1791,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         ait->second->kind ==
                                             sema::TypeRef::Kind::Primitive)
                                         argTy = ait->second;
+                                }
+                                // fix #5035 (§14.1, v0.307): same placeholder-
+                                // body fallback as the receiver's `tt` above —
+                                // see that comment for the full rationale. The
+                                // argument `b` is just as much a bare `T` as
+                                // the receiver `a` in the exporter's
+                                // placeholder compile, and needs the same
+                                // assumption to reach the primitive fast path
+                                // below instead of the `argSameFamily == false`
+                                // universal-equals fallback.
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Named &&
+                                    !argTy->declaration &&
+                                    argTy->astNode && argTy->astNode->name &&
+                                    argTy->astNode->name->parts.size() == 1) {
+                                    if (auto* p =
+                                            genericParamSoundAtI32ForPlaceholder(
+                                                ctx_, currentMethod_,
+                                                argTy->headName()))
+                                        argTy = p;
                                 }
                                 bool argSameFamily = argTy &&
                                     !argTy->nullable &&
