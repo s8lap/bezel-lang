@@ -11,14 +11,29 @@
 # changes. Idempotent: safe to re-run, refuses to clobber a real (non-symlink)
 # build dir that already holds objects.
 #
-# Usage:  bash scripts/lane_setup.sh
+# Usage:  bash scripts/lane_setup.sh [--owner <name>]
+#   --owner <name>  also bind this worktree to <name> and its current branch
+#                   (scripts/wt_owner.sh claim), so the ownership hooks refuse
+#                   a commit here from anyone who switches it to another branch.
+#                   Without the flag nothing about ownership changes.
 set -u
+
+OWNER=""
+if [ "${1:-}" = "--owner" ]; then
+  OWNER="${2:-}"
+  [ -n "$OWNER" ] || { echo "[lane_setup] --owner needs a name" >&2; exit 64; }
+fi
 
 FAST_ROOT="${BEZEL_LANE_BUILD_ROOT:-/mnt/fast/lane-builds}"
 
 # Resolve the worktree root from git, not $PWD, so it works from a subdir.
 WT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "[lane_setup] not inside a git worktree — skipping (build stays local)"; exit 0; }
+# Before every early `exit 0` below, so the claim happens however build/ is set up.
+if [ -n "$OWNER" ]; then
+  bash "$(dirname -- "${BASH_SOURCE[0]}")/wt_owner.sh" claim "$OWNER" \
+    || echo "[lane_setup] ownership claim failed — continuing without it"
+fi
 # fix #3213: KEY THE BUILD DIR ON THE FULL PATH, NOT THE BASENAME.
 #
 # This was `NAME="$(basename "$WT")"`. Two worktrees whose directories share a

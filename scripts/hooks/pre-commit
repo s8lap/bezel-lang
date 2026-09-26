@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# pre-commit — refuse a commit in an OWNED worktree that is not on the owner's branch.
+#
+# WHY: see scripts/wt_owner.sh. In R21 lane agents from one session switched a
+# worktree owned by another session to their own branch and were about to
+# commit there. The binding lives in `git rev-parse --git-dir`/bezel-owner.
+#
+# No bezel-owner file -> no-op (unowned worktrees and the gate are unaffected).
+# Escape hatch: BEZEL_OWNER_OVERRIDE=1 git commit ...
+#
+# Coverage, measured on git 2.55: pre-commit runs for `git commit` and
+# `git commit --amend`; it does NOT run for `git cherry-pick` (with or without
+# -e), `git rebase`, or `git merge` (which runs pre-merge-commit). So it guards
+# the ordinary commit/amend path, not every way to move a branch.
+[ "${BEZEL_OWNER_OVERRIDE:-}" = 1 ] && exit 0
+f="$(git rev-parse --git-dir 2>/dev/null)/bezel-owner"
+[ -f "$f" ] || exit 0
+owner="$(sed -n 's/^owner: *//p' "$f" | head -n 1)"
+want="$(sed -n 's/^branch: *//p' "$f" | head -n 1)"
+[ -n "$want" ] || exit 0
+cur="$(git branch --show-current 2>/dev/null)"
+[ "$cur" = "$want" ] && exit 0
+cat >&2 <<EOF
+pre-commit: REFUSED — this worktree is owned by '$owner' and bound to branch
+  '$want', but HEAD is on '${cur:-(detached)}'.
+  Another session's work may live here. Commit in your own worktree instead.
+  If this really is the owner moving the worktree to a new branch, re-claim:
+      scripts/wt_owner.sh claim <owner-name>
+  or, for this one commit only:  BEZEL_OWNER_OVERRIDE=1 git commit ...
+EOF
+exit 1
