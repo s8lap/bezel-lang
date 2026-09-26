@@ -20608,7 +20608,43 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 return;
                             }
                         }
+                        // fall through — `importedTypesOf` returned non-null
+                        // but did not contain `ma.member`. Pre-fix this was
+                        // a silent fall-through (issue #5025). Post-fix the
+                        // §13.2 diagnostic below fires, EXCEPT for the two
+                        // `System.Threading.<Builtin>` heads
+                        // (`CancellationToken`, `Task`) which the
+                        // #5012/#5013 gate at ~L21210/L21265 below
+                        // recognises via `isQualifiedBuiltinThreadingHead`
+                        // (§2.7 — qualified names denote the same entity).
+                        // The builtins are NOT in
+                        // `importedTypesOf("System.Threading")` (§6.1, §6.7);
+                        // the gate is what admits them, not the export list.
+                        // Falls through to that gate.
                     }
+                    // Reached either because `importedTypesOf` returned null
+                    // (module loaded with no exported types or the loader
+                    // could not find it) OR because the for-loop above did
+                    // not match. Both share the same diagnostic wording
+                    // (neutral form: §13.2 — top-level types default to
+                    // private unless declared public; §2.7 — only the named
+                    // module's exported types are reachable through a
+                    // module prefix) and the same exemption.
+                    const std::string memberStr5025b(ma.member);
+                    const bool exemptSystemThreadingHead5025 =
+                        name == "System.Threading" &&
+                        (memberStr5025b == "CancellationToken" ||
+                         memberStr5025b == "Task");
+                    if (!exemptSystemThreadingHead5025) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("module `") + name +
+                            "` has no public type `" + memberStr5025b +
+                            "` (§2.2 / §13.2)");
+                        return;
+                    }
+                    // fall through (System.Threading.<Builtin> head — the
+                    // #5012/#5013 gate at L21210/L21265 owns it).
                 }
                 // Multi-segment prefix building: record a partial module path
                 // so the next MemberAccess level can extend or resolve it.
@@ -20677,8 +20713,40 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             return;
                         }
                     }
+                    // fall through — `importedTypesOf` returned non-null but
+                    // did not contain `ma.member`. Pre-fix this was a silent
+                    // fall-through (issue #5025). Post-fix the same §13.2
+                    // diagnostic as Case (b) fires here, EXCEPT for the two
+                    // `System.Threading.<Builtin>` heads (`CancellationToken`,
+                    // `Task`) which the #5012/#5013 gate at ~L21210/L21265
+                    // below recognises via `isQualifiedBuiltinThreadingHead`
+                    // (§2.7 — qualified names denote the same entity). The
+                    // builtins are NOT in `importedTypesOf("System.Threading")`
+                    // (§6.1, §6.7); the gate is what admits them, not the
+                    // export list. Falls through to that gate.
                 }
-                // Module found but type not found — fall through to error path.
+                // Reached either because `importedTypesOf` returned null
+                // (module loaded with no exported types or the loader could
+                // not find it) or because the for-loop above did not match.
+                // Both share the same diagnostic wording and exemption
+                // (neutral form: §13.2 — top-level types default to private
+                // unless declared public; §2.7 — only the named module's
+                // exported types are reachable through a module prefix).
+                const std::string partialMember5025c(ma.member);
+                const bool exemptSystemThreadingHead5025c =
+                    partialMod == "System.Threading" &&
+                    (partialMember5025c == "CancellationToken" ||
+                     partialMember5025c == "Task");
+                if (!exemptSystemThreadingHead5025c) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("module `") + partialMod +
+                        "` has no public type `" + partialMember5025c +
+                        "` (§2.2 / §13.2)");
+                    return;
+                }
+                // fall through (System.Threading.<Builtin> head — the
+                // #5012/#5013 gate at L21210/L21265 owns it).
             }
         }
     }
