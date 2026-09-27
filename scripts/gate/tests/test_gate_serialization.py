@@ -189,7 +189,7 @@ def _spawn_detached(argv, argv0=None):
     The fix is to give the fixture a genuinely clean ancestry rather than to
     weaken the predicate. `is_gate_sibling` is correct in production, where its
     only call site passes pids from `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|
-    make|bezel_tests*` and so never sees a gate-named process. A detached
+    ninja-build|make|bezel_tests*` and so never sees a gate-named process. A detached
     fixture is also the *faithful* model of what these tests describe — a
     "foreign builder" that is not part of this gate — which a child of the
     test runner can never be.

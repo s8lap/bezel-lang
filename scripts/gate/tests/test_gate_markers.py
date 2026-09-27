@@ -368,6 +368,10 @@ class SelfTestSuiteIsolationTest(_MarkerAssertions):
         # block against a stub git remote in a temp dir (smart-push design,
         # user directive 2026-09-18). Never the real gate_and_push.sh.
         "test_gate_and_push_smart_push.py": "source-only",
+        # Reads gate.sh's BUILDERS='...' TEXT only (#5087); "gate_and_push.sh"
+        # appears solely as a literal comm-name string in a non-match
+        # assertion. Never spawns any script.
+        "test_gate_builders_preflight.py": "source-only",
         # This file.
         "test_gate_markers.py": "isolated",
     }

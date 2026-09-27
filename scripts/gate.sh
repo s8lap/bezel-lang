@@ -205,7 +205,12 @@ export BEZEL_JOBSERVER=off
 # per-area binaries the suite is now built as (bezel_tests_codegen, …) — pgrep's
 # pattern is a regex and -x anchors it to the WHOLE comm, so this still cannot
 # match this bash script.
-BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
+# NB `ninja-build`: Fedora's ninja binary is `/usr/bin/ninja-build` (a symlink
+# target invoked directly, not via the `ninja` name), and the kernel sets a
+# process's comm from the invoked pathname's basename — so a real ninja build
+# has comm `ninja-build`, which the bare `ninja` alternative does NOT match
+# under `-x`'s whole-string anchoring (same class of gap as #5080/#5083; #5087).
+BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|ninja-build|make|bezel_tests(_[a-z]+)?'
 # Sibling detection for the preflight (gate-infra preflight-lockfile lane):
 # when the ONLY matched builders are processes descended from another gate, do
 # NOT report them as "builders active" — they are this gate's own workers, not

@@ -302,7 +302,7 @@ def is_gate_sibling(pid: int) -> bool:
     That matches the `test_self_is_not_sibling_when_invoked_as_gate_script`
     contract and is structurally safe in production: the bash call site at
     `scripts/gate.sh:194-201` only invokes the predicate on pids returned
-    by `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?`,
+    by `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|ninja-build|make|bezel_tests(_[a-z]+)?`,
     so the predicate never sees a gate-named comm in the first place.
 
     Match shape: substring match against the joined argv (NUL-separated
