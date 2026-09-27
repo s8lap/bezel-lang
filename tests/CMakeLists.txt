@@ -206,6 +206,13 @@ message(STATUS
 # include dirs the 12 PCH headers need; bezel_warnings for -Wall/-Wextra
 # /-Wpedantic) and compile definitions identically to bezel_tests_pch AND
 # every group target, from ONE place, so they cannot drift apart.
+# #5074: see bezel_test_apply_common_compile_settings below.
+set(BEZEL_TEST_BUILD_PATH_POISON
+    BEZEL_RUNTIME_LIB_PATH=bezel_include_support_build_paths_hpp
+    BEZEL_CORE_LIB_PATH=bezel_include_support_build_paths_hpp
+    BEZELC_PATH=bezel_include_support_build_paths_hpp
+    BEZEL_RUNTIME_SRC_DIR=bezel_include_support_build_paths_hpp
+    BEZEL_REPO_ROOT_DIR=bezel_include_support_build_paths_hpp)
 function(bezel_test_apply_common_compile_settings tgt)
     target_include_directories(${tgt} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -232,13 +239,21 @@ function(bezel_test_apply_common_compile_settings tgt)
     # TU. A -D value is part of the ccache key and the headers expanded it into
     # every TU's preprocessed text, so all ~2,000 test TUs missed the cache in a
     # fresh worktree at the same commit. They now live as `extern const char[]`
-    # definitions in ONE generated TU (bezel_test_build_paths), and every test
-    # TU sees only this VALUE-FREE switch; support/build_paths.hpp maps the old
-    # macro names onto the constants, so every `#ifdef BEZEL_X` / use site is
-    # unchanged. The values are still absolute and still per-build, so the
-    # #3468 / #3627 absolute-path guarantees (runtime_source_dir_absolute_test,
-    # repo_root_absolute_test) are untouched.
-    target_compile_definitions(${tgt} PRIVATE BEZEL_HAVE_BUILD_PATHS=1)
+    # definitions in ONE generated TU (bezel_test_build_paths), and
+    # support/build_paths.hpp maps the old macro names onto the constants, so
+    # every `#ifdef BEZEL_X` / use site is unchanged. The values are still
+    # absolute and still per-build, so the #3468 / #3627 absolute-path
+    # guarantees (runtime_source_dir_absolute_test, repo_root_absolute_test)
+    # are untouched.
+    # #5074: every test TU gets the five names as VALUE-FREE POISON defines
+    # (identical in every tree, so the ccache keys stay tree-independent).
+    # `#ifdef BEZEL_X` is therefore always true, and a TU that USES one without
+    # including support/build_paths.hpp (which #undef's and redefines them)
+    # fails to compile with "use of undeclared identifier
+    # 'bezel_include_support_build_paths_hpp'" -- instead of silently taking
+    # an #ifdef fallback branch (a fail-open cache identity, or a __FILE__
+    # root) and passing vacuously.
+    target_compile_definitions(${tgt} PRIVATE ${BEZEL_TEST_BUILD_PATH_POISON})
     if(BEZEL_CCACHE_RELOCATABLE)
         # #5010: clang stamps each input header's mtime into the PCH and
         # ccache then refuses to reuse a PCH whose inputs have a new mtime
@@ -293,7 +308,7 @@ add_library(bezel_test_build_paths OBJECT
 target_include_directories(bezel_test_build_paths PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(bezel_test_build_paths PRIVATE
-    BEZEL_HAVE_BUILD_PATHS=1)
+    ${BEZEL_TEST_BUILD_PATH_POISON})
 
 # The PCH owner: one dummy, never-edited TU, written into the BINARY dir (not
 # tests/) so it is invisible to the tests/**/*.cpp glob and the two partition
