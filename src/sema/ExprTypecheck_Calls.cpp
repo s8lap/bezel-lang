@@ -14576,9 +14576,10 @@ void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
 //      value (no modifier, no discard) whose static type and whose parameter
 //      type are both resolved and `classifyArg` ≠ NotApplicable. An
 //      unresolved type is NOT given the benefit of the doubt here (unlike
-//      `classifyArg`'s own "can't judge → don't filter"), and §5.1 constant
-//      narrowing (`narrowIntConstantToTarget`) is not attempted — both only
-//      keep a previously-rejected program rejected;
+//      `classifyArg`'s own "can't judge → don't filter") — that only keeps
+//      a previously-rejected program rejected. §5.1 constant narrowing
+//      (`narrowIntConstantToTarget`) IS applied first (#4923): an in-range
+//      int constant bound by name to a byte/short formal is applicable;
 //  (3) following the leading `this(...)` chain edges of the constructors
 //      reachable from it — an edge to EVERY sibling its chain binds by name,
 //      an over-approximation of what codegen's `ctorForArgs` picks — never
@@ -14658,8 +14659,27 @@ void ExprTC::checkDeferredNamedThisChain(const ast::ConstructorDecl& cd) {
                 !od.params[j].type) { applicable = false; break; }
             const TypeRef* at = ctx_.exprType(*a.value);
             const TypeRef* pt = ctx_.resolvedType(*od.params[j].type);
-            if (!at || !pt ||
-                classifyArg(at, pt) == ArgMatch::NotApplicable)
+            if (!at || !pt) { applicable = false; break; }
+            // fix #4923 (§5.1 / §22.5 / §22.6, v0.307): delegate to
+            // narrowIntConstantToTarget before classifyArg, exactly as the
+            // multi-candidate `resolveOverload` path and `checkArgsAgainst-
+            // Params` already do (fix #2985 / fix #4854). Without this, an
+            // in-range constant bound to a narrower-integer formal (e.g.
+            // `this(y := 100, x := 1)` naming a sibling's `y: short`) sees the
+            // argument's un-narrowed `int` type against `short`, which
+            // `classifyArg` judges a NARROWING (not in §5.1's widening
+            // table) and therefore NotApplicable — over-rejecting a program
+            // §5.1's constant-narrowing carve-out admits. This was
+            // previously a conservative reject-only guard (see the block
+            // comment above `checkDeferredNamedThisChain`); adding narrowing
+            // here only ever ADMITS a program that fits in range, matching
+            // the sibling checks. An out-of-range constant is unaffected:
+            // narrowIntConstantToTarget returns the type unchanged when the
+            // value does not fit, so classifyArg still rejects it below.
+            at = narrowIntConstantToTarget(a.value.get(),
+                                           const_cast<TypeRef*>(at),
+                                           const_cast<TypeRef*>(pt));
+            if (classifyArg(at, pt) == ArgMatch::NotApplicable)
                 applicable = false;
         }
     }
