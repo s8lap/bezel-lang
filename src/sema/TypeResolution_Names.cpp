@@ -4234,6 +4234,13 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* sco
                 if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
                         recvType = ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+                    // §21.1 / §14.6 (v0.307): a `const` local is a different
+                    // AST node (LocalConstDecl) but the same alias of a value
+                    // of the enclosing type; without this arm a self-call
+                    // through a `const` receiver went unrecorded (#3591 family).
+                    else if (auto* lc =
+                                 dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+                        recvType = lc->type ? ctx_.resolvedType(*lc->type) : nullptr;
                 } else if (auto* ps = dynamic_cast<ParameterSymbol*>(sym)) {
                     recvType = ps->resolvedDeclType;
                     if (!recvType && ps->declType)
