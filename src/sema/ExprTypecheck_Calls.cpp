@@ -17348,6 +17348,69 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // skip resolution in that case.
         for (const auto& a : ne.args)
             if (!a.modifier.empty() || a.isDiscard) return;
+        // fix #4949 (§22.6 "Resolution pipeline" step 3 / §22.3, v0.307):
+        // every argument here carries NO call-site modifier (the loop just
+        // above returned otherwise), but a candidate can still declare a
+        // `ref`/`out` FORMAL at a bound position — and step 3 of §22.6's
+        // pipeline ("Applicability over the (substituted) signatures:
+        // parameter types under the implicit conversions and the ref/out
+        // modifiers") makes such a candidate INAPPLICABLE to a modifier-free
+        // argument, before step 5's exact-match ranking ever runs. Pre-fix,
+        // `resolveOverload`/`classifyArg` judge Exact vs Convert on TYPE
+        // alone and have no notion of parameter modifiers, so `new J(n, 5)`
+        // against `constructor(ref y: int, x: int)` / `constructor(y: long,
+        // x: int)` saw int→int Exact for the `ref` candidate (beating
+        // int→long Convert) and picked it — silent wrong code, since a `ref`
+        // formal can never be satisfied by a plain argument (§22.3). This
+        // reuses `refOutMatch`, the same predicate `emitModifierMismatch`
+        // above already applies to the single-candidate arm, so both arms
+        // enforce §22.3 identically — the fix `resolveMethodOverload`
+        // (§22.5 method-call resolution) already applies at
+        // ExprTypecheck_Calls.cpp:1970-1989, shared here rather than
+        // re-derived.
+        {
+            std::vector<const ast::ConstructorDecl*> fdecls;
+            std::vector<ConstructorSymbol*> fdeclSyms;
+            std::vector<BindResult> fbinds;
+            for (std::size_t c = 0; c < decls.size(); ++c) {
+                bool ok = true;
+                const auto& params = decls[c]->params;
+                for (std::size_t j = 0; j < params.size() && ok; ++j) {
+                    int ai = binds[c].paramToArg[j];
+                    std::string_view argMod =
+                        ai >= 0
+                            ? ne.args[static_cast<std::size_t>(ai)].modifier
+                            : std::string_view{};
+                    if (!refOutMatch(argMod, params[j].modifier)) ok = false;
+                }
+                if (ok) {
+                    fdecls.push_back(decls[c]);
+                    fdeclSyms.push_back(declSyms[c]);
+                    fbinds.push_back(binds[c]);
+                }
+            }
+            if (fdecls.empty()) {
+                // Every candidate needs a `ref`/`out` this modifier-free call
+                // does not supply — a genuine §22.3 violation. Report it off
+                // the first candidate, exactly as the single-candidate arm
+                // above does (same diagnostic text, no new needle to grep).
+                emitModifierMismatch(decls[0]->params, binds[0]);
+                return;
+            }
+            decls.swap(fdecls);
+            declSyms.swap(fdeclSyms);
+            binds.swap(fbinds);
+        }
+        if (decls.size() == 1) {
+            // §22.3 filtering just above admitted exactly one candidate —
+            // publish it exactly as the pre-filter single-candidate arm does.
+            ctx_.setResolvedNewCtor(&ne.args, declSyms[0]);
+            checkArgsAgainstParams(
+                decls[0]->params, ne.args, ne.span.begin,
+                std::string("`new ") + std::string(t->name) + "`",
+                &ne, t);
+            return;
+        }
         // Build the per-candidate parameter-type and bound argument-type rows
         // (parameter order, defaulted slots dropped — they carry no ranking
         // pressure), exactly as resolveMethodOverload does for §22.5 calls.
