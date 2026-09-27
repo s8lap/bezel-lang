@@ -3459,7 +3459,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // descriptor") instead of the prior complete silence — a second,
     // independent silence bug stacked on #4926's, since the pre-fix
     // `concreteTarget` test excluded EVERY declaration-less Named target,
-    // conflating the genuinely-dead bare-type-parameter shape (§490/#2775,
+    // conflating the genuinely-dead bare-type-parameter shape (#490/#2775,
     // where a warning would fire on unspecialized-template code that never
     // runs) with this reachable, executed one.
     auto isBareTypeParamArg = [](const sema::TypeRef* a) {
