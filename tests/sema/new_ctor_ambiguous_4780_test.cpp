@@ -103,3 +103,71 @@ BEZEL_TEST(new_ctor_ambiguous_4780,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ---------------------------------------------------------------------------
+// fix-forward #4780 (§22.5 / §22.6 stages 5-8, v0.307). The first #4780 fix
+// compared an argument-indexed binding against a parameter-indexed type row,
+// and on a mismatch handed resolveOverload columns that were not aligned. The
+// three rows below are the shapes that exposed it. FAIL-WITHOUT (the
+// cherry-picked d5ff73c28d alone): row 5 compiles and prints "first", row 6 is
+// rejected with "no overload of `new K` is applicable", and row 7 is rejected
+// as ambiguous. With the fix-forward, all three pass.
+
+// Row 5: a 3-cycle named-argument permutation. Both candidates are exact at
+// every argument, so neither is unambiguously better: §22.6 stage 8.
+BEZEL_TEST(new_ctor_ambiguous_4780,
+           rejects_named_arg_three_cycle_permutation_spec_22_6_stage_8) {
+    auto r = runAot(
+        "module M; "
+        "class K "
+        "  public constructor(a: int, b: string, c: bool) Console.WriteLine(\"first\"); end constructor; "
+        "  public constructor(b: string, c: bool, a: int) Console.WriteLine(\"second\"); end constructor; "
+        "end K; "
+        "class P public static method Main(): int "
+        "  var k := new K(a := 1, b := \"x\", c := true); "
+        "  return 0; "
+        "end Main; end P;");
+    expectRejected(r, "no overload is unambiguously better (§22.6)");
+}
+
+// Row 6: bindings differ, and only the second candidate is applicable
+// (`long` -> `int` is not a §5.1 implicit conversion). The call is valid and
+// resolves to the second constructor (§22.6 stage 3 leaves one candidate).
+BEZEL_TEST(new_ctor_ambiguous_4780,
+           accepts_named_arg_differing_bindings_single_applicable_spec_22_6) {
+    auto r = runAot(
+        "module M; "
+        "class K "
+        "  public constructor(a: int, b: string) Console.WriteLine(\"first\"); end constructor; "
+        "  public constructor(b: string, a: long) Console.WriteLine(\"second\"); end constructor; "
+        "end K; "
+        "class P public static method Main(): int "
+        "  var n: long := 5; "
+        "  var k := new K(a := n, b := \"x\"); "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("second\n"));
+}
+
+// Row 7: bindings differ and both candidates are exact at every supplied
+// argument, but the second fills the default `c`. §22.6's defaulted-arity
+// tie-break (stage 6) prefers the candidate that fills no default, so the call
+// resolves to the first constructor rather than being ambiguous.
+BEZEL_TEST(new_ctor_ambiguous_4780,
+           accepts_named_arg_defaulted_arity_tie_break_spec_22_6_stage_6) {
+    auto r = runAot(
+        "module M; "
+        "class K "
+        "  public constructor(a: int, b: string) Console.WriteLine(\"first\"); end constructor; "
+        "  public constructor(b: string, a: int, c: int := 0) Console.WriteLine(\"second\"); end constructor; "
+        "end K; "
+        "class P public static method Main(): int "
+        "  var k := new K(a := 1, b := \"x\"); "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("first\n"));
+}

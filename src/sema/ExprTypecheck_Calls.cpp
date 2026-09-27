@@ -17459,52 +17459,48 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             candNames[c] = std::string("new ") + std::string(t->name) +
                            methodSignatureString("", params);
         }
-        // resolveOverload uses one shared argument vector across candidates,
-        // so each column must be the same call argument for every candidate.
-        // Fall back if the bound shapes diverge (uncommon for ctor overloads).
-        const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
-        bool bindingsDiffer = false;
+        // resolveOverload takes ONE argument vector shared by every
+        // candidate, so each candidate's parameter-type row must be laid out
+        // in CALL-ARGUMENT order, not in its own parameter order.
+        //
+        // fix-forward #4780 (§22.5 / §22.6 stages 5-8, v0.307): §22.5 makes
+        // every supplied argument bind exactly one parameter, so a candidate
+        // that bound (`binds[c].ok`) maps the supplied arguments one-to-one
+        // onto its non-defaulted parameters; `argIdxRows[c][k]` is the
+        // argument bound to that row's k-th parameter. Re-index every row
+        // through it into argument order. A named-argument call whose
+        // candidates bind in DIFFERENT parameter orders (`a := 1, b := "x"`
+        // against `(a: int, b: string)` / `(b: string, a: int)`) then reaches
+        // the ordinary ranking (exact match, the defaulted-arity tie-break,
+        // and the stage-8 ambiguity) instead of the pre-#4780 silent defer.
+        // It replaces d5ff73c28d's direct check. That check indexed the
+        // parameter-ordered `paramTypes[c]` by an argument index, so it missed
+        // any permutation that is not its own inverse. It also ignored the
+        // defaulted-arity tie-break and handed misaligned columns to
+        // resolveOverload: a valid call was rejected as "no overload is
+        // applicable" and a tie-break winner as "ambiguous". The
+        // re-indexing also aligns the columns with the `argExprs` list below,
+        // which is in argument order too.
+        const std::size_t nSupplied = ne.args.size();
+        std::vector<const TypeRef*> argTypes(nSupplied, nullptr);
+        for (std::size_t i = 0; i < nSupplied; ++i)
+            if (ne.args[i].value)
+                argTypes[i] = ctx_.exprType(*ne.args[i].value);
         for (std::size_t c = 0; c < decls.size(); ++c) {
-            if (argIdxRows[c].size() != argIdxRows[0].size()) return;
-            for (std::size_t i = 0; i < argIdxRows[c].size(); ++i)
-                if (argIdxRows[c][i] != argIdxRows[0][i]) bindingsDiffer = true;
-        }
-        // fix #4780 (§22.6 stage 8, v0.307): named-arg calls that produce
-        // different bindings for each candidate (e.g. `a := 1, b := "x"`
-        // against `(a:int,b:string)` vs `(b:string,a:int)`) used to fall
-        // through silently — resolveOverload was never called because
-        // argIdxRows differed, and codegen's ctorForArgs picked the first-in-
-        // member-order candidate. When every candidate has identical argType
-        // rows and no filled defaults, all conversions are equal → stage 8
-        // ambiguity. Emit the diagnostic directly.
-        if (bindingsDiffer && decls.size() >= 2) {
-            // Check: every argument converts EXACTLY to its bound parameter
-            // type for ALL candidates. If so, all candidates are applicable
-            // with identical conversions → §22.6 stage 8 ambiguity.
-            bool allExact = true;
-            for (std::size_t i = 0; i < argTypes.size(); ++i) {
-                for (std::size_t c = 0; c < decls.size(); ++c) {
-                    int pos = argIdxRows[c][i];
-                    if (!typeRefEqual(argTypes[i], paramTypes[c][pos])) {
-                        allExact = false;
-                        break;
-                    }
-                }
-                if (!allExact) break;
+            // Defensive: a binding that is not a bijection onto the supplied
+            // arguments cannot be ranked column-wise — defer, as before.
+            if (argIdxRows[c].size() != nSupplied) return;
+            std::vector<const TypeRef*> byArg(nSupplied, nullptr);
+            std::vector<bool> seen(nSupplied, false);
+            for (std::size_t k = 0; k < argIdxRows[c].size(); ++k) {
+                const int ai = argIdxRows[c][k];
+                if (ai < 0 || static_cast<std::size_t>(ai) >= nSupplied ||
+                    seen[static_cast<std::size_t>(ai)])
+                    return;
+                seen[static_cast<std::size_t>(ai)] = true;
+                byArg[static_cast<std::size_t>(ai)] = paramTypes[c][k];
             }
-            if (allExact) {
-                std::string msg = "ambiguous call to `new " + std::string(t->name) +
-                                  "`: no overload is unambiguously better (§22.6); "
-                                  "candidates:";
-                for (std::size_t c = 0; c < decls.size(); ++c) {
-                    msg += "\n  ";
-                    msg += candNames[c];
-                }
-                msg += "\nadd an explicit cast (§5.2) so exactly one candidate "
-                       "is an exact match";
-                ctx_.diagnostics().report(Severity::Error, ne.span.begin, msg);
-                return;
-            }
+            paramTypes[c].swap(byArg);
         }
         // resolveOverload emits the ambiguous / unreachable diagnostic; the
         // winner needs no further per-argument check (each arg is already
