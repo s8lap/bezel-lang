@@ -3389,6 +3389,140 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         auto bit = builtinDesc_.find(tn);
         if (bit != builtinDesc_.end()) targetDesc = bit->second;
     }
+    // narrow #4926 (§12.7 / §8.6 / §14, v0.307): a builtin GENERIC COLLECTION
+    // target (Array<T>, LinkedList<T>, Dictionary<K,V>, Set<T>, ...) has no
+    // runtime descriptor at all — these are sealed, non-boxed REFERENCE types
+    // (§8.6: only a value type reaching an Object/interface location is
+    // boxed), so none of boxDescriptorFor / descArray_ / builtinDesc_ above
+    // ever resolves one for it. Pre-fix this fell straight through to the
+    // `!targetDesc` bail below and silently answered `false` for EVERY case,
+    // matched or not — issue #4926's repro (`e is Array<char>` / `o is
+    // Array<char>` reading false always, no diagnostic at all).
+    //
+    // A subset of this IS decidable purely statically, at zero runtime cost,
+    // by combining two invariants: these collection classes are SEALED (no
+    // subclassing — a LinkedList<char> value can never also be an Array<char>
+    // instance) and Bezel generics are INVARIANT (§14 — no covariance). So
+    // when the OPERAND's static type is ITSELF a ground instance of a builtin
+    // collection (no Object/bare-interface erasure standing between the
+    // operand and its runtime value), the test is decided by comparing the
+    // operand's own collection head + generic arguments against the target's:
+    //   - different head (Array vs LinkedList vs Dictionary, ...) → always
+    //     false, the backing structs are mutually exclusive and neither is a
+    //     subtype of the other;
+    //   - same head → true exactly when every generic argument is statically
+    //     identical (builtinCollectionArgIdentical), false otherwise.
+    //
+    // This does NOT cover the issue's own headline repro shape — an Object or
+    // a matching-element-type INTERFACE carrier (`e: IEnumerable<char> := a;
+    // e is Array<char>`) erases exactly the information this needs: there is
+    // no runtime tag on a bz_array_t/bz_llist_t/bz_dict_t recording which
+    // concrete collection class produced it, and bz_obj_is_string (the only
+    // existing "is this vtable-less object a string" signal, narrow #4858)
+    // cannot further distinguish an array from a string within its
+    // vtable-less bucket — that is #4885's own defect. Deciding THAT shape
+    // needs a positive runtime collection-kind tag that does not exist yet
+    // (filed as #5059, alongside #4885 for the string side). That shape keeps
+    // falling through to the bail below, whose `concreteTarget` classification
+    // is widened by this fix to recognize a constructed builtin-generic Named
+    // target (arity > 0, no bare type-parameter argument left unsubstituted)
+    // as concrete, so it now correctly WARNS ("dropped ... no runtime
+    // descriptor") instead of the prior complete silence — a second,
+    // independent silence bug stacked on #4926's, since the pre-fix
+    // `concreteTarget` test excluded EVERY declaration-less Named target,
+    // conflating the genuinely-dead bare-type-parameter shape (§490/#2775,
+    // where a warning would fire on unspecialized-template code that never
+    // runs) with this reachable, executed one.
+    auto isBareTypeParamArg = [](const sema::TypeRef* a) {
+        return a && a->kind == sema::TypeRef::Kind::Named && !a->declaration &&
+               a->genericArgs.empty();
+    };
+    const bool targetIsBuiltinCollection =
+        rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        !rt->genericArgs.empty() &&
+        (isCollectionTypeName(rt) || isLinkedListTypeName(rt) ||
+         isDictTypeName(rt));
+    bool targetArgsConcrete = targetIsBuiltinCollection;
+    for (auto* a : rt->genericArgs)
+        if (isBareTypeParamArg(a)) { targetArgsConcrete = false; break; }
+    if (!targetDesc && targetArgsConcrete && obj->getType()->isPointerTy()) {
+        const sema::TypeRef* operandTy = operandStaticTy();
+        const sema::TypeRef* opConcrete =
+            (operandTy && operandTy->kind == sema::TypeRef::Kind::Named &&
+             !operandTy->declaration && operandTy->genericArgs.empty())
+                ? resolveTypeParamRef(operandTy)
+                : operandTy;
+        bool opArgsConcrete = opConcrete != nullptr;
+        if (opConcrete)
+            for (auto* a : opConcrete->genericArgs)
+                if (isBareTypeParamArg(a)) { opArgsConcrete = false; break; }
+        if (opArgsConcrete && opConcrete->kind == sema::TypeRef::Kind::Named &&
+            !opConcrete->declaration && !opConcrete->genericArgs.empty() &&
+            (isCollectionTypeName(opConcrete) ||
+             isLinkedListTypeName(opConcrete) || isDictTypeName(opConcrete))) {
+            bool sameTy =
+                opConcrete->headName() == rt->headName() &&
+                opConcrete->genericArgs.size() == rt->genericArgs.size();
+            for (size_t i = 0; sameTy && i < rt->genericArgs.size(); ++i)
+                sameTy = builtinCollectionArgIdentical(opConcrete->genericArgs[i],
+                                                        rt->genericArgs[i]);
+            // §12.7: null is an instance of no type, even at a matching
+            // static type (`Array<char>?` holding null is not "an
+            // Array<char>").
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                obj, llvm::ConstantPointerNull::get(ptrTy()), "is.coll.nonnull");
+            llvm::Value* holds = sameTy ? nonNull : builder_.getInt1(false);
+            if (te.op == "is") { releaseFreshBoxTemp(); return holds; }
+            if (te.op == "is not") {
+                releaseFreshBoxTemp();
+                return builder_.CreateXor(holds, builder_.getInt1(true));
+            }
+            if (te.op == "as") {
+                // §17.4: a reference-type target's `as` yields the operand
+                // itself on a match (no unboxing — Array<T> is never boxed)
+                // or null otherwise, exactly like the Object/interface
+                // reference-target arm further below.
+                if (!sameTy) return llvm::ConstantPointerNull::get(ptrTy());
+                return builder_.CreateSelect(
+                    holds, obj, llvm::ConstantPointerNull::get(ptrTy()));
+            }
+            return nullptr;
+        }
+        // narrow #4926 (§12.7 / §14, v0.307), Case B: the operand is erased to
+        // a single-element-type-parameter builtin INTERFACE (IEnumerable<T>,
+        // ICollection<T>, IList<T>, IReadOnlyList<T>, IOwningList<T>,
+        // IReadOnlyCollection<T>, IOwningCollection<T> — the element-type-
+        // preserving interfaces; NOT IEquatable<T>/IComparable<T>, which state
+        // a relation about a T rather than "holds elements of type T" and are
+        // exactly the shape #4909 warns is unsound to fold in here) whose OWN
+        // generic argument is statically KNOWN. Bezel generics are invariant
+        // (§14, no covariance): `Array<T> : IEnumerable<T>` for exactly that
+        // T, never a different one, so a value assignable to `IEnumerable<char>`
+        // can never be an `Array<int>` (or any single-arg collection<int>)
+        // instance — decidable as `false` with no runtime check at all,
+        // regardless of which concrete collection backs the interface. A
+        // MATCHING argument (`IEnumerable<char>` vs target `Array<char>`)
+        // stays genuinely ambiguous (the interface erases which concrete
+        // collection — or a user class, or a string per stdlib §9.6 — backs
+        // it) and falls through to the bail below unresolved, same as before.
+        else if (opArgsConcrete && opConcrete->kind == sema::TypeRef::Kind::Named &&
+                 !opConcrete->declaration && opConcrete->genericArgs.size() == 1 &&
+                 rt->genericArgs.size() == 1 &&
+                 (isListInterfaceName(opConcrete, nullptr) ||
+                  isCollectionInterfaceName(opConcrete) ||
+                  opConcrete->headName() == "IEnumerable" ||
+                  opConcrete->headName() == "IOwningEnumerable") &&
+                 !builtinCollectionArgIdentical(opConcrete->genericArgs[0],
+                                                 rt->genericArgs[0])) {
+            if (te.op == "is") { releaseFreshBoxTemp(); return builder_.getInt1(false); }
+            if (te.op == "is not") {
+                releaseFreshBoxTemp();
+                return builder_.getInt1(true);
+            }
+            if (te.op == "as") return llvm::ConstantPointerNull::get(ptrTy());
+            return nullptr;
+        }
+    }
     if (!targetDesc) {
         // #2775: a CONCRETE target with no runtime descriptor means the
         // compiler has no runtime tag for it — an internal limitation, not a
@@ -3400,7 +3534,8 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             rt->kind == sema::TypeRef::Kind::Primitive ||
             rt->kind == sema::TypeRef::Kind::Unit ||
             rt->kind == sema::TypeRef::Kind::InlineArray ||
-            (rt->kind == sema::TypeRef::Kind::Named && rt->declaration);
+            (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) ||
+            targetArgsConcrete;  // narrow #4926 — see the header above
         if (concreteTarget)
             reportDroppedTest("no runtime descriptor resolved for the target "
                               "type");

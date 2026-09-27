@@ -9352,6 +9352,41 @@ private:
         return false;
     }
 
+    // narrow #4926 (§12.7 / §14, v0.307): generic-ARGUMENT identity for the
+    // builtin-collection static-decision branch in `lowerTypeTest`
+    // (LlvmBackend_Layout.cpp), which decides `x is Array<T>` / `LinkedList<T>`
+    // / `Dictionary<K,V>` / ... purely statically when the OPERAND's static
+    // type is itself a ground instance of a builtin collection (see that
+    // branch's header comment for why the erased-carrier shape the issue's
+    // own repro uses is NOT decided this way). `staticTypeIdentical` above
+    // deliberately answers `false` for a pair of declaration-less Named types
+    // (its own comment: "a generic-template shape that does not reach here")
+    // — but a builtin collection's element type can itself be another builtin
+    // collection (`Array<Array<char>>`), and for that shape `false` would be
+    // the WRONG answer, not just an imprecise one. This recurses through the
+    // declaration-less-Named case by HEAD NAME + arity (Bezel generics are
+    // invariant, §14 — no covariance, so a differing head or arity can never
+    // be the same type), falling back to staticTypeIdentical for every shape
+    // it already decides correctly (Primitive, Unit, InlineArray,
+    // declaration-ful Named — records/enums/value-builtins as element types).
+    static bool builtinCollectionArgIdentical(const sema::TypeRef* a,
+                                               const sema::TypeRef* b) {
+        if (!a || !b) return a == b;
+        if (a->kind != b->kind) return false;
+        if (a->nullable != b->nullable) return false;
+        if (a->kind == sema::TypeRef::Kind::Named && !a->declaration &&
+            !b->declaration) {
+            if (a->headName() != b->headName()) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!builtinCollectionArgIdentical(a->genericArgs[i],
+                                                    b->genericArgs[i]))
+                    return false;
+            return true;
+        }
+        return staticTypeIdentical(a, b);
+    }
+
     // fix #3090 (§12.7 / §8.6, v0.252): the §12.7 flow-narrowed VALUE type of an
     // identifier read, or nullptr when this read is not one.
     //
