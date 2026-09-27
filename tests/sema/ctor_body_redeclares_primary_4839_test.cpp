@@ -7,20 +7,23 @@
 // body constructors against each other (types-only), and the primary constructor
 // is not included in that group (it carries no ConstructorSymbol). Nothing
 // compared a body constructor against the primary's parameter list, so a body
-// ctor with the same type sequence compiled and ran — creating an ambiguous
-// dispatch situation.
+// ctor with the same parameter list compiled and ran.
 //
-// WHAT THE FIX DOES. In `Resolver::checkTypeConstructorChains`, after the
-// existing chain checks, add a check for types with a primary constructor: for
-// each body constructor, compare its parameter types against the primary's
-// positionalFields types. If all match (count, types, and modifiers), emit a
-// §11.1 error: "body constructor redeclares the primary constructor: it has
-// the same parameter list."
+// WHAT THE FIX DOES (as narrowed by the fix-forward). In
+// `Resolver::checkTypeConstructorChains`, for a CLASS with a primary
+// constructor, a body constructor whose list matches the primary's at every
+// position — same name, same resolved type, same §22.6 overload modifier,
+// same default presence — gets the §11.1 error. Two things are deliberately
+// left alone because issue #4775 (Q1/Q2) has not been ruled:
+//   * same types with DIFFERENT names (does "same parameter list" include
+//     names?) — rows 4 and 7;
+//   * RECORDS, whose primary is governed by §9.3's own sentence and whose
+//     §9.8 step 2 requires the name-matching explicit constructor that a
+//     types-only §9.3 reading would forbid — row 6.
 //
-// REJECT rows: the issue's repro — primary `class K(a: int, b: int)` and body
-// `constructor(a: int, b: int) this(a, b);` — must produce the §11.1
-// diagnostic. ACCEPT rows: body ctor with DIFFERENT parameter list — different
-// types, different arity, or different names — must compile and run cleanly.
+// REJECT rows: same names + same types (rows 1, 5), and the `owned` variant
+// (row 8). ACCEPT rows: different types, different arity, different names,
+// the §9.8 record explicit-ctor match, and the #3751 `owned` convenience ctor.
 
 #include <cstdio>
 #include <string>
@@ -59,7 +62,7 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
     auto r = runAot(
         "module M; "
         "class K(a: int, b: int) "
-        "  constructor(a: int, b: int) "
+        "  public constructor(a: int, b: int) "
         "    this(a, b); "
         "  end constructor; "
         "end K; "
@@ -138,7 +141,8 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
 // ---------------------------------------------------------------------------
 // Row 4 — ACCEPT control: single-parameter primary `(x: int)` and a
 // convenience body ctor `(y: int)` that chains to the primary. Same type,
-// different name — not a redeclaration under types-only reading.
+// different name — whether that is "the same parameter list" is the open
+// #4775 Q1, so the §11.1 check leaves it alone until the ruling.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(ctor_body_redeclares_primary_4839,
            accepts_same_types_different_names) {
@@ -172,7 +176,7 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
     auto r = runAot(
         "module M; "
         "class K(a: int) "
-        "  constructor(a: int) "
+        "  public constructor(a: int) "
         "    this(a); "
         "  end constructor; "
         "end K; "
@@ -183,6 +187,100 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
         !hasError(r, "§11.1")) {
         dumpDiagnostics(r);
     }
+    BEZEL_EXPECT_TRUE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(hasError(r, "§11.1"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// ---------------------------------------------------------------------------
+// Row 6 — ACCEPT (fix-forward): the §9.8 step 2 combined-form record shape.
+// `record Vec2(X: int, Y: int): ISerializable, IDeserializable` with an
+// explicit `constructor(x: int, y: int)` — the constructor §9.8 REQUIRES
+// (it binds exactly the components by case-insensitive name). §11.1 is the
+// class sentence and must not reject a record; the record rule is §9.3,
+// whose reading is the open #4775 Q2. Pre-fix-forward this was rejected with
+// the §11.1 diagnostic (lit row sema_serialization_550__record_combined_
+// form_explicit_ctor_match_accepted_spec_9_8_v0182).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(ctor_body_redeclares_primary_4839,
+           accepts_record_combined_form_explicit_ctor_match_spec_9_8) {
+    auto r = runAot(
+        "module M; "
+        "record Vec2(X: int, Y: int): ISerializable, IDeserializable "
+        "  public constructor(x: int, y: int) "
+        "    X := x + 100; "
+        "    Y := y + 100; "
+        "  end constructor; "
+        "end Vec2; "
+        "class C "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
+    BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+
+// ---------------------------------------------------------------------------
+// Row 7 — ACCEPT (fix-forward): the #3751 shape. `class Base(owned r: Res)`
+// with `constructor(owned x: Res) this(owned x);` — same type and modifier,
+// different name (open #4775 Q1). Pre-fix-forward this was rejected with the
+// §11.1 diagnostic (lit row this_chain_3751__owned_marker_to_primary_ctor_
+// accepted). The chain runs and the object reads back its resource.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(ctor_body_redeclares_primary_4839,
+           accepts_owned_convenience_ctor_different_name_3751_shape) {
+    auto r = runAot(
+        "module M; "
+        "class Res "
+        "  private _id: int; "
+        "  public constructor(id: int) _id := id; end constructor; "
+        "  public method Id(): int => _id; "
+        "end Res; "
+        "class Base(owned r: Res) "
+        "  private owned _s: Res := r; "
+        "  public constructor(owned x: Res) "
+        "    this(owned x); "
+        "  end constructor; "
+        "  public method Id(): int return _s.Id(); end Id; "
+        "end Base; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Base(new Res(9)); "
+        "    Console.WriteLine(b.Id().ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
+    BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("9\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Row 8 — REJECT: the `owned` variant with the SAME name. `class
+// Base(owned r: Res)` with `constructor(owned r: Res)` matches the primary in
+// name, type and §22.6 modifier — rejected under every reading of §11.1.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(ctor_body_redeclares_primary_4839,
+           rejects_owned_same_name_same_type) {
+    auto r = runAot(
+        "module M; "
+        "class Res "
+        "  private _id: int; "
+        "  public constructor(id: int) _id := id; end constructor; "
+        "end Res; "
+        "class Base(owned r: Res) "
+        "  private owned _s: Res := r; "
+        "  public constructor(owned r: Res) "
+        "    this(owned r); "
+        "  end constructor; "
+        "end Base; "
+        "class C "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    if (!hasError(r, "redeclares the primary constructor")) dumpDiagnostics(r);
     BEZEL_EXPECT_TRUE(hasError(r, "redeclares the primary constructor"));
     BEZEL_EXPECT_TRUE(hasError(r, "§11.1"));
     BEZEL_EXPECT_FALSE(r.ran);

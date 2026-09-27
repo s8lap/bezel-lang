@@ -512,12 +512,29 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
             " (§22.10)");
     }
     // fix #4839 (§11.1, v0.307): "The body may not redeclare a constructor
-    // with the same parameter list as the primary constructor." The primary's
-    // parameters are the class's positionalFields (on the TypeDecl). Compare
-    // each body constructor's parameter types against the primary's types;
-    // the §22.6 overload identity (types-only, ignoring names) is the right
-    // comparison — it matches every other signature-shape rule in the codebase.
-    if (!typeHasPrimaryCtor) return;
+    // with the same parameter list as the primary constructor."
+    //
+    // fix-forward #4839 (§11.1 / §9.3 / §9.8, v0.307): the check is
+    // deliberately NARROW, for two reasons the spec text forces.
+    //
+    // (1) CLASSES ONLY. §11.1 is the class sentence. A record's primary is
+    // governed by §9.3's own sentence, and §9.8 step 2 REQUIRES a
+    // combined-form record that declares any explicit constructor to declare
+    // one binding exactly its components by (case-insensitive) name — for a
+    // purely positional component set that is `constructor(x: int, y: int)`
+    // beside `Vec2(X: int, Y: int)`, a list with the primary's types. Whether
+    // §9.3 forbids that shape is issue #4775 Q1/Q2, still awaiting a ruling;
+    // this §11.1 check must not decide it for records.
+    //
+    // (2) SAME NAMES, NOT JUST SAME TYPES. Whether "same parameter list"
+    // means the §22.6 type sequence or also the parameter names is the same
+    // open #4775 Q1 (issue #4839 was filed as blocked on it). Until it is
+    // ruled, reject only the shape EVERY reading rejects: equal arity and, at
+    // each position, the same name (case-sensitive), resolved type, §22.6
+    // overload modifier and default presence. `class Base(owned r: Res)` with
+    // `constructor(owned x: Res)` (the #3751 accept row) differs by name and
+    // is left to the ruling.
+    if (!classHasPrimaryCtor) return;
     auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
     if (!td || td->positionalFields.empty()) return;
     for (Symbol* m : t->members) {
@@ -525,32 +542,37 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
         if (!cs || cs->isStatic) continue;
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
-        if (cs->params.size() != td->positionalFields.size()) continue;
-        // Compare parameter types at each position using the same resolved-type
-        // equality as the §22.6 overload check.
-        bool typesMatch = true;
+        if (cs->params.size() != td->positionalFields.size() ||
+            cd->params.size() != td->positionalFields.size())
+            continue;
+        bool listsMatch = true;
         for (std::size_t i = 0; i < cs->params.size(); ++i) {
             auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
-            if (!ps) { typesMatch = false; break; }
+            if (!ps) { listsMatch = false; break; }
+            const ast::Param& pf = td->positionalFields[i];
+            const ast::Param& bp = cd->params[i];
+            if (bp.name != pf.name ||
+                (bp.defaultValue != nullptr) != (pf.defaultValue != nullptr)) {
+                listsMatch = false;
+                break;
+            }
             TypeRef* paramType =
                 ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
-            const ast::Param& pf = td->positionalFields[i];
             TypeRef* primaryType =
                 pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
             if (!typeRefEqual(paramType, primaryType)) {
-                typesMatch = false;
+                listsMatch = false;
                 break;
             }
-            // Also compare modifiers: ordinary vs owned is part of the §22.6
-            // identity; scoped and out are never distinguishable.
-            std::string_view pm = overloadModifier(ps->modifier);
-            std::string_view pfm = overloadModifier(pf.modifier);
-            if (pm != pfm) {
-                typesMatch = false;
+            // Ordinary vs owned is part of the §22.6 identity; scoped and out
+            // are never distinguishable.
+            if (overloadModifier(ps->modifier) !=
+                overloadModifier(pf.modifier)) {
+                listsMatch = false;
                 break;
             }
         }
-        if (typesMatch) {
+        if (listsMatch) {
             ctx_.diagnostics().report(
                 Severity::Error, cd->span.begin,
                 std::string("body constructor redeclares the primary ")
