@@ -27,10 +27,10 @@
 // OBSERVABILITY. The pre-fix behaviour is a CLEAN compile then a UAF, so each
 // REJECT row asserts the SPECIFIC diagnostic AND `!r.ran`. The ACCEPT rows pin
 // what stays legal: the spec's own remedy (the marked arm transfer and the
-// statement equalization), a local (non-escaping) use of the coalesce, and the
-// pre-existing `p ?? <fresh producer>` owned-transfer shape (#1029), each with
-// exact stdout including the dispose lines; the loop row amplifies the remedy's
-// disposal claim.
+// statement equalization) and a local (non-escaping) use of the coalesce, each
+// with exact stdout including the dispose lines; the loop row amplifies the
+// remedy's disposal claim. (The `p ?? <fresh producer>` shape, once accepted
+// here as the #1029 transfer, is a K7.3 mixed meet and rejected — #4964.)
 //
 // per §28.3 (producer table `a ?? b` row, K7.2, K3.13, K3.4), §17.2, v0.307
 
@@ -201,14 +201,18 @@ BEZEL_TEST(coalesce_owned_locals_return_4959,
         "p\ndispose q\ndispose p\nn\ndispose n\ndispose g\n");
 }
 
-// The #1029 shape: a FRESH right operand makes the `??` an owned producer.
+// fix #4964 (behaviour flip): `p ?? new W()` over a NAMED owned local was the
+// #1029 owned-transfer shape and was accepted here. §28.3's `a ?? b` row makes
+// the unmarked named binding a BORROW arm met with an OWNED arm — a K7.3 mixed
+// meet, rejected ("equalize the arms first").
 BEZEL_TEST(coalesce_owned_locals_return_4959,
-           return_coalesce_owned_local_fresh_right_accepted_4959_1029) {
-    expectAccepted(program("owned Widget",
+           return_coalesce_owned_local_fresh_right_rejected_4964_k7_3) {
+    expectRejected(program("owned Widget",
                            "var p: Widget? := new Widget(\"p\"); "
                            "return p ?? new Widget(\"n\");",
                            kOwnedMain),
-                   "p\ndispose p\ndispose g\n");
+                   "the operands of this `??` mix an owned value with a "
+                   "borrowed arm");
 }
 
 // §28.3's own remedy, the marked arm transfer (K3.4), loop-amplified: the

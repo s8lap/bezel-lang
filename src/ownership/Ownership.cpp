@@ -5732,6 +5732,20 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
 // typed arms carry an ownership meaning; a value-typed conditional has no meet.
 void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
     std::vector<const ast::Expr*> arms;
+    // fix #4964: the built-in `??` is the same K7 meet (§28.3 `a ?? b` row).
+    // Peel `!` — `(a ?? b)!` has the meet's classification (§17.8).
+    {
+        const ast::Expr* core = &e;
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+            if (!pb->operand) break;
+            core = pb->operand.get();
+        }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(core);
+            be && be->op == "??") {
+            checkCoalesceMeetMixed(*be);
+            return;
+        }
+    }
     if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         arms = {c->thenValue.get(), c->elseValue.get()};
     } else if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
@@ -5773,6 +5787,59 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
                "— mark the named binding with the arm transfer (`owned x`, "
                "§28.3 K3.4 v0.209), bind the owned source first, or transfer "
                "both arms — so every arm has the same ownership");
+}
+
+// fix #4964 (§28.3 producer table `a ?? b` row, K7.1–K7.3, K7.5, K3.13,
+// v0.307): "`a ?? b` — the meet of the ownership states of `a` and `b` per K7
+// … owned ⊓ owned = owned …; borrowed ⊓ borrowed = borrowed with the union of
+// sources; mixed = rejected — equalize the arms first. A named owned binding
+// written as an arm is an unmarked read and therefore a borrow arm". So
+// `p ?? new W()` (named owned `p`) and `g ?? new W()` (borrowed parameter
+// `g`) are both mixed meets and are rejected. Before this the pass classified
+// any `??` with an owned right operand as an OWNED producer (#1029) and
+// codegen transferred the left operand's value: for a named owned local that
+// was a silent transfer the spec forbids, and for a borrow (a parameter, a
+// field, a property) it handed a value the caller still owns to a new owner
+// — a heap-use-after-free, measured on e3b0bdf0 at a local, `using var`,
+// field assignment, `owned` return and `owned` argument.
+//
+// Arms are classified exactly as checkArmMeetMixed classifies if/case arms
+// (producerState; a borrow arm counts only when class/interface-typed; `null`
+// and `throw` absorb, K7.5). A user-defined `operator ??` (an operator
+// MethodSymbol on the node) is an ordinary call, not a meet, and is skipped.
+void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
+    if (be.op != "??" || !be.left || !be.right) return;
+    if (auto* sym = ctx_.exprSymbol(be))
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            if (ms->isOperator) return;
+    if (coalesceMeetReported_.count(&be)) return;
+    bool ownedArm = false;
+    bool borrowArm = false;
+    const ast::Expr* borrowAt = nullptr;
+    for (const ast::Expr* arm : {be.left.get(), be.right.get()}) {
+        if (dynamic_cast<const ast::ThrowExpr*>(arm)) continue;      // K7.5
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm)) continue;  // K7.5
+        OwnershipState s = producerState(*arm);
+        if (s == OwnershipState::Owned) {
+            ownedArm = true;
+        } else if (s == OwnershipState::Borrowed &&
+                   isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+            borrowArm = true;
+            if (!borrowAt) borrowAt = arm;
+        }
+    }
+    if (!ownedArm || !borrowArm || suppressDiag_) return;
+    coalesceMeetReported_.insert(&be);
+    report(Severity::Error, borrowAt->span.begin,
+           "the operands of this `??` mix an owned value with a borrowed arm "
+           "— the ownership meet is rejected (§28.3 producer table, `a ?? b` "
+           "row; K7.3, v0.307): owned⊓owned is owned and borrowed⊓borrowed "
+           "is borrowed, but a mixed pair has no coherent owner (a parameter, "
+           "field or property read is a borrow, and so is an UNMARKED named "
+           "owned binding — K3.13; `move` is rejected in `??`-operand "
+           "position, axiom A7). Equalize the arms: use "
+           "`(if a <> null then move a! else new …)` (§28.3 K3.4), or "
+           "equalize by statement");
 }
 
 bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {

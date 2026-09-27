@@ -1277,7 +1277,16 @@ private:
 
     // §28.3 arm-meet (v0.184, #1661): reject an if-expression / expression-
     // position `case`/`when` whose arms mix an owned value with a borrow.
+    // fix #4964 (§28.3 `a ?? b` row, K7.3, v0.307): also the built-in `??`,
+    // whose operands are the two arms of the same K7 meet.
     void checkArmMeetMixed(const ast::Expr& e);
+
+    // fix #4964: the `??` half of checkArmMeetMixed, and the set of `??`
+    // nodes already diagnosed. The `??` check runs from every read position
+    // (checkRead's BinaryExpr arm) as well as from the binding / return
+    // drivers, so one node can be reached more than once on the emit pass.
+    void checkCoalesceMeetMixed(const ast::BinaryExpr& be);
+    std::unordered_set<const ast::Expr*> coalesceMeetReported_;
 
     // fix #4286 (§28.3 / §28.6, v0.298): `fromLambdaBody` mirrors the
     // established `fromLambdaBody` convention (`checkCollectionBorrowStoreEscape`

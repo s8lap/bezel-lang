@@ -3025,6 +3025,10 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // fix #4964 (§28.3 `a ?? b` row, K7.3, v0.307): a mixed owned/borrowed
+        // `??` is rejected in EVERY position, not only at a binding or a
+        // return — the meet has no coherent owner wherever it is formed.
+        if (be->op == "??") checkCoalesceMeetMixed(*be);
         if (be->left) checkRead(*be->left, false);
         if (be->right) checkRead(*be->right, false);
         return;
