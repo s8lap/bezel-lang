@@ -511,6 +511,53 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                  : "") +
             " (§22.10)");
     }
+    // fix #4839 (§11.1, v0.307): "The body may not redeclare a constructor
+    // with the same parameter list as the primary constructor." The primary's
+    // parameters are the class's positionalFields (on the TypeDecl). Compare
+    // each body constructor's parameter types against the primary's types;
+    // the §22.6 overload identity (types-only, ignoring names) is the right
+    // comparison — it matches every other signature-shape rule in the codebase.
+    if (!typeHasPrimaryCtor) return;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+    if (!td || td->positionalFields.empty()) return;
+    for (Symbol* m : t->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        if (cs->params.size() != td->positionalFields.size()) continue;
+        // Compare parameter types at each position using the same resolved-type
+        // equality as the §22.6 overload check.
+        bool typesMatch = true;
+        for (std::size_t i = 0; i < cs->params.size(); ++i) {
+            auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
+            if (!ps) { typesMatch = false; break; }
+            TypeRef* paramType =
+                ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
+            const ast::Param& pf = td->positionalFields[i];
+            TypeRef* primaryType =
+                pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+            if (!typeRefEqual(paramType, primaryType)) {
+                typesMatch = false;
+                break;
+            }
+            // Also compare modifiers: ordinary vs owned is part of the §22.6
+            // identity; scoped and out are never distinguishable.
+            std::string_view pm = overloadModifier(ps->modifier);
+            std::string_view pfm = overloadModifier(pf.modifier);
+            if (pm != pfm) {
+                typesMatch = false;
+                break;
+            }
+        }
+        if (typesMatch) {
+            ctx_.diagnostics().report(
+                Severity::Error, cd->span.begin,
+                std::string("body constructor redeclares the primary ")
+                    .append("constructor: it has the same parameter list ")
+                    .append("as the primary constructor (§11.1, v0.307)"));
+        }
+    }
 }
 
 void Resolver::checkAsyncModifiers() {
