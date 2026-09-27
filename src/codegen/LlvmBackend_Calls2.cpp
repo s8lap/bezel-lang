@@ -14439,7 +14439,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     // implies `inlined`, so every previously-returning case still
                     // returns, and a genuine decline still falls through untouched.
                     bool inlined = false;
-                    llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+                    llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
                     if (inlined || diverged_) {
                         emitPendingCheck();
                         return r;
@@ -14778,7 +14778,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     const sema::TypeRef* formal =
                         ps->declType ? ctx_.resolvedType(*ps->declType)
                                      : ps->resolvedDeclType;
-                    args[ai] = wrapArgForNullableValueFormal(args[ai], formal);
+                    args[ai] = wrapArgForNullableValueFormal(
+                        args[ai], formal, argUnsigned(ai));
                 }
             }
             bool needsConcrete = false;
@@ -14916,7 +14917,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
          // LlvmBackend_impl.hpp:2602-2614), so widening this guard to also
          // include OperatorDecl is the whole codegen-side change for the fix.
          dynamic_cast<const ast::OperatorDecl*>(ms->decl))) {
-        llvm::Value* r = emitInlineGenericMethod(ms, args);
+        llvm::Value* r = emitInlineGenericMethod(ms, args, nullptr, argExprs);
         emitPendingCheck();
         // HARD route: never fall through to methodFns_ for an imported generic
         // method. The only entry there is the EXTERNAL declaration of the
@@ -15012,7 +15013,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // implies `inlined`, so every previously-returning case still
             // returns, and a genuine decline still falls through untouched.
             bool inlined = false;
-            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
             if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
@@ -15080,7 +15081,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // implies `inlined`, so every previously-returning case still
             // returns, and a genuine decline still falls through untouched.
             bool inlined = false;
-            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
             if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
@@ -15192,7 +15193,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 // LlvmBackend_impl.hpp. Detects cases (A)/(B)/(C) and wraps `arg` into the
 // tagged `{i8, T}` struct when one applies; returns `arg` unchanged otherwise.
 llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
-                                                     const sema::TypeRef* formal) {
+                                                     const sema::TypeRef* formal,
+                                                     bool srcUnsigned) {
     if (!formal || !arg) return arg;
     sema::TypeRef concBuf;
     const sema::TypeRef* nvTy = nullptr;
@@ -15229,12 +15231,64 @@ llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
         return nullableValueNull(nvTy);
     if (arg->getType() == expectedSt->getElementType(1))
         return wrapNullableValue(nvTy, arg);
+    // fix #5046 (§5.1 "Nullable conversions", v0.307): `S?` -> `T?` LIFT at a
+    // generic `T?` FORMAL. §5.1: "S? implicitly converts to T? whenever S
+    // implicitly converts to T ... a present value converts by the underlying
+    // conversion, null converts to null" — so `Id<double>(a)` with
+    // `a: int?` and `Id<T>(x: T?): T? => x;` must compile: T is bound to
+    // `double` at this call, so the formal here (`nvTy`) is `double?`, but
+    // `arg` arrives as the CALLER's own `int?` — already the tagged
+    // `{i8, i32}` struct, not the bare `i32` payload the case above handles
+    // and not a null pointer. Neither prior case matches (the struct is
+    // neither `expectedSt` nor a bare payload), so `arg` fell through
+    // unwrapped: the specialized body's parameter (and its `T?` return) then
+    // disagreed with the call site's expected `{i8, double}`, and
+    // `verifyModule` rejected the PHI merging the two (measured: "PHI node
+    // operands are not the same type as the result!" over `Id<double>(a) ??
+    // -1.0`). Unwrap the payload, widen it per §5.1 (the same
+    // `coerceNumericToType` widening `coerceReturnToNullableValue` and the
+    // `buildOrderedArgs` / `fillOmittedParamDefaults` `S? -> T?` lift
+    // (#4967, LlvmBackend_Assign.cpp) use), and re-wrap with the hasValue tag
+    // carried through untouched — `null` stays `null`.
+    //
+    // `srcUnsigned` is the CALLER-supplied answer (see the parameter's own
+    // comment, LlvmBackend_impl.hpp): treating every source as signed here
+    // was a soundness bug, not merely a documented gap — `uint?` holding
+    // 3000000000 lifted to a `long?` formal would sign-extend the payload
+    // into a negative `long`, silent wrong code (caught in review before
+    // landing). Only a numeric pair is matched at all (a `record?`/`enum?`
+    // payload is left unchanged).
+    if (auto* vSt = llvm::dyn_cast<llvm::StructType>(arg->getType())) {
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (vSt != expectedSt && vSt->getNumElements() == 2 &&
+            vSt->getElementType(0) == nullablePrimHasValTy() &&
+            expectedSt->getNumElements() == 2 &&
+            expectedSt->getElementType(0) == nullablePrimHasValTy() &&
+            numeric(vSt->getElementType(1)) &&
+            numeric(expectedSt->getElementType(1))) {
+            llvm::Type* dstPay = expectedSt->getElementType(1);
+            llvm::Value* conv = coerceNumericToType(
+                builder_.CreateExtractValue(arg, {1u}, "arg.lift.in"),
+                dstPay, srcUnsigned);
+            if (conv->getType() == dstPay) {
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(expectedSt),
+                    builder_.CreateExtractValue(arg, {0u}, "arg.lift.has"),
+                    {0u});
+                return builder_.CreateInsertValue(res, conv, {1u});
+            }
+        }
+    }
     return arg;
 }
 
-llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
-                                       std::vector<llvm::Value*>& args,
-                                       const CallableInfo& ci) {
+llvm::Value* Emitter::emitGenericSpecialization(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const CallableInfo& ci,
+        const std::vector<const ast::Expr*>* argExprs) {
     // Build the function type with concrete arg/ret types. Each param type
     // defaults to its argument's LLVM type, BUT when the declared parameter is a
     // nullable VALUE type `T?` (a bare value-type generic param under the active
@@ -15255,7 +15309,14 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                 const sema::TypeRef* formal =
                     ps->declType ? ctx_.resolvedType(*ps->declType)
                                  : ps->resolvedDeclType;
-                args[i] = wrapArgForNullableValueFormal(args[i], formal);
+                // fix #5046 follow-up (§5.1, v0.307): real signedness when the
+                // caller (emitInlineGenericMethod, threading emitMethodCall's
+                // own argExprs) has this argument's source expression.
+                bool argUns = argExprs && i < argExprs->size() &&
+                              (*argExprs)[i] &&
+                              isUnsignedTargetExpr(*(*argExprs)[i]);
+                args[i] = wrapArgForNullableValueFormal(args[i], formal,
+                                                         argUns);
             }
         }
         paramTys.push_back(args[i]->getType());
@@ -16191,9 +16252,9 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
 }
 
 
-llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                      std::vector<llvm::Value*>& args,
-                                      bool* emitted) {
+llvm::Value* Emitter::emitInlineGenericMethod(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        bool* emitted, const std::vector<const ast::Expr*>* argExprs) {
     // fix #3497: "did I lower the call here?" starts out NO and is answered at
     // each emission arm below; see the declaration for why the answer cannot be
     // read off the returned value. Assigned before every `return` so a caller
@@ -16313,8 +16374,17 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
                 ps ? (ps->declType ? ctx_.resolvedType(*ps->declType)
                                     : ps->resolvedDeclType)
                    : nullptr;
+            // fix #5046 follow-up (§5.1, v0.307): real signedness when
+            // `argExprs` (threaded from emitMethodCall) has this argument's
+            // source expression — see wrapArgForNullableValueFormal's own
+            // comment for why signed-by-default here would be silent wrong
+            // code for an unsigned source.
+            const std::size_t argIdx = pi + paramStart;
+            bool argUns = argExprs && argIdx < argExprs->size() &&
+                          (*argExprs)[argIdx] &&
+                          isUnsignedTargetExpr(*(*argExprs)[argIdx]);
             llvm::Value* argVal = wrapArgForNullableValueFormal(
-                args[pi + paramStart], formal);
+                args[argIdx], formal, argUns);
             auto* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
             paramSlots_[ms->params[pi]] = slot;
@@ -16395,7 +16465,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         // Inlining block bodies is problematic because `return` generates
         // `ret` in the outer function. Instead, monomorphize: compile a
         // concrete version of the function with the active substitution.
-        result = emitGenericSpecialization(ms, args, ci);
+        result = emitGenericSpecialization(ms, args, ci, argExprs);
         // fix #3497: exact for this arm without the footprint — emitGeneric
         // Specialization returns the `CallInst` (void-typed for a unit method,
         // hence non-null) on every path that emits a call, and nullptr only

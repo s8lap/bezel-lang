@@ -19631,8 +19631,21 @@ private:
     // shape (`Holder<int?>`'s `v: T`), which the other two cases do not cover
     // because `T?` never appears in source. Declared here (defined in
     // LlvmBackend_Calls2.cpp) since both call sites live in that file.
+    //
+    // `srcUnsigned` (fix #5046 follow-up, §5.1, v0.307): governs the ONE case
+    // that widens a numeric payload — an already-tagged `S?` argument lifted
+    // to a differently-typed `T?` formal (#5046 itself). Defaults to `false`
+    // (signed) for a caller with no source expression to ask, exactly the
+    // posture `coerceNumericToType`'s two-argument overload documents; a
+    // caller that DOES have the argument's source expression (currently
+    // `emitGenericSpecialization` / `emitInlineGenericMethod`, both threading
+    // it from `emitMethodCall`'s own `argExprs`) must pass the real value —
+    // `uint? -> long?` at a generic `T?` formal sign-extending a value like
+    // 3000000000 into a negative `long` is silent wrong code, not merely an
+    // uncovered shape.
     llvm::Value* wrapArgForNullableValueFormal(llvm::Value* arg,
-                                                const sema::TypeRef* formal);
+                                                const sema::TypeRef* formal,
+                                                bool srcUnsigned = false);
 
     // fix #3501 (§4.7 "The unit type" / §7.10 "Generics and nullability" /
     // §14.1, v0.283): make the CALLEE's UNIT bindings visible to the §4.7
@@ -20779,9 +20792,17 @@ private:
     // the current genericSubst_ applied to all types.  The specialized
     // function is cached in specializedMethods_ so each (ms, subst) pair is
     // compiled at most once.  The result is a call to the specialized fn.
-    llvm::Value* emitGenericSpecialization(sema::MethodSymbol* ms,
-                                           std::vector<llvm::Value*>& args,
-                                           const CallableInfo& ci);
+    // `argExprs`, when the caller has it (from `emitMethodCall`'s own
+    // parameter of the same name), carries each argument's SOURCE expression
+    // so a narrower-than-formal numeric argument can be widened at its actual
+    // signedness (fix #5046 follow-up, §5.1, v0.307) instead of assuming
+    // signed — see `wrapArgForNullableValueFormal`. Absent (nullptr) at a
+    // caller that has no source expressions to offer (e.g. the itable-slot
+    // rebuild path); such a caller widens as signed, exactly as before.
+    llvm::Value* emitGenericSpecialization(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const CallableInfo& ci,
+        const std::vector<const ast::Expr*>* argExprs = nullptr);
 
     // fix #580 / §14.1 / §14.2: build (or fetch from cache) a STANDALONE
     // monomorphized function for `ms` under the active genericSubst_, with the
@@ -20830,9 +20851,15 @@ private:
     // it is computed from the fact the compiler ALREADY has: `IrFootprint` /
     // `emittedSideEffectSince`, #2963's own discriminator. Pass `nullptr` (the
     // default) at a caller that returns unconditionally.
-    llvm::Value* emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                          std::vector<llvm::Value*>& args,
-                                          bool* emitted = nullptr);
+    // `argExprs`: see the identical parameter on `emitGenericSpecialization`
+    // just above (fix #5046 follow-up, §5.1, v0.307) — threaded through to
+    // the SAME `wrapArgForNullableValueFormal` parameter-binding call this
+    // function makes for an expression-bodied generic method, and passed on
+    // to `emitGenericSpecialization` for a block-bodied one.
+    llvm::Value* emitInlineGenericMethod(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        bool* emitted = nullptr,
+        const std::vector<const ast::Expr*>* argExprs = nullptr);
 
     // CG42: null-conditional call `x?.M(args)` (§7.5) — the callee is a
     // null-conditional member access. If the receiver is null the call is
