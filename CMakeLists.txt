@@ -258,6 +258,23 @@ if(CMAKE_BUILD_TYPE MATCHES "Deb" AND
    (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
     add_compile_options(-gsplit-dwarf)
     message(STATUS "Bezel: using split DWARF (-gsplit-dwarf)")
+    set(BEZEL_SPLIT_DWARF ON)
+endif()
+#  * no GNU pubnames (#5069): under -gsplit-dwarf clang defaults to emitting
+#    .debug_gnu_pubnames/.debug_gnu_pubtypes, an accelerator table meant for a
+#    linker-built .gdb_index. Nothing here builds one (no --gdb-index), so the
+#    tables are pure write volume: 1.3 MB of a 2 MB bezel_core object and 77 MB
+#    of the 311 MB codegen test binary, rewritten on every relink. Without them
+#    gdb/lldb/llvm-symbolizer still resolve symbols (they index the DWARF
+#    themselves, a little slower on first load). Gated on the compiler accepting
+#    the flag, with a clang-style feature check rather than a version test.
+if(BEZEL_SPLIT_DWARF)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-gno-gnu-pubnames BEZEL_HAS_GNO_GNU_PUBNAMES)
+    if(BEZEL_HAS_GNO_GNU_PUBNAMES)
+        add_compile_options(-gno-gnu-pubnames)
+        message(STATUS "Bezel: not emitting GNU pubnames (-gno-gnu-pubnames)")
+    endif()
 endif()
 
 # --- LLVM (codegen backend) -------------------------------------------------
