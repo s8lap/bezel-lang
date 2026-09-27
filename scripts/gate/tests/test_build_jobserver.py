@@ -126,6 +126,49 @@ class CapTest(DaemonTestBase):
         self.assertTrue(_wait_for(lambda: _avail(self.dir) == self.TOKENS))
 
 
+NINJA = shutil.which("ninja-build") or shutil.which("ninja")
+
+
+@unittest.skipUnless(NINJA, "ninja not installed")
+class NinjaCapTest(DaemonTestBase):
+    """Two ninja builds joined to the pool obey the same cap as makes.
+
+    Fedora installs ninja as `ninja-build`, so that is the holder's comm. A
+    holder the audit does not recognise has its held tokens read as a leak
+    and re-minted, which made the pool unbounded (R22, 2026-09-27: ~245
+    concurrent compiles against 20 tokens). Jobs are long enough to span
+    several audit/confirm cycles, so a mis-counted holder does get repaired."""
+
+    def test_two_ninjas_share_the_pool(self):
+        log = os.path.join(self.dir, "jobs.log")
+        for n in range(2):
+            sub = os.path.join(self.dir, f"n{n}")
+            os.mkdir(sub)
+            with open(os.path.join(sub, "build.ninja"), "w") as f:
+                f.write("rule s\n"
+                        f"  command = echo \"+ $$(date +%s.%N)\" >> {log}; sleep 1.2; "
+                        f"echo \"- $$(date +%s.%N)\" >> {log}; touch $out\n")
+                for i in range(8):
+                    f.write(f"build o{i}: s\n")
+        env = dict(os.environ, MAKEFLAGS=f"-j --jobserver-auth=fifo:{self.dir}/fifo")
+        ps = [subprocess.Popen([NINJA, "-C", os.path.join(self.dir, f"n{n}")],
+                               env=env, stdout=subprocess.DEVNULL)
+              for n in range(2)]
+        for p in ps:
+            self.assertEqual(p.wait(timeout=120), 0)
+        with open(log) as f:
+            events = sorted((float(t), 1 if s == "+" else -1)
+                            for s, t in (line.split() for line in f))
+        running = peak = 0
+        for _, delta in events:
+            running += delta
+            peak = max(peak, running)
+        self.assertEqual(sum(1 for _, d in events if d == 1), 16)
+        self.assertLessEqual(peak, self.TOKENS + 2,
+                             "ninja's held tokens were re-minted as a leak")
+        self.assertTrue(_wait_for(lambda: _avail(self.dir) == self.TOKENS))
+
+
 class RepairTest(DaemonTestBase):
     def test_lost_token_is_restored_when_idle(self):
         fd = os.open(os.path.join(self.dir, "fifo"), os.O_RDONLY | os.O_NONBLOCK)

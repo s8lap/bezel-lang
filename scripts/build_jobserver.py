@@ -127,7 +127,9 @@ def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int]:
     held = 0
     makes = 0
     for pid in _fifo_holders(fifo, self_pid):
-        if _comm(pid) not in ("make", "gmake", "ninja"):
+        # Fedora installs ninja as `ninja-build`; an unrecognised holder's
+        # tokens read as a leak and get re-minted (R22: pool unbounded).
+        if _comm(pid) not in ("make", "gmake", "ninja", "ninja-build"):
             continue
         makes += 1
         held += max(0, _children_count(pid) - 1)

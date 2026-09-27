@@ -138,7 +138,7 @@ esac
 # after this rewrite) and a caller that already set MAKEFLAGS.
 if [ "$kind" = build ] && [ "${BEZEL_JOBSERVER:-on}" != off ] \
    && [ -z "${MAKEFLAGS:-}" ] \
-   && case "$(basename "$1")" in cmake|make|gmake|ninja) true;; *) false;; esac; then
+   && case "$(basename "$1")" in cmake|make|gmake|ninja|ninja-build) true;; *) false;; esac; then
   _js="$(dirname "$0")/build_jobserver.py"
   _jsdir="${BEZEL_JOBSERVER_DIR:-/var/tmp/bezel-scratch/jobserver}"
   if [ -f "$_js" ] && python3 "$_js" alive --dir "$_jsdir" 2>/dev/null; then
