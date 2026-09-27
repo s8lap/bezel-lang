@@ -3528,10 +3528,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before
         // `ret`, giving the caller a dangling pointer.
+        //
+        // fix #4955 (§17.8, §28.3, v0.307): `return y!;` is the same transfer.
+        // §17.8: "if `x` has ownership state owned …, `x!` is owned" — the
+        // null-forgiving operator neither moves nor copies, so `y!` IS `y` and
+        // the returned local must be excluded from its scope-end auto-drop
+        // exactly as a bare `return y;` is. Before this the `!` hid the
+        // identifier, `y` was auto-dropped before `ret`, and the caller read
+        // (and disposed) the freed object — a heap-use-after-free. Peel only
+        // postfix `!` layers (never `as`, whose result is a borrow, §17.4).
         llvm::AllocaInst* retSlot = nullptr;
+        const ast::Expr* retCore = rs->value.get();
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(retCore)) {
+            if (!pb->operand) break;
+            retCore = pb->operand.get();
+        }
         if (rs->value) {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(rs->value.get())) {
-                sema::Symbol* sym = ctx_.exprSymbol(*rs->value);
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(retCore)) {
+                sema::Symbol* sym = ctx_.exprSymbol(*id);
                 if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     auto lit = locals_.find(loc->decl);
                     if (lit != locals_.end()) retSlot = lit->second;

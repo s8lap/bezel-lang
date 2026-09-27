@@ -8675,7 +8675,17 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
     // pessimistically.
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+    //
+    // fix #4955 (§17.8, §28.3, v0.307): `return y!;` over a bare identifier is
+    // `return y;` — §17.8: "if `x` has ownership state owned …, `x!` is owned"
+    // (and a borrowed `x!` is borrowed with the same source) — so it takes the
+    // same arm. Before this an owned plain local's `return y!;` skipped this
+    // arm, so this pass never recorded `y` as discharged by the return (with
+    // the arm, a read of `y` in an active `finally` draws the same warning as
+    // after `return y;`). The `using var` arm of `y!` is rejected above.
+    const ast::Expr* returnedCore =
+        isBangOverBareIdentifier(e) ? peelTopCastBang(&e) : &e;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(returnedCore)) {
         // §28.3 / §28.10 (#762): a `using var` is owned but scope-bound — per
         // §28.3 "it cannot be moved out of, only borrowed from." Returning it by
         // bare identifier transfers it out of its scope: for an `owned` return
