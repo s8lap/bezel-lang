@@ -7011,46 +7011,73 @@ void Resolver::checkAbstractImplementations() {
         // the record's own Equals is absent from `concreteNames` when the
         // BFS reaches the record, while `IEquatable<Self>`'s `Equals(T)` IS
         // in `abstractNames`, producing a false "does not implement inherited
-        // abstract member" error at L7030-7038.
+        // abstract member" error below.
         //
-        // Detect the Self-typed IEquatable listing: walk `t->baseTypes` and
-        // check whether any base is `IEquatable` whose type argument resolves to
-        // `t` itself (Self). Then confirm `t` qualifies for auto-equality
-        // synthesis (positional record or admissible body record). If both
-        // hold, inject `Equals` into `concreteNames` and `concreteArities`
-        // so the abstract/concrete mismatch check does not fire.
-        if (t->kind == ast::TypeDeclKind::Record) {
-            for (TypeSymbol* base : t->baseTypes) {
-                if (!base || base->name != "IEquatable") continue;
-                // IEquatable has one generic param; check it resolves to `t`.
-                if (base->genericParams.size() != 1 || !base->genericParams[0])
+        // fix #5095 (§9.1 / §12.5 / §2.3, v0.307): the synthesized witness
+        // satisfies EXACTLY ONE obligation — the auto-imported (stdlib §2.9)
+        // `IEquatable<T>.Equals(T)` at T = Self — and nothing else. Three
+        // shapes the first cut admitted must keep the §12.5 reject:
+        //   (a) a USER `interface IEquatable<T>` shadowing the name (§2.3
+        //       permits it; #3139's precedent): identity, not name — the
+        //       base must carry `isSynthesizedBuiltinInterface`;
+        //   (b) `record Pair<T>(...): IEquatable<Pair<int>>`: the type
+        //       argument must be Self in FULL — the record's own declaration
+        //       applied to its own generic parameters, in order — not just
+        //       the same head declaration;
+        //   (c) `record Point(...): IEquatable<Point>, IEquatable<int>`: the
+        //       `IEquatable<int>` entry is a second, separate obligation the
+        //       synthesized `Equals(Point)` does not witness.
+        // So the injection is decided AFTER the BFS: it happens only when
+        // every abstract `Equals` obligation the BFS records is the builtin
+        // IEquatable's at exactly Self, reached through `t`'s own inheritance
+        // clause. Any other abstract `Equals` (a non-Self instantiation, a
+        // shadow interface, a user interface declaring `Equals`, or builtin
+        // IEquatable reached only through another interface) sets
+        // `equalsNeedsRealWitness`, and the record then needs a written
+        // `Equals` exactly as before #5048. Codegen's
+        // `isSynthesizedIEquatableEquals` (#5068) tests builtin identity and
+        // relies on this check for the Self-ness of the listing.
+        TypeSymbol* builtinIEq = nullptr;
+        for (TypeSymbol* b : t->baseTypes) {
+            if (b && b->isSynthesizedBuiltinInterface &&
+                b->name == "IEquatable" && b->genericParams.size() == 1 &&
+                b->genericParams[0]) {
+                builtinIEq = b;
+                break;
+            }
+        }
+        // (b): is `ref` exactly Self — `t` at its own generic parameters?
+        auto isExactlySelf = [&](const TypeRef* ref) -> bool {
+            if (!ref || ref->kind != TypeRef::Kind::Named || ref->nullable ||
+                ref->declaration != t)
+                return false;
+            if (ref->genericArgs.size() != t->genericParams.size())
+                return false;
+            for (std::size_t gi = 0; gi < t->genericParams.size(); ++gi) {
+                const TypeRef* ga = ref->genericArgs[gi];
+                const Symbol* gp = t->genericParams[gi];
+                if (!ga || !gp || ga->kind != TypeRef::Kind::Named ||
+                    ga->declaration || ga->nullable ||
+                    !ga->genericArgs.empty() || ga->headName() != gp->name)
+                    return false;
+            }
+            return true;
+        };
+        bool listsBuiltinIEqAtSelf = false;
+        if (t->kind == ast::TypeDeclKind::Record && builtinIEq) {
+            for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+                if (t->baseTypes[bi] != builtinIEq ||
+                    bi >= t->baseTypeRefs.size())
                     continue;
-                // Find the corresponding baseTypeRef to get the instantiated type.
-                std::size_t baseIdx = 0;
-                for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
-                    if (t->baseTypes[bi] == base) { baseIdx = bi; break; }
-                }
-                if (baseIdx >= t->baseTypeRefs.size()) continue;
-                TypeRef* bref = t->baseTypeRefs[baseIdx];
-                if (!bref || bref->genericArgs.empty()) continue;
-                TypeRef* typeArg = bref->genericArgs[0];
-                // The type argument must resolve to `t` itself.
-                if (!typeArg || typeArg->kind != TypeRef::Kind::Named) continue;
-                if (typeArg->declaration != t) continue;
-                // `t` lists IEquatable<Self>. Now check if it qualifies for
-                // auto-equality synthesis. A record with an explicit Equals or
-                // GetHashCode is NOT auto-synthesized (those members would
-                // already be in concreteNames from the BFS below, so no fix
-                // needed), so this only fires for records that genuinely rely
-                // on synthesis.
-                if (isPositionalRecordEqualityBearing(t, ctx_) ||
-                    isAutoEqualityBearingBodyRecord(t, ctx_)) {
-                    concreteNames.insert("Equals");
-                    concreteArities["Equals"].insert(1);  // Equals(T): 1 param
-                    break;  // found the match; no need to keep searching
+                TypeRef* bref = t->baseTypeRefs[bi];
+                if (bref && bref->genericArgs.size() == 1 &&
+                    isExactlySelf(bref->genericArgs[0])) {
+                    listsBuiltinIEqAtSelf = true;
+                    break;
                 }
             }
         }
+        bool equalsNeedsRealWitness = false;
         std::size_t i = 0;
         while (i < frontier.size()) {
             FrontierNode node = frontier[i++];  // copy — frontier may realloc
@@ -7075,6 +7102,19 @@ void Resolver::checkAbstractImplementations() {
                     if (methodIsAbstract(ms)) {
                         abstractNames.insert(ms->name);
                         abstractArities[ms->name].insert(ms->params.size());
+                        // fix #5095: see `equalsNeedsRealWitness` above.
+                        if (ms->name == "Equals") {
+                            const TypeRef* selfArg = nullptr;
+                            if (curIsIface && cur == builtinIEq &&
+                                !builtinIEq->genericParams.empty()) {
+                                auto sit = curSubst.find(
+                                    builtinIEq->genericParams[0]->name);
+                                if (sit != curSubst.end())
+                                    selfArg = sit->second;
+                            }
+                            if (!isExactlySelf(selfArg))
+                                equalsNeedsRealWitness = true;
+                        }
                         // #1685: record the interface's own MethodSymbol so
                         // the `scoped` match below can inspect its per-
                         // parameter modifiers directly (curIsIface implies
@@ -7210,10 +7250,24 @@ void Resolver::checkAbstractImplementations() {
                         }
                     }
                 }
+                // fix #5095: builtin IEquatable reached through ANOTHER
+                // interface is not `t`'s own `IEquatable<Self>` listing.
+                if (cur != t && b == builtinIEq && builtinIEq)
+                    equalsNeedsRealWitness = true;
                 std::string key = seenKey(b, bSubst);
                 if (!seen.insert(key).second) continue;
                 frontier.push_back(FrontierNode{b, std::move(bSubst)});
             }
+        }
+        // fix #5048 / #5095 (§9.1 / §14.2 clause 2 / §12.5, v0.307): inject
+        // the synthesized `Equals(T)` for the one obligation it witnesses —
+        // see the comment above `builtinIEq`. A record with a written
+        // `Equals` already has it in `concreteNames` from the BFS.
+        if (listsBuiltinIEqAtSelf && !equalsNeedsRealWitness &&
+            (isPositionalRecordEqualityBearing(t, ctx_) ||
+             isAutoEqualityBearingBodyRecord(t, ctx_))) {
+            concreteNames.insert("Equals");
+            concreteArities["Equals"].insert(1);  // Equals(T): 1 param
         }
         for (auto name : abstractNames) {
             if (!concreteNames.count(name)) {
