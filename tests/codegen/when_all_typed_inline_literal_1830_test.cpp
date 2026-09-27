@@ -35,9 +35,12 @@
 // Spec: §6.7 (WhenAll<T> / Task<Array<T>>), §30.5 (await Task<Array<T>>), v0.217.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 
 namespace {
@@ -51,7 +54,6 @@ int run(const std::string& prog) {
 // the result is `Task<Array<int>>`; `await w` yields Array<int>. Return
 // the sum results[0] + results[1]. Pre-fix: compiler abort
 // (DataLayout assertion) in emitAsyncMethod. Post-fix: exit code 30.
-// Uses `using var` on the result so the Array is disposed at scope end.
 BEZEL_TEST(when_all_typed_inline_literal_1830,
            two_elem_inline_literal_sums_results_spec_6_7) {
     int rc = run(
@@ -60,7 +62,7 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    using var ta := Task.FromResult(10); "
         "    using var tb := Task.FromResult(20); "
         "    using var w := Task.WhenAll([ta, tb]); "
-        "    using var results := await w; "
+        "    var results := await w; "
         "    return results[0] + results[1]; "
         "  end Main; end App;");
     if (rc == -999) return;  // AOT unavailable
@@ -78,7 +80,7 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    using var tb := Task.FromResult(2); "
         "    using var tc := Task.FromResult(3); "
         "    using var w := Task.WhenAll([ta, tb, tc]); "
-        "    using var results := await w; "
+        "    var results := await w; "
         "    return results[0] + results[1] + results[2]; "
         "  end Main; end App;");
     if (rc == -999) return;
@@ -129,4 +131,29 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "  end Main; end App;");
     if (rc == -999) return;
     BEZEL_EXPECT_EQ(rc, 120);
+}
+
+// fix #5043 / §30.5 (v0.307, line 8551): pins that `using var r := await w`
+// is rejected when `w` is the result of `Task.WhenAll<T>` over an inline
+// collection literal. The inline-literal path in ExprTypecheck_Calls.cpp
+// produces a Task<Array<T>> result TypeRef with a BuiltinTypeRef head that
+// has no astNode and no importedName, so the §30.5 headOk predicate
+// (ExprTypecheck.cpp:17068-17070) requires a Named head with a 1-part
+// astNode name — which the BuiltinTypeRef lacks. Without this explicit
+// reject test, the row would pass vacuously (the existing accept rows
+// use `var r` instead of `using var r`).
+BEZEL_TEST(when_all_typed_inline_literal_1830,
+           reject_using_var_await_whenall_inline_literal_pattern_a_30_5) {
+    auto r = runAot(
+        "module M; class App "
+        "  public static async method Main(): Task<int> "
+        "    using var ta := Task.FromResult(10); "
+        "    using var tb := Task.FromResult(20); "
+        "    using var w := Task.WhenAll([ta, tb]); "
+        "    using var results := await w; "
+        "    return results[0] + results[1]; "
+        "  end Main; end App;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "the borrow produced by `await Task<T>` (Pattern A) may not flow to a `using var` binding"));
 }
