@@ -440,29 +440,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // Mirrors the declaration-initializer path (#840, lowerLocalDecl). A
         // no-op unless both sides are the tagged-struct shape, the types
         // differ, and a §5.1 payload widening applies.
-        auto liftNullableValueToSlot = [this](llvm::Value* v,
-                                              llvm::Type* slotTy,
-                                              bool srcUnsigned) {
-            auto isTagged = [this](llvm::Type* t) {
-                auto* st = llvm::dyn_cast<llvm::StructType>(t);
-                return st && st->isLiteral() && st->getNumElements() == 2 &&
-                       st->getElementType(0) == nullablePrimHasValTy();
-            };
-            if (!v || !slotTy || v->getType() == slotTy ||
-                !isTagged(v->getType()) || !isTagged(slotTy))
-                return v;
-            llvm::Type* want = slotPayloadTy(slotTy);
-            llvm::Value* srcInner =
-                builder_.CreateExtractValue(v, {1u}, "lift.in");
-            llvm::Value* conv =
-                coerceNumericToType(srcInner, want, srcUnsigned);
-            if (conv->getType() != want) return v;
-            llvm::Value* hasVal =
-                builder_.CreateExtractValue(v, {0u}, "lift.has");
-            llvm::Value* res = builder_.CreateInsertValue(
-                llvm::UndefValue::get(slotTy), hasVal, {0u});
-            return builder_.CreateInsertValue(res, conv, {1u}, "lift.wrap");
-        };
+        //
+        // fix #5078: hoisted to the member function `liftNullableValueToSlot`
+        // (LlvmBackend_impl.hpp) so the indexer-setter arm in
+        // `lowerCollectionIndexerSet` (LlvmBackend_Assign.cpp) — a SEPARATE
+        // `IndexExpr` branch below that `return`s before reaching this shared
+        // preamble — can reuse the identical logic instead of a second copy.
         if (as->target && as->value) {
             // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound

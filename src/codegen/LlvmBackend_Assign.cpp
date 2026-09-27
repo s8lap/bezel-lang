@@ -1157,6 +1157,37 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                     if (val->getType()->isPointerTy())
                         val = nullableValueNull(elemTyRef);  // null → tagged null
                     else {
+                        // fix #5078 (§5.1 "Nullable conversions", v0.307):
+                        // `val` may ALREADY be the tagged `{i8, S}` struct of
+                        // a DIFFERENT nullable-value type — a nullable-VALUE
+                        // RHS (`arr[0] := ki;` with `ki: int?`,
+                        // `arr: Array<double?>`) lowers to `{i8, i32}` before
+                        // it ever reaches here. The #5017 lift for this exact
+                        // shape lives in lowerStmt's shared `elemTy`-based
+                        // preamble (LlvmBackend_Stmts.cpp), but this
+                        // indexer-setter arm is a SEPARATE `IndexExpr` branch
+                        // that `return`s before reaching it, so a tagged-
+                        // struct `val` reached the scalar-only #5005 widen
+                        // below unconverted (not `isIntegerTy()` /
+                        // `isFloatingPointTy()`) and then `wrapNullableValue`
+                        // — whose `reinterpretToType` round-trip does not
+                        // reshape a MISMATCHED struct — handed its
+                        // `insertvalue` a `{i8, i32}` where a `double` payload
+                        // was expected. MEASURED: "Invalid InsertValueInst
+                        // operands!" / IR verification failed on
+                        // `arr[0] := ki;` (`Array<double?>`, `ki: int?`), and
+                        // identically for `??=`, a null source, and an
+                        // unsigned (`uint?`) source. `liftNullableValueToSlot`
+                        // is a no-op (returns `val` unchanged) unless `val` is
+                        // ITSELF that tagged shape, so trying it first is safe
+                        // before the bare-scalar #5005 path below, which still
+                        // handles the non-tagged (`int`/`double`) RHS case.
+                        llvm::Value* lifted = liftNullableValueToSlot(
+                            val, expected,
+                            valueExpr && isUnsignedTargetExpr(*valueExpr));
+                        if (lifted->getType() == expected) {
+                            val = lifted;
+                        } else {
                         // fix #5005 (§5.1 `S → T → T?`, v0.307): a NARROWER
                         // numeric `val` (e.g. an `int` at an `Array<long?>`
                         // element, `a[i] := k;`) reached `wrapNullableValue`
@@ -1183,6 +1214,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                                 val, payloadTy,
                                 valueExpr && isUnsignedTargetExpr(*valueExpr));
                         val = wrapNullableValue(elemTyRef, val);  // scalar → {1, val}
+                        }
                     }
                 }
             }
@@ -1406,8 +1438,29 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // true).  Wrap into {i8=1, Item} before boxing so decode always finds the
         // full tagged struct.  Detect by comparing against the outer tagged struct.
         if (valNullableVal && v->getType()->isStructTy() &&
-            v->getType() != nullableValueStructTy(valTy))
-            v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
+            v->getType() != nullableValueStructTy(valTy)) {
+            // fix #5078 (§5.1 "Nullable conversions", v0.307): `v` may
+            // instead ALREADY be the tagged `{i8, S}` struct of a DIFFERENT
+            // nullable-VALUE type (`d[k] := ki;` with `ki: int?`,
+            // `d: Dictionary<K, long?>` lowers `ki` to `{i8, i32}` before it
+            // ever reaches here) — not a bare inner record. This dict encode
+            // path conflated the two: it treated ANY struct-typed, not-yet-
+            // tagged `v` as an inner record and handed it straight to
+            // `wrapNullableValue`, whose `reinterpretToType` round-trip does
+            // not reshape a mismatched-width tagged struct. MEASURED: the
+            // same "Invalid InsertValueInst operands!" / IR verification
+            // failed as the Array<T?> shape above, on
+            // `Dictionary<string, long?>["k"] := ki;` (and `??=`). Try the
+            // shared unwrap/convert/rewrap lift first — a no-op (returns `v`
+            // unchanged) unless `v` is ITSELF the tagged shape — and fall
+            // back to the inner-record wrap only when it declines.
+            llvm::StructType* wantSt = nullableValueStructTy(valTy);
+            llvm::Value* lifted = liftNullableValueToSlot(
+                v, wantSt, valueExpr && isUnsignedTargetExpr(*valueExpr));
+            v = (lifted->getType() == wantSt)
+                    ? lifted
+                    : wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
+        }
         // fix #3780 (§4.8 / §28.9, v0.286): route the boxing decision through
         // the #3770/#3768 shared predicate instead of this arm's own
         // `(valRec || valNullableVal) && isStructTy()` copy — see

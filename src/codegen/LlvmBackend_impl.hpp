@@ -5756,6 +5756,50 @@ private:
         return wrapNullableValue(nvTy, v);
     }
 
+    // fix #5017 / #5078 (§5.1 "Nullable conversions", v0.307): lift a
+    // NULLABLE-VALUE-typed value `v` — the tagged `{i8 hasValue; S}` struct a
+    // `Nullable<S>`-typed expression already lowers to — into a DIFFERENT
+    // nullable-value slot type `{i8 hasValue; T}` (S ≠ T, both scalars §5.1
+    // permits widening between). Converts the payload via coerceNumericToType
+    // and carries the source's hasValue through unchanged — §5.1, verbatim:
+    // "a present value converts by the underlying conversion, `null` converts
+    // to `null`". Returns `v` UNCHANGED unless BOTH `v` and `slotTy` are that
+    // exact tagged-struct shape and the types actually differ, so it is safe
+    // to try unconditionally on a bare scalar or a pointer (a `null` literal)
+    // before falling back to whatever scalar-specific wrap the caller already
+    // performs for those shapes.
+    //
+    // Originally a local lambda inside lowerStmt's AssignmentStmt handling
+    // (fix #5017, the `:=` / `??=` reassignment preamble). Hoisted to a member
+    // so `lowerCollectionIndexerSet`'s `Array<T?>` / `Dictionary<K,T?>`
+    // indexer-setter arm (fix #5078, LlvmBackend_Assign.cpp) can reuse the
+    // identical unwrap/convert/rewrap instead of a second copy — indexer
+    // assignment is a SEPARATE `IndexExpr` arm in lowerStmt that returns
+    // before ever reaching the shared preamble where #5017's fix lives, so it
+    // needs its own call site to the same logic.
+    llvm::Value* liftNullableValueToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                        bool srcUnsigned) {
+        auto isTagged = [this](llvm::Type* t) {
+            auto* st = llvm::dyn_cast<llvm::StructType>(t);
+            return st && st->isLiteral() && st->getNumElements() == 2 &&
+                   st->getElementType(0) == nullablePrimHasValTy();
+        };
+        if (!v || !slotTy || v->getType() == slotTy ||
+            !isTagged(v->getType()) || !isTagged(slotTy))
+            return v;
+        llvm::Type* want = slotPayloadTy(slotTy);
+        llvm::Value* srcInner =
+            builder_.CreateExtractValue(v, {1u}, "lift.in");
+        llvm::Value* conv =
+            coerceNumericToType(srcInner, want, srcUnsigned);
+        if (conv->getType() != want) return v;
+        llvm::Value* hasVal =
+            builder_.CreateExtractValue(v, {0u}, "lift.has");
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(slotTy), hasVal, {0u});
+        return builder_.CreateInsertValue(res, conv, {1u}, "lift.wrap");
+    }
+
     // v0.171 (#1336) — the Try-convention writeback. Every extraction
     // `TryX(out item: T?)` builtin must assign the out slot on BOTH exit paths
     // (§22.3): `null` on the false path, the extracted value on the true path.
