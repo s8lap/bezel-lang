@@ -441,6 +441,33 @@ both from the other pool.
 coordinator** — not per lane and not by both sessions. Two pools adding
 `runAotChecked` rows otherwise collide on the single baseline file.
 
+### Peer heartbeats report events, not ticks
+
+*Added 2026-09-28 (R23), at the owner's request.* A peer's cron is its own
+wake-up backstop; it is **not** a reporting schedule. With two peers each
+sending a full roster on every tick, the integrating coordinator spent most of
+its turns re-reading status that had not moved, and the few actionable lines
+(a handback SHA, a slot freed) were buried in tables.
+
+A peer messages the integrator **only** when something is actionable or has
+changed:
+
+- a handback or review verdict is ready (with its SHA);
+- a blocker, or a question that needs a ruling;
+- a cold-codegen slot freed or taken;
+- a resource alarm (`MemAvailable` < 8G, sustained swap-out, `/mnt/fast` > 85%);
+- an acknowledgement of a drain or gate order.
+
+On a no-change tick it sends **nothing**. At most once every two hours it sends
+one line — `<peer> alive: N lanes, no change`. Batch several events into one
+message; no roster tables or restated protocols unless the integrator asks.
+
+The peer **keeps** its ~30-minute cron — only the message is suppressed, not
+the check. (One peer read "fewer reports" as "sparser cron" and started
+removing its own backstop.) Correspondingly, the integrator no longer treats
+silence as an alarm: it pings a peer only after ~2 h of silence or when an
+event it is waiting on is overdue.
+
 ## Coordinator tooling
 
 *Added 2026-09-26 (R21). In R21 most coordinator time that was not review went
