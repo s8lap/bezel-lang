@@ -3488,29 +3488,46 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             }
             return nullptr;
         }
-        // narrow #4926 (§12.7 / §14, v0.307), Case B: the operand is erased to
-        // a single-element-type-parameter builtin INTERFACE (IEnumerable<T>,
-        // ICollection<T>, IList<T>, IReadOnlyList<T>, IOwningList<T>,
-        // IReadOnlyCollection<T>, IOwningCollection<T> — the element-type-
-        // preserving interfaces; NOT IEquatable<T>/IComparable<T>, which state
-        // a relation about a T rather than "holds elements of type T" and are
-        // exactly the shape #4909 warns is unsound to fold in here) whose OWN
-        // generic argument is statically KNOWN. Bezel generics are invariant
-        // (§14, no covariance): `Array<T> : IEnumerable<T>` for exactly that
-        // T, never a different one, so a value assignable to `IEnumerable<char>`
-        // can never be an `Array<int>` (or any single-arg collection<int>)
-        // instance — decidable as `false` with no runtime check at all,
-        // regardless of which concrete collection backs the interface. A
-        // MATCHING argument (`IEnumerable<char>` vs target `Array<char>`)
-        // stays genuinely ambiguous (the interface erases which concrete
-        // collection — or a user class, or a string per stdlib §9.6 — backs
-        // it) and falls through to the bail below unresolved, same as before.
+        // narrow #4926 (§12.7 / §14 / §12.9, v0.307), Case B: the operand is
+        // erased to a single-element-type-parameter builtin INTERFACE whose
+        // OWN generic argument is statically KNOWN, and the argument
+        // mismatches the target's. Bezel CLASSES/RECORDS are invariant
+        // (§14), but INTERFACES may be independently marked variant (§12.9:
+        // "Variance attaches to interface and function-type parameters
+        // only"). The stdlib declares `IEnumerable<out T>`,
+        // `IReadOnlyCollection<out T>` and `IReadOnlyList<out T>` COVARIANT
+        // (§12.9's own worked example: "`IEnumerable<Dog>` is assignable to
+        // `IEnumerable<Animal>`") — so a mismatched argument on ONE OF THOSE
+        // proves nothing: `v: IEnumerable<Animal> := (an Array<Dog>)` is a
+        // legal covariant assignment, so `v is Array<Dog>` is actually TRUE
+        // despite the argument "mismatch" (Animal vs Dog). Narrow #5077
+        // (reviewer-caught) is exactly this: the original version of this
+        // branch folded those three covariant interfaces in via
+        // isListInterfaceName / isCollectionInterfaceName and answered a
+        // confident, undiagnosed `false` — worse than the pre-#4926 silent
+        // drop, because it pre-empted the #2775 "dropped" warning the
+        // widened `concreteTarget` bail below would otherwise emit for this
+        // still-genuinely-ambiguous shape.
+        //
+        // This branch is therefore restricted to the interfaces stdlib
+        // declares INVARIANT — `ICollection<T>`, `IList<T>`,
+        // `IOwningCollection<T>`, `IOwningList<T>`, `IOwningEnumerable<T>`
+        // (verified against Bezel_Standard_Library.md: none of the five
+        // carries `out`/`in`) — where Bezel's ordinary invariance holds and
+        // a mismatched argument genuinely rules out every possible backing
+        // (NOT IEquatable<T>/IComparable<T> either, which state a relation
+        // about a T rather than "holds elements of type T" and are exactly
+        // the shape #4909 warns is unsound to fold in here). The three
+        // covariant interfaces, and a MATCHING argument on any of these five,
+        // fall through unconditionally to the bail below, unresolved, same
+        // as before.
         else if (opArgsConcrete && opConcrete->kind == sema::TypeRef::Kind::Named &&
                  !opConcrete->declaration && opConcrete->genericArgs.size() == 1 &&
                  rt->genericArgs.size() == 1 &&
-                 (isListInterfaceName(opConcrete, nullptr) ||
-                  isCollectionInterfaceName(opConcrete) ||
-                  opConcrete->headName() == "IEnumerable" ||
+                 (opConcrete->headName() == "ICollection" ||
+                  opConcrete->headName() == "IList" ||
+                  opConcrete->headName() == "IOwningCollection" ||
+                  opConcrete->headName() == "IOwningList" ||
                   opConcrete->headName() == "IOwningEnumerable") &&
                  !builtinCollectionArgIdentical(opConcrete->genericArgs[0],
                                                  rt->genericArgs[0])) {

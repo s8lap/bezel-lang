@@ -14,10 +14,27 @@
 //            same head + identical generic arguments -> true; a different
 //            head, or a mismatched argument, -> false.
 //   Case B — the operand is erased to a single-element-type-parameter
-//            builtin interface (IEnumerable<T>, ICollection<T>, IList<T>,
-//            ...) whose OWN argument is statically known and differs from
-//            the target's -> false (invariance rules out every possible
-//            concrete backing at once, with no runtime check).
+//            builtin interface whose OWN argument is statically known and
+//            differs from the target's -> false (invariance rules out every
+//            possible concrete backing at once, with no runtime check).
+//
+// ⚠ Case B is restricted to `ICollection<T>`, `IList<T>`,
+// `IOwningCollection<T>`, `IOwningList<T>` and `IOwningEnumerable<T>` — the
+// five interfaces stdlib declares INVARIANT — since #5077 (a reviewer-caught
+// unsoundness in the original #4926 landing, `5f2c8753`). `IEnumerable<out
+// T>`, `IReadOnlyCollection<out T>` and `IReadOnlyList<out T>` are
+// stdlib-COVARIANT (§12.9), so a mismatched argument on one of THOSE proves
+// nothing (§12.9's own worked example: `IEnumerable<Dog>` is assignable to
+// `IEnumerable<Animal>`, an argument "mismatch" that is actually a true
+// subtyping relation) — folding them into Case B answered a confident,
+// undiagnosed `false` for `v: IEnumerable<Animal> := (an Array<Dog>); v is
+// Array<Dog>`, which is WRONG (must be `true`) and worse than the pre-#4926
+// state because it pre-empted the #2775 warning. See
+// tests/lit/type_test_covariant_interface_carrier_warns_5077.bzl for the
+// three covariant repros (pinned via the #2775 warning, not a gtest value,
+// since none has a trivially sound decision) and the
+// `interface_carrier_invariant_ilist_mismatched_element_type_...` row below
+// for Case B's still-decisive invariant path.
 //
 // NOT covered here (still genuinely ambiguous, UNCHANGED behavior): an
 // Object carrier, or a MATCHING-element-type interface carrier — exactly the
@@ -117,13 +134,20 @@ BEZEL_TEST(codegen_type_test_4926,
         "end C;"), std::string("false"));
 }
 
-// §12.7 / §14 (#4926 narrow, Case B): the operand is erased to
-// `IEnumerable<char>` (a single-element-type-parameter builtin interface)
-// whose OWN generic argument (char) is statically known and differs from the
-// target's (int). Bezel generics are invariant, so `Array<T> :
-// IEnumerable<T>` for exactly that T — a value assignable to
-// IEnumerable<char> can never be an Array<int> instance, regardless of which
-// concrete collection backs the interface, decidable with no runtime check.
+// §12.7 / §14 / §12.9 (#4926 narrow — RE-POINTED by #5077): the operand is
+// erased to `IEnumerable<char>` whose OWN generic argument (char) is
+// statically known and differs from the target's (int). `IEnumerable<out
+// T>` is stdlib-COVARIANT (§12.9), so since #5077 this name is no longer one
+// of Case B's decisive five (see the code comment in LlvmBackend_Layout.cpp)
+// and this row no longer exercises Case B at all — it falls through to the
+// `concreteTarget` bail and answers `false` via the #2775 "dropped" warning
+// path instead (this gtest oracle cannot observe the warning itself; see
+// tests/lit/type_test_covariant_interface_carrier_warns_5077.bzl for that
+// half). The VALUE stays `false` either way — char is a value type, and
+// §12.9 "variance applies only when the type argument is a reference type"
+// — but the MECHANISM changed, so this row is kept as the control that pins
+// the value is unaffected by the #5077 narrowing. Case B's decisive path for
+// a genuinely INVARIANT interface is pinned separately, immediately below.
 BEZEL_TEST(codegen_type_test_4926,
            interface_carrier_mismatched_element_type_answers_false_spec_12_7_14) {
     BEZEL_EXPECT_EQ(runAotOut(
@@ -132,6 +156,32 @@ BEZEL_TEST(codegen_type_test_4926,
         "  public static method Main(): int "
         "    var a: Array<char> := ['a', 'b']; "
         "    var e: IEnumerable<char> := a; "
+        "    if e is Array<int> then Console.WriteLine(\"bug-true\"); "
+        "    else Console.WriteLine(\"false\"); end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), std::string("false"));
+}
+
+// §12.7 / §14 (#5077 — Case B's decisive path, now restricted to the five
+// stdlib-INVARIANT interfaces): the operand is erased to `IList<char>`
+// (invariant — no `out`/`in` marker; `IList<T>` has mutating methods, per
+// §12.9's own worked example) whose OWN generic argument (char) is
+// statically known and differs from the target's (int). Bezel's ordinary
+// invariance holds for this name, so `Array<T> : IList<T>` for exactly that
+// T — a value assignable to IList<char> can never be an Array<int> instance,
+// regardless of which concrete collection backs the interface, decidable
+// with no runtime check. This is the positive control that Case B still
+// fires for at least one of the five names #5077 kept in, now that
+// IEnumerable/IReadOnlyCollection/IReadOnlyList have been carved out above.
+BEZEL_TEST(codegen_type_test_4926,
+           interface_carrier_invariant_ilist_mismatched_element_type_answers_false_spec_12_7_14_5077) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var a: Array<char> := ['a', 'b']; "
+        "    var e: IList<char> := a; "
         "    if e is Array<int> then Console.WriteLine(\"bug-true\"); "
         "    else Console.WriteLine(\"false\"); end; "
         "    return 0; "
