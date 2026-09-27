@@ -1735,6 +1735,27 @@ private:
     TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                        TypeRef* from, TypeRef* to);
 
+    // §25.2 "the ordinary argument rules" / §5.1 "Constant narrowing" (#5063,
+    // v0.307): does a PRIMITIVE operand of static type `at` (from expression
+    // `operandExpr`, when known) match a PRIMITIVE operator/parameter type
+    // `pt`? Identity and §5.1 numeric widening always match. When
+    // `allowConstantNarrowing` is set and neither applies, an in-range
+    // compile-time integer CONSTANT operand additionally narrows to `pt` —
+    // §25.2: "a derived-typed operand satisfies a base-typed parameter by the
+    // ordinary argument rules," and §5.1: constant narrowing "applies at
+    // every position where this section's implicit conversions apply … and
+    // it participates in overload-resolution applicability." Delegates to
+    // narrowIntConstantToTarget — the ONE §5.1 implementation — rather than
+    // duplicating its range table; `operandExpr` may be null (an operator's
+    // non-constant operand, e.g. a compound assignment's target, which is
+    // never itself a constant), in which case narrowing is simply
+    // unavailable and only identity/widening are tested. Shared by
+    // findBinaryOperator (ExprTypecheck_Exprs.cpp) and the compound-
+    // assignment Named-target operator search (ExprTypecheck.cpp) so the
+    // two candidate-matching copies ask the SAME primitive-operand question.
+    bool primitiveOperandMatchesParam(const ast::Expr* operandExpr, TypeRef* at,
+                                      TypeRef* pt, bool allowConstantNarrowing);
+
     // §14.1 (#2926): does `t` mention a generic type parameter that is still
     // UNSUBSTITUTED at this point — one of the enclosing type's (currentType_)
     // or the enclosing method's (currentMethodDecl_)? Such a slot's real type

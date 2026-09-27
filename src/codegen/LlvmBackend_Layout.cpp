@@ -240,8 +240,9 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
     // ORDER (left→param0, right→param1). Sema has already validated that the
     // compound is well-typed, so this only DISAMBIGUATES when one type declares
     // several overloads of the same token. A Primitive parameter matches a
-    // Primitive operand by kind (numeric widening is downstream, as for the
-    // binary form).
+    // Primitive operand by identity or §5.1 widening (fix #5063: NOT by kind
+    // alone — see the note on the Primitive arm of `paramMatches` below for
+    // why kind-only broke sema/codegen agreement on which overload is used).
     //
     // fix #2932 (§25.2, v0.240): a Named parameter matches a Named operand by
     // declaration OR by the operand's CLASS BASE CHAIN — §25.2, verbatim: "A
@@ -269,8 +270,36 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
                 if (t == pt->declaration) return true;
             return false;
         }
-        if (pt->kind == sema::TypeRef::Kind::Primitive)
-            return operandTy->kind == sema::TypeRef::Kind::Primitive;
+        if (pt->kind == sema::TypeRef::Kind::Primitive) {
+            if (operandTy->kind != sema::TypeRef::Kind::Primitive) return false;
+            // fix #5063 (§5.1/§25.2/§22.6, v0.307): this used to match by KIND
+            // ALONE ("numeric widening is downstream"), so this independent
+            // codegen-side re-derivation could pick a DIFFERENT overload than
+            // sema did whenever a type declares more than one primitive-
+            // parameterized overload of the same operator token. Sema now runs
+            // a two-pass "exact beats convert" search (§22.6) for the compound-
+            // assignment path too, and — critically — only RETYPES the operand
+            // expression via §5.1 constant narrowing when narrowing was the
+            // candidate it actually chose; an exact match leaves the operand's
+            // recorded type untouched. `rightTy`/`leftTy` here are read from
+            // `ctx_.exprType(*as->value)` (see the three call sites in
+            // LlvmBackend_Assign.cpp / LlvmBackend_Stmts.cpp), i.e. sema's
+            // POST-narrowing type — so a kind-only match here could still
+            // select an earlier-declared narrower-typed overload sema had
+            // already passed over, leaving the operand at its wider,
+            // un-narrowed width: `v *= 2` against BOTH `operator *(V, byte)`
+            // and `operator *(V, int)` had sema resolve the exact `int`
+            // overload (leaving the literal `int`-typed) while this search,
+            // unchanged, still matched the `byte`-param overload FIRST by
+            // declaration order — "Call parameter type does not match
+            // function signature! i32 2 ... i8". Requiring identity or
+            // widening (no narrowing — sema already applied any narrowing
+            // needed, if at all) keeps this search's outcome consistent with
+            // sema's.
+            return pt->primitive == operandTy->primitive ||
+                   sema::primitiveImplicitlyWidens(operandTy->primitive,
+                                                    pt->primitive);
+        }
         return false;
     };
     // fix #2932 (§25.2, v0.240): "including declarations inherited from their

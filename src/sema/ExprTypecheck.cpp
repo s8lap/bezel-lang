@@ -19536,8 +19536,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // arithmetic twin `x += Flags.B`) on `x: Flags` compiled
                 // silently and codegen emitted an unspecified value.
                 std::string binOp(as->op.substr(0, as->op.size() - 1));
-                auto operandMatchesParam = [&](const TypeRef* operandTy,
-                                               Symbol* paramSym) -> bool {
+                // fix #5063 (§25.2 "the ordinary argument rules" / §5.1
+                // "Constant narrowing", v0.307): `operandExpr` is the AST
+                // expression the operand type came from, or null for the
+                // TARGET operand (`as->target` is an lvalue being written to,
+                // never itself a compile-time constant) — only the RHS
+                // (`as->value`) can be a narrowable constant. The primitive
+                // branch used to accept ANY primitive-typed RHS against ANY
+                // primitive param with no width/kind check at all ("numeric
+                // coercion downstream" — but no downstream site actually
+                // performed one for a NAMED-target compound assignment's user
+                // operator: `v *= 2` against `operator *(v: V, n: byte)`
+                // admitted here, then reached codegen with the literal still
+                // `int`-typed against an `i8` parameter — malformed IR).
+                // Delegate to primitiveOperandMatchesParam — shared with
+                // findBinaryOperator (ExprTypecheck_Exprs.cpp) — so this copy
+                // asks the SAME primitive-operand question: identity/§5.1
+                // widening, or (when `allowConstantNarrowing`) §5.1 constant
+                // narrowing, which also RE-TYPES `operandExpr` to the
+                // parameter's type so codegen's later `lowerExpr`/
+                // `ctx_.exprType(*as->value)` reads the narrowed width.
+                auto operandMatchesParam = [&](const ast::Expr* operandExpr,
+                                               const TypeRef* operandTy,
+                                               Symbol* paramSym,
+                                               bool allowConstantNarrowing) -> bool {
                     auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
                     if (!ps) return false;
                     TypeRef* pt = ps->declType
@@ -19545,12 +19567,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                       : ps->resolvedDeclType;
                     if (!pt || !operandTy) return false;
                     // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
-                    // a primitive param accepts a primitive operand (numeric
-                    // coercion downstream); a Named param needs the operand's
+                    // a primitive param accepts a primitive operand under
+                    // §5.1's rules; a Named param needs the operand's
                     // declaration (or a derived one) with §7.11 nullability
                     // agreement (user-operator lifting over T? is deferred).
                     if (pt->kind == TypeRef::Kind::Primitive)
-                        return operandTy->kind == TypeRef::Kind::Primitive;
+                        return primitiveOperandMatchesParam(
+                            operandExpr, const_cast<TypeRef*>(operandTy), pt,
+                            allowConstantNarrowing);
                     if (pt->kind != TypeRef::Kind::Named || !pt->declaration ||
                         operandTy->kind != TypeRef::Kind::Named ||
                         !operandTy->declaration)
@@ -19573,21 +19597,42 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // result-type check just above uses) would silently miss an
                 // INHERITED operator and leave rule 6 unenforced for it.
                 auto typeDeclaresApplicable =
-                    [&](TypeSymbol* decl) -> MethodSymbol* {
+                    [&](TypeSymbol* decl,
+                        bool allowConstantNarrowing) -> MethodSymbol* {
                     if (!decl) return nullptr;
                     for (MethodSymbol* m :
                          collectInheritedOperators(decl, binOp, 2)) {
                         if (m->params.size() < 2) continue;
-                        if (operandMatchesParam(tTy, m->params[0]) &&
-                            operandMatchesParam(rTy, m->params[1]))
+                        if (operandMatchesParam(nullptr, tTy, m->params[0],
+                                                allowConstantNarrowing) &&
+                            operandMatchesParam(as->value.get(), rTy,
+                                                m->params[1],
+                                                allowConstantNarrowing))
                             return m;
                     }
                     return nullptr;
                 };
-                MethodSymbol* matchedOp = typeDeclaresApplicable(tTy->declaration);
+                // #5063 (§22.6 "exact beats convert"): try every candidate
+                // WITHOUT constant narrowing first, exactly as
+                // findBinaryOperator's `tryOperand` does, so a plain `int`
+                // literal against both `operator *(V, byte)` and
+                // `operator *(V, int)` prefers the exact `int` overload
+                // regardless of which is declared first.
+                MethodSymbol* matchedOp =
+                    typeDeclaresApplicable(tTy->declaration,
+                                           /*allowConstantNarrowing=*/false);
                 if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
                     rTy->declaration)
-                    matchedOp = typeDeclaresApplicable(rTy->declaration);
+                    matchedOp = typeDeclaresApplicable(
+                        rTy->declaration, /*allowConstantNarrowing=*/false);
+                if (!matchedOp) {
+                    matchedOp = typeDeclaresApplicable(
+                        tTy->declaration, /*allowConstantNarrowing=*/true);
+                    if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
+                        rTy->declaration)
+                        matchedOp = typeDeclaresApplicable(
+                            rTy->declaration, /*allowConstantNarrowing=*/true);
+                }
                 bool hasApplicableOp = matchedOp != nullptr;
                 if (matchedOp) ctx_.setStmtOperatorSymbol(as, matchedOp);
                 if (!hasApplicableOp) {

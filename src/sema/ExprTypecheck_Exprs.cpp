@@ -5472,6 +5472,33 @@ ExprTC::collectInheritedOperators(TypeSymbol* ts, std::string_view token,
     return out;
 }
 
+// §25.2 "the ordinary argument rules" / §5.1 "Constant narrowing" (#5063,
+// v0.307) — see the declaration comment (ExprTypecheck_impl.hpp) for the rule
+// and the spec citations. Identity and §5.1 numeric widening are tried first
+// (the existing, unchanged rule); constant narrowing is attempted only when
+// `allowConstantNarrowing` is set AND neither of those already matches, so a
+// candidate that fits WITHOUT narrowing is never displaced by one that needs
+// it — callers run a narrowing-disallowed pass before a narrowing-allowed one
+// (findBinaryOperator's `tryOperand`, the compound-assignment search) to
+// implement §22.6's "exact beats convert" deterministically, independent of
+// declaration order (an out-of-range constant, and a non-constant int, both
+// correctly stay inapplicable — narrowIntConstantToTarget returns `from`
+// unchanged for either, so the primitive-match falls through to `false`).
+bool ExprTC::primitiveOperandMatchesParam(const ast::Expr* operandExpr,
+                                          TypeRef* at, TypeRef* pt,
+                                          bool allowConstantNarrowing) {
+    if (!at || !pt) return false;
+    if (at->kind != TypeRef::Kind::Primitive ||
+        pt->kind != TypeRef::Kind::Primitive)
+        return false;
+    if (pt->primitive == at->primitive || primitiveWidens(at->primitive, pt->primitive))
+        return true;
+    if (!allowConstantNarrowing || !operandExpr) return false;
+    TypeRef* narrowed = narrowIntConstantToTarget(operandExpr, at, pt);
+    return narrowed->kind == TypeRef::Kind::Primitive &&
+           narrowed->primitive == pt->primitive;
+}
+
 // §25: the user-defined `static operator <op>` method that applies to a
 // binary expression, if either operand's type (class or record) — OR a base
 // class of that type (§25.2, v0.181, #1562) — declares one. `=`/`<>` on
@@ -5504,8 +5531,11 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // operator does not apply. (Previously a reversed-operand match, e.g.
     // `4 * v` against `operator *(Vec, int)`, was accepted, and codegen emitted
     // the args in source order → an IR-verification crash.)
-    auto operandMatchesParam = [&](const ast::Expr* operand,
-                                   Symbol* paramSym) -> bool {
+    // `allowConstantNarrowing` (#5063, §25.2/§5.1, v0.307): the second pass
+    // `tryOperand` runs below — see its own comment for why two passes make
+    // "exact beats convert" hold regardless of declaration order.
+    auto operandMatchesParam = [&](const ast::Expr* operand, Symbol* paramSym,
+                                   bool allowConstantNarrowing) -> bool {
         auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
         if (!ps) return false;
         TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
@@ -5561,9 +5591,13 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             if (at->kind != TypeRef::Kind::Primitive) return false;
             if (!pt->nullable && at->nullable && be.op != "=" && be.op != "<>")
                 return false;
-            // Identity is always valid; §5.1 numeric widening covers the rest.
-            return pt->primitive == at->primitive ||
-                   primitiveWidens(at->primitive, pt->primitive);
+            // Identity and §5.1 numeric widening are tried first, then (#5063,
+            // §25.2/§5.1, v0.307) §5.1 constant narrowing when the pass allows
+            // it — "a derived-typed operand satisfies a base-typed parameter
+            // by the ordinary argument rules" (§25.2), and the ordinary
+            // argument rules include constant narrowing (§5.1).
+            return primitiveOperandMatchesParam(operand, at, pt,
+                                                allowConstantNarrowing);
         }
         return false;
     };
@@ -5601,10 +5635,34 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     };
     auto tryOperand = [&](const ast::Expr* operand) -> MethodSymbol* {
         // #1131: examine EVERY overload of the operator declared on `operand`'s
-        // type and return the first whose parameters match the operands in order.
+        // type and return the first whose parameters match the operands in
+        // order.
+        //
+        // #5063 (§22.6 "exact beats convert" / §25.2 "the ordinary argument
+        // rules", v0.307): run TWO passes — the first with constant narrowing
+        // DISALLOWED, the second WITH it. Without this, `v * 2` against BOTH
+        // `operator *(V, byte)` and `operator *(V, int)` would pick whichever
+        // is declared first in `candidatesOn`'s order (a single pass returns
+        // the first applicable candidate, and #5063's own narrowing makes a
+        // successfully-narrowed candidate applicable too) — the literal `2`
+        // is naturally `int`-typed, so the `int` overload is the one that
+        // matches WITHOUT narrowing, and must win regardless of where either
+        // overload is declared. An out-of-range constant or a non-constant
+        // int stays inapplicable in both passes (narrowIntConstantToTarget's
+        // own gates), so those rows are unaffected.
         for (MethodSymbol* m : candidatesOn(operand)) {
-            if (operandMatchesParam(be.left.get(), m->params[0]) &&
-                operandMatchesParam(be.right.get(), m->params[1]) &&
+            if (operandMatchesParam(be.left.get(), m->params[0],
+                                    /*allowConstantNarrowing=*/false) &&
+                operandMatchesParam(be.right.get(), m->params[1],
+                                    /*allowConstantNarrowing=*/false) &&
+                genericArgsConsistent(m))
+                return m;
+        }
+        for (MethodSymbol* m : candidatesOn(operand)) {
+            if (operandMatchesParam(be.left.get(), m->params[0],
+                                    /*allowConstantNarrowing=*/true) &&
+                operandMatchesParam(be.right.get(), m->params[1],
+                                    /*allowConstantNarrowing=*/true) &&
                 genericArgsConsistent(m))
                 return m;
         }
