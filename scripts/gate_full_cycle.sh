@@ -1617,7 +1617,7 @@ say "rule-corpus-baseline phase: GREEN ($(tail -1 "$_rcb_log"))"
 # --self-test runs FIRST for the same reason every sibling phase pins: a green
 # from a matcher that matched nothing is worth nothing, and the detector's
 # self-test (synthetic tree + fake bezelc) is build-free.
-say "internal-residual phase: detector self-test + `internal:` count ratchet (#4761)"
+say "internal-residual phase: detector self-test + \`internal:\` count ratchet (#4761)"
 _ir_log="$LOGDIR/${TAG}_internal_residual.log"
 if ! python3 scripts/check_internal_residual.py --self-test \
       > "$_ir_log" 2>&1; then
@@ -1636,7 +1636,7 @@ fi
 if ! python3 scripts/check_internal_residual.py --strict \
       --bezelc "$REPO/build/bezelc" \
       >> "$_ir_log" 2>&1; then
-  say "CYCLE FAILURE: the `internal:` emission count moved against"
+  say "CYCLE FAILURE: the \`internal:\` emission count moved against"
   say "  scripts/internal_residual.baseline — a silent-wrong-code"
   say "  emitter shipped green, or the baseline is stale headroom (#4761)."
   say "  See $_ir_log"
