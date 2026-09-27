@@ -17,7 +17,9 @@ properties that make that sound, using a fake compiler so they need no clang:
     never published next to a PCH built from other content; persistent churn
     fails the build with nothing left behind;
   - #5085: tests/pch_verify.sh deletes a PCH whose recorded input hashes no
-    longer match (a same-size edit with an OLD mtime, which make misses).
+    longer match (a same-size edit with an OLD mtime, which make misses);
+  - #5088: it touches its stamp ONLY when it deletes, so Ninja's restat
+    rebuilds the PCH in the same build and leaves an intact one alone.
 """
 import os
 import pathlib
@@ -47,6 +49,10 @@ if [ -n "${FAKE_EDIT_AFTER:-}" ]; then
         sed -i "s/v$n\$/v$((n + 1))/" "$FAKE_EDIT_AFTER"
         # A package install keeps the package's OLD mtime; only ctime moves.
         [ -n "${FAKE_EDIT_OLD_MTIME:-}" ] && touch -d 2000-01-01 "$FAKE_EDIT_AFTER"
+        # The edit lands in the stamp's own timestamp tick: the launcher's
+        # pre-compile stamp gets exactly the edited file's ctime (mtime <= it).
+        [ -n "${FAKE_EDIT_SAME_TICK:-}" ] \
+            && touch -d "@$(stat -c %.9Z "$FAKE_EDIT_AFTER")" "$out.stamp"
     fi
 fi
 exit 0
@@ -217,6 +223,18 @@ class PchSumLauncherTest(unittest.TestCase):
         _, clean = self._run(self._tree("b"))
         self.assertEqual(self._sum(pch), self._sum(clean))
 
+    def test_race_edit_in_the_stamps_own_tick_is_caught(self):
+        # #5088 review: the check is INCLUSIVE (>=). On a coarse clock an edit
+        # can share the stamp's timestamp exactly, and a strict > misses it.
+        r, pch = self._run(self._tree("a"),
+                           env_extra=dict(self._race_env(1),
+                                          FAKE_EDIT_SAME_TICK="1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("changed during the PCH compile", r.stderr)
+        self.assertIn("system header v1", pch.read_text())
+        _, clean = self._run(self._tree("b"))
+        self.assertEqual(self._sum(pch), self._sum(clean))
+
     def test_race_edit_on_every_attempt_fails_with_nothing_published(self):
         tree = self._tree("a")
         _, pch = self._run(tree)
@@ -248,6 +266,31 @@ class PchSumLauncherTest(unittest.TestCase):
         self.assertIn("stale", r.stderr)
         for suffix in ("", ".sum", ".inputs"):
             self.assertFalse(pathlib.Path(str(pch) + suffix).exists(), suffix)
+
+    def _verify_stamp(self, pch, stamp):
+        return subprocess.run([str(VERIFY), str(pch), str(stamp)],
+                              cwd=pch.parent, capture_output=True, text=True)
+
+    def test_verify_stamp_moves_only_when_the_pch_is_deleted(self):
+        # #5088: the stamp is an OBJECT_DEPENDS of the PCH compile, so that
+        # Ninja (restat) rebuilds the PCH in the SAME build verify deleted it.
+        _, pch = self._run(self._tree("a"))
+        stamp = pch.parent / "verify.stamp"
+        r = self._verify_stamp(pch, stamp)          # created, ancient mtime
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(stamp.stat().st_mtime, 1)
+        self.assertTrue(pch.exists())
+        r = self._verify_stamp(pch, stamp)          # intact: untouched
+        self.assertEqual(stamp.stat().st_mtime, 1)
+        self.sys_hdr.write_text("// system header v5\n")
+        os.utime(self.sys_hdr, (0, 0))
+        r = self._verify_stamp(pch, stamp)          # stale: deleted + touched
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(pch.exists())
+        self.assertGreater(stamp.stat().st_mtime, 1)
+        before = stamp.stat().st_mtime_ns
+        r = self._verify_stamp(pch, stamp)          # no PCH: untouched
+        self.assertEqual((r.returncode, stamp.stat().st_mtime_ns), (0, before))
 
     def test_verify_deletes_an_unverifiable_pch_and_ignores_a_missing_one(self):
         _, pch = self._run(self._tree("a"))

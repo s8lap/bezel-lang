@@ -356,13 +356,34 @@ if(BEZEL_CCACHE_RELOCATABLE)
     # against the hashes the launcher recorded, and delete a PCH whose inputs
     # changed. make alone keys on mtimes, which a package update can leave OLDER
     # than the PCH, and clang does not revalidate system headers from a PCH.
-    # Always-run (no OUTPUT); ordered before the PCH rule by the target
-    # dependency, and every group reaches the PCH through REUSE_FROM.
-    add_custom_target(bezel_tests_pch_verify
+    # Always-run (a SYMBOLIC output); ordered before the PCH rule by the
+    # target dependency, and every group reaches the PCH through REUSE_FROM.
+    #
+    # #5088: under Ninja, deleting the .pch is not enough. Ninja computes its
+    # dirty set before the build starts and never re-stats the .pch, so the
+    # build would finish rc=0 on stale objects and recover only on the NEXT
+    # build. So verify also owns a stamp, declared as a BYPRODUCT (which gives
+    # the edge `restat = 1` under Ninja) and as an OBJECT_DEPENDS of the PCH
+    # compile. It is touched ONLY when the PCH is deleted. Ninja then keeps the
+    # PCH and its consumers dirty, or restat-cleans them when the stamp did not
+    # move. make needs no help: it evaluates the PCH rule after verify ran. The
+    # stamp is deliberately NOT in the target's DEPENDS, because the Makefile
+    # generator has no rule for a byproduct.
+    set(_pch_verify_stamp ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.stamp)
+    set(_pch_verify_always ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.always)
+    add_custom_command(OUTPUT ${_pch_verify_always}
+        BYPRODUCTS ${_pch_verify_stamp}
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/pch_verify.sh
                 CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch
+                ${_pch_verify_stamp}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Checking the test PCH inputs (#5085)"
         VERBATIM)
+    set_source_files_properties(${_pch_verify_always} PROPERTIES SYMBOLIC TRUE)
+    add_custom_target(bezel_tests_pch_verify DEPENDS ${_pch_verify_always})
+    set_source_files_properties(
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.cxx
+        PROPERTIES OBJECT_DEPENDS ${_pch_verify_stamp})
     add_dependencies(bezel_tests_pch bezel_tests_pch_verify)
 endif()
 

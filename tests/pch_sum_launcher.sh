@@ -108,7 +108,7 @@ for attempt in $(seq 1 "$attempts"); do
     # PCH, and a stale .inputs can never vouch for one (tests/pch_verify.sh).
     rm -f -- "$out.sum" "$out.inputs" || exit 1
     cleanup
-    : >"$stamp" && ref=$(stat -c %.9Y -- "$stamp") || exit 1
+    : >"$stamp" || exit 1
 
     CCACHE_DISABLE=1 "$@"
     rc=$?
@@ -131,6 +131,7 @@ for attempt in $(seq 1 "$attempts"); do
     compiler_version=$(CCACHE_DISABLE=1 "$1" --version 2>&1) || { cleanup; warn "'$1 --version' failed"; exit 0; }
     dep_hashes=$(sha256sum -- "${deps[@]}") || { cleanup; warn "hashing the PCH inputs failed"; exit 0; }
 
+    ref=$(stat -c %.9Y -- "$stamp") || { cleanup; warn "stat of $stamp failed"; exit 0; }
     times=$(stat -c '%.9Y %.9Z %n' -- "${deps[@]}") || { cleanup; warn "stat of the PCH inputs failed"; exit 0; }
     changed=$(awk -v r="$ref" '$1 >= r || $2 >= r { print substr($0, index($0, $3)); exit }' <<<"$times")
     if [ -z "$changed" ]; then break; fi
