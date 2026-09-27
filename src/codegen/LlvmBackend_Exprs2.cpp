@@ -202,6 +202,21 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                                                 "coal.dec.rhs");
                     }
                 }
+                // fix #5017 (§7.7 typing + §5.1 widening, v0.307): a BINARY
+                // FLOAT payload (`double? ?? -1`, `double? ?? f` with
+                // `f: float`). §7.7 types the result `T` when the right
+                // operand converts to `T`, and §5.1 widens int → float/double
+                // and float → double — but neither arm above covers a float
+                // payload, so the RHS reached the PHI at its own type and the
+                // verifier aborted ("PHI node operands are not the same type
+                // as the result!"). coerceNumericToType is §5.1's widening;
+                // signedness is the RHS's own (uint → UIToFP).
+                if (!rhsDiv && primVal->getType()->isFloatingPointTy() &&
+                    r->getType() != primVal->getType() &&
+                    (r->getType()->isIntegerTy() ||
+                     r->getType()->isFloatingPointTy()))
+                    r = coerceNumericToType(r, primVal->getType(),
+                                            isUnsignedTargetExpr(*bin.right));
                 llvm::BasicBlock* rhsEndBB = nullptr;
                 if (!rhsDiv) { rhsEndBB = builder_.GetInsertBlock(); builder_.CreateBr(endBB); }
                 builder_.SetInsertPoint(endBB);
