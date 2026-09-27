@@ -1243,12 +1243,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // nullable value type. Otherwise `lambda(y) => y + 1` returned a bare i32
     // from a `{i8, i32}` function (IR verifier) and `lambda(y) => null`
     // returned `ptr` while the specialization expected the carrier.
+    //
+    // Only the CALLEE's own method type parameters are resolved this way, and
+    // only for a lambda bound to one of that callee's formals (per §14.1 a
+    // type parameter belongs to its declaration): genericSubstSemaTy_ also
+    // holds the ENCLOSING generic method's bindings, so a by-name lookup took
+    // `Box<T>`'s `T` in `Box<string>.Apply(v, f: (T) -> T)` for an enclosing
+    // `Go<T>`'s `T := int?` and declared the lambda `{i8, i32}` over a
+    // `string` body. The pre-pass records that set (lambdaCalleeOwnTParams_).
     const sema::TypeRef* expectedRetSema =
         expectedFunctionType_ ? expectedFunctionType_->funcReturn : nullptr;
     if (expectedRetSema && !genericSubstSemaTy_.empty() &&
-        isBareTypeParamRef(expectedRetSema))
-        expectedRetSema =
-            substituteTypeRefLocal(expectedRetSema, genericSubstSemaTy_);
+        lambdaCalleeOwnParams_ && isBareTypeParamRef(expectedRetSema) &&
+        lambdaCalleeOwnTParams_.count(expectedRetSema->headName())) {
+        bool isCalleeFormal = false;
+        for (const auto& p : *lambdaCalleeOwnParams_)
+            if (p.type && ctx_.resolvedType(*p.type) == expectedFunctionType_) {
+                isCalleeFormal = true;
+                break;
+            }
+        if (isCalleeFormal)
+            expectedRetSema =
+                substituteTypeRefLocal(expectedRetSema, genericSubstSemaTy_);
+    }
     if (expectedRetSema && isNullableValueTy(expectedRetSema)) {
         llvm::Type* expected = lowerTypeRef(expectedRetSema);
         // #5041: the i32-fallback override above may already have set retTy

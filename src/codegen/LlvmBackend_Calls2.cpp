@@ -11646,6 +11646,23 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 e.calleeFormalSemaSubst_ = std::move(sema);
             }
         } formalSubstRestore{*this, savedFormalParams, savedFormalSema};
+        // fix #5041 (§14.1, v0.307): likewise scope the lambda pre-pass's
+        // callee-own type-parameter set to THIS call (see the member's comment).
+        const std::vector<ast::Param>* savedLambdaOwnParams =
+            lambdaCalleeOwnParams_;
+        auto savedLambdaOwnTParams = std::move(lambdaCalleeOwnTParams_);
+        lambdaCalleeOwnParams_ = nullptr;
+        lambdaCalleeOwnTParams_.clear();
+        struct LambdaOwnTParamsRestore {
+            Emitter& e;
+            const std::vector<ast::Param>* params;
+            std::unordered_set<std::string_view>& names;
+            ~LambdaOwnTParamsRestore() {
+                e.lambdaCalleeOwnParams_ = params;
+                e.lambdaCalleeOwnTParams_ = std::move(names);
+            }
+        } lambdaOwnTParamsRestore{*this, savedLambdaOwnParams,
+                                  savedLambdaOwnTParams};
         // One read of the callee's declaration serves both pre-passes in this
         // block (the literal-formal bindings here and the lambda pre-pass
         // below); fix #4813 adds no new MemberSymbol::decl classification.
@@ -11710,7 +11727,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (ownerNames.count(gp.name)) continue;
                             preSubst.erase(gp.name);
                             preSema.erase(gp.name);
+                            lambdaCalleeOwnTParams_.insert(gp.name);
                         }
+                        if (!lambdaCalleeOwnTParams_.empty())
+                            lambdaCalleeOwnParams_ = &md->params;
                     }
                     // fix #5041 (§14.5 phase 1, v0.307): explicit type
                     // arguments are seeded FIRST and are authoritative — the

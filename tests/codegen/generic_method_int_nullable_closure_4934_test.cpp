@@ -247,3 +247,76 @@ BEZEL_TEST(generic_method_int_nullable_closure_4934, issue_5041_map_return_nulla
         "end Program;",
         "<null><1><null><1.5>\n");
 }
+
+// per §14.1 / §14.5 (v0.307), fix #5041 review REJECT — a lambda bound to a
+// generic CLASS's formal `f: (T) -> T` (`Box<string>.Apply`) inside a generic
+// METHOD `Go<T>` whose own `T` is `int?` / `double?`. The two `T`s are
+// different declarations' parameters (§14.1); lowerLambda's #5041 return
+// override resolved the bare `T` by NAME through the enclosing `Go<T>`
+// substitution, so the `string` lambda was declared `{i8, i32}` / `{i8,
+// double}` and `ret ptr` failed IR verification. The override now fires only
+// for the callee's own method type parameters. Output is the unchanged
+// pre-#5041 behaviour (`a!`).
+BEZEL_TEST(generic_method_int_nullable_closure_4934, class_tparam_collides_with_enclosing_method_tparam_string_14_1) {
+    expectPrints4934Lambda(
+        "module Conf; "
+        "public class Box<T> "
+        "  public method Apply(v: T, f: (T) -> T): T "
+        "    return f(v); "
+        "  end Apply; "
+        "end Box; "
+        "public class Util "
+        "  public static method Go<T>(x: T): string "
+        "    var b := new Box<string>(); "
+        "    return b.Apply(\"a\", lambda(y) => y + \"!\"); "
+        "  end Go; "
+        "  public static method GoX<T>(x: T): string "
+        "    var b := new Box<string>(); "
+        "    var s := b.Apply(\"a\", lambda(y) => y + \"!\"); "
+        "    return $\"{x}{s}\"; "
+        "  end GoX; "
+        "end Util; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Util.Go<int?>(null)); "
+        "    Console.WriteLine(Util.Go<int?>(3)); "
+        "    Console.WriteLine(Util.Go<double?>(null)); "
+        "    Console.WriteLine(Util.Go<double?>(1.5)); "
+        "    Console.WriteLine(Util.GoX<int?>(null)); "
+        "    Console.WriteLine(Util.GoX<double?>(1.5)); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;",
+        "a!\na!\na!\na!\nnulla!\n1.5a!\n");
+}
+
+// per §14.1 / §14.5 (v0.307), fix #5041 review REJECT — the same collision
+// with a VALUE-typed class argument, `Box<long>` inside `Go2<T>` at
+// `T := int?` / `double?`: the `long` lambda was declared with the enclosing
+// `T`'s nullable carrier.
+BEZEL_TEST(generic_method_int_nullable_closure_4934, class_tparam_collides_with_enclosing_method_tparam_long_14_1) {
+    expectPrints4934Lambda(
+        "module Conf; "
+        "public class Box<T> "
+        "  public method Apply(v: T, f: (T) -> T): T "
+        "    return f(v); "
+        "  end Apply; "
+        "end Box; "
+        "public class Util "
+        "  public static method Go2<T>(x: T): string "
+        "    var b := new Box<long>(); "
+        "    var s := b.Apply(5L, lambda(y) => y + 1L); "
+        "    return $\"{x}/{s}\"; "
+        "  end Go2; "
+        "end Util; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Console.WriteLine(Util.Go2<int?>(null)); "
+        "    Console.WriteLine(Util.Go2<int?>(3)); "
+        "    Console.WriteLine(Util.Go2<double?>(null)); "
+        "    Console.WriteLine(Util.Go2<double?>(1.5)); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;",
+        "null/6\n3/6\nnull/6\n1.5/6\n");
+}

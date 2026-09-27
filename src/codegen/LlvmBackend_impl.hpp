@@ -2945,6 +2945,16 @@ private:
     const std::vector<ast::Param>* calleeFormalSubstParams_ = nullptr;
     std::unordered_map<std::string_view, const sema::TypeRef*>
         calleeFormalSemaSubst_;
+    // fix #5041 (§14.1 / §14.5, v0.307): the callee whose lambda pre-pass is
+    // active in lowerCallDispatch — its formals and the names of its OWN
+    // method type parameters (owner-type names excluded). lowerLambda resolves
+    // a bare type-parameter return of expectedFunctionType_ through the active
+    // substitution ONLY when that formal is one of these params and the name
+    // is one of these type parameters; otherwise a same-named binding of the
+    // ENCLOSING generic method (`Go<T>` calling `Box<string>.Apply(v, f: (T)
+    // -> T)`) would be taken for the callee's. Saved/restored per call.
+    const std::vector<ast::Param>* lambdaCalleeOwnParams_ = nullptr;
+    std::unordered_set<std::string_view> lambdaCalleeOwnTParams_;
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
