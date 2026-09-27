@@ -1138,8 +1138,10 @@ std::vector<MetaGenericParam> convertGenericParams(
         mg.name = std::string(gp->name);
         mg.variance = std::string(gp->variance);  // "", "in", "out"
         // §14.2: gather constraints whose `where T:` parameter matches.
+        bool hasAstConstraint = false;
         for (const ast::GenericConstraint& gc : constraints) {
             if (gc.typeParam != gp->name) continue;
+            hasAstConstraint = true;
             for (const ast::ConstraintItem& ci : gc.items) {
                 if (ci.kind == "type" && ci.typeArg) {
                     mg.constraintTypes.push_back(convertAstType(ci.typeArg.get(),
@@ -1150,6 +1152,30 @@ std::vector<MetaGenericParam> convertGenericParams(
             }
             if (!gc.modifierConstraint.empty())
                 mg.specialConstraints.emplace_back(gc.modifierConstraint);
+        }
+        // fix #5076 (§14.2, v0.307): an override that omits its `where` clause
+        // (§14.2's recommended spelling) has an empty `md->genericConstraints`
+        // AST list, but `checkOverrideSignatureMatch` already materialized the
+        // inherited constraint set into `gp->constraints`.  When the AST gave
+        // nothing, fall back to the symbol's materialized set so the metadata
+        // writer exports the full constraint set rather than an empty one.
+        if (!hasAstConstraint && !gp->constraints.empty()) {
+            for (const auto& c : gp->constraints) {
+                if (c.kind == "type") {
+                    // c.astBound is set for a same-module override.
+                    if (c.astBound) {
+                        mg.constraintTypes.push_back(
+                            convertAstType(c.astBound, ctx));
+                    }
+                    // c.importedBound is set for a cross-module override.
+                    else if (c.importedBound) {
+                        mg.constraintTypes.push_back(
+                            convertType(c.importedBound));
+                    }
+                } else {
+                    mg.specialConstraints.emplace_back(c.kind);
+                }
+            }
         }
         out.push_back(std::move(mg));
     }
