@@ -15043,6 +15043,13 @@ private:
                 return false;
             return true;
         };
+        // fix #5081 (§22.3 / §22.6, v0.307): scoped opt-in read by
+        // `slotTypeMatches` below — when true, it enforces ref/out
+        // applicability for a NEW-site call too, not only a chain call. Set
+        // (and reset) only around the arity>1 arm further down; see the fix
+        // #4924 comment just below for why the check exists at all, and the
+        // fix #5081 comment at that arm for the scoping rationale.
+        bool enforceRefOutAtNewSite = false;
         // fix #4924 (§22.3 / §22.6, v0.307): at a `this(...)` / `base(...)`
         // chain call (`chainCall`) the call-site `ref`/`out` modifier is part
         // of APPLICABILITY — a `ref` formal is filled only by a `ref`
@@ -15055,12 +15062,25 @@ private:
         // candidate that check admits: it accepts a chain only when some
         // binding candidate, or the modifier-free primary list, matches.
         // Every return of `searchOnce` goes through this per-slot check.
-        // Scoped to chain calls: the `new` sites have the same gap, but there
-        // the #4805 codegen diagnostic and the pending §9.3 ruling (#4775)
-        // decide what a primary-vs-`ref`-ctor record means (#4949).
+        //
+        // fix #5081 (§22.3 / §22.6, v0.307): a `new`-site call has the SAME
+        // gap when TWO OR MORE explicit constructors share the call's arity
+        // (`enforceRefOutAtNewSite`, applied at that arm below only) — such a
+        // call reaches this proxy tier only when sema declined to resolve it
+        // (a call-site `ref`/`out` modifier on one of its own arguments makes
+        // `ExprTC::checkNewExprArgs` return early), so this ranking is the
+        // ONLY thing that picks among the candidates. It is deliberately NOT
+        // extended to the arity==1 arm just below it, or to the §22.10
+        // primary-vs-explicit-ctor interaction (`primaryStrictlyApplicable`):
+        // a combined-form record's single explicit constructor competing
+        // with its auto-generated primary (#4805) turns on the still-open
+        // §9.3 "same parameter list" ruling (#4775 Q1), and applying the
+        // filter there would flip the pinned row
+        // `rec_ref_ctor_4805.combined_form_literal_arg_rejects_clean_22_3`
+        // from reject to accept — out of scope here; see #5081's issue text.
         auto slotTypeMatches = [&](sema::ConstructorSymbol* cs, std::size_t pi,
                                    const ast::CallArgument& arg) -> bool {
-            if (chainCall &&
+            if ((chainCall || enforceRefOutAtNewSite) &&
                 !sema::callSiteRefOutMatches(
                     arg.modifier, sema::formalParamModifier(*cs, pi)))
                 return false;
@@ -15267,9 +15287,26 @@ private:
                 // compatible with param sema types. The same `ctorTypeMatches`
                 // helper the ==1 arm uses (#3760) — sharing keeps the two paths
                 // from drifting on what "type match" means.
+                //
+                // fix #5081 (§22.3 / §22.6, v0.307): enforce ref/out
+                // applicability here too (`enforceRefOutAtNewSite`, see the
+                // declaration above) — a `new`-site call with 2+ same-arity
+                // explicit candidates reaches this arm only when sema
+                // declined to resolve it, so this loop is the only ranking
+                // that ever runs for it. Pre-fix it ignored ref/out entirely,
+                // so `new J(ref n, 6)` against `constructor(ref y: int, x:
+                // int)` / `constructor(y: long, x: int)` picked whichever
+                // candidate's TYPES matched first by declaration order
+                // (`V6,3` with the value ctor declared first, `R6,3` with it
+                // declared second) — silent wrong code, since only the `ref`
+                // candidate is ever applicable to a `ref`-modified argument.
+                enforceRefOutAtNewSite = true;
+                sema::ConstructorSymbol* refOutRanked = nullptr;
                 for (auto* cs : candidates) {
-                    if (ctorTypeMatches(cs)) return cs;
+                    if (ctorTypeMatches(cs)) { refOutRanked = cs; break; }
                 }
+                enforceRefOutAtNewSite = false;
+                if (refOutRanked) return refOutRanked;
                 // fix #4790 (§22.5 / §22.6 stage 3, v0.307): #4779's own
                 // fallback here — "first candidate that binds by NAME" — is
                 // REMOVED. It had the identical defect the ==1 arm had above:
