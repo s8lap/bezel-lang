@@ -461,6 +461,27 @@ target_compile_definitions(bezelc PRIVATE
 # on all 52 bezel_core TUs it made every one of them miss in a fresh worktree.
 set_source_files_properties(src/driver/Driver.cpp PROPERTIES
     COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
+# APPENDED after the #5010 SET above (a SET after it would drop this).
+# #5062: every program the driver links statically pulls in the runtime
+# archive's debug sections (the Bezel objects themselves carry no DWARF). The
+# runtime is compiled with -gz (above), but the DEFAULT linker the driver
+# invokes (plain `clang`, no -fuse-ld) inflates compressed input sections
+# unless told otherwise. So when that linker accepts
+# --compress-debug-sections, hand the flag to the driver's link recipe.
+# Nothing is lost: ASan/llvm-symbolizer and gdb still resolve runtime frames to
+# file:line. The flag is part of Driver::linkRecipeSignature, so the AOT
+# bincache link key moves exactly once. Scoped to Driver.cpp, the one TU
+# that reads it.
+if(BEZEL_DEBUG_COMPRESSION)
+    check_linker_flag(C
+        "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}"
+        BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+    if(BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+        set_property(SOURCE src/driver/Driver.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS
+            BEZEL_LINK_COMPRESS_DEBUG="-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}")
+    endif()
+endif()
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()

@@ -314,6 +314,15 @@ std::string Driver::linkCommandLine(const std::string& objectPath,
         // with --sanitize=address; the default link line is unchanged.
         cmd += " -fsanitize=address -g";
     }
+#ifdef BEZEL_LINK_COMPRESS_DEBUG
+    // #5062: keep the runtime archive's (already -gz compressed) debug
+    // sections compressed in the linked program, instead of letting the
+    // linker inflate them. ~60% of every AOT test executable was DWARF, and
+    // each one is written to the bincache. Symbolizers read the compressed
+    // sections, so ASan reports still resolve runtime frames to file:line.
+    // Injected by CMake only when the default linker accepts the flag.
+    cmd += " " BEZEL_LINK_COMPRESS_DEBUG;
+#endif
     if (!runtimeLibPath.empty()) {
         // Static-link the Bezel runtime (path injected at compile time by CMake).
         cmd += " ";
