@@ -43,20 +43,13 @@ using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 
-namespace {
-int run(const std::string& prog) {
-    auto r = runAot(prog);
-    return r.ran ? r.exitCode : -999;
-}
-}  // namespace
-
 // §6.7 / #1830: Task.WhenAll<T>([t1, t2]) where each tN is Task<int> —
 // the result is `Task<Array<int>>`; `await w` yields Array<int>. Return
 // the sum results[0] + results[1]. Pre-fix: compiler abort
 // (DataLayout assertion) in emitAsyncMethod. Post-fix: exit code 30.
 BEZEL_TEST(when_all_typed_inline_literal_1830,
            two_elem_inline_literal_sums_results_spec_6_7) {
-    int rc = run(
+    auto r = runAot(
         "module M; class App "
         "  public static async method Main(): Task<int> "
         "    using var ta := Task.FromResult(10); "
@@ -65,15 +58,16 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    var results := await w; "
         "    return results[0] + results[1]; "
         "  end Main; end App;");
-    if (rc == -999) return;  // AOT unavailable
-    BEZEL_EXPECT_EQ(rc, 30);
+    BEZEL_EXPECT_TRUE(r.ran);  // assert actually ran (not silently skipped)
+    if (!r.ran) return;        // AOT unavailable
+    BEZEL_EXPECT_EQ(r.exitCode, 30);
 }
 
 // Three-element variant — pins that the literal element inspection
 // handles n != 2. Pre-fix: abort. Post-fix: 1+2+3 = 6.
 BEZEL_TEST(when_all_typed_inline_literal_1830,
            three_elem_inline_literal_sums_results_spec_6_7) {
-    int rc = run(
+    auto r = runAot(
         "module M; class App "
         "  public static async method Main(): Task<int> "
         "    using var ta := Task.FromResult(1); "
@@ -83,8 +77,9 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    var results := await w; "
         "    return results[0] + results[1] + results[2]; "
         "  end Main; end App;");
-    if (rc == -999) return;
-    BEZEL_EXPECT_EQ(rc, 6);
+    BEZEL_EXPECT_TRUE(r.ran);  // assert actually ran (not silently skipped)
+    if (!r.ran) return;       // AOT unavailable
+    BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
 
 // Bare-Task WhenAll over an inline literal — the untyped result path
@@ -94,7 +89,7 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
 // branch does not regress the bare-Task path.
 BEZEL_TEST(when_all_typed_inline_literal_1830,
            bare_task_when_all_over_literal_unchanged_spec_6_7) {
-    int rc = run(
+    auto r = runAot(
         "module M; class App "
         "  public static async method DoIt(): Task "
         "    Console.WriteLine(\"doit\"); "
@@ -105,8 +100,9 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    using var w := Task.WhenAll([a, b]); "
         "    Console.WriteLine(\"done\"); "
         "  end Main; end App;");
-    if (rc == -999) return;
-    BEZEL_EXPECT_EQ(rc, 0);
+    BEZEL_EXPECT_TRUE(r.ran);  // assert actually ran (not silently skipped)
+    if (!r.ran) return;       // AOT unavailable
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // Named `var` `Array<Task<int>>` form — was already working; this test
@@ -118,7 +114,7 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
 // this fix).
 BEZEL_TEST(when_all_typed_inline_literal_1830,
            named_var_array_typed_path_unchanged_spec_6_7) {
-    int rc = run(
+    auto r = runAot(
         "module M; class App "
         "  public static async method Main(): Task<int> "
         "    using var ta := Task.FromResult(50); "
@@ -129,17 +125,18 @@ BEZEL_TEST(when_all_typed_inline_literal_1830,
         "    var results := await w; "
         "    return results[0] + results[1]; "
         "  end Main; end App;");
-    if (rc == -999) return;
-    BEZEL_EXPECT_EQ(rc, 120);
+    BEZEL_EXPECT_TRUE(r.ran);  // assert actually ran (not silently skipped)
+    if (!r.ran) return;       // AOT unavailable
+    BEZEL_EXPECT_EQ(r.exitCode, 120);
 }
 
-// fix #5043 / §30.5 (v0.307, line 8551): pins that `using var r := await w`
+// fix #5043 / §30.5 (v0.307): pins that `using var r := await w`
 // is rejected when `w` is the result of `Task.WhenAll<T>` over an inline
 // collection literal. The inline-literal path in ExprTypecheck_Calls.cpp
-// produces a Task<Array<T>> result TypeRef with a BuiltinTypeRef head that
-// has no astNode and no importedName, so the §30.5 headOk predicate
-// (ExprTypecheck.cpp:17068-17070) requires a Named head with a 1-part
-// astNode name — which the BuiltinTypeRef lacks. Without this explicit
+// types the result as Task<Array<T>> (a Named TypeRef with astNode).
+// awaitTaskKind classifies this as Pattern A (Task<T:class>), and the
+// ownership pass's §30.5 consumer-side rules reject a borrow (the await
+// result) flowing into a `using var` binding. Without this explicit
 // reject test, the row would pass vacuously (the existing accept rows
 // use `var r` instead of `using var r`).
 BEZEL_TEST(when_all_typed_inline_literal_1830,
