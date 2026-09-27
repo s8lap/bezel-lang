@@ -9643,8 +9643,55 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                 ps->declType ? lowerType(ps->declType) : i32();
                             refParams_[cs->params[pi]] = {args[pi + 1], elemTy};
                         } else {
-                            auto* slot = entryAlloca(args[pi + 1]->getType());
-                            builder_.CreateStore(args[pi + 1], slot);
+                            // fix #5089 (§5.1 "Nullable conversions" / §14.1
+                            // "Generic declarations" / §22.7 "Constructors",
+                            // v0.307): the constructor-formal sibling of
+                            // #5046's generic-METHOD-formal fix. `new
+                            // Box<double>(a)` with `a: int?` and
+                            // `constructor(x: T?)` bound `x` (T -> double at
+                            // this instantiation) — `args[pi + 1]` arrives as
+                            // the CALLER's own `int?` tagged `{i8, i32}`
+                            // struct, not the `{i8, double}` the specialized
+                            // body's field stores / reads expect, and
+                            // `buildOrderedArgs`'s own per-arg nullable-wrap
+                            // (fix #4967) cannot catch this: it resolves the
+                            // formal under the ENCLOSING (caller) generic
+                            // substitution active at that call (see the
+                            // `genericSubst_ = savedSubst` bracket around it
+                            // above), where a bare `T?` formal does not yet
+                            // resolve to a concrete nullable value type. This
+                            // loop runs AFTER `genericSubst_` is restored to
+                            // THIS type's own substitution (`ctorArgSubst`,
+                            // T -> double here), the same context
+                            // `emitInlineGenericMethod`'s twin binding uses,
+                            // so `wrapArgForNullableValueFormal`'s case
+                            // (B)/(C) resolution (`nullableTypeParamConcrete`
+                            // / `resolveTypeParamRef`, both reading the ACTIVE
+                            // `genericSubstSemaTy_`) now sees the concrete
+                            // `double?` formal and lifts the payload
+                            // (`coerceNumericToType`) before re-wrapping —
+                            // exactly `wrapArgForNullableValueFormal`'s own
+                            // comment. `null` stays `null`; a same-type or
+                            // non-numeric (record/enum) payload is left
+                            // unchanged by that helper's `numeric()` guard.
+                            // `srcUnsigned` is threaded from `ctorArgExprs`
+                            // (parallel to `args[1..]`, see the comment where
+                            // it is built above) so an unsigned source (e.g.
+                            // `uint?`) zero-extends rather than sign-extends,
+                            // mirroring #5046's review correction.
+                            const sema::TypeRef* formal =
+                                ps ? (ps->declType
+                                          ? ctx_.resolvedType(*ps->declType)
+                                          : ps->resolvedDeclType)
+                                   : nullptr;
+                            bool argUns = pi < ctorArgExprs.size() &&
+                                          ctorArgExprs[pi] &&
+                                          isUnsignedTargetExpr(
+                                              *ctorArgExprs[pi]);
+                            llvm::Value* argVal = wrapArgForNullableValueFormal(
+                                args[pi + 1], formal, argUns);
+                            auto* slot = entryAlloca(argVal->getType());
+                            builder_.CreateStore(argVal, slot);
                             paramSlots_[cs->params[pi]] = slot;
                         }
                     }
