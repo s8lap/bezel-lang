@@ -5546,10 +5546,19 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
                    (pt->nullable || !at->nullable ||
                     be.op == "=" || be.op == "<>");
         }
-        // A primitive parameter accepts a primitive operand (numeric widening /
-        // coercion is handled downstream); the kinds must still agree.
-        if (pt->kind == TypeRef::Kind::Primitive)
-            return at->kind == TypeRef::Kind::Primitive;
+        // A primitive parameter accepts a primitive operand only if §5.1 admits
+        // an implicit conversion — identity or numeric widening. §5.1's table has
+        // no non-numeric primitive-to-primitive conversion (string, bool, Object
+        // do not widen to any other primitive), so e.g. a `string` argument does
+        // NOT match an `int` parameter.  Numeric coercion (e.g. int→long) is
+        // handled downstream in codegen after overload resolution picks the
+        // applicable candidate.
+        if (pt->kind == TypeRef::Kind::Primitive) {
+            if (at->kind != TypeRef::Kind::Primitive) return false;
+            // Identity is always valid; §5.1 numeric widening covers the rest.
+            return pt->primitive == at->primitive ||
+                   primitiveWidens(at->primitive, pt->primitive);
+        }
         return false;
     };
     // #1270 (§25 / §14.1): `operandMatchesParam` matches a Named operand against a
