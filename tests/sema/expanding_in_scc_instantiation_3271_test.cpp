@@ -953,3 +953,152 @@ BEZEL_TEST(expanding_in_scc_instantiation_3271,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
 }
+
+// =========================================================================
+// §14.6 / #5111: expanding self-call through a LOCAL-VARIABLE receiver.
+// This is the residual #5082's fix explicitly left MEASURED-not-fixed:
+// `recordGenericMemberSelfEdge`'s variable-receiver lookup calls
+// `lookupName()`, but the Resolver pass never registered ANY LocalSymbol
+// into the scopes it walks (real local registration happens later, in
+// ExprTypecheck) — so neither a `var` nor a `const` local receiver was ever
+// found, and the expanding substitution `T -> Pair<T, T>` reached
+// monomorphization instead of being rejected, hanging the compiler. This is
+// the issue's own repro: `const r: Runner := other;` then `r.Go<Pair<T,
+// T>>(p, other)` — a `const`-local-typed receiver of the enclosing type.
+// =========================================================================
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_const_local_receiver_expanding_rejected_spec_14_6_issue_5111) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    const r: Runner := other; "
+        "    return r.Go<Pair<T, T>>(p, other); "
+        "  end Go; "
+        "end Runner; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var rr := new Runner(); "
+        "    return rr.Go<int>(1, rr); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// Same repro but a `var` local receiver instead of `const` — the issue's
+// text noted "Only the `const` form was measured hanging, so the `var`
+// form still needs a probe." Both LocalDecl and LocalConstDecl are fixed
+// identically in the Resolver's registration, so this pins the sibling arm.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_var_local_receiver_expanding_rejected_spec_14_6_issue_5111) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    var r: Runner := other; "
+        "    return r.Go<Pair<T, T>>(p, other); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// =========================================================================
+// §14.6 / #5111 (fix-forward, R23 non-author review): a lambda-body local
+// must NOT leak into the enclosing method's self-edge lookup after the
+// lambda ends. The first side-table fix (d3de6bf0) walked a LambdaExpr's
+// body with the SAME `currentAnnotatedLocals_` map and no save/restore, so
+// a local declared INSIDE a lambda stayed recorded for the rest of the
+// enclosing method — over-rejecting a later, unrelated field-receiver call
+// that merely happens to share the lambda-local's name. This is the
+// reviewer's probe6 repro: `Runner` has a field `w2: Widget`; a lambda body
+// shadows that name with `const w2: Runner := other;`; after the lambda,
+// `w2.Go<Pair<T, T>>(p, 1)` must resolve to the FIELD `w2: Widget`, whose
+// `Widget.Go` is NOT self-recursive with `Runner.Go` — so this must be
+// ADMITTED, not rejected under §14.6.
+// =========================================================================
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_field_receiver_after_lambda_local_shadow_admitted_spec_14_6_issue_5111) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Widget "
+        "  public method Go<T>(x: T, other: int): int "
+        "    return 0; "
+        "  end Go; "
+        "end Widget; "
+        "class Runner "
+        "  public w2: Widget; "
+        "  public constructor() "
+        "    this.w2 := new Widget(); "
+        "  end constructor; "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    var f := lambda() => do "
+        "      const w2: Runner := other; "
+        "      return 0; "
+        "    end; "
+        "    _ := f(); "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return w2.Go<Pair<T, T>>(p, 1); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// A lambda body must still see the ENCLOSING method's annotated locals
+// (captures): a self-recursive call through a CAPTURED local, made from
+// INSIDE the lambda body, must be rejected exactly as it would be if made
+// directly in the method body. This pins the reverse direction of the
+// save/restore fix above — the lambda arm must not CLEAR the table before
+// walking the body, only restore the outer state AFTER.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_captured_local_receiver_expanding_rejected_inside_lambda_spec_14_6_issue_5111) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    const r: Runner := other; "
+        "    var f := lambda() => do "
+        "      using var p := new Pair<T, T>(x, x); "
+        "      return r.Go<Pair<T, T>>(p, other); "
+        "    end; "
+        "    return f(); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}

@@ -1335,6 +1335,14 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
 }
 
 void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
+    // fix #5111 (§14.6, v0.307): each member's body is walked exactly once
+    // here (resolveMember is not re-entrant for a single member), so
+    // clearing the annotated-locals side table on entry scopes it to THIS
+    // member and prevents a local name from one method/operator/constructor
+    // leaking into the next one's self-edge lookup. See
+    // currentAnnotatedLocals_'s own declaration comment for the full
+    // rationale of the table itself.
+    currentAnnotatedLocals_.clear();
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         if (fd->type) resolveType(*fd->type, parent);
         // per §28.14 (v0.175): a `scoped` FIELD must be function-typed.
@@ -3984,11 +3992,32 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->type) resolveType(*ld->type, scope);
         if (ld->initializer) resolveTypesInExpr(*ld->initializer, scope);
+        // fix #5111 (§14.6, v0.307): record this `var`-local's AST node in
+        // the Resolver-private `currentAnnotatedLocals_` side table (keyed
+        // by name), so a later self-recursive call through it
+        // (`p.Go<...>(...)`) is found by
+        // resolveGenericSelfEdgeReceiverType's variable-receiver lookup —
+        // see currentAnnotatedLocals_'s own comment for why this is a plain
+        // map and NOT a Symbol inserted into `scope` (a first attempt did
+        // that and non-author review measured it created a second,
+        // null-declType LocalSymbol per local, corrupting unrelated
+        // by-name lookups in ExprTypecheck). Before this, no local-variable
+        // receiver was ever found and an expanding generic self-call
+        // through one hung the compiler instead of being rejected
+        // (#5045/#5082's residual). Only an explicitly `: Type`-annotated
+        // local is recorded: an unannotated one's type isn't known until
+        // ExprTypecheck's inference, and resolveGenericSelfEdgeReceiverType
+        // only ever reads `ld->type`/`lc->type` (never an inferred type),
+        // so an unannotated local would resolve to null there regardless.
+        if (ld->type) currentAnnotatedLocals_[ld->name] = ld;
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->type) resolveType(*lc->type, scope);
         if (lc->value) resolveTypesInExpr(*lc->value, scope);
+        // fix #5111 (§14.6, v0.307): same recording for a `const` local —
+        // see the `var` arm above for the full rationale.
+        if (lc->type) currentAnnotatedLocals_[lc->name] = lc;
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -4304,6 +4333,21 @@ TypeSymbol* Resolver::resolveGenericSelfEdgeReceiverType(const ast::Expr& recv,
                                           : nullptr;
                     break;
                 }
+            }
+        }
+        // fix #5111 (§14.6, v0.307): a LOCAL variable receiver — `lookupName`
+        // above can never find one (Resolver registers no LocalSymbol; see
+        // currentAnnotatedLocals_'s own comment for why this is a private
+        // side table rather than a Symbol). Consult the annotated-locals
+        // recorded so far, in statement order, by resolveTypesInStmt.
+        if (!recvType) {
+            auto it = currentAnnotatedLocals_.find(rootId->name);
+            if (it != currentAnnotatedLocals_.end()) {
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(it->second))
+                    recvType = ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+                else if (auto* lc =
+                             dynamic_cast<const ast::LocalConstDecl*>(it->second))
+                    recvType = lc->type ? ctx_.resolvedType(*lc->type) : nullptr;
             }
         }
         if (recvType && recvType->kind == TypeRef::Kind::Named)
@@ -4662,10 +4706,28 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         // Type too — resolve it so ExprTypecheck can read it via
         // resolvedType() and treat it as the lambda's declared return type.
         if (lam->retType) resolveType(*lam->retType, scope);
+        // fix #5111 (§14.6, v0.307): a lambda is ITS OWN function — locals
+        // are function-scoped (§21.1), and a lambda body's own locals must
+        // not leak into the enclosing method's `currentAnnotatedLocals_`
+        // once the lambda ends (over-rejection review found this: a local
+        // declared inside a lambda shadowed an outer field of the same name
+        // for the rest of the enclosing method's self-edge check, wrongly
+        // rejecting a field-receiver call after the lambda as if it were a
+        // self-recursive call through the long-gone lambda-local). Save the
+        // table before walking the lambda body and restore it after,
+        // exactly as currentMethodDecl_/currentOuterType_ are saved/restored
+        // around a nested scope elsewhere in this file. The saved copy is
+        // NOT cleared first: a lambda body can still self-call through an
+        // ENCLOSING local it captures (`v.M<...>()` inside the lambda, `v`
+        // declared in the outer method) — the same as any other reference to
+        // a captured variable — so the outer table must remain visible
+        // while the lambda body is walked, not just after it.
+        auto savedAnnotatedLocals = currentAnnotatedLocals_;
         if (lam->exprBody) resolveTypesInExpr(*lam->exprBody, scope);
         for (const auto& s : lam->stmts) {
             if (s) resolveTypesInStmt(*s, scope);
         }
+        currentAnnotatedLocals_ = std::move(savedAnnotatedLocals);
         return;
     }
     if (auto* cae = dynamic_cast<const ast::CaseExpr*>(&e)) {

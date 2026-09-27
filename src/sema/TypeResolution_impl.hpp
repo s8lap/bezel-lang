@@ -1565,6 +1565,41 @@ private:
     // call to the wrong node.
     const ast::MethodDecl* currentMethodDecl_ = nullptr;
 
+    // fix #5111 (§14.6, v0.307): a Resolver-PRIVATE side table of the
+    // annotated locals declared so far (in statement order) in the method
+    // body currently being walked, consulted ONLY by
+    // resolveGenericSelfEdgeReceiverType's variable-receiver lookup. This is
+    // NOT a real symbol table — Resolver runs before ExprTypecheck, which is
+    // the ONE place that constructs the real LocalSymbol for each local
+    // (Symbol.hpp's own comment: "Slice 1 doesn't collect locals ... those
+    // live inside method bodies which sema visits in typecheck slice 3+").
+    // A first attempt at this fix called `ctx_.makeSymbol<LocalSymbol>()`
+    // here directly and inserted it into the Resolver's Scope so the
+    // existing `lookupName` path would find it — non-author review (R23)
+    // MEASURED that this left TWO LocalSymbols per local in `ctx_.symbols()`
+    // (Resolver's placeholder, with a null declType, plus ExprTypecheck's
+    // real one), and any later lookup-by-name that assumed at most one
+    // (`findLocal` in ExprTypecheck) could pick up the placeholder instead —
+    // `sema_local_infer.explicit_ascription_wins` and
+    // `sema_local_infer.no_initializer_no_ascription_no_type` both failed on
+    // exactly that: a null `declType` from the wrong symbol. This map avoids
+    // creating any Symbol at all: resolveTypesInStmt fills it as it walks
+    // each LocalDecl/LocalConstDecl, and resolveGenericSelfEdgeReceiverType
+    // reads the AST node straight out of it instead of going through
+    // `lookupName`.
+    //
+    // Resolver's blocks share ONE flat Scope with no push/pop (unlike
+    // ExprTypecheck's nested per-block scopes) — reviewer-measured — and
+    // Bezel locals are function-scoped, so registering only locals already
+    // declared earlier in statement order is the correct, sufficient
+    // approximation: it does not need to (and does not attempt to) model
+    // definite assignment or block-exit shadowing. Cleared at the start of
+    // each method/operator/constructor body walk (mirrors currentMethodDecl_
+    // being saved/restored around the same bodies) so no local from a
+    // PRIOR member leaks into this one.
+    std::unordered_map<std::string_view, const ast::Node*>
+        currentAnnotatedLocals_;
+
     struct DeferredNestedObligation {
         TypeSymbol* outerType = nullptr;        // e.g. Box (owns outerParam)
         std::string_view outerParamName;        // e.g. "W"
