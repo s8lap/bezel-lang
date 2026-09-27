@@ -38,7 +38,7 @@ while IFS= read -r spec; do
 done <<'SPECS'
 clang:^clang
 cc1:^cc1
-make:^(make|gmake|ninja)$
+make:^(make|gmake|ninja|ninja-build)$
 cmake:^cmake$
 linker:^ld\.(mold|lld)$
 bezel_tests:^bezel_tests
