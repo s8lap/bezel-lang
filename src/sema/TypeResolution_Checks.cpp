@@ -7003,6 +7003,54 @@ void Resolver::checkAbstractImplementations() {
         frontier.push_back({t, {}});
         std::unordered_set<std::string> seen;
         seen.insert(seenKey(t, {}));
+        // fix #5048 (§14.2 clause 2 / §9.2, v0.307): a record that lists
+        // `IEquatable<Self>` satisfies the constraint via the synthesized
+        // `Equals(T)` witness. The BFS below populates `concreteNames` from
+        // `TypeSymbol::members`, but `Equals(T)` / `GetHashCode()` are added
+        // only at codegen time (LlvmBackend_Setup.cpp), not during sema — so
+        // the record's own Equals is absent from `concreteNames` when the
+        // BFS reaches the record, while `IEquatable<Self>`'s `Equals(T)` IS
+        // in `abstractNames`, producing a false "does not implement inherited
+        // abstract member" error at L7030-7038.
+        //
+        // Detect the Self-typed IEquatable listing: walk `t->baseTypes` and
+        // check whether any base is `IEquatable` whose type argument resolves to
+        // `t` itself (Self). Then confirm `t` qualifies for auto-equality
+        // synthesis (positional record or admissible body record). If both
+        // hold, inject `Equals` into `concreteNames` and `concreteArities`
+        // so the abstract/concrete mismatch check does not fire.
+        if (t->kind == ast::TypeDeclKind::Record) {
+            for (TypeSymbol* base : t->baseTypes) {
+                if (!base || base->name != "IEquatable") continue;
+                // IEquatable has one generic param; check it resolves to `t`.
+                if (base->genericParams.size() != 1 || !base->genericParams[0])
+                    continue;
+                // Find the corresponding baseTypeRef to get the instantiated type.
+                std::size_t baseIdx = 0;
+                for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+                    if (t->baseTypes[bi] == base) { baseIdx = bi; break; }
+                }
+                if (baseIdx >= t->baseTypeRefs.size()) continue;
+                TypeRef* bref = t->baseTypeRefs[baseIdx];
+                if (!bref || bref->genericArgs.empty()) continue;
+                TypeRef* typeArg = bref->genericArgs[0];
+                // The type argument must resolve to `t` itself.
+                if (!typeArg || typeArg->kind != TypeRef::Kind::Named) continue;
+                if (typeArg->declaration != t) continue;
+                // `t` lists IEquatable<Self>. Now check if it qualifies for
+                // auto-equality synthesis. A record with an explicit Equals or
+                // GetHashCode is NOT auto-synthesized (those members would
+                // already be in concreteNames from the BFS below, so no fix
+                // needed), so this only fires for records that genuinely rely
+                // on synthesis.
+                if (isPositionalRecordEqualityBearing(t, ctx_) ||
+                    isAutoEqualityBearingBodyRecord(t, ctx_)) {
+                    concreteNames.insert("Equals");
+                    concreteArities["Equals"].insert(1);  // Equals(T): 1 param
+                    break;  // found the match; no need to keep searching
+                }
+            }
+        }
         std::size_t i = 0;
         while (i < frontier.size()) {
             FrontierNode node = frontier[i++];  // copy — frontier may realloc
