@@ -16268,6 +16268,26 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             genericSubst_ = std::move(rk);
             genericSubstSemaTy_ = std::move(rks);
         }
+        // fix #5090 (§5.1/§14.1/§12, v0.307): when a formal is a nullable value
+        // type `T?` (explicit or resolved from a bare `T` in a class instantiated
+        // at a nullable value type) and the argument arrived as bare `T`, the
+        // specialized body reads the param as `{i8, T}` — so the argument must be
+        // wrapped HERE before building the function type, matching what
+        // emitGenericSpecialization does at its call to wrapArgForNullableValueFormal.
+        std::size_t ifThisOff = isStaticMethod(impl) ? 0u : 1u;
+        for (std::size_t ai = ifThisOff; ai < args.size(); ++ai) {
+            std::size_t pi = ai - ifThisOff;
+            if (pi >= impl->params.size()) break;
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    impl->params[pi])) {
+                const sema::TypeRef* formal =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                args[ai] = wrapArgForNullableValueFormal(args[ai], formal);
+            }
+        }
+        paramTys.clear();
+        for (auto* a : args) paramTys.push_back(a->getType());
         llvm::Function* fn = buildSpecializedMethodFn(impl, ci, paramTys);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSema);

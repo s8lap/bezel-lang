@@ -15604,6 +15604,61 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
                 }
             }
         }
+        // fix #5090 (§5.1, v0.307): cross-type S?→T? nullable lift at return.
+        // When the return value is a nullable struct of one primitive type ({i8, S})
+        // and the declared return type is a nullable struct of a different primitive
+        // ({i8, T}), the value must be lifted: extract S, convert to T, re-wrap as
+        // {i8, 1, T}. This is the return-site twin of the arg-binding wrap that
+        // wrapArgForNullableValueFormal applies — without it, `return x` in a body
+        // specialized at T=double where x: S?=int? produces a bare {i8, i32} return
+        // against a {i8, double} function return type → IR verifier failure.
+        if (v && v->getType() != retTy &&
+            llvm::isa<llvm::StructType>(v->getType()) &&
+            llvm::isa<llvm::StructType>(retTy)) {
+            auto* vs = llvm::dyn_cast<llvm::StructType>(v->getType());
+            auto* rts = llvm::dyn_cast<llvm::StructType>(retTy);
+            if (vs && rts &&
+                vs->getNumElements() == 2 && rts->getNumElements() == 2 &&
+                vs->getElementType(0) == nullablePrimHasValTy() &&
+                rts->getElementType(0) == nullablePrimHasValTy() &&
+                vs->getElementType(1) != rts->getElementType(1)) {
+                // Extract the hasValue flag and payload from the source nullable.
+                llvm::Value* hasVal = builder_.CreateExtractValue(v, {0u}, "lift.hasVal");
+                llvm::Value* payload = builder_.CreateExtractValue(v, {1u}, "lift.payload");
+                // Coerce the payload from S to T (int↔fp conversion).
+                llvm::Type* targetPayloadTy = rts->getElementType(1);
+                if (payload->getType() != targetPayloadTy) {
+                    if (payload->getType()->isIntegerTy() && targetPayloadTy->isIntegerTy()) {
+                        llvm::IntegerType* srcInt = llvm::cast<llvm::IntegerType>(payload->getType());
+                        llvm::IntegerType* dstInt = llvm::cast<llvm::IntegerType>(targetPayloadTy);
+                        if (dstInt->getBitWidth() > srcInt->getBitWidth())
+                            payload = builder_.CreateSExt(payload, targetPayloadTy, "lift.zxt");
+                        else
+                            payload = builder_.CreateTrunc(payload, targetPayloadTy, "lift.trunc");
+                    } else if (payload->getType()->isIntegerTy() &&
+                               targetPayloadTy->isFloatingPointTy()) {
+                        // int → float/double conversion.
+                        payload = builder_.CreateSIToFP(payload, targetPayloadTy, "lift.sitofp");
+                    } else if (payload->getType()->isFloatingPointTy() &&
+                               targetPayloadTy->isIntegerTy()) {
+                        // float/double → int conversion.
+                        payload = builder_.CreateFPToSI(payload, targetPayloadTy, "lift.fptosi");
+                    } else if (payload->getType()->isFloatingPointTy() &&
+                               targetPayloadTy->isFloatingPointTy()) {
+                        if (payload->getType()->isDoubleTy())
+                            payload = builder_.CreateFPExt(payload, targetPayloadTy, "lift.fpext");
+                        else
+                            payload = builder_.CreateFPTrunc(payload, targetPayloadTy, "lift.fptrunc");
+                    }
+                }
+                // Re-wrap as the target nullable type {i8, T}.
+                // First insert hasVal at index 0, then payload at index 1.
+                llvm::Value* newVal = llvm::UndefValue::get(retTy);
+                newVal = builder_.CreateInsertValue(newVal, hasVal, {0u});
+                newVal = builder_.CreateInsertValue(newVal, payload, {1u});
+                v = newVal;
+            }
+        }
         // #817 / §14.2: in an UNSPECIALIZED generic TEMPLATE body, a `T`-typed
         // field/local read takes the i32/`{i8,i32}` placeholder layout, which can
         // be irreconcilable with a CONCRETE signature return type (e.g.
