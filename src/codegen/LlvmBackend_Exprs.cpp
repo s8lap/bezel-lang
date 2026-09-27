@@ -7681,12 +7681,38 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     // so this function must be able to derive the value type without `pd`
     // too, instead of bailing out — the value type rides the
     // importedMemberType side table, exactly like the getter already reads.
+    //
+    // fix #4947 (§11.2/§14.1/§23, v0.307): the call-site parameter type MUST
+    // be computed from the sema-resolved, SUBSTITUTED type of the assignment
+    // TARGET first — not from `pd->type.get()` unconditionally, as this used
+    // to do. `pd->type` is the bare AST declaration on the INTERFACE (or base
+    // class) member; for a generic interface property (`property Q: T;` on
+    // `I<T>`) lowering that bare `T` with no active genericSubst_ at this call
+    // site resolves to the i32 ERASED PLACEHOLDER, while the per-instantiation
+    // itable/vtable slot the call dispatches through expects the SPECIALIZED
+    // parameter type (e.g. `ptr` for `T = string`, per §11.2 "parameter types
+    // that are exactly equal under the interface's substitution"). The
+    // mismatch aborts the build: "Call parameter type does not match function
+    // signature! ptr @.bz.str.N  i32  call void %pset(ptr %r, ptr @.bz.str.N)".
+    // `ctx_.exprType(target)` is the post-substitution sema type (§14.1) —
+    // exactly the same call already used two lines below this at
+    // `boxForTarget(v, ctx_.exprType(target), valueExpr)` — and mirrors the
+    // getter twin's identical #2944 fix above (`lowerVirtualPropertyGet`),
+    // which computes `valTy` from `ctx_.exprType(e)` first for the same
+    // reason. `pd->type.get()` and the imported side table remain the
+    // fallbacks for when sema did not annotate the target (no static type) or
+    // `pd` is null (an imported property with no local AST).
     llvm::Type* valTy = nullptr;
-    if (pd) {
-        valTy = lowerType(pd->type.get());
-    } else {
-        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
-            valTy = lowerTypeRef(tr);
+    if (sema::TypeRef* resolved = ctx_.exprType(target)) {
+        valTy = lowerTypeRef(resolved);
+    }
+    if (!valTy) {
+        if (pd) {
+            valTy = lowerType(pd->type.get());
+        } else {
+            if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+                valTy = lowerTypeRef(tr);
+        }
     }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(
