@@ -77,15 +77,22 @@ BEZEL_TEST(codegen_cg39, right_evaluated_when_left_null) {
     // `Boom()` runs and its DivideByZeroException is observed. v0.201 (#2048):
     // the fresh-producing factory is spelled `owned T` per the declaration-
     // site static-return rule.
+    // #4964 (§28.3 `a ?? b` row, K7.3, v0.307): a named local left arm is a
+    // borrow, so `a ?? Boom()` with an owned right is a mixed meet and is
+    // rejected. The left is therefore a null-returning `owned T?` producer,
+    // which makes the meet owned⊓owned (legal). This row still pins what it
+    // always did: the left is null, so `Boom()` runs and throws.
     BEZEL_EXPECT_EQ(runProg(
         "module M; class T public V: int := 0; end T; "
         "class C "
+        "  public static method Nothing(): owned T? "
+        "    return null; "
+        "  end Nothing; "
         "  public static method Boom(): owned T "
         "    var z := 1 / 0; return new T(); "
         "  end Boom; "
         "  public static method Main(): int "
-        "    var a: T? := null; "
-        "    try var r := a ?? Boom(); return 1; "
+        "    try using var r := C.Nothing() ?? Boom(); return 1; "
         "    catch DivideByZeroException => return 7; end; "
         "  end Main; "
         "end C;"), 7);
