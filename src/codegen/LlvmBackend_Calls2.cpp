@@ -11712,8 +11712,79 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             preSema.erase(gp.name);
                         }
                     }
+                    // fix #5041 (§14.5 phase 1, v0.307): explicit type
+                    // arguments are seeded FIRST and are authoritative — the
+                    // argument-inference loop below skips every name they
+                    // bind, mirroring sema's #4935 gate (inference runs only
+                    // when the call site gave no type arguments). Seeded
+                    // after inference, as before, `Map<int?>(null, lambda(y)
+                    // => …)` bound T from `null`'s own type (a reference,
+                    // `ptr`) and `Map<long?>(7L, …)` from `long` (`i64`), so
+                    // the lambda was emitted with a `ptr` / `i64` parameter
+                    // while the specialization passed the `{i8, T}` nullable
+                    // carrier — an ASan SEGV in bz_obj_is_string.
+                    std::unordered_set<std::string_view> explicitTypeArgNames;
+                    // per §14.1 (issue #516/#561): a generic method with U
+                    // appearing ONLY in the lambda's return type (e.g.
+                    // `Apply<U>(x:int, fn:(int)->U):U`) is left U unbound by
+                    // the non-lambda arg loop below — no concrete arg has
+                    // declared type exactly `U`. If the call site supplies
+                    // explicit type arguments (`Apply<string>(...)`), those
+                    // explicit args settle the substitution. Seed from the
+                    // callee's typeArgs (MemberAccessExpr or bare IdentifierExpr)
+                    // before buildOrderedArgs runs so lowerLambda resolves
+                    // lowerTypeRef(U) correctly when lowering the lambda return.
+                    {
+                    const std::vector<std::unique_ptr<ast::Type>>* callTAs =
+                        nullptr;
+                    if (auto* callMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                call.callee.get()))
+                        callTAs = &callMa->typeArgs;
+                    else if (auto* callId =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     call.callee.get()))
+                        callTAs = &callId->typeArgs;
+                    if (callTAs) {
+                        for (std::size_t gi = 0;
+                             gi < md->genericParams.size() &&
+                             gi < callTAs->size(); ++gi) {
+                            std::string_view pname = md->genericParams[gi].name;
+                            if (preSubst.count(pname)) continue;
+                            if (!(*callTAs)[gi]) continue;
+                            sema::TypeRef* concreteArg =
+                                ctx_.resolvedType(*(*callTAs)[gi]);
+                            if (!concreteArg) continue;
+                            explicitTypeArgNames.insert(pname);
+                            llvm::Type* lt = lowerTypeRef(concreteArg);
+                            if (lt != i32()) {
+                                // Unchanged pre-#4896 behavior (see the
+                                // non-lambda arg loop below for the
+                                // rationale).
+                                preSubst[pname] = lt;
+                                preSema[pname] = substituteTypeRefLocal(
+                                    concreteArg, genericSubstSemaTy_);
+                            } else {
+                                // fix #4896: same substitute-then-gate as
+                                // the non-lambda arg loop below — an
+                                // explicit type argument can itself be a
+                                // bare outer-method type-parameter
+                                // reference (e.g. `Map<T>(v, lambda(y) =>
+                                // …)` inside `Go<T>`'s body).
+                                const sema::TypeRef* concreteArgSub =
+                                    substituteTypeRefLocal(
+                                        concreteArg, genericSubstSemaTy_);
+                                if (!isBareTypeParamRef(concreteArgSub)) {
+                                    preSema[pname] = concreteArgSub;
+                                }
+                            }
+                        }
+                    }
+                    }
                     for (const auto& gp : md->genericParams) {
-                        if (preSubst.count(gp.name)) continue;
+                        if (preSubst.count(gp.name) ||
+                            explicitTypeArgNames.count(gp.name))
+                            continue;
                         for (std::size_t pi = 0;
                              pi < md->params.size() && pi < call.args.size();
                              ++pi) {
@@ -11794,62 +11865,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             }
                             break;
                         }
-                    }
-                    // per §14.1 (issue #516/#561): a generic method with U
-                    // appearing ONLY in the lambda's return type (e.g.
-                    // `Apply<U>(x:int, fn:(int)->U):U`) may leave U unbound
-                    // after the non-lambda arg loop above — no concrete arg has
-                    // declared type exactly `U`. If the call site supplies
-                    // explicit type arguments (`Apply<string>(...)`), those
-                    // explicit args settle the substitution. Seed from the
-                    // callee's typeArgs (MemberAccessExpr or bare IdentifierExpr)
-                    // before buildOrderedArgs runs so lowerLambda resolves
-                    // lowerTypeRef(U) correctly when lowering the lambda return.
-                    {
-                    const std::vector<std::unique_ptr<ast::Type>>* callTAs =
-                        nullptr;
-                    if (auto* callMa =
-                            dynamic_cast<const ast::MemberAccessExpr*>(
-                                call.callee.get()))
-                        callTAs = &callMa->typeArgs;
-                    else if (auto* callId =
-                                 dynamic_cast<const ast::IdentifierExpr*>(
-                                     call.callee.get()))
-                        callTAs = &callId->typeArgs;
-                    if (callTAs) {
-                        for (std::size_t gi = 0;
-                             gi < md->genericParams.size() &&
-                             gi < callTAs->size(); ++gi) {
-                            std::string_view pname = md->genericParams[gi].name;
-                            if (preSubst.count(pname)) continue;
-                            if (!(*callTAs)[gi]) continue;
-                            sema::TypeRef* concreteArg =
-                                ctx_.resolvedType(*(*callTAs)[gi]);
-                            if (!concreteArg) continue;
-                            llvm::Type* lt = lowerTypeRef(concreteArg);
-                            if (lt != i32()) {
-                                // Unchanged pre-#4896 behavior (see the
-                                // non-lambda arg loop above for the
-                                // rationale).
-                                preSubst[pname] = lt;
-                                preSema[pname] = substituteTypeRefLocal(
-                                    concreteArg, genericSubstSemaTy_);
-                            } else {
-                                // fix #4896: same substitute-then-gate as
-                                // the non-lambda arg loop above — an
-                                // explicit type argument can itself be a
-                                // bare outer-method type-parameter
-                                // reference (e.g. `Map<T>(v, lambda(y) =>
-                                // …)` inside `Go<T>`'s body).
-                                const sema::TypeRef* concreteArgSub =
-                                    substituteTypeRefLocal(
-                                        concreteArg, genericSubstSemaTy_);
-                                if (!isBareTypeParamRef(concreteArgSub)) {
-                                    preSema[pname] = concreteArgSub;
-                                }
-                            }
-                        }
-                    }
                     }
                     if (preSubst != genericSubst_ ||
                         preSema != genericSubstSemaTy_) {

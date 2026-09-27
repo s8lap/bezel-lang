@@ -1234,12 +1234,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // produced by lowerConditional for expr-body, or by emitReturn's coercion for
     // block-body); only the function's declared return type needs correction here.
     // per §7.1 / §7.2 / §17.14.
-    if (expectedFunctionType_ && expectedFunctionType_->funcReturn &&
-        isNullableValueTy(expectedFunctionType_->funcReturn)) {
-        llvm::Type* expected = lowerTypeRef(expectedFunctionType_->funcReturn);
-        if (expected != retTy) {
+    //
+    // fix #5041 (§14.1 / §14.5, v0.307): the formal's return may be a bare
+    // method type parameter (`f: (T) -> U` at U := int?). Resolve it through
+    // the active substitution first, so the concrete `int?` both fixes the
+    // declared return type AND becomes retSemaTy — the expr-body emit wraps
+    // the body value into the `{i8, i32}` carrier only when retSemaTy is the
+    // nullable value type. Otherwise `lambda(y) => y + 1` returned a bare i32
+    // from a `{i8, i32}` function (IR verifier) and `lambda(y) => null`
+    // returned `ptr` while the specialization expected the carrier.
+    const sema::TypeRef* expectedRetSema =
+        expectedFunctionType_ ? expectedFunctionType_->funcReturn : nullptr;
+    if (expectedRetSema && !genericSubstSemaTy_.empty() &&
+        isBareTypeParamRef(expectedRetSema))
+        expectedRetSema =
+            substituteTypeRefLocal(expectedRetSema, genericSubstSemaTy_);
+    if (expectedRetSema && isNullableValueTy(expectedRetSema)) {
+        llvm::Type* expected = lowerTypeRef(expectedRetSema);
+        // #5041: the i32-fallback override above may already have set retTy
+        // to the carrier (lowerTypeRef(U) through genericSubst_) while
+        // leaving retSemaTy the bare `U`; refresh retSemaTy in that case too.
+        if (expected != retTy || expectedRetSema != expectedFunctionType_->funcReturn) {
             retTy = expected;
-            retSemaTy = expectedFunctionType_->funcReturn;
+            retSemaTy = expectedRetSema;
         }
     }
     // Also try to resolve via genericSubst_ when the sema return type is
