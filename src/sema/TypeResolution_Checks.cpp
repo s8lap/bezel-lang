@@ -5845,8 +5845,64 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
             if (gc.typeParam == dName) { dc = &gc; break; }
         // No `where` clause on the OVERRIDE for this type parameter at
         // all means "exactly the inherited set" — always legal, the
-        // recommended spelling; nothing to compare.
-        if (!dc) continue;
+        // recommended spelling; nothing to *compare*. But fix #5039 (§14.2,
+        // v0.307): "An override ... inherits the overridden ... declaration's
+        // constraints" is not only a restatement-comparison rule — the
+        // override's own GenericParamSymbol must actually CARRY that
+        // inherited set, because every later reader (codegen's
+        // `genericParamSoundAtI32ForPlaceholder`, and any other constraint
+        // consumer) asks the OVERRIDE's own symbol, not the base's. Before
+        // this fix, an omitted `where` clause left `derived`'s
+        // GenericParamSymbol::constraints empty — indistinguishable from a
+        // genuinely unconstrained `T` — so a cross-module virtual dispatch
+        // into an override compiled from an unconstrained-`T` placeholder
+        // body silently lost the `IEquatable<T>`-conformance information the
+        // body's `a.Equals(b)` call depends on. Materialize the inherited
+        // constraints positionally, from whichever side (`bDecl` /
+        // `importedGCs`) `checkOverrideSignatureMatch` already established
+        // just above.
+        if (!dc) {
+            if (gi < derived->genericParams.size()) {
+                auto* dgp = dynamic_cast<GenericParamSymbol*>(
+                    derived->genericParams[gi]);
+                if (dgp && dgp->constraints.empty()) {
+                    if (bDecl) {
+                        std::string_view bName = bDecl->genericParams[gi].name;
+                        const ast::GenericConstraint* bc = nullptr;
+                        for (const auto& gc : bDecl->genericConstraints)
+                            if (gc.typeParam == bName) { bc = &gc; break; }
+                        // §14.4: the modifier form (`where T is owned`)
+                        // carries no instantiation-time obligation and is
+                        // never recorded in `constraints` — mirrors
+                        // `collectGenericParams`'s identical filter.
+                        if (bc && bc->modifierConstraint.empty()) {
+                            for (const ast::ConstraintItem& ci : bc->items) {
+                                if (ci.kind.empty()) continue;
+                                GenericParamConstraint c;
+                                c.kind = ci.kind;
+                                c.astBound = ci.typeArg.get();
+                                dgp->constraints.push_back(c);
+                            }
+                        }
+                    } else if (importedGCs && gi < importedGCs->size()) {
+                        const ImportedGenericConstraint& bic =
+                            (*importedGCs)[gi];
+                        for (std::string_view kind : bic.specialConstraints) {
+                            GenericParamConstraint c;
+                            c.kind = kind;
+                            dgp->constraints.push_back(c);
+                        }
+                        for (TypeRef* bound : bic.constraintTypes) {
+                            GenericParamConstraint c;
+                            c.kind = "type";
+                            c.importedBound = bound;
+                            dgp->constraints.push_back(c);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         bool mismatch = false;
         if (bDecl) {
             // Same-module base: AST-vs-AST comparison.
