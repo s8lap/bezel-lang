@@ -36,9 +36,15 @@ using bezel::test::runAot;
 
 namespace {
 
+// Error-severity only: the §11.1 / §9.3 diagnostic is an Error, so a reject
+// row must see it AS an Error, and an accept row's EXPECT_FALSE is then the
+// (redundant, not vacuous) Error-only form - the real accept oracle is the
+// program's exit code and stdout (check_vacuous_tests, #3138).
 bool hasError(const JitResult& r, const char* sub) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(sub) != std::string::npos) return true;
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(sub) != std::string::npos)
+            return true;
     return false;
 }
 
@@ -213,12 +219,20 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
         "  end constructor; "
         "end Vec2; "
         "class C "
-        "  public static method Main(): int return 0; end Main; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(\"accepted\"); "
+        "    return 0; "
+        "  end Main; "
         "end C;");
     if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
     BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
+    // The accept oracle proper: the program compiled, linked and ran to
+    // completion. (Which constructor `new Vec2(a, b)` would pick is #4775's
+    // open question, so the program deliberately does not construct one.)
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("accepted\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +269,7 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
     BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("9\n"));
 }
 
