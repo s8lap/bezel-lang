@@ -34,6 +34,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "test_harness.hpp"
 
 namespace {

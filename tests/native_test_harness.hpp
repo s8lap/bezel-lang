@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "support/force_sanitize.hpp"   // bezel::test::forceSanitizeAddress() (#3682)
 #include "support/scratch_dir.hpp"      // the ONE scratch-root policy
 #include "support/asan_infra_failure.hpp"  // #4563: asanBuildFailure/-Link/-Exec,

@@ -50,6 +50,7 @@
 #include <string>
 #include <sys/wait.h>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"

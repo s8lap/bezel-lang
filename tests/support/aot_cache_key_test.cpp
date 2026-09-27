@@ -37,6 +37,7 @@
 
 #include <unistd.h>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"

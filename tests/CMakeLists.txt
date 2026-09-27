@@ -225,56 +225,75 @@ function(bezel_test_apply_common_compile_settings tgt)
     # Driver::compileFile child needs full frames, since that is the code
     # being tested, not the harness driving it.
     target_compile_options(${tgt} PRIVATE -gline-tables-only)
-    # Teach the AOT harness's content-addressed link-cache
-    # (support/aot_support.hpp) the path to libbezel_runtime.a, so it can fold
-    # the runtime archive's identity into the cache key (constraint (b)/(d)): a
-    # runtime rebuilt WITHOUT relinking the test binaries must invalidate cached
-    # link products. Mirrors the same definition on bezel_core (which is where
-    # Driver.cpp reads it to drive the actual link). BEZEL_CORE_LIB_PATH is the
-    # k2 compiler-identity refinement (#2100): the cache keys on the COMPILER
-    # archive, not on the test binary — so a test-only relink no longer
-    # invalidates the cache, AND every per-area binary shares one cache (they
-    # all embed the same compiler). Soundness guard + fallback live in
-    # aot_support.hpp combinedIdentity(); its STALE-CORE guard already handles
-    # the new "only one area was relinked against a newer core.a" case by
-    # falling back to the conservative whole-binary identity.
-    target_compile_definitions(${tgt} PRIVATE
-        BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>"
-        BEZEL_CORE_LIB_PATH="$<TARGET_FILE:bezel_core>"
-        # fix #3084: the bezelc --version regression test (tests/support/
-        # bezelc_version_test.cpp) needs to exec the driver binary to check
-        # the output. Same generator expression as the lit track uses; not on
-        # a separate target so a test-only build misses nothing.
-        BEZELC_PATH="$<TARGET_FILE:bezelc>"
-        # The ABSOLUTE path to src/runtime, for native_test_harness.hpp's
-        # runtimeSourceDir(). It used to derive that path from the header's own
-        # __FILE__, which is only absolute when the compiler is invoked with an
-        # absolute -I -- and a path-REWRITING compiler wrapper breaks exactly
-        # that assumption. ccache's `base_dir` rewrites every absolute path
-        # under it into one relative to the compiler's cwd (the CMake build
-        # dir) and passes the REWRITTEN argv to the real compiler, so __FILE__
-        # became `../../../../../home/.../tests/native_test_harness.hpp`. That
-        # resolves from the build dir and nowhere else; gate.sh runs the test
-        # binaries from the WORKTREE ROOT (`cd $(git rev-parse --show-toplevel)`,
-        # gate.sh:71), where it does not resolve at all -- so
-        # runtimeSourceFiles() came back empty, asanRuntimeObject() returned "",
-        # and the ASan leg of 123 test files silently degraded (a handful FAILED
-        # loudly; the rest treat "" as "toolchain missing -> SKIP" and passed
-        # VACUOUSLY). A -D value is not a path argument, so no wrapper rewrites
-        # it; this is the only channel that is absolute by construction.
-        BEZEL_RUNTIME_SRC_DIR="${CMAKE_SOURCE_DIR}/src/runtime"
-        # fix #3627: the SAME defect class, one directory over. Four source-
-        # scanning ratchet tests each derived the repo root from their own
-        # __FILE__ (tests/support/repo_root.hpp); under the same ccache
-        # base_dir rewrite this becomes unresolvable-from-the-worktree-root,
-        # and (worse than the runtime case) a directory walk over an
-        # unresolvable root silently visits zero files instead of erroring,
-        # so a "zero hits expected" ratchet passes having scanned nothing.
-        # Same fix: an absolute -D no path-rewriting wrapper touches.
-        BEZEL_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}")
+    # #5010: the five per-build absolute paths the harness needs
+    # (BEZEL_RUNTIME_LIB_PATH, BEZEL_CORE_LIB_PATH, BEZELC_PATH,
+    # BEZEL_RUNTIME_SRC_DIR, BEZEL_REPO_ROOT_DIR — see the generated
+    # build_paths.cpp below for what each is for) used to be -D's on EVERY test
+    # TU. A -D value is part of the ccache key and the headers expanded it into
+    # every TU's preprocessed text, so all ~2,000 test TUs missed the cache in a
+    # fresh worktree at the same commit. They now live as `extern const char[]`
+    # definitions in ONE generated TU (bezel_test_build_paths), and every test
+    # TU sees only this VALUE-FREE switch; support/build_paths.hpp maps the old
+    # macro names onto the constants, so every `#ifdef BEZEL_X` / use site is
+    # unchanged. The values are still absolute and still per-build, so the
+    # #3468 / #3627 absolute-path guarantees (runtime_source_dir_absolute_test,
+    # repo_root_absolute_test) are untouched.
+    target_compile_definitions(${tgt} PRIVATE BEZEL_HAVE_BUILD_PATHS=1)
+    if(BEZEL_CCACHE_RELOCATABLE)
+        # #5010: clang stamps each input header's mtime into the PCH and
+        # ccache then refuses to reuse a PCH whose inputs have a new mtime
+        # ("Precompiled header includes ./CMakeFiles/bezel_tests_pch.dir/
+        # cmake_pch.hxx, which has a new mtime") — every tree writes
+        # cmake_pch.hxx at configure time, so the PCH and every PCH'd TU missed
+        # across worktrees. The ccache manual requires -fno-pch-timestamp for
+        # clang PCH. Applied to the owner AND every consumer: REUSE_FROM needs
+        # identical options.
+        target_compile_options(${tgt} PRIVATE
+            "SHELL:-Xclang -fno-pch-timestamp")
+    endif()
 endfunction()
 
 set(BEZEL_TEST_TARGETS "")
+
+# #5010: the ONE translation unit that carries the harness's per-build absolute
+# paths (declared in support/build_paths.hpp). Generated into the BINARY dir, so
+# it is invisible to the tests/**/*.cpp glob and the partition invariants above,
+# and file(GENERATE) resolves the $<TARGET_FILE:...> expressions to literals.
+# It is an OBJECT library compiled once and linked into every group binary. It
+# is the one test TU that (correctly) misses ccache in a new worktree.
+#
+# What each path is for (moved here from the old per-TU -D comments):
+#  - kRuntimeLibPath: libbezel_runtime.a, folded into the AOT link-cache key
+#    (support/aot_support.hpp, constraint (b)/(d)); must equal the value
+#    compiled into Driver.cpp (soundness guard in combinedIdentity()).
+#  - kCoreLibPath: libbezel_core.a, the k2 compiler identity (#2100): the
+#    bincache keys on the COMPILER archive, not the test binary.
+#  - kBezelcPath: the driver binary, exec'd by CLI-surface tests (#3084,
+#    #4386).
+#  - kRuntimeSrcDir: ABSOLUTE src/runtime for native_test_harness.hpp's
+#    runtimeSourceDir() (#3468). It must not derive from __FILE__: a
+#    path-rewriting compiler wrapper (ccache base_dir, and now also
+#    -ffile-prefix-map) makes __FILE__ relative, and the ASan leg of ~123 test
+#    files then silently SKIPs when run from the worktree root.
+#  - kRepoRootDir: ABSOLUTE repo root for support/repo_root.hpp (#3627), same
+#    defect class: a directory walk over an unresolvable root visits zero files.
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/build_paths.cpp CONTENT
+"// GENERATED by tests/CMakeLists.txt (#5010) -- do not edit.
+#include \"support/build_paths.hpp\"
+namespace bezel::test::build_paths {
+const char kRuntimeLibPath[] = \"$<TARGET_FILE:bezel_runtime>\";
+const char kCoreLibPath[] = \"$<TARGET_FILE:bezel_core>\";
+const char kBezelcPath[] = \"$<TARGET_FILE:bezelc>\";
+const char kRuntimeSrcDir[] = \"${CMAKE_SOURCE_DIR}/src/runtime\";
+const char kRepoRootDir[] = \"${CMAKE_SOURCE_DIR}\";
+}  // namespace bezel::test::build_paths
+")
+add_library(bezel_test_build_paths OBJECT
+    ${CMAKE_CURRENT_BINARY_DIR}/build_paths.cpp)
+target_include_directories(bezel_test_build_paths PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(bezel_test_build_paths PRIVATE
+    BEZEL_HAVE_BUILD_PATHS=1)
 
 # The PCH owner: one dummy, never-edited TU, written into the BINARY dir (not
 # tests/) so it is invisible to the tests/**/*.cpp glob and the two partition
@@ -305,7 +324,8 @@ target_precompile_headers(bezel_tests_pch PRIVATE
 
 function(bezel_add_test_binary group)
     set(tgt bezel_tests_${group})
-    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}})
+    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}}
+        $<TARGET_OBJECTS:bezel_test_build_paths>)
     bezel_test_apply_common_compile_settings(${tgt})
     target_precompile_headers(${tgt} REUSE_FROM bezel_tests_pch)
     # Force all bezel_runtime object files in, then export-dynamic so a

@@ -189,6 +189,27 @@ if [ -d "$WT/build" ]; then
     echo "[lane_setup] build/ is a non-empty real dir and not configured; leaving as is"; exit 0; }
 fi
 
+# #5010: A WORKTREE THAT ALREADY LIVES ON THE FAST DISK GETS A REAL build/.
+#
+# The symlink exists only to move the build tree OFF the slow disk. When the
+# worktree itself is on the fast filesystem there is nothing to move, and the
+# symlink is actively harmful: CMake turns on relocatable ccache keys
+# (BEZEL_CCACHE_RELOCATABLE — base_dir + -ffile-prefix-map, CMakeLists.txt)
+# only for a build dir physically inside the tree, because ccache's base_dir
+# rewrites paths relative to the PHYSICAL cwd. Through the symlink the keys
+# keep the lane name and a fresh worktree misses on every TU (#4991 measured
+# 0 of 3 shareable TUs); in-tree, it hits on everything but the handful of TUs
+# that embed a per-tree path. "Same filesystem" is decided by device number,
+# not by path prefix (the #3008 lesson: inspect what the name resolves to).
+_wt_dev="$(stat -L -c %d "$WT" 2>/dev/null)"
+_fast_dev="$(stat -L -c %d "$FAST_ROOT" 2>/dev/null)"
+if [ -n "$_wt_dev" ] && [ "$_wt_dev" = "$_fast_dev" ]; then
+  mkdir -p "$WT/build" || { echo "[lane_setup] could not create $WT/build"; exit 0; }
+  echo "[lane_setup] worktree is on the fast disk — build/ is a REAL in-tree dir" \
+       "(cross-worktree ccache hits, #5010)"
+  exit 0
+fi
+
 mkdir -p "$TARGET" || { echo "[lane_setup] could not create $TARGET"; exit 0; }
 # fix #3005: leave a BACKREF so a future orphan reaper can identify the owning
 # worktree directly instead of inferring it from the directory basename. Nothing

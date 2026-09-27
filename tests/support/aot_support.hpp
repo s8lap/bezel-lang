@@ -170,6 +170,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "test_harness.hpp"              // currentTestFailed() — the #3007 trip
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "support/force_sanitize.hpp"    // the ONE BEZEL_AOT_FORCE_SANITIZE parse

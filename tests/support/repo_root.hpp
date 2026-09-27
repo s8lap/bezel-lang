@@ -62,6 +62,8 @@
 #include <string>
 #include <system_error>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
+
 namespace bezel::test {
 
 namespace repo_root_detail {

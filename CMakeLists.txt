@@ -134,10 +134,82 @@ endif()
 #  * lld: a much faster linker than the default bfd/gold for the 60M test
 #    binary, which is relinked on every change.
 find_program(BEZEL_CCACHE ccache)
+#  * #5010 RELOCATABLE ccache keys (cross-worktree hits). By default every
+#    object's ccache key embeds its worktree's absolute path (the -c/-I
+#    arguments, and the cwd via DWARF comp_dir), so a fresh worktree at the SAME
+#    commit misses on every TU. When the build dir lives PHYSICALLY inside the
+#    source tree (a real ./build, no symlink between them) we make the keys
+#    tree-independent:
+#      - ccache `base_dir=<tree>`, passed on the launcher command line
+#        (`ccache KEY=VALUE compiler ...`), so it is per-build and never read
+#        from or written to the user's global ccache.conf;
+#      - `-ffile-prefix-map=<tree>=.` on every TU, so the OBJECT is
+#        tree-independent too (DW_AT_comp_dir "./build", __FILE__ "./src/..."),
+#        which is what makes serving tree A's object to tree B correct rather
+#        than merely a hit (ccache logs "Relocating debuginfo from <tree> to .");
+#      - per-tree absolute paths only in the TUs that need them (Driver.cpp for
+#        the runtime archive; one generated TU for the test harness — see
+#        tests/CMakeLists.txt), so those few TUs miss, correctly, and the rest
+#        hit;
+#      - `-Xclang -fno-pch-timestamp` on the test PCH (tests/CMakeLists.txt).
+#    Measured (#4991, #5010): a PCH'd test TU 6-9 s cold -> ~1.4 s from the
+#    cache of a sibling worktree.
+#    WHY ONLY IN-TREE: base_dir rewrites paths relative to the compiler's
+#    PHYSICAL cwd. With build/ a symlink to /mnt/fast/lane-builds/<name> the
+#    rewritten paths still contain the lane name (no hit — #4991 measured 0/3),
+#    and worse, the relative paths in the -MD depfiles are then joined by CMake
+#    against the LOGICAL build dir, i.e. resolve to the wrong file: header edits
+#    would stop triggering rebuilds. So the mode is OFF for that layout and
+#    FATAL if forced on there.
+#    DEBUGGING a relocatable build: debug paths are relative to the worktree
+#    root. Start gdb from the worktree root (or `directory <tree>` /
+#    `set substitute-path . <tree>`); addr2line/llvm-symbolizer/ASan print
+#    `./build/../src/x.cpp:N`-style paths, which read correctly from the root.
+set(_bezel_in_tree_build OFF)
+file(RELATIVE_PATH _bezel_bin_rel "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+if(NOT _bezel_bin_rel STREQUAL "" AND NOT _bezel_bin_rel MATCHES "^\\.\\.(/|$)"
+   AND NOT IS_ABSOLUTE "${_bezel_bin_rel}")
+    file(REAL_PATH "${CMAKE_SOURCE_DIR}" _bezel_src_real)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _bezel_bin_real)
+    # No symlink anywhere between the tree root and the build dir: the
+    # physical and logical `..` chains then agree (see WHY ONLY IN-TREE).
+    if(_bezel_bin_real STREQUAL "${_bezel_src_real}/${_bezel_bin_rel}")
+        set(_bezel_in_tree_build ON)
+    endif()
+endif()
+option(BEZEL_CCACHE_RELOCATABLE
+    "Tree-independent ccache keys (#5010); default ON for an in-tree build dir"
+    ${_bezel_in_tree_build})
 if(BEZEL_CCACHE)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
-    set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
-    message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
+    if(BEZEL_CCACHE_RELOCATABLE AND NOT _bezel_in_tree_build)
+        # A cached ON from an earlier layout must not survive a move to a
+        # symlinked/out-of-tree build dir: that combination mis-resolves
+        # depfiles (see WHY ONLY IN-TREE above).
+        message(FATAL_ERROR
+            "BEZEL_CCACHE_RELOCATABLE=ON requires the build dir to be a real "
+            "directory inside the source tree (${CMAKE_BINARY_DIR} is not). "
+            "Reconfigure with -DBEZEL_CCACHE_RELOCATABLE=OFF.")
+    endif()
+    if(BEZEL_CCACHE_RELOCATABLE)
+        set(CMAKE_CXX_COMPILER_LAUNCHER
+            "${BEZEL_CCACHE};base_dir=${CMAKE_SOURCE_DIR}")
+        set(CMAKE_C_COMPILER_LAUNCHER
+            "${BEZEL_CCACHE};base_dir=${CMAKE_SOURCE_DIR}")
+        add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
+        if(NOT _bezel_src_real STREQUAL CMAKE_SOURCE_DIR)
+            # The tree reached through a symlinked ancestor (e.g. a worktrees
+            # dir that points at the NVMe): clang may see either spelling.
+            add_compile_options("-ffile-prefix-map=${_bezel_src_real}=.")
+        endif()
+        message(STATUS "Bezel: using ccache (${BEZEL_CCACHE}), relocatable "
+                       "keys (base_dir + prefix map, #5010)")
+    else()
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+        set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+        message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
+    endif()
+elseif(BEZEL_CCACHE_RELOCATABLE)
+    set(BEZEL_CCACHE_RELOCATABLE OFF CACHE BOOL "" FORCE)
 endif()
 #    mold is preferred when available (faster than lld on the large test-binary
 #    link and on incremental relinks); lld is the fallback, then the default.
@@ -299,9 +371,12 @@ target_compile_definitions(bezelc PRIVATE
 # Teach the driver the path to libbezel_runtime.a so it can pass it to clang
 # when compiling standalone Bezel programs (generator expression → literal path).
 # NOTE: Driver.cpp is compiled as part of bezel_core, so the definition must
-# be added to bezel_core (not bezelc which only compiles main.cpp).
-target_compile_definitions(bezel_core PRIVATE
-    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
+# be added to bezel_core's Driver.cpp (not bezelc which only compiles main.cpp).
+# #5010: scoped to the ONE source that reads it, not the whole target — a
+# per-worktree absolute path on the command line is part of the ccache key, so
+# on all 52 bezel_core TUs it made every one of them miss in a fresh worktree.
+set_source_files_properties(src/driver/Driver.cpp PROPERTIES
+    COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()
