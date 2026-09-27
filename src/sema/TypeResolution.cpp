@@ -773,16 +773,24 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
             // modifier and default presence. Apply bb2040db's narrow predicate
             // (which already does this for classes) to records as well.
             // The primary's parameters are the record's positional fields.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-            if (!td) continue;
-            if (cs->params.size() != td->positionalFields.size() ||
-                cd->params.size() != td->positionalFields.size())
+            // imported-symbol seam (#3152, audit §4): the primary's
+            // parameters come off the positional FieldSymbols (`posParam`),
+            // not a TypeDecl downcast.
+            const std::vector<const Symbol*> primary =
+                recordPositionalFieldSymbols(t);
+            if (primary.empty()) continue;
+            if (cs->params.size() != primary.size() ||
+                cd->params.size() != primary.size())
                 continue;
             bool listsMatch = true;
             for (std::size_t i = 0; i < cs->params.size(); ++i) {
                 auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
-                if (!ps) { listsMatch = false; break; }
-                const ast::Param& pf = td->positionalFields[i];
+                auto* pfs = dynamic_cast<const FieldSymbol*>(primary[i]);
+                if (!ps || !pfs || !pfs->posParam) {
+                    listsMatch = false;
+                    break;
+                }
+                const ast::Param& pf = *pfs->posParam;
                 const ast::Param& bp = cd->params[i];
                 if (bp.name != pf.name ||
                     (bp.defaultValue != nullptr) !=

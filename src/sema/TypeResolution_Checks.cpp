@@ -535,24 +535,24 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
     // `constructor(owned x: Res)` (the #3751 accept row) differs by name and
     // is left to the ruling.
     if (!classHasPrimaryCtor) return;
-    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-    if (!td || td->positionalFields.empty()) return;
+    // imported-symbol seam (#3152, audit §4): the primary's parameters are
+    // read off the §9.1/§22.10 positional FieldSymbols (`posParam`) and each
+    // body constructor's off its ParameterSymbols — no TypeDecl or
+    // ConstructorDecl downcast.
+    const std::vector<const Symbol*> primary = recordPositionalFieldSymbols(t);
+    if (primary.empty()) return;
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
-        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        if (!cd) continue;
-        if (cs->params.size() != td->positionalFields.size() ||
-            cd->params.size() != td->positionalFields.size())
-            continue;
+        if (cs->params.size() != primary.size()) continue;
         bool listsMatch = true;
         for (std::size_t i = 0; i < cs->params.size(); ++i) {
             auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
-            if (!ps) { listsMatch = false; break; }
-            const ast::Param& pf = td->positionalFields[i];
-            const ast::Param& bp = cd->params[i];
-            if (bp.name != pf.name ||
-                (bp.defaultValue != nullptr) != (pf.defaultValue != nullptr)) {
+            auto* pfs = dynamic_cast<const FieldSymbol*>(primary[i]);
+            if (!ps || !pfs || !pfs->posParam) { listsMatch = false; break; }
+            const ast::Param& pf = *pfs->posParam;
+            if (ps->name != pf.name ||
+                ps->hasDefault != (pf.defaultValue != nullptr)) {
                 listsMatch = false;
                 break;
             }
@@ -574,7 +574,7 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
         }
         if (listsMatch) {
             ctx_.diagnostics().report(
-                Severity::Error, cd->span.begin,
+                Severity::Error, cs->declLoc,
                 std::string("body constructor redeclares the primary ")
                     .append("constructor: it has the same parameter list ")
                     .append("as the primary constructor (§11.1, v0.307)"));
