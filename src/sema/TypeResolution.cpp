@@ -765,6 +765,53 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
                     "declaring positional fields is constructor-only "
                     "(\xC2\xA7""9.9, \xC2\xA7""9.3)");
             }
+            // fix #5100 (§9.3, v0.307): "The body may not declare a
+            // constructor with the same parameter list as the auto-generated
+            // primary constructor." Every candidate reading of #4775 Q1 rejects
+            // the exact-duplicate shape — same arity, and at each position
+            // the same case-sensitive name, resolved type, §22.6 overload
+            // modifier and default presence. Apply bb2040db's narrow predicate
+            // (which already does this for classes) to records as well.
+            // The primary's parameters are the record's positional fields.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+            if (!td) continue;
+            if (cs->params.size() != td->positionalFields.size() ||
+                cd->params.size() != td->positionalFields.size())
+                continue;
+            bool listsMatch = true;
+            for (std::size_t i = 0; i < cs->params.size(); ++i) {
+                auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
+                if (!ps) { listsMatch = false; break; }
+                const ast::Param& pf = td->positionalFields[i];
+                const ast::Param& bp = cd->params[i];
+                if (bp.name != pf.name ||
+                    (bp.defaultValue != nullptr) !=
+                        (pf.defaultValue != nullptr)) {
+                    listsMatch = false;
+                    break;
+                }
+                TypeRef* paramType =
+                    ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
+                TypeRef* primaryType =
+                    pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+                if (!typeRefEqual(paramType, primaryType)) {
+                    listsMatch = false;
+                    break;
+                }
+                if (overloadModifier(ps->modifier) !=
+                    overloadModifier(pf.modifier)) {
+                    listsMatch = false;
+                    break;
+                }
+            }
+            if (listsMatch) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cd->span.begin,
+                    std::string("body constructor redeclares the primary ")
+                        .append("constructor: it has the same parameter list ")
+                        .append("as the auto-generated primary constructor ")
+                        .append("(\xC2\xA7""9.3, v0.307)"));
+            }
         }
     }
 }
