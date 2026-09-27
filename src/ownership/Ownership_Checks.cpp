@@ -3659,6 +3659,26 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     // returned from a method at all unless ... value-typed returns ...";
     // a value-typed projection is a copy, so it is never a borrow escape).
     if (!returnedExprMayBorrow(e)) return;
+    // fix #4959: whether the returned `??` is an OWNED producer (#1029), in
+    // which case its bare owned-local operands are transferred, not borrowed.
+    // Only `!` and binding atoms are peeled — an `as` over it is a borrow
+    // (§17.4) whose operands are kRootDerived and never reach that exemption.
+    const ast::Expr* coalesceTop = &e;
+    for (;;) {
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(coalesceTop);
+            pb && pb->operand) {
+            coalesceTop = pb->operand.get();
+            continue;
+        }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(coalesceTop);
+            bx && bx->body) {
+            coalesceTop = bx->body.get();
+            continue;
+        }
+        break;
+    }
+    const bool coalesceIsOwnedProducer =
+        producerState(*coalesceTop) == OwnershipState::Owned;
     std::set<std::string_view> reported;
     for (const auto& [root, how] : roots) {
     if (reported.count(root->name)) continue;
@@ -3687,10 +3707,40 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
         // fix #4948: a `??` operand that is the bare local (or `y!` over it)
         // is the local's own value, not a borrow derived from it. For a
         // `using var` that is illegal on either reading (§28.3/§28.10: never
-        // moved out of, and no borrow of it may escape). For an owned plain
-        // local, whether `p ?? y` moves `y` out is a K7 owned/borrowed join
-        // question outside this rule, so it is left exactly as before.
-        if (how == kRootCoalesceOperand && !usingVar) break;
+        // moved out of, and no borrow of it may escape).
+        //
+        // fix #4959 (§28.3 producer table `a ?? b` row, K7.2, K3.13, axiom
+        // A7, v0.307): for an owned plain local the spec settles it — "A
+        // named owned binding written as an arm is an unmarked read and
+        // therefore a borrow arm … `a ?? b` over two named owned locals
+        // consumes neither binding". The `??` result is then a borrow whose
+        // source set includes this local (K7.2), and the local is auto-
+        // dropped at scope end, so returning it is the same borrow-lifetime
+        // escape as a derived borrow (measured: heap-use-after-free). The
+        // one exemption is a `??` the pass already classifies as an OWNED
+        // producer (#1029: a fresh right operand, `p ?? new W()`), whose
+        // selected value codegen transfers; that shape is left exactly as
+        // before.
+        if (how == kRootCoalesceOperand && !usingVar) {
+            if (coalesceIsOwnedProducer) break;
+            reported.insert(root->name);
+            report(
+                Severity::Error, root->span.begin,
+                std::string("`??` operand `") + std::string(root->name) +
+                "` is a named owned binding, so it is a borrow arm and the "
+                "`??` result borrows `" + std::string(root->name) +
+                "` — owned local `" + std::string(root->name) +
+                "` is auto-dropped at scope end, so returning the result "
+                "lets the borrow outlive its source (§28.3 producer table, "
+                "`a ?? b` row: an unmarked named owned binding is a borrow "
+                "arm and `??` consumes neither binding; K7.2; §28.3 "
+                "borrow-lifetime rule). To return one of two owned locals, "
+                "use the marked arm transfer `(if " +
+                std::string(root->name) +
+                " <> null then move ... else move ...)` (§28.3 K3.4) or "
+                "return each local by statement");
+            break;
+        }
         reported.insert(root->name);
         report(
             Severity::Error, root->span.begin,

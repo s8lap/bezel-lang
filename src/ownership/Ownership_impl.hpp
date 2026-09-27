@@ -4101,8 +4101,9 @@ private:
     // `((x as W) ?? g).Self()` yields `x` and `g`. Each root carries HOW it
     // was reached: kRootTop (only `!` / binding atoms — the pre-#4948 single
     // root, whose verdict is unchanged), kRootCoalesceOperand (a `??` operand
-    // reached without a deriving step, i.e. the local's own value, not a
-    // borrow of it), or kRootDerived (through member / call / index / `as`).
+    // reached without a deriving step — for an owned plain local a borrow
+    // ARM of the `??`, fix #4959, §28.3 `a ?? b` row), or kRootDerived
+    // (through member / call / index / `as`).
     static constexpr int kRootTop = 0;
     static constexpr int kRootCoalesceOperand = 1;
     static constexpr int kRootDerived = 2;
