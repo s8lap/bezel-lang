@@ -13426,6 +13426,76 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                             std::string(baseTs->name) +
                             "` declares that many parameters (§22.5/§22.10)");
                 }
+                // fix #4902 (§22.5 / §22.6, v0.307): when `ambiguousArity` is
+                // true the arity scans leave `clauseCtor = nullptr`, so the block
+                // below never runs and gap (a)'s scan also never runs (its guard
+                // is `clauseCtor && !ambiguousArity`). At an OVERLOAD SET where
+                // every candidate has the clause's arity but the names don't
+                // bind any candidate, the clause must be rejected.
+                //
+                // §22.6 stage 1 ("arity filtering AND named-argument-to-parameter
+                // binding") applies to the overload set as a whole: if no
+                // candidate in the set declares any parameter by a name the clause
+                // supplies, §22.5's "the error is reported only where no
+                // candidate survives" is met.
+                //
+                // MEASURED pre-fix (origin/main e3b0bdf0): `class D(v: int) :
+                // B(zz := v, b := 9)` over `constructor(a: int, b: int)` +
+                // `constructor(c: string, d: int)` compiled at exit 0 with no
+                // diagnostic and printed `n=0 s=0` — the base subobject was never
+                // constructed.
+                //
+                // The fix is deliberately narrow: a clause WITH named args against
+                // an ambiguous-arity overload set where no candidate binds any
+                // name. An all-positional clause or one some candidate binds is
+                // not reached (those are §22.6's type-ranking ambiguity, handled
+                // by codegen's `ctorForArgs`).
+                if (ambiguousArity && td->primaryBaseCtorArgs[0].value) {
+                    bool clauseHasName = false;
+                    for (const auto& a : td->primaryBaseCtorArgs)
+                        if (!a.name.empty()) { clauseHasName = true; break; }
+                    if (clauseHasName) {
+                        const std::string desc =
+                            std::string("inheritance-clause base call to `") +
+                            std::string(baseTs->name) + "`";
+                        const auto at =
+                            td->primaryBaseCtorArgs[0].value->span.begin;
+                        bool anyCandidateBinds = false;
+                        for (Symbol* m : baseTs->members) {
+                            auto* other =
+                                dynamic_cast<ConstructorSymbol*>(m);
+                            if (!other || other->isStatic) continue;
+                            if (bindArgsToParams(sema::FormalsView::of(*other),
+                                                 td->primaryBaseCtorArgs, at,
+                                                 desc, /*emit=*/false)
+                                    .ok) {
+                                anyCandidateBinds = true;
+                                break;
+                            }
+                        }
+                        if (!anyCandidateBinds &&
+                            baseTs->hasPositionalFields) {
+                            const std::vector<const Symbol*> pf =
+                                recordPositionalFieldSymbols(baseTs);
+                            if (!pf.empty() &&
+                                bindArgsToParams(sema::FormalsView::of(pf),
+                                                 td->primaryBaseCtorArgs, at,
+                                                 desc, /*emit=*/false)
+                                        .ok)
+                                anyCandidateBinds = true;
+                        }
+                        if (!anyCandidateBinds) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, at,
+                                "inheritance-clause base call to `" +
+                                    std::string(baseTs->name) +
+                                    "` supplies named argument(s) but no "
+                                    "candidate in the overload set declares "
+                                    "any parameter by those name(s) "
+                                    "(§22.5/§22.6)");
+                        }
+                    }
+                }
                 if (clauseCtor && !ambiguousArity) {
                     const std::string desc =
                         std::string("inheritance-clause base call to a "
