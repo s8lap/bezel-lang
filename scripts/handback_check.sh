@@ -199,12 +199,15 @@ check_named_tests() {
     [ -n "$id" ] || continue
     n=$((n + 1))
     if [[ "$id" == tests/* ]]; then
+      g cat-file -e "$TIP:$id" 2>/dev/null || \
+        g cat-file -e "$TIP:scripts/gate/$id" 2>/dev/null || missing+="$id "
+    elif [[ "$id" == scripts/* ]]; then
       g cat-file -e "$TIP:$id" 2>/dev/null || missing+="$id "
     else
       suite="${id%%.*}"; name="${id#*.}"
-      g grep -qE "\\b$suite\\b.*\\b$name\\b" "$TIP" -- tests/ 2>/dev/null || missing+="$id "
+      g grep -qE "\\b$suite\\b.*\\b$name\\b" "$TIP" -- tests/ scripts/gate/tests/ 2>/dev/null || missing+="$id "
     fi
-  done < <( { printf '%s\n' "$msgs" | grep -oE '\btests/[A-Za-z0-9_./-]+\.(cpp|hpp|bzl|py|tsv)\b'
+  done < <( { printf '%s\n' "$msgs" | grep -oE '\btests/[-A-Za-z0-9_./-]+\.(cpp|hpp|bzl|py|tsv)\b'
               printf '%s\n' "$msgs" | grep -oE '\b[A-Z][A-Za-z0-9_]{2,}\.[A-Za-z_][A-Za-z0-9_]{2,}\b' \
                 | grep -vE '\.(md|py|sh|cpp|hpp|bzl|txt|tsv|json|log|cmake)$'
             } | sort -u )
