@@ -151,7 +151,18 @@ find_program(BEZEL_CCACHE ccache)
 #        the runtime archive; one generated TU for the test harness — see
 #        tests/CMakeLists.txt), so those few TUs miss, correctly, and the rest
 #        hit;
-#      - `-Xclang -fno-pch-timestamp` on the test PCH (tests/CMakeLists.txt).
+#      - `-Xclang -fno-pch-timestamp` on the test PCH (tests/CMakeLists.txt);
+#      - the test PCH itself is NEVER served from ccache (#5073): a clang PCH
+#        embeds its own tree's absolute input paths, so a PCH from tree A is
+#        unusable once A is removed. It is compiled per tree, and its
+#        consumers key on a content-derived, tree-independent `<pch>.sum`
+#        (ccache option `pch_external_checksum=true`) instead of the PCH
+#        bytes -- see tests/pch_sum_launcher.sh for the staleness argument.
+#        NB it is a BOOLEAN OPTION, not a sloppiness value: ccache silently
+#        ignores an unknown sloppiness word, which left every PCH'd TU
+#        missing across trees. The launcher also passes
+#        `sloppiness=pch_defines,time_macros`, which REPLACES the ccache.conf
+#        value for this build (the two values CLAUDE.md requires there).
 #    Measured (#4991, #5010): a PCH'd test TU 6-9 s cold -> ~1.4 s from the
 #    cache of a sibling worktree.
 #    WHY ONLY IN-TREE: base_dir rewrites paths relative to the compiler's
@@ -191,10 +202,24 @@ if(BEZEL_CCACHE)
             "Reconfigure with -DBEZEL_CCACHE_RELOCATABLE=OFF.")
     endif()
     if(BEZEL_CCACHE_RELOCATABLE)
-        set(CMAKE_CXX_COMPILER_LAUNCHER
-            "${BEZEL_CCACHE};base_dir=${CMAKE_SOURCE_DIR}")
-        set(CMAKE_C_COMPILER_LAUNCHER
-            "${BEZEL_CCACHE};base_dir=${CMAKE_SOURCE_DIR}")
+        set(BEZEL_CCACHE_RELOCATABLE_LAUNCHER
+            "${BEZEL_CCACHE}" "base_dir=${CMAKE_SOURCE_DIR}"
+            "sloppiness=pch_defines,time_macros" "pch_external_checksum=true")
+        # #5073: pch_external_checksum is what lets PCH'd test TUs hit across
+        # trees. An old ccache without the option would ignore it (correct,
+        # but every PCH consumer misses), so say so instead of degrading
+        # silently.
+        execute_process(COMMAND "${BEZEL_CCACHE}" -k pch_external_checksum
+            RESULT_VARIABLE _bezel_ccache_extsum_rc OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _bezel_ccache_extsum_rc EQUAL 0)
+            message(WARNING "ccache (${BEZEL_CCACHE}) does not know "
+                "pch_external_checksum: test TUs using the PCH will not hit "
+                "the cache across worktrees (#5073).")
+        endif()
+        # The real path of the tree, for tests/pch_sum_launcher.sh (#5073).
+        set(BEZEL_SOURCE_DIR_REAL "${_bezel_src_real}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${BEZEL_CCACHE_RELOCATABLE_LAUNCHER})
+        set(CMAKE_C_COMPILER_LAUNCHER ${BEZEL_CCACHE_RELOCATABLE_LAUNCHER})
         add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
         if(NOT _bezel_src_real STREQUAL CMAKE_SOURCE_DIR)
             # The tree reached through a symlinked ancestor (e.g. a worktrees

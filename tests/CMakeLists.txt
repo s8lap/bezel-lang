@@ -313,7 +313,8 @@ bezel_test_apply_common_compile_settings(bezel_tests_pch)
 # part of the ccache key.
 # NOTE (machine-local, not tracked): ccache needs `sloppiness =
 # pch_defines,time_macros` (~/.config/ccache/ccache.conf) to cache PCH
-# builds — see the build-accelerators note in CLAUDE.md.
+# builds — see the build-accelerators note in CLAUDE.md. (In
+# BEZEL_CCACHE_RELOCATABLE mode the launcher passes them itself, #5073.)
 target_precompile_headers(bezel_tests_pch PRIVATE
     <cstddef> <cstdlib> <functional> <memory>
     <string> <string_view> <utility> <vector>
@@ -321,6 +322,21 @@ target_precompile_headers(bezel_tests_pch PRIVATE
     <llvm/IR/Module.h>
     <llvm/ExecutionEngine/Orc/LLJIT.h>
     <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
+if(BEZEL_CCACHE_RELOCATABLE)
+    # #5073: in relocatable-ccache mode the PCH is compiled per tree, never
+    # served from ccache (a clang PCH embeds its tree's absolute input paths,
+    # so a PCH cached by tree A breaks every consumer in tree B once A is
+    # removed). The launcher also writes a content-derived, tree-independent
+    # <pch>.sum that the consumers' ccache hashes instead of the PCH bytes
+    # (ccache pch_external_checksum=true, set on the launcher in the top-level
+    # CMakeLists.txt), so PCH'd test TUs still hit across trees. The .sum is
+    # deleted before every PCH compile and written only after it succeeds;
+    # with no .sum ccache falls back to the PCH bytes. See the script header.
+    set_target_properties(bezel_tests_pch PROPERTIES CXX_COMPILER_LAUNCHER
+        "${CMAKE_CURRENT_SOURCE_DIR}/pch_sum_launcher.sh;${CMAKE_SOURCE_DIR};${BEZEL_SOURCE_DIR_REAL};${BEZEL_CCACHE_RELOCATABLE_LAUNCHER};--")
+    set_property(TARGET bezel_tests_pch APPEND PROPERTY ADDITIONAL_CLEAN_FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.sum)
+endif()
 
 function(bezel_add_test_binary group)
     set(tgt bezel_tests_${group})
