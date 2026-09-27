@@ -242,9 +242,11 @@ find_program(BEZEL_MOLD ld.mold)
 find_program(BEZEL_LLD ld.lld)
 if(BEZEL_MOLD)
     add_link_options(-fuse-ld=mold)
+    set(BEZEL_FUSE_LD -fuse-ld=mold)
     message(STATUS "Bezel: using mold linker")
 elseif(BEZEL_LLD)
     add_link_options(-fuse-ld=lld)
+    set(BEZEL_FUSE_LD -fuse-ld=lld)
     message(STATUS "Bezel: using lld linker")
 endif()
 #  * split DWARF: the RelWithDebInfo build carries full `-g` debug info, and
@@ -274,6 +276,46 @@ if(BEZEL_SPLIT_DWARF)
     if(BEZEL_HAS_GNO_GNU_PUBNAMES)
         add_compile_options(-gno-gnu-pubnames)
         message(STATUS "Bezel: not emitting GNU pubnames (-gno-gnu-pubnames)")
+    endif()
+endif()
+#  * compressed debug sections (#5069): the debug info that remains is still
+#    most of the bytes written. .debug_line alone is 178 MB of the codegen test
+#    binary, and each .dwo is 2-3x its object. `-gz=<fmt>` compresses the debug
+#    sections of every object AND .dwo at compile time, and
+#    `--compress-debug-sections=<fmt>` makes the linker keep them compressed in
+#    the output; without it the linker inflates them back. zlib, NOT zstd:
+#    Fedora's gdb 17.2 is built with a BFD that lacks zstd and REFUSES a
+#    zstd-compressed binary outright ("not in executable format"), as do the
+#    BFD-based binutils (addr2line). zlib is read by every consumer here: gdb,
+#    addr2line, llvm-symbolizer (ASan and LLVM backtraces), mold and GNU ld.
+#    Each half is gated on its own feature check (the link check uses the
+#    linker chosen above), so a toolchain without one just keeps that half
+#    uncompressed. Directory-level, so the test PCH owner and all six
+#    consumers get the identical flag, as REUSE_FROM requires.
+#    BEZEL_DEBUG_COMPRESSION is also what the driver's link recipe uses for
+#    generated programs (#5062, see the Driver.cpp properties below).
+set(BEZEL_DEBUG_COMPRESSION "")
+if(CMAKE_BUILD_TYPE MATCHES "Deb")
+    include(CheckCXXCompilerFlag)
+    include(CheckLinkerFlag)
+    check_cxx_compiler_flag(-gz=zlib BEZEL_HAS_GZ_zlib)
+    if(BEZEL_HAS_GZ_zlib)
+        set(BEZEL_DEBUG_COMPRESSION zlib)
+    endif()
+    if(BEZEL_DEBUG_COMPRESSION)
+        add_compile_options(-gz=${BEZEL_DEBUG_COMPRESSION})
+        set(CMAKE_REQUIRED_LINK_OPTIONS ${BEZEL_FUSE_LD})
+        check_linker_flag(CXX
+            "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}"
+            BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+        unset(CMAKE_REQUIRED_LINK_OPTIONS)
+        if(BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+            add_link_options(
+                "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}")
+        endif()
+        message(STATUS "Bezel: compressing debug sections "
+            "(-gz=${BEZEL_DEBUG_COMPRESSION}; link: "
+            "${BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION}})")
     endif()
 endif()
 
