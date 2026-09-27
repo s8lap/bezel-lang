@@ -967,6 +967,71 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 }
 
 
+// fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): shared
+// promotion half of the dictionary-VALUE encode — see the declaration in
+// LlvmBackend_impl.hpp for the full rationale. Lifts `v` to the nullable-
+// value tagged `{i8,T}` struct when `valTy` is a nullable value type and `v`
+// is not already that exact struct; returns `v` unchanged otherwise. This is
+// verbatim the promotion block `lowerCollectionIndexerSet`'s `encodeValue`
+// used to run inline (issue #544 / #5078), factored out so
+// `materializeHeapDictLiteral`'s `encodeVal` (LlvmBackend_Setup.cpp) can call
+// the SAME logic for a dictionary LITERAL's `["k": v]` entries instead of
+// passing `v` straight through — the gap that let a literal `null` reach the
+// runtime as a bare `ptr null` (Bug A) and let a literal non-null scalar
+// (`["k": 99]` against `Dictionary<K, long?>`) reach the runtime as a raw,
+// untagged inttoptr'd value that later crashed a read-back AND the disposing
+// overwrite's `free()` of it (Bug B — MEASURED: both bugs share this one
+// root cause; #5084's own "Bug B" repro's `d["k"] := null;` overwrite
+// SIGABRTs freeing the bogus untagged `99` stored by the literal, not
+// anything wrong with `bz_dict_set_str_disposing` itself).
+llvm::Value* Emitter::liftDictValueToNullableStruct(
+        llvm::Value* v, const sema::TypeRef* valTy,
+        const ast::Expr* valueExpr) {
+    if (!valTy || !isNullableValueTy(valTy)) return v;
+    if (!v->getType()->isStructTy()) {
+        if (v->getType()->isPointerTy() &&
+            llvm::isa<llvm::ConstantPointerNull>(v)) {
+            return nullableValueNull(valTy);   // null literal → {i8=0, T=0}
+        }
+        if (!v->getType()->isPointerTy()) {
+            // fix #5005 (§5.1 `S → T → T?`, v0.307): widen a narrower numeric
+            // `v` to the nullable's payload width BEFORE `wrapNullableValue`,
+            // which otherwise hands an undersized value to its
+            // `reinterpretToType` alloca round-trip.
+            llvm::StructType* nst = nullableValueStructTy(valTy);
+            llvm::Type* payloadTy = nst ? nst->getElementType(1) : nullptr;
+            if (payloadTy &&
+                (v->getType()->isIntegerTy() ||
+                 v->getType()->isFloatingPointTy()) &&
+                v->getType() != payloadTy)
+                v = coerceNumericToType(
+                    v, payloadTy, valueExpr && isUnsignedTargetExpr(*valueExpr));
+            return wrapNullableValue(valTy, v);  // scalar T → {i8=1, T=v}
+        }
+        return v;
+    }
+    // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — the caller
+    // passed the inner record struct directly (e.g. `d["k"] := new Item(42)`
+    // implicitly coerced to Item?): wrap into {i8=1, Item} before boxing so
+    // decode always finds the full tagged struct. Detect by comparing against
+    // the outer tagged struct.
+    if (v->getType() != nullableValueStructTy(valTy)) {
+        // fix #5078 (§5.1 "Nullable conversions", v0.307): `v` may instead
+        // ALREADY be the tagged `{i8, S}` struct of a DIFFERENT nullable-
+        // VALUE type — try the shared unwrap/convert/rewrap lift first (a
+        // no-op unless `v` is itself the tagged shape) and fall back to the
+        // inner-record wrap only when it declines.
+        llvm::StructType* wantSt = nullableValueStructTy(valTy);
+        llvm::Value* lifted = liftNullableValueToSlot(
+            v, wantSt, valueExpr && isUnsignedTargetExpr(*valueExpr));
+        return (lifted->getType() == wantSt)
+                   ? lifted
+                   : wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
+    }
+    return v;
+}
+
+
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
 // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwningArray /
 // OwningDictionary) the displaced slot/value is disposed exactly once before the
@@ -1406,61 +1471,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // {i8,T} struct BEFORE the struct-boxing branch below, so the box always
     // holds the full tagged struct and the decode path (lowerCollectionIndexerGet
     // / TryGetValue) can safely load {i8,T} from the box.
+    // fix #5084 (stdlib §4.8 / §5.1, v0.307): this promotion now lives in the
+    // shared `liftDictValueToNullableStruct` (declared in LlvmBackend_impl.hpp,
+    // defined just above this function) so `materializeHeapDictLiteral`'s own
+    // value encode (LlvmBackend_Setup.cpp) can reuse it verbatim instead of
+    // re-deriving it — see that function's header comment for the bug this
+    // sharing fixes.
     auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
-        if (valNullableVal && !v->getType()->isStructTy()) {
-            if (v->getType()->isPointerTy() &&
-                llvm::isa<llvm::ConstantPointerNull>(v)) {
-                v = nullableValueNull(valTy);    // null literal → {i8=0, T=0}
-            } else if (!v->getType()->isPointerTy()) {
-                // fix #5005 (§5.1 `S → T → T?`, v0.307): the Dictionary-value
-                // twin of the Array<T> element fix just above — widen a
-                // narrower numeric `v` (e.g. an `int` value stored into a
-                // `Dictionary<K, long?>`, `d[k] := n;`) to the nullable's
-                // payload width BEFORE `wrapNullableValue`, which otherwise
-                // hands an undersized value to its `reinterpretToType`
-                // alloca round-trip.
-                llvm::StructType* nst = nullableValueStructTy(valTy);
-                llvm::Type* payloadTy = nst ? nst->getElementType(1) : nullptr;
-                if (payloadTy &&
-                    (v->getType()->isIntegerTy() ||
-                     v->getType()->isFloatingPointTy()) &&
-                    v->getType() != payloadTy)
-                    v = coerceNumericToType(
-                        v, payloadTy,
-                        valueExpr && isUnsignedTargetExpr(*valueExpr));
-                v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
-            }
-        }
-        // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — when the
-        // caller passes the inner record struct directly (e.g. `d["k"] := new Item(42)`
-        // implicitly coerced to Item?), the value is an Item struct (not the
-        // tagged {i8,Item} struct).  The promotion above skips it (isStructTy() is
-        // true).  Wrap into {i8=1, Item} before boxing so decode always finds the
-        // full tagged struct.  Detect by comparing against the outer tagged struct.
-        if (valNullableVal && v->getType()->isStructTy() &&
-            v->getType() != nullableValueStructTy(valTy)) {
-            // fix #5078 (§5.1 "Nullable conversions", v0.307): `v` may
-            // instead ALREADY be the tagged `{i8, S}` struct of a DIFFERENT
-            // nullable-VALUE type (`d[k] := ki;` with `ki: int?`,
-            // `d: Dictionary<K, long?>` lowers `ki` to `{i8, i32}` before it
-            // ever reaches here) — not a bare inner record. This dict encode
-            // path conflated the two: it treated ANY struct-typed, not-yet-
-            // tagged `v` as an inner record and handed it straight to
-            // `wrapNullableValue`, whose `reinterpretToType` round-trip does
-            // not reshape a mismatched-width tagged struct. MEASURED: the
-            // same "Invalid InsertValueInst operands!" / IR verification
-            // failed as the Array<T?> shape above, on
-            // `Dictionary<string, long?>["k"] := ki;` (and `??=`). Try the
-            // shared unwrap/convert/rewrap lift first — a no-op (returns `v`
-            // unchanged) unless `v` is ITSELF the tagged shape — and fall
-            // back to the inner-record wrap only when it declines.
-            llvm::StructType* wantSt = nullableValueStructTy(valTy);
-            llvm::Value* lifted = liftNullableValueToSlot(
-                v, wantSt, valueExpr && isUnsignedTargetExpr(*valueExpr));
-            v = (lifted->getType() == wantSt)
-                    ? lifted
-                    : wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
-        }
+        v = liftDictValueToNullableStruct(v, valTy, valueExpr);
         // fix #3780 (§4.8 / §28.9, v0.286): route the boxing decision through
         // the #3770/#3768 shared predicate instead of this arm's own
         // `(valRec || valNullableVal) && isStructTy()` copy — see

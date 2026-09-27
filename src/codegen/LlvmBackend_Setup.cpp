@@ -40179,7 +40179,24 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
 
     // Encode a scalar/float/ptr/record value into the void* slot the runtime
     // stores (mirrors the encodeValue lambda in tryLowerCollectionInstanceCall).
-    auto encodeVal = [&](llvm::Value* v) -> llvm::Value* {
+    // fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): promote a
+    // nullable-VALUE-typed entry (`v` a bare scalar or a `ptr null`) to its
+    // tagged `{i8,T}` struct via the SAME shared lift
+    // `lowerCollectionIndexerSet`'s `encodeValue` uses
+    // (`liftDictValueToNullableStruct`, LlvmBackend_Assign.cpp) BEFORE the
+    // struct-boxing decision below, so a dict LITERAL entry against a
+    // `V?` value type is never boxed/stored as a raw, untagged value —
+    // previously this lambda had no such promotion at all: a literal `null`
+    // value passed a bare `ptr null` straight through (issue #5084 Bug A,
+    // MEASURED SEGV on the first read of the stored key), and a literal
+    // non-null scalar (`["k": 99]` against `Dictionary<K, long?>`) was
+    // likewise stored as a raw inttoptr'd `99` rather than a boxed
+    // `{i8=1,i64=99}` — MEASURED to be the actual root cause of Bug B's
+    // `free(): invalid pointer` abort on a later `d["k"] := null;` overwrite
+    // (the disposing setter free()s the bogus untagged `99` "box").
+    auto encodeVal = [&](llvm::Value* v,
+                          const ast::Expr* elemExpr) -> llvm::Value* {
+        v = liftDictValueToNullableStruct(v, valTy, elemExpr);
         // fix #685: any struct-typed value (record, nullable, or primitive struct
         // e.g. decimal) must be heap-boxed — too wide for the scalar inttoptr slot.
         if (v->getType()->isStructTy()) {
@@ -40256,7 +40273,7 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         // retain-before-encode ordering of the `.Add(k,v)` lowering.
         if (dictIsStringValue && !isPlusOneStringProducer(cl->elements[i].get()))
             emitStringRetain(v);
-        llvm::Value* vPtr = encodeVal(v);
+        llvm::Value* vPtr = encodeVal(v, cl->elements[i].get());
         if (keyTy) {
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});

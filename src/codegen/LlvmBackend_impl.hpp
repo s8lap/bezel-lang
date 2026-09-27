@@ -11258,6 +11258,28 @@ private:
     // value box is never freed twice.
     llvm::Function* dictValueBoxFreer(const sema::TypeRef* dictTy);
 
+    // fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): promote a
+    // Dictionary/OwningDictionary VALUE to its nullable-value tagged `{i8,T}`
+    // struct BEFORE the caller's own struct-boxing decision
+    // (`dictValueIsBoxedStruct`), so a `null` literal (a bare LLVM `ptr null`)
+    // or an un-tagged scalar/record destined for a `V?` slot is never boxed or
+    // stored as a raw, untagged value. This is the promotion half of
+    // `lowerCollectionIndexerSet`'s `encodeValue` lambda
+    // (LlvmBackend_Assign.cpp) — factored out so `materializeHeapDictLiteral`'s
+    // `encodeVal` (LlvmBackend_Setup.cpp) can call the SAME logic instead of
+    // reimplementing it, which is how the dictionary-LITERAL path missed this
+    // promotion entirely (issue #5084 Bug A: a literal null value passed a raw
+    // `ptr null` straight through to the runtime; Bug B, an overwrite
+    // afterwards aborting on `free()` of a bogus pointer, was traced to the
+    // SAME gap — a plain literal like `99` in `["k": 99]` against
+    // `Dictionary<K, long?>` was never wrapped to `{i8=1,i64=99}` either, so
+    // the table held a raw inttoptr'd `99` that later crashed both a read-back
+    // and the disposing overwrite's `free()` of it). No-op (returns `v`
+    // unchanged) when `valTy` is not a nullable value type.
+    llvm::Value* liftDictValueToNullableStruct(llvm::Value* v,
+                                                const sema::TypeRef* valTy,
+                                                const ast::Expr* valueExpr);
+
     // fix #2791 / §8.6 / §15.4 (v0.240): a standalone `void(void*)` thunk that
     // releases a §8.6 BOX element of a collection literal (a value type boxed
     // into an Object/interface slot by the #2771 fix's `boxForTarget` arm).
