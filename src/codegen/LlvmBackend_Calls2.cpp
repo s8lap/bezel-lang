@@ -2803,11 +2803,38 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     bool isEquals      = member == "Equals"       && call.args.size() == 1;
     if (!isToString && !isGetHashCode && !isEquals) return nullptr;
 
-    // A user-declared method of this name wins (the callee resolves to it).
-    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee)))
-        return nullptr;
-
     auto* recvTy = ctx_.exprType(*ma->target);
+
+    // A user-declared method of this name wins (the callee resolves to it).
+    //
+    // fix #5068 (§9.1 / §9.2 / stdlib §2.9, v0.307): EXCEPT the abstract
+    // `IEquatable<T>.Equals` a record listing `IEquatable<Self>` resolves to.
+    // The record's synthesized `Equals(T)` is not a sema member, so member
+    // lookup finds the interface's declaration instead, and bailing here sent
+    // a record-VALUE receiver down the interface dispatch path, which cannot
+    // take one and degraded to a constant `false` (measured: `p1.Equals(p2)`
+    // on two equal `record Point(X: int, Y: int): IEquatable<Point>` values
+    // answered False, while the same record without the listing answered
+    // True). §9.1: the synthesized `Equals(T)` IS the witness, so route to it
+    // exactly as the unlisted record does. The receiver is the record itself
+    // or a bare `T` this instantiation binds to one (`where T: IEquatable<T>`).
+    if (auto* callee =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        const sema::TypeSymbol* recRecv = nullptr;
+        if (isEquals && recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Named) {
+            if (recvTy->declaration) {
+                recRecv = recvTy->declaration;
+            } else if (!genericSubstSemaTy_.empty()) {
+                auto sit = genericSubstSemaTy_.find(recvTy->headName());
+                if (sit != genericSubstSemaTy_.end() && sit->second &&
+                    sit->second->kind == sema::TypeRef::Kind::Named)
+                    recRecv = sit->second->declaration;
+            }
+        }
+        if (!isSynthesizedIEquatableEquals(callee, recRecv)) return nullptr;
+    }
+
     if (!recvTy) return nullptr;
     // #1091 (§8.1/§14.2): GetHashCode/Equals on a bare unconstrained generic
     // type parameter `T` (Named, no declaration). The value-semantics gate below

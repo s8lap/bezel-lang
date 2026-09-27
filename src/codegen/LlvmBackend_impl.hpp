@@ -7499,6 +7499,27 @@ private:
                sema::isAutoEqualityBearingBodyRecord(rec, ctx_);
     }
 
+    // fix #5068 (§9.1 / §9.2 / stdlib §2.9, v0.307): is `ms` the builtin
+    // `IEquatable<T>.Equals(other: T)` AND is its implementation on record
+    // `rec` the SYNTHESIZED `Equals(T)`? §9.1: "the synthesized `Equals(T)` is
+    // what satisfies a declared `IEquatable<T>` conformance". That witness is
+    // minted in codegen and is never a `TypeSymbol::members` entry, so when a
+    // record lists `IEquatable<Self>` sema resolves `p.Equals(q)` to the
+    // abstract interface member and every consumer that asks "which member
+    // implements this?" finds nothing. False when the record declares its own
+    // `Equals` of the interface's arity (that user method IS the witness and
+    // keeps its ordinary dispatch) and for a body record that is not
+    // auto-hashable (no synthesized package exists to route to).
+    bool isSynthesizedIEquatableEquals(const sema::MethodSymbol* ms,
+                                       const sema::TypeSymbol* rec) {
+        if (!ms || !rec || ms->name != "Equals" || ms->params.size() != 1)
+            return false;
+        const sema::TypeSymbol* ieq =
+            ctx_.builtinInterfaceSymIfCached("IEquatable");
+        if (!ieq || ms->parent != ieq) return false;
+        return recordIsAutoBearing(rec) && !findInterfaceImpl(rec, ms);
+    }
+
     // fix #2934 (spec §8.5, v0.252): does §8.5's *name-only* `ToString` default
     // for `ts` render the QUALIFIED name? True for exactly the three bullets
     // that say "qualified name" — classes, enums, and body records that do NOT
@@ -9217,6 +9238,17 @@ private:
                                              const std::string& fnName);
     llvm::Function* boxRecordHashThunkCore(const sema::TypeSymbol* ts,
                                            const std::string& fnName);
+    // fix #5068: the `IEquatable<T>.Equals` itable slot of a boxed record
+    // whose witness is the synthesized `Equals(T)` (§9.1). Reads the ACTIVE
+    // genericSubst_ like the two cores above.
+    llvm::Function* boxRecordIEquatableEqualsThunk(const sema::TypeSymbol* ts,
+                                                   const std::string& fnName);
+    // fix #5068: the per-instantiation itmap for a boxed generic record whose
+    // IEquatable slot holds that thunk (specializedBoxVtableFor's caller).
+    llvm::Constant* specializedIEquatableItmap(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args,
+        const std::string& readable, llvm::Constant* sharedItmap);
 
     // per §10.5 (v0.183): an enum may declare plain `ToString(): string`,
     // `Equals(E): bool`, and `GetHashCode(): int` members that REPLACE the

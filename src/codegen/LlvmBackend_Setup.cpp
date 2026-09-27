@@ -34583,6 +34583,16 @@ struct BoxEscapeWalker {
     // warrant). Left EMPTY for the phase-1 walk that computes the set arm (a)
     // of that predicate reads, so the relaxation can never feed on itself.
     std::function<bool(const ast::Expr*)> isKnownBoxReceiver;
+    // fix #5068 (§9.1 / stdlib §2.9, v0.307): "is this resolved callee the
+    // abstract `IEquatable<T>.Equals` whose witness on this RECEIVER is the
+    // synthesized `Equals(T)`?" — the Emitter's `isSynthesizedIEquatableEquals`
+    // applied to the receiver's record type. Such a call lowers through the
+    // SAME value-semantics path as the unlisted record's symbol-less
+    // `Equals` (tryLowerValueSemanticsCall), so it must not lose
+    // `isKnownBoxEqualsArg`'s relaxation merely because sema bound a symbol.
+    // Left empty in phase 1, like `isKnownBoxReceiver`.
+    std::function<bool(const sema::MethodSymbol*, const ast::Expr*)>
+        isSynthesizedEqualsCallee;
     // fix #3447 (§8.6 / §28.9, v0.306): PHASE-1 mode. The question phase 1
     // asks is NOT "does the box escape" but the strictly weaker "can anything
     // overwrite this slot" — a local passed as a call argument still HOLDS the
@@ -34752,19 +34762,28 @@ struct BoxEscapeWalker {
     //   * the receiver is a `pureBoxBindings_` local. A user CLASS receiver
     //     dispatches to a user override, which may store its argument — see
     //     `pureBoxBindings_`'s own warning and #3480.
+    // The "NO resolved MethodSymbol" gate below, widened by fix #5068 to the
+    // one resolved symbol that lowers exactly like no symbol at all.
+    bool unresolvedOrSynthesizedEquals(const ast::Expr& member,
+                                       const ast::Expr* recv) const {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(member));
+        if (!ms) return true;
+        return isSynthesizedEqualsCallee && isSynthesizedEqualsCallee(ms, recv);
+    }
+
     bool isKnownBoxEqualsArg(const ast::Expr* callee,
                              const std::vector<ast::CallArgument>& args) const {
         if (!isKnownBoxReceiver || args.size() != 1) return false;
         const ast::Expr* recv = nullptr;
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
             if (m->member != "Equals") return false;
-            if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*m)))
+            if (!unresolvedOrSynthesizedEquals(*m, m->target.get()))
                 return false;
             recv = m->target.get();
         } else if (auto* m =
                        dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
             if (m->member != "Equals") return false;
-            if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*m)))
+            if (!unresolvedOrSynthesizedEquals(*m, m->target.get()))
                 return false;
             recv = m->target.get();
         } else {
@@ -35385,6 +35404,12 @@ void Emitter::collectBoxReleaseEligible(
             [this](const ast::Expr* r) {       // fix #3447
                 return knownBoxReceiverShape(r, /*allowPureBinding=*/true);
             }};
+        w.isSynthesizedEqualsCallee =            // fix #5068
+            [this](const sema::MethodSymbol* ms, const ast::Expr* r) {
+                const sema::TypeRef* rt = r ? ctx_.exprType(*r) : nullptr;
+                return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                       isSynthesizedIEquatableEquals(ms, rt->declaration);
+            };
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         bool hasManagedBox =
             isPlusOneBoxProducer(ld) || w.sawBoxAssignment;
@@ -40971,6 +40996,17 @@ void Emitter::setupBoxDescriptors() {
                             tb.CreateRet(r);
                         fp = thunk;
                     }
+                } else if (isSynthesizedIEquatableEquals(im, ts)) {
+                    // fix #5068 (§9.1 / stdlib §2.9, v0.307): the record's
+                    // `IEquatable<T>.Equals` witness is the SYNTHESIZED
+                    // `Equals(T)` ("the synthesized `Equals(T)` is what
+                    // satisfies a declared `IEquatable<T>` conformance"),
+                    // which has no MethodSymbol for findInterfaceImpl to
+                    // find. The slot used to stay null, so dispatch through
+                    // an `IEquatable<Point>` reference called address 0
+                    // (SIGSEGV). Fill it with a structural-equality thunk.
+                    fp = boxRecordIEquatableEqualsThunk(
+                        ts, "bz$boxieq$" + std::string(ts->name));
                 }
                 itabElems.push_back(fp);
             }
@@ -41922,6 +41958,36 @@ llvm::Function* Emitter::boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
         phi->addIncoming(builder_.getFalse(), notNullBB); // descriptor mismatch
         phi->addIncoming(eq, checkEnd);                   // structural result
         builder_.CreateRet(phi);
+    }
+    return thunk;
+}
+
+// fix #5068 (§9.1 / §9.2 / stdlib §2.9, v0.307): the `IEquatable<T>.Equals`
+// itable slot of a boxed record whose witness is the SYNTHESIZED `Equals(T)`.
+// Signature `i1(ptr box, <record struct> other)`: the interface caller passes
+// `this` as the box and the `T`-typed argument BY VALUE, exactly as a
+// user-written `Equals(other: Point)` box thunk forwards it. Loads the
+// receiver's payload (two words past the box header, the slot every box thunk
+// reads) and runs the same emitStructEquality the `=` operator and the
+// universal `bz$boxeq$` thunk use, so the three spellings of §8.3 equality can
+// never disagree. Depends on the ACTIVE genericSubst_ exactly like
+// boxRecordEqualsThunkCore: the per-instantiation variant installs the
+// substitution first (specializedBoxVtableFor).
+llvm::Function* Emitter::boxRecordIEquatableEqualsThunk(
+        const sema::TypeSymbol* ts, const std::string& fnName) {
+    llvm::StructType* st = recordStruct(ts);
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), st},
+                                         /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, fnName, module_.get());
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* selfPayload = builder_.CreateGEP(
+            ptrTy(), thunk->getArg(0), {builder_.getInt32(2)}, "bieq.spay");
+        llvm::Value* sv = builder_.CreateLoad(st, selfPayload, "bieq.sv");
+        builder_.CreateRet(
+            emitStructEquality(sv, thunk->getArg(1), st, ts));
     }
     return thunk;
 }
@@ -44349,6 +44415,86 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
 // non-record, a non-generic record, or an instantiation with a non-concrete
 // (erased) argument — the caller keeps the shared vtable, and the sema
 // erasure guards (#2006/#2012/#2018) reject the corresponding tests.
+// fix #5068 (§9.1 / §14.1 / stdlib §2.9, v0.307): the per-instantiation itmap
+// of a boxed GENERIC record whose `IEquatable<T>.Equals` witness is the
+// synthesized `Equals(T)`. Returns `sharedItmap` unchanged whenever there is
+// nothing to specialize (no such witness, no IEquatable entry, an unexpected
+// shape), so every other record keeps its shared itmap exactly as before.
+llvm::Constant* Emitter::specializedIEquatableItmap(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args,
+        const std::string& readable, llvm::Constant* sharedItmap) {
+    const sema::TypeSymbol* ieq =
+        ctx_.builtinInterfaceSymIfCached("IEquatable");
+    if (!ieq || !sharedItmap) return sharedItmap;
+    const sema::MethodSymbol* eqMs = nullptr;
+    for (sema::Symbol* m : ieq->members)
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+            ms && ms->name == "Equals") {
+            eqMs = ms;
+            break;
+        }
+    if (!eqMs || !isSynthesizedIEquatableEquals(eqMs, ts)) return sharedItmap;
+    auto kIt = ifaceMethodIndex_.find(eqMs);
+    auto dIt = descArray_.find(ieq);
+    if (kIt == ifaceMethodIndex_.end() || dIt == descArray_.end())
+        return sharedItmap;
+    auto* itmapGV = llvm::dyn_cast<llvm::GlobalVariable>(
+        sharedItmap->stripPointerCasts());
+    auto* itmapArr = itmapGV && itmapGV->hasInitializer()
+        ? llvm::dyn_cast<llvm::ConstantArray>(itmapGV->getInitializer())
+        : nullptr;
+    if (!itmapArr) return sharedItmap;
+
+    std::vector<llvm::Constant*> pairs;
+    for (unsigned i = 0; i < itmapArr->getNumOperands(); ++i)
+        pairs.push_back(itmapArr->getOperand(i));
+    bool swapped = false;
+    for (std::size_t i = 0; i + 1 < pairs.size(); i += 2) {
+        if (pairs[i]->stripPointerCasts() != dIt->second) continue;
+        auto* itabGV = llvm::dyn_cast<llvm::GlobalVariable>(
+            pairs[i + 1]->stripPointerCasts());
+        auto* itabArr = itabGV && itabGV->hasInitializer()
+            ? llvm::dyn_cast<llvm::ConstantArray>(itabGV->getInitializer())
+            : nullptr;
+        if (!itabArr || kIt->second >= itabArr->getNumOperands()) break;
+        std::vector<llvm::Constant*> slots;
+        for (unsigned j = 0; j < itabArr->getNumOperands(); ++j)
+            slots.push_back(itabArr->getOperand(j));
+        // Install the instantiation's substitution around the emit, exactly as
+        // boxRecordEqualsThunkFor does for the vtable Equals slot.
+        auto savedLLVM = genericSubst_;
+        auto savedSema = genericSubstSemaTy_;
+        for (std::size_t g = 0; g < ts->genericParams.size() && g < args.size();
+             ++g) {
+            const sema::Symbol* gp = ts->genericParams[g];
+            if (!gp || !args[g]) continue;
+            genericSubst_[gp->name] = lowerTypeRef(args[g]);
+            genericSubstSemaTy_[gp->name] = args[g];
+        }
+        slots[kIt->second] = boxRecordIEquatableEqualsThunk(
+            ts, "bz$boxieq$" + std::string(ts->name) + "$" + readable);
+        genericSubst_ = std::move(savedLLVM);
+        genericSubstSemaTy_ = std::move(savedSema);
+        auto* itabTy = llvm::ArrayType::get(ptrTy(), slots.size());
+        auto* newItab = new llvm::GlobalVariable(
+            *module_, itabTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(itabTy, slots),
+            "itab$box$" + readable + "$IEquatable");
+        pairs[i + 1] = llvm::ConstantExpr::getPointerCast(newItab, ptrTy());
+        swapped = true;
+        break;
+    }
+    if (!swapped) return sharedItmap;
+    auto* itmapTy = llvm::ArrayType::get(ptrTy(), pairs.size());
+    auto* newItmap = new llvm::GlobalVariable(
+        *module_, itmapTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(itmapTy, pairs), "itmap$box$" + readable);
+    return llvm::ConstantExpr::getPointerCast(newItmap, ptrTy());
+}
+
 llvm::GlobalVariable* Emitter::specializedBoxVtableFor(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return nullptr;
@@ -44433,6 +44579,15 @@ llvm::GlobalVariable* Emitter::specializedBoxVtableFor(const sema::TypeRef* rt) 
         vtElems[kEqualsSlot] = boxRecordEqualsThunkFor(ts, args, readable);
     if (kGetHashCodeSlot < vtElems.size())
         vtElems[kGetHashCodeSlot] = boxRecordHashThunkFor(ts, args, readable);
+    // fix #5068 (§9.1 / §14.1 / stdlib §2.9, v0.307): the same swap for the
+    // `IEquatable<T>.Equals` itable slot when its witness is the synthesized
+    // `Equals(T)`. The shared itmap's thunk (Pass C) was compiled against the
+    // TEMPLATE layout, so dispatch through an `IEquatable<Pair<string>>`
+    // compared the erased i32 placeholders of two string pointers and answered
+    // False for equal values. Copy the itmap, and in the IEquatable itab only
+    // replace that one slot with a thunk compiled under this instantiation.
+    if (vtElems.size() > 1)
+        vtElems[1] = specializedIEquatableItmap(ts, args, readable, vtElems[1]);
     auto* vtTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
     auto* vtGV = new llvm::GlobalVariable(
         *module_, vtTy, /*isConstant=*/true,
