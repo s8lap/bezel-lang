@@ -425,6 +425,22 @@ bool isVtableLessBuiltinClassName(std::string_view n);
 // that set — the predicate covers the case where a user class may legitimately
 // implement a built-in interface head, which the derived vtable-less
 // predicate excludes by construction.
+// fix #5044 (§2.3 Row 10, stdlib §4, v0.307): the §2.3 always-available
+// bare-name Row 10 collection/iterator heads — `Array`, `Stack`, `Queue`,
+// `Set`, `Dictionary`, `LinkedList`, `FrozenArray`, and the `Owning*` forms,
+// plus every `I*` interface in stdlib §4 (enumerable, collection, span).
+//
+// This is a PURPOSE-BUILT subset for §2.3's "alias collision" gate: it
+// answers whether `n` is one of the names that blocks `import Foo as Bar`
+// where `Bar` collides with an always-available bare name. It is NOT a
+// general-purpose collection-name predicate — callers needing broader sets
+// use the existing `isArrayBackedCollectionName`, `isDictionaryName`,
+// `isLinkedListName`, `isIterableInterfaceHead`, or `isBuiltinForInEnumerableHead`
+// predicates, which each answer different questions with intentionally
+// different membership.
+// per §2.3 / stdlib §4, fix #5044
+bool isAlwaysAvailableBareNameCollection(std::string_view n);
+
 // per §8.1 / §8.5 / §18.5 / §28.9
 bool isBuiltinInterfaceHead(std::string_view n);
 

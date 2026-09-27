@@ -1535,4 +1535,51 @@ bool isBuiltinIntCountPropertyHead(std::string_view head) {
     return contains(kBuiltinIntCountPropertyHeads, head);
 }  // per §5.1 / §4.17 / §4.18 / §6.9, fix #4766 + #4833
 
+// fix #5044 (§2.3 Row 10, stdlib §4, v0.307): the §2.3 always-available
+// bare-name Row 10 collection/iterator heads. The single authority for
+// `isAlwaysAvailableBareName`'s Row 10 chain, replacing the hand-spelled
+// comparison chain that previously duplicated this list independently.
+// kBuiltinInterfaceHeads (which is in the declaration section below) holds
+// the span-interface heads separately; those are included here too because
+// §2.3 Row 10 covers stdlib §4 in its entirety.
+constexpr std::array<std::string_view, 46> kAlwaysAvailableBareNameCollections = {
+    // §4.4 / §4.5: array-backed collections
+    "Array", "OwningArray",
+    // §4.11: stack / queue
+    "Stack", "OwningStack", "Queue", "OwningQueue",
+    // §4.10 / §4.18: set types
+    "Set", "OwningSet", "SortedSet",
+    // §4.8 / §4.17: dictionary types
+    "Dictionary", "OwningDictionary", "SortedDictionary",
+    "DictionaryEntry", "DrainedEntry",
+    // §4.6 / §4.7: linked list
+    "LinkedList", "OwningLinkedList", "LinkedListNode",
+    // §4.14 / §4.19: buffer / frozen array
+    "OwningBuffer", "FrozenArray",
+    // §4.15: span types
+    "Span", "ReadOnlySpan",
+    // §4.16: bit reader / writer
+    "BitReader", "BitWriter",
+    // §4.15: array span types
+    "ArraySpan", "ReadOnlyArraySpan",
+    "ArrayBitReader", "ArrayBitWriter",
+    // §4.12 / §4.13: iterator interfaces
+    "IEnumerable", "IEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator",
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+    // §4.4 / §4.5: collection interfaces
+    "IReadOnlyCollection", "IReadOnlyList",
+    "ICollection", "IList",
+    "IOwningCollection", "IOwningList",
+    // §4.15 / §4.4 / §4.5 / §4.8: supporting interfaces
+    "IReadOnlySpan", "IEqualityComparer",
+    // §4.14: slot map
+    "Counter", "OwningSlotMap", "SlotHandle",
+};
+
+bool isAlwaysAvailableBareNameCollection(std::string_view n) {
+    return contains(kAlwaysAvailableBareNameCollections, n);
+}  // per §2.3 / stdlib §4, fix #5044
+
 }  // namespace bezel::common

@@ -99,29 +99,9 @@ constexpr bool isAlwaysAvailableBareName(std::string_view n) {
         // Row 9 (System.Text).
         n == "StringBuilder" || n == "Encoding" || n == "ReadOnlyStringSpan" ||
         // Row 10 (System.Collections.Generic — the whole of stdlib §4).
-        // GRID-DEBT: #5044 §2.3 alias-collision name table, not a wrap mint/claim site
-        n == "Array" || n == "OwningArray" ||
-        n == "Stack" || n == "OwningStack" ||
-        n == "Queue" || n == "OwningQueue" ||
-        n == "Set" || n == "OwningSet" || n == "SortedSet" ||
-        n == "Dictionary" || n == "OwningDictionary" ||
-        n == "DictionaryEntry" || n == "DrainedEntry" ||
-        n == "SortedDictionary" ||
-        n == "LinkedList" || n == "OwningLinkedList" || n == "LinkedListNode" ||
-        n == "OwningBuffer" || n == "FrozenArray" ||
-        n == "Span" || n == "ReadOnlySpan" ||
-        n == "BitReader" || n == "BitWriter" ||
-        n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
-        n == "ArrayBitReader" || n == "ArrayBitWriter" ||
-        n == "IEnumerable" || n == "IEnumerator" ||
-        n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-        n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
-        n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
-        n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
-        n == "ICollection" || n == "IList" ||
-        n == "IOwningCollection" || n == "IOwningList" ||
-        n == "IReadOnlySpan" || n == "IEqualityComparer" ||
-        n == "Counter" || n == "OwningSlotMap" || n == "SlotHandle" ||
+        // Derived from kAlwaysAvailableBareNameCollections (BuiltinRegistry.cpp,
+        // fix #5044) — the single authority for §2.3 Row 10 names.
+        common::isAlwaysAvailableBareNameCollection(n) ||
         // Row 11 (System.Collections.Linq).
         n == "IGrouping" || n == "IOrderedEnumerable";
 }
