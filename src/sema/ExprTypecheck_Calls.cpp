@@ -16806,6 +16806,113 @@ bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
 // declared constructors → the implicit default ctor takes no arguments.
 // One constructor → argument count/type check. Multiple constructors →
 // §22.6 type-based overload resolution (exact-match-then-ambiguity).
+// fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307). See the declaration.
+// The primary's parameters are the class's `positionalFields` (the same
+// `ast::Param` list the LOCAL primary-only path binds), so the primary is
+// ranked from its own syntax, with no synthesized parameter list.
+bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
+                                            TypeSymbol* t) {
+    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+    if (!td || td->positionalFields.empty()) return false;
+    // A call-site modifier or a discard is outside this ranking, exactly as
+    // for the body-constructor overload set below: defer.
+    for (const auto& a : ne.args)
+        if (!a.modifier.empty() || a.isDiscard || !a.value) return false;
+    const std::size_t nSupplied = ne.args.size();
+
+    // §22.5 binding filters the candidate set first: the primary, then every
+    // body constructor. A candidate that does not bind is inapplicable.
+    std::vector<const std::vector<ast::Param>*> cands;
+    std::vector<BindResult> binds;
+    {
+        BindResult pb = bindArgsToParams(td->positionalFields, ne.args,
+                                         ne.span.begin, std::string(),
+                                         /*emit=*/false);
+        if (!pb.ok) return false;  // the primary is not a candidate: no tie
+        cands.push_back(&td->positionalFields);
+        binds.push_back(std::move(pb));
+    }
+    for (Symbol* m : t->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        BindResult b = bindArgsToParams(cd->params, ne.args, ne.span.begin,
+                                        std::string(), /*emit=*/false);
+        if (!b.ok) continue;
+        cands.push_back(&cd->params);
+        binds.push_back(std::move(b));
+    }
+    if (cands.size() < 2) return false;
+
+    // Lay every candidate's bound parameters out in call-argument order (the
+    // shared column order resolveOverload needs; §22.5 binds each supplied
+    // argument to exactly one parameter). Bail, leaving the call deferred,
+    // where this ranking would be incomplete:
+    //  - a `ref`/`out` formal at a bound position: §22.3 makes it
+    //    inapplicable to a modifier-free argument (the §22.6 pipeline's
+    //    step 3), which resolveOverload does not model;
+    //  - candidates whose modifiers differ at one argument (an ordinary-
+    //    `owned` or `scoped` difference): §22.6's ownership-mode
+    //    applicability decides those, which resolveOverload does not model.
+    std::vector<std::vector<const TypeRef*>> paramTypes(cands.size());
+    std::vector<std::vector<std::string_view>> mods(cands.size());
+    std::vector<bool> fillsDefault(cands.size(), false);
+    std::vector<std::string> candNames(cands.size());
+    for (std::size_t c = 0; c < cands.size(); ++c) {
+        const auto& params = *cands[c];
+        paramTypes[c].assign(nSupplied, nullptr);
+        mods[c].assign(nSupplied, std::string_view{});
+        std::vector<bool> seen(nSupplied, false);
+        for (std::size_t j = 0; j < params.size(); ++j) {
+            const int ai = binds[c].paramToArg[j];
+            if (ai < 0) {
+                fillsDefault[c] = true;
+                continue;
+            }
+            const auto a = static_cast<std::size_t>(ai);
+            if (a >= nSupplied || seen[a]) return false;
+            seen[a] = true;
+            const std::string_view pm = params[j].modifier;
+            if (pm == "ref" || pm == "out" || pm == "out owned") return false;
+            mods[c][a] = pm;
+            paramTypes[c][a] =
+                params[j].type
+                    ? substituteMemberType(ctx_.resolvedType(*params[j].type),
+                                           &ne, t)
+                    : nullptr;
+        }
+        for (std::size_t a = 0; a < nSupplied; ++a)
+            if (!seen[a]) return false;
+        candNames[c] = std::string("new ") + std::string(t->name) +
+                       methodSignatureString("", params) +
+                       (c == 0 ? " (primary constructor)" : "");
+    }
+    for (std::size_t c = 1; c < cands.size(); ++c)
+        if (mods[c] != mods[0]) return false;
+
+    std::vector<const TypeRef*> argTypes(nSupplied, nullptr);
+    std::vector<const ast::Expr*> argExprs(nSupplied, nullptr);
+    for (std::size_t i = 0; i < nSupplied; ++i) {
+        argExprs[i] = ne.args[i].value.get();
+        argTypes[i] = ctx_.exprType(*ne.args[i].value);
+    }
+    // resolveOverload re-types an in-range int constant for a narrower-int
+    // parameter (§5.1 constant narrowing) as it classifies. This call only
+    // looks for an ambiguity, and the call stays on its deferred path, so the
+    // argument types are restored afterwards. The deferred lowering then sees
+    // exactly what it saw before this check existed.
+    OverloadResult res = resolveOverload(
+        paramTypes, argTypes, fillsDefault, candNames, ne.span.begin,
+        std::string("`new ") + std::string(t->name) + "`",
+        /*extraNote=*/std::string(), argExprs);
+    for (std::size_t i = 0; i < nSupplied; ++i)
+        ctx_.setExprType(const_cast<ast::Expr*>(argExprs[i]),
+                         const_cast<TypeRef*>(argTypes[i]));
+    return res.outcome == OverloadOutcome::Ambiguous ||
+           res.outcome == OverloadOutcome::Unreachable;
+}
+
 void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     // A class with a primary constructor (parenthesized params after
     // the name) carries those params on the TypeDecl rather than as
@@ -16975,6 +17082,16 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // shape is handled by `checkImportedNewExprArgs` below — we
             // keep that fall-through to preserve the existing import-side
             // behavior (don't widen it here either).
+            //
+            // fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307): the
+            // deferral must not skip §22.6 entirely. The primary constructor
+            // is a constructor (§22.7), so it is a candidate at `new C(...)`
+            // like any body constructor. `class C(x: int)` beside
+            // `constructor(y: int) this(y);` makes `new C(1)` ambiguous: both
+            // are applicable with identical parameter types. Before this, the
+            // call compiled and codegen's `ctorForArgs` silently chose the
+            // body constructor.
+            (void)reportPrimaryBodyCtorAmbiguity(ne, t);
             return;
         } else if (ctx_.isImported(t) && hasExplicitCtor && !ne.args.empty()) {
             // fix #3625 (§22.5 / §22.7 / §22.10 / §2.8.3 rule 4, v0.286) — the

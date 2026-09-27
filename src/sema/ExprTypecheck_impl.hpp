@@ -3149,6 +3149,14 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
+    // fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307): at `new C(...)` on a
+    // LOCAL class that has both a primary constructor and body constructors,
+    // rank the primary together with the body constructors and report a
+    // §22.6 stage-8 ambiguity when no candidate is unambiguously better.
+    // Returns true when an error was reported. Any other outcome leaves the
+    // call on its existing deferred path.
+    bool reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne, TypeSymbol* t);
+
     // fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10
     // enum rejection): neither an enum nor a choice has a constructor
     // for `new` to resolve to — an enum value comes from the int→enum

@@ -92,7 +92,7 @@ BEZEL_TEST(two_hop_primary_chain_3760, single_hop_chain_still_works) {
         "end C; "
         "class MainClass "
         "  public static method Main(): int "
-        "    var c := new C(10); "
+        "    var c := new C(a := 10); "
         "    Console.WriteLine(c.X.ToString()); "
         "    return 0; "
         "  end Main; "
