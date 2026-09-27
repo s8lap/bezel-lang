@@ -11993,6 +11993,91 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 }
             }
         }
+        // fix #5024 (§14.1 / §14.5, v0.307): a call through a RECEIVER whose
+        // static type instantiates a generic CLASS (`Box<T>`) with a lambda
+        // argument (`b.Apply(lambda(y) => …)`, `b: Box<U>` inside `Go<U>`'s
+        // own body) never reaches the pre-pass above at all when the callee
+        // method (`Apply`) declares no generic parameters of its OWN — the
+        // class's `T` is not in `md->genericParams` (that list is the
+        // method's own `<...>` clause only), so the whole
+        // `if (!md->genericParams.empty())` gate above is skipped.
+        // `genericSubstSemaTy_["T"]` is populated only by the "CG-generic"
+        // receiver substitution further below (the `!isStaticMethod(ms) &&
+        // ms->parent && !args.empty()` block), which runs AFTER
+        // `buildOrderedArgs` — too late for `lowerLambda`'s #4896 hint
+        // injection, which consults `genericSubstSemaTy_` while lowering the
+        // lambda argument HERE. The formal parameter `y: T` therefore kept
+        // the bare placeholder type, and when `T` resolved to `char`/an enum
+        // (both LLVM `i32`, indistinguishable at the LLVM level from
+        // "unresolved") interpolating `y` fell through to the raw-integer
+        // fallback (`Util.Go<char>('m')` printed `<109>` instead of `<m>`).
+        //
+        // Bind the callee's OWNER (declaring class) type-parameter names
+        // from the receiver's own class instantiation before
+        // `buildOrderedArgs` runs, mirroring the "CG-generic" computation
+        // below but early enough for the lambda pre-pass to see it.
+        // Additive only: a name already bound — by the method-generic-param
+        // pre-pass above or by an outer scope — is left untouched, and a
+        // still-bare resolution (the receiver's own type argument is itself
+        // an unresolved outer parameter) is skipped rather than recorded.
+        if (!isStaticMethod(ms) && ms->parent &&
+            !ms->parent->genericParams.empty()) {
+            bool hasLambdaArgForRecv = false;
+            for (const auto& a : call.args) {
+                if (a.value &&
+                    dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    hasLambdaArgForRecv = true;
+                    break;
+                }
+            }
+            if (hasLambdaArgForRecv) {
+                const ast::Expr* recvExpr = nullptr;
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call.callee.get()))
+                    recvExpr = ma->target.get();
+                if (recvExpr) {
+                    sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration == ms->parent &&
+                        !recvTy->genericArgs.empty()) {
+                        const std::vector<std::string_view> ownerGpNames =
+                            sema::genericParamNames(ms->parent);
+                        if (ownerGpNames.size() ==
+                            recvTy->genericArgs.size()) {
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                recvSubst = genericSubst_;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*>
+                                recvSema = genericSubstSemaTy_;
+                            bool changed = false;
+                            for (std::size_t gi = 0;
+                                 gi < ownerGpNames.size(); ++gi) {
+                                std::string_view pname = ownerGpNames[gi];
+                                if (recvSubst.count(pname)) continue;
+                                const sema::TypeRef* argSema =
+                                    substituteTypeRefLocal(
+                                        recvTy->genericArgs[gi],
+                                        genericSubstSemaTy_);
+                                if (!argSema || isBareTypeParamRef(argSema))
+                                    continue;
+                                recvSubst[pname] = lowerTypeRef(argSema);
+                                recvSema[pname] = argSema;
+                                changed = true;
+                            }
+                            if (changed) {
+                                if (!didPrePass) {
+                                    preSavedSubst = genericSubst_;
+                                    preSavedSema  = genericSubstSemaTy_;
+                                    didPrePass = true;
+                                }
+                                genericSubst_ = std::move(recvSubst);
+                                genericSubstSemaTy_ = std::move(recvSema);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // §22.4/§22.7: place arguments into parameter order.
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
             // #1918 / §28.3: this is the ordinary user-method (ast::MethodDecl)

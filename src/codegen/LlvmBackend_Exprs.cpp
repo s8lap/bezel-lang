@@ -415,6 +415,43 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return ty;
             return cand;
         };
+        // fix #5024 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema type is
+        // a BARE (non-nullable) type parameter `T` reached through a
+        // CAPTURED variable — not a declared lambda parameter, so #4896's
+        // `lambdaParamTypeHint_` injection (which fires only for an inferred
+        // lambda PARAMETER's formal type) never touches it — keeps its
+        // unsubstituted sema type here. `char` and every enum lower to the
+        // SAME LLVM `i32` as a genuinely unresolved placeholder, so when `T`
+        // resolves to one of them the dispatch below fell through to the
+        // LLVM-shape fallback arm (`isIntegerTy(32) -> P::Int`) and rendered
+        // the raw ordinal instead of dispatching char/enum ToString:
+        // `lambda(q: int) => $"{v}/{q}"` captured from `Go<T>`'s frame
+        // printed the code point / enum ordinal instead of the character /
+        // qualified type name. `Box<T>.Apply(lambda) `called through a
+        // generic method (`Go<U>` binding `T` to `U`) is the sibling shape
+        // (fixed separately at the call-dispatch pre-pass, LlvmBackend_Calls2.cpp).
+        //
+        // Resolve `ty` through the ACTIVE substitution, gated on the
+        // candidate's OWN LLVM shape actually matching the lowered value's
+        // shape — so a substitution meant for an unrelated, same-named type
+        // parameter in a different scope cannot mis-route this hole (mirrors
+        // the shape gate `resolveBareTParamNullableHoleTy` above uses for the
+        // nullable-value case). A candidate that resolves to a NULLABLE
+        // value type is left to that sibling helper — it builds the nullable
+        // copy via `nullableTypeParamConcrete`/the `ty->nullable` branch,
+        // which this helper does not replicate.
+        auto resolveBareTParamConcreteHoleTy =
+            [&](const sema::TypeRef* ty, llvm::Value* v) -> const sema::TypeRef* {
+            if (!ty || !v || ty->nullable || genericSubstSemaTy_.empty() ||
+                !isBareTypeParamRef(ty))
+                return ty;
+            const sema::TypeRef* cand = resolveTypeParamRef(ty);
+            if (!cand || cand == ty || isBareTypeParamRef(cand) ||
+                isNullableValueTy(cand))
+                return ty;
+            if (lowerTypeRef(cand) != v->getType()) return ty;
+            return cand;
+        };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
@@ -627,6 +664,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
                     const sema::TypeRef* frt = ctx_.exprType(*part.expr);
+                    frt = resolveBareTParamConcreteHoleTy(frt, ev);  // #5024
                     sema::TypeRef frtNvBuf4934;
                     frt = resolveBareTParamNullableHoleTy(frt, ev, frtNvBuf4934);
                     // §18.5 / §7: a nullable VALUE part WITH a format spec —
@@ -725,6 +763,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // emitWithFormatSpec returned null: fall through.
                 }
                 const sema::TypeRef* rt = ctx_.exprType(*part.expr);
+                rt = resolveBareTParamConcreteHoleTy(rt, ev);  // #5024
                 sema::TypeRef rtNvBuf4934;
                 rt = resolveBareTParamNullableHoleTy(rt, ev, rtNvBuf4934);
                 // CG-nullable: for nullable value types (primitives, and a

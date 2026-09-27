@@ -1066,11 +1066,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     // character / enum name.
                     //
                     // genericSubstSemaTy_ can ALSO hold a still-bare entry
-                    // (the pre-#4896 non-i32 pre-pass branch records the
-                    // unsubstituted TypeRef verbatim when it is nested
-                    // inside another generic method's own monomorphization
-                    // — e.g. `W → T` while Go<T>'s own `T` is resolved
-                    // elsewhere) — using THAT as a hint would regress the
+                    // (the non-i32 pre-pass branch records the unsubstituted
+                    // TypeRef verbatim when it is nested inside another
+                    // generic method's own monomorphization — e.g. `W → T`
+                    // while Go<T>'s own `T` is resolved elsewhere; this
+                    // pre-pass substitution has been in place since #4813
+                    // (bb41c32f), not merely since #4896 as an earlier
+                    // revision of this comment said — #5024) — using THAT as
+                    // a hint would regress the
                     // pre-existing, working path for those types (measured:
                     // a nested `Go<string>` call printed a raw pointer
                     // value instead of the string once this arm stopped
