@@ -4198,7 +4198,7 @@ void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
 // Recording is deliberately generous and the VERDICT is where the guards live
 // (the overload guard in particular) — recording is side-effect-free, so an
 // over-recorded edge costs a vector entry and nothing else.
-void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
+void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* scope) {
     if (!currentMethodDecl_ || !currentOuterType_) return;
     // Only a GENERIC member has a self-edge to constrain: a non-generic
     // member's edges attach to its declaring type's node (§14.6), and those
@@ -4214,12 +4214,44 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
     } else if (auto* ma =
                    dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
         if (ma->member != currentMethodDecl_->name) return;
-        // The receiver must be `this` or the enclosing type's own name; any
-        // other receiver names a different declaration's member.
         auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
         if (!recv || !recv->typeArgs.empty()) return;
-        if (recv->name != "this" && recv->name != currentOuterType_->name)
-            return;
+        // §14.6 requires a finite instantiation set. A variable receiver of
+        // the enclosing type is a potential self-recursive call through that
+        // variable — the callee resolves to this method at compile time. Accept
+        // three receiver spellings: `this`, the type name (static member), or
+        // any identifier whose declared type is the enclosing type.
+        if (recv->name == "this") {
+            // ok
+        } else if (recv->name == currentOuterType_->name) {
+            // ok
+        } else {
+            // A variable receiver: look it up in the current scope and in the
+            // method's formal parameters to find its declared type.
+            Symbol* sym = lookupName(recv->name, scope);
+            const TypeRef* recvType = nullptr;
+            if (sym) {
+                if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                        recvType = ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+                } else if (auto* ps = dynamic_cast<ParameterSymbol*>(sym)) {
+                    recvType = ps->resolvedDeclType;
+                    if (!recvType && ps->declType)
+                        recvType = ctx_.resolvedType(*ps->declType);
+                }
+            }
+            // Also check method parameters directly — scope may not contain them.
+            if (!recvType && currentMethodDecl_) {
+                for (const auto& param : currentMethodDecl_->params) {
+                    if (param.name == recv->name) {
+                        recvType = param.type ? ctx_.resolvedType(*param.type) : nullptr;
+                        break;
+                    }
+                }
+            }
+            if (!recvType || recvType->declaration != currentOuterType_)
+                return;
+        }
         typeArgs = &ma->typeArgs;
     } else if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(
                    call.callee.get())) {
@@ -4239,7 +4271,25 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
         if (nc->member != currentMethodDecl_->name) return;
         auto* recv = dynamic_cast<const ast::IdentifierExpr*>(nc->target.get());
         if (!recv || !recv->typeArgs.empty()) return;
-        if (recv->name != "this") return;
+        if (recv->name == "this") {
+            // ok
+        } else if (recv->name == currentOuterType_->name) {
+            // ok
+        } else {
+            // Variable receiver: check declared type via method params.
+            const TypeRef* recvType = nullptr;
+            if (currentMethodDecl_) {
+                for (const auto& param : currentMethodDecl_->params) {
+                    if (param.name == recv->name) {
+                        recvType =
+                            param.type ? ctx_.resolvedType(*param.type) : nullptr;
+                        break;
+                    }
+                }
+            }
+            if (!recvType || recvType->declaration != currentOuterType_)
+                return;
+        }
         typeArgs = &nc->typeArgs;
     } else {
         return;
@@ -4253,6 +4303,56 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
     edge.source = currentMethodDecl_;
     edge.loc = call.span.begin.line != 0 ? call.span.begin
                                          : currentMethodDecl_->span.begin;
+    for (const auto& ta : *typeArgs) {
+        edge.argRefs.push_back(ta ? ctx_.resolvedType(*ta) : nullptr);
+        edge.argAsts.push_back(ta.get());
+    }
+    genericMemberEdges_.push_back(std::move(edge));
+}
+
+// fix #5045 (§14.6, v0.307): overload for NullCondMemberExpr, which is the
+// callee inside a NullCondCallExpr (the `?.` form). The logic is identical to
+// the NullCondMemberExpr branch inside the CallExpr overload, but wrapped in
+// its own free function so the NullCondCallExpr arm can call it directly.
+void Resolver::recordGenericMemberSelfEdge(const ast::NullCondMemberExpr& ncm,
+                                          Scope* scope) {
+    (void)scope; // not yet used but reserved for future lookup extensions
+    if (!currentMethodDecl_ || !currentOuterType_) return;
+    const std::size_t arity = currentMethodDecl_->genericParams.size();
+    if (arity == 0) return;
+
+    if (ncm.member != currentMethodDecl_->name) return;
+    auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ncm.target.get());
+    if (!recv || !recv->typeArgs.empty()) return;
+
+    // §14.6: accept `this`, the type name (static member), or any variable
+    // receiver whose declared type is the enclosing type.
+    if (recv->name == "this") {
+        // ok
+    } else if (recv->name == currentOuterType_->name) {
+        // ok
+    } else {
+        const TypeRef* recvType = nullptr;
+        if (currentMethodDecl_) {
+            for (const auto& param : currentMethodDecl_->params) {
+                if (param.name == recv->name) {
+                    recvType =
+                        param.type ? ctx_.resolvedType(*param.type) : nullptr;
+                    break;
+                }
+            }
+        }
+        if (!recvType || recvType->declaration != currentOuterType_) return;
+    }
+
+    const std::vector<std::unique_ptr<ast::Type>>* typeArgs = &ncm.typeArgs;
+    if (!typeArgs || typeArgs->size() != arity) return;
+
+    GenericMemberEdge edge;
+    edge.enclosingType = currentOuterType_;
+    edge.source = currentMethodDecl_;
+    edge.loc = ncm.span.begin.line != 0 ? ncm.span.begin
+                                        : currentMethodDecl_->span.begin;
     for (const auto& ta : *typeArgs) {
         edge.argRefs.push_back(ta ? ctx_.resolvedType(*ta) : nullptr);
         edge.argAsts.push_back(ta.get());
@@ -4345,6 +4445,17 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         if (be->left) resolveTypesInExpr(*be->left, scope);
         if (be->right) resolveTypesInExpr(*be->right, scope);
+        // fix #5045 (§14.6, v0.307): `other?.Go<...>(p) ?? 0` parses as a
+        // BinaryExpr with NullCondCallExpr as the left child. Both children
+        // are recursed into above, but neither records a generic-member
+        // self-edge — only the CallExpr and NullCondCallExpr arms do that.
+        // Record it here so the expanding-instantiation check fires.
+        if (be->op == "??") {
+            if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(be->left.get()))
+                if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                        nc->callee.get()))
+                    recordGenericMemberSelfEdge(*ncm, scope);
+        }
         return;
     }
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -4385,7 +4496,7 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         // argument already has a resolved TypeRef to record. §14.6 makes each
         // generic member its own node; `instantiations_` carries generic TYPE
         // nodes only, so this is the one place a member self-loop is visible.
-        recordGenericMemberSelfEdge(*ce);
+        recordGenericMemberSelfEdge(*ce, scope);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
@@ -4393,6 +4504,16 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         for (const auto& a : nc->args) {
             if (a.value) resolveTypesInExpr(*a.value, scope);
         }
+        // fix #5045 (§14.6, v0.307): `other?.Go<...>() ?? 0` has a
+        // NullCondCallExpr whose callee is a NullCondMemberExpr. The CallExpr
+        // arm above calls recordGenericMemberSelfEdge for calls where callee IS
+        // a CallExpr, but a NullCondCallExpr's callee is a NullCondMemberExpr,
+        // so it takes the NullCondCallExpr arm and the edge went unrecorded.
+        // The callee (NullCondMemberExpr) was already recursed into above, so
+        // its type args are resolved when we call the overload here.
+        if (auto* ncm =
+                dynamic_cast<const ast::NullCondMemberExpr*>(nc->callee.get()))
+            recordGenericMemberSelfEdge(*ncm, scope);
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {

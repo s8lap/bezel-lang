@@ -835,7 +835,10 @@ private:
     // callee spells the enclosing generic method's own name with explicit type
     // arguments (`M<…>(…)`, `this.M<…>(…)`, `C.M<…>(…)`). No-op outside a
     // generic method body and for every other callee shape.
-    void recordGenericMemberSelfEdge(const ast::CallExpr& call);
+    void recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* scope);
+    // fix #5045 (§14.6, v0.307): overload for NullCondCallExpr's callee,
+    // which is a NullCondMemberExpr (not wrapped in a CallExpr).
+    void recordGenericMemberSelfEdge(const ast::NullCondMemberExpr& ncm, Scope* scope);
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 

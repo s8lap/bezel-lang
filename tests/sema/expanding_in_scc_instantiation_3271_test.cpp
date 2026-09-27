@@ -657,3 +657,94 @@ BEZEL_TEST(expanding_in_scc_instantiation_3271,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
 }
+
+// =========================================================================
+// §14.6 / #5045: variable-receiver self-calls.
+// fix #5045 (§14.6, v0.307): a generic method calling itself through a
+// VARIABLE receiver of the enclosing type — `other.Go<Pair<T,T>>(p, other)`
+// inside `Go<T>` on class `Runner` — was not recorded as a self-edge because
+// `recordGenericMemberSelfEdge` only accepted `this`, the type name, or
+// `IdentifierExpr` with no receiver at all. A local variable or method
+// parameter typed as the enclosing type is a compile-time alias for `this`
+// and produces the identical access; the expanding instantiation check must
+// run on it too. Both the dot form (`other.Go<...>`) and the null-cond
+// form (`other?.Go<...>() ?? 0`) are covered.
+//
+// The NullCondCallExpr arm (`other?.Go<...>() ?? 0`) parses as a BinaryExpr
+// with op=="??" and left==NullCondCallExpr; the BinaryExpr arm previously
+// recursed but did not call `recordGenericMemberSelfEdge`, so that shape
+// had no edge recording at all.
+// =========================================================================
+
+// REJECTED — dot form, variable receiver of enclosing type.
+// `Runner.Go<T>` calling `other.Go<Pair<T, T>>` where `other: Runner`:
+// the substitution `T → Pair<T, T>` is neither bare (it's `Pair<T, T>`)
+// nor closed (it contains T). The expanding instantiation must be rejected.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_variable_receiver_dot_form_expanding_rejected_spec_14_6_issue_5045) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return other.Go<Pair<T, T>>(p, other); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// REJECTED — null-conditional form, variable receiver.
+// `other?.Go<Pair<T, T>>(p) ?? 0` inside `Go<T>` on class `Runner`:
+// the `??` creates a BinaryExpr whose left is a NullCondCallExpr; the
+// BinaryExpr arm did not record the edge, so the expanding instantiation
+// check never ran and the compiler hung in monomorphization.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_variable_receiver_nullcond_form_expanding_rejected_spec_14_6_issue_5045) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T, other: Runner): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return other?.Go<Pair<T, T>>(p) ?? 0; "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// LEGAL — uniform self-recursion through a variable receiver of the enclosing
+// type. `Runner.Go<T>` calling `other.Go<T>(x, other)` where `other: Runner`:
+// the substitution `T → T` is bare (the source's own parameter), so the
+// in-SCC self-loop is admitted.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_variable_receiver_uniform_self_call_admitted_spec_14_6_issue_5045) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Runner "
+        "  public method Depth<T>(x: T, n: int, other: Runner): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + other.Depth<T>(x, n - 1, other); "
+        "  end Depth; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
