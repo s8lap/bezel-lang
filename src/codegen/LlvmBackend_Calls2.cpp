@@ -12047,6 +12047,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // pre-pass above or by an outer scope — is left untouched, and a
         // still-bare resolution (the receiver's own type argument is itself
         // an unresolved outer parameter) is skipped rather than recorded.
+        //
+        // fix #5094 (§14.1 / §14.5, v0.307): #5024's own binding below gates
+        // on an EXACT match (`recvTy->declaration == ms->parent`), so an
+        // INHERITED (not overridden) lambda-taking method called through a
+        // SUBCLASS receiver (`SubBox<U>: Box<U>` calling inherited `Apply`)
+        // missed this pre-pass entirely — same bug, same `<109>` instead of
+        // `<m>` output, just one level of inheritance away from #5024's own
+        // repro. The block below now branches: an exact-match receiver keeps
+        // #5024's binding unchanged; a subclass receiver instead asks the
+        // shared #585/#2840 `computeAncestorGenericSubst` walk to compose the
+        // base-chain substitution up to `ms->parent`.
         if (!isStaticMethod(ms) && ms->parent &&
             !ms->parent->genericParams.empty()) {
             bool hasLambdaArgForRecv = false;
@@ -12065,41 +12076,77 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (recvExpr) {
                     sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
                     if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
-                        recvTy->declaration == ms->parent &&
-                        !recvTy->genericArgs.empty()) {
-                        const std::vector<std::string_view> ownerGpNames =
-                            sema::genericParamNames(ms->parent);
-                        if (ownerGpNames.size() ==
-                            recvTy->genericArgs.size()) {
+                        recvTy->declaration) {
+                        std::unordered_map<std::string_view, llvm::Type*>
+                            recvSubst = genericSubst_;
+                        std::unordered_map<std::string_view,
+                                           const sema::TypeRef*>
+                            recvSema = genericSubstSemaTy_;
+                        bool changed = false;
+                        if (recvTy->declaration == ms->parent &&
+                            !recvTy->genericArgs.empty()) {
+                            // Direct-class receiver: #5024's original binding.
+                            const std::vector<std::string_view> ownerGpNames =
+                                sema::genericParamNames(ms->parent);
+                            if (ownerGpNames.size() ==
+                                recvTy->genericArgs.size()) {
+                                for (std::size_t gi = 0;
+                                     gi < ownerGpNames.size(); ++gi) {
+                                    std::string_view pname = ownerGpNames[gi];
+                                    if (recvSubst.count(pname)) continue;
+                                    const sema::TypeRef* argSema =
+                                        substituteTypeRefLocal(
+                                            recvTy->genericArgs[gi],
+                                            genericSubstSemaTy_);
+                                    if (!argSema || isBareTypeParamRef(argSema))
+                                        continue;
+                                    recvSubst[pname] = lowerTypeRef(argSema);
+                                    recvSema[pname] = argSema;
+                                    changed = true;
+                                }
+                            }
+                        } else if (recvTy->declaration != ms->parent) {
+                            // fix #5094 (§14.1 / §14.5, v0.307): the receiver's
+                            // static type is a SUBCLASS of the class that
+                            // DECLARES the callee (an INHERITED, not
+                            // overridden, method) — the exact-match gate above
+                            // (`recvTy->declaration == ms->parent`) misses this
+                            // shape entirely; #5024 only covers the direct-
+                            // class receiver (its own repro never subclasses
+                            // `Box<T>`). Walk the base chain with the shared
+                            // #585/#2840 `computeAncestorGenericSubst`
+                            // authority instead of re-deriving the walk here:
+                            // it already composes each level's
+                            // `baseTypeRefs[i]->genericArgs` against the level
+                            // below, so a pass-through subclass (`SubBox<U>:
+                            // Box<U>`), a fixed base argument (`IntBox:
+                            // Box<char>`), a reordered base-clause param
+                            // (`Pair2<A,B>: Base<B>`), and a two-level chain
+                            // all resolve `ms->parent`'s own param names the
+                            // same way its other call sites already rely on.
                             std::unordered_map<std::string_view, llvm::Type*>
-                                recvSubst = genericSubst_;
+                                ancSubst;
                             std::unordered_map<std::string_view,
                                                const sema::TypeRef*>
-                                recvSema = genericSubstSemaTy_;
-                            bool changed = false;
-                            for (std::size_t gi = 0;
-                                 gi < ownerGpNames.size(); ++gi) {
-                                std::string_view pname = ownerGpNames[gi];
-                                if (recvSubst.count(pname)) continue;
-                                const sema::TypeRef* argSema =
-                                    substituteTypeRefLocal(
-                                        recvTy->genericArgs[gi],
-                                        genericSubstSemaTy_);
-                                if (!argSema || isBareTypeParamRef(argSema))
-                                    continue;
-                                recvSubst[pname] = lowerTypeRef(argSema);
-                                recvSema[pname] = argSema;
-                                changed = true;
-                            }
-                            if (changed) {
-                                if (!didPrePass) {
-                                    preSavedSubst = genericSubst_;
-                                    preSavedSema  = genericSubstSemaTy_;
-                                    didPrePass = true;
+                                ancSema;
+                            if (computeAncestorGenericSubst(
+                                    recvTy, ms->parent, ancSubst, ancSema)) {
+                                for (auto& [pname, argSema] : ancSema) {
+                                    if (recvSubst.count(pname)) continue;
+                                    recvSubst[pname] = ancSubst[pname];
+                                    recvSema[pname] = argSema;
+                                    changed = true;
                                 }
-                                genericSubst_ = std::move(recvSubst);
-                                genericSubstSemaTy_ = std::move(recvSema);
                             }
+                        }
+                        if (changed) {
+                            if (!didPrePass) {
+                                preSavedSubst = genericSubst_;
+                                preSavedSema  = genericSubstSemaTy_;
+                                didPrePass = true;
+                            }
+                            genericSubst_ = std::move(recvSubst);
+                            genericSubstSemaTy_ = std::move(recvSema);
                         }
                     }
                 }
