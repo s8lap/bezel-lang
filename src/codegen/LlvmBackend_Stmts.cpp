@@ -431,6 +431,38 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return diverged_;  // CG40
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #5017 (§5.1 "Nullable conversions", v0.307): the lifted
+        // `S? → T?` conversion at an assignment into a nullable-VALUE slot.
+        // `rhs` is a `{i8 hasValue; S}` struct and `slotTy` the `{i8; T}`
+        // slot with S ≠ T: convert the payload by §5.1's underlying widening
+        // and carry the source's hasValue through unchanged ("a present value
+        // converts by the underlying conversion, `null` converts to `null`").
+        // Mirrors the declaration-initializer path (#840, lowerLocalDecl). A
+        // no-op unless both sides are the tagged-struct shape, the types
+        // differ, and a §5.1 payload widening applies.
+        auto liftNullableValueToSlot = [this](llvm::Value* v,
+                                              llvm::Type* slotTy,
+                                              bool srcUnsigned) {
+            auto isTagged = [this](llvm::Type* t) {
+                auto* st = llvm::dyn_cast<llvm::StructType>(t);
+                return st && st->isLiteral() && st->getNumElements() == 2 &&
+                       st->getElementType(0) == nullablePrimHasValTy();
+            };
+            if (!v || !slotTy || v->getType() == slotTy ||
+                !isTagged(v->getType()) || !isTagged(slotTy))
+                return v;
+            llvm::Type* want = slotPayloadTy(slotTy);
+            llvm::Value* srcInner =
+                builder_.CreateExtractValue(v, {1u}, "lift.in");
+            llvm::Value* conv =
+                coerceNumericToType(srcInner, want, srcUnsigned);
+            if (conv->getType() != want) return v;
+            llvm::Value* hasVal =
+                builder_.CreateExtractValue(v, {0u}, "lift.has");
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(slotTy), hasVal, {0u});
+            return builder_.CreateInsertValue(res, conv, {1u}, "lift.wrap");
+        };
         if (as->target && as->value) {
             // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound
@@ -1361,6 +1393,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     rhs = coerceNumericToType(
                         rhs, slotPayloadTy(elemTy),
                         isUnsignedTargetExpr(*as->value));
+                // fix #5017: the lifted `S? → T?` twin of the `:=` arm below
+                // (same mechanism, same measurement: `x ??= ki;` with
+                // `ki: int? := 4`, `x: double?` printed `0`).
+                if (elemTy)
+                    rhs = liftNullableValueToSlot(
+                        rhs, elemTy, isUnsignedTargetExpr(*as->value));
                 // CG-nullable: wrap a plain primitive RHS into the target's
                 // {hasValue, value} struct (or normalize a null literal).
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
@@ -1527,6 +1565,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (elemTy)
                 rhs = coerceNumericToType(rhs, slotPayloadTy(elemTy),
                                           isUnsignedTargetExpr(*as->value));
+            // fix #5017 (§5.1 "Nullable conversions", v0.307: "`S?`
+            // implicitly converts to `T?` whenever `S` implicitly converts to
+            // `T` — a present value converts by the underlying conversion,
+            // `null` converts to `null`"): a NULLABLE-VALUE RHS of a narrower
+            // payload (`x := ki;` with `ki: int?`, `x: double?`) lowers to the
+            // `{i8, i32}` struct. The #5005 widening above is a no-op on a
+            // struct, and the wrap block below matches only a bare payload,
+            // so the `{i8, i32}` was stored over the `{i8, double}` slot —
+            // MEASURED printing `lift 0` instead of `lift 4`. Convert the
+            // payload and KEEP the source's hasValue (null stays null), the
+            // same shape the declaration-initializer path uses (#840).
+            if (elemTy)
+                rhs = liftNullableValueToSlot(
+                    rhs, elemTy, isUnsignedTargetExpr(*as->value));
             // CG-nullable: if target slot is a nullable-prim struct and
             // rhs is a plain primitive, wrap it (or fix null literal).
             if (elemTy && llvm::isa<llvm::StructType>(elemTy)) {
