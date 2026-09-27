@@ -11,7 +11,13 @@ properties that make that sound, using a fake compiler so they need no clang:
   - a stale .sum never survives a PCH compile: it is removed before the
     compiler runs, so a failed compile or an unparsable depfile leaves none;
   - the PCH compile runs with CCACHE_DISABLE=1 and bypasses the ccache
-    launcher; every other compile is handed to the launcher unchanged.
+    launcher; every other compile is handed to the launcher unchanged;
+  - #5085: an input edited DURING the PCH compile (mtime or, for an rpm-style
+    install that keeps the old mtime, ctime) forces a recompile, so a .sum is
+    never published next to a PCH built from other content; persistent churn
+    fails the build with nothing left behind;
+  - #5085: tests/pch_verify.sh deletes a PCH whose recorded input hashes no
+    longer match (a same-size edit with an OLD mtime, which make misses).
 """
 import os
 import pathlib
@@ -21,15 +27,29 @@ import unittest
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 LAUNCHER = REPO / "tests" / "pch_sum_launcher.sh"
+VERIFY = REPO / "tests" / "pch_verify.sh"
 
 FAKE_CLANG = r"""#!/usr/bin/env bash
 if [ "$1" = --version ]; then echo "fakeclang ${FAKE_VERSION:-1.0}"; exit 0; fi
 [ -n "${FAKE_FAIL:-}" ] && exit 3
 prev=; out=; mf=; src=
 for a; do case $prev in -o) out=$a;; -MF) mf=$a;; -c) src=$a;; esac; prev=$a; done
-# Like clang, the "PCH" embeds the absolute input path.
-echo "pch-of $src ccache_disable=${CCACHE_DISABLE:-}" > "$out"
+# Like clang, the "PCH" embeds the absolute input path, and it records the
+# content of the inputs it was built from (what a real PCH bakes in).
+{ echo "pch-of $src ccache_disable=${CCACHE_DISABLE:-}"; cat $FAKE_DEPS; } > "$out"
 printf '%s: %s \\\n  %s\n' "$out" "$src" "$FAKE_DEPS" > "$mf"
+# #5085 race: a same-size edit of an input lands AFTER the "compile" read it
+# (as a dnf upgrade would), on the first $FAKE_EDIT_TIMES invocations.
+if [ -n "${FAKE_EDIT_AFTER:-}" ]; then
+    n=$(cat "$FAKE_EDIT_COUNTER" 2>/dev/null || echo 0)
+    if [ "$n" -lt "${FAKE_EDIT_TIMES:-1}" ]; then
+        echo $((n + 1)) > "$FAKE_EDIT_COUNTER"
+        sed -i "s/v$n\$/v$((n + 1))/" "$FAKE_EDIT_AFTER"
+        # A package install keeps the package's OLD mtime; only ctime moves.
+        [ -n "${FAKE_EDIT_OLD_MTIME:-}" ] && touch -d 2000-01-01 "$FAKE_EDIT_AFTER"
+    fi
+fi
+exit 0
 """
 
 FAKE_CCACHE = r"""#!/usr/bin/env bash
@@ -48,7 +68,7 @@ class PchSumLauncherTest(unittest.TestCase):
         # An out-of-tree "system" header shared by every tree.
         self.sys_hdr = self.tmp / "sys" / "vector"
         self.sys_hdr.parent.mkdir()
-        self.sys_hdr.write_text("// system header v1\n")
+        self.sys_hdr.write_text("// system header v0\n")
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -88,6 +108,10 @@ class PchSumLauncherTest(unittest.TestCase):
         r = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
         return r, cwd / out
 
+    def _verify(self, pch):
+        return subprocess.run([str(VERIFY), str(pch)], cwd=pch.parent,
+                              capture_output=True, text=True)
+
     def _sum(self, pch):
         s = pathlib.Path(str(pch) + ".sum")
         return s.read_text().strip() if s.exists() else None
@@ -123,7 +147,7 @@ class PchSumLauncherTest(unittest.TestCase):
         tree = self._tree("c")
         _, p3 = self._run(tree)
         before = self._sum(p3)
-        self.sys_hdr.write_text("// system header v2\n")
+        self.sys_hdr.write_text("// system header v8\n")
         _, p3 = self._run(tree)
         self.assertIsNotNone(self._sum(p3))
         self.assertNotEqual(before, self._sum(p3))
@@ -160,6 +184,80 @@ class PchSumLauncherTest(unittest.TestCase):
         r, pch = self._run(tree, env_extra={"FAKE_DEPS": "a\\ b.h"})
         self.assertEqual(r.returncode, 0)
         self.assertIsNone(self._sum(pch))
+
+    # ---- #5085: an input edited DURING the PCH compile -------------------
+
+    def _race_env(self, times, old_mtime=False):
+        env = {"FAKE_EDIT_AFTER": str(self.sys_hdr),
+               "FAKE_EDIT_COUNTER": str(self.tmp / "edit-counter"),
+               "FAKE_EDIT_TIMES": str(times)}
+        if old_mtime:
+            env["FAKE_EDIT_OLD_MTIME"] = "1"
+        return env
+
+    def test_race_edit_once_recompiles_and_sum_matches_the_pch(self):
+        # Pre-fix, the .sum was hashed from the NEW header next to a PCH
+        # holding the OLD one, so a consumer compiled against the stale PCH
+        # was cached under a correct tree's key.
+        r, pch = self._run(self._tree("a"), env_extra=self._race_env(1))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("changed during the PCH compile", r.stderr)
+        self.assertIn("system header v1", pch.read_text())  # rebuilt from the edit
+        self.assertIsNotNone(self._sum(pch))
+        # ...and equal to the sum of a clean build of the edited content.
+        _, clean = self._run(self._tree("b"))
+        self.assertEqual(self._sum(pch), self._sum(clean))
+
+    def test_race_edit_keeping_old_mtime_is_caught_by_ctime(self):
+        r, pch = self._run(self._tree("a"),
+                           env_extra=self._race_env(1, old_mtime=True))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("changed during the PCH compile", r.stderr)
+        self.assertIn("system header v1", pch.read_text())
+        _, clean = self._run(self._tree("b"))
+        self.assertEqual(self._sum(pch), self._sum(clean))
+
+    def test_race_edit_on_every_attempt_fails_with_nothing_published(self):
+        tree = self._tree("a")
+        _, pch = self._run(tree)
+        self.assertIsNotNone(self._sum(pch))
+        r, pch = self._run(tree, env_extra=self._race_env(3))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("kept changing", r.stderr)
+        for suffix in ("", ".sum", ".inputs", ".stamp"):
+            self.assertFalse(pathlib.Path(str(pch) + suffix).exists(), suffix)
+
+    # ---- #5085: tests/pch_verify.sh (within-tree staleness) --------------
+
+    def test_verify_keeps_a_pch_whose_inputs_are_unchanged(self):
+        _, pch = self._run(self._tree("a"))
+        self.assertTrue(pathlib.Path(str(pch) + ".inputs").exists())
+        r = self._verify(pch)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(pch.exists())
+        self.assertIsNotNone(self._sum(pch))
+
+    def test_verify_deletes_a_pch_after_a_same_size_edit_with_old_mtime(self):
+        _, pch = self._run(self._tree("a"))
+        before = self.sys_hdr.stat().st_size
+        self.sys_hdr.write_text("// system header v5\n")   # rpm-style update
+        os.utime(self.sys_hdr, (0, 0))                       # OLD mtime
+        self.assertEqual(self.sys_hdr.stat().st_size, before)
+        r = self._verify(pch)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stale", r.stderr)
+        for suffix in ("", ".sum", ".inputs"):
+            self.assertFalse(pathlib.Path(str(pch) + suffix).exists(), suffix)
+
+    def test_verify_deletes_an_unverifiable_pch_and_ignores_a_missing_one(self):
+        _, pch = self._run(self._tree("a"))
+        pathlib.Path(str(pch) + ".inputs").unlink()
+        r = self._verify(pch)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(pch.exists())
+        self.assertIsNone(self._sum(pch))
+        r = self._verify(pch)   # nothing to check: a no-op
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
 
 
 if __name__ == "__main__":

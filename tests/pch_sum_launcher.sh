@@ -38,6 +38,12 @@
 # applies to anything this script cannot parse (a missing/odd depfile, an
 # escaped path): no .sum, one warning line.
 #
+# RACES AND SILENT STALENESS (#5085) -- see the stamp check below, and
+# tests/pch_verify.sh, which re-checks <pch>.inputs before every build and
+# deletes a PCH whose inputs changed since it was built (make alone misses a
+# package update that installs headers with OLD mtimes, and clang does not
+# revalidate system headers from a PCH).
+#
 # Every non-PCH compile of the target (pch_owner.cpp) is passed straight to
 # ccache with the given KEY=VALUE settings.
 set -u
@@ -74,13 +80,6 @@ if [ -z "$out" ]; then
     CCACHE_DISABLE=1 exec "$@"
 fi
 
-# Fail closed FIRST: from here on a stale .sum can never describe a new PCH.
-rm -f -- "$out.sum" "$out.sum.tmp" || exit 1
-
-CCACHE_DISABLE=1 "$@"
-rc=$?
-[ "$rc" -eq 0 ] || exit "$rc"
-
 norm() {  # replace both spellings of the tree root with a fixed placeholder
     local s=$1
     s=${s//"$tree"/@TREE@}
@@ -88,22 +87,61 @@ norm() {  # replace both spellings of the tree root with a fixed placeholder
     printf '%s\n' "$s"
 }
 
-if [ -z "$depfile" ] || [ ! -f "$depfile" ]; then
-    warn "no depfile (-MF) from the PCH compile"; exit 0
-fi
-# Make-syntax depfile: "target: dep dep \<newline> dep ...". Paths with
-# escaped characters are not expected here; refuse rather than mis-split.
-deptext=$(sed -e 's/\\$//' -- "$depfile" | tr '\n' ' ')
-case "$deptext" in *\\*|*'$$'*) warn "escaped path in $depfile"; exit 0 ;; esac
-case "$deptext" in *": "*) deptext=${deptext#*": "} ;; *) warn "unparsable $depfile"; exit 0 ;; esac
-read -r -a deps <<<"$deptext"
-if [ "${#deps[@]}" -eq 0 ]; then warn "empty depfile $depfile"; exit 0; fi
-for d in "${deps[@]}"; do
-    [ -f "$d" ] || { warn "depfile entry is not a file: $d"; exit 0; }
-done
+# #5085: an input that changes WHILE the PCH compiles (a `dnf upgrade`
+# replacing a same-size header) must not yield a .sum that describes the new
+# content next to a .pch built from the old: clang does not revalidate system
+# headers from a PCH at all (and user headers by size only under
+# -fno-pch-timestamp), so a consumer would compile against the stale PCH and
+# be stored under the key of a correct tree. So: take a stamp BEFORE the
+# compile, hash the inputs AFTER it, and only then check that no input has an
+# mtime or ctime AT OR AFTER the stamp's (nanosecond stat, inclusive, so an
+# edit in the stamp's own timestamp tick counts; a false positive only costs a
+# recompile). ctime also catches a rename-install that keeps the package's old
+# mtime. If one has, the hashes may not match what clang read: recompile
+# (the header is normally stable again), and after $attempts tries fail the
+# build loudly with no .pch, .sum or .inputs left behind.
+attempts=3
+stamp="$out.stamp"
+cleanup() { rm -f -- "$out.sum.tmp" "$out.inputs.tmp" "$stamp"; }
+for attempt in $(seq 1 "$attempts"); do
+    # Fail closed FIRST: from here on a stale .sum can never describe a new
+    # PCH, and a stale .inputs can never vouch for one (tests/pch_verify.sh).
+    rm -f -- "$out.sum" "$out.inputs" || exit 1
+    cleanup
+    : >"$stamp" && ref=$(stat -c %.9Y -- "$stamp") || exit 1
 
-compiler_version=$(CCACHE_DISABLE=1 "$1" --version 2>&1) || { warn "'$1 --version' failed"; exit 0; }
-dep_hashes=$(sha256sum -- "${deps[@]}") || { warn "hashing the PCH inputs failed"; exit 0; }
+    CCACHE_DISABLE=1 "$@"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then cleanup; exit "$rc"; fi
+
+    if [ -z "$depfile" ] || [ ! -f "$depfile" ]; then
+        cleanup; warn "no depfile (-MF) from the PCH compile"; exit 0
+    fi
+    # Make-syntax depfile: "target: dep dep \<newline> dep ...". Paths with
+    # escaped characters are not expected here; refuse rather than mis-split.
+    deptext=$(sed -e 's/\\$//' -- "$depfile" | tr '\n' ' ')
+    case "$deptext" in *\\*|*'$$'*) cleanup; warn "escaped path in $depfile"; exit 0 ;; esac
+    case "$deptext" in *": "*) deptext=${deptext#*": "} ;; *) cleanup; warn "unparsable $depfile"; exit 0 ;; esac
+    read -r -a deps <<<"$deptext"
+    if [ "${#deps[@]}" -eq 0 ]; then cleanup; warn "empty depfile $depfile"; exit 0; fi
+    for d in "${deps[@]}"; do
+        [ -f "$d" ] || { cleanup; warn "depfile entry is not a file: $d"; exit 0; }
+    done
+
+    compiler_version=$(CCACHE_DISABLE=1 "$1" --version 2>&1) || { cleanup; warn "'$1 --version' failed"; exit 0; }
+    dep_hashes=$(sha256sum -- "${deps[@]}") || { cleanup; warn "hashing the PCH inputs failed"; exit 0; }
+
+    times=$(stat -c '%.9Y %.9Z %n' -- "${deps[@]}") || { cleanup; warn "stat of the PCH inputs failed"; exit 0; }
+    changed=$(awk -v r="$ref" '$1 >= r || $2 >= r { print substr($0, index($0, $3)); exit }' <<<"$times")
+    if [ -z "$changed" ]; then break; fi
+    echo "pch_sum_launcher.sh: PCH input changed during the PCH compile (attempt $attempt/$attempts): $changed" >&2
+    if [ "$attempt" -eq "$attempts" ]; then
+        cleanup
+        rm -f -- "$out"
+        echo "pch_sum_launcher.sh: error: PCH inputs kept changing; removed $out. Re-run the build once the headers are stable." >&2
+        exit 1
+    fi
+done
 
 {
     echo "bezel-pch-sum v1"
@@ -112,6 +150,13 @@ dep_hashes=$(sha256sum -- "${deps[@]}") || { warn "hashing the PCH inputs failed
     for a in "$@"; do norm "$a"; done
     echo "--- inputs"
     while IFS= read -r line; do norm "$line"; done <<<"$dep_hashes"
-} | sha256sum | cut -d' ' -f1 >"$out.sum.tmp" || { rm -f -- "$out.sum.tmp"; warn "writing the sum failed"; exit 0; }
-mv -f -- "$out.sum.tmp" "$out.sum" || { rm -f -- "$out.sum.tmp"; warn "renaming the sum failed"; exit 0; }
+} | sha256sum | cut -d' ' -f1 >"$out.sum.tmp" || { cleanup; warn "writing the sum failed"; exit 0; }
+# .inputs: the exact input hashes this PCH was built from, in `sha256sum -c`
+# form, for tests/pch_verify.sh (the within-tree half of #5085). Written
+# BEFORE the .sum is published, so a published .sum always has one.
+printf '%s\n' "$dep_hashes" >"$out.inputs.tmp" \
+    && mv -f -- "$out.inputs.tmp" "$out.inputs" \
+    && mv -f -- "$out.sum.tmp" "$out.sum" \
+    || { rm -f -- "$out.sum" "$out.inputs"; cleanup; warn "publishing the sum failed"; exit 0; }
+cleanup
 exit 0

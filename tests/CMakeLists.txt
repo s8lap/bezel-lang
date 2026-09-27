@@ -350,7 +350,20 @@ if(BEZEL_CCACHE_RELOCATABLE)
     set_target_properties(bezel_tests_pch PROPERTIES CXX_COMPILER_LAUNCHER
         "${CMAKE_CURRENT_SOURCE_DIR}/pch_sum_launcher.sh;${CMAKE_SOURCE_DIR};${BEZEL_SOURCE_DIR_REAL};${BEZEL_CCACHE_RELOCATABLE_LAUNCHER};--")
     set_property(TARGET bezel_tests_pch APPEND PROPERTY ADDITIONAL_CLEAN_FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.sum)
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.sum
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.inputs)
+    # #5085: before every build, re-check the content of every PCH input
+    # against the hashes the launcher recorded, and delete a PCH whose inputs
+    # changed. make alone keys on mtimes, which a package update can leave OLDER
+    # than the PCH, and clang does not revalidate system headers from a PCH.
+    # Always-run (no OUTPUT); ordered before the PCH rule by the target
+    # dependency, and every group reaches the PCH through REUSE_FROM.
+    add_custom_target(bezel_tests_pch_verify
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/pch_verify.sh
+                CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        VERBATIM)
+    add_dependencies(bezel_tests_pch bezel_tests_pch_verify)
 endif()
 
 function(bezel_add_test_binary group)
