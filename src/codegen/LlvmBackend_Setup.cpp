@@ -8783,8 +8783,21 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     llvm::Function* specFn =
                         buildSpecializedAccessorFn(ts, pimpl, isSet);
                     if (!specFn || specFn == canon) return;
-                    if (specFn->getFunctionType() != canon->getFunctionType())
-                        return;
+                    // fix #5058 (§11.2 / §14.1 / §23, v0.307): NO "function
+                    // type must equal the template's" guard here. A reference
+                    // `T` moves the accessor's signature (`T -> i32` erased vs
+                    // `ptr` substituted), which is exactly the slot that most
+                    // needs the specialization; the guard left it on the
+                    // erased template, so `I<string>.Q` read the handle back
+                    // as an i32 (empty string) and `I<Node>.Q.N` SEGV'd. Unlike
+                    // a SHARED vtable slot (#2906's (c)/(d) guard, whose ABI
+                    // is fixed by every receiver's static type), this itab is
+                    // a fresh per-instantiation clone reached only through an
+                    // `I<...>` view whose interface-side dispatch types the
+                    // call under the SAME substitution — the METHOD loop above
+                    // and patchConcreteDerivedGenericBaseItables (#4933/#4950)
+                    // already install signature-moving specializations on
+                    // that premise.
                     newItabElems[si] = llvm::cast<llvm::Constant>(specFn);
                 };
                 if (auto git = ifacePropertyGetIndex_.find(ip);
