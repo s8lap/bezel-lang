@@ -608,10 +608,25 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
 // v0.172 (#812/#1339, stdlib §2.18): the floating round-trip guarantee.
 // `double`/`float` no-format ToString() and the "R" specifier both produce the
 // SHORTEST decimal string that reparses to the identical bit pattern. Search
-// precisions 1..N with "%.*g", reparse with strtod/strtof, and take the first
+// precisions 1..N with "%.*e" (always a definite digit-string + exponent,
+// independent of notation), reparse with strtod/strtof, and take the first
 // that is bit-identical to the input (memcmp of the raw bits — distinguishes
 // -0.0 from 0.0 and never mistakes a NaN payload for an exact match). Correctness
 // over speed per CLAUDE.md; no caching.
+//
+// fix #5079 (stdlib §2.18, v0.307): §2.18 states the SHORTEST STRING, not
+// merely the fewest significant digits. The prior version searched with
+// "%.*g", which inherits C's own fixed/scientific switch (use scientific iff
+// exponent < -4 or exponent >= precision) — a rule that is wrong once the
+// digit count is itself minimized: 200.0 needs only 1 significant digit, so
+// %g's own rule (exponent 2 >= precision 1) forced scientific notation
+// ("2e+02", 5 chars) even though the fixed form ("200", 3 chars) is shorter
+// and round-trips identically. `bz_render_shortest` below renders BOTH the
+// fixed-point and scientific forms of the found minimal digit string and
+// returns whichever is not longer, ties favoring fixed — issue #5079's own
+// recommendation ("prefer plain decimal notation over scientific notation
+// when it round-trips and is not longer"), and the only reading of "shortest
+// string" that needs no invented exponent threshold.
 // ---------------------------------------------------------------------------
 
 // Build a fresh heap bz_string* (rc := 1) wrapping a copy of buf[0..len).
@@ -624,30 +639,104 @@ void* bz_make_string(const char* buf, int64_t len) {
     return sh;
 }
 
+// fix #5079 (stdlib §2.18, v0.307): `sciBuf[0..sciLen)` is a round-tripping
+// "%.*e"-style rendering ("[-]d[.ddd]e[+-]NN") of the shortest digit string
+// found by the search loop below. Parse it into sign / digit string /
+// exponent, render the equivalent fixed-point form, and choose between the
+// two textual forms as follows:
+//
+//   - exp >= 0: this is where the reported bug lives. C's own "%g" switches
+//     to scientific whenever exponent >= precision, which is wrong once the
+//     digit count is itself minimized (200.0 needs only 1 significant digit,
+//     so %g's rule, 2 >= 1, forces "2e+02" even though "200" is shorter and
+//     round-trips identically). So for exp >= 0 compare literal lengths and
+//     return whichever form is not longer, ties favoring fixed.
+//   - exp < 0: this side was never buggy — C99's negative-exponent notation
+//     switch (scientific iff exponent < -4) is independent of precision, so
+//     it cannot be defeated by minimizing the digit count the way the
+//     positive-exponent side can. A literal-length comparison here would
+//     actually regress a case the issue itself confirms as correct: 0.0001
+//     (exp -4) is "0.0001" (6 chars) vs "1e-04" (5 chars) — shorter
+//     literally, but #5079 states the fixed form is the correct rendering.
+//     So for exp < 0, keep applying the original exponent >= -4 threshold
+//     directly rather than a length comparison.
+static void* bz_render_shortest(const char* sciBuf, int sciLen) {
+    bool neg = sciBuf[0] == '-';
+    int i = neg ? 1 : 0;
+    char digits[24]; int nd = 0;
+    digits[nd++] = sciBuf[i++];
+    if (sciBuf[i] == '.') {
+        ++i;
+        while (sciBuf[i] != 'e' && sciBuf[i] != 'E') digits[nd++] = sciBuf[i++];
+    }
+    ++i;  // skip 'e'/'E'
+    int exp = atoi(sciBuf + i);
+
+    // Fixed-point candidate: up to ~324 leading/trailing zeros at the extremes
+    // of double's exponent range (DBL_TRUE_MIN / DBL_MAX), plus sign, point,
+    // and up to 17 significant digits — 512 bytes is ample headroom.
+    char fixedBuf[512]; int fp = 0;
+    if (neg) fixedBuf[fp++] = '-';
+    if (exp >= 0) {
+        for (int k = 0; k <= exp; ++k)
+            fixedBuf[fp++] = (k < nd) ? digits[k] : '0';
+        if (nd > exp + 1) {
+            fixedBuf[fp++] = '.';
+            for (int k = exp + 1; k < nd; ++k) fixedBuf[fp++] = digits[k];
+        }
+        if (fp <= sciLen) return bz_make_string(fixedBuf, fp);
+        return bz_make_string(sciBuf, sciLen);
+    }
+
+    // exp < 0: original %g-style threshold, not a length comparison (see
+    // rationale above).
+    if (exp >= -4) {
+        fixedBuf[fp++] = '0';
+        fixedBuf[fp++] = '.';
+        for (int k = 0; k < -exp - 1; ++k) fixedBuf[fp++] = '0';
+        for (int k = 0; k < nd; ++k) fixedBuf[fp++] = digits[k];
+        return bz_make_string(fixedBuf, fp);
+    }
+    return bz_make_string(sciBuf, sciLen);
+}
+
 // per stdlib §2.18 (R format / no-format ToString()): double round-trip.
 // Search 1..17 — IEEE 754 double's exact-decimal precision is 17 digits.
 extern "C" void* bz_double_to_string_r(double v) {
+    // NaN / the infinities have no digit-string/notation choice to make;
+    // render them exactly as before this fix (out of #5079's scope, which is
+    // about the shortest-string choice for FINITE values).
+    if (std::isnan(v) || std::isinf(v)) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%g", v);
+        return bz_make_string(buf, n);
+    }
     char buf[64];
     int n = 0;
     for (int prec = 1; prec <= 17; ++prec) {
-        n = snprintf(buf, sizeof(buf), "%.*g", prec, v);
+        n = snprintf(buf, sizeof(buf), "%.*e", prec - 1, v);
         double rt = strtod(buf, nullptr);
         if (memcmp(&rt, &v, sizeof(double)) == 0) break;  // exact round-trip
     }
-    return bz_make_string(buf, n);
+    return bz_render_shortest(buf, n);
 }
 
 // per stdlib §2.18 (R format / no-format ToString()): float round-trip.
 // Search 1..9 — IEEE 754 float's exact-decimal precision is 9 digits.
 extern "C" void* bz_float_to_string_r(float v) {
+    if (std::isnan(v) || std::isinf(v)) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%g", (double)v);
+        return bz_make_string(buf, n);
+    }
     char buf[64];
     int n = 0;
     for (int prec = 1; prec <= 9; ++prec) {
-        n = snprintf(buf, sizeof(buf), "%.*g", prec, (double)v);
+        n = snprintf(buf, sizeof(buf), "%.*e", prec - 1, (double)v);
         float rt = strtof(buf, nullptr);
         if (memcmp(&rt, &v, sizeof(float)) == 0) break;   // exact round-trip
     }
-    return bz_make_string(buf, n);
+    return bz_render_shortest(buf, n);
 }
 
 // v0.172 (stdlib §2.18): integer "B"/"Bn" — binary, no leading zeros beyond the
