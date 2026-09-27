@@ -17460,13 +17460,51 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                            methodSignatureString("", params);
         }
         // resolveOverload uses one shared argument vector across candidates,
-        // so each column must be the same call argument for every candidate;
-        // fall back if the bound shapes diverge (uncommon for ctor overloads).
+        // so each column must be the same call argument for every candidate.
+        // Fall back if the bound shapes diverge (uncommon for ctor overloads).
         const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
+        bool bindingsDiffer = false;
         for (std::size_t c = 0; c < decls.size(); ++c) {
             if (argIdxRows[c].size() != argIdxRows[0].size()) return;
             for (std::size_t i = 0; i < argIdxRows[c].size(); ++i)
-                if (argIdxRows[c][i] != argIdxRows[0][i]) return;
+                if (argIdxRows[c][i] != argIdxRows[0][i]) bindingsDiffer = true;
+        }
+        // fix #4780 (§22.6 stage 8, v0.307): named-arg calls that produce
+        // different bindings for each candidate (e.g. `a := 1, b := "x"`
+        // against `(a:int,b:string)` vs `(b:string,a:int)`) used to fall
+        // through silently — resolveOverload was never called because
+        // argIdxRows differed, and codegen's ctorForArgs picked the first-in-
+        // member-order candidate. When every candidate has identical argType
+        // rows and no filled defaults, all conversions are equal → stage 8
+        // ambiguity. Emit the diagnostic directly.
+        if (bindingsDiffer && decls.size() >= 2) {
+            // Check: every argument converts EXACTLY to its bound parameter
+            // type for ALL candidates. If so, all candidates are applicable
+            // with identical conversions → §22.6 stage 8 ambiguity.
+            bool allExact = true;
+            for (std::size_t i = 0; i < argTypes.size(); ++i) {
+                for (std::size_t c = 0; c < decls.size(); ++c) {
+                    int pos = argIdxRows[c][i];
+                    if (!typeRefEqual(argTypes[i], paramTypes[c][pos])) {
+                        allExact = false;
+                        break;
+                    }
+                }
+                if (!allExact) break;
+            }
+            if (allExact) {
+                std::string msg = "ambiguous call to `new " + std::string(t->name) +
+                                  "`: no overload is unambiguously better (§22.6); "
+                                  "candidates:";
+                for (std::size_t c = 0; c < decls.size(); ++c) {
+                    msg += "\n  ";
+                    msg += candNames[c];
+                }
+                msg += "\nadd an explicit cast (§5.2) so exactly one candidate "
+                       "is an exact match";
+                ctx_.diagnostics().report(Severity::Error, ne.span.begin, msg);
+                return;
+            }
         }
         // resolveOverload emits the ambiguous / unreachable diagnostic; the
         // winner needs no further per-argument check (each arg is already
@@ -17506,6 +17544,13 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                                 es.push_back(a.value.get());
                             return es;
                         }());
+        // fix #4780 (§22.6 stage 8, v0.307): resolveOverload returns
+        // Ambiguous when it finds multiple applicable candidates with
+        // identical conversions. The caller must not fall through silently.
+        if (newRes.outcome == OverloadOutcome::Ambiguous) {
+            // resolveOverload already reported the diagnostic.
+            return;
+        }
         if (newRes.outcome == OverloadOutcome::Resolved &&
             newRes.winnerIndex < declSyms.size())
             ctx_.setResolvedNewCtor(&ne.args, declSyms[newRes.winnerIndex]);
