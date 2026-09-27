@@ -210,7 +210,16 @@ export BEZEL_JOBSERVER=off
 # process's comm from the invoked pathname's basename — so a real ninja build
 # has comm `ninja-build`, which the bare `ninja` alternative does NOT match
 # under `-x`'s whole-string anchoring (same class of gap as #5080/#5083; #5087).
-BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|ninja-build|make|bezel_tests(_[a-z]+)?'
+# NB `clang(\+\+)?`: the mandated toolchain (CLAUDE.md's Build toolchain
+# section) is clang++, whose comm is `clang` or `clang++` — clang does not
+# fork a separate backend process the way GCC forks `cc1plus`. A bare
+# `clang++` alternative would repeat the exact metacharacter bug this project
+# already paid for once (`pgrep -x 'clang++'` treats `+` as an ERE repetition
+# operator, not a literal, so it does NOT mean "the literal string clang++");
+# escaping the `+`s makes `clang(\+\+)?` match exactly `clang` or `clang++`,
+# and -x's whole-string anchoring means it still cannot match `clangd` or a
+# versioned `clang-19` (#5093).
+BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|ninja-build|make|clang(\+\+)?|bezel_tests(_[a-z]+)?'
 # Sibling detection for the preflight (gate-infra preflight-lockfile lane):
 # when the ONLY matched builders are processes descended from another gate, do
 # NOT report them as "builders active" — they are this gate's own workers, not

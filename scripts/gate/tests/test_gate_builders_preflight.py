@@ -1,4 +1,5 @@
-"""gate.sh's own zero-builders preflight recognises ninja-build (#5087).
+r"""gate.sh's own zero-builders preflight recognises ninja-build (#5087) and
+clang/clang++ (#5093).
 
 `scripts/gate.sh`'s BUILDERS alternation (matched via `pgrep -x "$BUILDERS"`)
 had the exact same gap #5080/#5083 already fixed elsewhere: Fedora's ninja
@@ -9,12 +10,21 @@ under `-x`'s whole-string anchoring. The preflight is the gate's own
 cold-cache-flake defense (see the comment above BUILDERS in gate.sh): it must
 read a live `ninja-build` build as "builders active", not CLEAN.
 
+#5093: the same BUILDERS line also lacked `clang`/`clang++` entirely —
+`cc1plus` (a GCC-only backend name) was present while the mandated toolchain
+itself (CLAUDE.md's Build toolchain section) was not, so a live clang++
+compile was invisible to this preflight too. The fix escapes the `+`s
+(`clang(\+\+)?`), because a bare `clang++` alternative would repeat the exact
+metacharacter bug CLAUDE.md's "Gate protocol" #3 already documents for
+`no_builders.sh`'s predecessor: under `pgrep -x`'s ERE, an unescaped `+` is a
+repetition operator, not a literal character.
+
 This test does not invoke gate.sh itself (it builds/tests for real and has
 many side effects) or run pgrep against a live process table (nondeterministic
 and not hermetic). Instead it extracts the literal `BUILDERS='...'` value
 from the script and reproduces `pgrep -x`'s matching semantics directly:
 `-x` anchors the ERE to the WHOLE comm string, which Python's `re.fullmatch`
-models exactly for this pattern (plain alternation plus one optional group,
+models exactly for this pattern (plain alternation plus two optional groups,
 no POSIX character classes, backreferences, or other ERE/PCRE divergences)."""
 
 import os
@@ -59,12 +69,26 @@ class BuildersPatternTest(unittest.TestCase):
                     re.fullmatch(pattern, comm),
                     f"BUILDERS={pattern!r} no longer matches {comm!r}")
 
+    def test_clang_comms_match_under_pgrep_x_semantics(self):
+        pattern = _builders_pattern()
+        # pgrep -x anchors the ERE to the whole comm; re.fullmatch models that.
+        for comm in ("clang", "clang++"):
+            with self.subTest(comm=comm):
+                self.assertIsNotNone(
+                    re.fullmatch(pattern, comm),
+                    f"BUILDERS={pattern!r} does not match comm {comm!r} under "
+                    "pgrep -x whole-string semantics (#5093) — a live clang++ "
+                    "build would read as CLEAN")
+
     def test_non_builder_comms_do_not_spuriously_match(self):
         pattern = _builders_pattern()
         # Includes the gate driver names themselves, confirming the pattern
         # still cannot self-match (per gate.sh's own comment on BUILDERS).
+        # `clangd` (the language server, not a builder) pins that the
+        # `clang(\+\+)?` group's anchored match does not spuriously accept an
+        # extra trailing character (#5093).
         for comm in ("bash", "python3", "sshd", "gate.sh", "gate_and_push.sh",
-                     "bezelc"):
+                     "bezelc", "clangd"):
             with self.subTest(comm=comm):
                 self.assertIsNone(
                     re.fullmatch(pattern, comm),

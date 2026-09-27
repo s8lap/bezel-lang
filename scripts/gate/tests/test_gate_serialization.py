@@ -167,7 +167,7 @@ class _DetachedProc(object):
 
 
 def _spawn_detached(argv, argv0=None):
-    """Spawn `argv` REPARENTED AWAY from this test runner, and return a
+    r"""Spawn `argv` REPARENTED AWAY from this test runner, and return a
     `_DetachedProc`. Raises `RuntimeError` if the fixture cannot be
     established — a broken fixture must report as a broken fixture, not as a
     failure of the predicate under test.
@@ -189,7 +189,8 @@ def _spawn_detached(argv, argv0=None):
     The fix is to give the fixture a genuinely clean ancestry rather than to
     weaken the predicate. `is_gate_sibling` is correct in production, where its
     only call site passes pids from `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|
-    ninja-build|make|bezel_tests*` and so never sees a gate-named process. A detached
+    ninja-build|make|clang(\+\+)?|bezel_tests*` and so never sees a gate-named
+    process. A detached
     fixture is also the *faithful* model of what these tests describe — a
     "foreign builder" that is not part of this gate — which a child of the
     test runner can never be.
