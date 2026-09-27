@@ -840,6 +840,26 @@ private:
     // which is a NullCondMemberExpr (not wrapped in a CallExpr).
     void recordGenericMemberSelfEdge(const ast::NullCondMemberExpr& ncm, Scope* scope);
 
+    // fix #5082 (§14.6, v0.307): shared receiver-type resolver for the two
+    // overloads above — a §14.6 self-edge's RECEIVER (the expression the
+    // `.member<...>` / `?.member<...>` is accessed on) is `this`, the
+    // enclosing type's own name, a local/parameter of the enclosing type, or
+    // a field-access chain (`this.a.b`) whose FINAL link's declared type is
+    // the enclosing type. Before this fix each of the three recording sites
+    // (the `.` form, the `?.` form nested in a CallExpr, and the standalone
+    // `?.` overload) re-implemented its own subset of this check, so a
+    // variable receiver was found only via `currentMethodDecl_->params` in
+    // the `?.` arms (#5082's title) and a field-chain receiver was rejected
+    // outright everywhere (the field half of #5082). Returns nullptr when
+    // the receiver's type cannot be resolved to the enclosing type, in which
+    // case the caller declines to record an edge (under-recording is a
+    // documented residual, per the "Recording is deliberately generous"
+    // comment on recordGenericMemberSelfEdge — an OVER-recorded edge is the
+    // one that must never happen: it would make an unrelated same-named
+    // member's call a false self-loop and over-reject the enclosing method).
+    TypeSymbol* resolveGenericSelfEdgeReceiverType(const ast::Expr& recv,
+                                                    Scope* scope);
+
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
     // Slice S14: within one type, two members that aren't both

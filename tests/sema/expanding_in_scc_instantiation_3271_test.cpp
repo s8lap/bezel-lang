@@ -748,3 +748,208 @@ BEZEL_TEST(expanding_in_scc_instantiation_3271,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
 }
+
+// §14.6 / #5082: variable-receiver self-edge — locals and fields.
+// The #5045 fix added recordGenericMemberSelfEdge overloads for
+// MemberAccessExpr and NullCondMemberExpr, but only accepted `this` and
+// `C.this` spellings. fix #5082 (§14.6, v0.307) extends both arms to
+// also accept a local variable or field whose declared type is the enclosing
+// type — the same substitution that `this` carries — so `local.Go<…>(…)`
+// and `this.field.Go<…>(…)` record a self-edge and the expanding-
+// instantiation check fires on them too.
+// =========================================================================
+
+// ADMITTED — field receiver with bare substitution.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_field_receiver_bare_subst_admitted_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Runner "
+        "  public other: Runner; "
+        "  public constructor() "
+        "    this.other := new Runner(); "
+        "  end constructor; "
+        "  public method Depth<T>(x: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + this.other.Depth<T>(x, n - 1); "
+        "  end Depth; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// ADMITTED — NullCondMemberExpr with bare `this?.` (existing behavior).
+// This controls that the NullCondMemberExpr arm doesn't over-reject.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_nullcond_this_bare_subst_admitted_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Runner "
+        "  public other: Runner?; "
+        "  public constructor() "
+        "    this.other := new Runner(); "
+        "  end constructor; "
+        "  public method Depth<T>(x: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + (this?.Depth<T>(x, n - 1) ?? 0); "
+        "  end Depth; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// REJECTED — NullCondMemberExpr with expanding substitution via `this?.`.
+// The `?.` on `this` is a no-op wrapper; the expanding substitution is the
+// same as the plain `this.Go<Pair<T,T>>` case and is correctly rejected.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_nullcond_this_expanding_subst_rejected_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return (this?.Go<Pair<T, T>>(p) ?? 0); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+
+// REJECTED — field receiver with expanding substitution via dot form.
+// fix #5082 (§14.6, v0.307): `this.other.Go<Pair<T,T>>(p)` inside `Go<T>`
+// is a MemberAccessExpr whose target is another MemberAccessExpr
+// (`this.other`). The fix walks this chain to its root (`this`) and records
+// the self-edge. Without the fix, no self-edge is recorded and the
+// expanding substitution (Pair<T,T> substituted for T) is NOT rejected —
+// the call is incorrectly admitted.  This is the actual bug case from #5082.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_field_receiver_expanding_subst_rejected_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public other: Runner; "
+        "  public constructor() "
+        "    this.other := new Runner(); "
+        "  end constructor; "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return this.other.Go<Pair<T, T>>(p); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// NOTE on the issue title's "locals" half (#5082/#5111 relationship):
+// a genuine LOCAL-variable receiver (`using var other := new Runner();` /
+// `const other: Runner := ...;`, looked up via `lookupName` inside
+// resolveGenericSelfEdgeReceiverType) is deliberately NOT covered by this fix
+// and has no test here asserting rejection — MEASURED, not assumed: every
+// `LocalSymbol` in this compiler is constructed in ExprTypecheck_Exprs.cpp or
+// ExprTypecheck.cpp (`ctx_.makeSymbol<LocalSymbol>()`), both later passes;
+// `Resolver::resolveTypesInStmt` (this file) walks a LocalDecl/LocalConstDecl
+// only to resolve its type annotation and initializer — it registers no
+// Symbol into `scope` at all. So `lookupName(rootId->name, scope)` can never
+// return a LocalSymbol at the point recordGenericMemberSelfEdge runs, with or
+// without an explicit `: Type` annotation on the local. An annotated-local
+// variant of the test below was tried and FAILS (bezelc admits the expanding
+// substitution with no §14.6 diagnostic) for exactly this reason — the same
+// root cause #5111 diagnosed for its own (unannotated) repro. This lane does
+// not fix #5111; see the handback report for the full comparison against
+// what #5045 already covers (parameters, via a decl-level scan that does not
+// need `lookupName`) and what this fix adds (fields, via a field-chain walk
+// that also does not need `lookupName`).
+
+// REJECTED — field receiver via the null-conditional form.
+// fix #5082 (§14.6, v0.307): the standalone NullCondMemberExpr overload
+// previously found only `this` and a params-scan variable — a field receiver
+// through `?.` (`this.other?.Go<...>`, a MemberAccessExpr target rather than
+// a bare identifier) was rejected outright. `other: Runner?` here is a
+// FIELD, and its declared type (the enclosing type, nullable) makes this the
+// same self-loop as the dot-form field-receiver case, so the expanding
+// substitution must be rejected exactly as it is for the dot form.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_field_receiver_nullcond_form_expanding_rejected_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public other: Runner?; "
+        "  public constructor() "
+        "    this.other := new Runner(); "
+        "  end constructor; "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return this.other?.Go<Pair<T, T>>(p) ?? 0; "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// ADMITTED — field-chain receiver through an UNRELATED type must NOT be
+// mistaken for a self-edge. R22 integrator review point (2) of the original
+// #5082 attempt (268a6c4e, p22-5082-c27): a field-chain walk that accepts
+// ANY `this.a.b...` chain rooted at `this`, without checking each link's OWN
+// declared type, would misrecord `this.helper.Go<...>` as a self-edge of
+// `Runner.Go` merely because `Helper` happens to also declare a same-named,
+// same-arity generic method `Go<T>`. `helper: Helper` is a field of a
+// DIFFERENT class, so this call is Helper.Go's own (non-recursive)
+// instantiation, not a self-loop of Runner.Go, and must be admitted.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_field_receiver_unrelated_type_admitted_spec_14_6_issue_5082) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Helper "
+        "  public method Go<T>(x: T): int "
+        "    return 0; "
+        "  end Go; "
+        "end Helper; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public helper: Helper; "
+        "  public constructor() "
+        "    this.helper := new Helper(); "
+        "  end constructor; "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return this.helper.Go<Pair<T, T>>(p); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}

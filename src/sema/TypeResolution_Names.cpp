@@ -7,6 +7,7 @@
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
 #include "sema/ConstFold.hpp"
 #include "sema/ExprTypecheck_impl.hpp"  // isValidRangeElementType / rangeElementTypeName — fix #3247 / §16.3
+#include "sema/FieldSymbolAccessors.hpp"  // fieldDeclTypeOf — fix #5082 (§14.6, v0.307)
 #include "sema/SubstArgs.hpp"  // fix #4212: shared generic-substitution walker (§14.1 / §27.8, v0.298)
 
 namespace bezel::sema {
@@ -4177,27 +4178,183 @@ void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
     asTargetSites_.push_back({name, currentOuterType_, loc});
 }
 
+// fix #5082 (§14.6, v0.307): find a FIELD member declared on `type` or
+// inherited through its base-type chain, by name. Mirrors ExprTC::lookupMember
+// (ExprTypecheck.cpp)'s BFS shape, but that helper lives on ExprTC and this
+// walk is needed from the Resolver's earlier pass (recordGenericMemberSelfEdge
+// runs before ExprTC exists for the enclosing method), so it is a small local
+// copy rather than a shared one. Interface members never include fields, so
+// walking every `baseTypes` entry (not just classes) is harmless: no
+// `FieldSymbol` is ever found there.
+static FieldSymbol* findFieldInTypeChain(TypeSymbol* type,
+                                          std::string_view name) {
+    std::vector<TypeSymbol*> frontier{type};
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        TypeSymbol* t = frontier[i];
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            if (auto* fs = dynamic_cast<FieldSymbol*>(m))
+                if (fs->name == name) return fs;
+        }
+        for (TypeSymbol* b : t->baseTypes) frontier.push_back(b);
+    }
+    return nullptr;
+}
+
+// fix #5082 (§14.6, v0.307): resolve a FieldSymbol's declared type from
+// whichever side actually carries it — mirrors the LOCAL/imported split
+// `ownedBareTypeParamOfField` (above) and `fieldDeclTypeOf`
+// (FieldSymbolAccessors.hpp) each already document: a positional or
+// body-declared field's type is on its AST node (`fieldDeclTypeOf` covers
+// both), but an IMPORTED field has `decl == nullptr` and no positional param
+// either, so its type rides `SemaContext::importedMemberType` instead
+// (ModuleLoader's side table, #3149).
+static const TypeRef* selfEdgeFieldType(const FieldSymbol& fs,
+                                         SemaContext& ctx) {
+    if (const ast::Type* t = fieldDeclTypeOf(&fs))
+        return ctx.resolvedType(*t);
+    return ctx.importedMemberType(&fs);
+}
+
+// fix #5082 (§14.6, v0.307): the ONE receiver-type resolver shared by both
+// recordGenericMemberSelfEdge overloads below (see their declarations in
+// TypeResolution_impl.hpp for what "receiver" means and why an over-recorded
+// edge, not an under-recorded one, is the failure mode to avoid). `recv` is
+// the expression a `.member<...>`/`?.member<...>` call is accessed on.
+//
+// R22 integrator review of the original attempt at this fix (268a6c4e,
+// p22-5082-c27) found two defects, both fixed here:
+//   (1) the resolution DROPPED #5045's e5138578 ParameterSymbol lookup, its
+//       `currentMethodDecl_->params` fallback scan, and the receiver
+//       identifier's `typeArgs.empty()` guard. All three are preserved
+//       below, verbatim in behavior.
+//   (2) the field-chain walk accepted ANY `this.a.b` chain rooted at `this`
+//       without checking that any link's OWN declared type is the enclosing
+//       type — so `this.helper.Go<...>` would be misrecorded as a self-edge
+//       even when `helper` is a different type's field that merely happens
+//       to declare a same-named, same-arity generic method. This resolver
+//       walks the chain FORWARD from the root so each link's real field type
+//       gates whether the NEXT link is even consulted; the final link's type
+//       is what must equal the enclosing type.
+//
+// It is also the fix for #5082's title ("variable receivers found only via
+// params in ?. arms; fields/locals missed"): before this, the `.` form (the
+// MemberAccessExpr arm) found `this`, the type name, and — via `lookupName`
+// — a local or parameter, but rejected any field-access chain outright
+// (`ma->target` had to BE a bare IdentifierExpr). Both `?.` arms (the
+// NullCondMemberExpr arm nested in the CallExpr overload, and the standalone
+// NullCondMemberExpr overload used for `other?.M<...>() ?? 0`) found only
+// `this`, the type name, and a variable receiver via a direct scan of
+// `currentMethodDecl_->params` — never a local, never a field. Routing every
+// arm through this one resolver makes all three see locals, params and field
+// chains identically.
+TypeSymbol* Resolver::resolveGenericSelfEdgeReceiverType(const ast::Expr& recv,
+                                                          Scope* scope) {
+    // Collect the field-access chain from its OUTERMOST link (closest to the
+    // call) down to the root identifier, e.g. `this.a.b` collects ["b", "a"].
+    std::vector<std::string_view> fieldChain;
+    const ast::Expr* cursor = &recv;
+    while (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(cursor)) {
+        fieldChain.push_back(ma->member);
+        cursor = ma->target.get();
+    }
+
+    auto* rootId = dynamic_cast<const ast::IdentifierExpr*>(cursor);
+    if (!rootId || !rootId->typeArgs.empty()) return nullptr;
+
+    TypeSymbol* rootType = nullptr;
+    if (rootId->name == "this") {
+        rootType = currentOuterType_;
+    } else if (fieldChain.empty() && rootId->name == currentOuterType_->name) {
+        // A type-name-qualified chain (`C.someField.M<...>`) is not a shape
+        // either #5045 or #5082 needs to admit — declining it is an
+        // under-recording, which is always safe (see the comment above).
+        rootType = currentOuterType_;
+    } else if (scope) {
+        // fix #5045 (§14.6, v0.307): a variable receiver — local or
+        // parameter — of the enclosing type is a potential self-recursive
+        // call through that variable. Preserved verbatim from e5138578 (the
+        // R22 integrator review's point (1)): both the `LocalSymbol`/
+        // `ParameterSymbol` lookup via `lookupName` AND the direct
+        // `currentMethodDecl_->params` fallback (scope may not contain the
+        // method's own formals at this point in the walk) must survive.
+        Symbol* sym = lookupName(rootId->name, scope);
+        const TypeRef* recvType = nullptr;
+        if (sym) {
+            if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                    recvType = ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+                // §21.1 / §14.6 (v0.307, #3591 family): a `const` local is a
+                // different AST node (LocalConstDecl) but the same alias of a
+                // value of the enclosing type.
+                else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(
+                             ls->decl))
+                    recvType = lc->type ? ctx_.resolvedType(*lc->type) : nullptr;
+            } else if (auto* ps = dynamic_cast<ParameterSymbol*>(sym)) {
+                recvType = ps->resolvedDeclType;
+                if (!recvType && ps->declType)
+                    recvType = ctx_.resolvedType(*ps->declType);
+            }
+        }
+        // Also check method parameters directly — scope may not contain them.
+        if (!recvType && currentMethodDecl_) {
+            for (const auto& param : currentMethodDecl_->params) {
+                if (param.name == rootId->name) {
+                    recvType = param.type ? ctx_.resolvedType(*param.type)
+                                          : nullptr;
+                    break;
+                }
+            }
+        }
+        if (recvType && recvType->kind == TypeRef::Kind::Named)
+            rootType = recvType->declaration;
+    }
+    if (!rootType) return nullptr;
+
+    // fix #5082 (§14.6, v0.307), review point (2): walk the field chain
+    // FORWARD from the root, checking each link is a real field and
+    // threading ITS OWN declared type to the next link — a chain through an
+    // unrelated type's field (`this.helper.Go<...>` where `helper` is a
+    // DIFFERENT class) must fail here rather than being accepted just
+    // because the chain happens to start at `this`.
+    TypeSymbol* cur = rootType;
+    for (auto it = fieldChain.rbegin(); it != fieldChain.rend(); ++it) {
+        if (!cur) return nullptr;
+        FieldSymbol* fs = findFieldInTypeChain(cur, *it);
+        if (!fs) return nullptr;
+        const TypeRef* fieldType = selfEdgeFieldType(*fs, ctx_);
+        cur = (fieldType && fieldType->kind == TypeRef::Kind::Named)
+                  ? fieldType->declaration
+                  : nullptr;
+    }
+    return cur;
+}
+
 // §14.6 (v0.262, #3271): record `call` as a generic member's SELF-edge when
 // its callee spells the enclosing generic method's own name with explicit type
-// arguments. The three admitted spellings are the three ways a member can name
+// arguments. The four admitted spellings are the four ways a member can name
 // itself without going through another declaration:
 //
 //     M<...>(…)        — unqualified, the ordinary self-recursive call
 //     this.M<...>(…)   — instance-qualified
 //     C.M<...>(…)      — enclosing-type-qualified (the only spelling a static
 //                        member of `static class C` can use besides the bare one)
+//     v.M<...>(…)      — through a variable/field `v` whose declared type is
+//                        the enclosing type (fix #5045, fix #5082)
 //
-// Anything else — a call through a variable, an interface, a base projection,
-// or another declaration — is NOT recorded. §14.6's rule is per-edge over a
-// strongly-connected component, and a direct self-loop is the one edge class
-// whose SCC membership is decidable without a resolved call graph: a self-loop
-// is unconditionally inside its own component. Every other member edge needs
-// the call graph and is the recorded residual (see
+// Anything else — a call through an unrelated type, an interface, a base
+// projection, or another declaration — is NOT recorded. §14.6's rule is
+// per-edge over a strongly-connected component, and a direct self-loop is the
+// one edge class whose SCC membership is decidable without a resolved call
+// graph: a self-loop is unconditionally inside its own component. Every other
+// member edge needs the call graph and is the recorded residual (see
 // checkExpandingGenericMemberEdges in TypeResolution_Checks.cpp).
 //
 // Recording is deliberately generous and the VERDICT is where the guards live
 // (the overload guard in particular) — recording is side-effect-free, so an
-// over-recorded edge costs a vector entry and nothing else.
+// over-recorded edge costs a vector entry and nothing else. (An over-
+// ACCEPTED receiver is a different failure mode — see
+// resolveGenericSelfEdgeReceiverType's own comment.)
 void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* scope) {
     if (!currentMethodDecl_ || !currentOuterType_) return;
     // Only a GENERIC member has a self-edge to constrain: a non-generic
@@ -4214,51 +4371,15 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* sco
     } else if (auto* ma =
                    dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
         if (ma->member != currentMethodDecl_->name) return;
-        auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-        if (!recv || !recv->typeArgs.empty()) return;
-        // §14.6 requires a finite instantiation set. A variable receiver of
-        // the enclosing type is a potential self-recursive call through that
-        // variable — the callee resolves to this method at compile time. Accept
-        // three receiver spellings: `this`, the type name (static member), or
-        // any identifier whose declared type is the enclosing type.
-        if (recv->name == "this") {
-            // ok
-        } else if (recv->name == currentOuterType_->name) {
-            // ok
-        } else {
-            // A variable receiver: look it up in the current scope and in the
-            // method's formal parameters to find its declared type.
-            Symbol* sym = lookupName(recv->name, scope);
-            const TypeRef* recvType = nullptr;
-            if (sym) {
-                if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
-                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
-                        recvType = ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
-                    // §21.1 / §14.6 (v0.307): a `const` local is a different
-                    // AST node (LocalConstDecl) but the same alias of a value
-                    // of the enclosing type; without this arm a self-call
-                    // through a `const` receiver went unrecorded (#3591 family).
-                    else if (auto* lc =
-                                 dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
-                        recvType = lc->type ? ctx_.resolvedType(*lc->type) : nullptr;
-                } else if (auto* ps = dynamic_cast<ParameterSymbol*>(sym)) {
-                    recvType = ps->resolvedDeclType;
-                    if (!recvType && ps->declType)
-                        recvType = ctx_.resolvedType(*ps->declType);
-                }
-            }
-            // Also check method parameters directly — scope may not contain them.
-            if (!recvType && currentMethodDecl_) {
-                for (const auto& param : currentMethodDecl_->params) {
-                    if (param.name == recv->name) {
-                        recvType = param.type ? ctx_.resolvedType(*param.type) : nullptr;
-                        break;
-                    }
-                }
-            }
-            if (!recvType || recvType->declaration != currentOuterType_)
-                return;
-        }
+        // fix #5082 (§14.6, v0.307): the receiver may be `this`, the
+        // enclosing type's own name, a local/parameter of the enclosing
+        // type, or a field-access chain (`this.a.b`) whose final link is
+        // typed as the enclosing type — see
+        // resolveGenericSelfEdgeReceiverType.
+        if (!ma->target ||
+            resolveGenericSelfEdgeReceiverType(*ma->target, scope) !=
+                currentOuterType_)
+            return;
         typeArgs = &ma->typeArgs;
     } else if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(
                    call.callee.get())) {
@@ -4274,29 +4395,18 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* sco
         // than being rejected like its `this.Go<Pair<T, T>>(p)` twin.
         // Unlike MemberAccessExpr, the enclosing-type-qualified spelling
         // (`C.M<...>`) has no `?.` counterpart: a type name is not a value
-        // that can be null, so only `this` is admitted here.
+        // that can be null, so only `this` is admitted here (via
+        // resolveGenericSelfEdgeReceiverType, same as the `.` arm above).
+        //
+        // fix #5082 (§14.6, v0.307): this arm previously found only `this`
+        // and a variable via a direct `currentMethodDecl_->params` scan — no
+        // locals, no fields. Route through the shared resolver so it matches
+        // the `.` arm exactly.
         if (nc->member != currentMethodDecl_->name) return;
-        auto* recv = dynamic_cast<const ast::IdentifierExpr*>(nc->target.get());
-        if (!recv || !recv->typeArgs.empty()) return;
-        if (recv->name == "this") {
-            // ok
-        } else if (recv->name == currentOuterType_->name) {
-            // ok
-        } else {
-            // Variable receiver: check declared type via method params.
-            const TypeRef* recvType = nullptr;
-            if (currentMethodDecl_) {
-                for (const auto& param : currentMethodDecl_->params) {
-                    if (param.name == recv->name) {
-                        recvType =
-                            param.type ? ctx_.resolvedType(*param.type) : nullptr;
-                        break;
-                    }
-                }
-            }
-            if (!recvType || recvType->declaration != currentOuterType_)
-                return;
-        }
+        if (!nc->target ||
+            resolveGenericSelfEdgeReceiverType(*nc->target, scope) !=
+                currentOuterType_)
+            return;
         typeArgs = &nc->typeArgs;
     } else {
         return;
@@ -4323,34 +4433,21 @@ void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call, Scope* sco
 // its own free function so the NullCondCallExpr arm can call it directly.
 void Resolver::recordGenericMemberSelfEdge(const ast::NullCondMemberExpr& ncm,
                                           Scope* scope) {
-    (void)scope; // not yet used but reserved for future lookup extensions
     if (!currentMethodDecl_ || !currentOuterType_) return;
     const std::size_t arity = currentMethodDecl_->genericParams.size();
     if (arity == 0) return;
 
     if (ncm.member != currentMethodDecl_->name) return;
-    auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ncm.target.get());
-    if (!recv || !recv->typeArgs.empty()) return;
-
-    // §14.6: accept `this`, the type name (static member), or any variable
-    // receiver whose declared type is the enclosing type.
-    if (recv->name == "this") {
-        // ok
-    } else if (recv->name == currentOuterType_->name) {
-        // ok
-    } else {
-        const TypeRef* recvType = nullptr;
-        if (currentMethodDecl_) {
-            for (const auto& param : currentMethodDecl_->params) {
-                if (param.name == recv->name) {
-                    recvType =
-                        param.type ? ctx_.resolvedType(*param.type) : nullptr;
-                    break;
-                }
-            }
-        }
-        if (!recvType || recvType->declaration != currentOuterType_) return;
-    }
+    // fix #5082 (§14.6, v0.307): this standalone overload previously found
+    // only `this`, the type name, and a variable via a direct
+    // `currentMethodDecl_->params` scan — no locals, no fields (#5082's
+    // title's "?. arms" half). Route through the shared resolver so
+    // `other?.Go<...>() ?? 0` finds a local/field receiver exactly as the
+    // `.` and nested-`?.` arms above now do.
+    if (!ncm.target ||
+        resolveGenericSelfEdgeReceiverType(*ncm.target, scope) !=
+            currentOuterType_)
+        return;
 
     const std::vector<std::unique_ptr<ast::Type>>* typeArgs = &ncm.typeArgs;
     if (!typeArgs || typeArgs->size() != arity) return;
