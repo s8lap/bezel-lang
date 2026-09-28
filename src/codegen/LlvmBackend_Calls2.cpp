@@ -12990,6 +12990,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // of its enclosing type. `headName()` is alias-transparent (#1462), so
         // `type Fut = Task;` spelled `: Fut` is still seen as `Task`.
         bool declaredReturnOk = false;
+        bool isMethodOwnTypeParamReturn = false;  // fix #5116 §28.14
         if (!mdCb->returnType) {
             declaredReturnOk = true;
         } else if (mdCb->returnType->kind == ast::TypeKind::Named &&
@@ -13005,13 +13006,41 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             std::string_view head = synHead;
             if (const sema::TypeRef* drt =
                     ctx_.resolvedType(*mdCb->returnType)) {
-                if (drt->kind == sema::TypeRef::Kind::Function)
-                    isTypeParam = true;  // closure-returning — bail
-                else if (drt->kind == sema::TypeRef::Kind::Named &&
-                         !drt->headName().empty())
+                if (drt->kind == sema::TypeRef::Kind::Function) {
+                    // fix #5116 (§28.14 / §28.9, v0.307): a method-own type param
+                    // that substitutes to a function type (e.g. `method Apply<U>(f: U)`,
+                    // `U := (string)->int` at the call site) IS a
+                    // closure-returning call-bounded scenario: the callee holds the
+                    // callback through the call, exactly as the explicit
+                    // `(T) -> U` formal case does. The call-bounded arm handles
+                    // this correctly; setting isTypeParam=true here would cause
+                    // declaredReturnOk=false and skip the arm entirely.
+                    // Only set isTypeParam when the DECLARED return is a
+                    // non-generic function type (e.g. a named method `:(int)->int`).
+                    if (!isTypeParam)
+                        declaredReturnOk = true;  // §28.14 closure-returning case
+                } else if (drt->kind == sema::TypeRef::Kind::Named &&
+                         !drt->headName().empty()) {
                     head = drt->headName();
+                }
             }
-            declaredReturnOk = !isTypeParam && !headIsDeferredFrame(head);
+            if (!declaredReturnOk) {
+                declaredReturnOk = !isTypeParam && !headIsDeferredFrame(head);
+                // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): a method-own type
+                // param as return (e.g. `method Apply<U>(f: (T)->U): U` with U:=int)
+                // sets declaredReturnOk=false even when the substitution is NOT
+                // a deferred activation. We still want to enter the call-bounded
+                // arm if ANY formal is a +1 closure producer, because the
+                // call-bounded release applies to closures passed as ARGUMENTS,
+                // not to the return type. Track this case so the outer gate admits it.
+                if (!declaredReturnOk && isTypeParam &&
+                    mdCb->returnType->kind == ast::TypeKind::Named &&
+                    mdCb->returnType->name &&
+                    mdCb->returnType->name->parts.size() == 1 &&
+                    !headIsDeferredFrame(head)) {
+                    isMethodOwnTypeParamReturn = true;
+                }
+            }
         }
         // (2) The SUBSTITUTED result type at THIS call site — the belt to (1)'s
         // braces, closing the `: T`-through-an-interface corner where the
@@ -13020,6 +13049,21 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         bool callResultOk = true;
         if (mdCb->returnType) {
             const sema::TypeRef* rt = ctx_.exprType(call);
+            // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): for a method-own type
+            // param `U` that is still Named in the sema exprType (unresolved), resolve
+            // it through the active substitution to get the actual substituted type.
+            // Without this, `method Apply<U>(f: U): U` with `U := (string)->int`
+            // keeps rt as the bare `U` Named ref (not Function), so callResultOk
+            // stays true — but the actual substituted return is a function type, so
+            // the call-bounded arm should NOT fire (the closure is owned by the
+            // callee through the call). Resolve U through genericSubstSemaTy_ to get
+            // the real substituted type.
+            if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+                !genericSubstSemaTy_.empty()) {
+                if (auto it = genericSubstSemaTy_.find(rt->headName());
+                    it != genericSubstSemaTy_.end() && it->second)
+                    rt = it->second;
+            }
             if (!rt || rt->kind == sema::TypeRef::Kind::Function) {
                 callResultOk = false;
             } else if (rt->kind == sema::TypeRef::Kind::Named) {
@@ -13038,16 +13082,47 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // appends exactly `mdCb->params.size()` entries IN PARAMETER ORDER
         // (named and defaulted arguments included), so the prefix width is the
         // difference. Anything else is an unrecognised shape — bail.
-        if (!isAsyncMethod(ms) && !isSyncIterCallee && declaredReturnOk &&
+        // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): admit a method-own type
+        // param return (e.g. `method Apply<U>(f: (T)->U): U` with U:=int) into the
+        // call-bounded arm — the formal lambda argument needs release even when the
+        // return type is a non-deferred, non-function type param. isMethodOwnTypeParamReturn
+        // is set only when isTypeParam=true, declaredReturnOk=false, and the head
+        // is not a deferred activation frame.
+        const bool enterCallBoundedArm =
+            !isAsyncMethod(ms) && !isSyncIterCallee &&
+            (declaredReturnOk || isMethodOwnTypeParamReturn) &&
             callResultOk && argExprs.size() == args.size() &&
             args.size() >= mdCb->params.size() &&
-            args.size() - mdCb->params.size() <= 1) {
+            args.size() - mdCb->params.size() <= 1;
+        if (enterCallBoundedArm) {
             const std::size_t off = args.size() - mdCb->params.size();
             for (std::size_t pi = 0; pi < mdCb->params.size(); ++pi) {
                 const ast::Param& p = mdCb->params[pi];
                 if (!p.modifier.empty()) continue;
-                if (!p.type || p.type->kind != ast::TypeKind::Function) continue;
+                if (!p.type) continue;
                 const std::size_t ai = off + pi;
+                // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): a bare type-param
+                // formal (e.g. `method Apply<U>(f: U)` with `U := (string)->int`
+                // at the call site) has `p.type->kind == Named`, not Function, so
+                // the original gate skipped it. The argument IS a +1 closure producer,
+                // so it must be released after the call. Also admit when the formal
+                // is a method-own or class-own type param whose RESOLVED type at
+                // this call site is function.
+                bool formalIsFunction = p.type->kind == ast::TypeKind::Function;
+                if (!formalIsFunction && p.type->kind == ast::TypeKind::Named) {
+                    // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): the argument's
+                    // sema type at this call site tells us whether this bare
+                    // type-param formal is being used as a function type. If the
+                    // argument is a lambda, its type is the function type that U
+                    // is instantiated to — so check the argument's sema type.
+                    if (argExprs[ai]) {
+                        if (auto* argTy = ctx_.exprType(*argExprs[ai])) {
+                            if (argTy->kind == sema::TypeRef::Kind::Function)
+                                formalIsFunction = true;
+                        }
+                    }
+                }
+                if (!formalIsFunction) continue;
                 if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
                     callBoundedClosureArgs.push_back(args[ai]);
             }
