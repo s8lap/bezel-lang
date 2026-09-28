@@ -5745,6 +5745,138 @@ bool Resolver::derivedConstraintMatchesImported(
     return true;
 }
 
+// fix #5091 (narrows #5039 and #5075; §14.2, v0.307): when the override
+// already known to the calling check omitted its own `where` clause on
+// type parameter `gi`, climb same-module ancestors one class at a time
+// until we find one that actually writes an explicit `where` clause (or
+// an imported ancestor's side table), and copy THAT clause's items onto
+// the override's own `GenericParamSymbol::constraints`. Codegen, and
+// every later constraint consumer, reads the OVERRIDE's symbol — not the
+// base's — and a chained omission (`A.M <- B.M <- C.M` all omitting
+// `where`, recommended spelling per §14.2) needs more than the IMMEDIATE
+// base's own AST/side-table entry to populate it.
+//
+// #5091's narrower hazard: a base class that overloads the inherited
+// method name with a SAME-arity sibling of a DIFFERENT shape (a
+// `b: string` parameter rather than the real `b: T`) declared BEFORE the
+// real overridden overload. The climb must identify the right overload by
+// FULL SIGNATURE (the same `overrideParamsMatch` predicate
+// `checkHidingAndOverride` uses to pick the overridden declaration at line
+// 6536) — exactly the same signature check `checkOverrideSignatureMatch`
+// already applies for that one `cur->parent` -> `baseCls` hop, including
+// modifier-equality and the same `buildBaseGenericSubst` substitution —
+// not just name + param arity + generic arity. A shape-only pick that
+// matched the decoy's `(b: string)` by name+arity+gen-arity would silently
+// copy the decoy's `where T: new()` onto the leaf override, the codegen
+// warning "internal: codegen cannot dispatch member 'Equals' on receiver
+// of type 'T'" would fire on the leaf body's `a.Equals(b)`, and the
+// behavior #5039/#5075 exist to prevent would resurface through the fix.
+//
+// The climb deliberately reads the AST chain rather than already-
+// materialized `GenericParamSymbol::constraints`: `checkHidingAndOverride`
+// visits classes in declaration order (NestedTypeWalk.hpp), and a derived
+// class may legally be declared textually BEFORE its own base, so an
+// ancestor's own override check may not have run yet at this point in the
+// SAME pass. Walking the AST directly is correct regardless of order.
+//
+// The generic-arity check is kept on top of `overrideParamsMatch`:
+// `overrideParamsMatch` compares a method-level type parameter as a
+// declaration-less Named ref, so `M<T, U>(a: T, b: U)` and `M<T>(a: T,
+// b: T)` compare equal parameter-for-parameter; only the arity tells them
+// apart, and `gi` is positional anyway.
+//
+// When no exact match exists at a level, the climb stops WITHOUT
+// materializing — the pre-#5075 behaviour: the override keeps an empty
+// set, as it did before the climb existed. That covers an IMPORTED
+// candidate of the right shape: an imported method carries only
+// `resolvedDeclType` (no `declType`, #2386), which `overrideParamsMatch`
+// does not read, so its parameter types cannot be compared here.
+static void materializeConstraintUpChain(
+        SemaContext& ctx, GenericParamSymbol* dgp, MethodSymbol* member,
+        std::size_t gi,
+        const std::function<bool(MethodSymbol*, MethodSymbol*)>&
+            overrideParamsMatch) {
+    MethodSymbol* cur = member;
+    while (cur) {
+        if (auto* curDecl = dynamic_cast<const ast::MethodDecl*>(cur->decl)) {
+            if (gi >= curDecl->genericParams.size()) return;  // arity mismatch
+            std::string_view curName = curDecl->genericParams[gi].name;
+            const ast::GenericConstraint* cc = nullptr;
+            for (const auto& gc : curDecl->genericConstraints)
+                if (gc.typeParam == curName) { cc = &gc; break; }
+            if (cc) {
+                // §14.4: the modifier form (`where T is owned`) carries no
+                // instantiation-time obligation and is never recorded in
+                // `constraints` — mirrors `collectGenericParams`'s identical
+                // filter. Found an explicit clause at this level either way:
+                // stop climbing (an explicit clause, even a modifier-only
+                // one, is this level's OWN clause, not a further omission).
+                if (cc->modifierConstraint.empty()) {
+                    for (const ast::ConstraintItem& ci : cc->items) {
+                        if (ci.kind.empty()) continue;
+                        GenericParamConstraint c;
+                        c.kind = ci.kind;
+                        c.astBound = ci.typeArg.get();
+                        dgp->constraints.push_back(c);
+                    }
+                }
+                return;
+            }
+            // Omitted at this level too: climb to `cur`'s own class's direct
+            // base (`baseTypes[0]` is the class base by convention; see
+            // `TypeSymbol::baseTypes`) and find the same-signature method
+            // there, then repeat.
+            TypeSymbol* cls = cur->parent;
+            if (!cls || cls->baseTypes.empty()) return;
+            TypeSymbol* baseCls = cls->baseTypes[0];
+            if (!baseCls || baseCls->kind != ast::TypeDeclKind::Class) return;
+            MethodSymbol* anc = nullptr;
+            for (Symbol* mem : baseCls->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(mem);
+                if (!ms || ms->isOperator || ms->name != cur->name ||
+                    ms->params.size() != cur->params.size() ||
+                    ms->genericParams.size() != cur->genericParams.size())
+                    continue;
+                // An IMPORTED candidate has no `decl` (only `declType`), so
+                // its parameter types cannot be compared here — bail
+                // safely rather than guess.
+                if (!dynamic_cast<const ast::MethodDecl*>(ms->decl) &&
+                    !ms->params.empty())
+                    return;
+                if (overrideParamsMatch(cur, ms)) {
+                    anc = ms;
+                    break;
+                }
+            }
+            if (!anc) return;  // chain doesn't continue; bail safely
+            cur = anc;
+            continue;
+        }
+        // IMPORTED member: no local AST to climb further with — consult its
+        // side table once and stop either way. Mirrors the immediate-base
+        // import branch above; the metadata WRITER reads the raw AST `where`
+        // when exporting generic constraints, not the sema-materialized
+        // symbols (#5076: scope of this fix), which bounds how far past an
+        // imported ancestor the same-module AST chain can walk.
+        const auto* iGCs = ctx.importedGenericConstraints(cur);
+        if (iGCs && gi < iGCs->size()) {
+            const ImportedGenericConstraint& bic = (*iGCs)[gi];
+            for (std::string_view kind : bic.specialConstraints) {
+                GenericParamConstraint c;
+                c.kind = kind;
+                dgp->constraints.push_back(c);
+            }
+            for (TypeRef* bound : bic.constraintTypes) {
+                GenericParamConstraint c;
+                c.kind = "type";
+                c.importedBound = bound;
+                dgp->constraints.push_back(c);
+            }
+        }
+        return;
+    }
+}
+
 void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -5930,44 +6062,45 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         // constraints positionally, from whichever side (`bDecl` /
         // `importedGCs`) `checkOverrideSignatureMatch` already established
         // just above.
+        // No `where` clause on the OVERRIDE for this type parameter at
+        // all means "exactly the inherited set" — always legal, the
+        // recommended spelling; nothing to *compare*. But fix #5039 (§14.2,
+        // v0.307): "An override ... inherits the overridden ... declaration's
+        // constraints" is not only a restatement-comparison rule — the
+        // override's own GenericParamSymbol must actually CARRY that
+        // inherited set, because every later reader (codegen's
+        // `genericParamSoundAtI32ForPlaceholder`, and any other constraint
+        // consumer) asks the OVERRIDE's own symbol, not the base's. Before
+        // #5039, an omitted `where` clause left `derived`'s
+        // GenericParamSymbol::constraints empty — indistinguishable from a
+        // genuinely unconstrained `T` — so a cross-module virtual dispatch
+        // into an override compiled from an unconstrained-`T` placeholder
+        // body silently lost the `IEquatable<T>`-conformance information the
+        // body's `a.Equals(b)` call depends on.
+        //
+        // fix #5075 (§14.2, v0.307, NARROWED BY #5091): the immediate base
+        // may ITSELF have omitted its own clause — a chained omission, as
+        // legal per §14.2 as a single-level one. `materializeConstraintUpChain`
+        // below walks same-module ancestors one class at a time until it
+        // finds one that actually writes a clause (or an imported
+        // ancestor's side table) and populates `dgp->constraints` from THAT
+        // level, instead of stopping at the immediate base. The walk
+        // identifies the ancestor by FULL SIGNATURE (`overrideParamsMatch`,
+        // the same predicate `checkHidingAndOverride` uses at line 6536 to
+        // pick the overridden overload); a same-arity sibling with
+        // different parameter types declared before the real overridden
+        // declaration would otherwise leak that sibling's `where T: …`
+        // onto the leaf override, regressing #5039/#5075's own fix.
         if (!dc) {
             if (gi < derived->genericParams.size()) {
                 auto* dgp = dynamic_cast<GenericParamSymbol*>(
                     derived->genericParams[gi]);
                 if (dgp && dgp->constraints.empty()) {
-                    if (bDecl) {
-                        std::string_view bName = bDecl->genericParams[gi].name;
-                        const ast::GenericConstraint* bc = nullptr;
-                        for (const auto& gc : bDecl->genericConstraints)
-                            if (gc.typeParam == bName) { bc = &gc; break; }
-                        // §14.4: the modifier form (`where T is owned`)
-                        // carries no instantiation-time obligation and is
-                        // never recorded in `constraints` — mirrors
-                        // `collectGenericParams`'s identical filter.
-                        if (bc && bc->modifierConstraint.empty()) {
-                            for (const ast::ConstraintItem& ci : bc->items) {
-                                if (ci.kind.empty()) continue;
-                                GenericParamConstraint c;
-                                c.kind = ci.kind;
-                                c.astBound = ci.typeArg.get();
-                                dgp->constraints.push_back(c);
-                            }
-                        }
-                    } else if (importedGCs && gi < importedGCs->size()) {
-                        const ImportedGenericConstraint& bic =
-                            (*importedGCs)[gi];
-                        for (std::string_view kind : bic.specialConstraints) {
-                            GenericParamConstraint c;
-                            c.kind = kind;
-                            dgp->constraints.push_back(c);
-                        }
-                        for (TypeRef* bound : bic.constraintTypes) {
-                            GenericParamConstraint c;
-                            c.kind = "type";
-                            c.importedBound = bound;
-                            dgp->constraints.push_back(c);
-                        }
-                    }
+                    materializeConstraintUpChain(
+                        ctx_, dgp, base, gi,
+                        [this](MethodSymbol* d, MethodSymbol* b) {
+                            return overrideParamsMatch(d, b);
+                        });
                 }
             }
             continue;
