@@ -211,26 +211,29 @@ BEZEL_TEST(borrow_return_1007, shared_clone_owned_producer_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Was CONTROL for the §28.3 asymmetry the issue notes (Array<int> is not an
-// owning type, so the #1007 rule itself does not fire); flipped by fix #5112
-// (§28.3 K7.3, v0.307), which extended isClassOrInterfaceResult to treat the
-// declaration-less builtin `Array<T>` as class-like. That predicate is SHARED
-// with the §28.3 row-4 sourceless-factory check (staticReturnTypeRejected):
-// once Array<T> reads as class/interface there too, a static method
-// returning a plain (unmarked) `Array<int>` now correctly falls under row 4
-// ("plain concrete class or interface type ... Static: rejected at the
-// declaration — nothing names a responsible party", announcement table,
-// §28.3 v0.307) — exactly the same rejection this file's Pick(a, b): Res
-// already pins for a user-declared class. This was always spec-illegal
-// Bezel; #5112 closed the builtin-collection gap that let it through.
-BEZEL_TEST(borrow_return_1007, array_int_static_return_rejected_spec_28_3_row4) {
+// CONTROL (the §28.3 asymmetry the issue notes): a borrowed `Array<int>` param
+// returned through `: Array<int>` is a sound borrow return — Array<int> is not
+// an owning type, so the #1007 rule does not fire. Must compile.
+//
+// fca566b4 (#5112) briefly flipped this to a row-4 reject by widening the
+// SHARED isClassOrInterfaceResult predicate to treat declaration-less
+// Array<T> as class-like everywhere, including staticReturnTypeRejected —
+// but that widening also caused a 38-name gate FAIL elsewhere (Array-typed
+// locals silently entering auto-drop/affine tracking: double-frees / UAFs).
+// Fix-forward (gate FAIL, v0.307) confines #5112's Array-as-class-like arm
+// to ONLY the K7.3 mixed-meet call sites it targeted (a new
+// isArrayOrClassOrInterfaceForMeet), restoring this predicate — and this
+// row — to its pre-#5112 behavior. Whether Array<T> should fall under row 4
+// of the §28.3 return table more broadly is escalated as a spec-question:
+// the reject's blast radius here is large and unrelated call sites (builtin
+// owned-transfer classification, isCoveredLocal, imported-owned-return) are
+// not safe to widen without individual review.
+BEZEL_TEST(borrow_return_1007, array_int_borrow_return_clean) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Id(a: Array<int>): Array<int> => a; "
         "end P;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "returns class/interface type `Array` without `owned`"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §28.11 / #1264: a plain `var b := move a` of an OWNING COLLECTION must flag `b`

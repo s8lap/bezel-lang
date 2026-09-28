@@ -4209,31 +4209,47 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
 // isClassOrInterfaceRef (LlvmBackend_Setup.cpp) so the sema auto-drop gate and
 // the codegen reclaim gate agree on exactly the same result shape.
 static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named)
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
-    // fix #5112 (§28.3 K7.3, v0.307): Array<T> is a declaration-less
-    // heap collection with disposal obligation. Without this arm the
-    // mixed-meet check on a borrow `q?.CauseChain` (Array<ExceptionInfo>?)
-    // ?? new Array<ExceptionInfo>() never fires, because the left arm's
-    // class-like shape is invisible to the check. Keep this narrowly
-    // Array<T>-only: the lazy-query heap-pointer-reference builtins
-    // (IEnumerable, IGrouping, IOrderedEnumerable) are NOT class-like —
-    // #4178 pins that a static helper returning IOrderedEnumerable<T>
-    // is spec-legal — and including them would break that pattern.
-    if (!rt->declaration) {
-        if (rt->astNode && rt->astNode->name &&
-            rt->astNode->name->parts.size() == 1) {
-            if (rt->headName() == "Array")
-                return true;
-        }
-        return false;
-    }
     // A value-builtin (DateTime/Guid/TimeSpan/CancellationToken) carries
     // kind==Class but has no disposal obligation — exclude it exactly as the
     // sibling `new T` / `move` producer paths do (#1388 review consistency).
     if (rt->declaration->isValueBuiltin) return false;
     return rt->declaration->kind == ast::TypeDeclKind::Class ||
            rt->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+// fix-forward #5112 (§28.3 K7.3, v0.307): `isClassOrInterfaceResult` is
+// SHARED by ~8 callers (the K7.3 mixed-meet checks below, the builtin
+// owned-transfer-call classifier, the imported-owned-return classifier,
+// isCoveredLocal, and staticReturnTypeRejected). fca566b4 (#5112) widened
+// that ONE shared predicate to also admit declaration-less Array<T>, so
+// every one of those other callers started treating a plain (non-`owned`)
+// Array<T> as class-like too — entering auto-drop/affine tracking as an
+// Owned builtin-transfer/imported result (double-frees / UAFs measured in
+// the R23 gate: bug465_heap_array_literal, literal_tree_iterated_root_2711,
+// take_current_builtin_array_local_reclaim_3878, string_span_883,
+// codegen_property_compound_virtual_leak_2586, and 33 more) and rejecting a
+// static method returning Array<T> at row 4 of the §28.3 return table
+// (staticReturnTypeRejected), which was never true before #5112. Give #5112
+// its OWN predicate, used ONLY at the K7.3 mixed-meet call sites it
+// targeted (checkArmMeetMixed / checkCoalesceMeetMixed): `q?.CauseChain`
+// (Array<ExceptionInfo>?) needs to read as class-like there so the mixed
+// `??`/if-case meet with a fresh `new Array<ExceptionInfo>()` fires, but
+// nowhere else does a bare Array<T> need to behave as a heap class.
+// Whether Array<T> falls under row 4 of the §28.3 return table more
+// broadly is escalated as a spec-question (large blast radius) rather than
+// decided here.
+static bool isArrayOrClassOrInterfaceForMeet(const sema::TypeRef* rt) {
+    if (isClassOrInterfaceResult(rt)) return true;
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1) {
+        if (rt->headName() == "Array")
+            return true;
+    }
+    return false;
 }
 
 // §28.1 (v0.196, #1817): owned-marker erasure at a VALUE substitution. For a
@@ -5832,7 +5848,7 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
         if (s == OwnershipState::Owned) {
             ownedArm = true;
         } else if (s == OwnershipState::Borrowed &&
-                   isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+                   isArrayOrClassOrInterfaceForMeet(ctx_.exprType(*arm))) {
             borrowArm = true;
             borrowLoc = arm->span.begin;
         }
@@ -5884,7 +5900,7 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
         if (s == OwnershipState::Owned) {
             ownedArm = true;
         } else if (s == OwnershipState::Borrowed &&
-                   isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+                   isArrayOrClassOrInterfaceForMeet(ctx_.exprType(*arm))) {
             borrowArm = true;
             if (!borrowAt) borrowAt = arm;
         }
@@ -5906,7 +5922,7 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
         // does NOT fire (isClassOrInterfaceResult=false), which is correct —
         // records have no ownership semantics.
         if (dynamic_cast<const ast::NullCondMemberExpr*>(arm) &&
-            isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+            isArrayOrClassOrInterfaceForMeet(ctx_.exprType(*arm))) {
             borrowArm = true;
             if (!borrowAt) borrowAt = arm;
         }

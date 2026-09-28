@@ -315,29 +315,34 @@ BEZEL_TEST(static_borrow_return_1547, instance_method_returns_owned_field_clean)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// --- REJECT (was ACCEPT): the builtin-collection gap this row used to
-//     document was closed by fix #5112 (§28.3 K7.3, v0.307), which extended
-//     isClassOrInterfaceResult to treat the declaration-less builtin
-//     `Array<T>` as class-like. That predicate is SHARED with the §28.3
-//     row-4 sourceless-factory check (staticReturnTypeRejected): once
-//     Array<T> reads as class/interface there too, a static method
-//     returning a plain (unmarked) `Array<int>` now correctly falls under
-//     row 4 ("plain concrete class or interface type ... Static: rejected
-//     at the declaration — nothing names a responsible party", announcement
-//     table, §28.3 v0.307) — the same prohibition this file's Pick(a, b): Res
-//     already pins for a user-declared class (isBorrowableType's
-//     `declaration`-gated check is a DIFFERENT, narrower predicate than the
-//     one #5112 touched). This was always spec-illegal Bezel; the old,
-//     narrower isClassOrInterfaceResult had a hole for builtin collections
-//     that let it through — #5112 closed it. See the sibling flip in
-//     borrow_return_owning_type_1007_test.cpp's
-//     array_int_static_return_rejected_spec_28_3_row4. ---
-BEZEL_TEST(static_borrow_return_1547, builtin_collection_param_return_rejected_spec_28_3_row4) {
+// --- ACCEPT: the pre-existing out-of-scope boundary (builtin, non-owning
+//     collection return types) is unaffected — pinned here as a regression
+//     guard for THIS specific change (isBorrowableType requires a
+//     user-declared class/interface `declaration`; a builtin collection has
+//     none, so it is conservatively out of scope, matching
+//     borrow_return_owning_type_1007_test.cpp's array_int_borrow_return_
+//     clean). This is not an endorsement that the shape is dangle-free —
+//     it documents an existing, accepted limitation this fix does not
+//     widen.
+//
+//     fca566b4 (#5112) briefly flipped this to REJECT by widening the
+//     SHARED isClassOrInterfaceResult predicate to treat declaration-less
+//     Array<T> as class-like everywhere, including staticReturnTypeRejected
+//     — but that widening also caused a 38-name gate FAIL elsewhere
+//     (Array-typed locals silently entering auto-drop/affine tracking:
+//     double-frees / UAFs). Fix-forward (gate FAIL, v0.307) confines
+//     #5112's Array-as-class-like arm to ONLY the K7.3 mixed-meet call
+//     sites it targeted (a new isArrayOrClassOrInterfaceForMeet), restoring
+//     this predicate — and this row — to its pre-#5112 behavior. Whether
+//     Array<T> should fall under row 4 of the §28.3 return table more
+//     broadly is escalated as a spec-question: the reject's blast radius
+//     here is large and unrelated call sites (builtin owned-transfer
+//     classification, isCoveredLocal, imported-owned-return) are not safe
+//     to widen without individual review. ---
+BEZEL_TEST(static_borrow_return_1547, builtin_collection_param_return_out_of_scope) {
     auto r = parseAndCheckOwnership(
         "module M; class P "
         "  public static method Id(a: Array<int>): Array<int> => a; "
         "end P;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "returns class/interface type `Array` without `owned`"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
