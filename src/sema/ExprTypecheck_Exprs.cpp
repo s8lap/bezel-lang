@@ -8772,18 +8772,66 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // lambda `i32 (ptr, ptr)` whose body is an indirect call, the importer
         // emits `i32 (ptr, i32)` whose body is a bare `ret i32 0`).
         //
-        // A GENERIC callee is skipped on BOTH sides: there the function-param
-        // type may be an unresolved type parameter (`(T) -> int`) inferred
-        // from another argument, and the generic-inference path types the
-        // lambda parameter correctly (#505).
+        // A GENERIC callee's OWN type parameter is skipped: there the
+        // function-param type may be an unresolved type parameter
+        // (`(T) -> int`) inferred from another argument, and the generic-
+        // inference path types the lambda parameter correctly (#505).
+        //
+        // fix #5066 (§14.1 / §14.5, v0.307): #505's rationale is about the
+        // METHOD's own type parameters, not the receiver CLASS's. The
+        // former blanket "any generic param on the callee → bail" gate
+        // conflated the two: `Box<T>.Apply<U>(v: T, f: (T) -> U)` has a
+        // method-own generic param `U`, so the gate fired and NO lambda
+        // parameter type was ever threaded — even though `f`'s PARAMETER
+        // position (`T`) mentions only the receiver class's already-bound
+        // type argument, never the method's own still-unresolved `U`.
+        // `y`'s sema type then stayed the bare, unsubstituted `T`, and
+        // while codegen structurally recovers a correct VALUE for member
+        // access (`y.Length`, fixed for this shape by #5024's early
+        // receiver-generic binding), sema's own `+` operator check
+        // requires the OPERAND's sema type to literally be `string` — so
+        // `y + "!"` was rejected outright.
+        //
+        // Compute the (possibly class-substituted) function type first,
+        // then bail per-position only when the SPECIFIC formal parameter
+        // types actually mention one of the method's own generic names —
+        // preserving #505 exactly for that shape while letting a
+        // class-only-generic parameter type (this issue's shape) through.
+        std::unordered_set<std::string_view> calleeOwnGenericNames;
+        if (calleeMd2) {
+            for (const auto& gp : calleeMd2->genericParams)
+                calleeOwnGenericNames.insert(gp.name);
+        } else if (calleeMs2) {
+            for (auto* g : calleeMs2->genericParams)
+                if (auto* gps = dynamic_cast<GenericParamSymbol*>(g))
+                    calleeOwnGenericNames.insert(gps->name);
+        }
+        std::function<bool(const TypeRef*)> mentionsOwnGeneric =
+            [&](const TypeRef* t) -> bool {
+            if (!t) return false;
+            if (t->kind == TypeRef::Kind::Named) {
+                if (calleeOwnGenericNames.count(t->headName())) return true;
+                for (const TypeRef* ga : t->genericArgs)
+                    if (mentionsOwnGeneric(ga)) return true;
+            } else if (t->kind == TypeRef::Kind::Function) {
+                for (const auto& fp : t->funcParams)
+                    if (mentionsOwnGeneric(fp.type)) return true;
+                if (mentionsOwnGeneric(t->funcReturn)) return true;
+            } else if (t->kind == TypeRef::Kind::InlineArray) {
+                if (mentionsOwnGeneric(t->arrayElement)) return true;
+            }
+            return false;
+        };
         auto formalFnParamType2 =
             [&](std::size_t pos) -> TypeRef* {
-            if (calleeMd2) {
-                if (!calleeMd2->genericParams.empty()) return nullptr;
-            } else if (!calleeMs2 || !calleeMs2->genericParams.empty()) {
-                return nullptr;
+            if (!calleeMd2 && !calleeMs2) return nullptr;
+            TypeRef* pt = formalOutParamType2(pos);
+            if (!calleeOwnGenericNames.empty() && pt &&
+                pt->kind == TypeRef::Kind::Function) {
+                for (const auto& fp : pt->funcParams)
+                    if (mentionsOwnGeneric(fp.type)) return nullptr;
             }
-            return formalOutParamType2(pos);
+            return pt;
         };
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
@@ -9413,15 +9461,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 // are checked against the target under §5.1, not
                                 // unified by inference). Apply the same class-
                                 // level generic substitution as the params.
-                                pendingLambdaTargetReturn_ = pt->funcReturn;
-                                // fix #1820 (§28.3 / §28.8): the call-arg's
-                                // `funcReturnOwned` marker travels alongside
-                                // the inner slot, exactly like the typed-local
-                                // and assignment paths. The callee-side rule
-                                // reads this to suppress its check on the
-                                // §28.8 transferring branch.
-                                pendingLambdaTargetReturnOwned_ =
-                                    pt->funcReturnOwned;
+                                //
+                                // fix #5066 (§14.1 / §14.5, v0.307): unlike the
+                                // per-position PARAMETER check in
+                                // `formalFnParamType2` (this call only reaches
+                                // here once every formal param position has
+                                // cleared that gate), the RETURN slot can still
+                                // mention the method's own still-unresolved
+                                // generic parameter (`f: (T) -> U`'s `U`) even
+                                // when every parameter is class-only. Threading
+                                // a bare, unresolved `U` here would be exactly
+                                // #505's hazard the parameter-position gate
+                                // exists to avoid — so skip only the return-
+                                // slot thread in that case; the method's own
+                                // generic-inference path (untouched) still
+                                // resolves `U` from the call's explicit/
+                                // inferred type argument.
+                                if (!mentionsOwnGeneric(pt->funcReturn)) {
+                                    pendingLambdaTargetReturn_ = pt->funcReturn;
+                                    // fix #1820 (§28.3 / §28.8): the call-arg's
+                                    // `funcReturnOwned` marker travels alongside
+                                    // the inner slot, exactly like the typed-local
+                                    // and assignment paths. The callee-side rule
+                                    // reads this to suppress its check on the
+                                    // §28.8 transferring branch.
+                                    pendingLambdaTargetReturnOwned_ =
+                                        pt->funcReturnOwned;
+                                }
                                 if (!classSubst.empty() &&
                                     pendingLambdaTargetReturn_)
                                     pendingLambdaTargetReturn_ =
