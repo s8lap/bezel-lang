@@ -3049,7 +3049,13 @@ private:
     // member-access call sites to carry the §26.5 step 1 name-blocked-
     // extension note (see extensionNameBlockedNote); callers outside the
     // member-access path (e.g. `new T(...)` constructor overloads) pass the
-    // default and get no such suffix.
+    // default and get no such suffix. `isGeneric[i]` (fix #5101, §22.6
+    // "Generic candidates", v0.307; default empty) is true when candidate i
+    // is a generic method — consulted only for the final non-generic-vs-
+    // generic tie-break, the last comparison before ambiguity; an empty
+    // vector (every call site outside method-call resolution — constructors
+    // are never generic, §14.5's "Scope" paragraph) disables the branch
+    // entirely and changes nothing for those callers.
     OverloadResult resolveOverload(
         const std::vector<std::vector<const TypeRef*>>& paramTypes,
         const std::vector<const TypeRef*>& argTypes,
@@ -3058,7 +3064,8 @@ private:
         const std::string& calleeDesc,
         const std::string& extraNote = std::string(),
         const std::vector<const ast::Expr*>& argExprs =
-            std::vector<const ast::Expr*>());
+            std::vector<const ast::Expr*>(),
+        const std::vector<bool>& isGeneric = std::vector<bool>());
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol

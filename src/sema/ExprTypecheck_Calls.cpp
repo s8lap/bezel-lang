@@ -974,7 +974,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<bool>& fillsDefault,
     const std::vector<std::string>& candNames, SourceLocation loc,
     const std::string& calleeDesc, const std::string& extraNote,
-    const std::vector<const ast::Expr*>& argExprs) {
+    const std::vector<const ast::Expr*>& argExprs,
+    const std::vector<bool>& isGeneric) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
@@ -1130,6 +1131,18 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     // subject to the ambiguity check below. This only breaks a type-level
     // tie: it never overrides a case where the type ranking already favors
     // one side (x must still be better-or-equal at every position).
+    //
+    // fix #5101 (§22.6 "Generic candidates", v0.307): the NEXT tie-break,
+    // applied only once the defaulted-arity rule above also fails to decide
+    // (fillsDefault agrees on both sides) — the spec's own last comparison
+    // before ambiguity: "When a non-generic candidate and a generic
+    // candidate are both applicable, and neither the ranking ... nor the
+    // defaulted-arity tie-break separates them, the non-generic candidate is
+    // selected." `isGeneric` is empty for every call site that never has a
+    // generic candidate (constructor overloading — §14.5's own "Scope"
+    // paragraph: class/record/interface type arguments, which a constructor
+    // call could only ever supply, are never inferred), so this new branch
+    // is dead code there and changes nothing for them.
     auto unambiguouslyBetter = [&](std::size_t x, std::size_t y) {
         bool anyStrict = false;
         for (std::size_t i = 0; i < nArg; ++i) {
@@ -1137,7 +1150,10 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             if (strictlyBetterAt(grid[x][i], grid[y][i])) anyStrict = true;
         }
         if (anyStrict) return true;
-        return !fillsDefault[x] && fillsDefault[y];
+        if (!fillsDefault[x] && fillsDefault[y]) return true;
+        if (fillsDefault[x] != fillsDefault[y]) return false;
+        return !isGeneric.empty() && x < isGeneric.size() &&
+               y < isGeneric.size() && !isGeneric[x] && isGeneric[y];
     };
 
     for (std::size_t cx : appl) {
@@ -2039,6 +2055,104 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     for (const auto& a : ce.args)
         if (a.isDiscard) return arityFallback();
 
+    // fix #5101 (§14.5 phase 1 / §22.6, v0.307): compute each GENERIC
+    // candidate's phase-1 argument-driven-unification substitution BEFORE
+    // the ranking loop below builds its parameter-type vectors. §22.6's
+    // "Generic candidates" paragraph says a generic method enters overload
+    // resolution "only after per-candidate type-argument inference" and that
+    // "surviving candidates enter the ranking below with their SUBSTITUTED
+    // signatures" — but the loop below (pre-fix) fed `classifyArg` the
+    // candidate's bare, UNSUBSTITUTED declared parameter type (`T`, never the
+    // inferred `int`). `classifyArg`/`implicitlyConvertible` have no rule
+    // admitting a concrete argument against a bare, unresolved type-parameter
+    // `Named` TypeRef (its `declaration` is null and it matches no builtin
+    // boxing target), so EVERY generic candidate whose argument reaches a
+    // bare type-parameter position came back `NotApplicable` regardless of
+    // what that parameter would actually infer to: `EqF<T>(a: T, b: T)`
+    // called as `EqF(5, 5)` was rejected even though phase-1 unification
+    // cleanly binds `T = int` and the substituted signature `(int, int)` is
+    // an exact match for `(int, int)` — every candidate ranked inapplicable
+    // and the call was mis-rejected as "no overload ... is applicable".
+    //
+    // A candidate's map is left EMPTY when inference fails to agree across
+    // occurrences (the §14.5 "Agreement" paragraph): it then ranks on its
+    // untouched, bare-type-parameter signature exactly as before the fix,
+    // which makes it `NotApplicable` at the conflicting position and drops
+    // it from `appl` below — matching §22.6's "Interaction with overloading"
+    // ("a candidate whose inference fails is inapplicable and drops out")
+    // with no separate drop-out mechanism needed.
+    //
+    // Scope: only a candidate with an AST `MethodDecl` (`cands[c]->decl`) can
+    // be unified this way — the same precondition this file's other §14.5
+    // phase-1 call sites require, since unification walks the declared
+    // `ast::Type` node. A generic METHOD on a non-generic IMPORTED class
+    // carries no such AST (see fix #3178's comment above, on `cands`) and
+    // keeps its pre-existing (unsubstituted) ranking; #5101's repro is
+    // same-module, so this is not a regression for that shape and widening
+    // it is a separate concern.
+    std::vector<std::unordered_map<std::string_view, TypeRef*>> phase1Subst(
+        cands.size());
+    for (std::size_t c = 0; c < cands.size(); ++c) {
+        // SEAM-DEBT: #5101 deliberately scoped to same-module candidates only
+        // (see the "Scope" comment above) — `unifyArgSubst` needs the
+        // declared `ast::Type` node to walk, which an imported generic
+        // method's symbol never carries (`MethodSymbol::decl` is set only
+        // when `ModuleLoader` re-parses body text for a generic TYPE, per
+        // fix #3178's comment on `cands` above). An imported generic
+        // candidate falls back to its pre-existing (unsubstituted) ranking
+        // rather than being mis-classified as non-generic — see
+        // `isGenericCand` below, which answers genericity off
+        // `MethodSymbol::genericParams` (no `->decl` read) for the
+        // non-generic-preference tie-break, so that classification is
+        // correct across the module boundary even though phase-1
+        // substitution itself is not (yet) widened to it.
+        const auto* md = dynamic_cast<const ast::MethodDecl*>(cands[c]->decl);
+        if (!md || md->genericParams.empty()) continue;
+        std::unordered_set<std::string_view> gpNames;
+        for (const auto& gp : md->genericParams) gpNames.insert(gp.name);
+        std::unordered_set<std::string_view> conflicts;
+        // non-author review, fix #5101 follow-up (§22.5, v0.307): this loop
+        // used to pair `ce.args[pi]` with `md->params[pi]` by raw POSITION,
+        // so a NAMED argument that binds to a different parameter than its
+        // written position unified against the wrong parameter's declared
+        // type entirely — a call written with named arguments out of
+        // declaration order (or mixed positional+named) could unify a
+        // string-typed argument against a generic candidate's `int`
+        // parameter, corrupting or vacuously satisfying that candidate's
+        // substitution map. §22.5 requires resolution to be independent of
+        // the order named arguments are written in. Use the same
+        // `binds[c].paramToArg[j]` lookup the ranking loop below (and the
+        // ref/out filter above) already use to go from declared parameter
+        // index to the argument actually bound to it; a defaulted parameter
+        // (`paramToArg[j] < 0`) contributes no argument and is skipped.
+        for (std::size_t j = 0; j < md->params.size(); ++j) {
+            int ai = binds[c].paramToArg[j];
+            if (ai < 0) continue;  // defaulted parameter — no bound argument
+            const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+            std::string_view amod = arg.modifier;
+            // §14.5 phase 1 / §22.4 (#1164): an inline `out var`-family
+            // argument has no type of its own to unify with — mirrors the
+            // established skip at this file's other §14.5 phase-1 call
+            // sites (e.g. the return-type inference block above).
+            if (amod == "out var" || amod == "out using var" ||
+                amod == "out owned var")
+                continue;
+            if (!md->params[j].type || !arg.value) continue;
+            TypeRef* argTy = ctx_.exprType(*arg.value);
+            if (!argTy) continue;
+            // §14.5 phase 1: "a bare `null` literal argument is not
+            // self-determined and contributes no binding" — a null literal
+            // is typed as nullable Object, the sema sentinel; skip it, the
+            // same skip the other phase-1 call sites in this file use.
+            if (argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->primitive == PrimitiveType::Object && argTy->nullable)
+                continue;
+            unifyArgSubst(md->params[j].type.get(), argTy, gpNames,
+                          phase1Subst[c], &conflicts);
+        }
+        if (!conflicts.empty()) phase1Subst[c].clear();
+    }
+
     // §22.6 ranks the bound argument positions. For each candidate, build
     // its parameter-type vector and the matching per-parameter argument-type
     // vector from the binding; a parameter filled by its default contributes
@@ -2116,6 +2230,16 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             const TypeRef* pt =
                 at0 ? ctx_.resolvedType(*at0)
                     : sema::formalParamResolvedType(*cands[c], j);
+            // fix #5101 (§14.5 / §22.6): rank against the phase-1-substituted
+            // parameter type when this candidate is generic and inference
+            // bound something. `substituteReturnType` returns the same
+            // pointer unchanged when `pt` is non-generic or mentions no
+            // method type parameter, so this is a no-op for every
+            // pre-existing (non-generic, or already-conflicting) candidate
+            // shape — see `phase1Subst`'s computation above.
+            if (pt && !phase1Subst[c].empty())
+                pt = substituteReturnType(const_cast<TypeRef*>(pt),
+                                          phase1Subst[c]);
             const ast::CallArgument* carg =
                 ce.args[static_cast<std::size_t>(ai)].value
                     ? &ce.args[static_cast<std::size_t>(ai)]
@@ -2183,6 +2307,14 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 extNote = extensionNameBlockedNote(recvTy, initial->name);
         }
     }
+    // fix #5101 (§22.6 "Generic candidates", v0.307): per-candidate
+    // genericity, straight off the symbol (unlike `phase1Subst` above, this
+    // needs no AST decl — `MethodSymbol::genericParams` is populated for an
+    // imported candidate too) — passed to `resolveOverload` purely for its
+    // last tie-break before ambiguity; ranking itself is unaffected.
+    std::vector<bool> isGenericCand(cands.size());
+    for (std::size_t c = 0; c < cands.size(); ++c)
+        isGenericCand[c] = !cands[c]->genericParams.empty();
     OverloadResult r = resolveOverload(
         paramTypes, argTypes, fillsDefault, candNames, ce.span.begin,
         std::string("`") + std::string(initial->name) + "`", extNote,
@@ -2201,7 +2333,8 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             for (const auto& a : ce.args)
                 es.push_back(a.value.get());
             return es;
-        }());
+        }(),
+        isGenericCand);
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
             return cands[r.winnerIndex];
