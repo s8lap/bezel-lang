@@ -153,6 +153,29 @@ BEZEL_TEST(codegen_1964_nullable_compound, char_above_max_throws_nonnullable) {
     BEZEL_EXPECT_EQ(throwsOverflow("var c: char := char(0x10FFFF); c += 1;"), 1);
 }
 
+// fix-forward #5054 (§6.6/§17.6, v0.307) — REGRESSION-PIN, not a
+// FAIL-WITHOUT row: `--` twin of char_plus_equals_rejected_3298's
+// non-nullable row above, added alongside the fix-forward that scoped the
+// §3.5 raw-binary char gate off compound-assignment/`++`/`--`.
+// `IncrementStmt`'s own typecheck dispatch (ExprTypecheck.cpp, the §17.6
+// block) never called `reportBoolOperandExcludedFromArithmeticOrOrdering`
+// in the first place — `char` falls through its numeric-primitive category
+// with no rejection — so #5054's original commit (2c20822a) did NOT break
+// `c--`, and this row passes on 86cbee7c too. It is pinned here as a
+// same-shape sibling of the `+=` row the fix-forward DOES close, so a
+// future change that routes `++`/`--` through the shared compound-
+// assignment gate (as #2868/#4290's comments note codegen once mirrored by
+// hand and got wrong twice) is caught immediately rather than silently
+// re-introducing this bug for the decrement spelling. §17.6, verbatim:
+// "`x++`/`x--` is admitted only on an operand of a type §6.6's compound
+// form admits — an integer type, a floating-point type, `decimal`, or
+// `char`", and "the same desugaring applies to `--`". `char('C')` (67)
+// decremented once is `char('B')` (66).
+BEZEL_TEST(codegen_1964_nullable_compound, char_minus_minus_accepted_5054) {
+    BEZEL_EXPECT_EQ(
+        run("var c: char := char('C'); c--; return int(c);"), 66);
+}
+
 BEZEL_TEST(codegen_1964_nullable_compound, int_plus_equals_rejected_3298) {
     // fix #3830: `5` is an int literal — a local initialized with it narrows
     // (§7.4); routed through a parameter to keep testing the genuinely

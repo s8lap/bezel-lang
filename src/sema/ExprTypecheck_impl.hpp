@@ -1617,9 +1617,20 @@ private:
     // and returns true iff the pair is excluded; unlike the BinaryExpr call
     // site, the caller here does its own consequence (typeBinary does
     // error-recovery typing; the compound-assignment check just stops).
+    //
+    // fix-forward #5054 (§6.6/§17.6, v0.307): `allowCharWriteBack` lets the
+    // §6.6 compound-assignment / §17.6 increment-decrement callers admit a
+    // `char` target against an integer right-hand operand — §6.6's
+    // narrow-integer write-back names this pair explicitly ("For a `char`
+    // target the §5.2 code-point rules apply: `c += 1` is `c := char(c +
+    // 1)`"), so it is NOT one of the pairs §3.5's raw-binary char exclusion
+    // covers. A raw binary `char + int` (no compound-assignment desugaring)
+    // still passes `false` here and is rejected as before. Bool stays
+    // rejected unconditionally in both callers: §6.6/§17.6 name no
+    // corresponding bool write-back.
     bool reportBoolOperandExcludedFromArithmeticOrOrdering(
         SourceLocation loc, std::string_view op, const TypeRef* lt,
-        const TypeRef* rt);
+        const TypeRef* rt, bool allowCharWriteBack = false);
 
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented

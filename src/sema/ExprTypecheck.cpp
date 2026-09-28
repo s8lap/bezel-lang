@@ -19348,9 +19348,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         (isTrueInt(tTy->primitive) ||
                          tTy->primitive == P::Char) &&
                         isTrueInt(rTy->primitive);
+                    // fix-forward #5054 (§6.6, v0.307): the write-back pair
+                    // §6.6 admits for a `char` TARGET is broader than
+                    // `integerKindPair` above (which is scoped to the
+                    // unrelated #4513 "no conversion either way" wording and
+                    // must not change) — a `char` RHS is admitted too, e.g.
+                    // `n += m` where `n: char` and `m: char?` narrowed
+                    // non-null (§7.4): both operands promote to `int` for
+                    // the write-back's R computation exactly as `int(c) +
+                    // int(c)` would. A char target against any other
+                    // non-integer rhs (`c += 1.5`) still falls through and
+                    // is rejected below — unchanged.
+                    const bool allowCharWriteBack =
+                        tTy->primitive == P::Char &&
+                        (isTrueInt(rTy->primitive) ||
+                         rTy->primitive == P::Char);
                     bool pairRejectedAsBinary =
                         reportBoolOperandExcludedFromArithmeticOrOrdering(
-                            as->value->span.begin, binOp, tTy, rTy);
+                            as->value->span.begin, binOp, tTy, rTy,
+                            allowCharWriteBack);
                     if (!pairRejectedAsBinary && !integerKindPair) {
                         pairRejectedAsBinary =
                             reportNoImplicitConversionBetweenOperands(

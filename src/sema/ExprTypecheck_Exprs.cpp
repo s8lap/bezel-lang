@@ -5862,7 +5862,7 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
 // op) has no such deferral.
 bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
     SourceLocation loc, std::string_view op, const TypeRef* lt,
-    const TypeRef* rt) {
+    const TypeRef* rt, bool allowCharWriteBack) {
     auto isBool = [](const TypeRef* t) {
         return t && t->kind == TypeRef::Kind::Primitive &&
                t->primitive == PrimitiveType::Bool;
@@ -5911,7 +5911,16 @@ bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
     // so char ordering is valid and is NOT rejected here.  §4.6's string-
     // concat rule takes precedence over §3.5's arithmetic rule for `string +`,
     // just as it does for `bool +` above, so exclude that pair here too.
-    if ((isChar(lt) || isChar(rt)) && !ordering && !deferToStringConcat) {
+    //
+    // fix-forward #5054 (§6.6/§17.6, v0.307): `allowCharWriteBack` excludes
+    // the compound-assignment / `++`/`--` char-target write-back pair §6.6
+    // names explicitly ("For a `char` target the §5.2 code-point rules
+    // apply: `c += 1` is `c := char(c + 1)`") — this raw-binary gate governs
+    // `char + int` written out as a binary expression, which stays rejected;
+    // the desugared-assignment form does not reach this branch when the
+    // caller passes `allowCharWriteBack=true`.
+    if ((isChar(lt) || isChar(rt)) && !ordering && !deferToStringConcat &&
+        !allowCharWriteBack) {
         ctx_.diagnostics().report(
             Severity::Error, loc,
             "operator `" + std::string(op) + "` is not defined for `char` "
