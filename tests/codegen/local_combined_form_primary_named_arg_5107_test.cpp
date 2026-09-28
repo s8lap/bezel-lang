@@ -92,15 +92,19 @@
 // chain form is the canonical idiom and the block form was rejected on
 // first compile.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness
+#include "support/aot_support.hpp"   // runAot, runAotOut — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 // Run the program; return the exit code on a clean run, -999 if rejected.
+// Used by T2/T3/T4 which assert single-shot values that fit an 8-bit exit
+// code (42, 5, 7). T1 uses the STDOUT value-channel (runAotOut) so the
+// oracle is not bound to the 8-bit cap (see T1's comment block).
 int run(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
@@ -117,15 +121,26 @@ int run(const std::string& prog) {
 //     public constructor(y: int) this(y, 0); end constructor;
 //     public property X: int get => x;
 //   end C;
-// must store x = 81, z = 0, so c.X = 81.  Loop-amplified: sum of 3 copies
-// of X must be 3 * 81 = 243.  Pre-fix, every field is left at calloc-zero,
-// so the sum would be 0.  (The process exit code carries only the lower
-// 8 bits of the int — a sum past 255 truncates and the test would silently
-// invert, so the loop is sized to leave 243 < 256.)
+// must store x = 81, z = 0, so c.X = 81.  Loop-amplified across 81
+// iterations: sum of 81 copies of X is 81 * 81 = 6561.  Pre-fix, every
+// field is left at calloc-zero, so the printed sum would be 0.
+//
+// Why STDOUT (per reviewer dc 2026-09-28 directive): the process exit code
+// carries only the lower 8 bits of the int (WEXITSTATUS).  A sum of 6561
+// masked to 0..255 is 169, which would silently invert the exit-code
+// oracle — a vacuous-oracle trap flagged in CLAUDE.md.  Switching to
+// `runAotOut` + Console.WriteLine moves the value onto the stdout channel
+// (harness aot_support.hpp line 3492), which carries the full int.  The
+// `1..81` iteration count is 81 inclusive iterations (Bezel `a..b` is
+// inclusive of both ends; see tests/codegen/array_indexer_compound_508
+// "arr[2]=30+2=32" with `0..2` = three iterations).  81 copies of 81
+// is 6561, byte-distinct from every 8-bit truncation of plausible
+// miscomputations (0, 169, 243, 81) — any "fix" that returned the wrong
+// field would land on a different print string and FAIL this oracle.
 // ===========================================================================
 BEZEL_TEST(local_combined_form_primary_named_arg_5107,
            named_arg_to_primary_ctor_stores_correct_value) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M;\n"
         "class C(x: int, z: int)\n"
         "  public constructor(y: int) this(y, 0); end constructor;\n"
@@ -133,12 +148,13 @@ BEZEL_TEST(local_combined_form_primary_named_arg_5107,
         "end C;\n"
         "class P public static method Main(): int\n"
         "  var sum: int := 0;\n"
-        "  for var i in 0..2 do\n"
+        "  for var i in 1..81 do\n"
         "    using var c := new C(x := 81, z := 0);\n"
         "    sum := sum + c.X;\n"
         "  end for;\n"
-        "  return sum;\n"   // expect 243; calloc-zero sum would be 0
-        "end Main; end P;"), 243);
+        "  Console.WriteLine(sum);\n"
+        "  return 0;\n"
+        "end Main; end P;"), "6561");
 }
 
 // ===========================================================================
