@@ -65,15 +65,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 std::string trimTrailingNewline(std::string s) {
     if (!s.empty() && s.back() == '\n') {
         s.pop_back();
@@ -299,7 +290,6 @@ const char* kRecordDevirtualizedGenericPropertyLoop =
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            interface_dispatched_producer_property_does_not_leak_spec_4_6_28_3_28_9) {
     JitResult r = runAotChecked(kInterfacePropertyLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("440"));
@@ -313,7 +303,6 @@ BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            direct_class_read_control_still_clean_spec_4_6_28_9) {
     JitResult r = runAotChecked(kDirectPropertyLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("440"));
@@ -328,7 +317,6 @@ BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            virtual_class_property_does_not_leak_spec_12_1_12_5_4_6_28_9) {
     JitResult r = runAotChecked(kVirtualClassPropertyLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("220"));
@@ -342,7 +330,6 @@ BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            interface_method_call_control_already_sound_spec_4_6_28_9) {
     JitResult r = runAotChecked(kInterfaceMethodLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("440"));
@@ -358,7 +345,6 @@ BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            generic_class_interface_property_does_not_leak_spec_14_1_4_6_28_9) {
     JitResult r = runAotChecked(kGenericInterfacePropertyLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("220"));
@@ -377,7 +363,6 @@ BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
 BEZEL_TEST(codegen_interface_property_string_getter_ownership_4952,
            record_devirtualized_generic_property_does_not_leak_spec_14_2_9_4_4_6_28_9) {
     JitResult r = runAotChecked(kRecordDevirtualizedGenericPropertyLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(trimTrailingNewline(r.stdoutText), std::string("220"));
