@@ -15249,6 +15249,35 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // sema admitted an implicit numeric conversion (e.g. an int argument bound
     // to a double parameter — also reached by the operator-overload path in
     // lowerBinary). Without this the i32 reaches an f64 parameter as raw bits
+    // fix #5057 (§14.1 / §2.5, v0.307): BEFORE the coercion below — because
+    // coercion destroys the nullable-struct shape ({i8, T} → T) and the #1943
+    // gate after it can only see the coerced form. For an IMPORTED generic
+    // method (empty genericSubst_, placeholder-only callee), detect a
+    // nullable-value-typed argument ({i8, T} struct) reaching an i32-placeholder
+    // param BEFORE coercion transforms it, and report a clean error. This is
+    // unreachable for local generic methods (genericSubst_ is populated), and
+    // for non-generic imported methods (placeholder i32 matches i32 arg exactly).
+    if (ctx_.isImported(ms) && !ms->genericParams.empty()) {
+        auto* cft = callee->getFunctionType();
+        for (std::size_t ai = 0; ai < args.size() && ai < cft->getNumParams(); ++ai) {
+            auto* st = llvm::dyn_cast<llvm::StructType>(args[ai]->getType());
+            if (st && st->getNumElements() == 2 &&
+                llvm::isa<llvm::IntegerType>(st->getElementType(0)) &&
+                llvm::cast<llvm::IntegerType>(st->getElementType(0))->getBitWidth() == 8 &&
+                cft->getParamType(ai)->isIntegerTy(32)) {
+                SourceLocation loc{};
+                if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
+                    loc = (*argExprs)[ai]->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "calling imported generic method `" + std::string(ms->name) +
+                    "` with a nullable-value-typed argument (`T?`) that cannot "
+                    "cross the module boundary as a bare `int` placeholder "
+                    "(\xC2\xA7""14.1 / \xC2\xA7""2.5, #5057, v0.307)");
+                return llvm::PoisonValue::get(callee->getReturnType());
+            }
+        }
+    }
     // (issue #408 / finding [17]). Applied after the generic-specialization
     // checks above so it does not perturb their arg/param type comparisons.
     // fix #2925: `coerceExprValueToSlot` rather than `coerceNumericToType` for
@@ -15294,9 +15323,34 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // Emitter::run() return nullptr (#628 part 1), so the compile fails cleanly.
     if (ctx_.isImported(ms) && !ms->genericParams.empty()) {
         auto* cft = callee->getFunctionType();
+        // fix #5057 (§14.1 / §2.5, v0.307): a nullable-value-typed argument
+        // (`{i8, T}` struct) reaching a placeholder param (bare i32).
+        // The #1943 error below catches non-int types (long, double, bool, record).
+        // For T=int, the placeholder param IS i32, but the nullable struct arg
+        // `{i8, i32}` still can't be passed as i32. Report a clean error.
         for (std::size_t ai = 0;
              ai < args.size() && ai < cft->getNumParams(); ++ai) {
-            if (args[ai]->getType() == cft->getParamType(ai)) continue;
+            auto* st = llvm::dyn_cast<llvm::StructType>(args[ai]->getType());
+            if (st && st->getNumElements() == 2 &&
+                llvm::isa<llvm::IntegerType>(st->getElementType(0)) &&
+                llvm::cast<llvm::IntegerType>(st->getElementType(0))->getBitWidth() == 8 &&
+                cft->getParamType(ai)->isIntegerTy(32)) {
+                SourceLocation loc{};
+                if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
+                    loc = (*argExprs)[ai]->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "calling imported generic method `" + std::string(ms->name) +
+                    "` with a nullable-value-typed argument (`T?`) that cannot "
+                    "cross the module boundary as a bare `int` placeholder "
+                    "(\xC2\xA7""14.1 / \xC2\xA7""2.5, #5057, v0.307)");
+                return llvm::PoisonValue::get(callee->getReturnType());
+            }
+        }
+        auto* cft2 = callee->getFunctionType();
+        for (std::size_t ai = 0;
+             ai < args.size() && ai < cft2->getNumParams(); ++ai) {
+            if (args[ai]->getType() == cft2->getParamType(ai)) continue;
             SourceLocation loc{};
             if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
                 loc = (*argExprs)[ai]->span.begin;
