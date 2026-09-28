@@ -17258,6 +17258,41 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // are applicable with identical parameter types. Before this, the
             // call compiled and codegen's `ctorForArgs` silently chose the
             // body constructor.
+            //
+            // fix #5121 (§22.5, v0.307): the deferral must still emit §22.5
+            // diagnostics for the call site (probes A/B/C from #5107 review:
+            // duplicate named arg / unknown name / missing required must
+            // reject). `bindArgsToParams` with `emit=false` over every
+            // candidate (primary + each body ctor) decides whether ANY
+            // candidate binds; only when NONE bind does the primary's binder
+            // re-run with `emit=true` to surface the §22.5 diagnostic. Named
+            // args that bind to the explicit ctor's params (T3 `new C(y:=5)`
+            // where `y` is the explicit ctor's param) are not spuriously
+            // rejected. The codegen binding #5107 built at
+            // `storePrimaryCtorPositionalArgs` remains as defence-in-depth.
+            auto* td5121 = dynamic_cast<const ast::TypeDecl*>(t->decl);
+            if (td5121 && !td5121->positionalFields.empty()) {
+                bool anyBind = bindArgsToParams(td5121->positionalFields,
+                                                ne.args, ne.span.begin,
+                                                std::string(),
+                                                /*emit=*/false).ok;
+                for (Symbol* m : t->members) {
+                    if (anyBind) break;
+                    auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+                    if (bindArgsToParams(cd->params, ne.args, ne.span.begin,
+                                         std::string(),
+                                         /*emit=*/false).ok) { anyBind = true; break; }
+                }
+                if (!anyBind) {
+                    (void)bindArgsToParams(
+                        td5121->positionalFields, ne.args, ne.span.begin,
+                        std::string("`new ") + std::string(t->name) + "`",
+                        /*emit=*/true);
+                }
+            }
             (void)reportPrimaryBodyCtorAmbiguity(ne, t);
             return;
         } else if (ctx_.isImported(t) && hasExplicitCtor && !ne.args.empty()) {
