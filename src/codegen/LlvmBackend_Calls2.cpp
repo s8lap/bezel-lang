@@ -16985,6 +16985,56 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         }
         return nullptr;  // Dispose() is void — result discarded.
     }
+    // fix #5096 (§9.1 / §8.3 / stdlib §2.9, v0.307): the `?.` (NullCondMemberExpr)
+    // spelling of the synthesized `IEquatable<Self>.Equals` witness. #5068 fixed
+    // the `.` (MemberAccessExpr) spelling of the same program by widening
+    // `tryLowerValueSemanticsCall`'s "any resolved MethodSymbol" gate. The `?.`
+    // spelling never reaches that helper (its callee is a `NullCondMemberExpr`,
+    // not a `MemberAccessExpr`), so `ms` here is the abstract builtin
+    // `IEquatable<T>.Equals` and the value-semantics block gated on `!ms`
+    // below is skipped. The dispatch then falls into the general ms-driven
+    // path, calls `emitMethodCall` against the abstract interface member on
+    // a record-VALUE receiver, bails partway through, and leaves `nullcall.end`
+    // unterminated (the verifier error in the issue: "Basic Block in function
+    // 'main' does not have terminator! label %nullcall.end").
+    //
+    // Detect the synthesized Equals witness specifically — Equals is the
+    // ONLY `IEquatable<T>` member (§9.1, stdlib §2.9 declares
+    // `method Equals(other: T): bool`), so this is the only shape the bug can
+    // take — and route through the SAME `lowerNullCondValueSemCall` the `!ms`
+    // block uses. That helper ends in `lowerValueSemMethodOn` (the dispatch
+    // core #5068 widened), so the `?.`-form and the `.`-form and the boxed
+    // spellings of §8.3 equality agree. `BoxEscapeWalker`'s
+    // `isSynthesizedEqualsCallee` consult (added by #5068, already covering
+    // the `NullCondMemberExpr` arm) keeps `isKnownBoxEqualsArg`'s relaxation
+    // on the Object-argument spelling — this fix only changes which block
+    // lowers the call, not how it allocates.
+    if (ms && nm.target && nm.member == "Equals" &&
+        call.args.size() == 1) {
+        const sema::TypeRef* recvTy0 = ctx_.exprType(*nm.target);
+        if (recvTy0 && recvTy0->kind == sema::TypeRef::Kind::Named &&
+            recvTy0->nullable) {
+            const sema::TypeSymbol* recRecv = recvTy0->declaration;
+            // #730 (§14.1/§14.2): a bare `T` parameter receiver bound by the
+            // active monomorphization to an auto-bearing record.
+            if (!recRecv && !genericSubstSemaTy_.empty()) {
+                auto sit = genericSubstSemaTy_.find(recvTy0->headName());
+                if (sit != genericSubstSemaTy_.end() && sit->second &&
+                    sit->second->kind == sema::TypeRef::Kind::Named)
+                    recRecv = sit->second->declaration;
+            }
+            if (recRecv && isSynthesizedIEquatableEquals(ms, recRecv) &&
+                isNullableValueTy(recvTy0)) {
+                llvm::Value* recv = lowerExpr(*nm.target);
+                if (recv && recv->getType()->isStructTy())
+                    return lowerNullCondValueSemCall(
+                        call, nm, recvTy0, recv,
+                        /*isToString=*/false,
+                        /*isGetHashCode=*/false,
+                        /*isEquals=*/true);
+            }
+        }
+    }
     // §7.5 / #1075: an inherited Object value-semantics method (ToString /
     // GetHashCode / Equals) called via `?.` on a NULLABLE value-type/enum/record
     // receiver has NO MethodSymbol, so the ms-driven path below bails and the T?
