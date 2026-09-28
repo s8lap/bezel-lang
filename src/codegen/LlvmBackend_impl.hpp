@@ -3643,6 +3643,14 @@ private:
     // MethodSymbol (its narrow body); generated once per contributor.
     std::unordered_map<const sema::MethodSymbol*, llvm::Function*>
         vtableWideningThunks_;
+    // fix #4952 (§4.6 / §28.3 / §28.9, v0.307): per compiled property-getter
+    // FUNCTION, a thunk that normalizes its `string` return to a guaranteed
+    // +1 before handing it to a DYNAMIC (vtable/itable) caller — see
+    // ensureVirtualStringGetterOwnershipThunk. Keyed by the raw accessor
+    // llvm::Function* itself (already unique per (property, spec-tag)), so no
+    // extra key dimension is needed for the generic-instantiation case.
+    std::unordered_map<llvm::Function*, llvm::Function*>
+        virtualStringGetterOwnershipThunks_;
     // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         itmaps_;
@@ -8388,6 +8396,50 @@ private:
     llvm::Function* ensureVtableWideningThunk(const sema::MethodSymbol* rootMs,
                                               const sema::MethodSymbol* leafMs,
                                               const std::vector<bool>& widened);
+    // fix #4952 (§4.6 "string" / §28.3 "Unbound owned temporaries" / §28.9,
+    // v0.307): normalize a property-getter FUNCTION installed into a
+    // vtable/itable slot so a non-nullable `string` return is ALWAYS a fresh
+    // +1 to the caller, regardless of whether `impl`'s own getter body is a
+    // +1 producer (an interpolation/`+`/case/… expression, already +1) or a
+    // borrow (a bare field/identifier read, +0). A call THROUGH THE SLOT is
+    // dynamically dispatched — the call site (lowerVirtualPropertyGet) has
+    // only the STATIC (declaring interface/base) PropertySymbol, which may
+    // have no body at all (an interface) or a DIFFERENT body than the
+    // concrete override that actually runs, so it cannot decide
+    // producer-vs-borrow by inspecting a body the way a direct/inlined read
+    // does (isPlusOneStringProducer's own MemberAccessExpr arm). Mirrors how
+    // a virtual/interface METHOD call is already sound for this reason
+    // (isUserMethodStringReturnCall trusts the compiled body's OWN
+    // return-statement mint unconditionally) — a property accessor's
+    // expression body is instead returned via a bare CreateRet with no
+    // normalization (#2703's Axiom A4: "+0 mandatory" is upheld only when
+    // the reader inspects the SAME body that runs, true for a direct read,
+    // false for a dynamically-dispatched one).
+    //
+    // Returns `fn` UNCHANGED (no thunk) when: `fn` is null; `impl` is an
+    // indexer; the declared type is not non-nullable `string` (scope matches
+    // isPlusOneStringProducer's own `!ty->nullable` gate — for an IMPORTED
+    // `impl` (no local ast::PropertyDecl, so no `pd->type`), that type check
+    // falls back to ctx_.importedMemberType(impl), the same side-table every
+    // other imported-member-type read in this file already consults); or
+    // `impl`'s own body is ALREADY statically provable as a +1 producer (the
+    // raw accessor already returns +1 — wrapping again would double-count) —
+    // provable only for a LOCAL `impl` (computedGetterOf/blockGetterOf need
+    // `impl->decl`), so an imported getter is always wrapped: its body is
+    // uninspectable, and wrapping is the safe default (an extra retain on an
+    // already-+1 imported producer only leaks one reference; skipping it on
+    // an actual imported borrow would over-release a live object — see the
+    // function body for why this direction, not the reverse, is mandatory).
+    // Deliberately built as a SEPARATE wrapper rather than baked into
+    // ensurePropertyAccessorFn's own body: that function's memoized Function
+    // is SHARED with `base.P` static dispatch and the cross-module export
+    // wrapper, both of which independently re-inspect the SAME (statically
+    // known) body via isPlusOneStringProducer and would double-release (or,
+    // for a currently-clean cross-module borrow read, start leaking) if the
+    // shared function's own ABI changed under them. This thunk is installed
+    // ONLY into vtable/itable slots, never returned to those other callers.
+    llvm::Function* ensureVirtualStringGetterOwnershipThunk(
+        const sema::PropertySymbol* impl, llvm::Function* fn);
 
     void declareVtables();
 

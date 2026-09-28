@@ -4422,6 +4422,119 @@ llvm::Function* Emitter::ensureVtableWideningThunk(
 }
 
 
+// fix #4952 (§4.6 "string" / §28.3 "Unbound owned temporaries" / §28.9,
+// v0.307): see the declaration comment (LlvmBackend_impl.hpp) for the full
+// rationale. Builds/memoizes (keyed by the raw accessor `fn`, already unique
+// per (property, spec-tag) via ensurePropertyAccessorFn/buildSpecializedAccessorFn's
+// own memoization) a thin forwarding thunk that retains the getter's return
+// value before handing it back, so every DYNAMIC caller sees a guaranteed +1 —
+// mirroring isUserMethodStringReturnCall's treatment of virtual/interface
+// METHOD calls, which trusts the compiled body unconditionally rather than
+// re-deriving producer-vs-borrow from a (possibly absent, possibly different)
+// static declaration.
+llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
+        const sema::PropertySymbol* impl, llvm::Function* fn) {
+    if (!fn || !impl) return fn;
+    auto cacheIt = virtualStringGetterOwnershipThunks_.find(fn);
+    if (cacheIt != virtualStringGetterOwnershipThunks_.end())
+        return cacheIt->second;
+
+    if (impl->isIndexer) return fn;  // indexer: out of scope here
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(impl->decl);
+    if (pd && pd->isIndexer) return fn;
+
+    // fix #4952 follow-up (§2.8.3 rule 4 seam, same family as umbrella
+    // #3152): `impl` may be an IMPORTED PropertySymbol — an interface/
+    // virtual property whose actually-installed override lives in a
+    // dependency module, reached via classPropertyByName walking an
+    // imported base, or via a generic-instantiation re-specialization of
+    // an imported template. `impl->decl` is then null (ModuleLoader never
+    // reconstructs a body-less imported PropertyDecl), so `pd->type` is
+    // unavailable; fall back to the SAME importedMemberType side table
+    // every other imported-member-type read in this file already
+    // consults (ctx_.importedMemberType, SemaContext.hpp) instead of
+    // bailing unwrapped. Bailing here would be UNSOUND, not merely
+    // conservative: this thunk's caller (isPlusOneStringProducer's
+    // dynamicSlot fast path, just above) classifies EVERY dynamically-
+    // slotted non-nullable-string property read as a +1 and WILL release
+    // it, so handing back an unwrapped raw accessor whose actual (here
+    // uninspectable) body is a genuine borrow would be released one
+    // reference too many on every call — the dangerous over-release/UAF
+    // direction this project's discipline forbids, not the safe leak
+    // direction. Always retaining below (never skipping the wrap, since
+    // an imported body's producer-vs-borrow status cannot be proven the
+    // way a local `pd` body's can via computedGetterOf/blockGetterOf) is
+    // always safe: at worst an already-+1 imported producer gets
+    // over-retained, which only leaks one reference — it can never free a
+    // still-live object.
+    const sema::TypeRef* retTy =
+        pd ? (pd->type ? ctx_.resolvedType(*pd->type) : nullptr)
+           : ctx_.importedMemberType(impl);
+    if (!retTy || retTy->kind != sema::TypeRef::Kind::Primitive ||
+        retTy->primitive != sema::PrimitiveType::String || retTy->nullable)
+        return fn;
+
+    // Find the getter body the SAME way isPlusOneStringProducer's own
+    // MemberAccessExpr arm does (LlvmBackend_Setup.cpp, the #2304/#2704 fix
+    // block), so "already +1" here agrees exactly with what a DIRECT read of
+    // this same body would have concluded: an expression-bodied property /
+    // accessor-block getter, or a block getter whose body is exactly one
+    // `return <expr>;`. Both helpers key off `impl->decl` and answer null
+    // for an imported `impl` (no AST body to inspect), so an imported
+    // getter always falls through to "wrap" below — the safe default
+    // established just above.
+    auto* mutableImpl = const_cast<sema::PropertySymbol*>(impl);
+    const ast::Expr* getter = computedGetterOf(mutableImpl);
+    if (!getter) {
+        if (const ast::PropertyAccessor* blk = blockGetterOf(mutableImpl)) {
+            if (blk->bodyKind == ast::PropertyAccessorBodyKind::Block &&
+                blk->stmts.size() == 1) {
+                if (auto* rs =
+                        dynamic_cast<const ast::ReturnStmt*>(blk->stmts[0].get()))
+                    if (rs->value) getter = rs->value.get();
+            }
+        }
+    }
+    if (getter && isPlusOneStringProducer(getter)) {
+        // The compiled body already hands back a fresh +1 (the same
+        // conclusion a direct/inlined read of this exact body would reach) —
+        // wrapping again would leak one reference on every dynamic call.
+        // Install the raw function directly; no thunk needed.
+        return fn;
+    }
+
+    std::string name = "bz$vsg$" +
+                       std::string(impl->parent ? impl->parent->name : "") +
+                       "$" + std::string(impl->name);
+    llvm::FunctionType* fnTy = fn->getFunctionType();
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
+    virtualStringGetterOwnershipThunks_[fn] = thunk;
+
+    // Save/restore builder state (same pattern as ensureVtableWideningThunk —
+    // this may run during declareVtables/specializedVtableFor, before every
+    // method body is emitted).
+    llvm::Function* savedFn2 = currentFn_;
+    llvm::BasicBlock* savedBB2 = builder_.GetInsertBlock();
+    currentFn_ = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    builder_.SetInsertPoint(entry);
+
+    std::vector<llvm::Value*> args;
+    args.reserve(thunk->arg_size());
+    for (llvm::Argument& a : thunk->args()) args.push_back(&a);
+    llvm::Value* result = builder_.CreateCall(fnTy, fn, args, "vsg.ret");
+    // #422: bz_string_retain is null/sentinel-safe, so this is correct even
+    // when the borrow-bodied getter's read returns a null string reference.
+    emitStringRetain(result);
+    builder_.CreateRet(result);
+
+    currentFn_ = savedFn2;
+    if (savedBB2) builder_.SetInsertPoint(savedBB2);
+    return thunk;
+}
+
+
 // §24 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
 // returns the object's backing EventSource<T> (the event's instance field).
 // Cached per EventSymbol. Self-contained: saves/restores the builder so it may
@@ -5208,8 +5321,13 @@ void Emitter::declareVtables() {
                     llvm::ConstantPointerNull::get(ptrTy());
                 if (impl)
                     if (llvm::Function* acc =
-                            ensurePropertyAccessorFn(ts, impl, /*isSet=*/false))
+                            ensurePropertyAccessorFn(ts, impl, /*isSet=*/false)) {
+                        // fix #4952: normalize a dynamically-dispatched
+                        // non-nullable `string` getter to +1 (see the
+                        // function's declaration comment).
+                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc);
                         getFp = llvm::cast<llvm::Constant>(acc);
+                    }
                 itabElems.push_back(getFp);
                 if (propertyHasSetter(ip)) {
                     llvm::Constant* setFp =
@@ -5349,6 +5467,15 @@ void Emitter::declareVtables() {
                             ? (vs.isSet ? ensureIndexerSetterFn(ts, impl)
                                         : ensureIndexerGetterFn(ts, impl))
                             : ensurePropertyAccessorFn(ts, impl, vs.isSet);
+                    // fix #4952: same normalization as the itable getter fill
+                    // above, for a virtual (non-interface) class property's
+                    // vtable slot. Getter-only (indexers are excluded by
+                    // ensureVirtualStringGetterOwnershipThunk's own
+                    // `impl->isIndexer` guard; passing a setter slot's `fn`
+                    // here would be a no-op vs. actively wrong for a future
+                    // wired setter shape, so gate on `!vs.isSet` explicitly).
+                    if (fn && !vs.prop->isIndexer && !vs.isSet)
+                        fn = ensureVirtualStringGetterOwnershipThunk(impl, fn);
                     if (fn)
                         elems[kVirtualMethodsBase + i] =
                             llvm::cast<llvm::Constant>(fn);
@@ -8522,11 +8649,22 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 if (!impl || !impl->parent) continue;
                 llvm::Function* canon =
                     templateAccessorFn(impl, vs.isSet);
+                if (!canon) continue;
+                // fix #4952 (§4.6/§28.3/§28.9, v0.307): the shared vtable's
+                // slot may itself hold the ownership-normalizing thunk over
+                // `canon` rather than `canon` directly (the vtable getter-fill
+                // in the (b)/(d) loop above installs it for a non-nullable
+                // `string` property getter) — reconstruct that exact value
+                // before the "still holds the shared TEMPLATE accessor" guard,
+                // same as the itable twins of this loop. Getter-only.
+                llvm::Function* installedCanon =
+                    (!vs.isSet && !impl->isIndexer)
+                        ? ensureVirtualStringGetterOwnershipThunk(impl, canon)
+                        : canon;
                 // Only a slot that still holds the shared TEMPLATE accessor is
                 // ours to replace (the #2906 guard, verbatim in intent).
-                if (!canon ||
-                    sharedInitPeek->getAggregateElement(slot) !=
-                        llvm::cast<llvm::Constant>(canon))
+                if (sharedInitPeek->getAggregateElement(slot) !=
+                    llvm::cast<llvm::Constant>(installedCanon))
                     continue;
                 if (!instanceLayoutDiffersFromErasedTemplate(impl->parent))
                     continue;
@@ -8777,12 +8915,24 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 auto patchSlot = [&](bool isSet, unsigned si) {
                     if (si >= newItabElems.size()) return;
                     llvm::Function* canon = templateAccessorFn(pimpl, isSet);
-                    if (!canon ||
-                        newItabElems[si] != llvm::cast<llvm::Constant>(canon))
+                    if (!canon) return;
+                    // fix #4952 (§4.6/§28.3/§28.9, v0.307): the slot
+                    // `newItabElems` was seeded with (the slot-by-slot copy
+                    // above) may itself be the ownership-normalizing thunk
+                    // over `canon`, not `canon` directly — reconstruct that
+                    // exact installed value before comparing, same as the
+                    // single-module twin of this loop (LlvmBackend_Layout.cpp,
+                    // patchConcreteDerivedGenericBaseItables). Getter-only.
+                    llvm::Function* installedCanon =
+                        (!isSet && !pimpl->isIndexer)
+                            ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon)
+                            : canon;
+                    if (newItabElems[si] !=
+                        llvm::cast<llvm::Constant>(installedCanon))
                         return;
                     llvm::Function* specFn =
                         buildSpecializedAccessorFn(ts, pimpl, isSet);
-                    if (!specFn || specFn == canon) return;
+                    if (!specFn) return;
                     // fix #5058 (§11.2 / §14.1 / §23, v0.307): NO "function
                     // type must equal the template's" guard here. A reference
                     // `T` moves the accessor's signature (`T -> i32` erased vs
@@ -8798,6 +8948,9 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     // and patchConcreteDerivedGenericBaseItables (#4933/#4950)
                     // already install signature-moving specializations on
                     // that premise.
+                    if (!isSet && !pimpl->isIndexer)
+                        specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn);
+                    if (specFn == installedCanon) return;
                     newItabElems[si] = llvm::cast<llvm::Constant>(specFn);
                 };
                 if (auto git = ifacePropertyGetIndex_.find(ip);
@@ -8882,8 +9035,19 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         if (!canon) continue;
         llvm::Function* specFn =
             buildSpecializedAccessorFn(ts, as.impl, as.isSet);
-        if (!specFn || specFn == canon) continue;
+        if (!specFn) continue;
         if (specFn->getFunctionType() != canon->getFunctionType()) continue;
+        // fix #4952 (§4.6/§28.3/§28.9, v0.307): normalize the specialized
+        // getter's ownership the same way canon's own installation site did
+        // (the thunk shares `fn`'s FunctionType exactly, so this cannot
+        // affect the type check just above).
+        if (!as.isSet && !as.impl->isIndexer)
+            specFn = ensureVirtualStringGetterOwnershipThunk(as.impl, specFn);
+        llvm::Function* installedCanon =
+            (!as.isSet && !as.impl->isIndexer)
+                ? ensureVirtualStringGetterOwnershipThunk(as.impl, canon)
+                : canon;
+        if (specFn == installedCanon) continue;
         elems[as.slot] = llvm::cast<llvm::Constant>(specFn);
     }
 
@@ -24350,6 +24514,108 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
                     ty->primitive == sema::PrimitiveType::String &&
                     !ty->nullable) {
+                    // fix #4952 (§4.6 / §28.3 / §28.9, v0.307): a
+                    // DYNAMICALLY DISPATCHED property read — `ps` (the
+                    // symbol this MemberAccessExpr resolved to) has a
+                    // vtable slot (a virtual class property, read through
+                    // any static type at or above the introducing class) or
+                    // an itable slot (an interface property, read through
+                    // an interface-typed receiver) — is a +1 producer
+                    // UNCONDITIONALLY, exactly like isUserMethodStringReturnCall's
+                    // treatment of a virtual/interface METHOD call. `ps`
+                    // here is the STATIC (declaring interface/base) symbol,
+                    // which may have no body at all (an interface) or a
+                    // DIFFERENT body than whatever concrete override the
+                    // vtable/itable slot actually resolves to at runtime —
+                    // so, unlike the non-virtual case just below, this
+                    // cannot be decided by inspecting `ps->decl`'s own body.
+                    // Soundness of returning `true` here relies on
+                    // ensureVirtualStringGetterOwnershipThunk (installed at
+                    // every vtable/itable slot-fill site) guaranteeing every
+                    // possible override this slot could resolve to hands
+                    // back a normalized +1, regardless of that override's
+                    // own body shape (producer or borrow).
+                    //
+                    // EXCEPT `base.P` (§12.3): that spelling explicitly
+                    // requests the NON-virtual base implementation, and
+                    // lowerVirtualPropertyGet itself bypasses dispatch for it
+                    // (`tid->name == "base"` -> `return nullptr`) — the read
+                    // is lowered by INLINING `ps`'s own body (below), not
+                    // through the thunked slot, so it must keep using that
+                    // body-inspection classification instead.
+                    bool isBaseTarget = false;
+                    if (ma->target) {
+                        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get()))
+                            isBaseTarget = tid->name == "base";
+                    }
+                    bool dynamicSlot =
+                        !isBaseTarget &&
+                        (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps));
+                    // fix #4952 sibling (§14.2 record-conforms-to-interface /
+                    // §9.4, v0.307): lowerVirtualPropertyGet's record-
+                    // devirtualization branch (LlvmBackend_Exprs.cpp) redirects
+                    // an interface property read whose receiver's STATIC type
+                    // is a bare, unresolved generic type parameter to the
+                    // RECORD's own concrete accessor when the ACTIVE
+                    // substitution binds that parameter to a Record — fully
+                    // INLINING that body, bypassing the itable slot (and this
+                    // fix's thunk) entirely, exactly like `base.P` above. Mirror
+                    // that condition (verbatim) here: when it holds, redirect
+                    // the CLASSIFICATION to the record's own property + its own
+                    // body (reusing the SAME inline body-inspection block below
+                    // a non-virtual read already uses) instead of the
+                    // unconditional-true fast path. `classPropertyByName`
+                    // cannot be called here (non-const; this function is
+                    // `const`), so its (non-static, non-indexer, most-derived)
+                    // lookup is duplicated inline via the const `baseClassOf`.
+                    if (dynamicSlot && ifacePropertyGetIndex_.count(ps) &&
+                        ma->target) {
+                        const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                        const sema::TypeRef* concrete = recvTy;
+                        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                            !recvTy->declaration && recvTy->astNode &&
+                            recvTy->astNode->name &&
+                            recvTy->astNode->name->parts.size() == 1) {
+                            auto sit = genericSubstSemaTy_.find(recvTy->headName());
+                            if (sit != genericSubstSemaTy_.end() && sit->second)
+                                concrete = sit->second;
+                        }
+                        if (concrete && concrete->declaration &&
+                            concrete->declaration->kind ==
+                                ast::TypeDeclKind::Record) {
+                            dynamicSlot = false;
+                            sema::PropertySymbol* recordImpl = nullptr;
+                            for (const sema::TypeSymbol* t = concrete->declaration;
+                                 t && !recordImpl; t = baseClassOf(t)) {
+                                for (sema::Symbol* m : t->members) {
+                                    auto* mps =
+                                        dynamic_cast<sema::PropertySymbol*>(m);
+                                    if (!mps || mps->isIndexer ||
+                                        mps->name != ps->name)
+                                        continue;
+                                    bool isStatic = false;
+                                    for (auto mod : mps->modifiers)
+                                        if (mod == "static") {
+                                            isStatic = true;
+                                            break;
+                                        }
+                                    if (!isStatic) { recordImpl = mps; break; }
+                                }
+                            }
+                            // Redirect `ps` to the record's own property so the
+                            // body-inspection block below asks about the body
+                            // that ACTUALLY runs. `recordImpl` is null for a
+                            // POSITIONAL record field (#815 — a FieldSymbol,
+                            // not a PropertySymbol): that read is a struct-GEP
+                            // +load, inherently a borrow, so leaving `ps`
+                            // pointing at the interface symbol (whose `pd`
+                            // lookup below finds no body either) reaches the
+                            // same correct `false` by the existing fallthrough.
+                            if (recordImpl) ps = recordImpl;
+                        }
+                    }
+                    if (dynamicSlot) return true;
                     // Inline the predicate that computedGetterOf keys on
                     // (isPlusOneStringProducer is `const`, but computedGetterOf
                     // is not — duplicating the small constant-time check here
@@ -41260,6 +41526,12 @@ void Emitter::setupBoxDescriptors() {
                 if (impl) {
                     if (llvm::Function* acc =
                             ensurePropertyAccessorFn(ts, impl, /*isSet=*/false)) {
+                        // fix #4952: normalize BEFORE box-adapting — makeBoxThunk
+                        // is a pure receiver-ABI adapter, a tail call that passes
+                        // the return value through unchanged, so composing the
+                        // two in this order gives a boxed-record interface
+                        // getter the same +1 guarantee as a class's.
+                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc);
                         std::string thunkName =
                             "bz$boxpropget$" + std::string(ts->name) + "$" +
                             std::string(ip->name);

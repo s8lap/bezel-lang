@@ -2017,11 +2017,31 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
             auto patchSlot = [&](bool isSet, unsigned si) {
                 if (si >= numSlots) return;
                 llvm::Function* canon = templateAccessorFn(pimpl, isSet);
-                if (!canon || elems[si] != llvm::cast<llvm::Constant>(canon))
+                if (!canon) return;
+                // fix #4952 (§4.6/§28.3/§28.9, v0.307): the generic-instantiation
+                // twin of the itable/vtable getter-fill fix a few hundred lines
+                // up in LlvmBackend_Setup.cpp — the slot Pass D actually
+                // installed for the TEMPLATE (tag 0) may itself be the
+                // ownership-normalizing thunk over `canon`, not `canon`
+                // directly, when `canon` is a non-nullable `string` getter.
+                // Reconstruct that exact value here (rather than comparing
+                // against the raw `canon`) so the "still template-installed"
+                // guard below does not spuriously mismatch and skip every
+                // later, genuinely-needed layout/method specialization for
+                // this slot. Getter-only (indexers excluded by the thunk's
+                // own `impl->isIndexer` guard).
+                llvm::Function* installedCanon =
+                    (!isSet && !pimpl->isIndexer)
+                        ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon)
+                        : canon;
+                if (elems[si] != llvm::cast<llvm::Constant>(installedCanon))
                     return;
                 llvm::Function* specFn =
                     buildSpecializedAccessorFn(ts, pimpl, isSet);
-                if (!specFn || specFn == canon) return;
+                if (!specFn) return;
+                if (!isSet && !pimpl->isIndexer)
+                    specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn);
+                if (specFn == installedCanon) return;
                 elems[si] = llvm::cast<llvm::Constant>(specFn);
                 changed = true;
             };
