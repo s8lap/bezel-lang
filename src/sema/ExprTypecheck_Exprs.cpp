@@ -8887,19 +8887,45 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
             }
         }
+        // fix-forward #5117 (gate 1 FAIL, §14.1/§14.2/§14.5, v0.307): a formal
+        // parameter position that IS the method's own generic name DIRECTLY
+        // (`(T) -> R`, #5066's exact shape) must bail regardless of
+        // `methodSubst` — `Util.Map<int?>(v, lambda(y) => y.ToString())`
+        // substituted `T` to the call's explicit `int?` type argument BEFORE
+        // this check, so `mentionsOwnGeneric` no longer saw `T` in the
+        // substituted type and let the (now concrete, nullable) type thread
+        // through to `y`'s declared sema type — reintroducing #505's hazard
+        // for exactly the shape #5066 protects: `y`'s CORRECT typing comes
+        // from the method's own generic-inference path, not this seeding
+        // hack, and threading a substituted `int?` here made `y.ToString()`
+        // spuriously trip the §7.4 nullable-narrowing gate (measured:
+        // "member access `.ToString` on a nullable value requires narrowing
+        // it to non-null first"). #5117's substitution stays for the NESTED
+        // shape it fixed (`Array<U>` -> `Array<int>`), which is safe because
+        // that position was never a bare reference to the method's own
+        // generic to begin with.
+        auto isBareOwnGenericRef = [&](const TypeRef* t) -> bool {
+            return t && t->kind == TypeRef::Kind::Named &&
+                   t->genericArgs.empty() &&
+                   calleeOwnGenericNames.count(t->headName());
+        };
         auto formalFnParamType2 =
             [&](std::size_t pos) -> TypeRef* {
             if (!calleeMd2 && !calleeMs2) return nullptr;
             TypeRef* pt = formalOutParamType2(pos);
             if (!calleeOwnGenericNames.empty() && pt &&
                 pt->kind == TypeRef::Kind::Function) {
+                for (const auto& fp : pt->funcParams)
+                    if (isBareOwnGenericRef(fp.type)) return nullptr;
                 // fix #5117: apply methodSubst BEFORE mentionsOwnGeneric check.
                 // This substitutes U → int in Array<U>, so Array<int> no longer
                 // contains the method's own generic U, and we don't bail.
+                TypeRef* substPt = pt;
                 if (!methodSubst.empty())
-                    pt = substituteReturnType(pt, methodSubst);
-                for (const auto& fp : pt->funcParams)
+                    substPt = substituteReturnType(pt, methodSubst);
+                for (const auto& fp : substPt->funcParams)
                     if (mentionsOwnGeneric(fp.type)) return nullptr;
+                pt = substPt;
             }
             return pt;
         };
