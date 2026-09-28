@@ -4171,6 +4171,7 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
             fp.type = par->resolvedDeclType;
         ft->funcParams.push_back(fp);
     }
+    // SEAM-DEBT: #4988 AST return-type read; imported methods take the importedReturnType fallback below
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (md && md->returnType) {
         ft->funcReturn = ctx_.resolvedType(*md->returnType);

@@ -19,7 +19,7 @@
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
 1    src/sema/ExprTypecheck.cpp
-5    src/sema/ExprTypecheck_Calls.cpp
+6    src/sema/ExprTypecheck_Calls.cpp
 5    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp
 1    src/sema/Symbol.hpp
@@ -51,8 +51,8 @@
 3    src/ownership/Ownership_Checks.cpp
 2    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
-10   src/sema/ExprTypecheck.cpp
-20   src/sema/ExprTypecheck_Calls.cpp
+11   src/sema/ExprTypecheck.cpp
+21   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 7    src/sema/PureChecker.cpp
 7    src/sema/StaticInitCycles.cpp

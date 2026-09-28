@@ -17270,6 +17270,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // where `y` is the explicit ctor's param) are not spuriously
             // rejected. The codegen binding #5107 built at
             // `storePrimaryCtorPositionalArgs` remains as defence-in-depth.
+            // SEAM-DEBT: #5126 module-local only; an imported class has no decl here and skips §22.5
             auto* td5121 = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (td5121 && !td5121->positionalFields.empty()) {
                 bool anyBind = bindArgsToParams(td5121->positionalFields,
