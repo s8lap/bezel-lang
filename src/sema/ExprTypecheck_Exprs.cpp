@@ -5867,6 +5867,10 @@ bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
         return t && t->kind == TypeRef::Kind::Primitive &&
                t->primitive == PrimitiveType::Bool;
     };
+    auto isChar = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::Char;
+    };
     auto isStringPrim = [](const TypeRef* t) {
         return t && t->kind == TypeRef::Kind::Primitive &&
                t->primitive == PrimitiveType::String;
@@ -5898,6 +5902,25 @@ bool ExprTC::reportBoolOperandExcludedFromArithmeticOrOrdering(
                        "implicit conversion out of `bool`, so the operation "
                        "is a compile error (\xC2\xA7""6.2). To compute with a "
                        "flag, convert explicitly (`int(b)`).")));
+        return true;
+    }
+    // per §3.5: arithmetic (`+`, `-`, `*`, `/`, unary `+`, unary `-`) is
+    // defined only on byte, sbyte, short, ushort, int, uint, long, ulong,
+    // float, double, decimal — `char` is absent from that list.  Ordering
+    // (`<`, `<=`, `>`, `>=`) is defined on every primitive except `bool`,
+    // so char ordering is valid and is NOT rejected here.  §4.6's string-
+    // concat rule takes precedence over §3.5's arithmetic rule for `string +`,
+    // just as it does for `bool +` above, so exclude that pair here too.
+    if ((isChar(lt) || isChar(rt)) && !ordering && !deferToStringConcat) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "operator `" + std::string(op) + "` is not defined for `char` "
+            "operands (\xC2\xA7""3.5) \xE2\x80\x94 " +
+            std::string(
+                "\xC2\xA7""3.5 defines arithmetic (`+`, `-`, `*`, `/`) "
+                "on the numeric types only, and `char` is not among them. "
+                "To operate on a char's code point, convert explicitly "
+                "(`int(c)`)."));
         return true;
     }
     return false;
