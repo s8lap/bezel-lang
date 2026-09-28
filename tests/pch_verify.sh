@@ -25,8 +25,10 @@
 # when the PCH is deleted; Ninja's restat then keeps the PCH edge (and every
 # consumer) dirty, or cleans it when the stamp did not move. Under make the
 # deleted .pch alone forces the rebuild. The same build therefore recovers
-# under both generators. A missing stamp is created with an ancient mtime, so
-# creating it never makes an intact PCH out of date.
+# under both generators. A missing stamp is created at configure time with mtime 1
+# (tests/CMakeLists.txt #5092); if cmake has not been reconfigured this script
+# creates it as a fallback with the same ancient mtime, so creating it never
+# makes a valid PCH out of date.
 set -u
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     echo "pch_verify.sh: usage: <pch> [<stamp>]" >&2

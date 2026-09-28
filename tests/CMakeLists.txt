@@ -369,6 +369,18 @@ if(BEZEL_CCACHE_RELOCATABLE)
     # move. make needs no help: it evaluates the PCH rule after verify ran. The
     # stamp is deliberately NOT in the target's DEPENDS, because the Makefile
     # generator has no rule for a byproduct.
+    #
+    # #5092: pre-create the stamp at configure time with mtime 1 so it is always
+    # present when the build starts. Without this, a missing stamp goes 0→1 on
+    # first run under Ninja (restat thinks it changed), which forces a full PCH+
+    # consumer rebuild even though verify deleted nothing. The configure-time
+    # creation also fixes `make bezel_tests_pch/fast` in a fresh build dir.
+    # NOTE: shell `touch -d @1` (GNU coreutils), NOT cmake `-E touch -d`
+    # (cmake's -E touch does not support -d and creates three files instead).
+    if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.stamp)
+        execute_process(COMMAND touch -d @1 bezel_tests_pch_verify.stamp
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endif()
     set(_pch_verify_stamp ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.stamp)
     set(_pch_verify_always ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.always)
     add_custom_command(OUTPUT ${_pch_verify_always}
