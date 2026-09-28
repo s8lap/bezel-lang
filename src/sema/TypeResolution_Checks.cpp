@@ -5798,6 +5798,13 @@ static void materializeConstraintUpChain(
             overrideParamsMatch) {
     MethodSymbol* cur = member;
     while (cur) {
+        // SEAM-DEBT: #4988 an imported `cur` has no `decl` (#2386, only
+        // `resolvedDeclType`) and no way to read §14.2's per-level generic
+        // constraint clauses at all — they are dropped at load (see the
+        // audit's §3 "facts with no symbol-side channel" table). The loop
+        // stops WITHOUT materializing rather than guessing, matching the
+        // pre-#5075 behaviour; draining this needs a new wire carriage for
+        // `MetaGenericParam::constraintTypes`, not a local read change.
         if (auto* curDecl = dynamic_cast<const ast::MethodDecl*>(cur->decl)) {
             if (gi >= curDecl->genericParams.size()) return;  // arity mismatch
             std::string_view curName = curDecl->genericParams[gi].name;
@@ -5840,6 +5847,12 @@ static void materializeConstraintUpChain(
                 // An IMPORTED candidate has no `decl` (only `declType`), so
                 // its parameter types cannot be compared here — bail
                 // safely rather than guess.
+                // SEAM-DEBT: #4988 same seam as the `cur->decl` read above —
+                // no AST to compare an imported ancestor's parameter types
+                // against, so this bails to "no ancestor found" (safe:
+                // `materializeConstraintUpChain`'s pre-#5075 behaviour for an
+                // unmatched level is to leave `dgp->constraints` empty)
+                // rather than mis-comparing.
                 if (!dynamic_cast<const ast::MethodDecl*>(ms->decl) &&
                     !ms->params.empty())
                     return;

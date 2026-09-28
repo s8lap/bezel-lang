@@ -4440,6 +4440,13 @@ llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
         return cacheIt->second;
 
     if (impl->isIndexer) return fn;  // indexer: out of scope here
+    // SEAM-ACCESSOR: both-sources — `pd` is null for an imported `impl`
+    // (ModuleLoader never reconstructs a body-less imported PropertyDecl),
+    // and `retTy` below explicitly falls back to `ctx_.importedMemberType`
+    // in that case, per the #4952 follow-up comment (imported-symbol seam
+    // audit #3152). `pd && pd->isIndexer` is a redundant local-only
+    // belt-and-suspenders check: `impl->isIndexer` above already answers
+    // correctly for both a local and an imported symbol.
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(impl->decl);
     if (pd && pd->isIndexer) return fn;
 

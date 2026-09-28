@@ -844,14 +844,15 @@ TypeRef* methodReturnResolvedType(const MethodSymbol& ms,
     // matching the hand-written copy's behaviour at the same stage).
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
         return md->returnType ? ctx.resolvedType(*md->returnType) : nullptr;
-    // SEAM-ACCESSOR: AST arm for an operator overload — `OperatorDecl` is a
-    // sibling of `MethodDecl`, not a subclass, so the audit's
-    // `methodReturnsOwned` accessor above already had to consider it; this
-    // sibling mirrors the same split. Before this accessor existed the
-    // shared-event-handler site (#4901) silently rejected an OperatorDecl
-    // here via its `else if (ms->decl) return false;` defensive guard —
-    // the consolidation treats operators the same as methods, which is the
+    // AST arm for an operator overload — `OperatorDecl` is a sibling of
+    // `MethodDecl`, not a subclass, so the audit's `methodReturnsOwned`
+    // accessor above already had to consider it; this sibling mirrors the
+    // same split. Before this accessor existed the shared-event-handler
+    // site (#4901) silently rejected an OperatorDecl here via its
+    // `else if (ms->decl) return false;` defensive guard — the
+    // consolidation treats operators the same as methods, which is the
     // substantive claim the seam-audit intended.
+    // SEAM-ACCESSOR: the operator half of the same both-sources question.
     if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
         return od->returnType ? ctx.resolvedType(*od->returnType) : nullptr;
     // SEAM-ACCESSOR: the imported half. ModuleLoader sets `decl` only where

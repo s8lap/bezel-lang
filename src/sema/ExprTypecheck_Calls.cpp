@@ -16967,8 +16967,18 @@ bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
 // The primary's parameters are the class's `positionalFields` (the same
 // `ast::Param` list the LOCAL primary-only path binds), so the primary is
 // ranked from its own syntax, with no synthesized parameter list.
+// This whole ranking (below, both here and at the body-ctor `cd->decl` cast
+// a few lines down) reads each candidate's per-position declared TYPE and
+// ownership MODIFIER off a raw `ast::Param` list. An imported `t`/`cs` has
+// no such AST list (`decl` is null; `recordPositionalFieldSymbols`'s
+// synthetic `posParam`s carry a name and `hasDefault` only, per
+// `sema::FormalsView` — not a modifier or a full type), so there is no
+// both-sources equivalent of this stage-8 ambiguity ranking today; an
+// imported `t` safely falls through to `!td` below and this check is simply
+// skipped (deferred to the existing overload path), not mis-answered.
 bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
                                             TypeSymbol* t) {
+    // SEAM-DEBT: #4988 see the function comment above.
     auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
     if (!td || td->positionalFields.empty()) return false;
     // A call-site modifier or a discard is outside this ranking, exactly as

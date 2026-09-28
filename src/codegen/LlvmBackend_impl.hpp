@@ -218,9 +218,17 @@ inline bool calleeReturnMayAliasStringArgUnretained(
     // the non-imported Class-field walk (see the SEAM-DEBT #4300 marker
     // there for why it has to stay MethodDecl-typed specifically).
     const sema::TypeRef* crt = sema::methodReturnResolvedType(*ms, ctx);
-    const ast::MethodDecl* md = !ctx.isImported(ms)
-        ? dynamic_cast<const ast::MethodDecl*>(ms->decl)
-        : nullptr;
+    // `md` feeds only the non-imported Class-field walk below (the same one
+    // the pre-existing SEAM-DEBT #4300 FieldDecl cast there documents) — an
+    // imported method's body is never reconstructed, so there is no AST to
+    // walk for it regardless of this guard. Already gated on
+    // `!ctx.isImported(ms)` (never a silent wrong answer for an import);
+    // draining it needs the same parallel imported-field-type path #4300's
+    // marker calls for, not a local fix here.
+    const ast::MethodDecl* md =
+        // SEAM-DEBT: #4988 same seam as the FieldDecl cast below
+        !ctx.isImported(ms) ? dynamic_cast<const ast::MethodDecl*>(ms->decl)
+                            : nullptr;
     // fix #4280: shared Record/Choice test — ONE spelling for both the
     // top-level `crt` arm and the InlineArray-element arm below (§6).
     auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {
