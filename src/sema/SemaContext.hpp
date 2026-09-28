@@ -11,6 +11,7 @@
 // decision called out in the implementation plan as "AST mutation vs side
 // tables" — we pick side tables.
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -1689,11 +1690,28 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
     // shape the three builtin interfaces need); paramNames give the spec-faithful
     // names. retName/retPrim must agree so the pre-resolved return node matches
     // methodFnType's lowering.
+    //
+    // selfSpanParams (fix #5097 follow-up, §4.16/§11.2, v0.307): stdlib §4.16's
+    // `IReadOnlySpan<T>.SequenceEqual(other: IReadOnlySpan<T>)` — unlike every
+    // other synthesized-interface parameter — is NOT the bare element type `T`;
+    // it is the INTERFACE'S OWN instantiation. Before #5097, every synthesized
+    // param's declType went unresolved (null), so `checkArgsAgainstParams`
+    // skipped the §5.1 check outright and this modeling gap was silent. #5097
+    // resolved the bare-`T` param node for every synthesized method so
+    // `checkAbstractImplementations`'s own per-parameter check could run — which
+    // is correct for `IndexOf(item: T)`/`Contains(item: T)`/`Equals`/`CompareTo`
+    // (all genuinely `T`), but for `SequenceEqual` it now substitutes `T` to the
+    // element type instead of `IReadOnlySpan<T>`, so a well-typed
+    // `IReadOnlySpan<int>.SequenceEqual(other: IReadOnlySpan<int>)` call is
+    // compared against a formal of plain `int` and wrongly rejected (§5.1). This
+    // set names the params (by index within their method, 0-based) whose type
+    // must be built as `IReadOnlySpan<T>` rather than bare `T`.
     struct MethodSpec {
         const char* methodName;
         const char* retName;
         PrimitiveType retPrim;
         std::vector<const char*> paramNames;  // each parameter has type `T`
+        std::vector<std::size_t> selfSpanParams = {};  // indices typed `IReadOnlySpan<T>`
     };
     // PropSpec: a named property or read-only indexer on a builtin interface.
     // retPrim == PrimitiveType::None means generic T return (indexer); the
@@ -1731,7 +1749,8 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         ifaceName = "IReadOnlySpan";
         methods = {{"IndexOf",       "int",  PrimitiveType::Int,  {"item"}},
                    {"Contains",      "bool", PrimitiveType::Bool, {"item"}},
-                   {"SequenceEqual", "bool", PrimitiveType::Bool, {"other"}}};
+                   {"SequenceEqual", "bool", PrimitiveType::Bool, {"other"},
+                    /*selfSpanParams=*/{0}}};
         props   = {{"Length",  "int",  PrimitiveType::Int,  /*isIndexer=*/false, nullptr},
                    {"IsEmpty", "bool", PrimitiveType::Bool, /*isIndexer=*/false, nullptr},
                    {nullptr,   "T",    PrimitiveType::None, /*isIndexer=*/true,  "i"}};
@@ -1757,6 +1776,11 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         ast::MethodDecl* md;
         ast::Type* ret;
         std::vector<ast::Type*> paramTypes;
+        // For a `selfSpanParams` index, the inner `T` node nested inside the
+        // `IReadOnlySpan<T>` param type's genericArgs (nullptr otherwise) —
+        // the node `bareT`'s astNode must key off, NOT the outer param type
+        // node (which names "IReadOnlySpan", not "T").
+        std::vector<ast::Type*> selfSpanElemTypes;
     };
     std::vector<RawMethod> raws;
     for (const auto& spec : methods) {
@@ -1771,13 +1795,33 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         methodDecl->returnType = std::move(retType);
         RawMethod rm;
         rm.ret = methodDecl->returnType.get();
-        for (const char* pname : spec.paramNames) {
+        for (std::size_t pi = 0; pi < spec.paramNames.size(); ++pi) {
+            const char* pname = spec.paramNames[pi];
             ast::Param param;
             param.name = pname;
             auto paramType = std::make_unique<ast::Type>();
             paramType->kind = ast::TypeKind::Named;
             paramType->name = std::make_unique<ast::QualifiedName>();
-            paramType->name->parts.push_back("T");  // generic param → substituted per use
+            // fix #5097 follow-up (§4.16/§11.2, v0.307): a `selfSpanParams`
+            // index (currently only `SequenceEqual`'s `other`) is typed
+            // `IReadOnlySpan<T>` — the interface's own instantiation — not
+            // the bare element-type `T` every other synthesized param uses.
+            bool isSelfSpan =
+                std::find(spec.selfSpanParams.begin(),
+                          spec.selfSpanParams.end(), pi) !=
+                spec.selfSpanParams.end();
+            if (isSelfSpan) {
+                paramType->name->parts.push_back("IReadOnlySpan");
+                auto elemArg = std::make_unique<ast::Type>();
+                elemArg->kind = ast::TypeKind::Named;
+                elemArg->name = std::make_unique<ast::QualifiedName>();
+                elemArg->name->parts.push_back("T");
+                rm.selfSpanElemTypes.push_back(elemArg.get());
+                paramType->genericArgs.push_back(std::move(elemArg));
+            } else {
+                paramType->name->parts.push_back("T");  // generic param → substituted per use
+                rm.selfSpanElemTypes.push_back(nullptr);
+            }
             param.type = std::move(paramType);
             rm.paramTypes.push_back(param.type.get());
             methodDecl->params.push_back(std::move(param));
@@ -1867,12 +1911,41 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             // `!d->declaration && !d->headName().empty()`) treats it exactly
             // like a user interface's bare `T` and substitutes it per
             // obligation instead of comparing against an unresolved null.
-            TypeRef* bareT = makeTypeRef();
-            bareT->kind = TypeRef::Kind::Named;
-            bareT->declaration = nullptr;
-            bareT->astNode = rm.paramTypes[p];
-            bareT->nullable = rm.paramTypes[p]->nullable;
-            setResolvedType(rm.paramTypes[p], bareT);
+            bool isSelfSpan =
+                std::find(spec.selfSpanParams.begin(),
+                          spec.selfSpanParams.end(), p) !=
+                spec.selfSpanParams.end();
+            if (isSelfSpan) {
+                // fix #5097 follow-up (§4.16/§11.2, v0.307): `other`'s
+                // resolved type is `IReadOnlySpan<T>` itself — a Named
+                // TypeRef whose declaration IS this interface (so it
+                // conforms/assigns exactly like an ordinary
+                // `IReadOnlySpan<int>`-typed value), carrying a bare-`T`
+                // TypeRef (keyed to the INNER `T` node nested inside the
+                // param's `IReadOnlySpan<T>` AST, not the outer node — whose
+                // headName is "IReadOnlySpan", not "T" — so substitution can
+                // find it) as its sole generic argument, resolving the
+                // element type per call site instead of leaving `T` bare.
+                TypeRef* innerT = makeTypeRef();
+                innerT->kind = TypeRef::Kind::Named;
+                innerT->declaration = nullptr;
+                innerT->astNode = rm.selfSpanElemTypes[p];
+                innerT->nullable = rm.selfSpanElemTypes[p]->nullable;
+                TypeRef* selfSpanRef = makeTypeRef();
+                selfSpanRef->kind = TypeRef::Kind::Named;
+                selfSpanRef->declaration = ts;
+                selfSpanRef->astNode = rm.paramTypes[p];
+                selfSpanRef->nullable = rm.paramTypes[p]->nullable;
+                selfSpanRef->genericArgs.push_back(innerT);
+                setResolvedType(rm.paramTypes[p], selfSpanRef);
+            } else {
+                TypeRef* bareT = makeTypeRef();
+                bareT->kind = TypeRef::Kind::Named;
+                bareT->declaration = nullptr;
+                bareT->astNode = rm.paramTypes[p];
+                bareT->nullable = rm.paramTypes[p]->nullable;
+                setResolvedType(rm.paramTypes[p], bareT);
+            }
         }
         ts->members.push_back(ms);
 
