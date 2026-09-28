@@ -4739,20 +4739,126 @@ void Emitter::storePrimaryCtorPositionalArgs(
       //
       // When the binding IS NOT published (legacy / paths sema has not
       // reached — among them, #3163's combined "primary ctor + explicit
-      // ctor" deferral), fall back to position-i pairing and require all
-      // positional. The named arm of that legacy path was loud-rejected
-      // upstream by sema's existing `bindArgsToParams` paths / #3162's now-
-      // removed `anyNamed` decline, so the silent-zero-fallback it's
-      // guarding against is not reachable today from a semantically-
-      // accepted `new` site — keeping the guard preserves that posture.
+      // ctor" deferral at sema's `checkNewExprArgs` lines 17215-17248,
+      // whose `if (hasExplicitCtor) return;` short-circuits before
+      // `checkPositionalNewArgsFromSymbols` can publish), fall back to
+      // position-i pairing when all positional, or build the §22.5
+      // binding on demand from the call's named arguments when at least
+      // one is named. The named-arm build path keeps the fix self-
+      // contained at THIS lowering site: it does not require sema to
+      // publish, and the binder body mirrors `bindArgsToParams`'s
+      // named-vs-positional rule (§22.5 "Optional parameters and named
+      // arguments" — positional precedes named, names match primary
+      // parameters, no duplicate binding, every required slot filled or
+      // defaulted).
+      //
+      // fix #5107 (§22.10 "primary constructors" / §22.5 "Optional
+      // parameters and named arguments" / §9.3 "Combined form";
+      // spec v0.307): a LOCAL class combined-form class
+      // (`class C(x: int, z: int)` + `constructor(y: int) this(y, 0);`)
+      // with `new C(x := 81, z := 0)` reached this helper with
+      // `binding == nullptr` (sema's deferral returned without
+      // publishing it — dc 2026-09-28 ruled the previous lane's sema
+      // re-publication fix at `reportPrimaryBodyCtorAmbiguity` lines
+      // 16992-17003 unreachable for the non-ambiguous case: the helper
+      // returns false on `cands.size() < 2` BEFORE the publish call).
+      // The pre-fix posture — `return` on a named-without-binding
+      // argument — left every primary field at calloc-zero: the named
+      // `x := 81, z := 0` was dropped, the call's store skipped, and
+      // `c.X` read 0. Building the binding here, by name match against
+      // `recordPositionalFieldSymbols(t)`'s `posParam->name`, restores
+      // the spec-named-argument store without re-deciding the ctor —
+      // `ctorForArgs` already chose what to call; this helper only
+      // needs the per-slot argument index.
       const std::vector<int>* bindingPtr = binding;
+      std::vector<int> computedBinding;
       if (!bindingPtr) {
-          bool allPositional = true;
+          bool hasNamed = false;
           for (const auto& a : args)
-              if (!a.name.empty()) { allPositional = false; break; }
-          if (!allPositional || args.size() > posFields.size())
-              return;  // named-without-binding or oversupplied — every
-                       // field stays calloc-zero, the pre-#3196 posture.
+              if (!a.name.empty()) { hasNamed = true; break; }
+          if (hasNamed) {
+              // Build a §22.5 binding from the call's named args +
+              // `posFields`' declared order. The `posParam` field
+              // carries the parameter name on both the LOCAL side (the
+              // class's actual `ast::Param` declared in the class header)
+              // and the IMPORTED side (the synthetic `ast::Param` #2516
+              // attaches so the positional/body distinction survives
+              // without an AST — see `FieldSymbol::posParam` at
+              // Symbol.hpp:805). Match on `std::string_view` identity,
+              // not a string allocation — the call-side `CallArgument::name`
+              // is also a `string_view` of source text (Node.hpp:95).
+              computedBinding.assign(posFields.size(), -1);
+              bool viable = true;
+              std::unordered_set<std::string_view> seenNames;
+              std::size_t posSlot = 0;  // next positional binding slot
+              bool sawNamed = false;
+              for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                  const auto& a = args[ai];
+                  if (a.name.empty()) {
+                      // §22.5: a positional argument may not follow a
+                      // named one, and binds the NEXT unfilled field in
+                      // declaration order. Mirror `bindArgsToParams`'s
+                      // loop exactly so codegen cannot drift from sema
+                      // (`bindArgsToParams` at ExprTypecheck_Calls.cpp
+                      // line 14518-14553).
+                      if (sawNamed || posSlot >= posFields.size()) {
+                          viable = false; break;
+                      }
+                      computedBinding[posSlot] = static_cast<int>(ai);
+                      ++posSlot;
+                      continue;
+                  }
+                  sawNamed = true;
+                  std::size_t idx = posFields.size();
+                  for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                      auto* fs = static_cast<const sema::FieldSymbol*>(
+                          posFields[fi]);
+                      if (fs && fs->posParam &&
+                          fs->posParam->name == a.name) {
+                          idx = fi; break;
+                      }
+                  }
+                  if (idx >= posFields.size() ||
+                      !seenNames.insert(a.name).second ||
+                      computedBinding[idx] != -1) {
+                      viable = false; break;
+                  }
+                  computedBinding[idx] = static_cast<int>(ai);
+              }
+              // Every required (non-defaulted) slot must be filled; a
+              // defaulted slot's omission is OK because the per-field
+              // loop below fills it via `positionalParamDefaultValue`.
+              if (viable) {
+                  for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
+                      if (computedBinding[pi] != -1) continue;
+                      auto* fs = static_cast<const sema::FieldSymbol*>(
+                          posFields[pi]);
+                      if (fs && fs->posParam &&
+                          (fs->posParam->defaultValue ||
+                           !fs->posParam->defaultText.empty())) {
+                          continue;
+                      }
+                      viable = false;
+                      break;
+                  }
+              }
+              if (viable) {
+                  bindingPtr = &computedBinding;
+              } else {
+                  // The binding we COULD build does not match §22.5 —
+                  // an unknown name, a duplicate, a positional-after-
+                  // named, a required slot left empty. Sema would have
+                  // rejected this call above us; if no binding is
+                  // available, treat it conservatively as the pre-
+                  // #5107 fallback: every field calloc-zero, no
+                  // codegen crash, no false store. Loud rejection is
+                  // sema's job (this fix does not change sema).
+                  return;
+              }
+          } else if (args.size() > posFields.size()) {
+              return;  // positional-oversupplied — every field stays
+                       // calloc-zero, the pre-#3196 posture.
+          }
       }
       for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
               {  // scope for the per-field bindings below
