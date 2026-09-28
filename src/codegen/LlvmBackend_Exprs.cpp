@@ -7236,12 +7236,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // — a silent no-op for event handlers (#880) and a SIGSEGV at the
         // call site (#881). Route through makeMethodThunk with currentThis_.
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+            // fix #5019 (§27.6, v0.307): the §27.6 / #4978 formation-site
+            // overload selector picks the chosen overload's MethodSymbol
+            // (semantic), but `lookupMember`'s first-match BFS bound the
+            // FIRST-declared overload into `exprSymbol`. Use the chosen
+            // overload's MethodSymbol — if the selector published one — for
+            // the thunk emission so the binary dispatches the right body.
+            // Pre-#5019, this path emitted a thunk for the FIRST-declared
+            // overload and crashed at runtime (SIGSEGV) when the chosen
+            // overload was not the first-declared one.
+            sema::MethodSymbol* chosenMs =
+                ctx_.methodRefSelectedOverload(e);
+            sema::MethodSymbol* emitMs = chosenMs ? chosenMs : ms;
             // A bare (implicit-`this`) reference has no receiver EXPRESSION, so
             // there is no static interface type to instantiate from; the #2766
             // substitution simply does not apply and the erased signature is
             // used, exactly as before.
-            if (isStaticMethod(ms)) return makeMethodThunk(ms, nullptr);
-            else if (currentThis_) return makeMethodThunk(ms, currentThis_);
+            if (isStaticMethod(emitMs)) return makeMethodThunk(emitMs, nullptr);
+            else if (currentThis_) return makeMethodThunk(emitMs, currentThis_);
         }
     }
     // CG60: `Class.StaticMethod` or `obj.InstanceMethod` used as a
@@ -7325,6 +7337,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
         }
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+            // fix #5019 (§27.6, v0.307): the §27.6 / #4978 formation-site
+            // overload selector picks the chosen overload's MethodSymbol
+            // (semantic), but `lookupMember`'s first-match BFS bound the
+            // FIRST-declared overload into `exprSymbol`. Use the chosen
+            // overload's MethodSymbol — if the selector published one — for
+            // the thunk emission so the binary dispatches the right body.
+            // Pre-#5019, this path emitted a thunk for the FIRST-declared
+            // overload and crashed at runtime (SIGSEGV) when the chosen
+            // overload was not the first-declared one.
+            sema::MethodSymbol* chosenMs =
+                ctx_.methodRefSelectedOverload(e);
+            sema::MethodSymbol* emitMs = chosenMs ? chosenMs : ms;
             llvm::Value* recv = nullptr;
             // §27.6 (#1306 rework): an extension-method reference is EITHER
             // unbound (`Vec.Scaled`, type-name qualifier — the receiver is the
@@ -7335,7 +7359,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // uses the null-vs-value distinction to route the two cases:
             // extRef = isExtensionMethod && !receiverVal. So lower the target
             // uniformly for every non-static method ref.
-            if (!isStaticMethod(ms) && ma->target)
+            if (!isStaticMethod(emitMs) && ma->target)
                 recv = lowerExpr(*ma->target);
             // fix #2766: hand the RECEIVER's static type to makeMethodThunk. For
             // `eq.Equals` with `eq: IEquatable<string>` that is the only place
@@ -7343,9 +7367,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // reference's own function-type parameters null — and the thunk's
             // ABI has to match it, not the interface's erased `T`.
             const sema::TypeRef* recvTy =
-                (!isStaticMethod(ms) && ma->target) ? ctx_.exprType(*ma->target)
+                (!isStaticMethod(emitMs) && ma->target) ? ctx_.exprType(*ma->target)
                                                     : nullptr;
-            return makeMethodThunk(ms, recv, recvTy);
+            return makeMethodThunk(emitMs, recv, recvTy);
         }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics

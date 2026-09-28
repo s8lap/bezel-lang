@@ -447,6 +447,39 @@ public:
                    ? nullptr
                    : &it->second;
     }
+    // fix #5019 (§27.6, v0.307): the §27.6 / #4978 overload selector picks
+    // the chosen overload's MethodSymbol — for a method reference against a
+    // target function type, the formation-site selector returns a unique
+    // winner. The selection is recorded here, keyed by the bare-method-access
+    // expression (IdentifierExpr or MemberAccessExpr — whichever is the
+    // typecheck-pass source for `exprSymbol`), so codegen's method-thunk
+    // emission can read it and bind the chosen overload rather than the
+    // first-declared overload bound by `lookupMember`. Pre-#5019 the
+    // thunk-emission code (LlvmBackend_Exprs.cpp CG60, L6989 / L6900) read
+    // `ctx_.exprSymbol(e)` and emitted a thunk that crashed at runtime
+    // (SIGSEGV) when the chosen overload was not the first-declared one —
+    // the bound MethodSymbol's signature did not match the call site's
+    // argument types.
+    //
+    // Populated by `selectMethodRefOverload` on its `Unique` return, in the
+    // same SemaContext pass that already publishes the chosen overload's
+    // Function TypeRef to `exprType` (the `selFrom = chosen` line at
+    // ExprTypecheck.cpp:5276). Read by `LlvmBackend_Exprs.cpp`'s
+    // method-thunk emission site. A miss (no entry for the expression) is
+    // the existing pre-#5019 behaviour — the bound MethodSymbol is used
+    // — and is correct for every method reference that is NOT a
+    // target-typed overload selection: a non-overloaded reference, a
+    // single-overload class, an overload set whose first declaration
+    // matches the target by accident. Key shape mirrors `setExprSymbol` /
+    // `exprSymbol` (above), and the lifetime argument is the same
+    // (`exprSymbols_` comment): the AST node outlives this context.
+    void setMethodRefSelectedOverload(const ast::Expr* e, MethodSymbol* ms) {
+        if (e && ms) methodRefSelectedOverloads_[e] = ms;
+    }
+    MethodSymbol* methodRefSelectedOverload(const ast::Expr& e) const {
+        auto it = methodRefSelectedOverloads_.find(&e);
+        return it == methodRefSelectedOverloads_.end() ? nullptr : it->second;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -1188,6 +1221,12 @@ private:
     // source file / `ownImportedAst`.
     std::unordered_map<const ast::IndexExpr*, std::vector<TypeRef*>>
         indexerSubstitutedParamTypes_;
+    // fix #5019 (§27.6, v0.307): per-bare-method-access expression, the
+    // overload's MethodSymbol that the §27.6 / #4978 formation-site selector
+    // chose. See `setMethodRefSelectedOverload` / `methodRefSelectedOverload`
+    // above.
+    std::unordered_map<const ast::Expr*, MethodSymbol*>
+        methodRefSelectedOverloads_;
     // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
     // operator for a STATEMENT operator form (`a += b`, `t++`). See
     // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.

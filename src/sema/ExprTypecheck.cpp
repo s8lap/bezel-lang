@@ -4143,13 +4143,14 @@ static std::string spellPrimitiveName(PrimitiveType p) {
 //   - primitive → primitive: identity or §5.1 widening.
 //   - named → named (non-generic): identity or subclass/interface.
 // A non-nullable target accepting a nullable source is rejected.
-// fix #4897 (§27.1.1 v0.307 / §27.6): builds the Function TypeRef a BARE
-// (unqualified) method-group identifier denotes — the shape
-// resolveMemberAccess (ExprTypecheck_Calls.cpp) already builds for the
-// QUALIFIED spelling `C.OnS`/`obj.OnS`, duplicated here because
-// resolveMemberAccess is out of scope for this fix. See the declaration
-// comment in ExprTypecheck_impl.hpp for why this exists.
-TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
+
+// §27.6 (issue #4978, v0.307): build a Function TypeRef from a MethodSymbol.
+// Mirror of the bare-method-access TypeRef construction in
+// `resolveMemberAccess` (ExprTypecheck_Calls.cpp:25736 for local methods,
+// :25581 for imported methods) — hoisted here so the formation-site overload
+// selector can mint one Function TypeRef per overload without re-running the
+// source-side resolver.
+TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
     if (!ms) return nullptr;
     auto* ft = ctx_.makeTypeRef();
     ft->kind = TypeRef::Kind::Function;
@@ -4159,29 +4160,266 @@ TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
         TypeRef::FuncParam fp;
         fp.modifier = par->modifier;
         fp.name = par->name;
+        // Both-sources fallback (#4086, §27.6 / §5.1, v0.294): mirror
+        // `resolveMemberAccess`'s imported-method formation site — when the
+        // local AST half (`par->declType`) is null, fall through to the
+        // loader's `resolvedDeclType` so the formation TypeRef's funcParams
+        // is populated for every parameter.
         if (par->declType)
             fp.type = ctx_.resolvedType(*par->declType);
         else if (par->resolvedDeclType)
             fp.type = par->resolvedDeclType;
         ft->funcParams.push_back(fp);
     }
-    // fix #4988 (§22 / §27 / §28.3, v0.307 — sister accessor to
-    // `methodReturnsOwned` for umbrella #3152): the resolved declared
-    // return type, read both-sources. null means the method is unit,
-    // which the local-arm and imported-arm fall-through already treated
-    // as the universal default. The `owned` marker is read separately
-    // through the sister accessor (`methodReturnsOwned`) so the two
-    // halves never announce owned transfer on a unit-typed slot. Replaces
-    // the SEAM-DEBT #4988 hand-written copy.
-    if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (md && md->returnType) {
+        ft->funcReturn = ctx_.resolvedType(*md->returnType);
+        ft->funcReturnOwned = md->returnOwned;
+    } else if (TypeRef* rt = ctx_.importedReturnType(ms)) {
+        // fix #3193 (§27.6 / §28.1 / §28.3 / §2.5, v0.254): imported method
+        // formation — mirror the same fallback. The cast above is null for
+        // any non-generic imported class (ModuleLoader sets `decl` only
+        // where it re-parsed body text for a GENERIC type).
         ft->funcReturn = rt;
+        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
     } else {
         auto* unit = ctx_.makeTypeRef();
         unit->kind = TypeRef::Kind::Unit;
         ft->funcReturn = unit;
     }
-    ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
     return ft;
+}
+
+// §27.6 (issue #4978, v0.307): target-typed overload selection for a bare
+// method reference. The spec (§27.6, "Method references to overloaded
+// methods") says:
+//
+//   "When the named method (or property) is overloaded, the reference is
+//    resolved using the target function type at the use site. The compiler
+//    selects the overload whose parameter types and return type unify with
+//    the target's parameter and return types under the standard implicit-
+//    conversion rules (§5.1)."
+//
+//   "Selection among several unifying candidates: exact-preferred. More than
+//    one overload may unify with the target … Among unifying candidates, one
+//    whose parameter types — and return type, where the target's return
+//    position is closed — match the target's exactly is preferred; candidates
+//    that unify only through conversion are co-equal (the §22.6 posture
+//    applied to the reference's signature), so absent an exact candidate the
+//    reference is ambiguous and the compiler reports the candidates."
+//
+// Without this, the bare `H.On` access above resolves to the FIRST-declared
+// overload via `lookupMember`'s first-match BFS (`resolveMemberAccess`,
+// ExprTypecheck_Calls.cpp:24242) and the formation TypeRef is built from
+// that one method's signature — a #4968 c06-class bug where the `string`
+// overload was bound at an `(int) -> ()` event handler. Implement here in
+// the formation-site `checkAssignable` arm so the selector sees both the
+// source symbol AND the target function type (neither side alone is
+// enough: the bare-method-access arm has no target; the assignment site has
+// both).
+//
+// Modifier slots are part of a function signature's identity (§27.1,
+// §27.6's "modifier slots ... must match exactly") so a non-matching modifier
+// disqualifies an overload outright, regardless of whether the §5.1
+// formation-site check would otherwise bridge it. Filter on that first.
+ExprTC::MethodRefOverloadResult
+ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
+                                const TypeRef* target,
+                                const TypeRef*& winnerOut) {
+    winnerOut = nullptr;
+    if (!fromExpr || !target || target->kind != TypeRef::Kind::Function)
+        return MethodRefOverloadResult::SingleOverload;
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr));
+    if (!ms || !ms->parent)
+        return MethodRefOverloadResult::SingleOverload;
+
+    // §12.1/§22.6 (#1090): the candidate set is every same-name overload on
+    // the receiver's class hierarchy, not just the one class `lookupMember`
+    // stopped at — otherwise an overload declared only in a base class is
+    // invisible and a valid call to it is mis-rejected. Most-derived first so
+    // first-wins arity selection still honours §22.6 closer-wins. Re-use the
+    // existing helper (mirrors `resolveMethodOverload` for plain calls).
+    std::vector<MethodSymbol*> overloads;
+    collectHierarchyOverloads(ms->parent, ms->name, overloads);
+    if (overloads.size() < 2)
+        return MethodRefOverloadResult::SingleOverload;
+
+    const std::size_t arity = target->funcParams.size();
+
+    // First pass: filter by arity + modifier slots, build each survivor's
+    // Function TypeRef, and classify as exact / converting / no-fit. Among
+    // survivors, apply the exact-preferred ranking.
+    const TypeRef* exactWinner = nullptr;
+    std::vector<const TypeRef*> convertingWinners;
+    // fix #5019 (§27.6, v0.307): the chosen overload's MethodSymbol — paired
+    // with the chosen overload's Function TypeRef so codegen's method-thunk
+    // emission (LlvmBackend_Exprs.cpp CG60) can read BOTH instead of the
+    // first-declared MethodSymbol bound by `lookupMember`. Published to the
+    // `methodRefSelectedOverload` side table when the selector picks a
+    // unique winner.
+    MethodSymbol* exactWinnerMs = nullptr;
+    std::vector<MethodSymbol*> convertingWinnerMs;
+    for (MethodSymbol* ov : overloads) {
+        if (sema::formalParamCount(*ov) != arity) continue;
+
+        TypeRef* ft = buildMethodRefType(ov);
+        if (!ft) continue;
+
+        bool modMatch = true;
+        for (std::size_t i = 0; i < arity; ++i) {
+            if (ft->funcParams[i].modifier != target->funcParams[i].modifier) {
+                modMatch = false;
+                break;
+            }
+        }
+        if (!modMatch) continue;
+
+        // §5.1 formation-site check (mirrors `checkAssignable`'s
+        // freshReferenceFormation arm). Param slots contravariant (target's
+        // declared type must convert to the source's — identity OR §5.1);
+        // return slot covariant (source's must convert to target's). Identity
+        // is not a §5.1 conversion per `implicitlyConvertible`'s docstring, so
+        // the structural equality predicate runs first to mark "exact".
+        bool exact = true;
+        bool fits = true;
+        for (std::size_t i = 0; i < arity && fits; ++i) {
+            const TypeRef* tpar = target->funcParams[i].type;
+            const TypeRef* spar = ft->funcParams[i].type;
+            if (functionSlotTypeRefEqual(tpar, spar)) continue;
+            if (implicitlyConvertible(tpar, spar)) {
+                exact = false;
+            } else {
+                fits = false;
+            }
+        }
+        if (fits) {
+            if (!functionSlotTypeRefEqual(ft->funcReturn, target->funcReturn)) {
+                if (implicitlyConvertible(ft->funcReturn, target->funcReturn)) {
+                    exact = false;
+                } else {
+                    fits = false;
+                }
+            }
+        }
+        if (!fits) continue;
+
+        if (exact) {
+            if (exactWinner) {
+                // Two exact fits — ambiguous. A real same-signature duplicate
+                // should be rejected at the declaration site; if it slipped
+                // through, treat the reference as ambiguous rather than
+                // silently binding either one.
+                winnerOut = nullptr;
+                return MethodRefOverloadResult::Ambiguous;
+            }
+            exactWinner = ft;
+            exactWinnerMs = ov;
+        } else {
+            convertingWinners.push_back(ft);
+            convertingWinnerMs.push_back(ov);
+        }
+    }
+
+    if (exactWinner) {
+        winnerOut = exactWinner;
+        // fix #5019 (§27.6, v0.307): publish the chosen overload's
+        // MethodSymbol alongside its Function TypeRef so codegen's
+        // method-thunk emission can bind it (rather than the first-
+        // declared overload from `lookupMember`). See
+        // `setMethodRefSelectedOverload`.
+        ctx_.setMethodRefSelectedOverload(fromExpr, exactWinnerMs);
+        return MethodRefOverloadResult::Unique;
+    }
+    if (convertingWinners.size() == 1) {
+        winnerOut = convertingWinners[0];
+        // fix #5019 (§27.6, v0.307): the converting-winner side of the
+        // exact-preferred ranking also publishes the chosen overload's
+        // MethodSymbol — every `Unique` return is a §27.6 selection
+        // that codegen must honor.
+        ctx_.setMethodRefSelectedOverload(fromExpr, convertingWinnerMs[0]);
+        return MethodRefOverloadResult::Unique;
+    }
+    if (convertingWinners.size() > 1) {
+        winnerOut = nullptr;
+        return MethodRefOverloadResult::Ambiguous;
+    }
+    return MethodRefOverloadResult::NoFit;
+}
+
+// §27.6 (issue #4978, v0.307): the spec's no-target rule.
+//
+//   "When no target type is available (e.g., `var f := Math.Abs;` with no
+//    annotation), the reference is ambiguous and the compiler reports an
+//    error pointing to the candidate overloads."
+//
+// The formation-site `selectMethodRefOverload` only fires when a TARGET
+// function type is available — i.e., when the LHS / parameter slot supplies
+// one. A bare-method-reference consumed WITHOUT a target (a `var f := H.On;`
+// with no `f: T := ...` ascription, a field initializer, an RHS of an
+// untyped `:=` assignment) reaches a `var`-inference / `field`-inference
+// site that does not pass through `checkAssignable`. Detect here instead:
+// after the initializer is type-checked, check whether the resolved symbol
+// is a MethodSymbol with multiple overloads, and emit the §27.6 ambiguity.
+//
+// Returns true when the rule fires (so the caller knows to skip any further
+// use of the value).
+bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
+                                               SourceLocation loc) {
+    if (!initExpr) return false;
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*initExpr));
+    if (!ms || !ms->parent) return false;
+
+    std::vector<MethodSymbol*> overloads;
+    collectHierarchyOverloads(ms->parent, ms->name, overloads);
+    if (overloads.size() < 2) return false;
+
+    // Build the candidates' signatures for the diagnostic.
+    std::string sigs;
+    auto sigOne = [](const TypeRef* t) -> std::string {
+        if (!t) return "?";
+        if (t->kind == TypeRef::Kind::Primitive) {
+            switch (t->primitive) {
+                case PrimitiveType::Bool:   return "bool";
+                case PrimitiveType::SByte:  return "sbyte";
+                case PrimitiveType::Byte:   return "byte";
+                case PrimitiveType::Short:  return "short";
+                case PrimitiveType::UShort: return "ushort";
+                case PrimitiveType::Int:    return "int";
+                case PrimitiveType::UInt:   return "uint";
+                case PrimitiveType::Long:   return "long";
+                case PrimitiveType::ULong:  return "ulong";
+                case PrimitiveType::Float:  return "float";
+                case PrimitiveType::Double: return "double";
+                case PrimitiveType::Decimal:return "decimal";
+                case PrimitiveType::Char:   return "char";
+                case PrimitiveType::String: return "string";
+                case PrimitiveType::Object: return "Object";
+                default: return "?";
+            }
+        }
+        if (t->kind == TypeRef::Kind::Unit) return "()";
+        return std::string(t->headName());
+    };
+    for (MethodSymbol* ov : overloads) {
+        TypeRef* ft = buildMethodRefType(ov);
+        if (!ft) continue;
+        if (!sigs.empty()) sigs += ", ";
+        sigs += "`(";
+        for (std::size_t i = 0; i < ft->funcParams.size(); ++i) {
+            if (i > 0) sigs += ", ";
+            sigs += sigOne(ft->funcParams[i].type);
+        }
+        sigs += ") -> " + sigOne(ft->funcReturn) + "`";
+    }
+
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("the method reference `") + std::string(ms->name) +
+            "` is overloaded and has no target type to select by "
+            "(\xC2\xA7""27.6 v0.307) — add an explicit type annotation "
+            "(e.g. `var f: (int) -> () := " + std::string(ms->name) +
+            ";`) to disambiguate (candidates: " + sigs + ")");
+    return true;
 }
 
 void ExprTC::checkAssignable(
@@ -4202,7 +4440,7 @@ void ExprTC::checkAssignable(
     if (!from && to && to->kind == TypeRef::Kind::Function && fromExpr &&
         dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
         if (auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr))) {
-            from = functionTypeFromBareMethodSymbol(ms);
+            from = buildMethodRefType(ms);
         }
     }
     if (!from || !to) return;
@@ -4325,63 +4563,38 @@ void ExprTC::checkAssignable(
         to->primitive == PrimitiveType::Object) {
         return;
     }
-    // §3 / §5.1 / §8.6 / issue #3115, extended by issue #5023 (scope =
-    // VALUE-TYPED targets only): an `Object`-typed SOURCE (a class
-    // reference or a §8.6 box pointer) admits NO implicit conversion to
-    // a VALUE-TYPED target. §3.1/§3.2 (v0.307) fix the full population
-    // of "value type": primitives (non-`Object`, non-`string`), records,
-    // enums, choices, inline arrays `[N]T` (owning and non-owning
-    // alike), and the unit type `()` — plus the Named value-builtins
-    // (`DateTime`, `TimeSpan`, `Guid`, `CancellationToken`, `DateOnly`,
-    // `TimeOnly`) that are carried as synthetic `kind==Class` symbols
-    // with `isValueBuiltin` rather than as `TypeDeclKind::Record`. The
-    // static "unbox" path this function used to admit on
-    // `(!from->nullable || to->nullable)` had no runtime counterpart:
-    // codegen's `lowerLocalDecl` stores the `ptr`-typed slot at the
-    // value's storage (LlvmBackend_Setup.cpp `llvm::Type* slotTy = v ?
-    // v->getType() : …`) and a later load reinterprets the box pointer
-    // as the value, so `var i: int := o;` prints the low 32 bits of the
+    // §3 / §5.1 / §8.6 / issue #3115 (scope = VALUE-TYPED targets only):
+    // an `Object`-typed SOURCE (a class reference or a §8.6 box pointer)
+    // admits NO implicit conversion to a VALUE-TYPED target — Primitive
+    // non-Object non-String (`int`, `bool`, `char`, `float`, …) and the
+    // Named value-builtins (`DateTime`, `TimeSpan`, `Guid`,
+    // `CancellationToken`, `DateOnly`, `TimeOnly`). The static "unbox"
+    // path this function used to admit on `(!from->nullable ||
+    // to->nullable)` had no runtime counterpart: codegen's
+    // `lowerLocalDecl` stores the `ptr`-typed slot at the value's
+    // storage (LlvmBackend_Setup.cpp `llvm::Type* slotTy = v ? v->
+    // getType() : …`) and a later load reinterprets the box pointer as
+    // the value, so `var i: int := o;` prints the low 32 bits of the
     // box's heap address under ASLR instead of `42`, and the assignment
     // form `i := o;` produces the same garbage. The sanctioned
     // spellings carry an explicit runtime check: §12.7
     // (`if o is T then var v: T := o; end;`, the proven-narrowing path
     // #3090 leaves intact) or §17.4 (`var v := o as T;`, yielding `T?`).
     //
-    // issue #5023: this predicate originally covered only Primitive and
-    // the Named value-builtins, so `var b: [3]int := o;` and
-    // `var p: Pt := o;` (Pt a record) were silently admitted — the same
-    // reinterpret-the-box-pointer bug the scalar case above documents,
-    // just unreached for these target kinds. Extended here to
-    // `TypeRef::Kind::InlineArray` (any `[N]T`/`[N owned]T`, §3.2, §8.6
-    // "Boxing of inline arrays") and to `TypeRef::Kind::Named` types
-    // whose declaration is `TypeDeclKind::Record`, `::Enum`, or
-    // `::Choice` (§3.1's value-type list; a choice is a value type on
-    // every classification per §3.1's "Choices — user-defined value
-    // types", so no classification check is needed here). `Unit` is
-    // NOT extended: §4 ("The unit type is a value type and can in
-    // principle be boxed … The result is rarely meaningful") and §8.6
-    // ("Boxing of the unit value") both describe the forward
-    // (`() -> Object`) direction only, boxed `()` carries no payload to
-    // misread (the reinterpret-the-box-pointer defect this predicate
-    // exists to close cannot manifest — there is no bit pattern to get
-    // wrong), and no probe or spec passage was found describing the
-    // reverse; left for a follow-up issue rather than folded in
-    // silently (CLAUDE.md "Decline-with-reasons").
-    //
     // OUT OF SCOPE for this fix (deliberately kept on the permissive
     // path): `Object → reference-typed Primitive` (`string`), `Object →
-    // Named` (class / interface), and `Object → function-typed` (the
-    // §27.6 property-getter-as-function-value re-type). These are
-    // surfaces pinned by the existing test suite (#2761 function-value
-    // thunk, #2752 `IEquatable<Object>` dispatch, #2766 method-group
-    // thunks, #1857 bare-T erasure substitution) and are a separate spec
-    // question (does §3 forbid implicit unchecked downcast to a
-    // reference-typed target, or is the iface dispatch vtable a
-    // sufficient runtime check?). The function-typed carve-out is
-    // critical: the §27.6 block below re-types the source expression as
-    // the function type, which codegen's property-thunk emitter needs;
-    // an early-return here would skip the re-typing and produce a
-    // runtime SIGSEGV.
+    // Named` (class / interface / record / enum / choice), and
+    // `Object → function-typed` (the §27.6 property-getter-as-function-
+    // value re-type). These are surfaces pinned by the existing test
+    // suite (#2761 function-value thunk, #2752 `IEquatable<Object>`
+    // dispatch, #2766 method-group thunks, #1857 bare-T erasure
+    // substitution) and are a separate spec question (does §3 forbid
+    // implicit unchecked downcast to a reference-typed target, or is
+    // the iface dispatch vtable a sufficient runtime check?). The
+    // function-typed carve-out is critical: the §27.6 block below
+    // re-types the source expression as the function type, which
+    // codegen's property-thunk emitter needs; an early-return here
+    // would skip the re-typing and produce a runtime SIGSEGV.
     //
     // Exceptions preserved so existing tests stay green: `null` (typed
     // `Object?`) assigning to a nullable target (`var x: int? := null;`)
@@ -4400,17 +4613,7 @@ void ExprTC::checkAssignable(
         bool toIsValueBuiltinNamed =
             to->kind == TypeRef::Kind::Named &&
             isValueBuiltinByName(to->headName());
-        // issue #5023 (§3.1/§3.2, v0.307): the rest of the value-type
-        // population — user-declared records/enums/choices, and inline
-        // arrays of any element type or owning-ness.
-        bool toIsValueRecordEnumOrChoice =
-            to->kind == TypeRef::Kind::Named && to->declaration &&
-            (to->declaration->kind == ast::TypeDeclKind::Record ||
-             to->declaration->kind == ast::TypeDeclKind::Enum ||
-             to->declaration->kind == ast::TypeDeclKind::Choice);
-        bool toIsInlineArray = to->kind == TypeRef::Kind::InlineArray;
-        if (toIsValuePrimitive || toIsValueBuiltinNamed ||
-            toIsValueRecordEnumOrChoice || toIsInlineArray) {
+        if (toIsValuePrimitive || toIsValueBuiltinNamed) {
             if (from->nullable && to->nullable) {
                 return;  // `null → T?` — the legitimate §5.1 path.
             }
@@ -4810,17 +5013,8 @@ void ExprTC::checkAssignable(
             // builtins — their declaration is null and the type name lives in
             // importedName. headName() reads aliasResolvedHead / astNode->name
             // / importedName in that order.
-            //
-            // The invariance wording names the rejection only when source and
-            // target are the SAME source class at different payloads
-            // (`EventSource<Dog>` → `EventSource<IAnimal>`). A source class
-            // reaching a different head — `SharedEventSource<int>` →
-            // `IEvent<int>`, same payload — fails because the class does not
-            // implement that interface (stdlib §6.5, #4793), not by payload
-            // invariance, and keeps the §5.1 not-convertible diagnostic.
             std::string_view fromName = from->headName();
-            if ((fromName == "EventSource" || fromName == "SharedEventSource") &&
-                fromName == to->headName()) {
+            if (fromName == "EventSource" || fromName == "SharedEventSource") {
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
                     std::string("the source classes `EventSource<T>` / "
@@ -4968,6 +5162,12 @@ void ExprTC::checkAssignable(
               dynamic_cast<const ast::MemberAccessExpr*>(fromExpr)) &&
              (dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr)) ||
               dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*fromExpr))));
+        // §27.6 / fix #4978 (v0.307): default to `from`; the overload-selector
+        // below may rewrite it to the chosen overload's Function TypeRef for
+        // the §5.1 formation-site check, and the #1820 iterable-family fence
+        // further below reads the same rewritten type. Hoisted to the
+        // function-to-function block's top so both arms see one value.
+        const TypeRef* selFrom = from;
         bool freshLambda = fromExpr &&
             dynamic_cast<const ast::LambdaExpr*>(fromExpr);
         bool skipShapeCheck = freshReferenceFormation || freshLambda;
@@ -5043,113 +5243,6 @@ void ExprTC::checkAssignable(
                     "\xc2\xa7""27.1.1)");
                 return;
             }
-            // fix #4897 (§27.1.1 v0.307, §27.4): an UNANNOTATED lambda
-            // parameter is genuinely target-typed — ExprTypecheck_Exprs.cpp's
-            // LambdaExpr slice seeds that ParameterSymbol's resolvedDeclType
-            // directly FROM the target's inferred parameter type
-            // (`inferredParamTypes[pi]`), so `from->funcParams[i].type` IS
-            // `to->funcParams[i].type` for that slot and this loop is a
-            // no-op there (functionSlotConvertible is reflexive). An
-            // EXPLICITLY annotated parameter instead takes `ps->declType =
-            // p.type.get()` — its own written type, independent of the
-            // target — so it must be checked exactly as a formed value's
-            // parameter slot is (§27.1.1 first/third bullets: contravariant
-            // for a class/interface slot, invariant — exact match —
-            // otherwise), the same way the return-type ascription above is
-            // judged "as a value's return type under §27.1.1" (§27.3's
-            // *Admission at a target-typed non-call position*): an
-            // annotation is a written declared type and never silently
-            // bridges a conversion the value itself could not. Destructuring
-            // parameters (`p.destructure`) are excluded — their head-type
-            // agreement is already enforced where the destructure is bound
-            // (§27.4 *Lambda-parameter record destructuring*), a check this
-            // fix does not touch.
-            //
-            // Blast-radius fix (found via callee_type_param_name_collision_4915
-            // .literal_beside_lambda_to_same_named_callee_param_accepted_spec_14_5):
-            // when this checkAssignable call is itself checking a lambda ARGUMENT
-            // against a still-GENERIC callee parameter slot (e.g. `f: (T) -> T`
-            // in `Apply<T>(f: (T) -> T, x: T)`, called without an explicit type
-            // argument), `to->funcParams[i].type` is the UNSUBSTITUTED `T` —
-            // typeCall's generic-inference substitution has not necessarily run
-            // yet for this slot. There is no fixed target type to hold the
-            // annotation to at this point, so comparing an explicit `int`
-            // annotation against a bare `T` is not a fair test and must not
-            // reject; skip the slot exactly like the unannotated-parameter case
-            // above skips it, deferring to whichever generic-argument-inference
-            // check (out of this fix's scope — STAY-OUT list: typeCall) already
-            // validates the call once T is resolved.
-            //
-            // fix-forward (non-author review of #4897, §27.1.1 v0.307 / §14.5):
-            // the ORIGINAL fix here gated the skip on `refMentionsTypeVariable`,
-            // which answers "does this slot mention a name in
-            // `currentScopeGenericParamNames()`" — the CALLER's OWN enclosing
-            // type/method generic parameters, never the CALLEE's. That is the
-            // wrong scope for this question: whether `to->funcParams[i].type`
-            // is still the callee's unsubstituted type parameter depends on
-            // the callee's declaration, not on what the caller happens to be
-            // generic over. MEASURED (probes in
-            // /var/tmp/bezel-scratch/r21-rv4897/p6*.bzl): calling
-            // `Utils.Apply<T>(f: (T) -> T, x: T)` as
-            // `Utils.Apply(lambda(n: int) => n + 1, 41)` from a NON-generic
-            // `Main()` false-rejected (empty caller scope, so "T" was never
-            // recognised as a type variable); from `Go<Q>(v: Q)` it ALSO
-            // false-rejected (caller scope = {"Q"}, and "T" ∉ {"Q"}); from
-            // `Go<T>(v: T)` it was accepted only because the caller's own
-            // type parameter happens to share the callee's spelling — the
-            // exact defect class `callee_type_param_name_collision_4915`
-            // names elsewhere in this same function (see the
-            // `toIsCalleeFreeParam` arm ~700 lines below, which this mirrors).
-            // The correct ground truth is `freeTypeParamNames` — the CALLEE's
-            // own still-unsubstituted generic parameters for THIS call,
-            // threaded in by the call-argument check site
-            // (ExprTypecheck_Calls.cpp's `calleeFreeParamNames` /
-            // `calleeMethodGenericParamNames`) — walked structurally with the
-            // same `refOutParamTypeMentionsTypeParam` superset walk
-            // `refMentionsTypeVariable` itself delegates to, but against the
-            // CALLEE's names instead of the caller's. A checkAssignable site
-            // that is not itself a call-argument check (a local declaration's
-            // target type, a return-type check, …) passes no
-            // `freeTypeParamNames` at all; there the enclosing body's OWN
-            // scope is genuinely what "still generic" means, and a target
-            // slot naming that scope's own type parameter is not an inference
-            // gap to defer — §3.6 rule 2 / #4810's sibling arms in this same
-            // function already establish that a generic body converting a
-            // concrete-typed value to its own unresolved `T` is a REJECT, not
-            // a skip — so no fallback to `refMentionsTypeVariable` is used
-            // here; `freeTypeParamNames` is the only authority for this skip.
-            if (lamFrom) {
-                for (std::size_t i = 0;
-                     i < lamFrom->params.size() &&
-                     i < from->funcParams.size() &&
-                     i < to->funcParams.size();
-                     ++i) {
-                    const auto& lp = lamFrom->params[i];
-                    if (!lp.type || lp.destructure) continue;
-                    if (freeTypeParamNames && !freeTypeParamNames->empty() &&
-                        refOutParamTypeMentionsTypeParam(
-                            to->funcParams[i].type, *freeTypeParamNames))
-                        continue;
-                    if (!functionSlotConvertible(to->funcParams[i].type,
-                                                 from->funcParams[i].type,
-                                                 isSubtype)) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, loc,
-                            std::string("the ") + what + " is a lambda whose "
-                            "parameter " + std::to_string(i + 1) +
-                            " type annotation does not agree with the "
-                            "target function type's parameter slot "
-                            "\xe2\x80\x94 an explicit parameter annotation "
-                            "behaves as a declared parameter type and must "
-                            "satisfy \xc2\xa7""27.1.1's contravariant "
-                            "parameter rule (identity, or a reference "
-                            "conversion for a class/interface parameter); "
-                            "it never bridges a conversion (\xc2\xa7""27.4, "
-                            "\xc2\xa7""27.1.1 v0.307)");
-                        return;
-                    }
-                }
-            }
         }
         if (!skipShapeCheck) {
             // Parameter slots are CONTRAVARIANT (§27.1.1 first bullet): the
@@ -5198,17 +5291,144 @@ void ExprTC::checkAssignable(
         // formation-site check applies; the formed-value arm above is
         // also skipped for freshLambda).
         if (freshReferenceFormation && !freshLambda) {
-            for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
+            // §27.6 / fix #4978 (v0.307): target-typed overload selection
+            // for a method reference. The bare-method-access TypeRef carried
+            // by `from` is built from the FIRST-declared overload
+            // (`lookupMember`'s first-match BFS at `resolveMemberAccess`,
+            // ExprTypecheck_Calls.cpp:24242), which is not necessarily the
+            // overload that fits `to` — #4968 c06's reproducer binds the
+            // `string` overload at an `(int) -> ()` event handler. Run the
+            // §27.6 overload-selection rule here, where both the source
+            // symbol AND the target type are visible. When a unique winner
+            // exists, use its Function TypeRef for the §5.1 formation-site
+            // check (and downstream readers — codegen's method-thunk
+            // emission, in particular, sees the same overload via this
+            // reference). The #1820 mint-announcing / iterable-family fences
+            // further below re-check `from->funcReturn` directly; they pick
+            // up the chosen overload through this rewrite too.
+            if (auto* ms0 = dynamic_cast<MethodSymbol*>(
+                    ctx_.exprSymbol(*fromExpr))) {
+                const TypeRef* chosen = nullptr;
+                switch (selectMethodRefOverload(fromExpr, to, chosen)) {
+                    case MethodRefOverloadResult::Unique:
+                        selFrom = chosen;
+                        break;
+                    case MethodRefOverloadResult::Ambiguous: {
+                        // §27.6: report the candidates (the spec calls this
+                        // out explicitly — "the compiler reports the
+                        // candidates"). Mirror the §22.6 ambiguous-call
+                        // diagnostic shape: name the method and the
+                        // overloads' signatures.
+                        std::string sigs;
+                        std::vector<MethodSymbol*> overloads;
+                        collectHierarchyOverloads(ms0->parent, ms0->name,
+                                                  overloads);
+                        for (MethodSymbol* ov : overloads) {
+                            if (sema::formalParamCount(*ov) !=
+                                to->funcParams.size()) continue;
+                            TypeRef* ft = buildMethodRefType(ov);
+                            if (!ft) continue;
+                            bool modMatch = true;
+                            for (std::size_t i = 0;
+                                 i < to->funcParams.size(); ++i) {
+                                if (ft->funcParams[i].modifier !=
+                                    to->funcParams[i].modifier) {
+                                    modMatch = false; break;
+                                }
+                            }
+                            if (!modMatch) continue;
+                            bool fits = true, exact = true;
+                            for (std::size_t i = 0;
+                                 i < to->funcParams.size() && fits; ++i) {
+                                const TypeRef* tpar =
+                                    to->funcParams[i].type;
+                                const TypeRef* spar = ft->funcParams[i].type;
+                                if (functionSlotTypeRefEqual(tpar, spar))
+                                    continue;
+                                if (implicitlyConvertible(tpar, spar))
+                                    exact = false;
+                                else
+                                    fits = false;
+                            }
+                            if (fits &&
+                                !functionSlotTypeRefEqual(
+                                    ft->funcReturn, to->funcReturn)) {
+                                if (implicitlyConvertible(
+                                        ft->funcReturn, to->funcReturn))
+                                    exact = false;
+                                else
+                                    fits = false;
+                            }
+                            if (!fits) continue;
+                            // Compact signature for the diagnostic: head name
+                            // for Named / primitive kind, otherwise a placeholder.
+                            auto sigOne = [](const TypeRef* t) -> std::string {
+                                if (!t) return "?";
+                                if (t->kind == TypeRef::Kind::Primitive) {
+                                    switch (t->primitive) {
+                                        case PrimitiveType::Bool:   return "bool";
+                                        case PrimitiveType::SByte:  return "sbyte";
+                                        case PrimitiveType::Byte:   return "byte";
+                                        case PrimitiveType::Short:  return "short";
+                                        case PrimitiveType::UShort: return "ushort";
+                                        case PrimitiveType::Int:    return "int";
+                                        case PrimitiveType::UInt:   return "uint";
+                                        case PrimitiveType::Long:   return "long";
+                                        case PrimitiveType::ULong:  return "ulong";
+                                        case PrimitiveType::Float:  return "float";
+                                        case PrimitiveType::Double: return "double";
+                                        case PrimitiveType::Decimal:return "decimal";
+                                        case PrimitiveType::Char:   return "char";
+                                        case PrimitiveType::String: return "string";
+                                        case PrimitiveType::Object: return "Object";
+                                        default: return "?";
+                                    }
+                                }
+                                if (t->kind == TypeRef::Kind::Unit) return "()";
+                                return std::string(t->headName());
+                            };
+                            if (!sigs.empty()) sigs += ", ";
+                            sigs += "`(";
+                            for (std::size_t i = 0;
+                                 i < ft->funcParams.size(); ++i) {
+                                if (i > 0) sigs += ", ";
+                                sigs += sigOne(ft->funcParams[i].type);
+                            }
+                            sigs += ") -> " + sigOne(ft->funcReturn) + "`";
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("the method reference `") +
+                                std::string(ms0->name) +
+                                "` is ambiguous against the target type "
+                                "(\xC2\xA7""27.6 v0.307) — multiple "
+                                "overloads unify through implicit "
+                                "conversion and none matches exactly "
+                                "(candidates: " + sigs + ")");
+                        return;
+                    }
+                    case MethodRefOverloadResult::NoFit:
+                        // No overload fits the target. Fall through to the
+                        // §5.1 formation-site check below, which will
+                        // report the mismatch — the first-declared
+                        // overload's mismatch is the most informative
+                        // surface for that report.
+                        break;
+                    case MethodRefOverloadResult::SingleOverload:
+                        break;
+                }
+            }
+            for (std::size_t i = 0; i < selFrom->funcParams.size(); ++i) {
                 const TypeRef* targetParam = to->funcParams[i].type;
-                const TypeRef* sourceParam = from->funcParams[i].type;
+                const TypeRef* sourceParam = selFrom->funcParams[i].type;
                 if (!functionSlotTypeRefEqual(targetParam, sourceParam) &&
                     !implicitlyConvertible(targetParam, sourceParam)) {
                     reportNotConvertible();
                     return;
                 }
             }
-            if (!functionSlotTypeRefEqual(from->funcReturn, to->funcReturn) &&
-                !implicitlyConvertible(from->funcReturn, to->funcReturn)) {
+            if (!functionSlotTypeRefEqual(selFrom->funcReturn, to->funcReturn) &&
+                !implicitlyConvertible(selFrom->funcReturn, to->funcReturn)) {
                 reportNotConvertible();
                 return;
             }
@@ -5254,9 +5474,14 @@ void ExprTC::checkAssignable(
                     return common::isIterableInterfaceHead(t->headName()) ||
                            isBareLazyGroupingType(t);
                 };
-                if (calleeIsStatic && from->funcReturn && to->funcReturn &&
-                    isIterableFamily(from->funcReturn) &&
-                    !functionSlotConvertible(from->funcReturn, to->funcReturn,
+                // §27.6 / fix #4978 (v0.307): the chosen overload's return
+                // type is the load-bearing fact for this fence — if the
+                // formation-site selector swapped `from` to a different
+                // overload, the iterable-family check reads the chosen
+                // overload's `funcReturn`, not the first-declared's.
+                if (calleeIsStatic && selFrom->funcReturn && to->funcReturn &&
+                    isIterableFamily(selFrom->funcReturn) &&
+                    !functionSlotConvertible(selFrom->funcReturn, to->funcReturn,
                                             isSubtype)) {
                     // §27.6 (#1820): static iterable-factory bridge to a
                     // non-iterable return slot. The retyped face would
@@ -11996,28 +12221,6 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
         return d->kind == TypeRef::Kind::Named && d->declaration &&
                d->declaration->kind == ast::TypeDeclKind::Interface;
     };
-    // fix #4812 (§12.7, v0.307): a bare TYPE-PARAMETER-typed location — `v: T`
-    // in a generic body — is the OTHER declared-location kind whose runtime
-    // representation is not fixed statically: at monomorphization `T` is bound
-    // to some concrete type, which may itself be a value type stored inline
-    // (§12.7's own text draws no distinction: "the variable is flow-narrowed
-    // to `T` within the controlled block" names no restriction to
-    // Object/interface carriers). Pre-fix, `isBoxHoldingLocation` answered
-    // false for `T`, so `v is int` narrowed nothing: `v` kept its declared `T`
-    // inside the branch, and a subsequent `var x: int := v;` fell to #4768's
-    // "a type parameter converts only to Object and its constraint bounds"
-    // arm — an over-rejection, since the test just proved `T = int` for this
-    // read. Scope: only a bare Named type parameter (no declaration, no
-    // generic args) that is one of THIS body's own generic parameters
-    // (`currentScopeGenericParamNames()`, the same scope #4768's arm uses) —
-    // a callee's unsubstituted free parameter is the unrelated inference-gap
-    // case and stays excluded, same as #4768/#4810.
-    auto isGenericCarrierLocation = [this](const TypeRef* d) {
-        if (!d || d->kind != TypeRef::Kind::Named || d->declaration ||
-            !d->genericArgs.empty())
-            return false;
-        return currentScopeGenericParamNames().count(d->headName()) > 0;
-    };
     // fix #3122 (§12.7, v0.252): the declaration-less Named TypeRef shape a
     // value-builtin ANNOTATION resolves to is also the shape of a bare type
     // PARAMETER (`T` in `Box<T>`, #3092). The two cases are distinguished by
@@ -12053,8 +12256,7 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
             // PrimitiveType::None is not a type.
             narrowable = tt->primitive != PrimitiveType::None &&
                          tt->primitive != PrimitiveType::Object &&
-                         (isBoxHoldingLocation(declaredTypeOf(sym)) ||
-                          isGenericCarrierLocation(declaredTypeOf(sym)));
+                         isBoxHoldingLocation(declaredTypeOf(sym));
             break;
         case TypeRef::Kind::InlineArray:
             // §8.6 *Boxing of inline arrays*, verbatim: "Move-only value types —
@@ -13451,76 +13653,6 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                             "`" +
                             std::string(baseTs->name) +
                             "` declares that many parameters (§22.5/§22.10)");
-                }
-                // fix #4902 (§22.5 / §22.6, v0.307): when `ambiguousArity` is
-                // true the arity scans leave `clauseCtor = nullptr`, so the block
-                // below never runs and gap (a)'s scan also never runs (its guard
-                // is `clauseCtor && !ambiguousArity`). At an OVERLOAD SET where
-                // every candidate has the clause's arity but the names don't
-                // bind any candidate, the clause must be rejected.
-                //
-                // §22.6 stage 1 ("arity filtering AND named-argument-to-parameter
-                // binding") applies to the overload set as a whole: if no
-                // candidate in the set declares any parameter by a name the clause
-                // supplies, §22.5's "the error is reported only where no
-                // candidate survives" is met.
-                //
-                // MEASURED pre-fix (origin/main e3b0bdf0): `class D(v: int) :
-                // B(zz := v, b := 9)` over `constructor(a: int, b: int)` +
-                // `constructor(c: string, d: int)` compiled at exit 0 with no
-                // diagnostic and printed `n=0 s=0` — the base subobject was never
-                // constructed.
-                //
-                // The fix is deliberately narrow: a clause WITH named args against
-                // an ambiguous-arity overload set where no candidate binds any
-                // name. An all-positional clause or one some candidate binds is
-                // not reached (those are §22.6's type-ranking ambiguity, handled
-                // by codegen's `ctorForArgs`).
-                if (ambiguousArity && td->primaryBaseCtorArgs[0].value) {
-                    bool clauseHasName = false;
-                    for (const auto& a : td->primaryBaseCtorArgs)
-                        if (!a.name.empty()) { clauseHasName = true; break; }
-                    if (clauseHasName) {
-                        const std::string desc =
-                            std::string("inheritance-clause base call to `") +
-                            std::string(baseTs->name) + "`";
-                        const auto at =
-                            td->primaryBaseCtorArgs[0].value->span.begin;
-                        bool anyCandidateBinds = false;
-                        for (Symbol* m : baseTs->members) {
-                            auto* other =
-                                dynamic_cast<ConstructorSymbol*>(m);
-                            if (!other || other->isStatic) continue;
-                            if (bindArgsToParams(sema::FormalsView::of(*other),
-                                                 td->primaryBaseCtorArgs, at,
-                                                 desc, /*emit=*/false)
-                                    .ok) {
-                                anyCandidateBinds = true;
-                                break;
-                            }
-                        }
-                        if (!anyCandidateBinds &&
-                            baseTs->hasPositionalFields) {
-                            const std::vector<const Symbol*> pf =
-                                recordPositionalFieldSymbols(baseTs);
-                            if (!pf.empty() &&
-                                bindArgsToParams(sema::FormalsView::of(pf),
-                                                 td->primaryBaseCtorArgs, at,
-                                                 desc, /*emit=*/false)
-                                        .ok)
-                                anyCandidateBinds = true;
-                        }
-                        if (!anyCandidateBinds) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, at,
-                                "inheritance-clause base call to `" +
-                                    std::string(baseTs->name) +
-                                    "` supplies named argument(s) but no "
-                                    "candidate in the overload set declares "
-                                    "any parameter by those name(s) "
-                                    "(§22.5/§22.6)");
-                        }
-                    }
                 }
                 if (clauseCtor && !ambiguousArity) {
                     const std::string desc =
@@ -16915,18 +17047,6 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
         return;
     }
     TypeRef* h = ctx_.exprType(*value);
-    // fix #4897 (§27.1.1 v0.307, §27.6): a BARE method-group handler
-    // (`_beep += OnS;`) carries no exprType at all — see the
-    // functionTypeFromBareMethodSymbol declaration comment — so without this
-    // synthesis `h` arrives null here and the handler's param/return shape is
-    // never checked against the payload, silently accepting any mismatch. A
-    // qualified handler (`_beep += Beeper.OnS;`) already has `h` populated by
-    // resolveMemberAccess and is unaffected.
-    if (!h && dynamic_cast<const ast::IdentifierExpr*>(value)) {
-        if (auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*value))) {
-            h = functionTypeFromBareMethodSymbol(ms);
-        }
-    }
     if (!h || h->kind != TypeRef::Kind::Function) return;
     // A function value or a method reference: the ordinary argument check
     // against `(T) -> R`, where R is the handler's own return slot (§27.1.1
@@ -17470,6 +17590,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     return;  // early-return: lsym->declType intentionally null
                 }
                 lsym->declType = ctx_.exprType(*ld->initializer);
+                // §27.6 (issue #4978, v0.307): no-target overload detection.
+                // A `var f := M.On;` declaration (no `f: T` ascription) has
+                // no target function type to disambiguate by, so the
+                // formation-site selector in `checkAssignable` never runs —
+                // run the no-target rule here instead. The spec (§27.6,
+                // "When no target type is available … the reference is
+                // ambiguous") names the unannotated `var` as the canonical
+                // case; the issue-comment (#5006 lane) measured `var t :=
+                // Task.Delay;` and the spec's own `Math.Abs` example both
+                // degrade identically. Skip if the local has a target type
+                // (the formation-site selector covered it) — `ld->type` is
+                // null only in the unannotated spell.
+                if (!ld->type && ld->initializer)
+                    reportUncalledOverloadedMethodRef(
+                        ld->initializer.get(),
+                        ld->initializer->span.begin);
                 // §9 / §3.2 (#1759): `var q := this` — `this` is left
                 // deliberately untyped in visitExpr (memberTargetType resolves
                 // `this.member` via currentType_ directly, NOT via `this`'s
@@ -19112,17 +19248,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // shift/bitwise/arithmetic split — Object is not integer-kind,
                 // so the shift/bitwise branch's own "integer types" gate misses
                 // it, and the arithmetic branch's Widening path admits it.
-                // fix-forward (gate on 78470f01): scoped to the forms that
-                // gap actually admitted — every shift/bitwise form, and the
-                // arithmetic form only with an `Object` right-hand operand
-                // (`o += o`, R == T). An arithmetic `Object op= <non-Object>`
-                // (`o += 1`) was already rejected by the arithmetic branch's
-                // §6.6 "has no valid result: `Object + int`" wording below,
-                // which names the computed type; pre-empting it with this
-                // text flipped that pinned diagnostic (#4711's
-                // compound_without_narrowing_still_rejected).
-                if (tTy->primitive == P::Object &&
-                    (isShift || isBitwise || rTy->primitive == P::Object)) {
+                if (tTy->primitive == P::Object) {
                     std::string binOp(as->op.substr(0, as->op.size() - 1));
                     ctx_.diagnostics().report(
                         Severity::Error, as->value->span.begin,
@@ -19599,30 +19725,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // arithmetic twin `x += Flags.B`) on `x: Flags` compiled
                 // silently and codegen emitted an unspecified value.
                 std::string binOp(as->op.substr(0, as->op.size() - 1));
-                // fix #5063 (§25.2 "the ordinary argument rules" / §5.1
-                // "Constant narrowing", v0.307): `operandExpr` is the AST
-                // expression the operand type came from, or null for the
-                // TARGET operand (`as->target` is an lvalue being written to,
-                // never itself a compile-time constant) — only the RHS
-                // (`as->value`) can be a narrowable constant. The primitive
-                // branch used to accept ANY primitive-typed RHS against ANY
-                // primitive param with no width/kind check at all ("numeric
-                // coercion downstream" — but no downstream site actually
-                // performed one for a NAMED-target compound assignment's user
-                // operator: `v *= 2` against `operator *(v: V, n: byte)`
-                // admitted here, then reached codegen with the literal still
-                // `int`-typed against an `i8` parameter — malformed IR).
-                // Delegate to primitiveOperandMatchesParam — shared with
-                // findBinaryOperator (ExprTypecheck_Exprs.cpp) — so this copy
-                // asks the SAME primitive-operand question: identity/§5.1
-                // widening, or (when `allowConstantNarrowing`) §5.1 constant
-                // narrowing, which also RE-TYPES `operandExpr` to the
-                // parameter's type so codegen's later `lowerExpr`/
-                // `ctx_.exprType(*as->value)` reads the narrowed width.
-                auto operandMatchesParam = [&](const ast::Expr* operandExpr,
-                                               const TypeRef* operandTy,
-                                               Symbol* paramSym,
-                                               bool allowConstantNarrowing) -> bool {
+                auto operandMatchesParam = [&](const TypeRef* operandTy,
+                                               Symbol* paramSym) -> bool {
                     auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
                     if (!ps) return false;
                     TypeRef* pt = ps->declType
@@ -19630,14 +19734,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                       : ps->resolvedDeclType;
                     if (!pt || !operandTy) return false;
                     // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
-                    // a primitive param accepts a primitive operand under
-                    // §5.1's rules; a Named param needs the operand's
+                    // a primitive param accepts a primitive operand (numeric
+                    // coercion downstream); a Named param needs the operand's
                     // declaration (or a derived one) with §7.11 nullability
                     // agreement (user-operator lifting over T? is deferred).
                     if (pt->kind == TypeRef::Kind::Primitive)
-                        return primitiveOperandMatchesParam(
-                            operandExpr, const_cast<TypeRef*>(operandTy), pt,
-                            allowConstantNarrowing);
+                        return operandTy->kind == TypeRef::Kind::Primitive;
                     if (pt->kind != TypeRef::Kind::Named || !pt->declaration ||
                         operandTy->kind != TypeRef::Kind::Named ||
                         !operandTy->declaration)
@@ -19660,42 +19762,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // result-type check just above uses) would silently miss an
                 // INHERITED operator and leave rule 6 unenforced for it.
                 auto typeDeclaresApplicable =
-                    [&](TypeSymbol* decl,
-                        bool allowConstantNarrowing) -> MethodSymbol* {
+                    [&](TypeSymbol* decl) -> MethodSymbol* {
                     if (!decl) return nullptr;
                     for (MethodSymbol* m :
                          collectInheritedOperators(decl, binOp, 2)) {
                         if (m->params.size() < 2) continue;
-                        if (operandMatchesParam(nullptr, tTy, m->params[0],
-                                                allowConstantNarrowing) &&
-                            operandMatchesParam(as->value.get(), rTy,
-                                                m->params[1],
-                                                allowConstantNarrowing))
+                        if (operandMatchesParam(tTy, m->params[0]) &&
+                            operandMatchesParam(rTy, m->params[1]))
                             return m;
                     }
                     return nullptr;
                 };
-                // #5063 (§22.6 "exact beats convert"): try every candidate
-                // WITHOUT constant narrowing first, exactly as
-                // findBinaryOperator's `tryOperand` does, so a plain `int`
-                // literal against both `operator *(V, byte)` and
-                // `operator *(V, int)` prefers the exact `int` overload
-                // regardless of which is declared first.
-                MethodSymbol* matchedOp =
-                    typeDeclaresApplicable(tTy->declaration,
-                                           /*allowConstantNarrowing=*/false);
+                MethodSymbol* matchedOp = typeDeclaresApplicable(tTy->declaration);
                 if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
                     rTy->declaration)
-                    matchedOp = typeDeclaresApplicable(
-                        rTy->declaration, /*allowConstantNarrowing=*/false);
-                if (!matchedOp) {
-                    matchedOp = typeDeclaresApplicable(
-                        tTy->declaration, /*allowConstantNarrowing=*/true);
-                    if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
-                        rTy->declaration)
-                        matchedOp = typeDeclaresApplicable(
-                            rTy->declaration, /*allowConstantNarrowing=*/true);
-                }
+                    matchedOp = typeDeclaresApplicable(rTy->declaration);
                 bool hasApplicableOp = matchedOp != nullptr;
                 if (matchedOp) ctx_.setStmtOperatorSymbol(as, matchedOp);
                 if (!hasApplicableOp) {

@@ -3097,6 +3097,53 @@ private:
     void collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                    std::vector<MethodSymbol*>& out);
 
+    // §27.6 (issue #4978, v0.307): target-typed overload selection for a
+    // bare method reference. When a method reference is formed against a
+    // target function type, the compiler selects the overload whose signature
+    // unifies with the target under §5.1; among unifying candidates, the
+    // exact-preferred ranking picks the unique exact winner (§22.6's posture
+    // applied to a reference's signature). Returns:
+    //   - SingleOverload: the only same-name method on the receiver, no
+    //     selection needed (the formation site keeps the existing path).
+    //   - Unique: the unique chosen overload; `winnerOut` is set to a Function
+    //     TypeRef for that overload, suitable for the §5.1 formation-site
+    //     check.
+    //   - Ambiguous: multiple overloads unify with no unique exact-preferred
+    //     winner; the caller reports the candidates.
+    //   - NoFit: no overload fits the target; the caller falls through to the
+    //     §5.1 mismatch path, which rejects.
+    enum class MethodRefOverloadResult {
+        SingleOverload,
+        Unique,
+        Ambiguous,
+        NoFit,
+    };
+    MethodRefOverloadResult selectMethodRefOverload(const ast::Expr* fromExpr,
+                                                    const TypeRef* target,
+                                                    const TypeRef*& winnerOut);
+
+    // §27.6 (issue #4978, v0.307): build a Function TypeRef from a
+    // MethodSymbol — mirror of the bare-method-access TypeRef construction
+    // in `resolveMemberAccess` / `resolveExtensionMember` (ExprTypecheck_Calls.cpp),
+    // hoisted here so the formation-site overload selector can mint one
+    // candidate per overload without re-running the source-side resolver.
+    // Returns nullptr if the symbol lacks enough information (no param types,
+    // no return type).
+    TypeRef* buildMethodRefType(const MethodSymbol* ms);
+
+    // §27.6 (issue #4978, v0.307): the spec's no-target rule — "When no
+    // target type is available (e.g., `var f := Math.Abs;` with no
+    // annotation), the reference is ambiguous and the compiler reports an
+    // error pointing to the candidate overloads." Detects a bare method
+    // reference used at a use site that does NOT carry a target function
+    // type (the formation-site selector in `checkAssignable` only fires
+    // when the LHS / parameter slot supplies a target; this covers every
+    // other consumer — `var f := M.On;`, a field initializer, an assignment
+    // whose RHS has no LHS ascription, …). Returns true and emits the
+    // ambiguity diagnostic when the rule fires; returns false otherwise.
+    bool reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
+                                           SourceLocation loc);
+
     // §14.5 (v0.184, #1686): a `ref`/`out` argument bound to a generic
     // method's type parameter must unify EXACTLY with the parameter's
     // substituted type — no conversion, and no join across conflicting
