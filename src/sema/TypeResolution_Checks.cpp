@@ -8517,7 +8517,7 @@ void Resolver::checkAbstractImplementations() {
 // are flushed by the same loop (the driver calls this after it).
 void Resolver::recheckDeferredTypeBounds() {
     for (const auto& d : deferredTypeBoundFailures_) {
-        if (!argSatisfiesTypeBound(d.arg, d.bound)) {
+        if (!argSatisfiesTypeBound(d.arg, d.bound, &ctx_)) {
             ctx_.diagnostics().report(
                 Severity::Error, d.loc,
                 std::string("type argument `") + d.argName +
@@ -9032,7 +9032,8 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
     return TypeCategory::Unknown;
 }
 
-bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
+bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
+                           SemaContext* ctx) {
     if (!arg || !bound) return false;
     if (arg->kind != TypeRef::Kind::Named || !arg->declaration) return false;
     if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
@@ -9096,8 +9097,27 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
                 if (bArg && bArg->kind == TypeRef::Kind::Named &&
                     !bArg->declaration) {
                     bArg = arg;
-                }
-                if (!typeRefEqual(bArg, tRef->genericArgs[j])) {
+                    // fix #5086 (§14.2, v0.307): when bArg is replaced with
+                    // the full candidate arg (e.g. Pair<string>), the nested
+                    // generic in tRef->genericArgs[j] (e.g. Pair<T>) must also
+                    // be substituted so the comparison is Pair<string> vs
+                    // Pair<string>, not Pair<string> vs Pair<T>.
+                    const TypeRef* tArg = tRef->genericArgs[j];
+                    if (tArg && arg->genericArgs.size() == arg->declaration->genericParams.size()) {
+                        std::unordered_map<std::string_view, TypeRef*> innerSubst;
+                        for (std::size_t ki = 0; ki < arg->declaration->genericParams.size(); ++ki) {
+                            Symbol* gp = arg->declaration->genericParams[ki];
+                            TypeRef* ga = arg->genericArgs[ki];
+                            if (gp && ga) innerSubst[gp->name] = ga;
+                        }
+                        SubstArgs sa = {*ctx, innerSubst};
+                        tArg = sema::substituteGenericArgs(const_cast<TypeRef*>(tArg), sa);
+                    }
+                    if (!typeRefEqual(bArg, tArg)) {
+                        allMatch = false;
+                        break;
+                    }
+                } else if (!typeRefEqual(bArg, tRef->genericArgs[j])) {
                     allMatch = false;
                     break;
                 }
@@ -10355,7 +10375,7 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
         // Meters' base list is mid-resolution (baseTypes not yet pushed). Defer
         // the report; recheckDeferredTypeBounds re-runs the BFS after every
         // type's bases are populated and reports persistent failures.
-        if (!argSatisfiesTypeBound(arg, bound)) {
+        if (!argSatisfiesTypeBound(arg, bound, &ctx_)) {
             deferredTypeBoundFailures_.push_back(DeferredTypeBoundFailure{
                 useSite, param, boundName, argName, arg, bound});
         }
@@ -10502,7 +10522,7 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                         // Both substitutions are user types: route through
                         // the ordering-safe recheck (a base set may still be
                         // mid-population at this instantiation site).
-                        if (!argSatisfiesTypeBound(arg, uSubst))
+                        if (!argSatisfiesTypeBound(arg, uSubst, &ctx_))
                             deferredTypeBoundFailures_.push_back(
                                 DeferredTypeBoundFailure{
                                     t.span.begin, std::string(gp->name),

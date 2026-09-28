@@ -147,7 +147,8 @@ bool primitiveImplicitlyWidens(PrimitiveType from, PrimitiveType to);
 // `Resolver::checkGenericConstraints` only fires at instantiation sites,
 // not at method-call sites like `H.F<C>(c, …)`) can call it without
 // depending on Resolver directly.
-bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
+bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
+                           SemaContext* ctx = nullptr);
 
 // #2787 / spec §14.2 rule 3 + §12.9 / stdlib §2.2 §4.4 §5.1: does the INTERFACE
 // type `t` satisfy the self-recurrent bound `where T: IComparable<T>` — i.e.

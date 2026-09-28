@@ -1350,8 +1350,10 @@ private:
     // unchanged. The free function is callable directly from
     // ExprTypecheck_Calls.cpp's call-site constraint check, which the
     // Resolver's class method can't reach.
-    bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
-        return ::bezel::sema::argSatisfiesTypeBound(arg, bound);
+    bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
+                              SemaContext* ctx = nullptr) {
+        return ::bezel::sema::argSatisfiesTypeBound(
+            arg, bound, ctx ? ctx : &ctx_);
     }
 
     // §11.8 / §14.2 (v0.176, #807): a type-bound constraint failure recorded
