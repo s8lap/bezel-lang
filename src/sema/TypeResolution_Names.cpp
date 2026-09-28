@@ -3763,7 +3763,11 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                     bound = c.importedBound;
                                 }
                                 if (!bound) continue;
-                                bool satisfied = argSatisfiesTypeBound(arg, bound);
+                                // fix-forward #5086 (§14.2, v0.307): pass
+                                // ctx_ so the nested-generic substitution
+                                // branch does not dereference a null
+                                // SemaContext*.
+                                bool satisfied = argSatisfiesTypeBound(arg, bound, &ctx_);
                                 // A "type" bound that is itself a type parameter:
                                 // resolve it through aliasSubst to get the concrete
                                 // bound before emitting the diagnostic.
@@ -3778,7 +3782,9 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                     if (jt != aliasSubst.end() && jt->second &&
                                         jt->second->declaration) {
                                         bound = jt->second;
-                                        satisfied = argSatisfiesTypeBound(arg, bound);
+                                        // fix-forward #5086 (§14.2, v0.307):
+                                        // same ctx_ requirement as above.
+                                        satisfied = argSatisfiesTypeBound(arg, bound, &ctx_);
                                     }
                                 }
                                 if (!satisfied) {

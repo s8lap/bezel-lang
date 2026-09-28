@@ -9236,7 +9236,12 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                     // be substituted so the comparison is Pair<string> vs
                     // Pair<string>, not Pair<string> vs Pair<T>.
                     const TypeRef* tArg = tRef->genericArgs[j];
-                    if (tArg && arg->genericArgs.size() == arg->declaration->genericParams.size()) {
+                    // fix-forward #5086 (§14.2, v0.307): a null ctx (some
+                    // call sites historically passed none) must skip the
+                    // substitution rather than dereference it — fall back to
+                    // comparing the unsubstituted tArg, matching pre-fix
+                    // behaviour rather than crashing.
+                    if (ctx && tArg && arg->genericArgs.size() == arg->declaration->genericParams.size()) {
                         std::unordered_map<std::string_view, TypeRef*> innerSubst;
                         for (std::size_t ki = 0; ki < arg->declaration->genericParams.size(); ++ki) {
                             Symbol* gp = arg->declaration->genericParams[ki];

@@ -4699,7 +4699,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     report(std::string(bn));
                                 continue;
                             }
-                            if (!argSatisfiesTypeBound(argRef, bound))
+                            // fix-forward #5086 (§14.2, v0.307): pass ctx_ so
+                            // the nested-generic substitution branch inside
+                            // argSatisfiesTypeBound can build a SubstArgs
+                            // instead of dereferencing a null SemaContext*.
+                            if (!argSatisfiesTypeBound(argRef, bound, &ctx_))
                                 report(std::string(
                                     bound->declaration->name));
                         } else if (item.kind == "class") {
