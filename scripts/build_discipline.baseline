@@ -1,0 +1,12 @@
+# build_discipline.baseline - banked bare cmake --build -j$(nproc)
+# violations found in src/ commit messages and lane brief files.
+# Regenerate with scripts/check_build_discipline.py --update after
+# cleaning up the violations.  --update refuses to bank a NEW match.
+#
+# Format:  commit:<sha>  or  brief:<path>
+
+brief:/var/tmp/bezel-scratch/r21/lane-brief-4946-beze1c-only-probe.md
+brief:/var/tmp/bezel-scratch/r21/lane-brief-4946.md
+brief:/var/tmp/bezel-scratch/r21/lane-brief-4997-4998.md
+brief:/var/tmp/bezel-scratch/r21/lane-brief-5019.md
+
