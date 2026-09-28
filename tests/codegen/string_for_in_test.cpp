@@ -23,7 +23,7 @@ BEZEL_TEST(codegen_cg27g, string_for_in_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"ABC\"; var sum := 0; "
-        "  for var c in s do sum := sum + c; end; "
+        "  for var c in s do sum := sum + int(c); end; "
         "  return sum; "
         "end Main; end C;"), 65 + 66 + 67);
 }
