@@ -8072,9 +8072,12 @@ private:
                 if (!methodSigTypeRefEqual(ta, tb)) return false;
                 continue;
             }
-            // Fall back to the AST `ast::Type*`.
+            // Fall back to the AST `ast::Type*`. An override's parameter AST is
+            // freshly allocated even when its source text matches the base's
+            // (fix #5113 T40, spec §22.6 / §14.2, v0.307), so pointer equality
+            // alone misses same-text overrides; compare structurally.
             if (pa->declType && pb->declType) {
-                if (pa->declType == pb->declType) continue;
+                if (astTypesEqualForSig(pa->declType, pb->declType)) continue;
                 if (isOwnTypeParamRef(a, pa->declType) &&
                     isOwnTypeParamRef(b, pb->declType))
                     continue;
@@ -8083,6 +8086,34 @@ private:
             return false;
         }
         return true;
+    }
+
+    // fix #5113 T40 (spec §22.6 / §14.2, v0.307): structural equality on the
+    // raw `ast::Type*` for the no-resolvedDeclType fallback. Two declarations
+    // of the same-named type (a base and its override, a class in two modules)
+    // produce DIFFERENT AST nodes but represent the same shape — comparing
+    // pointers rejects identical signatures and breaks the dispatch.
+    static bool astTypesEqualForSig(const ast::Type* a, const ast::Type* b) {
+        if (a == b) return true;
+        if (!a || !b) return false;
+        if (a->kind != b->kind) return false;
+        if (a->nullable != b->nullable) return false;
+        if (a->kind == ast::TypeKind::Named) {
+            const auto* an = a->name.get();
+            const auto* bn = b->name.get();
+            if (!an || !bn) return an == bn;
+            if (an->parts.size() != bn->parts.size()) return false;
+            for (size_t k = 0; k < an->parts.size(); ++k)
+                if (an->parts[k] != bn->parts[k]) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (size_t k = 0; k < a->genericArgs.size(); ++k)
+                if (!astTypesEqualForSig(a->genericArgs[k].get(),
+                                         b->genericArgs[k].get()))
+                    return false;
+            return true;
+        }
+        // Unit / InlineArray / Function: not part of the #5113 T40 path.
+        return false;
     }
 
     // fix #5113 (§22.6 / §14.2 / §12, v0.307): the most-derived OVERLOAD of
