@@ -860,6 +860,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             if (rhs->getType()->isPointerTy() &&
                                 isPlusOneStringProducer(as->value.get()))
                                 emitStringRelease(rhs);
+                            // fix-forward #4952 (§4.6/§28.3/§28.9, v0.307): #4952
+                            // made a dynamically-slotted (vtable/itable) string
+                            // property read UNCONDITIONALLY a +1 producer (the
+                            // getter-side ownership thunk now retains every such
+                            // read), so `cur` — `lowerExpr(*as->target)` above,
+                            // a dynamic getter dispatch — is no longer the
+                            // guaranteed borrow this fix's original comment
+                            // assumed. Release it here on that same predicate,
+                            // mirroring rhs's release immediately above; `res` is
+                            // a distinct allocation (emitStringConcat memcpy's
+                            // `cur`'s bytes into a fresh header) so releasing
+                            // `cur` cannot UAF `res`.
+                            if (cur->getType()->isPointerTy() &&
+                                isPlusOneStringProducer(as->target.get()))
+                                emitStringRelease(cur);
                             return false;
                         }
                     }
