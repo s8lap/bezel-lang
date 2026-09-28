@@ -56,44 +56,51 @@ BEZEL_TEST(string_span_883, asspan_length_repro) {
 }
 
 // §3.3: the span indexer reads code points (chars) — sp[0]='A'(65), sp[4]='E'(69).
+// #5054 (§3.5, v0.307) closed `char`'s arithmetic-operator exclusion, so a
+// `char + char` (or `int + char`) sum now needs the explicit `int(c)`
+// conversion the diagnostic itself names; the span-indexer VALUE under test
+// is unchanged.
 BEZEL_TEST(string_span_883, indexer_reads_code_points) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"ABCDE\"; "
         "  var sp := s.AsSpan(); "
-        "  return sp[0] + sp[4]; "  // 65 + 69 == 134
+        "  return int(sp[0]) + int(sp[4]); "  // 65 + 69 == 134
         "end Main; end C;"), 134);
 }
 
 // §3.3: AsSpan(start) — view from an offset to the end (Start is applied to the
 // indexer, so sp[0] reads the 'l' at source index 2).
+// #5054 (§3.5, v0.307): sp[0] is `char`; `int(...)` per the diagnostic's remedy.
 BEZEL_TEST(string_span_883, asspan_start_overload) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
         "  var sp := s.AsSpan(2); "  // "llo"
-        "  return sp.Length * 10 + sp[0]; "  // 3*10 + 'l'(108) == 138
+        "  return sp.Length * 10 + int(sp[0]); "  // 3*10 + 'l'(108) == 138
         "end Main; end C;"), 138);
 }
 
 // §3.3: AsSpan(start, length) — a bounded view; "world" from "hello world".
+// #5054 (§3.5, v0.307): sp[0] is `char`; `int(...)` per the diagnostic's remedy.
 BEZEL_TEST(string_span_883, asspan_start_length_overload) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello world\"; "
         "  var sp := s.AsSpan(6, 5); "  // "world"
-        "  return sp.Length * 10 + sp[0]; "  // 5*10 + 'w'(119) == 169
+        "  return sp.Length * 10 + int(sp[0]); "  // 5*10 + 'w'(119) == 169
         "end Main; end C;"), 169);
 }
 
 // §3.3: Slice(start, length) returns a ReadOnlyStringSpan over the same source.
+// #5054 (§3.5, v0.307): sl[0] is `char`; `int(...)` per the diagnostic's remedy.
 BEZEL_TEST(string_span_883, slice_subview) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
         "  var sp := s.AsSpan(); "
         "  var sl := sp.Slice(1, 3); "  // "ell"
-        "  return sl.Length * 10 + sl[0]; "  // 3*10 + 'e'(101) == 131
+        "  return sl.Length * 10 + int(sl[0]); "  // 3*10 + 'e'(101) == 131
         "end Main; end C;"), 131);
 }
 
