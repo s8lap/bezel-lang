@@ -328,6 +328,64 @@ BEZEL_TEST(extern_out_callback_capture_issue_1719,
     BEZEL_EXPECT_TRUE(rejectsPlainExternCallbackCapture(r));
 }
 
+// --- non-extern Bezel callee: capturing lambda accepted (lambda does not escape) ---
+// These rows cover the #1719 property — ref/out lambda CAN escape via a
+// callback — with a NON-extern callee.  The callback is invoked synchronously
+// during the method call and the lambda's lifetime is bounded by the call;
+// there is no escape route, so this is sound and must compile cleanly.
+// The TODO rows below (extern, plain-callback) cover the case that requires
+// `env`-pairing; they will be re-expressed once #4561 makes the `env` clause
+// parse.
+
+// TODO #4561: once `env`-paired extern callbacks are supported
+// (cb: (env) -> int, env), restore these as accept rows using the env-paired
+// extern form.  The property they test — ref/out lambda escaping via callback
+// at an extern — is only sound when the extern uses env-pairing to extend
+// the binding lifetime through the native call.
+
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           non_extern_bezel_method_ref_capturing_lambda_accepted) {
+    // Identical pattern to the passing call_bounded_2814
+    // "invoke_only_callee_and_capturing_caller_clean" test — a lambda that
+    // captures a managed resource is passed to a plain function-typed parameter
+    // of a non-extern Bezel method.  Since there is no extern and the callback
+    // is invoked synchronously, the closure does not escape and this is sound.
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Res "
+        "  public method Val(): int return 7; end Val; "
+        "  destructor end; "
+        "end Res; "
+        "class C "
+        "  public static method Run(cb: () -> int): int return cb(); end Run; "
+        "  public static method Main(): int "
+        "    using var res := new Res(); "
+        "    return C.Run(lambda() => res.Val()); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           non_extern_bezel_method_out_capturing_different_binding_accepted) {
+    // Same pattern: lambda captures a managed resource, passed to a plain
+    // function-typed parameter of a non-extern method.  Sound, must compile.
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Res "
+        "  public method Val(): int return 42; end Val; "
+        "  destructor end; "
+        "end Res; "
+        "class C "
+        "  public static method Fill(cb: () -> int): int return cb(); end Fill; "
+        "  public static method Main(): int "
+        "    using var res := new Res(); "
+        "    return C.Fill(lambda() => res.Val()); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // §32.5 (#1719): capture identity is symbol-based, not name-based. A lambda
 // parameter that shadows the out recipient is local to the callback and is not
 // a capture of the recipient binding.
