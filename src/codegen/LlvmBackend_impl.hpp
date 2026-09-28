@@ -2914,6 +2914,24 @@ private:
     // to the sema TypeRef of the concrete substitution.  Used in binary
     // expression lowering to distinguish string vs. class pointer equality.
     std::unordered_map<std::string_view, const sema::TypeRef*> genericSubstSemaTy_;
+    // fix #5018 (§28.9 / §14.1 / §2.8.3 rule 4, v0.307): true only while
+    // lowering the STATEMENTS of an INLINED same-class block-form property
+    // SETTER whose receiver's own genericArgs were just installed as the
+    // active substitution (lowerPropertySetValue's SAME-CLASS branch, the
+    // #4983 gate). #4965 intentionally leaves a bare-`T` class field's OLD
+    // value unreleased on every store (`isTypeParamStringFieldLvalue`'s
+    // comment: "a caller in a generic body may hold it in a `T` local that
+    // owns no +1" — releasing could dangle that alias) — correct for an
+    // ARBITRARY generic method/constructor body, but overly conservative for
+    // the canonical `set => do _v := value; end;` shape, where `value` is
+    // the setter's own bound parameter and nothing in the inlined body binds
+    // a bare-`T` local to the field's PRIOR value before the store. Gating
+    // the release to exactly this narrow, save/restored window (never true
+    // for a constructor body, an ordinary method body, or a nested call)
+    // lets `_v := value` release the displaced value exactly as a concretely
+    // `string`-typed field already does, without touching #4965's broader,
+    // still-necessary leak-over-UAF default elsewhere.
+    bool inlinedSetterBareTFieldReleaseSafe_ = false;
     // expectedFunctionType_: set by buildOrderedArgs when processing a lambda
     // argument for a function-typed parameter.  lowerLambda reads this to
     // infer the LLVM types for unannotated lambda parameters.

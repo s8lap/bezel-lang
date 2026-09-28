@@ -14194,6 +14194,24 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
 void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
+    // fix #5018 (§28.9 / §14.1, v0.307): defensive reset. The narrow
+    // release-safety window #5018 arms around an inlined SETTER body's own
+    // statements (`inlinedSetterBareTFieldReleaseSafe_`) must not leak into a
+    // constructor inlined FROM that setter body (e.g. `new B<string>(...)`
+    // inside a setter) — a constructor body's bare-`T` field stores keep
+    // #4965's leak-over-UAF default regardless of what called it. Cleared
+    // for the ctor body's own duration and restored on return so an
+    // enclosing setter's flag is unaffected once this ctor's inline
+    // completes.
+    bool savedInlinedSetterBareTFieldReleaseSafeForCtor =
+        inlinedSetterBareTFieldReleaseSafe_;
+    inlinedSetterBareTFieldReleaseSafe_ = false;
+    struct RestoreOnReturn {
+        Emitter* self; bool saved;
+        ~RestoreOnReturn() {
+            self->inlinedSetterBareTFieldReleaseSafe_ = saved;
+        }
+    } restoreBareTFlag{this, savedInlinedSetterBareTFieldReleaseSafeForCtor};
     currentThis_ = obj;
     // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record ctor body's `this` is
     // the receiver POINTER (CG29), but callees expecting the record STRUCT
@@ -24693,6 +24711,28 @@ bool Emitter::lowerStringFieldStore(const ast::Expr& target,
     if (isTypeParamStringFieldLvalue(target)) {
         if (!fieldAddr || !newVal || !newVal->getType()->isPointerTy())
             return false;
+        // fix #5018 (§28.9 / §14.1 / §2.8.3 rule 4, v0.307): inside an
+        // INLINED same-class block-form property setter's own body
+        // (`inlinedSetterBareTFieldReleaseSafe_`, set only around that exact
+        // lowering window — see its declaration comment), it is safe to
+        // release the displaced value: the setter's canonical `_v := value;`
+        // shape never binds a bare-`T` local to the field's PRIOR value
+        // first, so there is no alias for a release to dangle. Mirror the
+        // concretely-`string`-typed field's own ordering exactly
+        // (load-old, retain-new, store-new, release-old) so a self-
+        // assignment (`Val := Val`) is safe: the retain bumps the shared
+        // refcount to 2 BEFORE the release brings it back to 1, never
+        // transiently to 0. Every other bare-`T` field store site (a
+        // constructor body, an ordinary method, a nested call) leaves the
+        // flag false and keeps #4965's leak-over-UAF default.
+        if (inlinedSetterBareTFieldReleaseSafe_) {
+            llvm::Value* oldVal = builder_.CreateLoad(
+                ptrTy(), fieldAddr, "tpstrf.old");
+            emitStringRetain(newVal);
+            builder_.CreateStore(newVal, fieldAddr);
+            emitStringRelease(oldVal);
+            return true;
+        }
         emitStringRetain(newVal);
         builder_.CreateStore(newVal, fieldAddr);
         return true;

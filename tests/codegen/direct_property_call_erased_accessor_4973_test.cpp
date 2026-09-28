@@ -61,6 +61,7 @@
 #include "test_harness.hpp"          // BEZEL_TEST / BEZEL_EXPECT_*
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 // ===========================================================================
 // P3C: block-form getter on `e: E: B<string>` reads the i32-shaped first 4
@@ -275,17 +276,34 @@ BEZEL_TEST(direct_property_call_erased_accessor_4973,
 // The final `Console.WriteLine(b.Val)` therefore reads garbage or empty
 // — pre-fix the program prints `\n\n` (3 bytes 78 0a 0a from
 // `x` + 2 newlines + the FINAL getter reading empty), post-fix it prints
-// `v199\n`. Runs under `runAot` only — the ASan/LSan path trips a
-// separate §28.9 leak in the constructor's `_v := v` body (the
-// constructor uses the erased T=i32 layout too, writing only 4 bytes
-// to offset 12 instead of 8 bytes to offset 16 — this is a separate
-// issue from the setter twin #4983 fixes), and that leak is outside the
-// scope of #4983. The 200-iteration amplification IS the regression
-// pin: a 1-shot write is not enough to catch the wrong-offset defect
-// on its own because the SETTER always correctly stores `value` SOMEWHERE
-// — the question is whether the READ sees that store. The plain
-// `runAot` printout (`x\ny\n` for the 1-shot rows, `v199\n` here)
-// discriminates the two layouts.
+// `v199\n`. The 200-iteration amplification IS the regression pin for the
+// wrong-offset defect: a 1-shot write is not enough on its own because the
+// SETTER always correctly stores `value` SOMEWHERE — the question is
+// whether the READ sees that store. The plain `runAot` printout (`x\ny\n`
+// for the 1-shot rows, `v199\n` here) discriminates the two layouts.
+//
+// fix #5018 (§28.9 / §14.1 / §2.8.3 rule 4, v0.307): this row now ALSO
+// runs `runAotChecked` (generated-code ASan/LSan) and asserts leak-clean.
+// Pre-#5018, #4983's own fix note recorded that "the ASan/LSan path trips
+// a separate §28.9 leak" here and attributed it to the constructor's
+// `_v := v` body writing at the erased T=i32 offset — that attribution
+// was WRONG (measured on origin/main e9eac9cc): removing the constructor
+// entirely and driving the identical 200-iteration setter loop against a
+// default-initialized `B<string>` reproduces the SAME 199-direct /
+// 199-indirect / 7253-byte leak (see `setter_loop_200_iter_no_ctor_5018`
+// below), and a 1-shot construct-then-read with NO setter call at all is
+// leak-clean. The true root cause is `lowerStringFieldStore`'s bare-`T`
+// branch (fix #4965, §4.6/§28.9/§14.1 v0.307): every REASSIGNMENT of a
+// generic `T`-bound-to-`string` class field intentionally never released
+// the displaced value (to avoid dangling a hypothetical bare-`T` local
+// alias of the OLD value) — safe (leak, not UAF) but wrong for the
+// canonical `set => do _v := value; end;` shape, which never creates such
+// an alias. #5018 arms a narrow release-safety window
+// (`inlinedSetterBareTFieldReleaseSafe_`) around exactly an INLINED
+// same-class block-form setter's own body, so this loop's 199 displaced
+// intermediate strings ("v0".."v198") are now released like a concretely
+// `string`-typed field's would be, leaving only the final "v199" alive at
+// `using`'s Dispose.
 // ===========================================================================
 BEZEL_TEST(direct_property_call_erased_accessor_4973,
            setter_loop_200_iter_4983) {
@@ -313,4 +331,128 @@ BEZEL_TEST(direct_property_call_erased_accessor_4973,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     BEZEL_EXPECT_EQ(plain.stdoutText, "v199\n");
+    // fix #5018: leak-clean under generated-code ASan/LSan (was 199 direct +
+    // 199 indirect / 7253 B pre-fix).
+    auto checked = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "v199\n");
+}
+
+// ===========================================================================
+// fix #5018 (§28.9 / §14.1, v0.307): the SAME 200-iteration setter loop as
+// `setter_loop_200_iter_4983` above, but with NO constructor at all — `_v`
+// is default-initialized (calloc-zero) and every value the field ever holds
+// arrives through the SETTER. This isolates the leak from any constructor
+// involvement: it reproduces byte-for-byte identically to the row above
+// (199 direct + 199 indirect / 7253 B pre-#5018), proving the root cause is
+// the setter's own drop-on-overwrite, not construction. Post-fix: leak-clean.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           setter_loop_200_iter_no_ctor_5018) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new B<string>(); "
+        "    for var i in 0..<200 do "
+        "      b.Val := \"v\" + i.ToString(); "
+        "    end; "
+        "    Console.WriteLine(b.Val); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "v199\n");
+    auto checked = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "v199\n");
+}
+
+// ===========================================================================
+// fix #5018 control (§28.9 / §14.1, v0.307): T=int. `isTypeParamStringFieldLvalue`
+// requires the SUBSTITUTED type to resolve to `string` (`isTypeParamBoundToString`),
+// so the release-safety window #5018 arms is inert for a non-pointer, non-string
+// substitution — this row confirms the fix does not touch (and cannot regress)
+// an ordinary bare-`T` numeric field's plain store.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           setter_loop_200_iter_int_control_5018) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new B<int>(0); "
+        "    for var i in 0..<200 do "
+        "      b.Val := i; "
+        "    end; "
+        "    Console.WriteLine(b.Val.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "199\n");
+    auto checked = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "199\n");
+}
+
+// ===========================================================================
+// fix #5018 control (§28.9 / §14.1, v0.307): self-assignment `b.Val := b.Val;`
+// through the newly-armed release-safety window. The concretely-`string`-typed
+// field path already proved this ordering safe (#429: load-old, retain-new,
+// store-new, release-old — retain BEFORE release keeps the shared refcount
+// from ever transiently reaching 0 when old==new); this row pins that the
+// bare-`T`-at-`string` twin added by #5018 uses the identical ordering and so
+// cannot double-free / use-after-free on a self-assignment.
+// ===========================================================================
+BEZEL_TEST(direct_property_call_erased_accessor_4973,
+           setter_self_assign_no_double_free_5018) {
+    const char* src =
+        "module M; "
+        "public class B<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Val: T "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end Val; "
+        "end B; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new B<string>(\"hello\"); "
+        "    b.Val := b.Val; "
+        "    Console.WriteLine(b.Val); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto plain = bezel::test::runAot(src);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.exitCode, 0);
+    BEZEL_EXPECT_EQ(plain.stdoutText, "hello\n");
+    auto checked = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 0);
+    BEZEL_EXPECT_EQ(checked.stdoutText, "hello\n");
 }

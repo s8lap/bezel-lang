@@ -7539,11 +7539,26 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);
     inlinedAccessorEnd_ = accEndBB;
     bool term = false;
+    // fix #5018 (§28.9 / §14.1 / §2.8.3 rule 4, v0.307): arm the narrow
+    // release-safety window (see the flag's declaration comment in
+    // LlvmBackend_impl.hpp) for exactly this inlined setter body's own
+    // statements — a bare-`T` field store reached from here (`_v := value`)
+    // may now release the displaced value instead of leaking it (#4965's
+    // default everywhere else). Only armed when a subst was actually
+    // installed above (a `T`-bound field access with no active subst cannot
+    // resolve to `string` regardless of this flag). Save/restore so a call
+    // made FROM this body into another function (which does not inherit
+    // this narrow guarantee) cannot see the flag left on.
+    bool savedInlinedSetterBareTFieldReleaseSafe =
+        inlinedSetterBareTFieldReleaseSafe_;
+    if (substInstalledSet) inlinedSetterBareTFieldReleaseSafe_ = true;
     if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
         setter->exprBody)
         lowerExpr(*setter->exprBody);
     else
         term = lowerScopedBlock(setter->stmts);
+    inlinedSetterBareTFieldReleaseSafe_ =
+        savedInlinedSetterBareTFieldReleaseSafe;
     inlinedAccessorEnd_ = savedAccEnd;
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
