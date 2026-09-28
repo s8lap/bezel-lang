@@ -158,10 +158,10 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874A; "
         "internal class InternalA2874 "
-        "  public static method foo(): Array<int> => new Array<int>(); "
+        "  public static method foo(): owned Array<int> => new Array<int>(); "
         "end InternalA2874; "
         "public class GA2874<T> "
-        "  public v: T; public items: Array<int> := InternalA2874.foo(); "
+        "  public v: T; public owned items: Array<int> := InternalA2874.foo(); "
         "  public constructor(x: T) v := x; end constructor; end GA2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
@@ -200,10 +200,10 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874B; "
         "internal class InternalB2874 "
-        "  public static method foo(): Array<int> => new Array<int>(); "
+        "  public static method foo(): owned Array<int> => new Array<int>(); "
         "end InternalB2874; "
         "public class GB2874<T> "
-        "  public v: T?; public items: Array<int> := InternalB2874.foo(); "
+        "  public v: T?; public owned items: Array<int> := InternalB2874.foo(); "
         "end GB2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
@@ -239,12 +239,12 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874C; "
         "internal class InternalC2874 "
-        "  public static method foo(): Array<int> => new Array<int>(); "
+        "  public static method foo(): owned Array<int> => new Array<int>(); "
         "end InternalC2874; "
         "public class Ok2874<T> public v: T; public tag: int := 107; "
         "  public constructor(x: T) v := x; end constructor; end Ok2874; "
         "public class Bad2874<T> public v: T; "
-        "  public items: Array<int> := InternalC2874.foo(); "
+        "  public owned items: Array<int> := InternalC2874.foo(); "
         "  public constructor(x: T) v := x; end constructor; end Bad2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
