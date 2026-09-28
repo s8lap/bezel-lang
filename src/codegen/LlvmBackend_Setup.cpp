@@ -7985,6 +7985,17 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                             ? indexerItableAccessor(ts, pimpl, isSet)
                             : ensurePropertyAccessorFn(ts, pimpl, isSet);
                     if (!acc || !accessorAbiFits(acc, isSet)) return;
+                    // fix-forward #4952 (§28.3/§28.9, v0.307): normalize a
+                    // dynamically-dispatched string getter to +1.  The
+                    // local vtable/itable paths apply
+                    // ensureVirtualStringGetterOwnershipThunk at their install
+                    // sites (lines ~5328, ~5478, ~8662, ~8928); this
+                    // buildImportedGenericVtable fill was the only one missing
+                    // it, causing an over-release UAF when an imported generic
+                    // class implements an interface with a non-nullable string
+                    // property and the call is dispatched through the itable.
+                    if (!isSet)
+                        acc = ensureVirtualStringGetterOwnershipThunk(pimpl, acc);
                     itabElems[si] = llvm::cast<llvm::Constant>(acc);
                 };
                 if (auto gi = ifacePropertyGetIndex_.find(ip);
