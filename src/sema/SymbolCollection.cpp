@@ -819,6 +819,51 @@ bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx) {
     return ctx.importedReturnOwned(&ms);
 }
 
+// fix #4988 (§22 / §27 / §28.3, v0.307 — sister accessor to
+// `methodReturnsOwned` for umbrella #3152): the both-sources reader of a
+// method's DECLARED RETURN TYPE. Mirrors `methodReturnsOwned`'s contract:
+// AST (MethodDecl/OperatorDecl) first, then the loader's `importedReturnType`
+// side-table. The five hand-written copies this accessor retires (see
+// Symbol.hpp for the enumeration) each spelled the same dual-sourcing pattern
+// in their own way — the consolidation drains the class-3 SEAM-DEBT entries
+// at every site that was carrying one for #4988.
+//
+// AST-first order matches `methodReturnsOwned` above and `formalParam*` above
+// that: for an imported GENERIC type the loader sets BOTH `decl` (body
+// re-parse) AND the `importedReturnType` wire entry, and the AST arm wins
+// (i.e. this accessor changes nothing for that case). For an imported
+// non-generic class member the AST arm is null and the loader-recorded entry
+// is the single source of truth.
+TypeRef* methodReturnResolvedType(const MethodSymbol& ms,
+                                  const SemaContext& ctx) {
+    // SEAM-ACCESSOR: AST arm for a regular method declaration. The
+    // `returnType` AST node carries the syntactic shape; sema's
+    // `resolveTypes` pass populates `ctx.resolvedTypes_` for it (so the
+    // lookup below returns null only for an unresolved body — a caller
+    // that consumes the accessor against an unresolved AST would see null,
+    // matching the hand-written copy's behaviour at the same stage).
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
+        return md->returnType ? ctx.resolvedType(*md->returnType) : nullptr;
+    // SEAM-ACCESSOR: AST arm for an operator overload — `OperatorDecl` is a
+    // sibling of `MethodDecl`, not a subclass, so the audit's
+    // `methodReturnsOwned` accessor above already had to consider it; this
+    // sibling mirrors the same split. Before this accessor existed the
+    // shared-event-handler site (#4901) silently rejected an OperatorDecl
+    // here via its `else if (ms->decl) return false;` defensive guard —
+    // the consolidation treats operators the same as methods, which is the
+    // substantive claim the seam-audit intended.
+    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
+        return od->returnType ? ctx.resolvedType(*od->returnType) : nullptr;
+    // SEAM-ACCESSOR: the imported half. ModuleLoader sets `decl` only where
+    // it re-parsed exported body text for a GENERIC type; for any
+    // non-generic imported class member the AST arm is null and the
+    // loader-recorded wire return on `ctx.importedReturnType` is the single
+    // source of truth. A side-table miss returns null, which the existing
+    // hand-written copies already treated as "no constraint" / default-to-
+    // unit — the accessor preserves that interpretation.
+    return ctx.importedReturnType(&ms);
+}
+
 const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
                                      std::size_t pos) {
     if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->type.get();

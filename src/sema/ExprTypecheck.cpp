@@ -4153,8 +4153,6 @@ TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
     if (!ms) return nullptr;
     auto* ft = ctx_.makeTypeRef();
     ft->kind = TypeRef::Kind::Function;
-    // SEAM-DEBT: #4988 no both-sources declared-return-type accessor exists yet; AST arm then importedReturnType below
-    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     for (auto* psym : ms->params) {
         auto* par = dynamic_cast<ParameterSymbol*>(psym);
         if (!par) continue;
@@ -4167,17 +4165,22 @@ TypeRef* ExprTC::functionTypeFromBareMethodSymbol(MethodSymbol* ms) {
             fp.type = par->resolvedDeclType;
         ft->funcParams.push_back(fp);
     }
-    if (md && md->returnType) {
-        ft->funcReturn = ctx_.resolvedType(*md->returnType);
-        ft->funcReturnOwned = md->returnOwned;
-    } else if (!md && ctx_.importedReturnType(ms)) {
-        ft->funcReturn = ctx_.importedReturnType(ms);
-        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
+    // fix #4988 (§22 / §27 / §28.3, v0.307 — sister accessor to
+    // `methodReturnsOwned` for umbrella #3152): the resolved declared
+    // return type, read both-sources. null means the method is unit,
+    // which the local-arm and imported-arm fall-through already treated
+    // as the universal default. The `owned` marker is read separately
+    // through the sister accessor (`methodReturnsOwned`) so the two
+    // halves never announce owned transfer on a unit-typed slot. Replaces
+    // the SEAM-DEBT #4988 hand-written copy.
+    if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
+        ft->funcReturn = rt;
     } else {
         auto* unit = ctx_.makeTypeRef();
         unit->kind = TypeRef::Kind::Unit;
         ft->funcReturn = unit;
     }
+    ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
     return ft;
 }
 

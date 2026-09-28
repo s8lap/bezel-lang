@@ -19734,7 +19734,6 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         // the leading function parameter ONLY for the unbound case.
         auto* ft = ctx_.makeTypeRef();
         ft->kind = TypeRef::Kind::Function;
-        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         bool unboundExtRef = false;
         if (ms->extensionDecl && ma.target) {
             if (auto* tgtSym = ctx_.exprSymbol(*ma.target)) {
@@ -19831,26 +19830,24 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
             if (par->declType) fp.type = ctx_.resolvedType(*par->declType);
             ft->funcParams.push_back(fp);
         }
-        if (md && md->returnType) {
-            ft->funcReturn = ctx_.resolvedType(*md->returnType);
-            ft->funcReturnOwned = md->returnOwned;
-        } else if (!md && ctx_.importedReturnType(ms)) {
-            // fix #3193 (§27.6 / §26.1, v0.254): extension methods are bound
-            // the same way as a class method — an IMPORTED extension method
-            // has no ast::MethodDecl, so without this fall-through the formed
-            // Function TypeRef would drop the return type AND the `owned`
-            // marker. Pull the return type from the loader's side table and
-            // the marker from the #3189 shared accessor — the two halves
-            // move together so we never announce owned transfer on a
-            // unit-typed slot. The two local arms above (#3189's predicate)
-            // were rewritten the same way for the same defect class.
-            ft->funcReturn = ctx_.importedReturnType(ms);
-            ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
+        // fix #4988 (§27 / §28.3, v0.307 — sister accessor to
+        // `methodReturnsOwned` for umbrella #3152): the resolved declared
+        // return type, read both-sources. null means unit, the universal
+        // default; non-null carries the resolved declared shape. The
+        // `owned` marker is read separately through the sister accessor so
+        // the two halves never announce owned transfer on a unit-typed
+        // slot. Replaces the hand-written copy that fix #3193 (§27.6 /
+        // §26.1, v0.254) put here to thread the imported extension method's
+        // return type and `owned` marker through the formed Function
+        // TypeRef — the consolidation preserves that behaviour verbatim.
+        if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
+            ft->funcReturn = rt;
         } else {
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
             ft->funcReturn = unit;
         }
+        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
         ctx_.setExprType(&ma, ft);
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         // §26.1: a computed read-only extension property — its type is the
@@ -27473,7 +27470,6 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto* ft = ctx_.makeTypeRef();
         ft->kind = TypeRef::Kind::Function;
         // Build parameter types from the method's ParameterSymbol list.
-        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         for (auto* psym : ms->params) {
             auto* par = dynamic_cast<ParameterSymbol*>(psym);
             if (!par) continue;
@@ -27496,34 +27492,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 fp.type = par->resolvedDeclType;
             ft->funcParams.push_back(fp);
         }
-        // Return type: from MethodDecl->returnType, or unit when absent.
-        if (md && md->returnType) {
-            ft->funcReturn = ctx_.resolvedType(*md->returnType);
-            ft->funcReturnOwned = md->returnOwned;
-        } else if (!md && ctx_.importedReturnType(ms)) {
-            // fix #3193 (§27.6 / §28.1 / §28.3 §2.5, v0.254): method-reference
-            // formation over an IMPORTED method. The cast here is null for any
-            // non-generic imported class (ModuleLoader sets `decl` only where
-            // it re-parsed exported body text for a GENERIC type), so without
-            // this fall-through the formed Function TypeRef would silently
-            // become `() -> ()` and the `owned` marker would be dropped. That
-            // shows up as a §28.3 borrow-lifetime FALSE REJECT on the typical
-            // shape, or as the `internal: lowerLocalDecl` diagnostic from
-            // #2434 with a silent no-allocate on the shorter form. Pull the
-            // return type from the loader's side table and the marker from the
-            // #3189 shared accessor (`methodReturnsOwned`) — the two halves
-            // move together so we never announce owned transfer on a
-            // unit-typed slot. The explicit-target-type spelling
-            // `var f: (int) -> owned Cell := Cell.MakeIt;` already worked
-            // because the type ascription rescued the formation; this closes
-            // the last gap.
-            ft->funcReturn = ctx_.importedReturnType(ms);
-            ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
+        // fix #4988 (§27 / §28.3, v0.307 — sister accessor to
+        // `methodReturnsOwned` for umbrella #3152): the resolved declared
+        // return type, read both-sources. null means unit, the universal
+        // default; non-null carries the resolved declared shape. The
+        // `owned` marker is read separately through the sister accessor so
+        // the two halves never announce owned transfer on a unit-typed
+        // slot. Replaces the hand-written copy that fix #3193 (§27.6 /
+        // §28.1 / §28.3 / §2.5, v0.254) put here to thread the imported
+        // method's return type and `owned` marker through the formed
+        // Function TypeRef — the consolidation preserves that behaviour
+        // verbatim and closes the §28.3 borrow-lifetime FALSE REJECT class
+        // the comment above named.
+        if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
+            ft->funcReturn = rt;
         } else {
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
             ft->funcReturn = unit;
         }
+        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
         ctx_.setExprType(&ma, ft);
     }
 }

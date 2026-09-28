@@ -4481,15 +4481,13 @@ bool sharedEventHandlerAdmissible(
         paramTy = sema::formalParamResolvedType(*ms, 0);
     if (!paramTy || !sharedEventTypeEq(paramTy, payload)) return false;
     if (sema::methodReturnsOwned(*ms, ctx)) return false;
-    // SEAM-DEBT: #4988 no both-sources declared-return-type accessor exists yet; AST arm then importedReturnType below
-    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (md->returnType) {
-            const sema::TypeRef* rt = ctx.resolvedType(*md->returnType);
-            if (!rt || rt->kind != sema::TypeRef::Kind::Unit) return false;
-        }
-    } else if (ms->decl) {
-        return false;  // not a plain method declaration
-    } else if (const sema::TypeRef* rt = ctx.importedReturnType(ms)) {
+    // fix #4988 (§15 / §28.3, v0.307 — sister accessor to `methodReturnsOwned`
+    // for umbrella #3152): the resolved declared return type, read both-
+    // sources. null means the method is `() -> ()`, the universal default;
+    // any non-Unit return disqualifies the shared-event-handler admission.
+    // Replaces the SEAM-DEBT #4988 hand-written copy (#4901 added this read
+    // and bumped the class-3 count by +1; the consolidation drains it).
+    if (const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx)) {
         if (rt->kind != sema::TypeRef::Kind::Unit) return false;
     }
     // (3) type parameters: one binding only.

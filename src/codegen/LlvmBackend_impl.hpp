@@ -208,22 +208,19 @@ inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
 inline bool calleeReturnMayAliasStringArgUnretained(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms) return false;
-    const sema::TypeRef* crt = nullptr;
-    // `md` is lifted to outer scope so the Class-field check below can use
-    // it; it is only non-null for non-imported methods (where `crt` is also
-    // resolved from the body). Imported methods have no body to inspect.
-    const ast::MethodDecl* md = nullptr;
-    if (ctx.isImported(ms)) {
-        crt = ctx.importedReturnType(ms);
-    } else {
-        // SEAM-ACCESSOR: local-path cast; `if (ctx.isImported(ms))` above
-        // returns early for the imported case via ctx.importedReturnType.
-        // #3152
-        md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        if (md && md->returnType) {
-            crt = ctx.resolvedType(*md->returnType);
-        }
-    }
+    // fix #4988 (§9.7 / §28.9, v0.307 — sister accessor to
+    // `methodReturnsOwned` for umbrella #3152): the resolved declared
+    // return type, read both-sources. Replaces the hand-written copy that
+    // branched on `ctx.isImported(ms)` to dispatch between the two sources
+    // — the accessor consults them in the same AST-then-symbol order the
+    // rest of the seam-accessor family uses, so a member both sources
+    // describe can never get two answers. `md` is preserved below for
+    // the non-imported Class-field walk (see the SEAM-DEBT #4300 marker
+    // there for why it has to stay MethodDecl-typed specifically).
+    const sema::TypeRef* crt = sema::methodReturnResolvedType(*ms, ctx);
+    const ast::MethodDecl* md = !ctx.isImported(ms)
+        ? dynamic_cast<const ast::MethodDecl*>(ms->decl)
+        : nullptr;
     // fix #4280: shared Record/Choice test — ONE spelling for both the
     // top-level `crt` arm and the InlineArray-element arm below (§6).
     auto isRecordOrChoiceDeclared = [](const sema::TypeRef* t) {

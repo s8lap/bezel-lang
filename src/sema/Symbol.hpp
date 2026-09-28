@@ -1963,6 +1963,53 @@ const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
 // `MethodSymbol` still answers `false` exactly as before.
 bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx);
 
+// §22 / §27 / §28.3 (v0.307, #4988 — sister accessor to `methodReturnsOwned`
+// for umbrella #3152): the DECLARED RETURN TYPE of a method, read both-sources.
+//
+// Until this accessor existed the answer was hand-written at five call sites,
+// each spelling "AST MethodDecl::returnType resolved through ctx.resolvedType,
+// else ctx.importedReturnType" with their own fall-through to `unit`. That
+// duplication was a class-3 `MemberSymbol::decl` read at each of those sites
+// (the seam-audit family marked each with a SEAM-DEBT comment for #4988); one
+// site (#4901, `sharedEventHandlerAdmissible`) was a new +1 read against the
+// class-3 ratchet ceiling, and the only sound fix was to consolidate.
+//
+// Like `methodReturnsOwned`, the sources are consulted in the AST-then-symbol
+// order the `formalParam*` accessors use. A `MethodSymbol` whose AST is a
+// `MethodDecl` answers the resolved `returnType`; one whose AST is an
+// `OperatorDecl` answers that one's resolved `returnType` (a sibling of
+// `MethodDecl`, not a subclass, so the accessor must cast for both — the same
+// drift #5 the sister accessor closes); one with no AST consults
+// `SemaContext::importedReturnType` (the loader-recorded wire return).
+//
+// Return values:
+//   * null  — no declared return type. The local AST arm answers null when
+//             the `returnType` node itself is null (a `method F()` with no
+//             `: T` clause is `() -> ()`, the universal default), AND the
+//             imported arm answers null when the side-table has no entry
+//             for this method (the existing sites already treat that as
+//             "no constraint" / default-to-unit — the accessor changes
+//             nothing there).
+//   * a non-null TypeRef  — the resolved declared return type. For the
+//             AST arms this is `ctx.resolvedType(*md->returnType)` (or
+//             `*od->returnType`), and for the imported arm it is the
+//             `importedReturnType` side-table entry verbatim. Whether the
+//             TypeRef's `kind` is `Unit` or some other type is the
+//             caller's question (e.g. `sharedEventHandlerAdmissible` asks
+//             "is it exactly Unit?"; method-reference formation asks "is
+//             it non-null so I can substitute it into a Function TypeRef
+//             otherwise fall through to a freshly-allocated Unit?").
+//
+// The return type matches `SemaContext::importedReturnType` (non-const) so
+// the four call sites that assign the resolved shape into a Function
+// TypeRef's `funcReturn` slot (sema `functionTypeFromBareMethodSymbol` and
+// the two method-reference formation sites in `ExprTypecheck_Calls.cpp`)
+// do not need a `const_cast` at every call. The TypeRef is shared-mutable
+// across sema slices in the same way the side-table entries it returns
+// are.
+TypeRef* methodReturnResolvedType(const MethodSymbol& ms,
+                                  const SemaContext& ctx);
+
 // §22.5 "Optional parameters" / §2.5 (v0.254, #3178 — family M5 of umbrella
 // #3152): does formal `pos` declare a default (`:= Expr`)? Same dual sourcing —
 // the `ast::Param`'s `defaultValue` locally, `ParameterSymbol::hasDefault` for
