@@ -16103,10 +16103,12 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     if (!staticMd) return nullptr;
     bool ifaceParent = staticType->kind == ast::TypeDeclKind::Interface;
 
-    // The most-derived method named `ms->name` reachable from class `c`
-    // (the override or interface implementation `c`'s instances run).
+    // The most-derived OVERLOAD of `ms` reachable from class `c` (the
+    // override or interface implementation `c`'s instances run). Match by
+    // signature (name + arity + param types) — see findMethodBySignature
+    // (§22.6 / §14.2 / §12, v0.307, fix #5113).
     auto mostDerived = [&](const sema::TypeSymbol* c) -> sema::MethodSymbol* {
-        return findMethodByName(c, ms->name);
+        return findMethodBySignature(c, ms);
     };
     auto isSubclassOf = [&](const sema::TypeSymbol* c,
                             const sema::TypeSymbol* anc) -> bool {

@@ -7998,6 +7998,120 @@ private:
         return nameOnly;
     }
 
+    // fix #5113 (§22.6 / §14.2 / §12, v0.307): structural TypeRef equality for
+    // method-signature matching in `findMethodBySignature`. Same KIND + same
+    // nullability; for Named types, same declaration pointer OR (for type
+    // parameters, where declaration is null) consider them equivalent at the
+    // SAME method-param position (a method's own `<T>` referenced by position
+    // is the same kind of thing on every override). Concrete types still
+    // recurse on genericArgs. Unit and Error kinds compare equal.
+    static bool methodSigTypeRefEqual(const sema::TypeRef* a,
+                                      const sema::TypeRef* b) {
+        if (a == b) return true;
+        if (!a || !b) return false;
+        if (a->kind != b->kind) return false;
+        if (a->nullable != b->nullable) return false;
+        switch (a->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                return a->primitive == b->primitive;
+            case sema::TypeRef::Kind::Named: {
+                // Both are type-parameter references (no declaration): treat
+                // as equivalent. The candidate is in the same method-param
+                // position, so its own `<T>` (or `<U>`) is the same "kind of
+                // thing" — comparing the *name* would be wrong because the
+                // override redeclares the type param under its own scope.
+                if (!a->declaration && !b->declaration) return true;
+                if ((a->declaration == nullptr) != (b->declaration == nullptr))
+                    return false;
+                if (a->declaration && a->declaration != b->declaration)
+                    return false;
+                if (a->genericArgs.size() != b->genericArgs.size()) return false;
+                for (size_t i = 0; i < a->genericArgs.size(); ++i) {
+                    if (!methodSigTypeRefEqual(a->genericArgs[i],
+                                               b->genericArgs[i]))
+                        return false;
+                }
+                return true;
+            }
+            case sema::TypeRef::Kind::Unit:
+            case sema::TypeRef::Kind::Error:
+                return true;
+            case sema::TypeRef::Kind::InlineArray:
+            case sema::TypeRef::Kind::Function:
+                return false;  // not part of #5113 repro shapes
+        }
+        return false;
+    }
+
+    // fix #5113 (§22.6 / §14.2 / §12, v0.307): compare two methods' parameter
+    // lists. When the param type is a method-level generic parameter (a
+    // Named AST whose single-part name matches one of the OWNING METHOD's
+    // genericParams), the override redeclares `<T>` under its own scope, so
+    // the AST pointers differ but the references are equivalent.
+    static bool methodSigParamsMatch(const sema::MethodSymbol* a,
+                                     const sema::MethodSymbol* b) {
+        if (!a || !b) return false;
+        if (a->params.size() != b->params.size()) return false;
+        auto isOwnTypeParamRef = [](const sema::MethodSymbol* m,
+                                    const ast::Type* t) {
+            if (!t || t->kind != ast::TypeKind::Named) return false;
+            if (t->genericArgs.size() != 0) return false;
+            if (!t->name || t->name->parts.size() != 1) return false;
+            std::string_view nm = t->name->parts[0];
+            for (const auto* gp : m->genericParams)
+                if (gp && gp->name == nm) return true;
+            return false;
+        };
+        for (size_t i = 0; i < a->params.size(); ++i) {
+            const auto* pa = dynamic_cast<const sema::ParameterSymbol*>(a->params[i]);
+            const auto* pb = dynamic_cast<const sema::ParameterSymbol*>(b->params[i]);
+            if (!pa || !pb) return false;
+            const sema::TypeRef* ta = pa->resolvedDeclType;
+            const sema::TypeRef* tb = pb->resolvedDeclType;
+            if (ta && tb) {
+                if (!methodSigTypeRefEqual(ta, tb)) return false;
+                continue;
+            }
+            // Fall back to the AST `ast::Type*`.
+            if (pa->declType && pb->declType) {
+                if (pa->declType == pb->declType) continue;
+                if (isOwnTypeParamRef(a, pa->declType) &&
+                    isOwnTypeParamRef(b, pb->declType))
+                    continue;
+                return false;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // fix #5113 (§22.6 / §14.2 / §12, v0.307): the most-derived OVERLOAD of
+    // `ms` reachable from class `c`. Match by signature (same name + same
+    // generic-param count + same param arity + same param types), not by
+    // name alone. Scoped to `emitVirtualGenericDispatch`; the other two
+    // `findMethodByName` call sites in LlvmBackend_Calls2.cpp (8319, 11423)
+    // are pre-narrowed to single-overload shapes and are not changed.
+    sema::MethodSymbol* findMethodBySignature(const sema::TypeSymbol* cls,
+                                              const sema::MethodSymbol* ms)
+                                              const {
+        if (!cls || !ms) return nullptr;
+        sema::MethodSymbol* nameOnly = nullptr;
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!cand || isStaticMethod(cand) || cand->name != ms->name)
+                    continue;
+                if (cand->genericParams.size() != ms->genericParams.size())
+                    continue;
+                if (!methodFns_.count(cand)) continue;
+                if (methodSigParamsMatch(cand, ms)) return cand;
+                if (!nameOnly) nameOnly = cand;
+            }
+            t = baseClassOf(t);
+        }
+        return nameOnly;
+    }
+
     // fix #2768 (stdlib §4.4 / §2.8, spec §14.2, v0.240): the `CompareTo` that
     // `Array<T>.Sort()` / `.Sorted()` must dispatch to when T is an INTERFACE,
     // or null when this element type is not one the comparerless forms govern.
