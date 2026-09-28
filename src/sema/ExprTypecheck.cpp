@@ -11993,6 +11993,28 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
         return d->kind == TypeRef::Kind::Named && d->declaration &&
                d->declaration->kind == ast::TypeDeclKind::Interface;
     };
+    // fix #4812 (§12.7, v0.307): a bare TYPE-PARAMETER-typed location — `v: T`
+    // in a generic body — is the OTHER declared-location kind whose runtime
+    // representation is not fixed statically: at monomorphization `T` is bound
+    // to some concrete type, which may itself be a value type stored inline
+    // (§12.7's own text draws no distinction: "the variable is flow-narrowed
+    // to `T` within the controlled block" names no restriction to
+    // Object/interface carriers). Pre-fix, `isBoxHoldingLocation` answered
+    // false for `T`, so `v is int` narrowed nothing: `v` kept its declared `T`
+    // inside the branch, and a subsequent `var x: int := v;` fell to #4768's
+    // "a type parameter converts only to Object and its constraint bounds"
+    // arm — an over-rejection, since the test just proved `T = int` for this
+    // read. Scope: only a bare Named type parameter (no declaration, no
+    // generic args) that is one of THIS body's own generic parameters
+    // (`currentScopeGenericParamNames()`, the same scope #4768's arm uses) —
+    // a callee's unsubstituted free parameter is the unrelated inference-gap
+    // case and stays excluded, same as #4768/#4810.
+    auto isGenericCarrierLocation = [this](const TypeRef* d) {
+        if (!d || d->kind != TypeRef::Kind::Named || d->declaration ||
+            !d->genericArgs.empty())
+            return false;
+        return currentScopeGenericParamNames().count(d->headName()) > 0;
+    };
     // fix #3122 (§12.7, v0.252): the declaration-less Named TypeRef shape a
     // value-builtin ANNOTATION resolves to is also the shape of a bare type
     // PARAMETER (`T` in `Box<T>`, #3092). The two cases are distinguished by
@@ -12028,7 +12050,8 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
             // PrimitiveType::None is not a type.
             narrowable = tt->primitive != PrimitiveType::None &&
                          tt->primitive != PrimitiveType::Object &&
-                         isBoxHoldingLocation(declaredTypeOf(sym));
+                         (isBoxHoldingLocation(declaredTypeOf(sym)) ||
+                          isGenericCarrierLocation(declaredTypeOf(sym)));
             break;
         case TypeRef::Kind::InlineArray:
             // §8.6 *Boxing of inline arrays*, verbatim: "Move-only value types —

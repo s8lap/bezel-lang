@@ -3597,7 +3597,23 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj->getType()->isPointerTy()) {
         // Only the nullable-VALUE-type struct case is handled here (nullable
         // CLASS types lower to ptr and never reach this branch).
-        const sema::TypeRef* operandTy = operandStaticTy();  // fix #3090
+        // fix #4812 (§12.7, v0.307): use `opTyResolved` — the same
+        // genericSubstSemaTy_-resolved type widen #4925 computed above for
+        // the string arm — rather than a fresh raw `operandStaticTy()`. A
+        // bare type-parameter operand (`v: T`) at a monomorphized site (e.g.
+        // `T = int`) lowers `obj` to the SUBSTITUTED concrete value (a plain
+        // i32, not a box), but the raw declared type is still `T`
+        // (Named, no declaration) — `concreteValueTypeOperand` below
+        // deliberately excludes that shape (#3120's own comment: "a bare
+        // type parameter … the unspecialized generic-template body that is
+        // never executed"), so pre-fix `v is int` / `v as int?` fell through
+        // this whole branch unresolved for every non-string, non-Object
+        // substitution and was silently dropped or misdirected to the
+        // reference-location diagnostics below. Resolving through
+        // `genericSubstSemaTy_` first makes the static-decision arm fire for
+        // ANY monomorphized concrete substitution, matching what #4925
+        // already did for `T = string`.
+        const sema::TypeRef* operandTy = opTyResolved;  // fix #3090 / #4812
         if (operandTy && isNullableValueTy(operandTy) &&
             obj->getType()->isStructTy()) {
             llvm::Value* hasVal = nullablePrimHasValue(obj);  // i1

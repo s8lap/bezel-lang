@@ -16946,6 +16946,53 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             iterFormatWrappedDecls_.erase(declNode);
     }
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
+    // fix #4812 (§12.7 / issue #490, v0.307): a §12.7-narrowed BARE
+    // TYPE-PARAMETER read at the UNSPECIALIZED generic template stub. Widening
+    // #4812's sema fix now types a T-typed simple variable at its narrowed
+    // type inside `if v is <ConcreteType> then …` (mirroring the existing
+    // Object-carrier rule), so `var s: string := v;` for `v: T` narrowed to
+    // `string` type-checks. At a MONOMORPHIZED site (T actually substituted
+    // to `string`) this is correct and `v`'s lowered LLVM type already equals
+    // `declaredTy` (ptr == ptr) — no mismatch, this guard is a no-op. But the
+    // UNSPECIALIZED stub (#490: "never executed … the specialization path
+    // compiles the concrete version") has no substitution to consult, so a
+    // bare type-parameter identifier lowers as its ARBITRARY erased
+    // placeholder representation (measured: `i32`) regardless of the
+    // narrowed type sema published — an `i32` read into a `string`-declared
+    // (`ptr`) slot. Storing it verbatim produces an ill-typed slot (the
+    // #490 guard below only catches `v == nullptr`, not a wrongly-typed `v`),
+    // and every subsequent use (`s.Length`) then GEPs a string struct off an
+    // `i32` base — malformed IR, verifier abort, on a block that never runs.
+    // Detect exactly this shape — the initializer is a bare identifier whose
+    // OWN declared type (not narrowed) is a bare type parameter (Named, no
+    // declaration, no generic args) — and degrade `v` to the same
+    // #2434/#490 "doesn't have to be correct, just IR-verifiable" zero-init
+    // answer already given every other erased-generic mismatch in this
+    // function. Scoped to the exact mismatch shape rather than a blanket
+    // `genericSubstSemaTy_.empty()` check so a genuine (non-generic) type
+    // mismatch elsewhere still surfaces as-is rather than being silently
+    // absorbed.
+    if (v && declaredTy && v->getType() != declaredTy) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(init)) {
+            if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                const sema::TypeRef* symDeclTy = nullptr;
+                if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym))
+                    symDeclTy = ls->declType;
+                else if (auto* ps =
+                             dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+                    symDeclTy = ps->resolvedDeclType;
+                    if (!symDeclTy && ps->declType)
+                        symDeclTy = ctx_.resolvedType(*ps->declType);
+                }
+                if (symDeclTy &&
+                    symDeclTy->kind == sema::TypeRef::Kind::Named &&
+                    !symDeclTy->declaration &&
+                    symDeclTy->genericArgs.empty()) {
+                    v = nullptr;
+                }
+            }
+        }
+    }
     // #914: a narrowed value-nullable initializer (sema accepted the assignment
     // because null-flow proved it non-null) lowered to the {flag, value} struct,
     // but the local is declared NON-nullable — unwrap to its value.
