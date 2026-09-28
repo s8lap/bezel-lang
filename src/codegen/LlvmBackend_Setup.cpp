@@ -16982,14 +16982,33 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // and every subsequent use (`s.Length`) then GEPs a string struct off an
     // `i32` base — malformed IR, verifier abort, on a block that never runs.
     // Detect exactly this shape — the initializer is a bare identifier whose
-    // OWN declared type (not narrowed) is a bare type parameter (Named, no
-    // declaration, no generic args) — and degrade `v` to the same
-    // #2434/#490 "doesn't have to be correct, just IR-verifiable" zero-init
-    // answer already given every other erased-generic mismatch in this
-    // function. Scoped to the exact mismatch shape rather than a blanket
-    // `genericSubstSemaTy_.empty()` check so a genuine (non-generic) type
-    // mismatch elsewhere still surfaces as-is rather than being silently
-    // absorbed.
+    // OWN declared type (not narrowed) is a bare type parameter — and degrade
+    // `v` to the same #2434/#490 "doesn't have to be correct, just
+    // IR-verifiable" zero-init answer already given every other erased-generic
+    // mismatch in this function. Scoped to the exact mismatch shape rather
+    // than a blanket `genericSubstSemaTy_.empty()` check so a genuine
+    // (non-generic) type mismatch elsewhere still surfaces as-is rather than
+    // being silently absorbed.
+    //
+    // fix-forward #4812 (§12.7, v0.307): MUST use `isBareTypeParamRef`, not a
+    // hand-rolled "Named, no declaration, no generic args" shape test. Per
+    // #3122's own comment (ExprTypecheck.cpp, narrowFromTypeTest), that bare
+    // shape is ALSO exactly how a value-builtin TYPE ANNOTATION resolves
+    // (Guid/DateTime/TimeSpan/DateOnly/TimeOnly/ExceptionInfo/JsonOptions/
+    // ReadOnlyStringSpan/…: `isBuiltinTypeRefName` is the only thing that
+    // tells the two apart). The hand-rolled test above lacked that exclusion,
+    // so `var back: Guid? := g;` (`g`'s OWN declared type is the bare-Named
+    // `Guid` shape, no declaration, no generic args) matched it too: `v` (the
+    // legitimate non-nullable `Guid` value awaiting the ordinary nullable-wrap
+    // below) was discarded and degraded to a zero `Guid?`, so every nullable
+    // value-builtin/value-struct-builtin identifier-initializer silently lost
+    // its value — MEASURED regression across 16 tests (nullable_value_
+    // builtin_1954, nullable_value_builtin_element_4585,
+    // nullable_value_struct_builtin_2763, elem_stride_4593's
+    // linkedlist_nullable_guid_membership). `isBareTypeParamRef` already
+    // carries the needed `!isBuiltinTypeRefName(headName())` exclusion (see
+    // its own comment), so it accepts a genuine unsubstituted type parameter
+    // and rejects every value-builtin annotation.
     if (v && declaredTy && v->getType() != declaredTy) {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(init)) {
             if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
@@ -17002,10 +17021,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     if (!symDeclTy && ps->declType)
                         symDeclTy = ctx_.resolvedType(*ps->declType);
                 }
-                if (symDeclTy &&
-                    symDeclTy->kind == sema::TypeRef::Kind::Named &&
-                    !symDeclTy->declaration &&
-                    symDeclTy->genericArgs.empty()) {
+                if (isBareTypeParamRef(symDeclTy)) {
                     v = nullptr;
                 }
             }
