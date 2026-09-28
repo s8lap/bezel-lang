@@ -1620,14 +1620,15 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Pick(a: Res, b: Res): owned Res => b;` (a borrowed parameter
     // returned through an `owned` return type, double-free). // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(exprBody);
-    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987): the `=>`
-    // expression-body sibling of the handleReturn driver above —
+    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987, #5071): the
+    // `=>` expression-body sibling of the handleReturn driver above —
     // `=> (if c then move y else g);` reaches the return site with the same
     // mixed Owned/Borrowed arm set the block-body `return <same>;` form does,
     // so the K7.3 rejection the `=>` body otherwise skipped (and which the
     // local-decl-INITIALIZER driver does not see for the body itself) fires
     // here too. A no-op outside a ConditionalExpr/CaseExpr body and any arm
-    // set that does not mix Owned with Borrowed-class-typed.
+    // set that does not mix Owned with Borrowed-class-typed. Also handles
+    // `=> (_w ?? new W()).Name()` — the MemberAccessExpr peel finds the `??`.
     // // per §28.3, K7.3, v0.307
     checkArmMeetMixed(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
@@ -5734,16 +5735,59 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
     std::vector<const ast::Expr*> arms;
     // fix #4964: the built-in `??` is the same K7 meet (§28.3 `a ?? b` row).
     // Peel `!` — `(a ?? b)!` has the meet's classification (§17.8).
+    // fix #5071: also peel MemberAccessExpr (e.g. `(_w ?? new W()).Name()`)
+    // and CallExpr (e.g. `(_w ?? new W()).Name()` where the body is a call).
     {
         const ast::Expr* core = &e;
-        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
-            if (!pb->operand) break;
-            core = pb->operand.get();
+        // fix #5071: first check if the top-level expr is a `??` — if so,
+        // checkCoalesceMeetMixed is called by the BinaryExpr arm in checkRead
+        // (or will be reached via checkArmMeetMixed from elsewhere).
+        // For wrapped forms like `(_w ?? new W()).Name()`, peel the wrappers.
+        while (true) {
+            // Check for `??` before descending into the left arm.
+            // For `q?.CauseChain ?? rhs`, the BinaryExpr IS the `??`.
+            if (auto* be = dynamic_cast<const ast::BinaryExpr*>(core)) {
+                if (be->op == "??") {
+                    checkCoalesceMeetMixed(*be);
+                    // Don't return here — continue peeling in case the left arm
+                    // is itself a wrapped form that needs checking.
+                }
+                // Descend into the left arm to check for nested `??`.
+                if (be->left) {
+                    core = be->left.get();
+                    continue;
+                }
+                break;
+            }
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+                if (!pb->operand) break;
+                core = pb->operand.get();
+            } else if (auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(core)) {
+                if (!ma->target) break;
+                core = ma->target.get();
+            } else if (auto* call =
+                           dynamic_cast<const ast::CallExpr*>(core)) {
+                // Peel method call to find callee (MemberAccessExpr target)
+                if (!call->callee) break;
+                core = call->callee.get();
+            } else if (auto* ncm =
+                           dynamic_cast<const ast::NullCondMemberExpr*>(core)) {
+                // Peel null-conditional member access (q?.CauseChain)
+                if (!ncm->target) break;
+                core = ncm->target.get();
+            } else {
+                break;
+            }
         }
-        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(core);
-            be && be->op == "??") {
-            checkCoalesceMeetMixed(*be);
-            return;
+        // Also recurse into CaseExpr scrutinee and arms
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(core)) {
+            if (ce->scrutinee) checkArmMeetMixed(*ce->scrutinee);
+            for (const auto& arm : ce->arms) {
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                    arm.exprBody)
+                    checkArmMeetMixed(*arm.exprBody);
+            }
         }
     }
     if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
@@ -5824,6 +5868,28 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
             ownedArm = true;
         } else if (s == OwnershipState::Borrowed &&
                    isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+            borrowArm = true;
+            if (!borrowAt) borrowAt = arm;
+        }
+        // fix #5071 (§28.3 K7.3, K3.13, v0.307): the original check only
+        // flagged a bare IdentifierExpr as a borrow arm, but K3.13 says any
+        // unmarked read is a borrow arm. A MemberAccessExpr (field read,
+        // property read, built-in property read) with producerState==Borrowed
+        // is equally a borrow arm. Without this, `_w ?? new W()` and
+        // `P ?? new W()` compiled clean and leaked the fresh right arm.
+        if (s == OwnershipState::Borrowed &&
+            dynamic_cast<const ast::MemberAccessExpr*>(arm)) {
+            borrowArm = true;
+            if (!borrowAt) borrowAt = arm;
+        }
+        // fix #5071: a NullCondMemberExpr (q?.CauseChain) on a class/interface
+        // result type is a borrow arm regardless of producerState — the null
+        // short-circuit means a non-null result is a borrow from the receiver.
+        // If CauseChain returns ExceptionInfo (a record, not a class), this
+        // does NOT fire (isClassOrInterfaceResult=false), which is correct —
+        // records have no ownership semantics.
+        if (dynamic_cast<const ast::NullCondMemberExpr*>(arm) &&
+            isClassOrInterfaceResult(ctx_.exprType(*arm))) {
             borrowArm = true;
             if (!borrowAt) borrowAt = arm;
         }

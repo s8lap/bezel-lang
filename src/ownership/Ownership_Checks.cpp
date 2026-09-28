@@ -3021,14 +3021,37 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        if (ma->target) checkRead(*ma->target, /*selfTarget=*/false);
+        // fix #5071 (§28.3 K7.3, v0.307): check for a `??` meet inside the
+        // member-access chain. For `(_w ?? new W()).Name()` the outer expr is
+        // MemberAccessExpr — its arm recurses into the target but the BinaryExpr
+        // `??` inside is never reached by checkRead's own BinaryExpr arm (it
+        // returns early after recursing). Peel the MemberAccessExpr chain to find
+        // any `??` at the base, and call checkArmMeetMixed (which has the peel
+        // loop to handle nested calls/properties).
+        if (ma->target) {
+            const ast::Expr* base = ma->target.get();
+            while (auto* innerMa =
+                       dynamic_cast<const ast::MemberAccessExpr*>(base))
+                base = innerMa->target.get();
+            if (auto* be = dynamic_cast<const ast::BinaryExpr*>(base))
+                if (be->op == "??") {
+                    checkCoalesceMeetMixed(*be);
+                    checkArmMeetMixed(*be);
+                }
+            checkRead(*ma->target, /*selfTarget=*/false);
+        }
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         // fix #4964 (§28.3 `a ?? b` row, K7.3, v0.307): a mixed owned/borrowed
         // `??` is rejected in EVERY position, not only at a binding or a
         // return — the meet has no coherent owner wherever it is formed.
-        if (be->op == "??") checkCoalesceMeetMixed(*be);
+        if (be->op == "??") {
+            checkCoalesceMeetMixed(*be);
+        }
+        // fix #5071: also check for mixed meets inside expression bodies
+        // (the peel loop handles MemberAccessExpr/CallExpr chains).
+        if (be->op == "??") checkArmMeetMixed(*be);
         if (be->left) checkRead(*be->left, false);
         if (be->right) checkRead(*be->right, false);
         return;
