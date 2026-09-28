@@ -46,6 +46,7 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotOut;
 
 namespace {
@@ -67,6 +68,22 @@ std::string msgOnlyProg(const std::string& main) {
            main +
            "  return 0; "
            "end Main; end C;";
+}
+
+// fix #5112 (§28.3 K7.3, v0.307): a `q?.CauseChain ?? new Array<ExceptionInfo>()`
+// pair is a mixed borrow/owned meet. Pre-fix the `?.` form had no exprType for
+// §31.4 surface members so the meet check never fired; post-fix it fires and
+// the program is REJECTED. This row previously asserted ACCEPT with "n=0"; it
+// now asserts the specific K7.3 diagnostic.
+const char* kMeetNeedle =
+    "the operands of this `??` mix an owned value with a borrowed arm";
+
+bool hasMeetError(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(kMeetNeedle) != std::string::npos)
+            return true;
+    return false;
 }
 
 }  // namespace
@@ -110,10 +127,11 @@ BEZEL_TEST(codegen_nullable_user_exception_message_2990,
 
 BEZEL_TEST(codegen_nullable_user_exception_message_2990,
            causechain_on_nullable_user_subclass_spec_31_4) {
-    BEZEL_EXPECT_TRUE(prints(
-        msgOnlyProg(
-            "  Console.WriteLine(\"n=\" + (q?.CauseChain ?? new Array<ExceptionInfo>()).Count.ToString()); "),
-        "n=0"));
+    // fix #5112 (§28.3 K7.3, v0.307): mixed meet — REJECT.
+    bezel::test::JitResult r = runAot(msgOnlyProg(
+        "  Console.WriteLine(\"n=\" + (q?.CauseChain ?? new Array<ExceptionInfo>()).Count.ToString()); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasMeetError(r));
 }
 
 BEZEL_TEST(codegen_nullable_user_exception_message_2990,

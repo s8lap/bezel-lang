@@ -27669,6 +27669,45 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     TypeSymbol* targetType = memberTargetType(nm.target.get());
     Symbol* member = targetType ? lookupMember(targetType, nm.member) : nullptr;
     const TypeRef* recvTyForDiag = nm.target ? ctx_.exprType(*nm.target) : nullptr;
+    // fix #5112 (§31.4, v0.307): the §31.4 builtin exception surface members
+    // (Message / StackTrace / CauseChain / ParamName) are typed specially in the
+    // `.` form through the `isBuiltinExInheritedMember` block in
+    // resolveMemberAccess. The `?.` form was missing this: it fell through to
+    // `storageComponentType` which returns the declared PropertyDecl type (for
+    // CauseChain) or `ctx_.importedMemberType` (for Message/StackTrace/ParamName
+    // on imported exceptions). Neither gives the correct nullable `?.` result
+    // type. Type them here explicitly, mirroring the `.` form's
+    // `isBuiltinExInheritedMember` block. Use targetType (not recvTyForDiag)
+    // because recvTyForDiag may be nullable while targetType is the unwrapped
+    // class.
+    if (targetType) {
+        switch (builtinExceptionSurfaceMember(targetType, nm.member)) {
+            case BuiltinExcMember::Message:
+            case BuiltinExcMember::StackTrace:
+                // §31.4: both `string`. Nullable per §7.5 (`?.`).
+                ctx_.setExprType(
+                    &nm, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                return;
+            case BuiltinExcMember::ParamName:
+                // §31.4 `ParamName: string?` — already nullable.
+                ctx_.setExprType(
+                    &nm, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                return;
+            case BuiltinExcMember::CauseChain:
+                // §31.4 `CauseChain: Array<ExceptionInfo>`.
+                // Nullable per §7.5 (`?.`).
+                {
+                    TypeRef* arr = excCauseChainTypeRef();
+                    arr->nullable = true;
+                    ctx_.setExprType(&nm, arr);
+                }
+                return;
+            default:
+                break;
+        }
+    }
     // §7.5 / §26.5 / #458: for a NULLABLE VALUE type receiver (e.g. `int?`,
     // `bool?`, `enum?`, `record?`) memberTargetType returns null (because the
     // type is Primitive or Named-record, not a class TypeSymbol). Also fall

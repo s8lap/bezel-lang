@@ -4209,8 +4209,25 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
 // isClassOrInterfaceRef (LlvmBackend_Setup.cpp) so the sema auto-drop gate and
 // the codegen reclaim gate agree on exactly the same result shape.
 static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named)
         return false;
+    // fix #5112 (§28.3 K7.3, v0.307): Array<T> is a declaration-less
+    // heap collection with disposal obligation. Without this arm the
+    // mixed-meet check on a borrow `q?.CauseChain` (Array<ExceptionInfo>?)
+    // ?? new Array<ExceptionInfo>() never fires, because the left arm's
+    // class-like shape is invisible to the check. Keep this narrowly
+    // Array<T>-only: the lazy-query heap-pointer-reference builtins
+    // (IEnumerable, IGrouping, IOrderedEnumerable) are NOT class-like —
+    // #4178 pins that a static helper returning IOrderedEnumerable<T>
+    // is spec-legal — and including them would break that pattern.
+    if (!rt->declaration) {
+        if (rt->astNode && rt->astNode->name &&
+            rt->astNode->name->parts.size() == 1) {
+            if (rt->headName() == "Array")
+                return true;
+        }
+        return false;
+    }
     // A value-builtin (DateTime/Guid/TimeSpan/CancellationToken) carries
     // kind==Class but has no disposal obligation — exclude it exactly as the
     // sibling `new T` / `move` producer paths do (#1388 review consistency).

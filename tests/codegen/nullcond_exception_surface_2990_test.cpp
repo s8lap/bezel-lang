@@ -59,6 +59,7 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotOut;
 
 namespace {
@@ -84,6 +85,22 @@ std::string chainProg(const std::string& members, const std::string& main) {
            main +
            "  return 0; "
            "end Main; end C;";
+}
+
+// fix #5112 (§28.3 K7.3, v0.307): a `q?.CauseChain ?? new Array<ExceptionInfo>()`
+// pair is a mixed borrow/owned meet. Pre-fix the `?.` form had no exprType for
+// §31.4 surface members so the meet check never fired; post-fix it fires and
+// the program is REJECTED. These two rows previously asserted ACCEPT with the
+// expected output bytes; they now assert the specific K7.3 diagnostic.
+const char* kMeetNeedle =
+    "the operands of this `??` mix an owned value with a borrowed arm";
+
+bool hasMeetError(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(kMeetNeedle) != std::string::npos)
+            return true;
+    return false;
 }
 
 }  // namespace
@@ -131,11 +148,13 @@ BEZEL_TEST(codegen_nullcond_exception_surface_2990,
 
 BEZEL_TEST(codegen_nullcond_exception_surface_2990,
            causechain_on_nullable_subclass_receiver_spec_31_4) {
-    BEZEL_EXPECT_TRUE(prints(
-        chainProg("",
-                  "  Console.WriteLine(\"n=\" + (q?.CauseChain ?? new Array<ExceptionInfo>()).Count.ToString()); "
-                  "  Console.WriteLine(\"m=\" + (q?.CauseChain ?? new Array<ExceptionInfo>())[0].Message); "),
-        "n=1\nm=root"));
+    // fix #5112 (§28.3 K7.3, v0.307): mixed meet — REJECT.
+    bezel::test::JitResult r = runAot(chainProg(
+        "",
+        "  Console.WriteLine(\"n=\" + (q?.CauseChain ?? new Array<ExceptionInfo>()).Count.ToString()); "
+        "  Console.WriteLine(\"m=\" + (q?.CauseChain ?? new Array<ExceptionInfo>())[0].Message); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasMeetError(r));
 }
 
 // §31.4 "empty when no cause" through `?.`: a subclass built through the
@@ -143,7 +162,8 @@ BEZEL_TEST(codegen_nullcond_exception_surface_2990,
 // reads EMPTY (Count = 0), not null and not faulting.
 BEZEL_TEST(codegen_nullcond_exception_surface_2990,
            causechain_empty_through_nullable_spec_31_4) {
-    BEZEL_EXPECT_TRUE(prints(
+    // fix #5112 (§28.3 K7.3, v0.307): mixed meet — REJECT.
+    bezel::test::JitResult r = runAot(
         "module M2990b; "
         "class Plain2990: Exception "
         "  public constructor() base(\"mm\"); end constructor; "
@@ -153,8 +173,9 @@ BEZEL_TEST(codegen_nullcond_exception_surface_2990,
         "  var q: Plain2990? := s; "
         "  Console.WriteLine(\"n=\" + (q?.CauseChain ?? new Array<ExceptionInfo>()).Count.ToString()); "
         "  return 0; "
-        "end Main; end C;",
-        "n=0"));
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasMeetError(r));
 }
 
 // §31.4 `ParamName: string?` on an ArgumentException subclass through `?.`.
