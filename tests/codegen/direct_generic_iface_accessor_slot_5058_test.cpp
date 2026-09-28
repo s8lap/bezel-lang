@@ -237,6 +237,75 @@ end Program;
                "idx\n");
 }
 
+// ─── Direct setter through I<string>, loop-amplified (T1) ─────────────────
+// #4947's fix enables `s.Q := v` directly through the interface without a
+// generic helper. The erased setter stores an i32; pre-fix: IR-verifier abort
+// (call site types the value with the erased T). Post-fix: correct string-ARC
+// store, verified by loop amplification + ASan.
+BEZEL_TEST(direct_generic_iface_accessor_slot_5058, setter_string_direct_t1) {
+    expectBoth(R"BZL(
+module M;
+public interface I<T>
+  property Q: T;
+end I;
+public class B<T>: I<T>
+  public constructor(v: T) Q := v; end constructor;
+  public property Q: T;
+end B;
+public class Program
+  public static method Main(): int
+    using var e := new B<string>("e");
+    var s: I<string> := e;
+    var ok := 0;
+    for var k in 0..<50 do
+      if k mod 2 = 0 then
+        s.Q := "w";
+      else
+        s.Q := "v";
+      end if;
+      if s.Q = e.Q then ok := ok + 1; end if;
+    end for;
+    Console.WriteLine(ok);
+    Console.WriteLine(e.Q);
+    Console.WriteLine(s.Q);
+    return 0;
+  end Main;
+end Program;
+)BZL",
+               "50\nv\nv\n");
+}
+
+// ─── Generic helper with differently-named type param, direct setter (T3) ─
+// Proves the fix is robust to type-param-name variation: a helper `Put<U>`
+// (not `Put<T>`) calling `x.Q := v` directly through `I<string>`. Pre-fix:
+// IR-verifier abort (same as T1). Post-fix: correct string-ARC store.
+BEZEL_TEST(direct_generic_iface_accessor_slot_5058, setter_string_direct_u_param_t3) {
+    expectBoth(R"BZL(
+module M;
+public interface I<T>
+  property Q: T;
+end I;
+public class B<T>: I<T>
+  public constructor(v: T) Q := v; end constructor;
+  public property Q: T;
+end B;
+public class Program
+  public static method Put<U>(x: I<U>, v: U)
+    x.Q := v;
+  end Put;
+  public static method Main(): int
+    using var e := new B<string>("e");
+    var s: I<string> := e;
+    Put<string>(s, "z");
+    Console.WriteLine(e.Q);
+    Console.WriteLine(s.Q);
+    return 0;
+  end Main;
+end Program;
+)BZL",
+               "z\nz\n");
+}
+
 // ─── int control ──────────────────────────────────────────────────────────
 // T = int: the erased template is signature-exact; getter and setter through
 // the interface were already right and must stay so.
