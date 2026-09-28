@@ -3597,16 +3597,29 @@ static bool collectRenderableConstraintTypes(
             // `metaTypeToSourceText` would render `Base?` — a syntax error in
             // constraint position. Decline rather than emit it.
             if (ct.nullable) return false;
-            // A generic constraint naming a constructed type (`where T:
-            // IComparable<U>`) needs its own argument list rendered and
-            // resolved; out of scope here — decline and keep pre-fix behaviour.
-            if (!ct.genericArgs.empty()) return false;
+            // fix #5040: a generic constraint naming a constructed type
+            // (`where T: IComparable<T>`, the common §14.2 form) is now
+            // RENDERED and left to the fresh context to resolve. The arg
+            // list is the class's own params (or other rendered params),
+            // which the fresh context's prelude-and-class-header together
+            // can resolve. Previously declined here, which left T
+            // unconstrained in the fresh context and rejected every body
+            // that called a constraint-provided member (CompareTo for
+            // IComparable, Equals for IEquatable, etc.) even though the
+            // constraint IS satisfiable at the import site. The typecheck
+            // still gates the body — a body that names a non-renderable
+            // generic arg (e.g. an unrendered sibling's own param) fails
+            // to resolve and the §14.1/#783 soundness gate declines as
+            // before.
             const std::string simple = metaNamedSimpleName(ct);
             if (simple == td.name) continue;  // self-reference: declared here
             bool isOwnParam = false;
             for (const MetaGenericParam& p : td.genericParams)
                 if (p.name == simple) { isOwnParam = true; break; }
             if (isOwnParam) continue;  // `where T: U` — bound by the header
+            // Try to find as a sibling of the exporting module (the path
+            // that requires the synthetic source to `import <moduleName>` to
+            // name it). If found, register the sibling for the import.
             sema::TypeSymbol* found = nullptr;
             if (const std::vector<sema::TypeSymbol*>* sibs =
                     mainCtx.importedTypesOf(moduleName)) {
@@ -3619,11 +3632,18 @@ static bool collectRenderableConstraintTypes(
                     }
                 }
             }
-            // Not an imported public sibling (a stdlib/builtin interface, an
-            // `internal` sibling that was never exported, a third module's
-            // type): it cannot be named in the synthetic source, so decline.
-            if (!found) return false;
-            outSiblings.push_back(found);
+            if (found) outSiblings.push_back(found);
+            // fix #5040: also allow STDLIB/BUILTIN interfaces (e.g.
+            // IComparable<T>) — the fresh context's prelude has these in
+            // scope, so the constraint can be rendered verbatim. Previously
+            // this function declined (returned false) for non-sibling
+            // constraint types, leaving a body that called a
+            // constraint-provided member unconstrained in the fresh
+            // context and rejected by the §14.1/#783 soundness gate, even
+            // though the constraint IS satisfiable at the import site. Now:
+            // render the constraint either way (sibling or builtin); the
+            // subsequent typecheck decides whether the fresh context can
+            // resolve it.
         }
     }
     return true;
