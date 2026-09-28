@@ -147,7 +147,68 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 isNullableValueTy(&concBuf)) {
                 effectiveLt = &concBuf;
             }
-            if (isNullableValueTy(effectiveLt)) {
+            // fix #5109 (§5.1 / §14.1, v0.307): the check above resolves the
+            // concrete substitution ONLY when `genericSubstSemaTy_` has a
+            // binding for T — true in a MONOMORPHIZED (specialized) generic
+            // body, but the UNSPECIALIZED TEMPLATE version of the same method
+            // (emitted and IR-VERIFIED alongside the specialization even when
+            // never called — every generic method/constructor keeps its
+            // erased-placeholder template) compiles this same `x ?? d` with NO
+            // active substitution: `nullableTypeParamConcrete` legitimately
+            // returns false there, `effectiveLt` stays the bare unresolved
+            // `T?`, `isNullableValueTy(effectiveLt)` is false, and execution
+            // fell to the "#1045 non-pointer, non-nullable-value LHS" arm below
+            // — WRONG for this shape, because a bare value-type generic
+            // parameter's nullable form `T?` still lowers to the tagged
+            // `{i8 hasValue; T}` struct even in the erased template (T erased
+            // to its i32 placeholder), so `l` IS the tagged struct, not a
+            // "can never be null" scalar. The #1045 arm then returned the RAW
+            // struct as the `??` result, and a caller expecting a scalar (e.g.
+            // `Console.WriteLine(x ?? d)`'s argument-to-string conversion, which
+            // has no arm for a bare-generic-typed struct value) passed the
+            // struct straight to `bz_string_to_utf8z` — a malformed call the IR
+            // verifier rejects for the TEMPLATE FUNCTION, failing the whole
+            // module's verification even though the template is never called by
+            // a program that only invokes the (correctly-lowered) specialization.
+            //
+            // Recognize the nullable-value carrier STRUCTURALLY instead of only
+            // via sema resolution: `nullablePrimHasValue`/`nullablePrimValue`
+            // are pure `extractvalue`s on field 0/1 and need no concrete sema
+            // type to be correct, so a 2-field `{i8, X}` struct whose first
+            // field is the hasValue tag type is unwrapped the same way whether
+            // or not `T` is concretely known.
+            //
+            // GUARDED to the RHS ALSO being an unresolved bare generic `T`
+            // (e.g. `d: T`, matching #5109's own shape): both operands then
+            // share the SAME erased placeholder type in the template (i32),
+            // so the unwrap-and-PHI below is type-safe there too. Measured
+            // (#5089 blast radius): dropping this guard broke
+            // `nullable_lift_generic_ctor_5089` — `x ?? -1.0` inside a
+            // `Box<T>` constructor has a CONCRETE-typed RHS (`double`, not
+            // `T`), so the template's erased `i32` payload and the literal
+            // `double` -1.0 built a genuinely mismatched PHI ("PHI node
+            // operands are not the same type as the result! %8 = phi i32
+            // [ %nv.val, ... ], [ -1.000000e+00, %coal.rhs ]") that the old
+            // "#1045 return l" fallback never reached (it never lowers the
+            // RHS). That template is still IR-verified though never called;
+            // the pre-existing fallback's raw-struct return already satisfies
+            // the verifier for a concrete-typed default, so this case keeps
+            // it.
+            bool structuralNullableCarrier = false;
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(l->getType())) {
+                structuralNullableCarrier =
+                    st->getNumElements() == 2 &&
+                    st->getElementType(0) == nullablePrimHasValTy();
+                if (structuralNullableCarrier) {
+                    const sema::TypeRef* rt =
+                        bin.right ? ctx_.exprType(*bin.right) : nullptr;
+                    bool rhsBareGenericT =
+                        rt && rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration;
+                    structuralNullableCarrier = rhsBareGenericT;
+                }
+            }
+            if (isNullableValueTy(effectiveLt) || structuralNullableCarrier) {
                 auto* entryBB = builder_.GetInsertBlock();
                 auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coal.rhs", currentFn_);
                 auto* endBB = llvm::BasicBlock::Create(llvm_, "coal.end", currentFn_);
