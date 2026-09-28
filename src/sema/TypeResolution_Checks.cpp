@@ -7349,21 +7349,94 @@ void Resolver::checkAbstractImplementations() {
                 // the unspecialized template's MethodSymbol; its bare type-
                 // parameter types read correctly only under that subst).
                 TypeSymbol* implClass = nullptr;
+                // fix #5097 (§11.2, v0.307, related #4836): a class may
+                // legitimately declare TWO same-name, same-arity overloads
+                // to witness TWO obligations from the same generic interface
+                // at different instantiations (`Equals(other: Point)` for
+                // `IEquatable<Point>` and `Equals(other: int)` for
+                // `IEquatable<int>`). The pre-existing walk below took the
+                // FIRST same-arity overload unconditionally, which is exactly
+                // right when there is only one candidate but silently picks
+                // the WRONG one of two when both exist — and after this fix
+                // resolves the interface's bare-`T` parameter type (see the
+                // `bareT`/`setResolvedType` fix in SemaContext.hpp), the
+                // subsequent §11.2 parameter-type check below would then
+                // reject the correct overload set as a false mismatch. Search
+                // every same-arity, same-name candidate on `c` for one whose
+                // parameter types actually match THIS obligation (under its
+                // substitution) before falling back to the first-found
+                // candidate, so the existing "first same-arity overload wins"
+                // behavior is preserved only when no candidate's types match
+                // — the shape #4836 is about — and a genuinely overloaded,
+                // correctly-typed pair is no longer confused for one another.
+                auto paramsMatchObligation = [&](MethodSymbol* candidate,
+                                                  TypeSymbol* declClass) -> bool {
+                    if (candidate->params.size() != im->params.size())
+                        return false;
+                    std::unordered_map<std::string_view, const TypeRef*>
+                        candSubst;
+                    auto it2 = classSubst.find(declClass);
+                    if (it2 != classSubst.end()) candSubst = it2->second;
+                    for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
+                        auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
+                        auto* cp = dynamic_cast<ParameterSymbol*>(
+                            candidate->params[pi]);
+                        if (!ip || !cp) return false;
+                        TypeRef* it = ip->declType ? resolvedOf(ip->declType)
+                                                    : ip->resolvedDeclType;
+                        TypeRef* ct = cp->declType ? resolvedOf(cp->declType)
+                                                    : cp->resolvedDeclType;
+                        if (!it || !ct) return false;
+                        if (it->kind == TypeRef::Kind::Error ||
+                            ct->kind == TypeRef::Kind::Error) return false;
+                        const TypeRef* itSub = substTypeRef(it, obl.subst);
+                        const TypeRef* ctSub = substTypeRef(ct, candSubst);
+                        bool match = typesMatch(itSub, ctSub);
+                        if (!match && itSub && ctSub &&
+                            !itSub->nullable && ctSub->nullable) {
+                            TypeRef stripped = *ctSub;
+                            stripped.nullable = false;
+                            match = typesMatch(itSub, &stripped);
+                        }
+                        if (!match) return false;
+                    }
+                    return true;
+                };
                 TypeSymbol* c = t;
                 while (c && !impl) {
+                    MethodSymbol* firstArityMatch = nullptr;
+                    TypeSymbol* firstArityMatchClass = nullptr;
                     for (Symbol* m : c->members) {
                         auto* ms = dynamic_cast<MethodSymbol*>(m);
                         if (!ms || ms->isOperator || hasMod(ms, "static") ||
                             ms->name != im->name || methodIsAbstract(ms))
                             continue;
                         if (ms->params.size() == im->params.size()) {
-                            impl = ms;
-                            implClass = c;
-                            break;
+                            if (!firstArityMatch) {
+                                firstArityMatch = ms;
+                                firstArityMatchClass = c;
+                            }
+                            // fix #5097: prefer a candidate whose parameter
+                            // types actually witness THIS obligation.
+                            if (paramsMatchObligation(ms, c)) {
+                                impl = ms;
+                                implClass = c;
+                                break;
+                            }
+                            continue;
                         }
                         if (!nameOnly) nameOnly = ms;
                     }
                     if (impl) break;
+                    if (firstArityMatch) {
+                        // No candidate's types matched — fall back to the
+                        // first same-arity one, exactly as before this fix,
+                        // so the existing §11.2 mismatch diagnostic still
+                        // fires for a genuinely wrong-typed sole witness.
+                        impl = firstArityMatch;
+                        implClass = firstArityMatchClass;
+                        break;
+                    }
                     TypeSymbol* nextClass = nullptr;
                     for (TypeSymbol* b : c->baseTypes) {
                         if (b && b->kind == ast::TypeDeclKind::Class) {

@@ -1847,6 +1847,32 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         for (std::size_t p = 0; p < spec.paramNames.size(); ++p) {
             ms->params.push_back(
                 buildBuiltinInterfaceParamSymbol(*this, rm.md->params[p]));
+            // fix #5097 (§11.2 / §12.5, v0.307): every synthesized builtin-
+            // interface parameter is the interface's own generic `T` (see the
+            // comment above `MethodSpec`), but unlike the return-type node
+            // below, the param-type node was never pre-resolved — only the
+            // return type went through `setResolvedType`. checkAbstractImplementations'
+            // §11.2 per-obligation parameter-type check reads
+            // `resolvedOf(ip->declType)`, got null for every builtin-interface
+            // obligation, and silently `continue`d — so a witness was matched
+            // by NAME + ARITY ONLY for IEquatable<T>/IComparable<T>/
+            // IEqualityComparer<T>: `Equals(other: Point)` was accepted as the
+            // witness for `IEquatable<int>.Equals(int)`, and codegen dispatched
+            // an `int` argument into a function expecting a `Point`. Resolve
+            // the bare `T` here exactly as `Resolver::resolveNamed` resolves an
+            // ordinary user-declared generic parameter reference (Named,
+            // `declaration == nullptr`, `astNode` set so `headName()` reads
+            // "T") so the substitution machinery in
+            // `checkAbstractImplementations::substTypeRef` (which keys off
+            // `!d->declaration && !d->headName().empty()`) treats it exactly
+            // like a user interface's bare `T` and substitutes it per
+            // obligation instead of comparing against an unresolved null.
+            TypeRef* bareT = makeTypeRef();
+            bareT->kind = TypeRef::Kind::Named;
+            bareT->declaration = nullptr;
+            bareT->astNode = rm.paramTypes[p];
+            bareT->nullable = rm.paramTypes[p]->nullable;
+            setResolvedType(rm.paramTypes[p], bareT);
         }
         ts->members.push_back(ms);
 
