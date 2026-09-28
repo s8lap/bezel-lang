@@ -8845,12 +8845,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
             return false;
         };
+        // fix #5117 (§14.2, v0.307): build `methodSubst` from the explicit
+        // method type arguments in the call expression, so that `formalFnParamType2`
+        // can substitute method generics (U) that appear inside a Named type's
+        // generic args (Array<U>). Without this, `Array<U>` recurses to U inside
+        // Array's genericArgs, finds the method's own generic name, and bails —
+        // even though the call's explicit type argument (<int>) already resolved U.
+        std::unordered_map<std::string_view, TypeRef*> methodSubst;
+        {
+            std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get()))
+                callTypeArgs = const_cast<std::vector<std::unique_ptr<ast::Type>>*>(&ma->typeArgs);
+            if (callTypeArgs && !callTypeArgs->empty()) {
+                if (calleeMd2) {
+                    // calleeMd2->genericParams is std::vector<GenericParam>
+                    for (std::size_t i = 0; i < calleeMd2->genericParams.size() && i < callTypeArgs->size(); ++i) {
+                        if (callTypeArgs->at(i).get()) {
+                            TypeRef* tr = ctx_.resolvedType(*(*callTypeArgs)[i]);
+                            if (tr) methodSubst[calleeMd2->genericParams[i].name] = tr;
+                        }
+                    }
+                } else if (calleeMs2) {
+                    // calleeMs2->genericParams is std::vector<Symbol*>
+                    for (std::size_t i = 0; i < calleeMs2->genericParams.size() && i < callTypeArgs->size(); ++i) {
+                        if (auto* gps = dynamic_cast<GenericParamSymbol*>(calleeMs2->genericParams[i])) {
+                            if (callTypeArgs->at(i).get()) {
+                                TypeRef* tr = ctx_.resolvedType(*(*callTypeArgs)[i]);
+                                if (tr) methodSubst[gps->name] = tr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         auto formalFnParamType2 =
             [&](std::size_t pos) -> TypeRef* {
             if (!calleeMd2 && !calleeMs2) return nullptr;
             TypeRef* pt = formalOutParamType2(pos);
             if (!calleeOwnGenericNames.empty() && pt &&
                 pt->kind == TypeRef::Kind::Function) {
+                // fix #5117: apply methodSubst BEFORE mentionsOwnGeneric check.
+                // This substitutes U → int in Array<U>, so Array<int> no longer
+                // contains the method's own generic U, and we don't bail.
+                if (!methodSubst.empty())
+                    pt = substituteReturnType(pt, methodSubst);
                 for (const auto& fp : pt->funcParams)
                     if (mentionsOwnGeneric(fp.type)) return nullptr;
             }
