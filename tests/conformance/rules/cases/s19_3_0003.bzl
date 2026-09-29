@@ -4,7 +4,7 @@
 //! title: a relational pattern over a nullable scrutinee is rejected
 //! rule: A nullable scrutinee — value or reference — is a compile error at
 //!   a relational pattern: ordering admits no absent participant, and
-//!   pattern position performs no narrowing.
+//!   pattern position performs no narrowing of its own.
 //! cites: 19.3
 //! expect: reject
 //! diagnostic: nullable
