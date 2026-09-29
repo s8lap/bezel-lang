@@ -240,8 +240,13 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
 // §28.6 / §23: the spec-sanctioned transfer — a take-method that moves the field
 // out through `move this.f` (which the compiler nulls) and returns it — compiles
 // and runs ASan-clean, disposing the Cell exactly once (Cell.live == 0). Proves
-// the #1999 fix does not over-reject the sound path (the `move box.Take()!`
+// the #1999 fix does not over-reject the sound path (the `box.Take()!`
 // producer argument is a call, not a bare `recv.f` place, so it is not flagged).
+// Spelled WITHOUT `move` (narrow #5158, Appendix A.7 / §28.8.1, v0.310): a call
+// result is already an Owned value and is none of A.7's three admitted MoveExpr
+// operand shapes (an owned field, an owning-collection slot, or a bare local/
+// owned-parameter identifier), so `move` here is not itself an admitted form —
+// the take-method's return is passed on unmarked.
 BEZEL_TEST(move_field_nonthis_owned_sink_1999,
            transfer_method_pattern_disposes_once_spec_28_6) {
     std::string src =
@@ -260,7 +265,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
-        "    C.Sink(move box.Take()!); "
+        "    C.Sink(box.Take()!); "
         "  end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";

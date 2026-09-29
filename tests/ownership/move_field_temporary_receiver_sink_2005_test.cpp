@@ -235,6 +235,11 @@ BEZEL_TEST(move_field_temporary_receiver_sink_2005,
 // place, take the field out through a `move this.f` take-method, pass the
 // result. Compiles and runs ASan-clean, disposing the Cell exactly once
 // (Cell.live == 0). Proves the #2005 fix does not over-reject the sound path.
+// Spelled WITHOUT `move` at the sink argument (narrow #5158, Appendix A.7 /
+// §28.8.1, v0.310): `box.Take()` is a call result, already Owned, and is none
+// of A.7's three admitted MoveExpr operand shapes (an owned field, an owning-
+// collection slot, or a bare local/owned-parameter identifier) — so it is
+// passed on unmarked.
 BEZEL_TEST(move_field_temporary_receiver_sink_2005,
            take_method_pattern_disposes_once_spec_28_6) {
     std::string src =
@@ -254,7 +259,7 @@ BEZEL_TEST(move_field_temporary_receiver_sink_2005,
         "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
         "  public static method Use() "
         "    using var box := Box.GetBox(); "
-        "    C.Sink(move box.Take()!); "
+        "    C.Sink(box.Take()!); "
         "  end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";
