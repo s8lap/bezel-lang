@@ -8342,6 +8342,13 @@ private:
         // `resolvedDeclType`); fall back to that side. Either path produces
         // the same spelling for a type written identically in source, so a
         // local override and an imported base method land on the same key.
+        //
+        // SEAM-DEBT: #5202 this class3 read already falls back correctly on
+        // the imported side (the `else` arm below walks ms->params,
+        // populated on both local and imported paths) rather than answering
+        // wrong, but a pure symbol-side read (no AST cast) needs a new
+        // parameter-type-spelling channel on ParameterSymbol — out of scope
+        // for this fix per the audit's "land a family whole" rule.
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
             for (const auto& p : md->params) {
                 key += "#";
