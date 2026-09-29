@@ -23198,9 +23198,11 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
         if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(arm)) {
             if (!scrutRootName.empty() && mt->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("owned", mt->name, mt->span.begin);
-            } else if (armNode &&
-                       isOwningMatchTransferBinding(*armNode, head,
-                                                    ctx_.exprSymbol(*mt))) {
+            } else if ((armNode &&
+                        isOwningMatchTransferBinding(*armNode, head,
+                                                     ctx_.exprSymbol(*mt))) ||
+                       isOwningMatchTransferredArmBinding(
+                           ctx_.exprSymbol(*mt))) {
                 // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmTransfer(*mt);
@@ -23211,9 +23213,11 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
                 dynamic_cast<const ast::IdentifierExpr*>(mv->operand.get());
             if (!scrutRootName.empty() && id->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("move", id->name, mv->span.begin);
-            } else if (armNode &&
-                       isOwningMatchTransferBinding(*armNode, head,
-                                                    ctx_.exprSymbol(*id))) {
+            } else if ((armNode &&
+                        isOwningMatchTransferBinding(*armNode, head,
+                                                     ctx_.exprSymbol(*id))) ||
+                       isOwningMatchTransferredArmBinding(
+                           ctx_.exprSymbol(*id))) {
                 // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmMoveTransfer(*mv);
