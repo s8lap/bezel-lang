@@ -6,6 +6,7 @@
 | **Tracking issue** | — (assign at first design pass) |
 | **Target** | stdlib §6.9 (`Channel<T>`); spec §30.15; possibly §30.8 (cancellation composition). |
 | **Written against** | spec v0.210 |
+| **Currency note** | Re-verified clean at v0.306 (2026-09-17 proposals currency sweep): §30.15's give-back sentence (*"An item being handed to the waiter at the instant of disposal is returned to the channel's head (an internal give-back; items remain exactly-once)"*), stdlib §6.9's recorded `TrySend` deferral reason, and §22.3's unconditional `owned`-argument consume all still read as cited. No tier-1 respell, no tier-2 flag. Written-against pin unchanged. |
 | **Origin** | The 2026-07-21 language-improvement sweep found spec §30.15 and stdlib §6.9 deferring four features "to the give-back-protocol RFC" — a design artifact that had never been written. This stub makes the referenced design real, consolidating the recorded fragments so the four features can graduate on **one** exactly-once-on-the-failure-edge argument instead of four parallel derivations. |
 
 ## 1. The one problem

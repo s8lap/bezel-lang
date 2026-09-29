@@ -4,6 +4,7 @@
 **Tracking issue:** [#2041](https://github.com/s8lap/bezel-lang/issues/2041)
 **Target:** tooling + convention (phase 1: zero normative change — rides spec §34's preserved-verbatim rule; phase 2, optional: a one-sentence addition to §34's recognized-tag list). Phase 1 spans implementation stages S0–S2 (§6); phase 2 is S3.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
+**Currency note:** Refreshed 2026-09-17 to v0.306: §2.2's id-scheme row generalized from `guide1` / `guide2` ("the two guides") to `guide1` … `guide7` — the guide set is seven documents (`Bezel_Guide_01_*`–`Bezel_Guide_07_*`), and the `guide3` correction was already recorded in #2041's ruling but never applied to the table. Otherwise re-verified clean at v0.306: §34's preserved-verbatim rule, its recognized-tag list and rationale §18's attribute deferral all still read as cited. No tier-2 flag. Written-against pin unchanged.
 
 ## 0. Summary
 
@@ -51,7 +52,7 @@ One grammar for every citable target, `scheme ":" body`:
 | `spec` | section number, or `#`-anchor | `Bezel_Language_Spec.md` headings/anchors | `spec:28.8.1`, `spec:#sec-consume-site-freeze` |
 | `stdlib` | section number or anchor | `Bezel_Standard_Library.md` | `stdlib:4.8` |
 | `rationale` | section number or anchor | `Bezel_Design_Rationale.md` | `rationale:5.23` |
-| `guide1` / `guide2` | section number | the two guides | `guide2:5` |
+| `guide1` … `guide7` | section number | the seven guides (`Bezel_Guide_01_*`–`Bezel_Guide_07_*`) | `guide2:5` |
 | `proposal` | proposal number | `docs/proposals/NNNN-*.md` | `proposal:0043` |
 | `issue` | issue number | the GitHub tracker | `issue:2030` |
 | `contract` | member path `/` kind `[` 1-based index `]` | 0044's per-member contract records | `contract:Banking.Account.Withdraw/ensures[1]` |

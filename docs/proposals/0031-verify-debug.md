@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1456](https://github.com/s8lap/bezel-lang/issues/1456) |
 | **Target module(s)** | `System.Diagnostics` (requires `import System.Diagnostics`); additions to `Debug` (existing §8.2) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-09-17 to v0.306: §5.1's transcribed `Debug` class conformed to the v0.290 overload-pair rule — the `Assert(condition)` / `Assert(condition, message)` pair is one `:=`-defaulted signature (stdlib §1, §8.2). §4's `throw`-bottom-type argument (§17.12), the A.6 `CatchArm` shape and `Exception.StackTrace` (§31.4) re-verified. ⚠ **Two tier-2 flags** recorded in `proposals-currency-2026-09-17.md` §3: (1) stdlib §8.2 now states that a failed `Debug.Assert` reports and **terminates the process** — *"`Assert` never throws"* — so §5.1's "`Debug.Assert(false, msg)` and `Debug.Fail(msg)` are equivalent semantically" and §5.2's "follows the same contract exactly" no longer hold of a `Fail` that raises a catchable `VerificationException`; (2) §5.1/§8's proposed `Fail(message)` / `Fail(message, detailMessage)` pair is the shape v0.290's rule collapses. Written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #23 (2×P1+P2) |
 
 ---
@@ -159,8 +159,7 @@ If Bezel eventually adds a `never` return type annotation (a spec change that wo
 The existing `Debug` class (stdlib §8.2):
 ```bezel
 public static class Debug
-  public static method Assert(condition: bool);
-  public static method Assert(condition: bool, message: string);
+  public static method Assert(condition: bool, message: string := "");
   public static method WriteLine(message: string);
 end Debug;
 ```

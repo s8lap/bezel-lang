@@ -7,6 +7,7 @@
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1444](https://github.com/s8lap/bezel-lang/issues/1444) |
 | **Gap-review item** | #26 (2026-07 ranking, wave D2) |
+| **Currency note** | Re-verified clean at v0.306 (2026-09-17 sweep): no tier-1 respell — stdlib §2.5 and §8.1 (anchors `sec-system-auto-imported`, `sec-stopwatch`) still resolve, and §1's enumeration of `Stopwatch`'s existing members matches the landed block exactly (`Restart()` never existed and was retired as a claim at v0.290; §8.1 now states `Reset()` stops and zeroes `Elapsed`, and `sw.Reset(); sw.Start();` — the §5 Pattern-2 spelling — is the documented restart form). One tier-2 flag recorded in `proposals-currency-2026-09-17.md` §3 (§4.1/§6 Q5's "`IComparable` gives the `<`/`>`/`<=`/`>=` operator group"). Written-against pin unchanged. |
 
 Gap-review verdict: "One decision: ns resolution vs TimeSpan's tick." This proposal settles that decision and adds the three related API surfaces.
 

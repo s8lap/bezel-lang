@@ -8,7 +8,7 @@
 | **Tracking issue** | [#1443](https://github.com/s8lap/bezel-lang/issues/1443) |
 | **Gap-review item** | #13 (2×P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Implementation substrate** | #1378 (timer-thread runtime) |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified clean at v0.306 (2026-09-17 sweep) — no tier-1 respell: `TaskScope` (stdlib §6.10), `ChannelSender<T>.Send` (§6.9), `TimeSpan.From*` (§2.5), `CancellationToken.None` (§6.1) and A.7's `LambdaBody ::= "do" Statement* "end"` all still read as cited. **Pinned-claim records:** §3's "if §6.11 is taken" conditional now applies — §6.11 is `Locked<T>`/`RwLocked<T>` since v0.186; and §4's note that bounding-object self-capture inside a `scoped` `Spawn` body is "in flight" is landed — spec §28.14 states it normatively with `scope.Spawn(lambda() => Work(scope.Token))` as its own example. Written-against pin unchanged. |
 
 ---
 

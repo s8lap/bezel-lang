@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1455](https://github.com/s8lap/bezel-lang/issues/1455) |
 | **Target module(s)** | `System.Text` (auto-imported, §3 of stdlib); adds two methods to `String` (§9.6) and a new `NormalizationForm` enum |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified clean at v0.306 (2026-09-17 sweep) — §19.6's enum-exhaustiveness argument, `NotImplementedException` (§31.4), the ordinal-equality contract (§9.6/§4.6) and the `:=`-defaulted `form` parameters (already the v0.290 one-signature shape) all still hold. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #31 (P2) |
 
 ---

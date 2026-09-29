@@ -5,6 +5,7 @@
 | **Status** | under-review — draft |
 | **Target module** | `System.IO` (stdlib §7 — new §7.3a `TempFile`; §7.4 `Path` and `Directory` extensions) |
 | **Written against** | spec/stdlib **v0.177** |
+| **Currency note** | Refreshed 2026-09-17 to v0.306: §1's transcribed `Directory` surface conformed to the v0.290 overload-pair rule (stdlib §1; the `Delete(path)` / `Delete(path, recursive)` pair is one `:=`-defaulted signature, stdlib §7.4). `TempFile.Take(owned TempFile)` re-verified as a declaration-position signature sketch (unchanged). No tier-2 flags. Written-against pin unchanged. |
 | **Tracking issue** | [#1446](https://github.com/s8lap/bezel-lang/issues/1446) |
 | **Gap-review item** | #25 (2026-07 ranking, wave D2); also closes the discharge-by-move ruling the review requested |
 
@@ -30,8 +31,7 @@ GetFullPath(path: string): string
 ```
 Exists(path: string): bool
 CreateDirectory(path: string)
-Delete(path: string)                  // IOException if non-empty
-Delete(path: string, recursive: bool)
+Delete(path: string, recursive: bool := false)   // IOException if non-empty and not recursive
 GetFiles(path: string): owned Array<string>
 GetDirectories(path: string): owned Array<string>
 ```
