@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.309 — September 2026**
+**Companion to the Bezel Language Specification, v0.310 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1080,7 +1080,7 @@ Usage notes:
 
 *(`ContractViolationException` — a `requires`/`ensures`/`invariant` clause evaluated `false`; language spec [§22.16](Bezel_Language_Spec.md#sec-contract-clauses), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types).)*
 
-The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)). Their **constructor surface** is the language spec's rule: a type declared here with no constructor shown carries `Exception`'s `()`, `(message)`, and `(message, cause)`; one that shows constructors carries exactly those.
+The built-in exception hierarchy — `Exception` and the types available without `import`, whose module is `System` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)). Their **constructor surface** is the language spec's rule: a type declared here with no constructor shown carries `Exception`'s `()`, `(message)`, and `(message, cause)`; one that shows constructors carries exactly those.
 
 The exception types that carry declared surface beyond `Exception`'s are enumerated by reference rather than counted: the built-ins `ArgumentException` (`ParamName` — language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)) and `TypeInitializationException` (below), and the producer-local `SerializationException` (`Offset`/`Line`/`Column` — [§2.15](#sec-concrete-serialization-formats)) and `DomainFaultedException` (`FaultStackTrace` — [§6.8](#sec-domain)). Of these, `TypeInitializationException` is recorded here for completeness:
 
@@ -5235,7 +5235,7 @@ end Decimal;
 
 **Rendering and range.** The no-format `ToString()` — the rendering an interpolation hole with no specifier uses, and what the `G` specifier produces ([§2.18](#sec-iformattable)) — is the value's exact decimal form and nothing more: a `-` when the value is negative, the integer digits (a single `0` when the magnitude is below one), and, when the value has a fractional part, a `.` followed by the fractional digits. There is no exponent, no grouping separator, and no trailing-zero padding, because **scale is not part of a `decimal`'s value**: `1.50m` and `1.5m` are one value and both render `1.5`, `10m` renders `10`, and `0m` renders `0` — which is what makes `=` on `decimal` plain value equality (language spec [§4.3.1](Bezel_Language_Spec.md#sec-equality-semantics-for-floating-point-types)). `MaxValue` is `79228162514264337593543950335` and `MinValue` is `-79228162514264337593543950335` — the range language spec [§4.4](Bezel_Language_Spec.md#sec-decimal)'s 28–29 significant decimal digits describe; `Zero` is `0m` and `One` is `1m`.
 
-`Parse` accepts an optional leading sign (`+`/`-`) followed by decimal digits with at most one `.`; **surrounding whitespace is not accepted** and raises `FormatException` (the strict-fault model of `Encoding` ([§3.2](#sec-encoding)) applies: silent tolerance hides data problems; a caller that means to accept padded input trims explicitly). A value outside the representable range raises `OverflowException`. `TryParse` returns `false` in every case where `Parse` would raise.
+`Parse` accepts an optional leading sign (`+`/`-`) followed by decimal digits with at most one `.`; **surrounding whitespace is not accepted** and raises `FormatException` (the strict-fault model of `Encoding` ([§3.2](#sec-encoding)) applies: silent tolerance hides data problems; a caller that means to accept padded input trims explicitly). An in-range value with more digits than a `decimal` holds is rounded as language spec [§4.4](Bezel_Language_Spec.md#sec-decimal) states (`"0.12345678901234567890123456785"` parses to `0.1234567890123456789012345678`); a value outside the representable range raises `OverflowException`. `TryParse` returns `false` in every case where `Parse` would raise.
 
 <a id="sec-boolean"></a>
 ### 9.4 `Boolean`
