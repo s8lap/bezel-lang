@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.307 — September 2026**
+**Companion to the Bezel Language Specification, v0.308 — September 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -1076,7 +1076,7 @@ The "if you override one, override both" invariant is a source of bugs in other 
 
 `NaN.Equals(NaN)` is `true`. `(-0.0).Equals(0.0)` is `true`. The relational operators `<`, `<=`, `>`, `>=` keep IEEE semantics — any comparison involving `NaN` is false.
 
-The asymmetry is intentional. Equality is what hash tables, sets, and `case` patterns use; an irreflexive `=` makes `Set<double>` misbehave when NaN is inserted. Relational operators retain IEEE semantics so numeric algorithms work as published. Strict IEEE equality is available as `Double.IeeeEquals`; bit-pattern equality is `Double.BitwiseEquals`.
+The asymmetry is intentional. Equality is what hash tables, sets, and `case` patterns use; an irreflexive `=` makes `Set<double>` misbehave when NaN is inserted. Relational operators retain IEEE semantics so ordering-based numeric algorithms work as published. The one published equality idiom this does not cover, the self-inequality NaN test `x != x`, does not port (`x <> x` is `false` for every `x`) and is written `Double.IsNaN(x)`. A warning on a float-typed self-comparison is deferred (changelog v0.308): the expression is certainly constant, but whether its author meant the IEEE test is not, and at a generic `T` the float-typed predicate is known only after substitution. Strict IEEE equality is available as `Double.IeeeEquals`; bit-pattern equality is `Double.BitwiseEquals`.
 
 <a id="sec-equality-skip"></a>
 ### 7.5 `equality skip`: per-member exclusion from auto-equality (v0.244)

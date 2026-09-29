@@ -70,6 +70,9 @@ using var settled := postings.Where(                              // anything mo
 **A blank line between the logical steps of a body.** Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
 
 ```bezel
+module Ledger.Accounts.Tests;
+import System.Diagnostics;          // Debug.Assert (stdlib §8.2)
+
 public static method PostRejectsAnUnknownAccount()
   using var ledger := new Ledger(["ada"]);                     // arrange
 
