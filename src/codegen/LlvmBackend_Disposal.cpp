@@ -6113,6 +6113,33 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
     llvm::Function* childDisposer = nullptr;
     if (childTy) {
         childDisposer = elementPolicyFor(childTy, /*owning=*/false).disposerThunk;
+        // fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): try the
+        // RECURSIVE literal-tree node disposer (this same function, one
+        // level deeper) BEFORE the flat `dictValueBoxFreer(nodeTy)` shortcut
+        // below. #5106 added a `dictValueBoxFreer` arm that fires whenever a
+        // Dictionary/SortedDictionary's VALUE type is itself a borrowing
+        // builtin collection (Dictionary/Array/Stack/Queue/LinkedList/
+        // FrozenArray) and returns a thunk that frees ONLY that value's own
+        // shell with a NULL disposer for ITS values
+        // (borrowingCollectionDisposerThunk) — correct for a flat
+        // `Dictionary<K, Array<int>>` (the array's own elements are plain
+        // ints, needing no further disposal), but WRONG for a THREE-level
+        // literal tree (`Dictionary<K, Dictionary<K2, Array<int>>>`): when
+        // `childTy` is itself a Dictionary/SortedDictionary, its inner
+        // VALUES (the innermost arrays) need their own disposer, which only
+        // `collectionNodeFreeThunk`'s recursion computes. Before this
+        // reordering, `dictValueBoxFreer(nodeTy)` ran first, returned
+        // non-null for this shape post-#5106, and pre-empted the recursive
+        // call below entirely — every innermost `Array<int>` leaked (measured:
+        // 3 arrays / 360 bytes under ASan/LSan for the §15.4 `depth_three_
+        // nesting` repro). `collectionNodeFreeThunk` is safe to try first
+        // unconditionally: it returns null immediately for any non-collection
+        // `childTy` (a record/choice has `declaration` set; a primitive has
+        // no Named `astNode` head), so a record/choice/string V still falls
+        // through to `dictValueBoxFreer`/the string-release arm below exactly
+        // as before — this only changes the collection-typed-V case.
+        if (!childDisposer)
+            childDisposer = collectionNodeFreeThunk(childTy);
         if (!childDisposer && childIsDictValue)
             childDisposer = dictValueBoxFreer(nodeTy);
         // A string child gets the +1 release ONLY where the construction side
@@ -6171,10 +6198,9 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
                    head == "FrozenArray");
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
-        // The child is itself an aggregate node (`Dictionary<string,
-        // Dictionary<string,int>>`): recurse.
-        if (!childDisposer)
-            childDisposer = collectionNodeFreeThunk(childTy);
+        // fix #5106 follow-up: the aggregate-node recursion
+        // (`collectionNodeFreeThunk(childTy)`) now runs FIRST, above — see
+        // its comment. Nothing left to try here.
     }
 
     llvm::Argument* node = &*fn->args().begin();

@@ -10199,6 +10199,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // exactly one function — but the invariant the disposer comment states
     // must actually hold.
     literalTreeAggregateEligible_.clear();
+    dictBorrowingValueAliasUnsafe_.clear();  // fix #5106 follow-up: same guard
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -16355,13 +16356,31 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         // Array<int>> := ["primes": […]]` — the root free above
                         // reclaims only the bz_dict_t; install the interior-node
                         // free for a proven aggregate. buildCollectionTempDisposal
-                        // yields a null value disposer for a collection-typed V
-                        // (it is neither a record box, nor a string, nor an
-                        // owning-family element), so nothing is displaced.
-                        if (!dd.dictValueDisposer && !dd.dictStringKeys)
+                        // used to yield a null value disposer for a collection-
+                        // typed V, but fix #5106 (§15.4/§28.9/§28.11, v0.313)
+                        // added a `dictValueBoxFreer` arm that now returns a FLAT
+                        // thunk (a NULL inner disposer) whenever V is itself a
+                        // borrowing builtin collection — exactly the aggregate
+                        // shape this block exists for. fix #5106 follow-up
+                        // (v0.313): the `!dd.dictValueDisposer` gate below is
+                        // dropped so the proven-aggregate recursive disposer
+                        // always wins over that flat shortcut when one is
+                        // available (literalTreeNodeDisposerFor itself already
+                        // returns null unless `declNode` is a proven aggregate
+                        // root, so a non-aggregate collection-typed V is
+                        // unaffected — it keeps the flat #5106 thunk).
+                        if (!dd.dictStringKeys)
                             if (llvm::Function* nodeFree =
                                     literalTreeNodeDisposerFor(declNode, dictTy))
                                 dd.dictValueDisposer = nodeFree;
+                        // fix #5106 follow-up (§15.4/§28.9/§28.11, v0.313):
+                        // an interior alias of `declNode`'s value provably
+                        // ESCAPES — neither the aggregate disposer above nor
+                        // #5106's flat one may run (see
+                        // `dictBorrowingValueAliasUnsafe_`'s comment).
+                        if (dictBorrowingValueAliasUnsafe_.count(
+                                static_cast<const void*>(declNode)))
+                            dd.dictValueDisposer = nullptr;
                         disposeStack_.back().push_back(dd);
                     }
                     return;
@@ -19964,10 +19983,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     }
                 }
                 // fix #2660 / §15.4: a literal-tree root — ["primes": [...]] etc.
-                if (!d.dictValueDisposer && !d.dictStringKeys)
+                // fix #5106 follow-up (§15.4/§28.9/§28.11, v0.313): the
+                // `!d.dictValueDisposer` gate is dropped — see the sibling
+                // edit's comment (LlvmBackend_Setup.cpp, plain-`var`
+                // dict-literal site above) for why the proven-aggregate
+                // recursive disposer must win over #5106's flat
+                // `dictValueBoxFreer` shortcut.
+                if (!d.dictStringKeys)
                     if (llvm::Function* nodeFree =
                             literalTreeNodeDisposerFor(ld, dt))
                         d.dictValueDisposer = nodeFree;
+                // fix #5106 follow-up: an escaping interior alias — see
+                // `dictBorrowingValueAliasUnsafe_`'s comment.
+                if (dictBorrowingValueAliasUnsafe_.count(
+                        static_cast<const void*>(ld)))
+                    d.dictValueDisposer = nullptr;
                 disposeStack_.back().push_back(d);
                 isAwaitCollection = true;
             }
@@ -21254,13 +21284,28 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // fix #2660 / §15.4: a `using var groups: Dictionary<string, Array<int>>
         // := ["primes": […]]` literal tree — §15.4's own motivating example, and
         // the form the conformance corpus writes (spec_0060.bzl). Free the
-        // interior nodes with the root. Only for a PROVEN aggregate root; the
-        // three value-disposer derivations above all yield null for a
-        // collection-typed value, so nothing is displaced.
-        if (!d.dictValueDisposer && !d.dictStringKeys)
+        // interior nodes with the root. Only for a PROVEN aggregate root.
+        // fix #5106 follow-up (§15.4/§28.9/§28.11, v0.313): the comment above
+        // ("the three value-disposer derivations above all yield null for a
+        // collection-typed value") is no longer true — #5106 added a
+        // `dictValueBoxFreer` arm that now returns a FLAT thunk (a NULL inner
+        // disposer) whenever V is itself a borrowing builtin collection,
+        // exactly the aggregate shape this block exists for. Dropping the
+        // `!d.dictValueDisposer` gate lets the proven-aggregate recursive
+        // disposer win over that flat shortcut; literalTreeNodeDisposerFor
+        // itself already returns null unless `ld` is a proven aggregate root,
+        // so a non-aggregate collection-typed V is unaffected (it keeps the
+        // flat #5106 thunk). Without this, every interior node of a 3-level
+        // literal tree leaked (measured: 3 `Array<int>` / 360 bytes under
+        // ASan/LSan for the §15.4 `depth_three_nesting` repro).
+        if (!d.dictStringKeys)
             if (llvm::Function* nodeFree =
                     literalTreeNodeDisposerFor(ld, dictTy))
                 d.dictValueDisposer = nodeFree;
+        // fix #5106 follow-up: an escaping interior alias — see
+        // `dictBorrowingValueAliasUnsafe_`'s comment.
+        if (dictBorrowingValueAliasUnsafe_.count(static_cast<const void*>(ld)))
+            d.dictValueDisposer = nullptr;
         disposeStack_.back().push_back(d);
         return;
     }
@@ -33858,6 +33903,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     dictLiteralFreeEligible_.clear();       // #2143
     takeCurrentDictFreeEligible_.clear();   // fix #3880
     literalTreeAggregateEligible_.clear();  // #2660
+    dictBorrowingValueAliasUnsafe_.clear();  // fix #5106 follow-up
     // fix issue 2802 / §21.1: the eligibility sets are keyed on the AST node pointer (const void*), and the consumers (escape walker's `target`, collectSafeViewAliases, lowerLocalDecl's `dictLiteralFreeEligible_` lookup, ...) all compare via `const void*` — so widening the candidate vector type from `const ast::LocalDecl*` to `const ast::Node*` admits §21.1 `const` locals (LocalConstDecl, a different Stmt subtype) without changing any downstream pointer-identity comparison. The pre-issue-2802 type was the local reason the dict-literal form below elided a `const` binding: collectBorrowingArrayFreeEligible's scan lambda only matched LocalDecl, so a `const d: Dictionary<K,V> := [k:v, ...]` (the issue's measured repro: 832 KB / 10000 allocs leaked per 2000 iters) was never added to dictLiteralCandidates, the escape-walk never ran for it, and dictLiteralFreeEligible_ never received it — the literal's table was allocated by materializeHeapDictLiteral but never reclaimed, exactly the issue's defect. Admitting const locals here is the fix for issue 2802.
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> dictCandidates;  // #1028
@@ -34200,7 +34246,30 @@ void Emitter::collectBorrowingArrayFreeEligible(
         w.safeViewAliases = &safeViews;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (w.escaped) continue;
-        if (!literalTreeInteriorAliasSafe(body, ld)) continue;
+        if (!literalTreeInteriorAliasSafe(body, ld)) {
+            // fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): the
+            // STRICT check just above denies ANY interior bind
+            // (`var inner := ld[key];`), escaping or not — #5106's own
+            // regression tests deliberately write that exact shape and rely
+            // instead on #5106's FLAT `dictValueBoxFreer` disposer (installed
+            // at the three literal-root registration sites when
+            // `literalTreeNodeDisposerFor` — gated on
+            // `literalTreeAggregateEligible_` — returns null). That flat
+            // disposer is unconditional: it does not know whether the bound
+            // alias itself escapes. When it does
+            // (`var inner := ld[key]; ... return inner;`), the flat free at
+            // `ld`'s scope end dangles the escaped alias — a silent UAF
+            // (measured: `interior_alias_returned_no_uaf` returned a stale
+            // value instead of 24, not a crash). Record `ld` here so the
+            // three registration sites can force `dictValueDisposer` back to
+            // null (the safe leak direction) instead of installing #5106's
+            // flat thunk, WITHOUT touching the non-escaping shape #5106's own
+            // tests need (dictBorrowingValueAliasEscapes below only fires
+            // when the bound alias is proven to escape).
+            if (dictBorrowingValueAliasEscapes(body, ld))
+                dictBorrowingValueAliasUnsafe_.insert(static_cast<const void*>(ld));
+            continue;
+        }
         literalTreeAggregateEligible_.insert(static_cast<const void*>(ld));
     }
 }
@@ -34797,6 +34866,83 @@ bool Emitter::literalTreeInteriorAliasSafe(
     };
     w.stmts(body);
     return w.safe;
+}
+
+
+// fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): see the declaration
+// comment (LlvmBackend_impl.hpp) and `dictBorrowingValueAliasUnsafe_`'s own
+// comment for the full story. Finds every `var`/`const` local in `body`
+// whose initializer is EXACTLY a single-level index into `ld`
+// (`ld[<anything>]`) and, for each, runs the ordinary (non-borrowing)
+// `StringEscapeWalker` over `body` with that alias local as the tracked
+// target — the SAME walker `collectBorrowingArrayFreeEligible`'s flat
+// families use to decide whether a plain local escapes. Returns true as
+// soon as any such alias is found to escape.
+bool Emitter::dictBorrowingValueAliasEscapes(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::Node* ld) {
+    std::vector<const ast::Node*> aliasLocals;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        LocalDeclInitView v = localDeclInitView(s);
+        if (v.init) {
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(v.init)) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ix->target.get())) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id))) {
+                        if (loc->decl &&
+                            static_cast<const void*>(loc->decl) == ld)
+                            aliasLocals.push_back(s);
+                    }
+                }
+            }
+        }
+        // Recurse — mirrors collectBorrowingArrayFreeEligible's own scan.
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    for (const ast::Node* aliasDecl : aliasLocals) {
+        // fix #5106 follow-up: the alias local IS itself a borrowing builtin
+        // collection (that is the whole reason it reached this scan — see
+        // the caller's `isBorrowingNodeColl` gate on `ld`'s value type), so
+        // it gets the SAME `borrowingArrayMode` relaxation the flat
+        // `borrowingArrayFreeEligible_` family uses: a `for var x in alias`
+        // iteration or a binding into a proven-safe view BORROWS the
+        // backing and is not itself an escape. Without this, #5106's own
+        // `nested_dict_array_value_disposes_inner_spec_28_9` regression
+        // test (`var inner := d["k"]; for var x in inner do … end;`)
+        // misclassified the for-in as an escape, forced the disposer back
+        // to null, and turned the correct #5106 flat free into a leak
+        // (LSan-caught, run() reporting -999 instead of the expected 1).
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, aliasDecl, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(aliasDecl)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (w.escaped) return true;
+    }
+    return false;
 }
 
 
