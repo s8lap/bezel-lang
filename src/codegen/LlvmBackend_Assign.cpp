@@ -7310,6 +7310,24 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
             }
         }
     };
+    // fix #5119 (§28.3 *Unbound owned temporaries* + §23.3 *Explicit setter
+    // parameter modifier*, v0.313): a setter's implicit `value` parameter "has
+    // no modifier by default and takes a borrow", so a fresh owned class
+    // producer on the right of `obj.P := new C(...)` is an unbound owned
+    // temporary serving a non-`owned` argument — disposed at the end of the
+    // full expression (the assignment statement), exactly as the method-call
+    // twin `obj.Put(new C(...))` already is. Before this fix the inlined-
+    // setter path disposed nothing, leaking one object per assignment (for a
+    // concrete `Item` property and a bare-`T` one at `T = Item` alike). A
+    // `set(owned)` setter takes the value over and is excluded. A borrowing
+    // field the setter body stored the value into dangles from here on: the
+    // §28.3 borrowed-field store rule's recorded trust residual (K4.3/K4.1),
+    // the same posture as the borrowing-collection store (#1881).
+    auto emitUnboundOwnedTempDispose = [&] {
+        if (setter->setterParamMod != "owned" && valueExpr &&
+            isFreshOwnedClassProducer(valueExpr))
+            emitDisposeAndReclaim(v);
+    };
     // CLASS-OWNED PROPERTY gate (§9/§9.7): only release the producer on the
     // CLASS path. Records' setter bodies plain-store, so the callee never
     // retained and dropping the producer here would UAF the field's only ref.
@@ -7359,6 +7377,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         // path. Records cannot have static properties per §10.5 anyway, so
         // the gate is conservative-on-leak, correct-on-UAF.
         if (classOwned) emitProducerRelease();
+        emitUnboundOwnedTempDispose();
         return true;
     }
     // fix #2498 (§9.2/§9.4/§23, v0.236): mirrors lowerImportedPropertySetValue's
@@ -7578,6 +7597,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     // same record-UAF reason. See the long comment above the static branch
     // for the full rationale and LSan reproduction.
     if (classOwned) emitProducerRelease();
+    emitUnboundOwnedTempDispose();
     // fix #4973 / fix #4983 restore: drop the subst installed at the top
     // of this instance branch before the inline body emission.
     if (substInstalledSet) {
