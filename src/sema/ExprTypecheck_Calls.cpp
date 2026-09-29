@@ -3578,6 +3578,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "(§5.2)");
                             return;
                         }
+                        // fix #5138 (§5.2, v0.309): a `float`/`double`/
+                        // `decimal` source does not convert to `char` — a
+                        // code point, not a number, just as for `bool`
+                        // above (nor is `char` an arithmetic operand,
+                        // §3.5). This is unconditional — unlike the
+                        // constant-operand overflow checks below, it does
+                        // not depend on the operand being a compile-time
+                        // constant. `char(int(x))` spells the truncation
+                        // toward zero and the code-point check as the two
+                        // conversions they are.
+                        if (pt == PrimitiveType::Char &&
+                            (srcPt == PrimitiveType::Float ||
+                             srcPt == PrimitiveType::Double ||
+                             srcPt == PrimitiveType::Decimal)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "a `float`/`double`/`decimal` source does "
+                                "not convert to `char` — a code point, not "
+                                "a number (§5.2); write `char(int(x))` for "
+                                "the truncation and the code-point check as "
+                                "the two conversions they are");
+                            return;
+                        }
                     }
                 }
                 // §5.2 / §17.14 constant-operand rule (v0.300, #4405): where
@@ -3755,8 +3778,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             srcPt2 == PrimitiveType::Float ||
                             srcPt2 == PrimitiveType::Double ||
                             srcPt2 == PrimitiveType::Decimal;
-                        const bool toIntegral =
-                            tgtIsNarrowerInt || pt == PrimitiveType::Char;
+                        // fix #5138: the `|| pt == PrimitiveType::Char`
+                        // disjunct this used to carry is now dead — a
+                        // float/double/decimal source to a `char` target
+                        // is rejected unconditionally above, before this
+                        // fold ever runs (§5.2, v0.309).
+                        const bool toIntegral = tgtIsNarrowerInt;
                         const bool toDecimal =
                             pt == PrimitiveType::Decimal &&
                             srcPt2 != PrimitiveType::Decimal;
@@ -14118,6 +14145,25 @@ void ExprTC::checkNullableCastConstantOperand(const ast::Expr& operand,
         target == PrimitiveType::Short || target == PrimitiveType::UShort ||
         target == PrimitiveType::Int   || target == PrimitiveType::UInt  ||
         target == PrimitiveType::Long  || target == PrimitiveType::ULong;
+    // fix #5138 (§5.2, v0.309): a `float`/`double`/`decimal` source does
+    // not convert to `char` — a code point, not a number — mirroring the
+    // unconditional rejection `typeCall` runs for the non-nullable form
+    // `char(x)` above. Unlike the constant-operand checks below, this does
+    // not depend on the operand being a compile-time constant, and per
+    // §5.3 the nullable form `T?(x)` is admitted exactly when the
+    // corresponding non-nullable conversion is admitted.
+    if (target == PrimitiveType::Char &&
+        (srcPt == PrimitiveType::Float || srcPt == PrimitiveType::Double ||
+         srcPt == PrimitiveType::Decimal)) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "a `float`/`double`/`decimal` source does not convert to "
+            "`char` — a code point, not a number (§5.2), including with a "
+            "nullable target per §5.3 `T?(x)`; write `char(int(x))` for "
+            "the truncation and the code-point check as the two "
+            "conversions they are");
+        return;
+    }
     // (a) integer narrowing / same-width signedness change at a
     // compile-time-constant integer operand — `fits` mirrors the inlined
     // `fits` from typeCall's primitive-cast arm; do not re-use a
@@ -14183,7 +14229,9 @@ void ExprTC::checkNullableCastConstantOperand(const ast::Expr& operand,
         srcPt == PrimitiveType::Float ||
         srcPt == PrimitiveType::Double ||
         srcPt == PrimitiveType::Decimal;
-    const bool toIntegral = tgtIsNarrowerInt || target == PrimitiveType::Char;
+    // fix #5138: the `|| target == PrimitiveType::Char` disjunct this used
+    // to carry is dead — rejected unconditionally above.
+    const bool toIntegral = tgtIsNarrowerInt;
     const bool toDecimal =
         target == PrimitiveType::Decimal && srcPt != PrimitiveType::Decimal;
     if (srcIsFloatish && (toIntegral || toDecimal)) {
