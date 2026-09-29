@@ -5561,76 +5561,6 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // operator does not apply. (Previously a reversed-operand match, e.g.
     // `4 * v` against `operator *(Vec, int)`, was accepted, and codegen emitted
     // the args in source order → an IR-verification crash.)
-    // `allowConstantNarrowing` (#5063, §25.2/§5.1, v0.307): the second pass
-    // `tryOperand` runs below — see its own comment for why two passes make
-    // "exact beats convert" hold regardless of declaration order.
-    auto operandMatchesParam = [&](const ast::Expr* operand, Symbol* paramSym,
-                                   bool allowConstantNarrowing) -> bool {
-        auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
-        if (!ps) return false;
-        TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
-                                   : ps->resolvedDeclType;
-        TypeRef* at = operand ? ctx_.exprType(*operand) : nullptr;
-        if (!pt || !at) return false;
-        // A named-type (record/class/enum) parameter must receive an operand of
-        // that exact declared type — the discriminating position for the
-        // reversed-operand (commutation) case.
-        // §7.11 (#1132): user-defined operator lifting over nullable operands is
-        // DEFERRED — a `Vec?` operand does NOT match a non-nullable `Vec`
-        // parameter. Without the nullability gate the operator resolved and
-        // codegen passed the `{i8, Vec}` wrapper struct to a function expecting a
-        // bare `Vec` (malformed IR). Requiring nullability agreement makes the
-        // operator not resolve, so the use is cleanly rejected below.
-        // §8.4 (#1248): `=`/`<>` are exempt from the nullability gate — a `T?`
-        // operand IS allowed to match a non-nullable `T` parameter for these two
-        // operators because codegen wraps the call in the null-safe equality
-        // protocol (lowerNullSafeRecordEquality), which unwraps the `{i8, T}`
-        // payload to bare `T` before invoking the user operator. All other
-        // operators remain gated (§7.11: lifting over `T?` is deferred).
-        if (pt->kind == TypeRef::Kind::Named) {
-            if (at->kind != TypeRef::Kind::Named) return false;
-            // §25.2 (v0.181, #1562): "a derived-typed operand satisfies a
-            // base-typed parameter by the ordinary argument rules." Accept an
-            // exact declaration match OR a derived operand whose declaration
-            // derives from the parameter's declaration — this is what makes an
-            // operator inherited from a base class applicable to a derived-typed
-            // operand (the params are declared with the *base* type). The
-            // covariant direction is preserved (operand is-a parameter), so no
-            // spurious commutation is introduced. Note: isSubtype compares
-            // declarations only; generic-instantiation consistency for a generic
-            // declaring type stays with genericArgsConsistent below.
-            bool declOk = pt->declaration == at->declaration ||
-                          (pt->declaration && at->declaration &&
-                           isSubtype(at->declaration, pt->declaration));
-            return declOk &&
-                   (pt->nullable || !at->nullable ||
-                    be.op == "=" || be.op == "<>");
-        }
-        // A primitive parameter accepts a primitive operand only if §5.1 admits
-        // an implicit conversion — identity or numeric widening. §5.1's table has
-        // no non-numeric primitive-to-primitive conversion (string, bool, Object
-        // do not widen to any other primitive), so e.g. a `string` argument does
-        // NOT match an `int` parameter.  Numeric coercion (e.g. int→long) is
-        // handled downstream in codegen after overload resolution picks the
-        // applicable candidate.
-        // §7.11 (#5053): the same nullability gate that applies to Named types
-        // applies to primitives — a `string?` operand does NOT match a
-        // non-nullable `string` parameter (lifting is deferred; §8.4 exempts
-        // only `=`/`<>`).
-        if (pt->kind == TypeRef::Kind::Primitive) {
-            if (at->kind != TypeRef::Kind::Primitive) return false;
-            if (!pt->nullable && at->nullable && be.op != "=" && be.op != "<>")
-                return false;
-            // Identity and §5.1 numeric widening are tried first, then (#5063,
-            // §25.2/§5.1, v0.307) §5.1 constant narrowing when the pass allows
-            // it — "a derived-typed operand satisfies a base-typed parameter
-            // by the ordinary argument rules" (§25.2), and the ordinary
-            // argument rules include constant narrowing (§5.1).
-            return primitiveOperandMatchesParam(operand, at, pt,
-                                                allowConstantNarrowing);
-        }
-        return false;
-    };
     // #1270 (§25 / §14.1): `operandMatchesParam` matches a Named operand against a
     // Named parameter by DECLARATION only, ignoring generic type args — so a binary
     // operator on a generic type (`operator +(a,b: Box<T>)`) wrongly accepted
@@ -5663,43 +5593,140 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             return false;
         return true;
     };
-    auto tryOperand = [&](const ast::Expr* operand) -> MethodSymbol* {
-        // #1131: examine EVERY overload of the operator declared on `operand`'s
-        // type and return the first whose parameters match the operands in
-        // order.
-        //
-        // #5063 (§22.6 "exact beats convert" / §25.2 "the ordinary argument
-        // rules", v0.307): run TWO passes — the first with constant narrowing
-        // DISALLOWED, the second WITH it. Without this, `v * 2` against BOTH
-        // `operator *(V, byte)` and `operator *(V, int)` would pick whichever
-        // is declared first in `candidatesOn`'s order (a single pass returns
-        // the first applicable candidate, and #5063's own narrowing makes a
-        // successfully-narrowed candidate applicable too) — the literal `2`
-        // is naturally `int`-typed, so the `int` overload is the one that
-        // matches WITHOUT narrowing, and must win regardless of where either
-        // overload is declared. An out-of-range constant or a non-constant
-        // int stays inapplicable in both passes (narrowIntConstantToTarget's
-        // own gates), so those rows are unaffected.
-        for (MethodSymbol* m : candidatesOn(operand)) {
-            if (operandMatchesParam(be.left.get(), m->params[0],
-                                    /*allowConstantNarrowing=*/false) &&
-                operandMatchesParam(be.right.get(), m->params[1],
-                                    /*allowConstantNarrowing=*/false) &&
-                genericArgsConsistent(m))
-                return m;
+    // fix #5110 (§22.6 / §25.2, v0.313): rank the applicable overloads on each
+    // operand type by §22.6's "unambiguously better" relation. Per position a
+    // candidate is Exact (the operand's static type IS the parameter type) or
+    // Converting (any §5.1 implicit conversion: widening, constant narrowing,
+    // a nullable wrap, a derived-to-base upcast). §22.6: "two candidates that
+    // both require an implicit conversion at the same position are equally
+    // ranked there, regardless of which conversion each uses", and "if no
+    // candidate is unambiguously better ... the call is ambiguous and is a
+    // compile error". The previous two-pass search (#5063) treated widening as
+    // if it were exact, so `v + 100` against `+(V, short)` and `+(V, long)`
+    // silently picked `long` instead of reporting the §22.6 Example 2 tie.
+    enum class Quality { Inapplicable, Exact, Converting };
+    auto paramTypeOf = [&](Symbol* paramSym) -> TypeRef* {
+        auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
+        if (!ps) return nullptr;
+        return ps->declType ? ctx_.resolvedType(*ps->declType)
+                            : ps->resolvedDeclType;
+    };
+    // Classifies one position WITHOUT side effects: constant narrowing is
+    // probed via narrowIntConstantToTarget (which re-types the operand on
+    // success) and the operand's type is restored, so every candidate is
+    // measured against the operand's original static type. The winner's
+    // narrowing is re-applied once, below.
+    auto quality = [&](const ast::Expr* operand, Symbol* paramSym) -> Quality {
+        TypeRef* pt = paramTypeOf(paramSym);
+        TypeRef* at = operand ? ctx_.exprType(*operand) : nullptr;
+        if (!pt || !at) return Quality::Inapplicable;
+        // §7.11 (#1132, #5053): user-defined operator lifting over a nullable
+        // operand is deferred — a `T?` operand does not match a non-nullable
+        // `T` parameter; §8.4 (#1248) exempts `=`/`<>`, whose codegen unwraps
+        // the payload (lowerNullSafeRecordEquality).
+        if (at->nullable && !pt->nullable && be.op != "=" && be.op != "<>")
+            return Quality::Inapplicable;
+        const bool sameNullability = at->nullable == pt->nullable;
+        if (pt->kind == TypeRef::Kind::Named) {
+            // §25.2 (v0.181, #1562): a derived-typed operand satisfies a
+            // base-typed parameter by the ordinary argument rules (an
+            // implicit reference conversion, §5.1).
+            if (at->kind != TypeRef::Kind::Named) return Quality::Inapplicable;
+            if (pt->declaration == at->declaration)
+                return sameNullability ? Quality::Exact : Quality::Converting;
+            if (pt->declaration && at->declaration &&
+                isSubtype(at->declaration, pt->declaration))
+                return Quality::Converting;
+            return Quality::Inapplicable;
         }
-        for (MethodSymbol* m : candidatesOn(operand)) {
-            if (operandMatchesParam(be.left.get(), m->params[0],
-                                    /*allowConstantNarrowing=*/true) &&
-                operandMatchesParam(be.right.get(), m->params[1],
-                                    /*allowConstantNarrowing=*/true) &&
-                genericArgsConsistent(m))
-                return m;
+        if (pt->kind == TypeRef::Kind::Primitive) {
+            // §5.1: identity or numeric widening; string/bool/Object convert
+            // to no other primitive.
+            if (at->kind != TypeRef::Kind::Primitive) return Quality::Inapplicable;
+            if (pt->primitive == at->primitive)
+                return sameNullability ? Quality::Exact : Quality::Converting;
+            if (primitiveWidens(at->primitive, pt->primitive))
+                return Quality::Converting;
+            // #5063 (§5.1 "Constant narrowing" participates in overload
+            // applicability).
+            if (!operand) return Quality::Inapplicable;
+            TypeRef* narrowed = narrowIntConstantToTarget(operand, at, pt);
+            if (narrowed == at) return Quality::Inapplicable;
+            ctx_.setExprType(const_cast<ast::Expr*>(operand), at);
+            return Quality::Converting;
         }
+        return Quality::Inapplicable;
+    };
+    struct Ranked {
+        MethodSymbol* m;
+        bool exact0;
+        bool exact1;
+    };
+    // §22.6: `a` is unambiguously better than `b` when it is better-or-equal
+    // at every position and strictly better (exact where `b` converts) at one.
+    auto better = [](const Ranked& a, const Ranked& b) -> bool {
+        bool geq = (a.exact0 || !b.exact0) && (a.exact1 || !b.exact1);
+        bool strict = (a.exact0 && !b.exact0) || (a.exact1 && !b.exact1);
+        return geq && strict;
+    };
+    // Resolves among the overloads declared on (or inherited by) one operand's
+    // type. Returns the unique best candidate, or null; sets `ambiguous` when
+    // candidates apply but none is unambiguously better than all the others.
+    auto resolveOn = [&](const ast::Expr* operand, bool& ambiguous) -> MethodSymbol* {
+        ambiguous = false;
+        std::vector<Ranked> app;
+        for (MethodSymbol* m : candidatesOn(operand)) {
+            if (!m || !genericArgsConsistent(m)) continue;
+            Quality q0 = quality(be.left.get(), m->params[0]);
+            if (q0 == Quality::Inapplicable) continue;
+            Quality q1 = quality(be.right.get(), m->params[1]);
+            if (q1 == Quality::Inapplicable) continue;
+            app.push_back({m, q0 == Quality::Exact, q1 == Quality::Exact});
+        }
+        for (const Ranked& c : app) {
+            bool best = true;
+            for (const Ranked& o : app)
+                if (o.m != c.m && !better(c, o)) { best = false; break; }
+            if (best) return c.m;
+        }
+        ambiguous = !app.empty();
         return nullptr;
     };
-    MethodSymbol* fromLeft = tryOperand(be.left.get());
-    MethodSymbol* fromRight = tryOperand(be.right.get());
+    auto reportTie = [&](const ast::Expr* operand) {
+        std::string candidates;
+        for (MethodSymbol* m : candidatesOn(operand)) {
+            if (!m || !genericArgsConsistent(m)) continue;
+            if (quality(be.left.get(), m->params[0]) == Quality::Inapplicable ||
+                quality(be.right.get(), m->params[1]) == Quality::Inapplicable)
+                continue;
+            auto spell = [&](Symbol* p) {
+                TypeRef* t = paramTypeOf(p);
+                return rangeElementTypeName(t);
+            };
+            if (!candidates.empty()) candidates += ", ";
+            candidates += "`operator " + std::string(be.op) + "(" +
+                          spell(m->params[0]) + ", " + spell(m->params[1]) +
+                          ")`";
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, be.span.begin,
+            "ambiguous operator `" + std::string(be.op) + "`: no applicable "
+            "overload is unambiguously better (candidates: " + candidates +
+            ") — every candidate needs an implicit conversion where no other "
+            "is exact; add an explicit cast to an operand so exactly one "
+            "candidate matches exactly (§22.6)");
+    };
+    bool ambLeft = false, ambRight = false;
+    MethodSymbol* fromLeft = resolveOn(be.left.get(), ambLeft);
+    if (ambLeft) {
+        reportTie(be.left.get());
+        return nullptr;
+    }
+    MethodSymbol* fromRight = resolveOn(be.right.get(), ambRight);
+    if (ambRight) {
+        reportTie(be.right.get());
+        return nullptr;
+    }
     // §25.2 (#1347, v0.160): if distinct applicable overloads are found on
     // BOTH operand types, the expression is a compile error. The compiler
     // declines to guess which is intended (mirroring §22.6's overload-
@@ -5720,7 +5747,22 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             "remove a conflicting import or qualify the call (§25.2)");
         return nullptr;
     }
-    return fromLeft ? fromLeft : fromRight;
+    MethodSymbol* chosen = fromLeft ? fromLeft : fromRight;
+    // #5063: re-apply constant narrowing for the chosen overload so the
+    // literal carries the parameter's width into codegen.
+    if (chosen) {
+        const ast::Expr* ops[2] = {be.left.get(), be.right.get()};
+        for (int i = 0; i < 2; ++i) {
+            TypeRef* pt = paramTypeOf(chosen->params[i]);
+            TypeRef* at = ops[i] ? ctx_.exprType(*ops[i]) : nullptr;
+            if (pt && at && pt->kind == TypeRef::Kind::Primitive &&
+                at->kind == TypeRef::Kind::Primitive &&
+                pt->primitive != at->primitive &&
+                !primitiveWidens(at->primitive, pt->primitive))
+                narrowIntConstantToTarget(ops[i], at, pt);
+        }
+    }
+    return chosen;
 }
 
 // fix #4501 (§5.1 / §6.2 / §17.3 / §8.4, v0.306): the ONE place that answers

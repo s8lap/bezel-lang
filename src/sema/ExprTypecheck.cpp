@@ -19971,11 +19971,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     TypeRef* p1 = paramTy(m->params[1]);
                     if (!p0 || !p1) continue;
                     // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
-                    // a primitive param accepts a primitive operand (numeric
-                    // coercion downstream); a Named param needs the operand's
-                    // declaration (or a derived one) with nullability
-                    // agreement.
-                    bool leftOk = p0->kind == TypeRef::Kind::Primitive;
+                    // a primitive param accepts a primitive operand under
+                    // §5.1's rules (identity or widening); a Named param needs
+                    // the operand's declaration (or a derived one) with
+                    // nullability agreement.
+                    // fix #5110 (§5.1 / §6.6, v0.313): the old
+                    // `p0->kind == Primitive` accepted ANY primitive target;
+                    // `n += r` with `n: long` against `operator +(int, R)`
+                    // needs a long->int conversion §5.1 never makes implicit.
+                    bool leftOk = p0->kind == TypeRef::Kind::Primitive &&
+                                  primitiveOperandMatchesParam(nullptr, tTy, p0,
+                                                              /*allowConstantNarrowing=*/false);
                     bool rightOk =
                         p1->kind == TypeRef::Kind::Named && p1->declaration &&
                         (p1->declaration == rTy->declaration ||
