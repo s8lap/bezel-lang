@@ -5409,6 +5409,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       asyncBorrowedReturn_(e.asyncBorrowedReturn_),
       pendingOwnedParams_(e.pendingOwnedParams_),
       pendingArgsDisposal_(e.pendingArgsDisposal_),
+      pendingChainOutDisposals_(e.pendingChainOutDisposals_),  // fix #4975
       genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
     // Clear the non-frame emitter state a nested body must not INHERIT.
     e.currentReturnTypeNode_     = nullptr;
@@ -5427,6 +5428,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.asyncBorrowedReturn_       = false;
     e.pendingOwnedParams_.clear();
     e.pendingArgsDisposal_.reset();
+    e.pendingChainOutDisposals_.clear();  // fix #4975
     // Clear the saved+restored frame to its neutral values. Generated from
     // BEZEL_SM_FRAME_MEMBERS so a member added to the macro is cleared in
     // lockstep with the ctor-init and the dtor-restore above. SuspendKind
@@ -5469,6 +5471,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.asyncBorrowedReturn_       = asyncBorrowedReturn_;
     e_.pendingOwnedParams_        = std::move(pendingOwnedParams_);
     e_.pendingArgsDisposal_       = std::move(pendingArgsDisposal_);
+    e_.pendingChainOutDisposals_  = std::move(pendingChainOutDisposals_);  // fix #4975
     e_.genericSubstSemaTy_        = std::move(genericSubstSemaTy_);
 }
 

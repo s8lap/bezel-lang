@@ -15968,8 +15968,14 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // the "two halves of one contract" gap LANE_RULES warns about.
     auto savedPendingOwnedParams = std::move(pendingOwnedParams_);
     auto savedPendingArgsDisposal = std::move(pendingArgsDisposal_);
+    // fix #4975: pendingChainOutDisposals_ shares the exact ROOT-SCOPE
+    // REGISTRATION mechanism as the two above (a chain-call `out owned var` /
+    // `out using var` recipient slot pre-created before any dispose scope
+    // exists) and is protected the same way for the same reason.
+    auto savedPendingChainOutDisposals = std::move(pendingChainOutDisposals_);
     pendingOwnedParams_.clear();
     pendingArgsDisposal_.reset();
+    pendingChainOutDisposals_.clear();
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -16232,6 +16238,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // covers every exit.
     pendingOwnedParams_ = std::move(savedPendingOwnedParams);
     pendingArgsDisposal_ = std::move(savedPendingArgsDisposal);
+    pendingChainOutDisposals_ = std::move(savedPendingChainOutDisposals);  // fix #4975
 
     return specFn;
 }

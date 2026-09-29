@@ -8728,6 +8728,56 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
             calleeParent2 = ms2->parent;
         }
+        // fix #4975 (§22.4/§12.8, v0.307): a `this(...)`/`base(...)` chain
+        // call's callee is the bare keyword identifier `this`/`base`, which
+        // `ctx_.exprSymbol` resolves to no ordinary symbol at all — so
+        // calleeSym2 above is null and every one of calleeMd2/calleeMs2/
+        // calleeXd2 stays null for a chain call, leaving `formalOutParamType2`
+        // below permanently unable to answer for an `out owned var x` / `out
+        // using var x` chain-call recipient (#4975's own repro: `recipient`
+        // got no declType at all, so codegen's outOwnedRecipientDisposes(null)
+        // is always false and the §28.11/§28.9 disposal obligation this
+        // recipient carries can never be discharged — the deeper half of the
+        // #1386 ICE this fix closes, not just the ICE itself). Resolve the
+        // call's bound target constructor by the same rule
+        // `checkChainCallBinding` (ExprTypecheck_Calls.cpp) uses for `target`
+        // (`this` → the enclosing type; `base` → its first CLASS base) and
+        // pick the same-arity candidate — narrower than that function's own
+        // binder (no name/default handling) because only the FORMAL TYPE at
+        // `pos2` is needed here; §22.5 binding correctness of the call itself
+        // is `checkChainCallBinding`'s question, already asked and diagnosed
+        // there.
+        const ast::ConstructorDecl* calleeChainCtor2 = nullptr;
+        if (!calleeMd2 && !calleeMs2 && !calleeXd2 && currentType_) {
+            if (auto* callId2 = dynamic_cast<const ast::IdentifierExpr*>(
+                    ce->callee.get())) {
+                if (callId2->name == "this" || callId2->name == "base") {
+                    const sema::TypeSymbol* chainTarget2 = nullptr;
+                    if (callId2->name == "this") {
+                        chainTarget2 = currentType_;
+                    } else {
+                        for (sema::TypeSymbol* b2 : currentType_->baseTypes)
+                            if (b2 && b2->kind == ast::TypeDeclKind::Class) {
+                                chainTarget2 = b2;
+                                break;
+                            }
+                    }
+                    if (chainTarget2) {
+                        for (sema::Symbol* m2 : chainTarget2->members) {
+                            auto* cs2 =
+                                dynamic_cast<sema::ConstructorSymbol*>(m2);
+                            if (!cs2 || cs2->isStatic) continue;
+                            auto* od2 = dynamic_cast<const ast::ConstructorDecl*>(
+                                cs2->decl);
+                            if (!od2 || od2->params.size() != ce->args.size())
+                                continue;
+                            calleeChainCtor2 = od2;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // fix #2657 (§22.4 "Inline `out` declarations" / §2.5, v0.236): an
         // IMPORTED method has NO `ast::MethodDecl` — ModuleLoader.cpp:337-346
         // reconstructs a `sema::MethodSymbol` from the artifact's metadata with
@@ -8771,6 +8821,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 if (auto* ps2 = dynamic_cast<ParameterSymbol*>(
                         calleeMs2->params[pos]))
                     return ps2->resolvedDeclType;
+            // fix #4975: the chain-call target constructor resolved above.
+            if (calleeChainCtor2) {
+                if (pos < calleeChainCtor2->params.size() &&
+                    calleeChainCtor2->params[pos].type)
+                    return ctx_.resolvedType(*calleeChainCtor2->params[pos].type);
+                return nullptr;
+            }
             return nullptr;
         };
         // fix #4510 (§2.8.2 clause 1 / §27.4 / §27.1, v0.306): the formal a

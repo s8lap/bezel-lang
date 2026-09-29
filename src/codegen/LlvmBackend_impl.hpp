@@ -2497,6 +2497,17 @@ private:
     // set by emitMethodBody and consumed by the first lowerScopedBlock call
     // (which opens the root scope), mirroring the pendingOwnedParams_ pattern.
     std::optional<Disposal> pendingArgsDisposal_;
+    // fix #4975 (§22.4/§28.3/§28.11, v0.307): `emitChainCall`'s `out owned
+    // var` / `out using var` recipient slots are created BEFORE the
+    // constructor body's root dispose scope exists (`emitConstructorBody`
+    // runs the leading `base(...)`/`this(...)` chain call ahead of the
+    // `lowerScopedBlock` that opens it, LlvmBackend_Setup.cpp), so a
+    // Disposal built at chain-call time has no `disposeStack_.back()` to
+    // register into — mirrors the `pendingOwnedParams_` / `pendingArgsDisposal_`
+    // pattern immediately above for exactly the same "no scope open yet"
+    // reason. Drained into the root scope by the first `lowerScopedBlock`
+    // call, same as those two.
+    std::vector<Disposal> pendingChainOutDisposals_;
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
     // §2.5 / §22.8 (issue #328 item 2+3): the `bz$<Type>$init(ptr)` function for
@@ -14673,6 +14684,7 @@ private:
         std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
                              pendingOwnedParams_;
         std::optional<Disposal> pendingArgsDisposal_;
+        std::vector<Disposal> pendingChainOutDisposals_;  // fix #4975
         // --- SAVED AND RESTORED BUT DELIBERATELY NOT CLEARED (see the .cpp) ---
         std::unordered_map<std::string_view, const sema::TypeRef*>
                              genericSubstSemaTy_;

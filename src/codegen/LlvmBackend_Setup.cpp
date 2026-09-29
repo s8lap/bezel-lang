@@ -13734,6 +13734,100 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                     slotTy = lowerTypeRef(fty);
                 v = entryAlloca(slotTy);
             }
+        } else if (a.modifier == "out owned var" && a.value) {
+            // fix #4975 (§22.4/§28.3/§28.11, v0.307): `this(out owned var x,
+            // ...)` / `base(out owned var x, ...)` — a chain-call recipient
+            // declared fresh via `out owned var`. Exactly the #4994 `out var`
+            // gap (isByRefMod already lists "out owned var", so `lvalueAddr`
+            // below has no address for a fresh identifier and the call would
+            // fall into the #1386 ICE), plus the ownership bookkeeping
+            // `ensureCtorOutVarSlots`' identical `out owned var` arm
+            // (LlvmBackend_Calls2.cpp) already performs for a `new
+            // T(out owned var x)` call — mirrored verbatim here for the
+            // structurally-identical chain-call site (`out owned` is only
+            // ever admitted on a class/interface parameter, §28.1, so a bare
+            // pointer alloca suffices, no per-parameter slotTy lookup).
+            if (auto* idoo = dynamic_cast<const ast::IdentifierExpr*>(
+                    a.value.get())) {
+                sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
+                auto* locoo = dynamic_cast<sema::LocalSymbol*>(symoo);
+                bool alreadyMapped = (locoo && locoo->decl &&
+                                      locals_.count(locoo->decl)) ||
+                                     locals_.count(idoo);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[idoo] = outSlot;
+                    if (locoo && locoo->decl) locals_[locoo->decl] = outSlot;
+                    const void* declKey =
+                        locoo && locoo->decl
+                            ? static_cast<const void*>(locoo->decl)
+                            : static_cast<const void*>(idoo);
+                    outOwnedRecipients_.insert(declKey);
+                    const sema::TypeRef* recipTy =
+                        (locoo && locoo->declType) ? locoo->declType
+                                                   : ctx_.exprType(*idoo);
+                    if (currentFn_ == unwindIneligibleFn_ &&
+                        !emittingDisposerBody_ &&
+                        outOwnedRecipientDisposes(recipTy) &&
+                        !unwindIneligible_.count(declKey)) {
+                        // fix #4975: `emitChainCall` runs before the ctor
+                        // body's root dispose scope exists (no
+                        // `disposeStack_` entry yet — the leading `base(...)`
+                        // / `this(...)` chain call precedes the first
+                        // `lowerScopedBlock`), so queue via the same
+                        // root-scope registration channel `pendingOwnedParams_`
+                        // uses instead of pushing into `disposeStack_.back()`
+                        // directly; drained by the first `lowerScopedBlock`.
+                        Disposal d{outSlot, nullptr};
+                        if (locoo && locoo->autoDropAtScopeEnd)
+                            d.dynamicDispose = true;
+                        else
+                            d.unwindOnly = true;
+                        pendingChainOutDisposals_.push_back(d);
+                    }
+                    v = outSlot;
+                }
+            }
+        } else if (a.modifier == "out using var" && a.value) {
+            // fix #4975 (§22.4/§28.9/§28.11, v0.307): `this(out using var x,
+            // ...)` / `base(out using var x, ...)` — same gap as the
+            // `out owned var` arm above, mirroring `ensureCtorOutVarSlots`'
+            // `out using var` arm. A chain call is never `Weak<T>.
+            // TryUpgrade` (that path exists only for a member-access callee
+            // on the builtin `Weak<T>` receiver), so this always takes the
+            // dynamicDispose (owned class-element) branch, never
+            // sharedHandle, and the scope-bound disposal is unconditional
+            // (the `using` obligation, always discharged at scope end).
+            if (auto* iduv = dynamic_cast<const ast::IdentifierExpr*>(
+                    a.value.get())) {
+                sema::Symbol* symuv = ctx_.exprSymbol(*iduv);
+                auto* locuv = dynamic_cast<sema::LocalSymbol*>(symuv);
+                bool alreadyMapped = (locuv && locuv->decl &&
+                                      locals_.count(locuv->decl)) ||
+                                     locals_.count(iduv);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[iduv] = outSlot;
+                    if (locuv && locuv->decl) locals_[locuv->decl] = outSlot;
+                    mapSuspendLocalSlot(iduv, outSlot);
+                    const sema::TypeRef* recipTy =
+                        (locuv && locuv->declType) ? locuv->declType
+                                                   : ctx_.exprType(*iduv);
+                    if (outOwnedRecipientDisposes(recipTy)) {
+                        // fix #4975: same root-scope registration channel as
+                        // the `out owned var` arm above (no disposeStack_
+                        // scope exists yet at chain-call time).
+                        Disposal disp{outSlot, nullptr};
+                        disp.dynamicDispose = true;
+                        pendingChainOutDisposals_.push_back(disp);
+                    }
+                    v = outSlot;
+                }
+            }
         } else if (!a.value) {
             // fix #2579: the call never runs — release any bracket pins
             // recorded by earlier args so their refcount isn't stranded.
@@ -41213,6 +41307,15 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
     if (disposeStack_.size() == 1 && pendingArgsDisposal_) {
         disposeStack_.back().push_back(std::move(*pendingArgsDisposal_));
         pendingArgsDisposal_.reset();
+    }
+    // fix #4975 (§22.4/§28.11, v0.307): a leading `this(...)`/`base(...)`
+    // chain call's `out owned var` / `out using var` recipient Disposal was
+    // queued in emitChainCall before this ROOT scope existed — drain it here,
+    // same pattern and same ROOT-scope-only guard as the two blocks above.
+    if (disposeStack_.size() == 1 && !pendingChainOutDisposals_.empty()) {
+        auto pending = std::move(pendingChainOutDisposals_);
+        pendingChainOutDisposals_.clear();
+        for (auto& d : pending) disposeStack_.back().push_back(d);
     }
     bool terminated = false;
     for (std::size_t i = startIdx; i < body.size(); ++i) {
