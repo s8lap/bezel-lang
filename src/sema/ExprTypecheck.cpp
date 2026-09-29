@@ -20853,6 +20853,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                tt->primitive == PrimitiveType::String) {
                         lsym->declType =
                             ctx_.primitiveTypeRef(PrimitiveType::Char);
+                    // fix #5125 (stdlib §3.3 / §4.16, v0.307): `for var c in sp`
+                    // over a `ReadOnlyStringSpan` — `string.AsSpan()` types the
+                    // call as a Named TypeRef with `declaration = nullptr` and
+                    // a synthetic `astNode` naming "ReadOnlyStringSpan"
+                    // (ExprTypecheck_Calls.cpp), so this is non-generic
+                    // (TypeResolution_Names.cpp: arity 0) and has no
+                    // `declaration` to search for a `GetEnumerator` — it never
+                    // reached the `!genericArgs.empty()` branch below, nor the
+                    // `declaration`-driven user-IEnumerable BFS branch (it is
+                    // iterated via the §4.16 direct-indexed-loop shape,
+                    // mirroring the indexer's element type at
+                    // ExprTypecheck_Exprs.cpp: "§3.3 (#883):
+                    // ReadOnlyStringSpan[i] → char"). Without this case
+                    // `lsym->declType` stayed null, so the loop variable's
+                    // type never reached the §3.5 char-arithmetic gate
+                    // (`reportBoolOperandExcludedFromArithmeticOrOrdering`)
+                    // and `sum + c` was silently admitted. Match on
+                    // `headName()` (not `declaration->name`, which is null
+                    // here) — the same head-name style already used for
+                    // ReadOnlyStringSpan's indexer element type below.
+                    } else if (tt->kind == TypeRef::Kind::Named &&
+                               tt->headName() == "ReadOnlyStringSpan") {
+                        lsym->declType =
+                            ctx_.primitiveTypeRef(PrimitiveType::Char);
                     // §3 / §29.2: runtime Array<T> or other IEnumerable<T>
                     // with a Named TypeRef — element type from first generic arg.
                     // Guard: Dictionary<K,V> and OwningDictionary<K,V> are NOT

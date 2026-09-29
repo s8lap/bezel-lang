@@ -168,13 +168,17 @@ BEZEL_TEST(string_span_883, indexof_span_operand_971) {
 // start..start+len). Sum-of-codes for "hello" is 104+101+108+108+111 = 532.
 // Uses runAotOut (write the sum to stdout) because 532 exceeds the 8-bit
 // exit-code channel that runAot reads.
+// fix #5125 (§3.5, v0.307): respelled `sum + c` as `sum + int(c)` — the
+// span for-in loop variable is `char` and char arithmetic is rejected;
+// these rows previously relied on a sema gap (the loop variable's type
+// never reached the §3.5 char-arithmetic gate).
 BEZEL_TEST(string_span_883, for_in_iterates_full_span_971) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
         "  var sp := s.AsSpan(); "
         "  var sum := 0; "
-        "  for var c in sp do sum := sum + c; end; "
+        "  for var c in sp do sum := sum + int(c); end; "
         "  Console.WriteLine(sum); "
         "  return 0; "
         "end Main; end C;"), "532");
@@ -189,7 +193,7 @@ BEZEL_TEST(string_span_883, for_in_iterates_sliced_span_971) {
         "  var s := \"hello world\"; "
         "  var sp := s.AsSpan(6, 5); "
         "  var sum := 0; "
-        "  for var c in sp do sum := sum + c; end; "
+        "  for var c in sp do sum := sum + int(c); end; "
         "  Console.WriteLine(sum); "
         "  return 0; "
         "end Main; end C;"), "552");
@@ -206,7 +210,7 @@ BEZEL_TEST(string_span_883, for_in_iterates_slice_subview_971) {
         "  var s := \"hello\"; "
         "  var sp := s.AsSpan(1, 3); "
         "  var sum := 0; "
-        "  for var c in sp do sum := sum + c; end; "
+        "  for var c in sp do sum := sum + int(c); end; "
         "  Console.WriteLine(sum); "
         "  return 0; "
         "end Main; end C;"), "317");
@@ -221,7 +225,7 @@ BEZEL_TEST(string_span_883, for_in_over_zero_length_span_971) {
         "  var s := \"hello\"; "
         "  var sp := s.AsSpan(2, 0); "
         "  var sum := 0; "
-        "  for var c in sp do sum := sum + c; end; "
+        "  for var c in sp do sum := sum + int(c); end; "
         "  return sum; "
         "end Main; end C;"), 0);
 }

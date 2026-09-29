@@ -155,3 +155,37 @@ BEZEL_TEST(char_arithmetic_rejected_5054,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("194\n"));
 }
+
+// T8: fix #5125 (§3.5 / stdlib §3.3-§4.16, v0.307) — the issue's exact
+// repro: the char-arithmetic gate above only reached `char` operands whose
+// declared type was resolved to Primitive::Char directly. A `for var c in sp`
+// loop variable over a `ReadOnlyStringSpan` (stdlib §3.3) never got that
+// type: ExprTypecheck.cpp's for-in loop-variable inference had a case for a
+// string source (§4.6, char) and for Named types with generic args or a
+// user `GetEnumerator`, but ReadOnlyStringSpan is a zero-arity Named type
+// iterated via the §4.16 direct-indexed-loop shape, so none of those cases
+// matched and the loop variable's type was left unset, quietly bypassing the
+// §3.5 gate. `sum + c` therefore compiled to a plain int add rather than
+// being rejected. Fixed by adding an explicit `declaration->name ==
+// "ReadOnlyStringSpan"` case that assigns Primitive::Char, mirroring the
+// element type the indexer already uses (`ReadOnlyStringSpan[i] → char`,
+// ExprTypecheck_Exprs.cpp).
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           span_for_in_loop_variable_char_arithmetic_rejected_5125) {
+    auto r = runAot(
+        "module M5125; "
+        "class C "
+        "  public static method Main(): int "
+        "    var s := \"hello\"; "
+        "    var sp := s.AsSpan(); "
+        "    var sum := 0; "
+        "    for var c in sp do sum := sum + c; end; "
+        "    Console.WriteLine(sum.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`char`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not defined"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "3.5"));
+}
