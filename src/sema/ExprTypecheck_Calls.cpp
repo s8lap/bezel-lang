@@ -17319,26 +17319,30 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // where `y` is the explicit ctor's param) are not spuriously
             // rejected. The codegen binding #5107 built at
             // `storePrimaryCtorPositionalArgs` remains as defence-in-depth.
-            // SEAM-DEBT: #5126 module-local only; an imported class has no decl here and skips §22.5
-            auto* td5121 = dynamic_cast<const ast::TypeDecl*>(t->decl);
-            if (td5121 && !td5121->positionalFields.empty()) {
-                bool anyBind = bindArgsToParams(td5121->positionalFields,
-                                                ne.args, ne.span.begin,
-                                                std::string(),
-                                                /*emit=*/false).ok;
+            // Both formal lists are read off the symbols (`FormalsView`),
+            // not `t->decl` / `cs->decl` (#5126: no AST-decl read at this
+            // site; an imported class takes the #3625 arm below).
+            const std::vector<const Symbol*> primaryFormals5121 =
+                recordPositionalFieldSymbols(t);
+            if (!primaryFormals5121.empty()) {
+                bool anyBind = bindArgsToParams(
+                    sema::FormalsView::of(primaryFormals5121),
+                    ne.args, ne.span.begin, std::string(),
+                    /*emit=*/false).ok;
                 for (Symbol* m : t->members) {
                     if (anyBind) break;
                     auto* cs = dynamic_cast<ConstructorSymbol*>(m);
                     if (!cs || cs->isStatic) continue;
-                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                    if (!cd) continue;
-                    if (bindArgsToParams(cd->params, ne.args, ne.span.begin,
-                                         std::string(),
-                                         /*emit=*/false).ok) { anyBind = true; break; }
+                    if (bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
+                                         ne.span.begin, std::string(),
+                                         /*emit=*/false).ok) {
+                        anyBind = true; break;
+                    }
                 }
                 if (!anyBind) {
                     (void)bindArgsToParams(
-                        td5121->positionalFields, ne.args, ne.span.begin,
+                        sema::FormalsView::of(primaryFormals5121),
+                        ne.args, ne.span.begin,
                         std::string("`new ") + std::string(t->name) + "`",
                         /*emit=*/true);
                 }
