@@ -205,12 +205,26 @@ const char* kDepExc3147 =
 
 // The §31.2.4/#811 cause-position shape: a wrapper built from the caught
 // exception and returned out of the catch arm.
+//
+// The return type is spelled `owned`. `Handle` is an INSTANCE method and both
+// return expressions are a direct `new` — a fresh owned production. §28.3's
+// announcement table row 4 (spec line 6927, v0.307) states that cell exactly:
+// "*Instance/extension:* return only a receiver-(parameter-)sourced borrow; a
+// fresh owned value is rejected (§28.6) — declare `owned`." The unmarked
+// spelling this fixture originally carried was admitted only because the
+// row-4 callee-side half was unimplemented; it is now correctly a compile
+// error, so the fixture is re-spelled to the form the spec's own cell
+// prescribes. The marker is orthogonal to what F11 measures: the §31.1/#430
+// catch-escape check runs either way, and T1-vs-T3 (below) still differ ONLY
+// in whether the imported wrapper derives from `Exception` — T3 is still
+// rejected by #430 and T1 is not, so `ownershipIsExceptionClassRef` stays the
+// load-bearing predicate in this fixture.
 std::string handlerBody3147(const char* wrapper) {
     std::string w(wrapper);
     return std::string(
         "public class C3147 "
         "  private method DoWork() end DoWork; "
-        "  public method Handle(): ") + w + " " +
+        "  public method Handle(): owned ") + w + " " +
         "    try "
         "      DoWork(); "
         "    catch var ex: Exception => return new " + w + "(ex); "

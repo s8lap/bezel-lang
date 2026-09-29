@@ -59,7 +59,7 @@ BEZEL_TEST(async_iter_token_routing_1525,
     auto r = runAotChecked(
         "module M; import System.Threading; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; yield return 2; yield return 3; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
@@ -84,7 +84,7 @@ BEZEL_TEST(async_iter_token_routing_1525,
     BEZEL_EXPECT_EQ(runFull(
         "module M; import System.Threading; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 42; yield return 99; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
@@ -108,7 +108,7 @@ BEZEL_TEST(async_iter_token_routing_1525,
     BEZEL_EXPECT_EQ(runFull(
         "module M; import System.Threading; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 7; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
@@ -173,7 +173,7 @@ BEZEL_TEST(async_iter_token_routing_1525,
     BEZEL_EXPECT_EQ(runFull(
         "module M; import System.Threading; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; yield return 2; yield return 3; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "

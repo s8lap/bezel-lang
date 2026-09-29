@@ -364,7 +364,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_static_owned_o
     auto r = runAot(
         std::string("module M; ") + kRes +
         "class Holder "
-        "  private static readonly owned _shared: Res := new Res(1); "
+        "  private static owned readonly _shared: Res := new Res(1); "
         "  public method Get(): int => 5; "
         "end Holder; "
         "class C public static method Main(): int "

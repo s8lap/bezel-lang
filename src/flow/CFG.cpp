@@ -380,6 +380,9 @@ private:
         if (auto* doBlock = dynamic_cast<const ast::DoEndBlock*>(&s)) {
             return visitDoEnd(*doBlock, from);
         }
+        if (auto* caseStmt = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            return visitCase(*caseStmt, from);
+        }
         if (dynamic_cast<const ast::ReturnStmt*>(&s)) {
             from->stmts.push_back(&s);
             recordStmtAwaits(from, s); // async-readiness 3a (additive)
@@ -570,6 +573,111 @@ private:
         CFGBlock* end = inner.runInto(b.body, bodyEntry);
         if (end) cfg_.addEdge(end, merge);
         return end;
+    }
+
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): a `case` STATEMENT. Each
+    // arm becomes its own block sequence (guard → body), all joining at a
+    // fresh Merge block. The scrutinee is recorded as a back-pointer on the
+    // case's entry block (`caseScrutinee`) so the ownership pass can locate
+    // it for the K8 full-expression boundary mark (`disposeOwnedScrutinee`)
+    // without re-walking the AST. The no-match fallthrough (§19.6) is a
+    // real edge from the entry block to the merge block, gated by the
+    // AST's cached exhaustiveness verdict (`noMatchEdgeStaticallyDead`).
+    //
+    // This retires the long hand-rolled armEnds/joinInto walker the
+    // ownership pass's `MethodOwnership::visitStmt` and
+    // `applyUsingVarBorrowPinInLambdaStmt` had to keep in lockstep with the
+    // real per-method CFG's if/while/for/try branches — the duplicated
+    // arm-join predicate that produced the entire
+    // #4116/#4117/#4138/#4141/#4142 family of false-rejects. The CFG-driven
+    // dataflow (`computeEntry`'s `joinInto` at the merge block) now
+    // computes the arm join for free, and the existing real CFG edges
+    // (`addEdge` from each arm's terminator to the function exit / loop
+    // afterEnd / header) handle return/throw/break/continue routing — no
+    // separate `armNeverFallsThrough` predicate needed at this layer.
+    CFGBlock* visitCase(const ast::CaseStmt& s, CFGBlock* from) {
+        CFGBlock* merge = cfg_.makeBlock(CFGBlock::Kind::Merge);
+        // Record the originating `case` on the merge so a forward analysis
+        // can locate the §28.3 branch-join diagnostic at the case's span
+        // (mirrors visitIf's merge->sourceStmt).
+        merge->sourceStmt = &s;
+        // fix #4146: also record the originating `case` on the entry
+        // block so the ownership pass's processBlock can fire the K8
+        // full-expression boundary mark (`disposeOwnedScrutinee`, #1795)
+        // without walking successors to find the merge — the entry block
+        // is where the case construct's `case EXPR of` keyword lives, and
+        // its K8 mark needs the CaseStmt AST node to set the flag on.
+        // The merge's own `sourceStmt` already serves the §28.3
+        // branch-join diagnostic lookup; this entry-side copy is additive.
+        from->sourceStmt = &s;
+        // Record the scrutinee Expr on the entry block so the ownership
+        // pass's processBlock can fire the K8 / checkRead side-band actions
+        // on it (mirrors visitIfBranches' `from->condition` field for
+        // if/elif conditions, except here it is the scrutinee, not the
+        // condition — a `case` has both, in different places).
+        from->caseScrutinee = s.scrutinee.get();
+        // The scrutinee's `await` sites (§30.2) execute in this entry
+        // block; record them so a later async-ownership pass finds them
+        // (mirrors visitIfBranches' `recordAwaitsInExpr(cfg_, from, ...)`
+        // for the if condition, but here for the scrutinee). The pattern
+        // match itself is non-`await`-bearing (Pattern is not an Expr and
+        // owns no UnaryExpr); only the scrutinee expression can carry
+        // awaits at this statement position.
+        if (s.scrutinee) recordAwaitsInExpr(cfg_, from, s.scrutinee.get());
+        // For each arm: emit a Branch block (the pattern-test decision
+        // point), a Linear block for the body, and connect the body's
+        // fall-through exit to the merge block. The arm guard (`when EXPR`)
+        // runs in the same Branch block as a follow-on guard (mirrors
+        // catch-arm `catchGuard` on the arm entry block — see #1591's
+        // rationale, which transfers verbatim here).
+        for (const auto& arm : s.arms) {
+            CFGBlock* armEntry = cfg_.makeBlock(CFGBlock::Kind::Branch);
+            cfg_.addEdge(from, armEntry);
+            // Record the arm's `when` guard (if any) on the arm entry
+            // block so the ownership pass's processBlock walks it through
+            // handleDischarge exactly like an if/while condition. The
+            // pattern itself is a Pattern (not an Expr), so it cannot carry
+            // an `await` and is not recorded via recordAwaitsInExpr — only
+            // the guard's expression form can. Mirrors visitTry's
+            // catch-arm `arm.guard` handling at the corresponding code path.
+            if (arm.guard) {
+                armEntry->catchGuard = arm.guard.get();
+                recordAwaitsInExpr(cfg_, armEntry, arm.guard.get());
+            }
+            // Walk the arm body in a sub-Builder so loops_/tryHandlers_ are
+            // preserved. For Block-form arms, run the body via runInto;
+            // for Expression-form arms, the arm body is an Expr (not a
+            // Stmt list) and is recorded on the arm entry block as a
+            // back-pointer (mirrors the scrutinee pattern above) so
+            // codegen / the ownership pass can locate it.
+            CFGBlock* armExit;
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody) {
+                    armEntry->caseArmExprBody = arm.exprBody.get();
+                    recordAwaitsInExpr(cfg_, armEntry, arm.exprBody.get());
+                }
+                armExit = armEntry; // no body stmts → no fall-through edge
+                cfg_.addEdge(armExit, merge);
+            } else {
+                Builder inner(cfg_, treatTryAsOpaque_);
+                inner.loops_ = loops_;
+                inner.tryHandlers_ = tryHandlers_;
+                armExit = inner.runInto(arm.stmts, armEntry);
+                if (armExit) cfg_.addEdge(armExit, merge);
+            }
+        }
+        // No-match fallthrough (§19.6): an unmatched value in statement
+        // position "falls through with no action" — a real edge to the
+        // merge block. The AST's cached exhaustiveness verdict
+        // (`noMatchEdgeStaticallyDead`, set by ExprTC::caseArmsExhaustive
+        // — see #4139) gates whether this edge is present: when set, the
+        // no-match edge is provably dead and codegen MUST lower it as a
+        // defined trap (`totalityGranted`, raising MatchFailureException or
+        // aborting) rather than as a fall-through to end-of-callable.
+        if (!s.noMatchEdgeStaticallyDead) {
+            cfg_.addEdge(from, merge);
+        }
+        return merge;
     }
 
     CFGBlock* visitWhile(const ast::WhileStmt& s, CFGBlock* from) {
@@ -885,6 +993,37 @@ private:
 };
 
 } // namespace
+
+// prep #4146 Stage 2-A (§28.3, v0.298): build a CFG for a lambda body.
+// Block-bodied lambdas: walks `lam->stmts` with the Builder, same as buildCFG.
+// Expression-bodied lambdas: creates a single Linear block that holds the
+// `exprBody` and connects it to the exit — the expression's value is the
+// lambda's implicit return value, and recording it in the block is sufficient
+// for ownership analysis to reach every sub-expression position.
+std::unique_ptr<CFG> CFG::buildLambdaBodyCFG(
+    const ast::LambdaExpr* lam,
+    const CFGBuildOptions& opts) {
+    auto cfg = std::make_unique<CFG>();
+    Builder builder(*cfg, opts.treatTryAsOpaque);
+    CFGBlock* end = nullptr;
+    if (lam->isBlockBody) {
+        end = builder.build(lam->stmts);
+    } else {
+        // Expression-bodied lambda: create a synthetic block that records the
+        // expression's await sites (if any) and links to exit. The expression
+        // is the implicit return value; ownership analysis reaches it through
+        // the block's stmt list exactly as it reaches every other expression
+        // position in a Linear block.
+        CFGBlock* block = cfg->makeBlock(CFGBlock::Kind::Linear);
+        cfg->addEdge(cfg->entry(), block);
+        recordAwaitsInExpr(*cfg, block, lam->exprBody.get());
+        end = block;
+    }
+    if (end) {
+        cfg->addEdge(end, cfg->exit());
+    }
+    return cfg;
+}
 
 std::unique_ptr<CFG> buildCFG(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,

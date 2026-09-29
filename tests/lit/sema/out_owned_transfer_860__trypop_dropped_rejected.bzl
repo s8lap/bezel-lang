@@ -13,7 +13,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push(move (new Cell(1))); var ok := s.TryPop(out owned var item); end; return 0; end Main; end C;
+module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push((new Cell(1))); var ok := s.TryPop(out owned var item); end; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `item` is implicitly disposed at the end of its scope
-// CHECK-SAME: (§28.3 auto-drop)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `item` is implicitly disposed at the end of its scope
+// CHECK-SAME: (§28.3 must-use / auto-drop)

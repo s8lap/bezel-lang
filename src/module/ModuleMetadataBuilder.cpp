@@ -447,6 +447,186 @@ bool hasModifier(const std::vector<std::string_view>& modifiers,
            modifiers.end();
 }
 
+// fix #4600 (§14.5 "Target-typed completion" / §14.1 / §2.8.3 rule 2, v0.307):
+// does the AST type `t` syntactically mention any name in `names` — as a bare
+// parameter reference, or nested inside a generic argument, an inline-array
+// element, or a function type's parameter/return slots? The AST-side twin of
+// sema's `collectBoundParamNamesFromRef` (ExprTypecheck_Calls.cpp), which asks
+// the same question of the loader's reconstructed `TypeRef`s; the two must
+// agree, because this routine decides what crosses the wire and that one
+// decides what the importer does with it. A bare parameter reference is a
+// single-part `QualifiedName` with no generic arguments of its own — the same
+// shape `bareTypeParamRef` recognizes on the TypeRef side.
+void astTypeMentionsNames(const ast::Type* t,
+                          const std::unordered_set<std::string_view>& names,
+                          std::unordered_set<std::string_view>& out) {
+    if (!t) return;
+    if (t->kind == ast::TypeKind::Named && t->name &&
+        t->name->parts.size() == 1 && t->genericArgs.empty() &&
+        names.count(t->name->parts.back()))
+        out.insert(t->name->parts.back());
+    for (const auto& ga : t->genericArgs)
+        astTypeMentionsNames(ga.get(), names, out);
+    astTypeMentionsNames(t->arrayElement.get(), names, out);
+    astTypeMentionsNames(t->funcReturn.get(), names, out);
+    for (const auto& fp : t->funcParams)
+        astTypeMentionsNames(fp.type.get(), names, out);
+}
+
+// fix #4600 (§14.5 phase 3 / §14.1 / §2.5 / §2.8.3 rule 2, v0.307): true when
+// `md` declares its OWN type parameters and its DECLARED RETURN TYPE mentions
+// at least one that NO formal parameter mentions — a RETURN-ONLY type
+// parameter, the shape §14.5 phase 3 ("target-typed completion") exists for.
+//
+// This is the exporter-side recognizer for the ONE generic-method shape whose
+// placeholder-compiled template is unsound cross-module AND is caught by no
+// existing gate. The argument-side gate (#1943, LlvmBackend_Calls2.cpp) fires
+// when a type-param-typed ARGUMENT reaches the i32-placeholder parameter at a
+// different width; a return-only parameter has no such argument, so that loop
+// never runs, and the call is emitted against the template whose return is the
+// i32 placeholder while the caller's slot is whatever the instantiation is.
+// MEASURED (#4600's two-module repro, `Factory.Create<T>(): owned T where T:
+// class, new()` called as `using var w: Widget := Factory.Create()`): exit 0
+// cross-module against exit 1 for the byte-identical single-module program —
+// the constructor never ran — and under generated-code AddressSanitizer a
+// `stack-buffer-overflow`, READ of size 8 at a 4-byte stack object.
+//
+// Shipping the body lets `ModuleLoader`'s existing re-parse attach a live
+// `ast::MethodDecl` (its non-generic-class widening already admits any class
+// with a non-empty `methodBodyText`) so codegen monomorphizes the call under
+// the concrete substitution, exactly as the single-module path does.
+//
+// DELIBERATELY NARROW — this is the #3645 scope-narrow re-opened for exactly
+// one shape, not lifted. A type parameter mentioned in ANY formal parameter is
+// excluded, which leaves in force:
+//   * #1937 (`Make<A, B>(a: A, b: B): Pair<A, B>`) — both parameters are
+//     argument-bound, nothing ships, the sema gate still rejects. Its body
+//     constructs a SIBLING generic record, which the single-class synthetic
+//     source the importer re-parses cannot resolve, so admitting it here would
+//     trade a clean reject for a reconstruction failure.
+//   * #1943 (`Count<T>(x: T): int`) — the return mentions no type parameter,
+//     nothing ships, the codegen argument-width gate still rejects.
+//   * `Echo<T>(x: T): T` — argument-bound, unchanged.
+// Verified by measurement, not by reading: with the gate widened to every
+// generic method both of those shapes newly COMPILE, which is the broader
+// #1937/#428 monomorphization work item and not this fix.
+bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
+    if (md.genericParams.empty() || !md.returnType) return false;
+    std::unordered_set<std::string_view> names;
+    for (const auto& gp : md.genericParams)
+        if (!gp.name.empty()) names.insert(gp.name);
+    if (names.empty()) return false;
+    std::unordered_set<std::string_view> boundByArg;
+    for (const auto& p : md.params)
+        astTypeMentionsNames(p.type.get(), names, boundByArg);
+    std::unordered_set<std::string_view> mentionedInReturn;
+    astTypeMentionsNames(md.returnType.get(), names, mentionedInReturn);
+    for (std::string_view nm : mentionedInReturn)
+        if (!boundByArg.count(nm)) return true;
+    return false;
+}
+
+// fix #5009 (§14.1 / §14.2 / §2.8.3 rule 2, v0.307): true when `md` declares
+// its OWN type parameters and a `where` clause gives one of them a TYPE bound
+// (`where T: IShape`, `where T: IComparable<T>`) or `new()`. Those are exactly
+// the two §14.2 forms that let a generic body USE a type-parameter-typed value
+// beyond copying/holding it: a type bound admits calls to the bound's members
+// (`v.Area()`), `new()` admits `new T()`. Neither can be lowered against the
+// i32 placeholder the defining module compiles the template with — the body
+// degrades to a zero/null return with the INTERNAL #2491 (or #2477) note — so
+// every call that reaches that template returns a silent zero. The #1943
+// argument-width gate hides it for a pointer-width argument, but not for a
+// call with no type-parameter-typed argument (`Mk<T>(): int where T: IShape,
+// new()`) nor for an i32-width instantiation (`Cmp<int>` over `where T:
+// IComparable<T>`): MEASURED on dcb17d57, both exit 0 where the single-module
+// twin returns the constraint method's value.
+//
+// Shipping the body routes the call through the same importer re-parse and
+// per-instantiation monomorphization #4600 uses for a return-only parameter.
+// Special-only constraints (`class`, `value`, `notnull`) and modifier
+// constraints grant no member access, so a body bounded only by them still
+// treats T opaquely and stays on the template — which is what keeps the #1943
+// (`Count<T>(x: T): int where T: value`) and #1937 (`where A: value`) shapes
+// on their existing clean rejects.
+//
+// DELIBERATELY NARROW on the bound, too: every TYPE bound on the method's own
+// parameters must resolve to a type DECLARED IN THIS MODULE. The importer
+// re-parses the body in a fresh SemaContext; an own-module bound there binds to
+// the IMPORTED TypeSymbol (the #3645 sibling registry), so the importer's
+// §14.2 call-site check and codegen see one identity. A bound on a builtin or
+// stdlib interface (`where T: INumber<T>`, `IComparable<T>`) is instead
+// re-synthesized by the fresh context as a DIFFERENT TypeSymbol, and the
+// identity-keyed conformance check then rejects a conforming argument —
+// MEASURED: `GenNum<T>(v: T): int where T: INumber<T> return 4;` called as
+// `GenNum<int>(5)` compiles and returns 4 today and was spuriously rejected
+// with the body shipped. That shape keeps the template path; it is the
+// fresh-context builtin-identity follow-up (#5021), not this fix.
+//
+// Shipping the body is NOT by itself a guarantee of a correct value. The
+// importer attaches it only if its exprSymbol remap binds every reference
+// inside the body to a member of the reconstructed type, to a parameter, or
+// to the reconstructed type itself. Members of the exporting module's public
+// siblings bind by identity. On this route the reconstruction fails closed
+// (`failClosed` in ModuleLoader's `parseAndAttachMethodBody`), and a sema-clean
+// typecheck alone is not enough. When the body is not attached, the call keeps
+// the template: a clean #1943 reject for a non-i32 type-parameter-typed
+// argument, but still the placeholder zero for a call with no such argument or
+// an i32-width one. That is the pre-existing #5022 residual, for example a
+// body that calls a PRIVATE helper the wire does not carry.
+//
+// Binding is not lowering either. The importer also refuses, on this route, a
+// body containing a lambda, a function-valued local or parameter, or a
+// generic method call; and when an attached body still does not lower, codegen
+// (`emitInlineGenericMethod`) turns the INTERNAL degrade into a located error
+// at the call site. So an attached body either produces the single-module
+// value or fails the compile.
+//
+// fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): ONLY a method whose
+// dispatch is statically resolved. A `virtual`, `override` or `abstract`
+// method, or any member of an interface, is excluded. Its call is lowered by
+// `emitVirtualGenericDispatch` (per-(class, type-argument) bodies selected by
+// the receiver's runtime descriptor), not by `emitInlineGenericMethod`, so
+// neither the importer's pre-attach refusal nor the codegen backstop sees it.
+// MEASURED on bd0405e6: `virtual VBox<T>(v: T): int where T: IShape` returned
+// 0 cross-module (twin 107), the same through an override on a base-typed
+// receiver returned 0 (twin 207), and a plain `v.Area() + 100` virtual body
+// ran the BASE body for a GV2 receiver, 107 with no warning (twin 207). The
+// cross-module override selection that last row exposes is #5031. Keeping the
+// body off the wire leaves the call on the pre-#5009 path.
+bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
+                                    sema::SemaContext& ctx) {
+    if (md.genericParams.empty()) return false;
+    if (hasModifier(md.modifiers, "virtual") ||
+        hasModifier(md.modifiers, "override") ||
+        hasModifier(md.modifiers, "abstract"))
+        return false;
+    std::unordered_set<std::string_view> names;
+    for (const auto& gp : md.genericParams)
+        if (!gp.name.empty()) names.insert(gp.name);
+    std::unordered_set<const sema::Symbol*> ownTypes;
+    if (const sema::ModuleSymbol* mod = ctx.module())
+        for (const sema::Symbol* child : mod->children)
+            if (dynamic_cast<const sema::TypeSymbol*>(child))
+                ownTypes.insert(child);
+    bool usesBound = false;
+    for (const auto& gc : md.genericConstraints) {
+        if (!names.count(gc.typeParam)) continue;
+        for (const auto& item : gc.items) {
+            if (item.kind == "new") {
+                usesBound = true;
+            } else if (item.kind == "type") {
+                if (!item.typeArg) return false;
+                const sema::TypeRef* b = ctx.resolvedType(*item.typeArg);
+                if (!b || !b->declaration ||
+                    !ownTypes.count(b->declaration))
+                    return false;
+                usesBound = true;
+            }
+        }
+    }
+    return usesBound;
+}
+
 std::string qualifiedSymbolName(const sema::Symbol* symbol,
                                 std::string_view moduleName) {
     if (!symbol) return {};
@@ -1020,6 +1200,15 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     out.serializedSkip     = m.serializedSkip;
     out.serializedOptional = m.serializedOptional;
     out.serializedWireName = std::string(m.serializedWireName);
+    // §9.2 "The `equality skip` clause" (v0.307; follow-up to fix #4643):
+    // §9.2 says "the artifact interface ([§2.8.2]) carries the clause exactly
+    // as it carries `serialized` clauses", so it is exported the same way and
+    // from the same place — the SYMBOL, which SymbolCollection filled from
+    // whichever of the three storage-bearing AST hosts this member has
+    // (positional field, auto-property, explicit field). Re-deriving it from
+    // `m.decl` here would miss the positional case outright, whose `decl` is
+    // the owning TypeDecl.
+    out.equalitySkip = m.equalitySkip;
 
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.decl)) {
         out.kind = MetaMemberKind::Field;
@@ -1304,7 +1493,25 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // non-parametric record) IS shipped.
             const bool isNonGenericClassRecordReturn =
                 methodReturnsRecord && md->genericParams.empty();
-            if ((isGenericType || isNonGenericClassRecordReturn) &&
+            // fix #4600 (§14.5 phase 3 / §14.1 / §2.8.3 rule 2, v0.307): the
+            // ONE generic-method shape the scope-narrow above leaves silently
+            // miscompiling — see `isReturnOnlyGenericMethod`'s header for the
+            // measurement and for why the #1937 and #1943 shapes are excluded
+            // rather than swept in. Ships for a generic method on a generic
+            // class too, where `isGenericType` already shipped it.
+            const bool isReturnOnlyGeneric = isReturnOnlyGenericMethod(*md);
+            // fix #5009 (§14.1 / §14.2, v0.307): a generic method whose own
+            // type parameter carries a type or `new()` bound — its placeholder
+            // template silently returns zero; see
+            // `isConstraintUsingGenericMethod`'s header.
+            // An interface member dispatches through the itable, so it is
+            // excluded like a virtual method (fix-forward 3, see the header).
+            const bool isConstraintUsingGeneric =
+                !(m.parent &&
+                  m.parent->kind == ast::TypeDeclKind::Interface) &&
+                isConstraintUsingGenericMethod(*md, ctx);
+            if ((isGenericType || isNonGenericClassRecordReturn ||
+                 isReturnOnlyGeneric || isConstraintUsingGeneric) &&
                 !source.empty() &&
                 md->span.begin.offset < md->span.end.offset &&
                 md->span.end.offset <= source.size()) {
@@ -1807,6 +2014,12 @@ void appendChoiceCases(const sema::TypeSymbol& t, sema::SemaContext& ctx,
                 mp.serializedOptional = pf.serialized->isOptional;
                 mp.serializedName = std::string(pf.serialized->name);
             }
+            // §35.7 / §9.2 "The `equality skip` clause" (v0.307, #4652):
+            // export the SAME way `serialized` above is — from the AST, which
+            // is always real on THIS side (the exporter's `caseDecl` is never
+            // an imported reconstruction; it is the module's own
+            // `ast::ChoiceCase`, per this function's header comment).
+            if (pf.equality) mp.equalitySkip = pf.equality->isSkip;
             mc.payload.push_back(std::move(mp));
         }
         out.choiceCases.push_back(std::move(mc));
@@ -2036,6 +2249,43 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
+        // fix #4572 (§15.1 / §2.8.3 rule 3, v0.306): for a generic class or
+        // record, also include private/internal CONST members. #4514 taught
+        // `buildConstStubs` (ModuleLoader.cpp) to declare every `MetaMemberKind
+        // ::Const` entry of `td.members` in each synthetic reconstruction
+        // source, so a verbatim body/signature text carried across the wire
+        // can resolve a const NAME — but that only helps a const that already
+        // reached `out.members`, which before this fix meant `exported`
+        // (public/protected) only. §15.1 makes an inline-array EXTENT part of
+        // the type, and an extent can be spelled as a const name on a
+        // PUBLIC constructor signature —
+        //   public class MxC<T>
+        //     private const MAX: int := 2;
+        //     public constructor(a: [MAX]int) … end constructor;
+        // — where `constructor(a: [MAX]int)` is unambiguously part of the
+        // exported surface (§13.1) even though `MAX` itself is `private`: the
+        // VISIBILITY of the const that names an extent is an implementation
+        // detail of the exporter, not a property of the signature it appears
+        // in (§2.8.3 rule 3: "the artifact interface must carry enough to
+        // reconstruct every public signature"). Without this widening,
+        // `ctorBodyText` carries `[MAX]int` verbatim but no reconstruction
+        // source declares `MAX`, so it re-parses unbound, TypeResolution
+        // leaves `arraySizeValue` at -1, and codegen's `lowerTypeRef` answers
+        // the unfoldable-extent placeholder — the #4514 guard now reports a
+        // clean §15.1 diagnostic instead of reading an unset `llvm::Value*`,
+        // but the construction is still rejected where the single-module twin
+        // compiles. Only name + type + valueText cross (via `convertMember`,
+        // identical to an exported const) — no storage, no ABI change, since
+        // §22.12 emits no global for a const. Mirrors `includeForCtorBody`
+        // (#695) / `includeForMethodBody` (#1224): the const stays
+        // inaccessible outside the class; the stub exists solely for sema
+        // name-resolution inside a re-parsed body or signature.
+        bool isConst = !isMethod && !isField && !isAutoPropStorage &&
+            dynamic_cast<const sema::ConstMemberSymbol*>(ms) != nullptr;
+        bool includeForConst = isGenericMonomorphized && isConst &&
+            !exported &&
+            (member->visibility == ast::Visibility::Private ||
+             member->visibility == ast::Visibility::Internal);
         // fix #2456 (§22.8 / §2.8.2-§2.8.3, v0.235): a non-static instance
         // field occupies a slot in the class's PHYSICAL layout regardless of
         // its §13 visibility — declaration order, not exported-surface
@@ -2123,7 +2373,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             (t.kind == ast::TypeDeclKind::Class ||
              t.kind == ast::TypeDeclKind::Record);
         if (!exported && !includeForCtorBody && !includeForMethodBody &&
-            !includeForLayout)
+            !includeForConst && !includeForLayout)
             continue;
         MetaMember mm;
         if (convertMember(*member, inInterface, ctx, mm, isGenericMonomorphized, source)) {
@@ -2236,24 +2486,79 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // base clause argument list is BYTE-IDENTICAL to a pre-#3916 build (the
     // field is left empty, `emitTypeDecl`'s guard skips the record, and the
     // module's header hash is unchanged).
-    if (t.hasPositionalFields && !source.empty()) {
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
-            if (!td->primaryBaseCtorArgs.empty()) {
-                std::string joined;
-                for (std::size_t i = 0; i < td->primaryBaseCtorArgs.size(); ++i) {
-                    const auto& a = td->primaryBaseCtorArgs[i];
-                    if (!a.value) continue;
-                    const std::size_t begin = a.value->span.begin.offset;
-                    const std::size_t end = a.value->span.end.offset;
-                    if (begin >= end || end > source.size() ||
-                        a.value->span.begin.line == 0)
-                        continue;
-                    if (i > 0) joined += ", ";
-                    joined.append(source.substr(begin, end - begin));
-                }
-                out.baseCtorArgsText = std::move(joined);
-            }
+    //
+    // SEAM-DEBT: #3911 — and reused by the §22.16 invariant-text block below.
+    // This is the EXPORTER: `t` is the local module's freshly-parsed type, so
+    // the AST half is present by construction and the read is safe (same
+    // argument `collectInvariants` records at its own identical read). The
+    // cast is hoisted here rather than repeated so the #3152 seam ratchet's
+    // per-file class-1 count does not rise for a second consumer of the very
+    // same local-only fact.
+    const auto* selfTd = !source.empty()
+                             ? dynamic_cast<const ast::TypeDecl*>(t.decl)
+                             : nullptr;
+    if (t.hasPositionalFields && selfTd != nullptr &&
+        !selfTd->primaryBaseCtorArgs.empty()) {
+        std::string joined;
+        for (std::size_t i = 0; i < selfTd->primaryBaseCtorArgs.size(); ++i) {
+            const auto& a = selfTd->primaryBaseCtorArgs[i];
+            if (!a.value) continue;
+            const std::size_t begin = a.value->span.begin.offset;
+            const std::size_t end = a.value->span.end.offset;
+            if (begin >= end || end > source.size() ||
+                a.value->span.begin.line == 0)
+                continue;
+            if (i > 0) joined += ", ";
+            joined.append(source.substr(begin, end - begin));
         }
+        out.baseCtorArgsText = std::move(joined);
+    }
+
+    // §22.16 / §2.8.2 (fix #4592): this class's OWN `invariant(E);` members,
+    // re-rendered as source text so the importer can RE-PARSE them into live
+    // expressions and evaluate them at §22.16's instrumentation points.
+    //
+    // WHY THE EXISTING CARRIAGE IS NOT ENOUGH. `out.invariants` (the §2.8.2
+    // contract records, built by `typeInvariants` above) already crosses, and
+    // `ModuleLoader` already publishes it as `TypeSymbol::invariantContracts`
+    // — but a record's payload is `canonicalText`, whose §2.8.2 definition
+    // replaces every name with its declaration-resolved, module-qualified
+    // spelling. MEASURED: an exported `invariant(v > 0);` over the field `v`
+    // canonicalizes to `InvLibA.BaseA.v > 0`, which does not re-parse into an
+    // expression evaluable against `this`. §2.8.2 anticipates the split ("An
+    // implementation may additionally carry each clause's display text
+    // (original names) for diagnostics; display text never participates in
+    // identity") — `ownInvariantText` is that second, identity-free channel.
+    //
+    // The exporter does NOT canonicalize or rewrite: the expression's span is
+    // sliced out of `source` verbatim and wrapped back into an `invariant(…);`
+    // member, exactly as #662c's `dtorBodyText` and #3916's `baseCtorArgsText`
+    // slice their fragments. `static` invariants are skipped: §22.16 makes one
+    // INERT in this revision ("`static invariant(false);` compiles and does
+    // nothing"), and codegen's `emitInvariantCheck` excludes them on the local
+    // side too, so carrying one would create a check across the boundary that
+    // the same program does not get in-module.
+    //
+    // Conditional on the class declaring at least one, so a module whose
+    // classes declare none produces BYTE-IDENTICAL metadata to a pre-#4592
+    // build (`emitTypeDecl`'s guard skips the record and `hashTypeDecl`'s
+    // fold is guarded on the same predicate).
+    if (t.kind == ast::TypeDeclKind::Class && selfTd != nullptr) {
+        std::string joined;
+        for (const auto& member : selfTd->members) {
+            const auto* inv =
+                dynamic_cast<const ast::InvariantDecl*>(member.get());
+            if (!inv || !inv->expr || inv->isStatic) continue;
+            const std::size_t begin = inv->expr->span.begin.offset;
+            const std::size_t end = inv->expr->span.end.offset;
+            if (begin >= end || end > source.size() ||
+                inv->expr->span.begin.line == 0)
+                continue;
+            joined += "invariant(";
+            joined.append(source.substr(begin, end - begin));
+            joined += ");\n";
+        }
+        out.ownInvariantText = std::move(joined);
     }
 
     // §9.8 / §2.8.3 rule 4 (#3179, family F10 of umbrella #3152): the

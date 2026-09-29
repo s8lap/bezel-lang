@@ -119,19 +119,20 @@ int runUnderLeakSanitizer550(const std::string& source, bool detectLeaks = true)
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -141,14 +142,17 @@ int runUnderLeakSanitizer550(const std::string& source, bool detectLeaks = true)
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
     std::string runCmd =
         std::string("ASAN_OPTIONS=detect_leaks=") +
         (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
     return 0;                                                       // clean
 }
@@ -338,7 +342,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public owned Child: Inner; "
         "  public property Tag: string; "
         "  public constructor(owned child: Inner, tag: string) "
-        "    Child := move child; Tag := tag; "
+        "    Child := child; Tag := tag; "
         "  end constructor; "
         "end Outer; "
         "class C public static method Main(): int "
@@ -367,14 +371,14 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public owned L: Leaf; "
         "  public property N: int; "
         "  public constructor(owned l: Leaf, n: int) "
-        "    L := move l; N := n; "
+        "    L := l; N := n; "
         "  end constructor; "
         "end Middle; "
         "class Root : ISerializable, IDeserializable "
         "  public owned M: Middle; "
         "  public property Name: string; "
         "  public constructor(owned m: Middle, name: string) "
-        "    M := move m; Name := name; "
+        "    M := m; Name := name; "
         "  end constructor; "
         "end Root; "
         "class C public static method Main(): int "
@@ -495,7 +499,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
-        "    Tag := tag; OptChild := move optChild; "
+        "    Tag := tag; OptChild := optChild; "
         "  end constructor; "
         "end Parent; "
         "class C public static method Main(): int "
@@ -526,7 +530,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
-        "    Tag := tag; OptChild := move optChild; "
+        "    Tag := tag; OptChild := optChild; "
         "  end constructor; "
         "end Parent; "
         "class C public static method Main(): int "
@@ -711,12 +715,12 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public Alias: Slot?; "  // nullable back-edge
         // §9.8 Deserialize binds {Target, Alias} through this constructor.
         "  public constructor(owned target: Slot, alias: Slot?) "
-        "    Target := move target; Alias := alias; "
+        "    Target := target; Alias := alias; "
         "  end constructor; "
         // Serialize-side convenience ctor: wire the self-alias from the receiver
         // (`this.Target`), admissible under §28.3. Not a §9.8 selection match.
         "  public constructor(owned target: Slot) "
-        "    Target := move target; Alias := Target; "
+        "    Target := target; Alias := Target; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
@@ -865,7 +869,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         // Container: owns a Shape field — triggers polymorphic ser/deser.
         "class Container : ISerializable, IDeserializable "
         "  public owned S: Shape; "
-        "  public constructor(owned s: Shape) S := move s; end constructor; "
+        "  public constructor(owned s: Shape) S := s; end constructor; "
         "end Container; "
         "class C public static method Main(): int "
         "  using var box := new Container(new Circle(5.0)); "
@@ -905,7 +909,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "end Square; "
         "class Container : ISerializable, IDeserializable "
         "  public owned S: Shape; "
-        "  public constructor(owned s: Shape) S := move s; end constructor; "
+        "  public constructor(owned s: Shape) S := s; end constructor; "
         "end Container; "
         "class C public static method Main(): int "
         "  using var box := new Container(new Square(3.0)); "
@@ -1085,13 +1089,13 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "class Mid : ISerializable, IDeserializable "
         "  public owned L: Leaf; "
         "  public Name: string := \"\"; "
-        "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
+        "  public constructor(name: string, owned l: Leaf) Name := name; L := l; end constructor; "
         "end Mid; "
         // Root: fields M, Id — ctor (id, m) — reversed order (the repro shape)
         "class Root : ISerializable, IDeserializable "
         "  public owned M: Mid; "
         "  public Id: int := 0; "
-        "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "
+        "  public constructor(id: int, owned m: Mid) Id := id; M := m; end constructor; "
         "end Root; "
         "class Program "
         "  public static method Main(): int "
@@ -1215,12 +1219,12 @@ const char* kTruncatedInput3Level =
     "class Mid : ISerializable, IDeserializable "
     "  public owned L: Leaf; "
     "  public Name: string := \"\"; "
-    "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
+    "  public constructor(name: string, owned l: Leaf) Name := name; L := l; end constructor; "
     "end Mid; "
     "class Root : ISerializable, IDeserializable "
     "  public owned M: Mid; "
     "  public Id: int := 0; "
-    "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "
+    "  public constructor(id: int, owned m: Mid) Id := id; M := m; end constructor; "
     "end Root; "
     "class Program "
     "  public static method Main(): int "

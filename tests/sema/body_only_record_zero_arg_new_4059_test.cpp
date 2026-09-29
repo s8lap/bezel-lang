@@ -251,17 +251,21 @@ BEZEL_TEST(body_only_record_zero_arg_new_4059,
         "class C public static method Main(): int "
         "  var r := new Combo4059(4, 5); return r.X; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
-    // §22.5 arity reject — `new Combo4059(4, 5)` clashes with the implicit
-    // positional ctor (takes `X: int`, 1 arg). The substring `argument`
-    // matches every arity-error wording the codebase emits (e.g. "expects
-    // N argument(s)", "takes N positional argument(s)", "argument count").
-    // Counts as protected per the ambiguous_ran_false ratchet: a crash /
-    // signal / timeout / ASan report would not produce an Error whose
-    // message contains the substring, so the row distinguishes a genuine
-    // rejection from a silent runtime failure mode.
-    BEZEL_EXPECT_TRUE(hasErrorMsg(r, "argument"));
+    // UPDATED by fix #4712 (§22.5, §9.1, v0.307). This row previously
+    // asserted the §22.5 arity REJECT, because `new Combo4059(4, 5)` was
+    // matched only against the implicit positional constructor (1 arg) and
+    // the explicit 2-arg body constructor was never an overload candidate.
+    // #4712 makes a combined-form record's body constructors candidates, so
+    // the call now resolves to `constructor(a, b)` and runs.
+    //
+    // The row's SUBJECT is unchanged and still load-bearing: a record WITH
+    // positional fields must take the earlier arm and never reach the
+    // body-only branch this file is about. Pre-#4712 that was demonstrated
+    // by which diagnostic fired; now it is demonstrated by the program
+    // running and returning the explicit constructor's own answer.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(9, r.exitCode);  // 4 + 5, via `constructor(a, b)`
 }
 
 // ============================================================================

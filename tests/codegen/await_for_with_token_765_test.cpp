@@ -24,7 +24,7 @@ int runFull(const std::string& program) {
 BEZEL_TEST(await_for_with_token_765, repro_none) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; "
         "    yield return 2; "
         "  end Gen; "
@@ -43,7 +43,7 @@ BEZEL_TEST(await_for_with_token_765, repro_none) {
 BEZEL_TEST(await_for_with_token_765, token_from_cts) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 10; "
         "    yield return 20; "
         "    yield return 30; "
@@ -65,7 +65,7 @@ BEZEL_TEST(await_for_with_token_765, token_from_cts) {
 BEZEL_TEST(await_for_with_token_765, with_and_without_coexist) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; "
         "    yield return 2; "
         "  end Gen; "

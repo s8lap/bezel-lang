@@ -56,6 +56,7 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/force_sanitize.hpp"  // #4569: forceSanitizeAddress
 
 namespace {
 
@@ -131,19 +132,31 @@ int runUnderSanitizer(const std::string& source, const std::string& san,
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        // #4569: a PER-CALL decision, not the rename the other 39 files in
+        // the #3917 burn-down took. This runner is parameterised on `san` and
+        // builds its link line as `-fsanitize=` + san, so OR-ing the sweep in
+        // unconditionally (what `emitObjectFileForTest` does) would hand an
+        // ASan-instrumented object to a `-fsanitize=thread` link -- wrong,
+        // not merely useless. Thread the sweep only on the "address" path.
+        // The explicit fourth argument is also what exempts this call from
+        // check_uninstrumented_emit_runners' by-arity bypassing_calls count.
+        const bool sweepThisObject =
+            san == "address" && bezel::test::forceSanitizeAddress();
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err,
+                                            sweepThisObject))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -159,13 +172,16 @@ int runUnderSanitizer(const std::string& source, const std::string& san,
     std::string linkCmd = "clang++ -fsanitize=" + san + " -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
 
     std::string runCmd =
         std::string(runOpts) + " " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
     return 0;                                                      // clean
 }

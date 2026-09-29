@@ -103,6 +103,7 @@
 #include <sys/wait.h>
 #include <vector>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "driver/Driver.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"

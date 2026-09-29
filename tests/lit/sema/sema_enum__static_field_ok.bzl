@@ -14,5 +14,5 @@
 
 module M; enum E A, B; public static _x: int := 0; end E;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_x` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_x` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

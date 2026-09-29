@@ -109,11 +109,33 @@ struct GenericParam {
 // Slice 6 introduces FieldDecl only; other kinds arrive with their slices.
 struct Member : Node {};
 
-// A.4: `FieldDecl ::= Visibility "static"? "owned"? "readonly"?
-//                     Identifier ":" Type (":=" Expression)? ";"`.
+// §9.2 EqualityClause (v0.298+). `equality` is a contextual keyword
+// (App. B.2) lexed as Identifier; `skip` is also contextual. The grammar
+// admits this on the same storage-bearing sites as `serialized` —
+// PositionalField, CaseField (choice payload), explicit FieldDecl, and
+// auto-property PropertyBody — but NOT on EnumConstant or ChoiceCase
+// (those are §9.2 inert-annotation rejects). Only `skip` exists: rename
+// and `optional` have no equality analogue, so the vocabulary is one word,
+// closed (spec §9.2, line 1385). Sema enforces the inert-annotation
+// rejection on statics, computed properties, methods, enum constants, and
+// choice cases — see fix #4643 / spec §9.2.
+//
+// Defined BEFORE FieldDecl (line 114 below) and Param (line 597 below)
+// because both embed `std::unique_ptr<EqualityClause>` and the compiler
+// needs the complete type to instantiate the unique_ptr.
+struct EqualityClause {
+    bool isSkip = false;            // `equality skip` — the only form
+};
+
+// A.4: `FieldDecl ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
+//                     EqualityClause? Identifier ":" Type (":=" Expression)? ";"`.
 struct FieldDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // "static", "owned", "readonly"
+    // §9.2 EqualityClause on an explicit field declaration. Grammar places
+    // it BEFORE the Identifier (A.4 FieldDecl, v0.298). Sema rejects the
+    // clause on a `static` field as an inert annotation (§9.2 line 1419).
+    std::unique_ptr<EqualityClause> equality;
     std::string_view name;
     std::unique_ptr<Type> type;
     std::unique_ptr<Expr> initializer; // null if no `:= Expr` was written
@@ -594,6 +616,10 @@ struct Param {
     // A.4 PositionalField's SerializedClause. Only populated for record
     // positional fields — other Param uses leave this null.
     std::unique_ptr<SerializedClause> serialized;
+    // §9.2 EqualityClause on a PositionalField or CaseField (§35.7).
+    // Only populated for record positional fields and choice payload
+    // fields — other Param uses leave this null.
+    std::unique_ptr<EqualityClause> equality;
     // §27.4 (v0.183, #1408) / A.7 `LambdaDestructure`: non-null when this
     // LambdaParam was written as a record-destructuring pattern
     // (`(Entry(k, v)) => ...`) instead of a plain identifier. When set,
@@ -757,8 +783,12 @@ struct DestructorDecl : Member {
 // either — a `static invariant` in an ordinary class compiles clean today,
 // and per the spec text above, should.
 //
-// Slice 1 carries the parsed member only; instrumentation, instrumentation
-// set, and the checked/unchecked face split land in later slices.
+// Slice 1 carried the parsed member only. Instrumentation landed with #2941
+// (construction exit, public-method entry/exit), and the §22.16
+// checked/unchecked FACE SPLIT with fix #4597 (v0.306) — see
+// `Emitter::uncheckedFaceFor` in LlvmBackend_Setup.cpp. Still outstanding on
+// the instrumentation set: public SETTERS (§22.16 lists them as an
+// instrumentation point; no site emits a check for one).
 struct InvariantDecl : Member {
     bool isStatic = false;
     std::unique_ptr<Expr> expr;
@@ -842,6 +872,8 @@ struct PropertyDecl : Member {
     bool autoAccessorIsSet = false; // true=set, false=get
     // Slice 41: SerializedClause on the auto-property form.
     std::unique_ptr<SerializedClause> serialized;
+    // §9.2 EqualityClause on the auto-property form (after `serialized`).
+    std::unique_ptr<EqualityClause> equality;
     std::vector<PropertyAccessor> accessors; // Block-body case
     std::string_view blockEndLabel;          // optional Identifier after `end`
     // Indexer form (A.4 IndexerDecl): the index parameter list appears as
@@ -1094,6 +1126,41 @@ struct IdentifierExpr : Expr {
     // sound however many such calls a program contains, in either order.
     // // per §28.3, §28.6
     bool disposeReclaimsReassignedBorrow = false;
+    // fix #4734 (§35.5 *The owning match*, §28.6 "Who may call Dispose()",
+    // §17.13, §28.8.1, v0.307): set by the ownership pass on every occurrence
+    // of an arm binding an OWNING match transferred a payload into that
+    // CONSUMES it — the receiver of an explicit `r.Dispose()`, the operand of
+    // a discard `_ := r;`, and the operand of a `move r`. §35.5 makes such a binding "an **owned local of the arm
+    // body's scope**" and names both spellings as warning-free discharges, but
+    // codegen's `explicitDisposeOwnedReceiverSlot` is LOCALDECL-ONLY and an
+    // arm binding's `decl` is a `BindingPattern`, so both fell to its trailing
+    // `return nullptr`: the destructor would run and the heap block LEAK.
+    // MEASURED pre-fix on `_ := w;`: 24 bytes in 1 allocation under
+    // LeakSanitizer, on a program the compiler ACCEPTED.
+    //
+    // Per-occurrence for the same reason `disposeReclaimsReassignedBorrow` is:
+    // only the sites the ownership pass proved to be an owning-match transfer
+    // binding are stamped, so a same-named binding of a BORROWING match — whose
+    // payload the scrutinee's owner still disposes — can never reclaim.
+    // Reclaiming here is exactly-once: #4617's per-slot mark
+    // (`dischargeOwningMatchTransfers`) already zeroes the transferred slot in
+    // the scrutinee temp at the top of the selected arm, so the construct-
+    // completion reclaim declines it.
+    //
+    // At a `move r` the flag instead asks codegen to NULL the binding's slot
+    // after the transfer, which is what keeps a SECOND consume harmless: the
+    // ownership dataflow keeps no `states_` entry for a pattern binding, so it
+    // cannot reject `using var u := move r; r.Dispose();` the way it rejects
+    // that shape on an ordinary owned local (§28.8.1: "a moved-from binding is
+    // unreadable until reassigned"). The reclaim above is null-guarded, so a
+    // nulled slot makes the later consume a no-op instead of a double free —
+    // the same null-site reasoning #4016 records for the K3.4 arm-transfer
+    // discharge, and the reason this flag had to cover the `move` spelling
+    // before the other two could be admitted at all. A second consume is
+    // therefore memory-safe but still UNDIAGNOSED; diagnosing it needs the
+    // `states_` entry #4634's auto-drop introduces.
+    // // per §35.5, §28.6, §17.13, §28.8.1, v0.307
+    bool owningMatchTransferBinding = false;
 };
 
 // Source-level parentheses (`(expr)`) are NOT represented as their own AST

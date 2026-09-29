@@ -8,26 +8,26 @@ spec_0005	spec	283-Transitive-dependencies-and-cross-artifact-type-identity	skip
 spec_0006	spec	46-string	fragment	compiles	
 spec_0007	spec	52-Explicit-conversions	skip	n/a	skip:incomplete-fragment
 spec_0008	spec	53-Nullable-casts	skip	n/a	skip:incomplete-fragment
-spec_0009	spec	54-Enum-casts	skip	n/a	skip:incomplete-fragment
+spec_0009	spec	54-Enum-casts	fragment	compiles	preamble; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0010	spec	61-Integer-arithmetic	fragment	compiles	
 spec_0011	spec	61-Integer-arithmetic	fragment	compiles	
-spec_0012	spec	66-Compound-assignments	skip	n/a	blocked-on-#2741 (docs-ahead: §6.6 checked write-back compound assignment; cf. #2985)
+spec_0012	spec	66-Compound-assignments	fragment	compiles	env:category,counts; activated 2026-09-21 coverage pass (was blocked-on-#2741 (docs-ahead: §6.6 checked write-back compound assignment, cf. #2985))
 spec_0013	spec	71-Non-nullable-and-nullable-types	fragment	compiles	
-spec_0014	spec	74-Member-access-on-nullable-values	skip	n/a	skip:incomplete-fragment
+spec_0014	spec	74-Member-access-on-nullable-values	fragment	compiles	preamble; env:GetUser; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0015	spec	Narrowing-applies-to-locals-and-readonly-fields-only	skip	n/a	skip:incomplete-fragment
 spec_0016	spec	75-Null-conditional-access	skip	n/a	skip:incomplete-fragment
 spec_0017	spec	76-Null-conditional-call-args	fragment	compiles	
 spec_0018	spec	77-Null-coalescing-and	skip	n/a	skip:incomplete-fragment
 spec_0019	spec	81-Definition	skip	n/a	skip:signature
 spec_0020	spec	91-Positional-records	fragment	compiles	
-spec_0021	spec	91-Positional-records	skip	n/a	skip:incomplete-fragment (carried spec_0016)
+spec_0021	spec	91-Positional-records	fragment	compiles	activated 2026-09-21 coverage pass (was skip:incomplete-fragment (carried spec_0016))
 spec_0022	spec	92-Body-records	fragment	compiles	
 spec_0023	spec	The-equality-skip-clause	skip	n/a	blocked-on-#3050 (docs-ahead: equality-skip, v0.244)
 spec_0024	spec	93-Combined-form	fragment	compiles	
 spec_0025	spec	95-Non-destructive-update-with	fragment	compiles	preamble
 spec_0026	spec	96-Records-and-inheritance	fragment	compiles	
 spec_0027	spec	Polymorphic-dispatch	skip	n/a	skip:incomplete-fragment (carried spec_0021)
-spec_0028	spec	99-Constructor-only-records	skip	n/a	skip:literal-listing
+spec_0028	spec	99-Constructor-only-records	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 spec_0029	spec	101-Basic-syntax	fragment	compiles	
 spec_0030	spec	102-Explicit-values	fragment	compiles	
 spec_0031	spec	103-Underlying-type	fragment	compiles	
@@ -35,11 +35,11 @@ spec_0032	spec	104-Methods-properties-static-members	skip	n/a	blocked-on-#1723 (
 spec_0033	spec	104-Methods-properties-static-members	skip	n/a	skip:signature-listing
 spec_0034	spec	104-Methods-properties-static-members	skip	n/a	skip:incomplete-fragment
 spec_0035	spec	105-Restrictions	fragment	compiles	
-spec_0036	spec	106-Case-matching	skip	n/a	skip:incomplete-fragment
+spec_0036	spec	106-Case-matching	fragment	compiles	preamble; env:p; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0037	spec	111-Class-declaration	skip	n/a	skip:signature-listing
 spec_0038	spec	Primary-constructors	skip	n/a	skip:signature-listing
 spec_0039	spec	Primary-constructors	skip	n/a	skip:signature-listing
-spec_0040	spec	Primary-constructors	skip	n/a	skip:signature-listing
+spec_0040	spec	Primary-constructors	fragment	compiles	activated 2026-09-21 coverage pass (was skip:signature-listing)
 spec_0041	spec	Primary-constructors	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 spec_0042	spec	112-Interface-declaration	skip	n/a	skip:signature
 spec_0043	spec	owned-in-interface-signatures	fragment	compiles	
@@ -52,7 +52,7 @@ spec_0049	spec	118-Static-interface-members	fragment	compiles	wrap:mixed
 spec_0050	spec	124-Sealing	fragment	compiles	wrap:mixed; preamble
 spec_0051	spec	125-Abstract-classes-and-members	fragment	compiles	
 spec_0052	spec	126-async-and-abstract	skip	n/a	skip:incomplete-fragment
-spec_0053	spec	127-Type-tests-is-is-not-as	skip	n/a	skip:incomplete-fragment
+spec_0053	spec	127-Type-tests-is-is-not-as	fragment	compiles	preamble; env:animal; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0054	spec	127-Type-tests-is-is-not-as	skip	n/a	skip:incomplete-fragment
 spec_0055	spec	128-Constructor-chaining	skip	n/a	skip:signature-listing (carried spec_0044)
 spec_0056	spec	129-Variance	fragment	compiles	
@@ -66,8 +66,8 @@ spec_0063	spec	145-Type-argument-inference-for-generic-methods	error	diagnose
 spec_0064	spec	151-Inline-arrays	fragment	compiles	
 spec_0065	spec	151-Inline-arrays	fragment	compiles	preamble
 spec_0066	spec	151-Inline-arrays	fragment	compiles	preamble
-spec_0067	spec	1511-Owning-inline-arrays	skip	n/a	skip:incomplete-fragment
-spec_0068	spec	152-Heap-arrays	skip	n/a	skip:incomplete-fragment
+spec_0067	spec	1511-Owning-inline-arrays	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+spec_0068	spec	152-Heap-arrays	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0069	spec	154-Collection-literals	skip	n/a	skip:syntax-snippet (carried spec_0057)
 spec_0070	spec	154-Collection-literals	skip	n/a	skip:incomplete-fragment
 spec_0071	spec	154-Collection-literals	error	diagnose	
@@ -75,27 +75,27 @@ spec_0072	spec	154-Collection-literals	skip	n/a	skip:mixed (top-level decls + st
 spec_0073	spec	1541-The-user-defined-sequence-literal-protocol	skip	n/a	skip:signature-listing
 spec_0074	spec	1541-The-user-defined-sequence-literal-protocol	skip	n/a	skip:signature-listing
 spec_0075	spec	1541-The-user-defined-sequence-literal-protocol	skip	n/a	skip:elided
-spec_0076	spec	156-Slicing	skip	n/a	skip:incomplete-fragment
+spec_0076	spec	156-Slicing	fragment	compiles	env:Process,arr; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0077	spec	161-Construction	fragment	compiles	
 spec_0078	spec	162-Open-ended-ranges	skip	n/a	skip:syntax-snippet (carried spec_0066)
 spec_0079	spec	163-The-RangeT-type	skip	n/a	skip:signature-listing
 spec_0080	spec	164-Stride	fragment	compiles	
-spec_0081	spec	165-Iteration	skip	n/a	skip:incomplete-fragment
+spec_0081	spec	165-Iteration	fragment	compiles	env:Process,n; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0082	spec	165-Iteration	fragment	compiles	
 spec_0083	spec	Open-ended-ranges	skip	n/a	skip:elided
 spec_0084	spec	Open-ended-ranges	skip	n/a	skip:elided
-spec_0085	spec	174-The-is-is-not-and-as-operators	skip	n/a	skip:incomplete-fragment
-spec_0086	spec	175-The-in-operator	skip	n/a	skip:incomplete-fragment
+spec_0085	spec	174-The-is-is-not-and-as-operators	fragment	compiles	preamble; env:Acquire; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+spec_0086	spec	175-The-in-operator	fragment	compiles	env:numbers,score; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0087	spec	176-The-increment-and-decrement-operators	fragment	compiles	
-spec_0088	spec	Incrementdecrement-on-indexer-slots	skip	n/a	skip:incomplete-fragment
-spec_0089	spec	Incrementdecrement-on-indexer-slots	skip	n/a	skip:incomplete-fragment
+spec_0088	spec	Incrementdecrement-on-indexer-slots	fragment	compiles	env:category,counts; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+spec_0089	spec	Incrementdecrement-on-indexer-slots	fragment	compiles	env:expr,i; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0090	spec	177-The-new-operator	skip	n/a	skip:syntax-snippet (carried spec_0080)
 spec_0091	spec	179-The-nameof-operator	skip	n/a	skip:syntax-snippet (carried spec_0081)
 spec_0092	spec	1710-The-typeof-operator	skip	n/a	skip:incomplete-fragment
 spec_0093	spec	1710-The-typeof-operator	skip	n/a	skip:signature
 spec_0094	spec	1712-The-throw-expression	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 spec_0095	spec	1713-The-discard-_	skip	n/a	skip:incomplete-fragment
-spec_0096	spec	1713-The-discard-_	skip	n/a	skip:incomplete-fragment
+spec_0096	spec	1713-The-discard-_	fragment	compiles	env:dict,key; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0097	spec	1713-The-discard-_	error	diagnose	
 spec_0098	spec	The-anonymous-owning-binding-using-var-_	skip	n/a	skip:incomplete-fragment
 spec_0099	spec	1714-Constant-expressions	fragment	compiles	
@@ -115,26 +115,26 @@ spec_0112	spec	191-Forms	fragment	compiles	wrap:mixed; env:delta
 spec_0113	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
 spec_0114	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
 spec_0115	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
-spec_0116	spec	192-Arms	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0116	spec	192-Arms	fragment	compiles	wrap:mixed; env:Log,score; activated 2026-09-21 coverage pass (was skip:mixed (top-level decls + statements, no single wrap, cf. #683))
 spec_0117	spec	193-Patterns	skip	n/a	blocked-on-#1409 (docs-ahead: named destructure v0.224 incl. the v0.250 marked slot, #3087; hand-added v0.250)
 spec_0118	spec	194-Guards	fragment	compiles	wrap:mixed; env:temperature
 spec_0119	spec	196-Exhaustiveness	skip	n/a	skip:elided
 spec_0120	spec	197-Termination	fragment	compiles	wrap:mixed; env:score,month
 spec_0121	spec	20-The-if-Expression	skip	n/a	skip:syntax-snippet
-spec_0122	spec	20-The-if-Expression	skip	n/a	skip:incomplete-fragment
+spec_0122	spec	20-The-if-Expression	fragment	compiles	env:a,age,b; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0123	spec	20-The-if-Expression	fragment	compiles	wrap:mixed; env:score
 spec_0124	spec	211-Variable-declarations	fragment	compiles	
 spec_0125	spec	Runtime-const-locals	error	diagnose	
 spec_0126	spec	212-The-if-statement	fragment	compiles	wrap:mixed; env:score,grade,amount,Balance
 spec_0127	spec	213-The-while-statement	fragment	compiles	wrap:mixed; env:i
-spec_0128	spec	214-The-for-statement	skip	n/a	skip:incomplete-fragment
+spec_0128	spec	214-The-for-statement	fragment	compiles	preamble; env:Process,dict,n,transactions; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0129	spec	214-The-for-statement	skip	n/a	skip:elided
 spec_0130	spec	215-break-and-continue	skip	n/a	skip:incomplete-fragment
 spec_0131	spec	216-do-end-blocks	skip	n/a	skip:incomplete-fragment
 spec_0132	spec	217-The-return-statement	skip	n/a	skip:incomplete-fragment
 spec_0133	spec	2110-Local-type-declarations	skip	n/a	skip:not-implemented (method-local record declaration)
 spec_0134	spec	221-Method-declarations	fragment	compiles	
-spec_0135	spec	222-Expression-bodied-methods	skip	n/a	skip:incomplete-fragment
+spec_0135	spec	222-Expression-bodied-methods	fragment	compiles	env:Height,Width; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0136	spec	224-Inline-out-declarations	skip	n/a	skip:incomplete-fragment
 spec_0137	spec	224-Inline-out-declarations	skip	n/a	skip:incomplete-fragment
 spec_0138	spec	Nullability-postcondition-on-out-parameters	skip	n/a	skip:signature-listing
@@ -158,16 +158,16 @@ spec_0155	spec	Capture-rule-and-layout-stability	fragment	compiles
 spec_0156	spec	Capture-rule-and-layout-stability	fragment	compiles	
 spec_0157	spec	Capture-rule-and-layout-stability	fragment	compiles	chained:1
 spec_0158	spec	2213-Static-initialization-order	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-spec_0159	spec	2213-Static-initialization-order	skip	n/a	skip:incomplete-fragment
+spec_0159	spec	2213-Static-initialization-order	fragment	compiles	preamble; env:LoadConfigAsync; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0160	spec	2214-No-params-no-ref-returns	skip	n/a	skip:elided
 spec_0161	spec	The-throw-carve-out	fragment	compiles	
 spec_0162	spec	Properties-indexers-accessors	fragment	compiles	
 spec_0163	spec	2216-Contract-clauses	skip	n/a	blocked-on-#2942 (ensures result/old not yet implemented)
 spec_0164	spec	231-Auto-properties	skip	n/a	skip:signature-listing (§23.1's four auto-property forms are shown together with no enclosing constructor -- a syntax listing, not a compilable class; #4012 closed the class no-ctor §7.9 screen's field/auto-property asymmetry, so the harness's class-wrap now correctly rejects it for definite assignment)
-spec_0165	spec	232-Expression-bodied-read-only-properties	skip	n/a	skip:incomplete-fragment
+spec_0165	spec	232-Expression-bodied-read-only-properties	fragment	compiles	env:FirstName,Height,LastName,Width,_count; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0166	spec	233-Block-form-properties	fragment	compiles	wrap:mixed; env:_balance
 spec_0167	spec	233-Block-form-properties	fragment	compiles	
-spec_0168	spec	234-Indexers	skip	n/a	skip:incomplete-fragment
+spec_0168	spec	234-Indexers	fragment	compiles	env:_grid,_items,_values,_width; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0169	spec	234-Indexers	fragment	compiles	
 spec_0170	spec	253-Examples	fragment	compiles	
 spec_0171	spec	253-Examples	fragment	compiles	
@@ -199,7 +199,7 @@ spec_0196	spec	2771-Equality-of-function-values	skip	n/a	skip:incomplete-fragmen
 spec_0197	spec	278-Type-aliases	fragment	compiles	preamble
 spec_0198	spec	278-Type-aliases	fragment	compiles	
 spec_0199	spec	Generic-type-aliases	fragment	compiles	
-spec_0200	spec	Generic-type-aliases	skip	n/a	skip:stdlib-unresolved (IOrderedEnumerable)
+spec_0200	spec	Generic-type-aliases	fragment	compiles	activated 2026-09-21 coverage pass (was skip:stdlib-unresolved (IOrderedEnumerable))
 spec_0201	spec	Generic-type-aliases	skip	n/a	skip:stdlib-unresolved (Predicate)
 spec_0202	spec	282-The-IDisposable-contract	fragment	compiles	
 spec_0203	spec	Ownership-state-of-locals	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
@@ -229,13 +229,13 @@ spec_0226	spec	Trivial-dispose-for-generic-class-instantiations	fragment	compile
 spec_0227	spec	2810-using-var	fragment	compiles	
 spec_0228	spec	2810-using-var	fragment	compiles	
 spec_0229	spec	Borrowing-collections	fragment	compiles	preamble
-spec_0230	spec	Owning-collections	skip	n/a	skip:incomplete-fragment
+spec_0230	spec	Owning-collections	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0231	spec	move-on-a-collection-slot	skip	n/a	skip:signature-listing
-spec_0232	spec	Compatibility-between-borrowing-and-owning-forms	skip	n/a	skip:incomplete-fragment
+spec_0232	spec	Compatibility-between-borrowing-and-owning-forms	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0233	spec	Compatibility-between-borrowing-and-owning-forms	fragment	compiles	
 spec_0234	spec	2812-Asynchronous-disposal	fragment	compiles	
 spec_0235	spec	2812-Asynchronous-disposal	skip	n/a	skip:incomplete-fragment
-spec_0236	spec	2813-Shared-ownership-SharedT-and-WeakT	skip	n/a	skip:incomplete-fragment
+spec_0236	spec	2813-Shared-ownership-SharedT-and-WeakT	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0237	spec	291-The-protocol	fragment	compiles	
 spec_0238	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
 spec_0239	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
@@ -244,14 +244,14 @@ spec_0241	spec	293-Iterator-methods	fragment	compiles
 spec_0242	spec	298-Iterators-with-owned-parameters	skip	n/a	blocked-on-#1394 (stdlib-unresolved: StreamReader)
 spec_0243	spec	298-Iterators-with-owned-parameters	skip	n/a	blocked-on-#1394 (stdlib-unresolved: StreamReader)
 spec_0244	spec	2910-Empty-iterators	fragment	compiles	
-spec_0245	spec	2912-Mutation-during-iteration	skip	n/a	skip:incomplete-fragment
+spec_0245	spec	2912-Mutation-during-iteration	fragment	compiles	preamble; env:transactions; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0246	spec	301-async-methods	skip	n/a	blocked-on-#1376 (stdlib-unresolved: HttpClient)
 spec_0247	spec	302-await	skip	n/a	skip:incomplete-fragment
 spec_0248	spec	303-The-Task-TaskT-and-OwningTaskT-types	skip	n/a	skip:signature
 spec_0249	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment
 spec_0250	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment
 spec_0251	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment
-spec_0252	spec	Consumer-side-rules	skip	n/a	skip:literal-listing
+spec_0252	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
 spec_0253	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment
 spec_0254	spec	Consumer-side-rules	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 spec_0255	spec	Consumer-side-rules	skip	n/a	skip:incomplete-fragment
@@ -278,10 +278,10 @@ spec_0275	spec	3015-Channels	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker 
 spec_0276	spec	311-Throwing	skip	n/a	skip:syntax-snippet (carried spec_0261)
 spec_0277	spec	312-trycatchfinally	skip	n/a	skip:syntax-snippet (carried spec_0262)
 spec_0278	spec	312-trycatchfinally	skip	n/a	skip:incomplete-fragment
-spec_0279	spec	3122-Arm-bodies	skip	n/a	skip:incomplete-fragment
+spec_0279	spec	3122-Arm-bodies	fragment	compiles	env:DoWork,Log,Retry; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0280	spec	3123-Catch-ordering-and-exhaustiveness	skip	n/a	skip:incomplete-fragment
 spec_0281	spec	3124-Bare-re-raise	skip	n/a	skip:syntax-snippet (carried spec_0266)
-spec_0282	spec	3125-Deliberate-suppression	skip	n/a	skip:incomplete-fragment
+spec_0282	spec	3125-Deliberate-suppression	fragment	compiles	env:BestEffortCleanup; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0283	spec	313-No-throws-clause	skip	n/a	skip:elided
 spec_0284	spec	314-Standard-exception-types	skip	n/a	skip:signature-listing
 spec_0285	spec	314-Standard-exception-types	skip	n/a	skip:signature
@@ -309,13 +309,13 @@ spec_0306	spec	332-Accepted-signatures	skip	n/a	skip:signature-listing (carried 
 spec_0307	spec	336-Example	program	compiles	
 spec_0308	spec	34-Comments-and-Documentation	skip	n/a	skip:signature-listing
 spec_0309	spec	35-Choices	skip	n/a	skip:incomplete-fragment
-spec_0310	spec	353-Construction-and-payload-ownership	skip	n/a	skip:incomplete-fragment
+spec_0310	spec	353-Construction-and-payload-ownership	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:incomplete-fragment)
 spec_0311	spec	353-Construction-and-payload-ownership	skip	n/a	skip:incomplete-fragment
-spec_0312	spec	The-borrowing-match-the-default	skip	n/a	skip:incomplete-fragment
+spec_0312	spec	The-borrowing-match-the-default	fragment	compiles	env:Client,FetchOutcome,ScheduleRetry,client,url; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0313	spec	The-owning-match	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.251 — also docs-ahead on #2045 stage 3/#3094: the owning match itself and the move-only-value-payload transfer; label static per R7, no probe this train — no oracle binary in the docs lane)
-spec_0314	spec	Disposal-traces-the-four-paths-of-an-owning-match	skip	n/a	skip:incomplete-fragment
-spec_0315	spec	Disposal-traces-the-four-paths-of-an-owning-match	skip	n/a	skip:incomplete-fragment
-spec_0316	spec	Disposal-traces-the-four-paths-of-an-owning-match	skip	n/a	skip:incomplete-fragment
+spec_0314	spec	Disposal-traces-the-four-paths-of-an-owning-match	fragment	compiles	env:Client,FetchOutcome,Render,RenderCached,ShowError,client,url; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+spec_0315	spec	Disposal-traces-the-four-paths-of-an-owning-match	fragment	compiles	env:Client,Count,FetchOutcome,client,url; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+spec_0316	spec	Disposal-traces-the-four-paths-of-an-owning-match	fragment	compiles	env:FetchOutcome,RefetchLater,Render,outcome; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 spec_0317	spec	Disposal-traces-the-four-paths-of-an-owning-match	skip	n/a	skip:incomplete-fragment
 spec_0318	spec	A1-Lexical	skip	n/a	skip:ebnf-grammar
 spec_0319	spec	A2-Source-file	skip	n/a	skip:ebnf-grammar
@@ -325,12 +325,12 @@ spec_0322	spec	A5-Types	skip	n/a	skip:ebnf-grammar
 spec_0323	spec	A6-Statements	skip	n/a	grammar-production block, not Bezel source (permanently skip)
 spec_0324	spec	A7-Expressions	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 spec_0325	spec	A8-Constants-and-literals	skip	n/a	skip:ebnf-grammar
-codegen_0000	codegen	31-File-shape	skip	n/a	skip:literal-listing
+codegen_0000	codegen	31-File-shape	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 codegen_0001	codegen	32-Keywords	skip	n/a	skip:signature-listing
 codegen_0002	codegen	33-Declaration-forms	skip	n/a	skip:ebnf-grammar
 codegen_0003	codegen	33-Declaration-forms	skip	n/a	skip:literal-listing
 codegen_0004	codegen	33-Declaration-forms	skip	n/a	skip:ebnf-grammar
-codegen_0005	codegen	33-Declaration-forms	skip	n/a	skip:literal-listing
+codegen_0005	codegen	33-Declaration-forms	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
 codegen_0006	codegen	34-Statements-with-their-exact-terminators	skip	n/a	skip:ebnf-grammar
 codegen_0007	codegen	35-Expressions	skip	n/a	skip:syntax-snippet
 codegen_0008	codegen	35-Expressions	skip	n/a	skip:literal-listing
@@ -339,7 +339,7 @@ codegen_0010	codegen	35-Expressions	skip	n/a	skip:incomplete-fragment
 codegen_0011	codegen	35-Expressions	skip	n/a	skip:literal-listing
 codegen_0012	codegen	35-Expressions	skip	n/a	skip:compile-failed
 codegen_0013	codegen	35-Expressions	skip	n/a	skip:compile-failed
-codegen_0014	codegen	45-Iteration-and-collection-ownership	skip	n/a	skip:incomplete-fragment
+codegen_0014	codegen	45-Iteration-and-collection-ownership	fragment	compiles	preamble; env:pool; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 codegen_0015	codegen	52-System-auto	skip	n/a	skip:literal-listing
 codegen_0016	codegen	52-System-auto	skip	n/a	skip:literal-listing
 codegen_0017	codegen	52-System-auto	skip	n/a	skip:signature-listing
@@ -359,15 +359,15 @@ codegen_0030	codegen	56-SystemThreading	skip	n/a	skip:signature-listing
 codegen_0031	codegen	57-SystemIO	skip	n/a	skip:signature-listing
 codegen_0032	codegen	59-Primitives	skip	n/a	skip:signature-listing
 codegen_0033	codegen	6-Idioms	program	compiles	
-codegen_0034	codegen	6-Idioms	skip	n/a	skip:multi-module
-codegen_0035	codegen	6-Idioms	skip	n/a	skip:literal-listing
-codegen_0036	codegen	6-Idioms	skip	n/a	skip:mixed
-codegen_0037	codegen	6-Idioms	skip	n/a	skip:literal-listing
-codegen_0038	codegen	6-Idioms	skip	n/a	skip:mixed
+codegen_0034	codegen	6-Idioms	program	compiles	activated 2026-09-21 coverage pass (was skip:multi-module)
+codegen_0035	codegen	6-Idioms	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
+codegen_0036	codegen	6-Idioms	fragment	compiles	wrap:mixed; activated 2026-09-21 coverage pass (was skip:mixed)
+codegen_0037	codegen	6-Idioms	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:literal-listing)
+codegen_0038	codegen	6-Idioms	fragment	compiles	activated 2026-09-21 coverage pass (was skip:mixed)
 codegen_0039	codegen	6-Idioms	skip	n/a	skip:literal-listing
 codegen_0040	codegen	6-Idioms	fragment	compiles	
-codegen_0041	codegen	6-Idioms	skip	n/a	skip:literal-listing
-codegen_0042	codegen	6-Idioms	skip	n/a	skip:literal-listing
+codegen_0041	codegen	6-Idioms	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
+codegen_0042	codegen	6-Idioms	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 codegen_0043	codegen	71-Syntax-reflexes	skip	n/a	skip:literal-listing
 codegen_0044	codegen	71-Syntax-reflexes	skip	n/a	skip:literal-listing
 codegen_0045	codegen	72-Ownership-shapes-that-look-fine	error	diagnose	
@@ -379,7 +379,7 @@ codegen_0050	codegen	72-Ownership-shapes-that-look-fine	skip	n/a	skip:literal-li
 codegen_0051	codegen	72-Ownership-shapes-that-look-fine	error	diagnose	
 codegen_0052	codegen	72-Ownership-shapes-that-look-fine	skip	n/a	skip:compile-failed
 codegen_0053	codegen	72-Ownership-shapes-that-look-fine	error	diagnose	
-codegen_0054	codegen	72-Ownership-shapes-that-look-fine	skip	n/a	skip:literal-listing
+codegen_0054	codegen	72-Ownership-shapes-that-look-fine	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
 codegen_0055	codegen	72-Ownership-shapes-that-look-fine	error	diagnose	
 codegen_0056	codegen	72-Ownership-shapes-that-look-fine	skip	n/a	skip:literal-listing
 codegen_0057	codegen	72-Ownership-shapes-that-look-fine	error	diagnose	
@@ -395,18 +395,18 @@ codegen_0066	codegen	76-Concurrency	skip	n/a	skip:compile-failed
 codegen_0067	codegen	77-Contracts-used-as-input-validation	skip	n/a	skip:incomplete-fragment
 codegen_0068	codegen	77-Contracts-used-as-input-validation	skip	n/a	skip:literal-listing
 codegen_0069	codegen	78-Nullability-narrowing	error	diagnose	
-codegen_0070	codegen	78-Nullability-narrowing	skip	n/a	skip:incomplete-fragment
+codegen_0070	codegen	78-Nullability-narrowing	fragment	compiles	env:Use,_field; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 codegen_0071	codegen	79-Small-standard-library-mistakes	error	diagnose	
-codegen_0072	codegen	79-Small-standard-library-mistakes	skip	n/a	skip:literal-listing
+codegen_0072	codegen	79-Small-standard-library-mistakes	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
 codegen_0073	codegen	81-v0267-operators-no-longer-lift-over-nullable-value-types-	error	diagnose	
 codegen_0074	codegen	81-v0267-operators-no-longer-lift-over-nullable-value-types-	skip	n/a	skip:incomplete-fragment
 codegen_0075	codegen	82-v0265-UnwrapOrs-argument-is-evaluated-eagerly	skip	n/a	skip:incomplete-fragment
 codegen_0076	codegen	82-v0265-UnwrapOrs-argument-is-evaluated-eagerly	skip	n/a	skip:literal-listing
-codegen_0077	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:literal-listing
-codegen_0078	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:literal-listing
-codegen_0079	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	skip	n/a	skip:literal-listing
+codegen_0077	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
+codegen_0078	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
+codegen_0079	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 codegen_0080	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	error	diagnose	chained:1
-codegen_0081	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	skip	n/a	skip:literal-listing
+codegen_0081	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	fragment	compiles	wrap:mixed; activated 2026-09-21 coverage pass (was skip:literal-listing)
 guide1_0000	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0001	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0002	guide1	3-Borrowing-the-default-for-just-let-me-use-it	skip	n/a	skip:incomplete-fragment
@@ -422,7 +422,7 @@ guide1_0011	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	error
 guide1_0012	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 guide1_0013	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 guide1_0014	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
-guide1_0015	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	skip:incomplete-fragment
+guide1_0015	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	fragment	compiles	preamble; env:userRecord; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide1_0016	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 guide1_0017	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 guide1_0018	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	n/a	skip:incomplete-fragment
@@ -430,26 +430,26 @@ guide1_0019	guide1	8-The-one-rule-that-will-actually-trip-you-branch-joins	skip	
 guide1_0020	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	skip	n/a	skip:incomplete-fragment
 guide1_0021	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	skip	n/a	skip:incomplete-fragment
 guide1_0022	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	skip	n/a	skip:incomplete-fragment
-guide1_0023	guide1	10-Cleanup-that-must-not-run-on-the-success-path-ScopeGuard	skip	n/a	skip:incomplete-fragment
+guide1_0023	guide1	10-Cleanup-that-must-not-run-on-the-success-path-ScopeGuard	fragment	compiles	env:DoWork,Register,Unregister,id; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide1_0024	guide1	10-Cleanup-that-must-not-run-on-the-success-path-ScopeGuard	skip	n/a	skip:incomplete-fragment
 guide1_0025	guide1	10-Cleanup-that-must-not-run-on-the-success-path-ScopeGuard	error	diagnose	
 guide1_0026	guide1	10-Cleanup-that-must-not-run-on-the-success-path-ScopeGuard	skip	n/a	skip:literal-listing
 guide2_0000	guide2	1-Non-nullable-by-default-familiar	error	diagnose	
 guide2_0001	guide2	1-Non-nullable-by-default-familiar	fragment	compiles	wrap:mixed; env:maybe
 guide2_0002	guide2	1-Non-nullable-by-default-familiar	fragment	compiles	wrap:mixed; env:maybe
-guide2_0003	guide2	1-Non-nullable-by-default-familiar	skip	n/a	skip:incomplete-fragment
+guide2_0003	guide2	1-Non-nullable-by-default-familiar	fragment	compiles	env:Use,_field; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide2_0004	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 guide2_0005	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	skip	n/a	skip:incomplete-fragment
 guide2_0006	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	fragment	compiles	preamble
 guide2_0007	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	skip	n/a	skip:incomplete-fragment
-guide2_0008	guide2	3-Expected-failure-outcomes-with-information-ResultT-E-and-d	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-guide2_0009	guide2	3-Expected-failure-outcomes-with-information-ResultT-E-and-d	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+guide2_0008	guide2	3-Expected-failure-outcomes-with-information-ResultT-E-and-d	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:mixed (top-level decls + statements, no single wrap, cf. #683))
+guide2_0009	guide2	3-Expected-failure-outcomes-with-information-ResultT-E-and-d	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:mixed (top-level decls + statements, no single wrap, cf. #683))
 guide2_0010	guide2	4-Exceptions-the-familiar-shape	skip	n/a	skip:incomplete-fragment
 guide2_0011	guide2	4-Exceptions-the-familiar-shape	fragment	compiles	
 guide2_0012	guide2	5-How-Bezel-does-it-a-caught-exception-is-a-borrow-not-yours	error	diagnose	
 guide2_0013	guide2	5-How-Bezel-does-it-a-caught-exception-is-a-borrow-not-yours	skip	n/a	skip:incomplete-fragment
 guide2_0014	guide2	6-How-Bezel-does-it-exceptions-and-cleanup-there-is-no-leak-	fragment	compiles	preamble
-guide2_0015	guide2	6-How-Bezel-does-it-exceptions-and-cleanup-there-is-no-leak-	skip	n/a	skip:incomplete-fragment
+guide2_0015	guide2	6-How-Bezel-does-it-exceptions-and-cleanup-there-is-no-leak-	fragment	compiles	env:BeginBatch,DoWork,EndBatch; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide3_0000	guide3	1-The-five-data-kinds-which-one	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 guide3_0001	guide3	2-Selecting-over-a-value-if-when-case	skip	n/a	skip:incomplete-fragment
 guide3_0002	guide3	2-Selecting-over-a-value-if-when-case	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.250 — also docs-ahead on #1409/#3087: the marked named slot)
@@ -470,7 +470,7 @@ guide4_0013	guide4	5-How-Bezel-does-it-domains-share-nothing-data-moves-or-is-i	
 guide4_0014	guide4	5-How-Bezel-does-it-domains-share-nothing-data-moves-or-is-i	error	diagnose	
 guide4_0015	guide4	6-Channels-ownership-in-flight	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 guide4_0016	guide4	7-Locks-that-own-their-data	skip	n/a	blocked-on-#1721 (stdlib-unresolved: Locked)
-guide4_0017	guide4	8-Statics-under-domains-process-global-so-constrained	skip	n/a	skip:incomplete-fragment
+guide4_0017	guide4	8-Statics-under-domains-process-global-so-constrained	fragment	compiles	preamble; env:LoadConfigAsync; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide4_0018	guide4	8-Statics-under-domains-process-global-so-constrained	fragment	compiles	
 guide4_0019	guide4	8-Statics-under-domains-process-global-so-constrained	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 guide4_0020	guide4	9-Cancellation-is-cooperative	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
@@ -482,17 +482,17 @@ guide5_0004	guide5	2-How-Bezel-does-it-the-loop-variable-is-not-always-yours	err
 guide5_0005	guide5	2-How-Bezel-does-it-the-loop-variable-is-not-always-yours	skip	n/a	skip:incomplete-fragment
 guide5_0006	guide5	2-How-Bezel-does-it-the-loop-variable-is-not-always-yours	error	diagnose	
 guide5_0007	guide5	2-How-Bezel-does-it-the-loop-variable-is-not-always-yours	skip	n/a	skip:incomplete-fragment
-guide5_0008	guide5	3-Consuming-iteration-Drain-and-the-take-forms	skip	n/a	skip:incomplete-fragment
+guide5_0008	guide5	3-Consuming-iteration-Drain-and-the-take-forms	fragment	compiles	preamble; env:pool; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide5_0009	guide5	3-Consuming-iteration-Drain-and-the-take-forms	skip	n/a	skip:incomplete-fragment
-guide5_0010	guide5	3-Consuming-iteration-Drain-and-the-take-forms	skip	n/a	skip:incomplete-fragment
+guide5_0010	guide5	3-Consuming-iteration-Drain-and-the-take-forms	fragment	compiles	preamble; env:Connect,i,pool; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide5_0011	guide5	3-Consuming-iteration-Drain-and-the-take-forms	fragment	compiles	
 guide5_0012	guide5	4-How-Bezel-does-it-a-bound-query-is-consumed-exactly-once	error	diagnose	
 guide5_0013	guide5	4-How-Bezel-does-it-a-bound-query-is-consumed-exactly-once	skip	n/a	skip:incomplete-fragment
 guide5_0014	guide5	4-How-Bezel-does-it-a-bound-query-is-consumed-exactly-once	skip	n/a	skip:incomplete-fragment
 guide5_0015	guide5	5-GroupBy-consume-the-outer-sequence-once-read-each-group-fr	skip	n/a	skip:incomplete-fragment
-guide5_0016	guide5	6-First-and-friends-at-class-elements-you-get-a-borrow-of-th	skip	n/a	skip:incomplete-fragment
+guide5_0016	guide5	6-First-and-friends-at-class-elements-you-get-a-borrow-of-th	fragment	compiles	preamble; env:Connect; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 guide5_0017	guide5	6-First-and-friends-at-class-elements-you-get-a-borrow-of-th	skip	n/a	skip:incomplete-fragment
-guide5_0018	guide5	6-First-and-friends-at-class-elements-you-get-a-borrow-of-th	skip	n/a	skip:literal-listing
+guide5_0018	guide5	6-First-and-friends-at-class-elements-you-get-a-borrow-of-th	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
 guide5_0019	guide5	7-Spans-and-buffers-in-brief	skip	n/a	skip:incomplete-fragment
 guide5_0020	guide5	7-Spans-and-buffers-in-brief	error	diagnose	
 guide5_0021	guide5	7-Spans-and-buffers-in-brief	skip	n/a	skip:incomplete-fragment
@@ -529,7 +529,7 @@ stdlib_0015	stdlib	213-The-Type-class	skip	n/a	skip:signature-listing (carried s
 stdlib_0016	stdlib	214-Serialization-vocabulary	fragment	compiles	
 stdlib_0017	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0018	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature-listing (carried stdlib_0016)
-stdlib_0019	stdlib	214-Serialization-vocabulary	skip	n/a	skip:incomplete-fragment (carried stdlib_0017)
+stdlib_0019	stdlib	214-Serialization-vocabulary	fragment	compiles	activated 2026-09-21 coverage pass (was skip:incomplete-fragment (carried stdlib_0017))
 stdlib_0020	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature-listing
 stdlib_0021	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature-listing
 stdlib_0022	stdlib	214-Serialization-vocabulary	skip	n/a	skip:incomplete-fragment
@@ -547,9 +547,9 @@ stdlib_0033	stdlib	217-Built-in-exception-types-cross-reference	fragment	compile
 stdlib_0034	stdlib	218-IFormattable-and-format-specifiers-v0172-8121339	fragment	compiles	
 stdlib_0035	stdlib	219-INumberT-ISteppableT-IParsableT-v0176-807	fragment	compiles	
 stdlib_0036	stdlib	220-ResultT-E-v0200	skip	n/a	skip:signature-listing
-stdlib_0037	stdlib	220-ResultT-E-v0200	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-stdlib_0038	stdlib	220-ResultT-E-v0200	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-stdlib_0039	stdlib	220-ResultT-E-v0200	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
+stdlib_0037	stdlib	220-ResultT-E-v0200	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:mixed (top-level decls + statements, no single wrap, cf. #683))
+stdlib_0038	stdlib	220-ResultT-E-v0200	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was skip:mixed (top-level decls + statements, no single wrap, cf. #683))
+stdlib_0039	stdlib	220-ResultT-E-v0200	skip	n/a	blocked-on-#2354 (spec §35.3 declared-result target-typing of a bare choice-case name: `return Error(...)` / `return Ok(...)` in a body declared `Result<int, string>` is rejected as an unresolved identifier, was blocked-on-#3056 (docs-ahead: move-marker unification, v0.246))
 stdlib_0040	stdlib	221-ScopeGuard-v0259	skip	n/a	skip:compile-failed
 stdlib_0041	stdlib	221-ScopeGuard-v0259	skip	n/a	skip:literal-listing
 stdlib_0042	stdlib	31-StringBuilder	skip	n/a	skip:signature
@@ -566,7 +566,7 @@ stdlib_0052	stdlib	46-LinkedListT	skip	n/a	skip:signature
 stdlib_0053	stdlib	47-OwningLinkedListT	skip	n/a	skip:signature
 stdlib_0054	stdlib	48-DictionaryK-V	skip	n/a	skip:signature
 stdlib_0055	stdlib	48-DictionaryK-V	skip	n/a	skip:signature-listing
-stdlib_0056	stdlib	48-DictionaryK-V	skip	n/a	skip:incomplete-fragment
+stdlib_0056	stdlib	48-DictionaryK-V	fragment	compiles	env:counts,w; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 stdlib_0057	stdlib	48-DictionaryK-V	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0058	stdlib	49-OwningDictionaryK-V	skip	n/a	skip:signature
 stdlib_0059	stdlib	49-OwningDictionaryK-V	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
@@ -590,7 +590,7 @@ stdlib_0076	stdlib	Byte-buffer-accessors	fragment	compiles
 stdlib_0077	stdlib	Byte-buffer-accessors	fragment	compiles	
 stdlib_0078	stdlib	Bit-granular-accessors	skip	n/a	skip:signature-listing
 stdlib_0079	stdlib	Bit-granular-accessors	skip	n/a	skip:incomplete-fragment
-stdlib_0080	stdlib	Bit-granular-accessors	skip	n/a	skip:signature-listing
+stdlib_0080	stdlib	Bit-granular-accessors	fragment	compiles	activated 2026-09-21 coverage pass (was skip:signature-listing)
 stdlib_0081	stdlib	ArraySpanT	skip	n/a	skip:signature-listing
 stdlib_0082	stdlib	ReadOnlyArraySpanT	skip	n/a	skip:signature-listing
 stdlib_0083	stdlib	Bit-granular-accessors	skip	n/a	skip:signature-listing
@@ -602,18 +602,18 @@ stdlib_0088	stdlib	419-FrozenArrayT-v0186	skip	n/a	skip:signature
 stdlib_0089	stdlib	419-FrozenArrayT-v0186	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 stdlib_0090	stdlib	420-CounterK-v0215	skip	n/a	skip:signature
 stdlib_0091	stdlib	420-CounterK-v0215	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-stdlib_0092	stdlib	5-SystemCollectionsLinq	skip	n/a	skip:signature-listing
-stdlib_0093	stdlib	5-SystemCollectionsLinq	skip	n/a	skip:literal-listing
+stdlib_0092	stdlib	5-SystemCollectionsLinq	fragment	compiles	activated 2026-09-21 coverage pass (was skip:signature-listing)
+stdlib_0093	stdlib	5-SystemCollectionsLinq	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 stdlib_0094	stdlib	51-No-selector-aggregation-overloads	fragment	compiles	
 stdlib_0095	stdlib	51-No-selector-aggregation-overloads	fragment	compiles	
-stdlib_0096	stdlib	51-No-selector-aggregation-overloads	skip	n/a	skip:literal-listing
+stdlib_0096	stdlib	51-No-selector-aggregation-overloads	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
 stdlib_0097	stdlib	61-CancellationToken-and-CancellationTokenSource	skip	n/a	skip:signature-listing
 stdlib_0098	stdlib	61-CancellationToken-and-CancellationTokenSource	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0099	stdlib	TimeoutException	skip	n/a	skip:syntax-snippet (carried stdlib_0074)
 stdlib_0100	stdlib	62-Mutex-and-Lock	skip	n/a	skip:incomplete-fragment (carried stdlib_0075)
-stdlib_0101	stdlib	62-Mutex-and-Lock	skip	n/a	skip:incomplete-fragment
-stdlib_0102	stdlib	62-Mutex-and-Lock	skip	n/a	skip:incomplete-fragment
-stdlib_0103	stdlib	62-Mutex-and-Lock	skip	n/a	skip:incomplete-fragment
+stdlib_0101	stdlib	62-Mutex-and-Lock	fragment	compiles	env:mutex; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+stdlib_0102	stdlib	62-Mutex-and-Lock	fragment	compiles	env:mutex; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
+stdlib_0103	stdlib	62-Mutex-and-Lock	fragment	compiles	env:mutex; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 stdlib_0104	stdlib	63-Semaphore	skip	n/a	skip:incomplete-fragment (carried stdlib_0079)
 stdlib_0105	stdlib	63-Semaphore	skip	n/a	skip:incomplete-fragment
 stdlib_0106	stdlib	AtomicT-load-store-exchange-compare-and-swap	skip	n/a	skip:signature

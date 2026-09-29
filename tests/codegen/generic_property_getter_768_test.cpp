@@ -57,11 +57,20 @@ BEZEL_TEST(generic_property_getter_768, value_typed_nullable_property) {
 
 // §14.1 / §23: a getter that force-unwraps the `T?` field and returns it — the
 // codegen field read resolves to the concrete type, so the value flows through.
+//
+// fix #4768 (§5.1 / §3.6 rule 2, v0.307): this row used to declare the getter
+// `Once: int => V!` — a bare type-parameter value (`V!: T`) returned at an
+// `int` target inside the generic body. §5.1 converts a type-parameter value
+// only to `Object` and its constraint bounds, never to a primitive, so that
+// spelling is now rejected at the declaration. The property is typed `T`
+// instead: the SAME force-unwrap getter, and `Box<int>`'s `b.Once` is `int` at
+// the call site, so the codegen path this row pins (the getter's field read
+// under the receiver's concrete type args) is unchanged and still yields 21.
 BEZEL_TEST(generic_property_getter_768, getter_force_unwraps_field) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "record Box<T>(V: T?) "
-        "  public property Once: int => V!; "
+        "  public property Once: T => V!; "
         "end Box; "
         "class P public static method Main(): int "
         "  var b := new Box<int>(21); "

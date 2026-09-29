@@ -11,21 +11,21 @@
 module Conf;
 
 public class NetworkException: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 
   public virtual method Code(): int => 0;
 end NetworkException;
 
 public class TimeoutNetException: NetworkException
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 
   public override method Code(): int => 1;
 end TimeoutNetException;
 
 public class ConnectException: NetworkException
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 
   public override method Code(): int => 2;

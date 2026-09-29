@@ -324,16 +324,14 @@ BEZEL_TEST(sema_indexer_body_presence_4101,
         11);
 }
 
-// ACCEPT — #4100 is a SEPARATE, still-open defect (abstract indexer
-// shorthand WITH an initializer is dead code, not a false-accept of
-// otherwise-invalid semantics) that this fix does not address: the indexer
-// IS abstract here, so `!isAbstract` is false and this fix's new branch
-// never fires, regardless of the initializer. Pinned here so a future fix
-// for #4100 (which WILL need to reject this shape) does not mistake this
-// row for evidence that #4101's fix already covers it.
+// REJECT — #4100 (abstract indexer shorthand WITH an initializer is dead
+// code per §12.5: an abstract member has no backing storage for the
+// initializer to write into, so it could never run). Previously accepted
+// due to the `p.isIndexer` guard in `isAbstractPropertyShorthand` (#4037
+// fix removes that guard so the shared predicate covers indexers correctly).
 BEZEL_TEST(sema_indexer_body_presence_4101,
-           abstract_indexer_shorthand_with_initializer_still_open_4100) {
-    BEZEL_EXPECT_EQ(runProg(
+           abstract_indexer_shorthand_with_initializer_rejected_4100) {
+    auto r = runAot(
         "module M; "
         "public abstract class BaseIdxInit4100 "
         "  public abstract property [i: int]: int := 5; "
@@ -342,6 +340,8 @@ BEZEL_TEST(sema_indexer_body_presence_4101,
         "  public static method Main(): int "
         "    return 0; "
         "  end Main; "
-        "end ProgramIdxInit4100;"),
-        0);
+        "end ProgramIdxInit4100;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not declare an initializer"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§12.5"));
 }

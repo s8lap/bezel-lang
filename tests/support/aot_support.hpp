@@ -105,6 +105,35 @@
 //     than passing for the wrong reason.
 // The self-tests are tests/support/aot_infra_loud_3007_test.cpp.
 //
+// COMPILE / RUN TIMEOUTS ARE LOUD, AND DISTINGUISHABLE (#3732). The harness
+// has TWO deadlines that, before #3732, surfaced as ordinary Severity::Error
+// diagnostics — byte-for-byte the shape of a legitimate compile REJECT — so
+// the same 272 `hasErrors()` and 205 `!ran` sites that #3007 protects against
+// a disk-full ENOSPC would have gone GREEN on a real hang (a runaway
+// front-end, a wedged clang link, a runaway program):
+//   1. the COMPILE deadline (aotCompileTimeoutSec, 120s default,
+//      BEZEL_AOT_COMPILE_TIMEOUT_SEC overrides) at the CompileOutcome::
+//      TimedOut return in forkedDriverStep;
+//   2. the PROGRAM RUN deadline (aotTimeoutSec, 30s default,
+//      BEZEL_AOT_TIMEOUT_SEC overrides) at the two timedOut sites — one in
+//      runAot, one in runAotCheckedImpl.
+//
+// So every timeout now goes through aot_detail::noteTimeoutFailure():
+//   * it marks the CURRENT TEST FAILED — same belt as noteInfraFailure;
+//   * it prints a `[ TIMEOUT ]` marker naming the stage ("compile did not
+//     finish within" / "program did not terminate within") and the deadline;
+//   * it counts into ITS OWN process-wide tally (NOT the infra tally — a real
+//     compiler hang is a finding, and folding it into the infra floor muddies
+//     exactly the signal that floor is for, spec §4). Printed at exit as
+//     `TIMEOUT: N compile/run timeout(s) ...` next to the `INFRA:` line;
+//   * the returned JitResult carries the reason at Severity::NOTE, never
+//     Error, so `hasErrors()` stays FALSE — the same belt-and-braces as
+//     #3007 — and a legacy negative assertion FAILS rather than reading a
+//     timeout as a rejection. (No `run_parallel.sh` floor of its own: a
+//     timeout already fails its test, so the run fails through the ordinary
+//     path; the tally is for triage.)
+// The self-tests are tests/support/native_timeout_unavailable_loud_test.cpp.
+//
 // TWO SEMANTIC DIFFERENCES FROM runJit (documented, inherent — not bugs here):
 //   1. runJit returns the raw 32-bit int from main(); a process exit status is
 //      8-bit (WEXITSTATUS masks to 0..255). A test whose Main returns a value
@@ -141,6 +170,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "support/build_paths.hpp"  // #5010: the BEZEL_*_PATH / BEZELC_PATH aliases
 #include "test_harness.hpp"              // currentTestFailed() — the #3007 trip
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "support/force_sanitize.hpp"    // the ONE BEZEL_AOT_FORCE_SANITIZE parse
@@ -152,6 +182,49 @@
 #include "llvm/Support/SHA256.h"         // content-addressed link-cache key
 
 namespace bezel::test {
+
+// ── checkedToolchainSkips + forceToolchainMissing (fix #3733) ─────────────
+//
+// WHY THIS PAIR EXISTS. `runAotCheckedImpl` probes `clang --version` once per
+// process and, on failure, returns `ran=false` with a single
+// `Severity::Error` carrying the literal message "<name>: SKIP — C toolchain
+// (clang) unavailable for the ASan link" (the in-source comment at the
+// chokepoint names this). 2,046 call sites in 634 files reach that branch
+// (measured 2026-09-17 at b57a712e) and the absorption surface is the ~1,518
+// `wasSkipped`/`SKIP (not a failure)` lines — #3733 is the whole program of
+// ratcheting + burn-down for this silent-skip class.
+//
+// THE LOUD HALF (this pair + the per-process line in test_main.cpp + the shard
+// JSON field + the run_parallel.sh floor) is the harness side: a box without
+// clang fails the run loudly instead of silently reporting clean PASS having
+// run no sanitizer at all. The source half (`scripts/check_toolchain_skip_surface.py`)
+// freezes the 2,046-call-site surface so it cannot grow while the burn-down
+// runs. Both halves are wired into the same gate cycle (spec §1 / issue #3733).
+//
+// `forceToolchainMissing()` is the test-only knob that forces the SKIP path
+// unconditionally regardless of whether the box has clang — mirrors the
+// `forceSanitizeAddress()` shape (`tests/support/force_sanitize.hpp`). It is
+// NOT memoized because the regression test sets it at runtime via setenv(),
+// so it must be re-read on every call (cheap, one getenv). Production paths
+// never set it, so the cost is irrelevant.
+inline bool forceToolchainMissing() {
+    const char* e = std::getenv("BEZEL_AOT_FORCE_NO_TOOLCHAIN");
+    if (!e || *e == '\0') return false;
+    return *e != '0';
+}
+
+// Process-wide counter for every `runAotChecked` row that hit the toolchain
+// SKIP branch. Modelled on `nativeSanitizerUnavailableSkips()`
+// (tests/native_test_harness.hpp:65–68). Atomic, memoised; incremented at the
+// ONE chokepoint inside runAotCheckedImpl (the early-return at the probe).
+// tests/test_main.cpp reads this once per process and prints it
+// UNCONDITIONALLY (so "0" is a positive confirmation the oracle ran), and
+// the additive `checked_toolchain_skips` field in the shard JSON carries it
+// to tests/run_parallel.sh's sum + floor.
+inline std::atomic<std::size_t>& checkedToolchainSkips() {
+    static std::atomic<std::size_t> n{0};
+    return n;
+}
 
 namespace aot_detail {
 
@@ -345,10 +418,40 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
         if (execPipe[0] >= 0) ::close(execPipe[0]);   // child holds only the write end
-        ::execv(cargv[0], cargv.data());
+        // Fix narrow #3007 retry: ETXTBSY (errno 26, "Text file busy") is a
+        // TRANSIENT FS-level race, not a real exec failure. It fires when
+        // another process / thread holds the executable open for writing —
+        // the async_frame_teardown_no_uaf_3460 reproducer measures ~1-3 %
+        // pre-fix failure on this exact symptom: it forks 8 threads × K=32
+        // attempts each, all hammering the SAME cached executable inode
+        // (one fs::create_hard_link per attempt), and a concurrent sibling
+        // shard's clang link (forkedLink's child) or storeToCache rename
+        // can leave a brief window where the kernel refuses the exec.
+        //
+        // Bounded retry (≤ kMaxExecRetries attempts with kExecRetrySleepMs
+        // between) closes the window. ONLY ETXTBSY is retried — EACCES,
+        // ENOENT, ENOMEM, and every other errno are real failures and pass
+        // through immediately, so the harness's "[ INFRA ]" channel still
+        // surfaces genuine compile/link or harness errors at the same
+        // fidelity. The total retry budget is ≤ 25 ms (5 attempts × 5 ms),
+        // negligible against aotTimeoutSec (30 s). The execPipe[1] write end
+        // stays open across retries (it's O_CLOEXEC — a successful exec
+        // would still close it automatically); we only WRITE the final errno
+        // after the retry budget is exhausted, so the parent receives the
+        // REAL outcome, not the first transient one.
+        int execRetryErrno = 0;
+        constexpr int kMaxExecRetries = 5;
+        constexpr int kExecRetrySleepMs = 5;
+        for (int attempt = 0;; ++attempt) {
+            ::execv(cargv[0], cargv.data());
+            execRetryErrno = errno;
+            if (execRetryErrno != ETXTBSY || attempt >= kMaxExecRetries) break;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kExecRetrySleepMs));
+        }
+        const int e = execRetryErrno;
         // exec failed — report errno through the CLOEXEC pipe (#3007) so the
         // parent can tell this apart from a program that returned 127 itself.
-        const int e = errno;
         if (execPipe[1] >= 0) {
             ssize_t ignored = ::write(execPipe[1], &e, sizeof(e));
             (void)ignored;
@@ -454,6 +557,148 @@ inline bool hasSanitizerReport(const std::string& text) {
 // therefore invisible to the sweep. One definition, three consumers; the third
 // is support/driver_run_support.hpp.
 using bezel::test::forceSanitizeAddress;
+// §22.16 / issue #4386: re-export the suite-wide checked-contracts override
+// (parallel to `forceSanitizeAddress` above) so `runAot` can consult it at
+// every AOT compile.
+using bezel::test::forceCheckedContracts;
+
+// issue #4638: re-export the opt-in leak oracle (defined beside the two sweeps
+// above in support/force_sanitize.hpp, for the same "one definition, N
+// consumers" reason #1822 moved forceSanitizeAddress there).
+using bezel::test::LeakDetectMode;
+using bezel::test::leakDetectMode;
+using bezel::test::aotLeakDetections;
+
+// True iff `text` carries a LeakSanitizer LEAK report and NO AddressSanitizer
+// memory-error report (issue #4638).
+//
+// The distinction is load-bearing. `hasSanitizerReport` above answers "did a
+// sanitizer say anything", which under `BEZEL_AOT_DETECT_LEAKS` is no longer
+// the same question as "is this program broken": in Report mode a leak must NOT
+// fail the row, while a use-after-free found in the same run still must. LSan's
+// leak report is headlined `ERROR: LeakSanitizer: detected memory leaks`;
+// ASan's memory-error reports are headlined `ERROR: AddressSanitizer: <kind>`.
+// A run that printed BOTH is a real memory error and is NOT leak-only, so the
+// #1822 check keeps its verdict.
+inline bool hasLeakOnlyReport(const std::string& text) {
+    if (text.find("ERROR: AddressSanitizer") != std::string::npos) return false;
+    return text.find("ERROR: LeakSanitizer") != std::string::npos ||
+           text.find("detected memory leaks") != std::string::npos;
+}
+
+// Pull "<bytes> byte(s) leaked in <allocations> allocation(s)" out of LSan's
+// SUMMARY line so the census records NUMBERS, not just "leaked". Returns false
+// (leaving the outputs untouched) when the line is absent or malformed — the
+// caller then reports the leak without a size rather than inventing one.
+inline bool parseLeakSummary(const std::string& text, unsigned long long& bytes,
+                             unsigned long long& allocs) {
+    const std::string key = "SUMMARY: AddressSanitizer: ";
+    const std::size_t at = text.find(key);
+    if (at == std::string::npos) return false;
+    const std::size_t lineEnd = text.find('\n', at);
+    const std::string line =
+        text.substr(at + key.size(),
+                    lineEnd == std::string::npos ? std::string::npos
+                                                 : lineEnd - at - key.size());
+    const std::size_t b = line.find(" byte(s) leaked in ");
+    if (b == std::string::npos) return false;
+    const std::size_t a = line.find(" allocation(s)", b);
+    if (a == std::string::npos) return false;
+    try {
+        bytes  = std::stoull(line.substr(0, b));
+        allocs = std::stoull(line.substr(b + std::strlen(" byte(s) leaked in "),
+                                         a - b - std::strlen(" byte(s) leaked in ")));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// The ONE place a leak observation is recorded (issue #4638). Counts at the
+// chokepoint and prints a `[ LEAK ]` marker on stdout — deliberately stdout,
+// not stderr, because tests/test_harness.hpp brackets every row with
+// `[ RUN  ] <suite>.<name>` / `[  OK  ]` on the same stream: the marker
+// therefore lands INSIDE its own row's bracket and scripts/check_leak_census.py
+// attributes it by position, with no change to the harness's row bookkeeping
+// (test_harness.hpp has no currentTestName() and adding one would invalidate
+// every test TU).
+struct LeakExpectation;
+inline LeakExpectation*& currentLeakExpectation() {
+    static LeakExpectation* p = nullptr;
+    return p;
+}
+
+// Record ONE leak observation (issue #4638) — see the definition below
+// LeakExpectation.
+inline void noteLeakDetection(const char* where, const std::string& report,
+                              bool failing);
+
+// Scoped interception, FOR THE HARNESS'S OWN SELF-TEST ONLY — the exact shape
+// of `InfraExpectation` above, and subject to the same ⚠ warning: it is a
+// process-global bypass of the strict-mode trip, so one that outlives its test
+// body disarms the oracle for the rest of the shard. Non-copyable, and the
+// destructor restores the PREVIOUS pointer rather than clearing to null, so
+// nesting cannot strand a stale one. The ONLY sanctioned use is a stack-scoped
+// local in tests/support/aot_leak_detection_4638_test.cpp, whose whole job is
+// to watch the strict oracle FAIL a row and still report green itself.
+struct LeakExpectation {
+    LeakExpectation() : prev_(currentLeakExpectation()) {
+        currentLeakExpectation() = this;
+    }
+    ~LeakExpectation() { currentLeakExpectation() = prev_; }
+    LeakExpectation(const LeakExpectation&) = delete;
+    LeakExpectation& operator=(const LeakExpectation&) = delete;
+
+    std::size_t count = 0;
+    bool lastFailing = false;
+    unsigned long long lastBytes = 0;
+    unsigned long long lastAllocs = 0;
+
+private:
+    LeakExpectation* prev_;
+};
+
+// The ONE place a leak observation is recorded (issue #4638). Counts at the
+// chokepoint and prints a `[ LEAK ]` marker on stdout — deliberately stdout,
+// not stderr, because tests/test_harness.hpp brackets every row with
+// `[ RUN  ] <suite>.<name>` / `[  OK  ]` on the same stream: the marker
+// therefore lands INSIDE its own row's bracket and scripts/check_leak_census.py
+// attributes it by position, with no change to the harness's row bookkeeping
+// (test_harness.hpp has no currentTestName() and adding one would invalidate
+// every test TU).
+//
+// In STRICT mode it also trips `currentTestFailed()`, for the #3007/#3682
+// reason: the caller's own diagnostic is `Severity::Error` with `ran == false`,
+// which is byte-for-byte the shape 272 `hasErrors()` and 205 `!ran` assertions
+// in this tree test FOR. Without the trip, a row that expects a rejection or a
+// crash would report `[  OK  ]` on a leak — a green tick for the wrong reason,
+// which is the family of defect this issue belongs to. With it, "strict mode
+// fails a leaking row" is a property of the harness rather than of what the
+// row happens to assert.
+inline void noteLeakDetection(const char* where, const std::string& report,
+                              bool failing) {
+    aotLeakDetections().fetch_add(1, std::memory_order_relaxed);
+    unsigned long long bytes = 0, allocs = 0;
+    const bool sized = parseLeakSummary(report, bytes, allocs);
+    std::cout << "    [ LEAK ] " << (where ? where : "runAot") << ": ";
+    if (sized)
+        std::cout << bytes << " byte(s) leaked in " << allocs
+                  << " allocation(s)";
+    else
+        std::cout << "LeakSanitizer reported a leak (no SUMMARY line)";
+    std::cout << (failing ? " — BEZEL_AOT_DETECT_LEAKS=strict, row FAILED"
+                          : " — BEZEL_AOT_DETECT_LEAKS=report, row NOT failed")
+              << " (#4638)\n";
+    std::cout.flush();
+    if (LeakExpectation* e = currentLeakExpectation()) {
+        ++e->count;
+        e->lastFailing = failing;
+        e->lastBytes = bytes;
+        e->lastAllocs = allocs;
+        return;   // self-test interception: observed, NOT a test failure
+    }
+    if (failing) ::bezel::test::currentTestFailed() = true;
+}
 
 // #1822: re-emit a fired sanitizer report to the harness's real stderr (fd 2) so
 // the whole-suite sweep (scripts/asan_sweep.sh) can grep the shard log for the
@@ -622,6 +867,104 @@ inline void noteInfraFailure(const char* where, const std::string& reason) {
                  "INFRASTRUCTURE failure (disk / fork / exec), NOT a compiler "
                  "rejection. The test is FAILED so no negative assertion can "
                  "read it as green (#3007).\n";
+    std::cout.flush();
+    ::bezel::test::currentTestFailed() = true;
+}
+
+// ── noteTimeoutFailure + ensureTimeoutTallyAtExit (fix #3732) ─────────────
+//
+// WHY THIS CHANNEL EXISTS. forkedDriverStep returns
+// {CompileOutcome::TimedOut, "runAot: compile did not finish within <N>s ..."}
+// at the timeout site below; the run-side sibling is "runAot: program did not
+// terminate within ..." at the program-run timeout site. Before #3732 each of
+// those surfaced as one ordinary `Severity::Error` diagnostic — byte-for-byte
+// indistinguishable from a compile REJECT — so the 272
+// `BEZEL_EXPECT_TRUE(<var>.diagnostics.hasErrors())` and 205
+// `BEZEL_EXPECT_FALSE(<var>.ran)` sites that #3007 measured (the same shape
+// #3007's `INFRA:` channel exists for) would all have gone GREEN on a real
+// timeout: the harness gave up, but every negative assertion in tests/ was
+// designed to pass on a rejection, and "the harness gave up" reads as one.
+//
+// THE LOUD HALF (this channel + the per-process line in tests/test_main.cpp's
+// atexit tally) is the harness side: a compile/run TIMEOUT now fails its own
+// test, marks the diagnostic at Severity::NOTE so `hasErrors()` stays false,
+// and is tallied in its own counter (printed as `TIMEOUT: N compile/run
+// timeout(s)` next to `INFRA: N failure(s)`) so a real hang is observable
+// per-process and the burn-down has a number to count down. The source half
+// (`scripts/check_timeout_satisfiable_negatives.py`) freezes the small (~24)
+// hand-rolled `.line > 0` location-check surface so it cannot grow while the
+// burn-down runs. Both halves are wired into the same gate cycle (spec §4 /
+// issue #3732).
+//
+// Why a SEPARATE channel from `INFRA:` (not folded in there): a real compiler
+// hang — runaway front-end, wedged link — is a FINDING. Folding it into the
+// infra floor muddies exactly the signal that floor is for (disk / fork /
+// exec, see #3007's own wording above). Two counters, two lines.
+//
+// ⚠ COST, recorded per CLAUDE.md rule 4. Under this change a timeout caused
+// by *contention* (CLAUDE.md: a cold `clang` link crossing 120s under 16
+// shards plus lane builds is "not exotic") becomes a loud per-test failure
+// instead of a silent green. That is the over-report class the gate already
+// has a protocol for — re-run the suspect alone with `BEZEL_TEST_FILTER=<name>`
+// (CLAUDE.md, tests/README.md:137-141), never a serial whole-suite pass.
+// Trading a false green for a disambiguable false red is the right trade,
+// but it is a trade.
+
+// Process-wide count of compile/run timeouts. Same discipline as
+// infraFailureCount(): leaked on purpose, the atexit hook below reads it at
+// teardown after ordinary function-local statics would already have been
+// destroyed.
+inline std::atomic<std::uint64_t>& timeoutFailureCount() {
+    static std::atomic<std::uint64_t>* c = new std::atomic<std::uint64_t>(0);
+    return *c;
+}
+
+// One-line summary printed at process exit, unconditionally once the AOT
+// harness has been used at all — so `TIMEOUT: 0 compile/run timeout(s)` is a
+// POSITIVE confirmation the channel was live this process, not merely the
+// absence of a signal. Format, stable and greppable, on stdout (shard logs
+// capture stdout and stderr into one file):
+//
+//     TIMEOUT: <N> compile/run timeout(s) (compile or run deadline exceeded —
+//     see tests/support/aot_support.hpp)
+//
+// The TIMEOUT line does NOT get a `run_parallel.sh` floor of its own — a
+// timeout already fails its test, so the run fails through the ordinary path
+// and the tally is for triage, not gate enforcement. Same shape as INFRA: in
+// this file (see comment above ensureInfraTallyAtExit at :609).
+inline void ensureTimeoutTallyAtExit() {
+    static const bool once = [] {
+        std::atexit([] {
+            std::fprintf(stdout,
+                "TIMEOUT: %llu compile/run timeout(s) (compile or run deadline"
+                " exceeded — see tests/support/aot_support.hpp)\n",
+                static_cast<unsigned long long>(
+                    timeoutFailureCount().load(std::memory_order_relaxed)));
+            std::fflush(stdout);
+        });
+        return true;
+    }();
+    (void)once;
+}
+
+// Record ONE compile/run timeout: count it, print the `[ TIMEOUT ]` marker,
+// and FAIL THE CURRENT TEST. `where` names the harness entry point
+// (runAot / runAotChecked / …), `reason` the stage ("compile did not finish"
+// or "program did not terminate") and the deadline. Modelled line-for-line on
+// noteInfraFailure above; the test-fail is the loud half of #3732, and the
+// severity demotion below in markTimeout is the belt-and-braces that makes
+// every `hasErrors()`/`!ran` site structurally immune.
+inline void noteTimeoutFailure(const char* where, const std::string& reason) {
+    ensureTimeoutTallyAtExit();
+    timeoutFailureCount().fetch_add(1, std::memory_order_relaxed);
+    // Inline with the test's own output (BEZEL_EXPECT_* writes to std::cout),
+    // so the marker lands next to the `[ FAIL ]` line in the shard log.
+    std::cout << "    [ TIMEOUT ] " << (where ? where : "runAot") << ": "
+              << reason << "\n"
+              << "    [ TIMEOUT ] the harness gave up waiting for this "
+                 "program (compile or run deadline exceeded): NOT a compiler "
+                 "rejection. The test is FAILED so no negative assertion can "
+                 "read it as green (#3732).\n";
     std::cout.flush();
     ::bezel::test::currentTestFailed() = true;
 }
@@ -1098,12 +1441,18 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 //       regardless of which TEST objects were relinked into bezel_tests. So a
 //       test-only edit (every "fix + regression test" iteration) keeps the
 //       cache WARM, where the old /proc/self/exe key went cold on ANY relink.
-//       STALE-CORE GUARD: if core.a on disk is NEWER than the running binary,
-//       the in-process compiler may predate it (e.g. `--target bezelc` rebuilt
-//       core.a without relinking bezel_tests, or a relink replaced the binary
-//       mid-run) — keying THIS process's products under the new archive's hash
-//       could hand a future, really-rebuilt bezel_tests a stale hit. The
-//       identity then falls back to /proc/self/exe (the k1 behaviour):
+//       STALE-CORE GUARD: the archive's hash is trusted only for a binary that
+//       was really linked from these bytes — e.g. `--target bezelc` can rebuild
+//       core.a without relinking bezel_tests, and keying THIS process's
+//       products under the new archive's hash would hand a future,
+//       really-rebuilt bezel_tests a stale hit. Since #4529 that question is
+//       answered by CONTENT: the link records SHA-256(core.a) in
+//       `<binary>.coreid` and the guard compares it with the archive on disk.
+//       A binary with no such record (a tree built before #4529) falls back to
+//       the older mtime ordering `coreTime <= exeTime`, which approximates the
+//       same question and, being a timestamp, gets a no-op re-archive wrong in
+//       the cooling direction. Either way the identity falls back to
+//       /proc/self/exe (the k1 behaviour) when the answer is no:
 //       conservative, never stale. Same fallback when the macro is undefined
 //       or the archive unreadable. Known gaps: the external clang/ld toolchain
 //       and the dynamically-linked libLLVM.so are now folded in via the
@@ -1125,10 +1474,25 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 //       which contains the archived runtime — sound, just coarser.)
 //   (c) COMPILE/LINK MODE — the CodegenOptions bits that change the emitted
 //       object AND the link line: sanitizeAddress (plain vs --sanitize=address
-//       → -fsanitize=address -g), checkedDisposal (§28.2 guards), isMainModule.
+//       → -fsanitize=address -g), checkedDisposal (§28.2 guards),
+//       checkedContracts (§22.16 `ensures`/`invariant` evaluation — added by
+//       fix #2877, see modeString), isMainModule.
 //       Each mode is a DISTINCT artifact and keys separately, so a plain, an
 //       ASan, and a checked-disposal build of the same source never collide.
 //   (d) the PROGRAM SOURCE TEXT — exactly the bytes writeSource() wrote.
+//   (e) BEHAVIOUR-CHANGING ENVIRONMENT (per #2877) — the variables the
+//       in-process compiler reads that no hashed artifact covers
+//       (BEZEL_OWNERSHIP_LAMBDA_DATAFLOW, BEZEL_VERIFY_IR) plus the
+//       BEZEL_AOT_CACHE_SALT escape hatch. Folded in ONLY when set, so this
+//       component alone never moves a key — which is NOT the same as saying the
+//       key is unchanged: (c)'s `;cc=` bit, added by the same fix, moves every
+//       key and orphans the whole pre-#2877 store on purpose.
+//
+// (a) additionally carries a LINK-PROVENANCE guard (per #2877): the archive's
+// hash is trusted only for a binary the build system DECLARED (the CMake
+// manifest build/tests/test_binaries.txt), because a binary hand-linked with an
+// object that shadows an archive member is a different compiler under the same
+// archive. See runningExeIsADeclaredTestBinary.
 //
 // VALUE: the linked executable ONLY. Only SUCCESSFUL compile+link products are
 // cached; every reject / compiler-crash / compile-timeout path runs the REAL
@@ -1149,11 +1513,16 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 // SPLIT (k3): the key above is now the FIRST of three lookups — see the "two-
 // level split" comment on computeObjectKey/computeLinkKey below for the object
 // and link keys that make a compiler-only or runtime-only rebuild keep half the
-// store warm. This key's composition is deliberately UNCHANGED so entries
-// stored before the split are still served.
+// store warm. THE SPLIT left this key's composition deliberately UNCHANGED, so
+// entries stored before the split were still served by it. (Read as a claim
+// about the split only: fix #2877 later added `;cc=` to (c), which does move
+// every KE key — deliberately, since a pre-#2877 entry cannot be attributed to
+// either §22.16 mode. Orphaned, never mis-served.)
 //
 // KNOBS: BEZEL_AOT_CACHE=0 disables (default ON); BEZEL_AOT_CACHE_DIR overrides
-// the location; BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
+// the location; BEZEL_AOT_CACHE_SALT (per #2877) isolates a run's entries
+// without disabling the cache or paying for a cold private dir;
+// BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
 // (shard) exit. BEZEL_DUMP_IR bypasses the cache entirely (a served product
 // cannot print the IR the flag asks for). GC: once per process, under an flock so only one shard sweeps,
 // if the store exceeds the cap (BEZEL_AOT_CACHE_MAX_GB, default 64 GiB — sized
@@ -1295,6 +1664,256 @@ inline bool computeToolchainIdentity(std::array<uint8_t, 32>& out) {
     return toolchainIdentityFrom(clangVer, ldVer, llvmInfo, out);
 }
 
+// ── per #2877: the LINK-PROVENANCE guard on the k2 compiler identity ───────
+//
+// The STALE-CORE GUARD below (`coreTime <= exeTime`) establishes that core.a is
+// not NEWER than the running binary. That is an ORDERING, not a provenance
+// proof: it does not establish that this binary was linked FROM those bytes. A
+// binary linked from the same archive PLUS one object that shadows an archive
+// member contains a DIFFERENT compiler, is newer than core.a, and therefore
+// passes the guard and keys its products under core.a's identity.
+//
+// That is not hypothetical, and it is not exotic. It is the routine lane recipe
+// for a cheap FAIL-WITHOUT — recompile the ONE changed src/ file at its parent
+// revision and put the object ahead of the archive on the link line, so `ld`
+// takes the explicit object and never extracts the member it shadows:
+//
+//     clang++ … PureChecker_parent.o test_main.cpp.o -o t_parent \
+//             build/libbezel_core.a …
+//
+// #2877 records what that produced, measured: `t_parent` stored PRE-fix
+// executables under keys minted from the POST-fix archives, and the next run of
+// the real binary was SERVED them — 5 of 6 reject rows "ran" and returned the
+// pre-fix answer, while `BEZEL_AOT_CACHE=0` on the same binary was 12/12 green.
+// The benign direction is a spurious FAIL; the dangerous one is its mirror
+// image — a test asserting the OLD behaviour passing against a compiler that no
+// longer produces it.
+//
+// #3669's verify-on-read does NOT cover this. It compares the entry's byte SIZE
+// against a `.sz` sidecar, i.e. it detects a TORN entry; a wrong-but-complete
+// product has a perfectly consistent size, so it is served. (Consistent with
+// the gate's `verify_rejects=0` against `hits=8353`.)
+//
+// The property that separates the two binaries is not a timestamp: it is
+// whether the BUILD SYSTEM produced this binary from a rule that consumes
+// libbezel_core.a. tests/CMakeLists.txt already generates
+// <build>/tests/test_binaries.txt naming every test binary it links, and
+// CLAUDE.md already makes that manifest the blessed answer to "which binaries
+// are the suite" ("never hardcode a binary path"). A binary the manifest names
+// was linked by that rule; a binary it does not name was linked by something
+// else, and the archive says nothing about that binary's compiler.
+//
+// FAILS OPEN, deliberately. This store is shared by every lane and the gate,
+// and the fallback identity (/proc/self/exe) keys PER BINARY: a false negative
+// here would split the cache six ways and re-cool it on every test-only relink,
+// a far larger cost than the defect. So an absent or unreadable manifest keeps
+// exactly today's behaviour, and ONLY a manifest that is readable and does not
+// name this binary downgrades the identity to the conservative exe hash.
+//
+// "Unreadable" means the bytes could not be obtained — absent, permission-
+// denied, an I/O error, or empty. A manifest that IS read but is CORRUPT (junk
+// rows, truncated mid-row, rows naming binaries this build never linked) does
+// NOT fail open: no row matches, so the identity downgrades to the exe hash and
+// this binary isolates itself. That is the safe direction, and it is a real
+// state a half-written file can be in, so it is named rather than left to be
+// inferred from the fail-open sentence above.
+
+// PURE core of the guard: does `manifestText` (`<group> TAB <path> TAB <n>`,
+// one line per binary) name a file that IS `exePath`?
+//
+// Compared with fs::equivalent (device+inode), never by string. A lane's
+// `build/` is a SYMLINK to /mnt/fast/lane-builds/<name> (scripts/lane_setup.sh),
+// so the manifest's CMake-spelled path and /proc/self/exe's resolved path name
+// the same file with different text; inode identity is immune to that and to
+// every other spelling difference. A COPY of a declared binary is correctly NOT
+// equivalent — a copy is exactly the undeclared case this guard exists for.
+inline bool manifestDeclaresExe(std::string_view manifestText,
+                                const std::string& exePath) {
+    std::size_t pos = 0;
+    while (pos < manifestText.size()) {
+        const std::size_t nl = manifestText.find('\n', pos);
+        const std::size_t end =
+            (nl == std::string_view::npos) ? manifestText.size() : nl;
+        const std::string_view line = manifestText.substr(pos, end - pos);
+        pos = end + 1;
+        // field 2 of a TAB-separated line; anything else is not a manifest row.
+        const std::size_t t1 = line.find('\t');
+        if (t1 == std::string_view::npos) continue;
+        const std::string_view rest = line.substr(t1 + 1);
+        const std::size_t t2 = rest.find('\t');
+        const std::string path(
+            rest.substr(0, t2 == std::string_view::npos ? rest.size() : t2));
+        if (path.empty()) continue;
+        std::error_code ec;
+        // fs::equivalent REPORTS an error for a path that does not exist, so the
+        // ec check is load-bearing: a manifest row for a binary this build has
+        // not linked yet must not throw and must not match.
+        if (fs::equivalent(path, exePath, ec) && !ec) return true;
+    }
+    return false;
+}
+
+// Where that manifest lives, derived from the one build-tree path this header
+// already has compiled in: tests/CMakeLists.txt writes it to
+// ${CMAKE_CURRENT_BINARY_DIR}/test_binaries.txt = <build>/tests/, and
+// BEZEL_CORE_LIB_PATH is <build>/libbezel_core.a.
+//
+// Derived rather than passed as a new -D on purpose: a new compile definition
+// moves the ccache key of every test TU (a full ~2,000-TU rebuild) and, because
+// the PCH's REUSE_FROM requires identical definitions across bezel_tests_pch and
+// all six groups, it would have to be the same string for all of them anyway —
+// i.e. it would buy nothing this derivation does not already have. The layout
+// coupling is pinned by aot_cache_key_test's
+// `manifest_path_derivation_finds_the_real_cmake_manifest` row, so it fails
+// loudly instead of rotting into a silent fail-open.
+inline std::string testBinaryManifestPath() {
+#ifdef BEZEL_CORE_LIB_PATH
+    const fs::path core(BEZEL_CORE_LIB_PATH);
+    if (!core.has_parent_path()) return {};
+    return (core.parent_path() / "tests" / "test_binaries.txt").string();
+#else
+    return {};
+#endif
+}
+
+// The live guard. TRUE ("trust core.a") whenever the manifest cannot be read at
+// all — see FAILS OPEN above.
+inline bool runningExeIsADeclaredTestBinary() {
+    const std::string manifest = testBinaryManifestPath();
+    if (manifest.empty()) return true;  // fail OPEN
+    std::ifstream in(manifest, std::ios::binary);
+    if (!in) return true;               // fail OPEN
+    const std::string text((std::istreambuf_iterator<char>(in)), {});
+    if (in.bad() || text.empty()) return true;  // fail OPEN
+    return manifestDeclaresExe(text, "/proc/self/exe");
+}
+
+// ── per #4529: LINK-TIME PROVENANCE, stated by the build instead of inferred ──
+//
+// The guard above answers "did the build system link this binary?". It does not
+// answer "was it linked from THESE archive bytes" — that was left to the
+// STALE-CORE mtime ordering (`coreTime <= exeTime`), and AN ORDERING IS NOT A
+// CONTENT COMPARISON IN EITHER DIRECTION. #2877 measured it over-accepting (the
+// shadowing link, which runningExeIsADeclaredTestBinary now covers). It also
+// OVER-REJECTS, and that is what failed the 87313e75 gate:
+//
+//   13:35:32.055  libbezel_core.a archived                  (gate[2/5])
+//   13:35:35.41   the six test binaries linked              <- ordering HOLDS
+//   13:35:58.73   libbezel_core.a RE-archived by gate[3/5]'s `--target bezelc
+//                 check-lit`, from 50 ccache-hit objects (84-180 ms each — a
+//                 real compile of LlvmBackend.cpp is tens of seconds) with no
+//                 file under src/ or tests/ touched since 13:30
+//
+// llvm-ar is deterministic here — members are stored uid/gid 0/0 with an
+// epoch-0 timestamp, and re-archiving the same 50 objects reproduces the
+// archive byte for byte (measured on that tree: sha256 b38429a4…). So that
+// re-archive moved the MTIME and not one byte of CONTENT. The ordering
+// nonetheless inverted, every shard fell to the per-binary exe fallback, the
+// shared store split six ways for the whole run, and this file's own safety pin
+// (the_running_test_binary_is_declared_and_keys_on_the_archive_2877) failed on
+// `id.compiler == core` — doing exactly the job its comment claims.
+//
+// The fix is to stop inferring provenance from a timestamp when the build
+// system can simply STATE it. tests/CMakeLists.txt now writes SHA-256(core.a)
+// to `<binary>.coreid` as a POST_BUILD step of every test binary's link, so the
+// record is produced by the same rule that does the link and says precisely
+// "this binary was linked while core.a held these bytes". Comparing it against
+// the archive's CURRENT hash is a content comparison, not a heuristic:
+//
+//   * no-op re-archive (identical bytes, new mtime)   -> matches -> TRUSTED
+//   * core.a genuinely rebuilt without relinking this
+//     binary — the real stale-core hazard             -> differs -> REJECTED,
+//     and rejected even when the mtimes are in the "safe" order, which the
+//     ordering alone cannot do
+//   * content changed and later reverted              -> matches -> TRUSTED,
+//     correctly: the archive on disk IS what this binary was linked from
+//
+// FALLBACK, and why it is not a weakening. A binary linked before this record
+// existed (any build tree from before this fix) has no `.coreid` and keeps
+// EXACTLY the previous rule — manifest + mtime ordering. Nothing trusted
+// yesterday becomes untrusted today, so no store is cooled by the change
+// itself; and nothing rejected yesterday becomes trusted, because #2877's
+// hand-linked probe is UNDECLARED and never reaches this code at all.
+inline std::string linkTimeCoreDigestPath() {
+    std::error_code ec;
+    // The RESOLVED path, not "/proc/self/exe" itself: the sidecar sits beside
+    // the real file, which is where CMake's $<TARGET_FILE:...> POST_BUILD wrote
+    // it. A binary relinked out from under a running process resolves to
+    // "<path> (deleted)", whose sidecar does not exist — the read fails and the
+    // legacy rule applies. That is the right answer: the deleted inode's
+    // provenance is exactly what cannot be established from the new file.
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec || exe.empty()) return {};
+    return exe.string() + ".coreid";
+}
+
+// PURE: read the 64 lowercase-or-uppercase-hex digest `text` begins with (after
+// leading whitespace), ignoring whatever follows the digest — so a bare digest,
+// a digest plus newline, and the `<digest>  <path>` shape `sha256sum` prints
+// all parse the same. A 65th hex character is REJECTED rather than truncated: a
+// longer run of hex is not a SHA-256, and silently taking its prefix would
+// accept a corrupt record as a valid one.
+inline bool parseHexDigest(std::string_view text,
+                           std::array<uint8_t, 32>& out) {
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::size_t i = 0;
+    while (i < text.size() &&
+           (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' ||
+            text[i] == '\r'))
+        ++i;
+    if (text.size() - i < 64) return false;
+    std::array<uint8_t, 32> digest{};
+    for (std::size_t b = 0; b < digest.size(); ++b) {
+        const int hi = nibble(text[i + 2 * b]);
+        const int lo = nibble(text[i + 2 * b + 1]);
+        if (hi < 0 || lo < 0) return false;
+        digest[b] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    const std::size_t after = i + 64;
+    if (after < text.size() && nibble(text[after]) >= 0) return false;
+    out = digest;
+    return true;
+}
+
+// Read the link-time record written beside the running binary. FALSE means "NO
+// RECORD" — absent, unreadable, or not a digest — and NEVER "mismatch"; the two
+// take different branches at the call site, so they must not be conflated. The
+// read is bounded: the record is 65 bytes and a build dir is not a place to
+// stream an arbitrary file from.
+inline bool readLinkTimeCoreDigest(const std::string& path,
+                                   std::array<uint8_t, 32>& out) {
+    if (path.empty()) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char buf[256];
+    in.read(buf, sizeof(buf));
+    if (in.bad()) return false;
+    return parseHexDigest(
+        std::string_view(buf, static_cast<std::size_t>(in.gcount())), out);
+}
+
+// PURE: the STALENESS half of the k2 decision. (The provenance half is
+// runningExeIsADeclaredTestBinary, ANDed by the caller — a binary the build
+// system never declared has no business keying on the archive whatever the
+// timestamps say.)
+//
+// A link-time record is AUTHORITATIVE when present: it is the build system's
+// own statement about this exact binary, so it accepts a no-op re-archive and
+// rejects a genuine rebuild, both of which the ordering gets wrong. Only in its
+// absence does the mtime ordering decide.
+inline bool archiveIdentityIsTrusted(bool haveLinkTimeRecord,
+                                     const std::array<uint8_t, 32>& recorded,
+                                     const std::array<uint8_t, 32>& coreHash,
+                                     bool mtimeOrderingOk) {
+    if (haveLinkTimeRecord) return recorded == coreHash;
+    return mtimeOrderingOk;
+}
+
 // The per-process build identity, computed ONCE (hashing the ~100 MB core
 // archive or the test binary is a few hundred ms; amortized over the whole
 // shard it is negligible).
@@ -1348,12 +1967,14 @@ inline const BuildIdentity& buildIdentity() {
 #endif
         bool haveCoreIdentity = false;
 #if defined(BEZEL_CORE_LIB_PATH) && defined(BEZEL_RUNTIME_LIB_PATH)
-        // (a) k2: the compiler archive, guarded — only trusted when the
-        // running binary is at least as new as the archive, i.e. it was linked
-        // FROM these bytes (see the STALE-CORE GUARD note in the KEY comment).
+        // (a) k2: the compiler archive, guarded — only trusted when this binary
+        // really was linked FROM these bytes, which since #4529 is decided by
+        // the link-time digest the build recorded and only otherwise by the
+        // mtime ordering (see the STALE-CORE GUARD note in the KEY comment).
         // /proc/self/exe resolves to the on-disk binary's inode even after a
         // mid-run relink replaced the path (the magic link pins the deleted
-        // inode, whose old mtime then correctly trips this guard). The branch
+        // inode, whose old mtime then correctly trips this guard, and whose
+        // `.coreid` sidecar no longer exists). The branch
         // requires BOTH archive macros: with the runtime path unknown a
         // core-only identity would leave the runtime entirely unkeyed, so the
         // exe fallback (which contains the whole-archived runtime) is used
@@ -1366,12 +1987,41 @@ inline const BuildIdentity& buildIdentity() {
             const auto coreTime =
                 fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore);
             const auto exeTime = fs::last_write_time("/proc/self/exe", ecExe);
-            if (!ecCore && !ecExe && coreTime <= exeTime) {
-                std::array<uint8_t, 32> coreHash;
-                if (sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
+            // per #2877: the mtime ordering is necessary but NOT sufficient —
+            // it does not establish that THIS binary was linked from these
+            // bytes. Require additionally that the build system declared this
+            // binary (see the LINK-PROVENANCE comment above).
+            //
+            // per #4529: nor is the ordering NECESSARY. When the build system
+            // recorded the archive digest at link time, that record decides and
+            // the ordering is not consulted — a no-op re-archive moves the
+            // mtime without moving a byte, and the ordering alone reads that as
+            // staleness and cools the whole shared store. The ordering remains
+            // the rule for a binary with no record. The archive is hashed only
+            // when one of the two can still say yes, so a stale-core process
+            // pays for the exe hash and not for both.
+            //
+            // The manifest read is consequently no longer short-circuited away
+            // on the stale-core path, because the ordering no longer decides on
+            // its own. It costs one ~600-byte read and six stats, once per
+            // process, against the 50 MB hash it gates.
+            if (!ecCore && !ecExe && runningExeIsADeclaredTestBinary()) {
+                std::array<uint8_t, 32> recorded{};
+                const bool haveRecord =
+                    readLinkTimeCoreDigest(linkTimeCoreDigestPath(), recorded);
+                const bool mtimeOrderingOk = coreTime <= exeTime;
+                std::array<uint8_t, 32> coreHash{};
+                // TOCTOU hardening (unchanged): core.a is re-stat'ed AFTER
+                // hashing, so a rebuild that began mid-hash changes the mtime
+                // and drops us to the exe fallback rather than keying a
+                // torn/new archive under a passed guard.
+                if ((haveRecord || mtimeOrderingOk) &&
+                    sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
                     fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore2) ==
                         coreTime &&
-                    !ecCore2) {
+                    !ecCore2 &&
+                    archiveIdentityIsTrusted(haveRecord, recorded, coreHash,
+                                             mtimeOrderingOk)) {
                     out->compiler = coreHash;
                     haveCoreIdentity = true;
                 }
@@ -1442,6 +2092,95 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
     return id.usable ? &id.combined : nullptr;
 }
 
+// ── per #2877: BEHAVIOUR-CHANGING ENVIRONMENT INPUTS ───────────────────────
+//
+// Components (a)-(d) cover every ARTIFACT the compile reads; none of them cover
+// the ENVIRONMENT it reads. Two in-tree variables change what the in-process
+// compiler DOES without moving a byte of any hashed artifact:
+//
+//   BEZEL_OWNERSHIP_LAMBDA_DATAFLOW=1 — src/ownership/Ownership.cpp: ALSO runs
+//       the #4146 Stage 2-A CFG dataflow over lambda bodies, so it can reach a
+//       different ACCEPT/REJECT verdict than the default pre-pass alone.
+//   BEZEL_VERIFY_IR                   — src/codegen/LlvmBackend_impl.hpp: runs
+//       verifyModule, so a module the default path emits happily can fail.
+//
+// Both are #2877's shape exactly: a run that sets one is served the product of
+// a run that did not (its flag silently does nothing), and — the dangerous
+// direction — a run that does NOT set one can be served a product minted by a
+// run that did. BEZEL_DUMP_IR and BEZEL_AOT_TEST_CRASH_HOOK are already handled,
+// by BYPASSING the cache in cachedCompile; these two cannot take that route,
+// because they are meant to be usable across a whole suite run where the cache
+// is what makes the run affordable.
+//
+// BEZEL_AOT_CACHE_SALT has no compiler meaning: it is the operator escape hatch
+// #2877 asks for — one word that isolates an experiment's entries without the
+// cold cost of a private BEZEL_AOT_CACHE_DIR and without losing the cache
+// entirely to BEZEL_AOT_CACHE=0. It is the right tool for the hand-linked
+// compiler above when the provenance guard cannot see the difference (an
+// LD_PRELOAD, a patched libLLVM, a deliberately doctored archive).
+//
+// FOLDED IN ONLY WHEN SET. An unset environment yields the empty string and
+// therefore NO hash input at all, so THIS COMPONENT never moves a key. It does
+// not follow that pre-#2877 entries are still served: the `;cc=` bit that fix
+// #2877 adds to both mode strings moves every key on its own and deliberately
+// orphans the whole pre-#2877 store (see modeString). The point of the
+// conditional fold is narrower — that the environment must not add a SECOND,
+// gratuitous key shift, and must not keep shifting keys on every future run.
+// Always folding a "none" marker would do exactly that, for no benefit.
+//
+// ENCODING CAVEAT (recorded, not fixed — see fix #2877's commit body). The
+// `NAME=value;` join is neither escaped nor length-prefixed, so a salt may
+// forge the separator: BEZEL_AOT_CACHE_SALT='a;BEZEL_VERIFY_IR=1' produces the
+// same text as SALT=a with BEZEL_VERIFY_IR=1 set, and the two therefore share a
+// key. Adversarial only — an operator choosing their own salt is not an
+// attacker — but composeObjectKey length-prefixes the prelude against precisely
+// this, so the rigour here is inconsistent with the rest of the file.
+//
+// COVERAGE CAVEAT (likewise recorded, not fixed). `BEZEL_VERIFY_IR=` — set but
+// EMPTY — is skipped here, while LlvmBackend_impl.hpp:896 tests the variable's
+// PRESENCE, not its value. That spelling therefore enables verifyModule while
+// contributing nothing to the key, so a cache hit silently skips the
+// verification the flag asked for. BEZEL_OWNERSHIP_LAMBDA_DATAFLOW has no such
+// gap: it requires atoi(...) == 1, which an empty value cannot satisfy.
+//
+// Read ONCE. The compiler consults these at compile time inside the forked
+// child, which inherits the parent's environment; a test that mutated the
+// environment mid-process could not change what a already-computed key covered,
+// so memoizing here is honest rather than a shortcut. `withEnvironment` is the
+// pure seam the key test drives instead.
+inline const std::string& cacheKeyEnvironment() {
+    static const std::string* v = new std::string([] {
+        static const char* const kNames[] = {
+            "BEZEL_AOT_CACHE_SALT",
+            "BEZEL_OWNERSHIP_LAMBDA_DATAFLOW",
+            "BEZEL_VERIFY_IR",
+        };
+        std::string s;
+        for (const char* n : kNames) {
+            const char* e = std::getenv(n);
+            if (!e || *e == '\0') continue;
+            s += n;
+            s += '=';
+            s += e;
+            s += ';';
+        }
+        return s;
+    }());
+    return *v;
+}
+
+// PURE: `mode` with the environment component appended, or `mode` UNCHANGED
+// when the environment contributes nothing. Both halves are load-bearing and
+// both are pinned in aot_cache_key_test: the "unchanged" half is what keeps the
+// shared store warm, the "moves" half is what makes the isolation real.
+inline std::string withEnvironment(std::string mode, std::string_view envText) {
+    if (envText.empty()) return mode;
+    mode += "env:";
+    mode.append(envText);
+    mode += ';';
+    return mode;
+}
+
 // The mode component of the key (c): every CodegenOptions bit that alters the
 // emitted object or the link line. The schema tag is bumped if the key
 // composition ever changes, so old entries fall out cleanly — "k1;"→"k2;" with
@@ -1455,13 +2194,31 @@ inline std::string modeString(const codegen::CodegenOptions& opts) {
     std::string s = "k2;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    // fix #2877 (§22.16, v0.303): checkedContracts was added by #4386 and never
+    // reached either mode string, so `runAot(src)` (which defaults the bit ON)
+    // and `runAot(src, CodegenOptions{})` (the §22.16 release default, OFF)
+    // computed the SAME key for the same source — and those two forms exist
+    // precisely to be paired on ONE source, which is what the contract corpus
+    // does. Measured pre-fix on this tree: identical KE 03161ae5… and identical
+    // K1 540a926b… for the two modes, i.e. whichever ran first minted the entry
+    // and the other was served it. That is #2877's wrong-product-under-a-
+    // matching-identity, reached by the ordinary suite rather than by any
+    // hand-linked binary. Folding the bit in shifts EVERY key, so entries minted
+    // before it was tracked — which cannot be attributed to either mode — are
+    // orphaned rather than risked; that is exactly what #3006 did for the
+    // toolchain, and for the same reason, so the "k2;"/"k3o;" tags stay put.
+    s += ";cc="; s += opts.checkedContracts ? '1' : '0';
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
     // Proposal 0082 stage-1 prototype (#3048): a FRONT-END desugaring, but one
     // that changes the emitted object (a program that did not compile now
     // does), so it belongs in the key like any codegen-mode bit.
     s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';
     s += ';';
-    return s;
+    // per #2877: contributes NO hash input when the environment is clean (the
+    // default), so this component alone never moves a key. The KE key still
+    // moves — by the `;cc=` bit above, which orphans the pre-#2877 store on
+    // purpose. See cacheKeyEnvironment for why the fold is conditional anyway.
+    return withEnvironment(std::move(s), cacheKeyEnvironment());
 }
 
 inline std::string toHex(const std::array<uint8_t, 32>& d) {
@@ -1516,9 +2273,10 @@ inline std::string computeCacheKey(std::string_view source,
 //
 // THE THREE KEYS (all SHA-256, all hex):
 //   KE ("k2;", unchanged) = H(compiler ‖ runtime ‖ mode ‖ source) → exe.
-//        The unchanged fast path: one hash, one hardlink, no object I/O, and —
-//        because its composition is untouched — every entry stored by the
-//        pre-split harness is still served.
+//        The fast path: one hash, one hardlink, no object I/O. The SPLIT left
+//        its composition untouched, so pre-split entries were still served by
+//        it; fix #2877's `;cc=` bit has since moved it (see modeString), which
+//        orphans those entries rather than mis-serving them.
 //   K1 ("k3o;") = H(compiler ‖ codegen-mode ‖ stdlib-prelude ‖ source) → object.
 //        The prelude (Driver::preludeSourceFingerprint) is the text the driver
 //        injects into EVERY compilation unit, so it is as much an input to the
@@ -1547,7 +2305,8 @@ inline std::string computeCacheKey(std::string_view source,
 
 // The codegen-mode component of K1: every CodegenOptions bit that alters the
 // EMITTED OBJECT. All of them do (sanitizeAddress adds the AddressSanitizer
-// pass, checkedDisposal emits §28.2 guards, isMainModule decides whether a
+// pass, checkedDisposal emits §28.2 guards, checkedContracts emits the
+// §22.16 `ensures`/`invariant` evaluations, isMainModule decides whether a
 // native `main` is lowered, scopedAwaitBind runs the #3048 front-end
 // desugaring), so this is modeString's set under its own schema tag —
 // kept as a separate function so that if the two ever diverge (an option that
@@ -1556,10 +2315,15 @@ inline std::string codegenModeString(const codegen::CodegenOptions& opts) {
     std::string s = "k3o;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    s += ";cc="; s += opts.checkedContracts ? '1' : '0';   // fix #2877, see modeString
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
     s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';   // #3048, see modeString
     s += ';';
-    return s;
+    // per #2877: the OBJECT is what BEZEL_OWNERSHIP_LAMBDA_DATAFLOW and
+    // BEZEL_VERIFY_IR actually change, so K1 is the key that must carry them.
+    // K2 needs nothing: it is keyed on the object's CONTENT hash, so a
+    // differently-compiled object already produces a different link key.
+    return withEnvironment(std::move(s), cacheKeyEnvironment());
 }
 
 // Driver::linkRecipeSignature, memoized per ASan mode (it is a pure function of
@@ -2389,6 +3153,29 @@ inline JitResult& markInfra(JitResult& r, const char* where,
     return r;
 }
 
+// Stamp a TIMEOUT onto a result AND fail the current test (#3732). Modelled
+// on markInfra: it did not run, its exit code is the did-not-run sentinel,
+// and the reason is recorded at Severity::NOTE — never Error — so
+// `r.diagnostics.hasErrors()` stays FALSE and a legacy negative assertion
+// FAILS rather than passing for the wrong reason. The difference from
+// markInfra is the underlying cause (a deadline expired rather than a
+// refused fork), the counter (timeoutFailureCount() rather than
+// infraFailureCount()), the marker ([TIMEOUT] rather than [INFRA]), and the
+// absence of any `run_parallel.sh` floor — the timeout already fails its
+// test, so the run fails through the ordinary path. A real compiler hang is
+// a finding; folding it into the infra tally muddies that signal (spec §4,
+// the rationale for a third channel rather than reusing infra).
+inline JitResult& markTimeout(JitResult& r, const char* where,
+                              const std::string& reason) {
+    noteTimeoutFailure(where, reason);
+    r.ran = false;
+    r.exitCode = -1;
+    r.diagnostics.report(Severity::Note, SourceLocation{},
+                         std::string("[TIMEOUT] ") +
+                             (where ? where : "runAot") + ": " + reason);
+    return r;
+}
+
 }  // namespace aot_detail
 
 // ---------------------------------------------------------------------------
@@ -2417,6 +3204,17 @@ inline JitResult runAot(std::string_view source,
     // public signature and every call site unchanged.
     codegen::CodegenOptions opts = optsIn;
     if (aot_detail::forceSanitizeAddress()) opts.sanitizeAddress = true;
+    // §22.16 / issue #4386: consult the suite-wide checked-contracts sweep
+    // override (parallel to the ASan sweep above) so an external trigger can
+    // flip every AOT program into checked-contracts mode uniformly.
+    if (aot_detail::forceCheckedContracts()) opts.checkedContracts = true;
+    // issue #4638: the opt-in leak oracle. LeakSanitizer here IS the ASan
+    // runtime's exit-time check, so asking for it implies the ASan link — a
+    // plain build has no LSan to enable. Read once per call (the predicate is
+    // deliberately unmemoized; see force_sanitize.hpp) and threaded through to
+    // the run-environment and the post-run check below.
+    const LeakDetectMode leakMode = aot_detail::leakDetectMode();
+    if (leakMode != LeakDetectMode::Off) opts.sanitizeAddress = true;
 
     std::string infraWhy;
     aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
@@ -2443,6 +3241,19 @@ inline JitResult runAot(std::string_view source,
         // Error made it read as a compile reject; route it to the infra channel.
         if (cc.outcome == aot_detail::CompileOutcome::Infra)
             return aot_detail::markInfra(r, "runAot", cc.diag);
+        // fix #3732: CompileOutcome::TimedOut is NOT a verdict on the program
+        // either — it is the harness's compile deadline firing
+        // (aotCompileTimeoutSec, 120s default). Reporting it as an Error made
+        // it read as a compile reject, satisfying 272 `hasErrors()` and 205
+        // `!ran` sites (#3007's own measurement) for the wrong reason. Route
+        // it to the timeout channel: mark the current test failed, leave
+        // `hasErrors()` false, tally into its own counter. The message
+        // continues to carry "did not finish within" verbatim so a row that
+        // already excludes that literal (e.g. tests/sema/catch_multitype_no_
+        // common_base_v182_test.cpp:360-366) still keys on it — verified
+        // 2026-09-17 at e7171c4c.
+        if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+            return aot_detail::markTimeout(r, "runAot", cc.diag);
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::move(cc.diag));
         return r;  // ran stays false — AOT is the stricter oracle (see header)
@@ -2458,8 +3269,23 @@ inline JitResult runAot(std::string_view source,
     // so the report text is captured intact.
     bool timedOut = false;
     std::vector<std::pair<std::string, std::string>> runEnv;
-    if (opts.sanitizeAddress)
-        runEnv.push_back({"ASAN_OPTIONS", "detect_leaks=0:abort_on_error=0"});
+    if (opts.sanitizeAddress) {
+        // issue #4638: with the opt-in leak oracle on, enable LSan AND pin
+        // `exitcode=0`. The second half is not cosmetic — it is what makes
+        // Report mode verdict-preserving: LeakSanitizer otherwise REPLACES the
+        // program's exit status with its own (#4532's measured defect, where 7
+        // rows asserting a value saw 1 and one row asserting 1 passed
+        // vacuously). VERIFIED 2026-09-23 on the #4619 leak500 program:
+        // `detect_leaks=1:abort_on_error=0` exited 1 where the program returns
+        // 2; adding `exitcode=0` exited 2 with the report still printed. The
+        // report TEXT stays the oracle either way (the qr1 M3 rule the
+        // runAotChecked sibling follows), so nothing keys on the exit status.
+        runEnv.push_back(
+            {"ASAN_OPTIONS",
+             leakMode == LeakDetectMode::Off
+                 ? std::string("detect_leaks=0:abort_on_error=0")
+                 : std::string("detect_leaks=1:exitcode=0:abort_on_error=0")});
+    }
     int execErrno = 0;
     int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
                                            aot_detail::aotTimeoutSec(), timedOut,
@@ -2488,15 +3314,23 @@ inline JitResult runAot(std::string_view source,
     r.stdoutText = aot_detail::slurp(outPath);
 
     if (timedOut) {
-        r.exitCode = -1;
+        // fix #3732: route through markTimeout — the harness's PROGRAM run
+        // deadline (aotTimeoutSec, 30s default) fired. Marking Severity::Error
+        // here made every `BEZEL_EXPECT_TRUE(hasErrors())` and
+        // `BEZEL_EXPECT_FALSE(<var>.ran)` row read a hang as a rejection
+        // (#3007's measurement: 272 + 205 sites). The message keeps the
+        // verbatim "did not terminate within" so a row that already excludes
+        // that literal stays sound (the v182 absence test at
+        // tests/sema/catch_multitype_no_common_base_v182_test.cpp:360-366
+        // searches for "did not finish within" + the sibling run-side literal
+        // is matched by the source ratchet's exempt clause).
         std::string runErr = aot_detail::slurp(errPath);
-        r.diagnostics.report(
-            Severity::Error, SourceLocation{},
+        return aot_detail::markTimeout(
+            r, "runAot",
             "runAot: program did not terminate within " +
                 std::to_string(aot_detail::aotTimeoutSec()) +
                 "s; killed (runaway / deadlock)" +
                 (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
-        return r;
     }
     // #1822: surface any ASan report the program printed to its stderr so the
     // whole-suite sweep detects a memory error in ANY program. A clean program
@@ -2504,6 +3338,33 @@ inline JitResult runAot(std::string_view source,
     // under sanitizeAddress (the forced sweep, or an explicit caller).
     if (opts.sanitizeAddress) {
         std::string errText = aot_detail::slurp(errPath);
+        // issue #4638: a LEAK-ONLY report is handled here, BEFORE the #1822
+        // check below, and consumed. Order matters twice over: (1) the #1822
+        // predicate `hasSanitizerReport` already matches "detected memory
+        // leaks", so without this arm Report mode would fail the very rows it
+        // exists to merely count; (2) a run that printed an AddressSanitizer
+        // memory-error headline as well is NOT leak-only, falls through, and
+        // keeps the #1822 verdict — turning the census on must never soften a
+        // use-after-free into a note.
+        if (leakMode != LeakDetectMode::Off &&
+            aot_detail::hasLeakOnlyReport(errText)) {
+            const bool failing = (leakMode == LeakDetectMode::Strict);
+            aot_detail::noteLeakDetection("runAot", errText, failing);
+            if (failing) {
+                aot_detail::emitSanitizerReportToStderr(errText);
+                r.exitCode = -1;
+                r.diagnostics.report(
+                    Severity::Error, SourceLocation{},
+                    "runAot: LeakSanitizer fired in the test program "
+                    "(BEZEL_AOT_DETECT_LEAKS=strict, #4638)\n" + errText);
+                return r;
+            }
+            // Report mode: counted, printed, and DELIBERATELY not a verdict.
+            // Fall through to the normal exit-status path with `errText`
+            // consumed, so `ran` and `exitCode` are byte-for-byte what the same
+            // program yields with the knob unset.
+            errText.clear();
+        }
         if (aot_detail::hasSanitizerReport(errText)) {
             aot_detail::emitSanitizerReportToStderr(errText);
             r.exitCode = -1;
@@ -2529,8 +3390,19 @@ inline JitResult runAot(std::string_view source,
 }
 
 // Convenience: default (release) codegen options — full parity with runJit.
+//
+// §22.16 / issue #4386: defaults `checkedContracts = true` to preserve the
+// pre-#4386 always-on behavior for the contract test corpus. The pre-#4386
+// codegen emitted `ensures`/`invariant` evaluations unconditionally, so the
+// existing contract tests assume a violated clause raises
+// ContractViolationException under `runAot(source)`. Without this default
+// those tests would break the moment the production default flipped to the
+// §22.16 release default (clauses not emitted). Tests that want the §22.16
+// release default pass `CodegenOptions{}` explicitly to the two-arg form.
 inline JitResult runAot(std::string_view source) {
-    return runAot(source, codegen::CodegenOptions{});
+    codegen::CodegenOptions opts;
+    opts.checkedContracts = true;
+    return runAot(source, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -2562,6 +3434,37 @@ inline JitResult runAot(std::string_view source) {
 inline JitResult runAotCheckedDisposal(std::string_view source) {
     codegen::CodegenOptions opts;
     opts.checkedDisposal = true;  // §28.2 checked-disposal MODE (not ASan)
+    return runAot(source, opts);
+}
+
+// ---------------------------------------------------------------------------
+// runAotCheckedContracts — the AOT counterpart of `--checked-contracts`
+// (issue #4386 / §22.16, parallel to runAotCheckedDisposal above). When
+// checked-contracts MODE is on, `ensures` clauses evaluate at every normal-
+// completion path and `invariant` clauses evaluate at every construction-exit
+// / public-method-entry / public-method-exit point; a false clause raises
+// ContractViolationException. This is exactly what `bezelc --checked-contracts`
+// (main.cpp) sets (opts.checkedContracts = true) and matches the pre-#4386
+// always-on behavior. The unchecked counterpart is
+// `runAot(program, codegen::CodegenOptions{})` (the two-arg form with the
+// production default — opts.checkedContracts defaults to false) so a test
+// can directly assert that the §22.16 release default is "clauses are not
+// emitted at codegen". Orthogonal to `runAotCheckedDisposal` — the two modes
+// are independent per-build choices and can be combined by passing both bits
+// in `CodegenOptions`.
+//
+// Drives the SAME forked Driver::compileFile + subprocess-run path as runAot
+// (via the runAot(source, opts) overload) — the shipping AOT oracle —
+// differing from plain runAot by exactly one bit, opts.checkedContracts. A
+// program whose checked clauses fault therefore raises
+// ContractViolationException (which a `catch ContractViolationException` arm
+// can observe, e.g. returning 1) here, whereas under plain runAot the
+// clauses are skipped and the fault is unobservable. The return type is
+// JitResult, so `.ran` / `.exitCode` / `.diagnostics` call sites are
+// untouched.
+inline JitResult runAotCheckedContracts(std::string_view source) {
+    codegen::CodegenOptions opts;
+    opts.checkedContracts = true;  // §22.16 checked-contracts MODE (not ASan)
     return runAot(source, opts);
 }
 
@@ -2623,12 +3526,34 @@ inline JitResult runAotCheckedImpl(std::string_view source,
                                     const char* name,
                                     bool detectLeaks,
                                     codegen::CodegenOptions opts = {}) {
+    // §22.16 / issue #4386: default `checkedContracts = true` to preserve the
+    // pre-#4386 always-on behavior for the ASan/LSan test corpus. The
+    // pre-#4386 codegen emitted `ensures`/`invariant` evaluations
+    // unconditionally, so the existing contract tests assume a violated
+    // clause raises ContractViolationException under `runAotChecked(source)`
+    // and `runAotCheckedLenient(source)`. Without this default those tests
+    // would break the moment the production default flipped to the §22.16
+    // release default (clauses not emitted). Tests that want the §22.16
+    // release default pass `CodegenOptions{}` explicitly to the two-arg form.
+    opts.checkedContracts = true;
     JitResult r;
     aot_detail::ensureInfraTallyAtExit();
 
     // SKIP if the C toolchain (which the driver shells out to for the ASan link)
     // is absent — preserves the pre-existing "environment can't run this"
     // contract. Memoized: probed once per process.
+    //
+    // fix #3733: this branch is now LOUD, not silent. The counter at the
+    // chokepoint (`checkedToolchainSkips()` above) is incremented on every
+    // early return here, and tests/test_main.cpp prints it unconditionally
+    // + appends it to the shard JSON, so a box without clang fails the
+    // sharded run via tests/run_parallel.sh's floor (the same shape as the
+    // #3626 native-sanitizer floor) instead of silently reporting clean
+    // PASS having run no sanitizer at all. `forceToolchainMissing()` is the
+    // test-only knob (env var BEZEL_AOT_FORCE_NO_TOOLCHAIN=1) that forces
+    // this branch on any box, so the regression test
+    // tests/support/native_toolchain_unavailable_loud_test.cpp can prove
+    // the chokepoint counts on a box that does have clang.
     //
     // #3007 scope note: this SKIP is itself a member of the #3633 silent-skip
     // class — a box without clang runs the whole ASan tier vacuously — but it
@@ -2642,10 +3567,20 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     // policy change about which environments may run the suite, not a
     // harness-honesty fix. Filed separately; this lane changes only the paths
     // that were INdistinguishable.
-    static const bool toolchainOk = [] {
+    static const bool toolchainProbeOk = [] {
         return std::system("clang --version > /dev/null 2>&1") == 0;
     }();
-    if (!toolchainOk) {
+    // `forceToolchainMissing()` is intentionally NOT memoized here: the
+    // regression test (`tests/support/native_toolchain_unavailable_loud_test.cpp`)
+    // sets/un-sets BEZEL_AOT_FORCE_NO_TOOLCHAIN at runtime via setenv(), and
+    // memoising it at first call would lock in whatever the env looked like
+    // then, not what it looks like NOW. The probe is memoised because
+    // `system("clang --version …")` is expensive; the env-var read is one
+    // getenv, irrelevant next to that. Production paths never set the knob,
+    // so the per-call check costs nothing measurable.
+    if (::bezel::test::forceToolchainMissing() || !toolchainProbeOk) {
+        ::bezel::test::checkedToolchainSkips().fetch_add(
+            1, std::memory_order_relaxed);
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::string(name) + ": SKIP — C toolchain (clang) "
                              "unavailable for the ASan link");
@@ -2683,11 +3618,22 @@ inline JitResult runAotCheckedImpl(std::string_view source,
         // It is infrastructure, so it goes to the infra channel and fails loudly.
         if (cc.outcome == aot_detail::CompileOutcome::Infra)
             return aot_detail::markInfra(r, name, cc.diag);
-        // #2214: prefix a genuine verdict (Rejected / Crashed / TimedOut) with
-        // the harness name so the diagnostic says which harness produced it.
+        // fix #3732: TimedOut gets the same Severity::Note + test-failed
+        // treatment runAot uses (the CompileOutcome::TimedOut case just above
+        // mirrors this one). Marking Error here would satisfy the same 272 +
+        // 205 hasErrors/`!ran` sites that the runAot channel protects; the
+        // runAotChecked surface reaches the same call sites through the
+        // shared helper, so the protection is structural (one edit, two
+        // harnesses).
+        if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+            return aot_detail::markTimeout(r, name, cc.diag);
+        // #2214: prefix a genuine verdict (Rejected / Crashed) with the
+        // harness name so the diagnostic says which harness produced it.
+        // TimedOut is handled by the branch above (its own prefix-bearing
+        // message); the residual here is Rejected + Crashed only.
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::string(name) + ": " + std::move(cc.diag));
-        return r;  // reject / compiler crash / compile timeout — ran=false
+        return r;  // reject / compiler crash — ran=false
     }
 
     // --- Run under (optionally) LeakSanitizer. abort_on_error=0 so a sanitizer
@@ -2724,10 +3670,14 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     std::string sanText = aot_detail::slurp(sanPath);
 
     if (timedOut) {
-        r.exitCode = -1;
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             std::string(name) + ": program timed out");
-        return r;
+        // fix #3732: same Severity::Note + test-failed treatment the runAot
+        // sibling uses just above — the runAotChecked program-run timeout
+        // (aotTimeoutSec, 30s default) routes through markTimeout so every
+        // `hasErrors()` / `!ran` site stays structurally immune. Prefixed with
+        // `name` ("runAotChecked" / "runAotCheckedLenient" / …) so the
+        // diagnostic identifies which harness saw the hang.
+        return aot_detail::markTimeout(r, name,
+                                       std::string(name) + ": program timed out");
     }
 
     const bool crashed = WIFSIGNALED(status);

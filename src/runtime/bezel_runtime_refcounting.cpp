@@ -127,8 +127,15 @@ extern "C" void bz_string_release(void* s) {
     int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
     if (__atomic_load_n(rcp, __ATOMIC_RELAXED) == BZ_STRING_RC_SENTINEL)
         return;                                // static/literal — never freed
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("string");
     // Last reference gone: free the data buffer, then the header. Read the data
     // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
     // empty-string case may carry a null data pointer).
@@ -270,7 +277,7 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
-// increment; issue #672 typed env-disposer foundation).
+// increment; issue #672 typed env-disposer foundation; #4475 dispose flag).
 //
 // Function-typed values (lambda closures — capturing or not — and method
 // references) are RUNTIME-MANAGED (§28.9): "Runtime management governs the
@@ -280,14 +287,21 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 //     void* env     (off  8),
 //     int64_t rc    (off 16),
 //     void* envdtor (off 24),
-//     int64_t kind  (off 32) }  = 40 bytes.
+//     int64_t kind  (off 32),
+//     int8_t disposed (off 40) }  = 48 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
 // keep their offsets: every codegen call site loads fn at offset 0 and env at
 // GEP index 1, both unmoved. `kind` (off 32, §27.7.1 / #1544) tags the
 // function-value equality rule (see bezel_runtime_internal.hpp's BZ_FVK_*
-// constants); retain/release never read it.
+// constants); retain/release never read it. `disposed` (off 40, #4475) is the
+// §28.2 use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+// bz_closure_mark_disposed on an explicit `c.Dispose()`. bz_closure_release
+// reads it at last-drop: when 1, the cell is QUARANTINED instead of freed (a
+// deliberate leak parallel to bz_array_mark_disposed), so a post-dispose
+// invoke's guard can read the flag and throw DisposedAccessException instead
+// of UAF-reading freed memory.
 //
 // #672 TYPED ENV-DISPOSER (foundation). `envdtor` (off 24) is a per-lambda
 // typed disposal function emitted by codegen beside the trampoline. When
@@ -326,6 +340,10 @@ static const int64_t BZ_CLOSURE_RC_OFFSET = 16;
 // Byte offset of the env pointer inside the closure cell (after fn).
 // #672: byte offset of the envdtor pointer inside the closure cell (after rc).
 static const int64_t BZ_CLOSURE_ENVDTOR_OFFSET = 24;
+// #4475 (§28.2): byte offset of the disposed flag (after kind). Single byte
+// is enough — the flag is binary. calloc zero-fill makes a fresh cell read
+// as "not disposed" (0), which is the only safe default.
+static const int64_t BZ_CLOSURE_DISPOSED_OFFSET = 40;
 
 extern "C" void bz_closure_retain(void* c) {
     if (!c) return;
@@ -336,8 +354,16 @@ extern "C" void bz_closure_retain(void* c) {
 extern "C" void bz_closure_release(void* c) {
     if (!c) return;
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site, e.g. #4540's racing releases) drives the count
+    // negative. Report it HERE, at the release that first goes negative,
+    // instead of falling through to a second free() below (see
+    // bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("closure");
     // Last reference gone.
     void* env;
     memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
@@ -355,11 +381,50 @@ extern "C" void bz_closure_release(void* c) {
         typedef void (*envdtor_t)(void*);
         ((envdtor_t)envdtor_fn)(env);
     }
-    // Free the env block (uniquely owned by this cell; allocations in
-    // lowerLambda/makeMethodThunk each produce one fresh env per cell).
-    // free(NULL) is safe (a non-capturing closure carries a null env).
-    free(env);
+    // #4475 (§28.2): if the closure was EXPLICITLY DISPOSED (codegen emits
+    // bz_closure_mark_disposed under --checked-disposal on `c.Dispose()`),
+    // the disposed flag is 1. The cell must stay alive (quarantined) so the
+    // closure-invoke guard can read the flag and throw DisposedAccessException
+    // instead of UAF-reading a freed cell at fn (offset 0). free the env block
+    // (it is uniquely owned) but NOT the cell. Outside --checked-disposal the
+    // flag is never written, so the legacy free-on-last-drop path is unchanged
+    // and calloc's zero-fill keeps the byte at 0.
+    int8_t disposed = 0;
+    memcpy(&disposed, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    free(env);  // env is owned by this cell; release it either way.
+    if (disposed) {
+        // Quarantine: do NOT free(c). The cell becomes a deliberate leak
+        // until the process exits (the same lifetime-end semantics as
+        // bz_array_mark_disposed / bz_dict_mark_disposed). The disposed flag
+        // is still readable, and the rc remains 0, so a future retain on the
+        // same pointer would be unsound — but the codegen stops retaining
+        // post-dispose (the `c.Dispose()` arm in --checked-disposal nulls
+        // the slot after the mark, parallel to channel/semaphore, so any
+        // second access goes through the same guard).
+        return;
+    }
     free(c);
+}
+
+// #4475 (§28.2): mark a closure-typed value as disposed. Called by codegen
+// BEFORE the explicit `c.Dispose()` release under --checked-disposal, so the
+// release's last-drop path sees the flag and quarantines instead of freeing.
+// Idempotent — repeated calls are no-ops. null is a no-op.
+extern "C" void bz_closure_mark_disposed(void* c) {
+    if (!c) return;
+    int8_t one = 1;
+    memcpy((uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, &one, sizeof(int8_t));
+}
+
+// #4475 (§28.2): read the per-instance disposed flag. Returns 0 for null
+// (a null closure is never "disposed" — it never held anything). The codegen
+// guard at the closure-invoke lower site calls this and throws
+// DisposedAccessException on a nonzero return.
+extern "C" int8_t bz_closure_is_disposed(void* c) {
+    if (!c) return 0;
+    int8_t d = 0;
+    memcpy(&d, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +483,15 @@ extern "C" void bz_box_retain(void* b) {
 extern "C" void bz_box_release(void* b) {
     if (!b) return;
     int64_t* rcp = (int64_t*)((uint8_t*)b + BZ_BOX_RC_OFFSET);
-    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
+    int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
+    if (new_count > 0)
         return;
+    // fix #4547: an over-release (two releases for one reference — a defect
+    // at the call site) drives the count negative. Report it HERE, at the
+    // release that first goes negative, instead of falling through to a
+    // second free() below (see bz_refcount_overrelease_fail's comment).
+    if (new_count < 0)
+        bz_refcount_overrelease_fail("box");
     // Last reference gone: free the box wrapper. The boxed value is a value type
     // (a leaf — no owned sub-objects), so nothing else is freed; the single
     // calloc'd cell is released exactly once. The box was proven non-escaping by
@@ -432,4 +504,319 @@ extern "C" void bz_box_release(void* b) {
     // never-hashed box is a cheap mutex lock + failed find.
     bz_obj_identity_hash_forget(b);
     free(b);
+}
+
+// ---------------------------------------------------------------------------
+// fix #3460 (§28.3 / §30.1): cross-task borrow tracker.
+//
+// Classes in Bezel are single-owner (no GC, no per-class refcount), so a
+// borrowed reference to a class instance cannot extend its lifetime through
+// refcounting alone. When an async method captures `this = c` into its heap
+// frame, the frame must hold a *borrow* on c that outlives every pending
+// resumption — the §28.3 claim that "the borrow of the captured state must
+// outlive any pending resumption". The borrow tracker is a process-global
+// side table indexed by the borrowed object's pointer. Each entry holds an
+// atomic borrow count and a condition variable for waiters. Codegen emits
+// bz_register_borrow / bz_release_borrow at the frame's lifetime boundary,
+// and emits bz_wait_for_borrows at the OWNER's dispose site (e.g. `using var
+// c := new C()` scope-end) BEFORE the actual `free(c)`. With both halves in
+// place, the race of #3460 closes: the owner's dispose site blocks until the
+// worker's resume continuation has run emitAsyncComplete and released its
+// borrow.
+//
+// Side table is a single global unordered_map guarded by g_borrow_mu. The
+// entry is RETAINED when the count returns to zero (a future register on
+// the same pointer must find it, and the BzBorrowEntry's cv must remain
+// valid across the wait/notify pair). The condition variable is per-entry
+// (no false wakes across objects). All three entry points are null-safe.
+//
+// Ordering: the register/release pair is acq_rel so a release that drops
+// the count to zero synchronizes-with the wait_for_borrows' acquire-load of
+// the same zero — the waiter observes every store that any preceding
+// retain-er (a frame's register) made before its release.
+// ---------------------------------------------------------------------------
+
+struct BzBorrowEntry {
+    std::atomic<int> borrow_count{0};
+    std::condition_variable cv;
+};
+
+namespace {
+std::mutex g_borrow_mu;
+std::unordered_map<void*, std::unique_ptr<BzBorrowEntry>> g_borrow_table;
+// Lazy atexit-registration flag: set the first time any code calls
+// bz_register_borrow, so a program that never crosses an async-method
+// borrow boundary never installs the exit-time drain. See bz_register_borrow
+// and bz_drain_borrow_table.
+bool g_borrow_atexit_registered = false;
+}  // namespace
+
+// Forward-declared: defined further below (after bz_wait_for_borrows). The
+// forward declaration lets bz_register_borrow install it as an atexit handler
+// at first invocation without a header split.
+static void bz_drain_borrow_table(void);
+
+extern "C" void bz_register_borrow(void* obj) {
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_borrow_mu);
+    // Lazy atexit registration (matches bz_register_static_owned's pattern):
+    // a process that never crosses an async-method borrow boundary never
+    // installs the drain, never allocates the table, and pays nothing for
+    // #3460 at exit — exit-time behavior is bit-identical to a build that
+    // doesn't link the borrow tracker.
+    if (!g_borrow_atexit_registered) {
+        g_borrow_atexit_registered = true;
+        std::atexit(bz_drain_borrow_table);
+    }
+    auto& slot = g_borrow_table[obj];
+    if (!slot) slot.reset(new BzBorrowEntry());
+    slot->borrow_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" void bz_release_borrow(void* obj) {
+    if (!obj) return;
+    std::unique_lock<std::mutex> lk(g_borrow_mu);
+    auto it = g_borrow_table.find(obj);
+    if (it == g_borrow_table.end()) return;
+    BzBorrowEntry* e = it->second.get();
+    int prev = e->borrow_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1) {
+        // Last borrower gone. Notify any waiters BEFORE the lock is released
+        // (so the waiter can re-acquire the mutex in cv.wait's atomic
+        // release/wait — releasing the lock before notify_all allows a
+        // second waiter to acquire it and miss the wakeup). The entry stays
+        // in the table; future register/release find it and increment again.
+        // The unique_ptr keeps the entry alive across the cv.notify_all,
+        // which would otherwise UAF if we erased the entry first.
+        e->cv.notify_all();
+    }
+}
+
+extern "C" void bz_wait_for_borrows(void* obj) {
+    if (!obj) return;
+    std::unique_lock<std::mutex> lk(g_borrow_mu);
+    auto it = g_borrow_table.find(obj);
+    if (it == g_borrow_table.end()) return;
+    BzBorrowEntry* e = it->second.get();
+    e->cv.wait(lk, [&] {
+        // Re-check under the lock: a register/release may have raced with us
+        // between the find and the wait. The predicate reads the atomic with
+        // acquire so it synchronizes-with the release that drove the count
+        // to zero.
+        return e->borrow_count.load(std::memory_order_acquire) == 0;
+    });
+}
+// fix #3460 follow-up: process-exit drain for the borrow-tracker side table.
+//
+// The entry-retain-not-erase design (above) keeps BzBorrowEntry instances alive
+// across count==0 so a late register on the same object pointer can find them.
+// For long-running services that capture many objects across many async tasks,
+// the side table therefore GROWS without bound for the process lifetime — at
+// exit every entry's BzBorrowEntry (and its condition variable) is still live,
+// and AddressSanitizer's exit-time leak scan flags the heap allocation per
+// entry as a leak.
+//
+// The drain runs as a process-finalization callback (atexit): at exit every
+// thread is done, so every entry's count must be 0 (any live borrow would be
+// a soundness bug — the bz_wait_for_borrows at the OWNER's free site would
+// still be blocked on the cv, and the OWNER's free(obj) would not have been
+// reached). We therefore drain unconditionally: take the lock, swap the table
+// for an empty local, notify_all any waiters that may be racing the exit
+// (none in a well-formed program; the notify_all is defensive), then release
+// the lock and let the local's destruction free every BzBorrowEntry.
+//
+// The drain does NOT wait for a particular entry's count to drop — by exit
+// the count is 0 by construction (see the argument above), and even if a
+// count were non-zero, waiting at exit would deadlock: the thread that owns
+// the borrow is already gone.
+//
+// Registered as an atexit handler on FIRST bz_register_borrow invocation
+// (matching the static-owned registry's lazy-atexit pattern), so a process
+// that never registers a borrow pays nothing — the handler is never
+// installed, the table is never created, and exit's static destruction
+// order is the same as before #3460.
+static void bz_drain_borrow_table(void) {
+    std::unordered_map<void*, std::unique_ptr<BzBorrowEntry>> drained;
+    {
+        std::lock_guard<std::mutex> lk(g_borrow_mu);
+        // Swap so the table is empty after the drain; a stray register after
+        // the drain (impossible: all threads are done, but defensive) would
+        // find an empty table and allocate a fresh entry, no UAF.
+        drained.swap(g_borrow_table);
+        // Wake any waiters still racing the exit (defensive — see comment).
+        for (auto& kv : drained) {
+            kv.second->cv.notify_all();
+        }
+    }
+    // Release the lock first so the per-entry cv destructors (which can take
+    // their own locks internally on some libstdc++ versions) don't recurse on
+    // g_borrow_mu. Then let `drained` fall out of scope — each unique_ptr
+    // frees its BzBorrowEntry (which destructs the std::condition_variable;
+    // the libstdc++ cv destructor is lock-free).
+    (void)drained.size();
+}
+
+// ---------------------------------------------------------------------------
+// fix #4509 (§27.5 / §28.9, v0.306): CAPTURE-CELL reference counting.
+//
+// The full protocol is documented at the declarations in bezel_runtime.h. In
+// one line: the declaring frame's reference to a capture cell is implicit and
+// unannounced, every closure env that captures the cell announces itself with
+// `bz_cell_retain`, and each of them — envs and frame alike — lets go with
+// `bz_cell_release`; the last one out frees the cell.
+//
+// WHY A SIDE TABLE and not a header word: see bezel_runtime.h. The pattern is
+// the one `g_identity_hashes` above already uses, mutex and all.
+//
+// WHY THE FIRST RETAIN RECORDS 2: the frame's reference exists from the
+// `calloc` in `boxLocalSlot` and is never announced — announcing it would mean
+// teaching all three allocation sites which cells are refcounted, which they
+// cannot know (the classification is made later, at the capture site). So the
+// table's invariant is "entry present ⇒ value == frame + live envs", and the
+// first env to arrive establishes it at 2. A cell that no env ever retains
+// stays out of the table entirely, and `bz_cell_release` on it is a plain
+// `free` — which is exactly what the pre-#4509 scope-end path emitted, so an
+// unclassified cell is byte-identical.
+//
+// EXACTLY-ONCE: codegen emits one retain per env capture-store, one release in
+// that env's envdtor, and one release at the declaring scope's end (on both the
+// normal and the unwind edge, a given exit going one way only). So releases ==
+// 1 + N and the count reaches 0 exactly once. An env that is never released
+// (a leaked closure) leaves the cell alive — the leak direction, which is the
+// PRIME DIRECTIVE's safe side.
+//
+// ADDRESS REUSE happens constantly and is handled explicitly, not avoided: a
+// cell's `calloc` block is freed here and the very next iteration's cell
+// typically lands on the same address (measured 197 of 200 iterations on
+// #4509's own event-subscription loop). Before #4564 the entry was ERASED at
+// the last drop, so a recycled address simply found no entry — correct, but
+// only by throwing away the fact that the cell had died, which is exactly what
+// #4564 needed back. See the TOMBSTONE note below for how both are now had at
+// once.
+//
+// ---------------------------------------------------------------------------
+// fix #4564 (§27.5 / §28.9, v0.306): TOMBSTONES — detecting an over-release
+// instead of double-freeing on it.
+//
+// THE DEFECT. `bz_cell_release` has two arms: a tracked cell decrements and
+// frees at zero, and an UNTRACKED cell (no env ever retained it) is freed
+// outright, because the frame is then the sole holder. Erasing the entry at
+// the last drop collapsed those two states into one. A release PAST the last
+// drop — an over-release, always a defect at the call site — found no entry
+// and took the untracked arm, so it called `free()` on a block this function
+// had already freed. That is the same double free #4547 fixed for
+// string/closure/box, reached by a different route: there the post-decrement
+// count went to -1 and fell through a `> 0` guard, here there is no count
+// left to go negative. #4547's three-way rewrite therefore does not transfer.
+//
+// THE FIX. The last drop now leaves a TOMBSTONE — the entry stays, with the
+// count at `BZ_CELL_TOMBSTONE` — instead of erasing. A release that finds a
+// tombstone is an over-release and is reported by the same
+// `bz_refcount_overrelease_fail` #4547 introduced, before any free.
+//
+// A TOMBSTONE IS NOT A LEAK OF THE CELL: the block is still freed at the last
+// drop, on the same instruction as before. What survives is the 1 map entry,
+// and only until one of the two reclaim routes takes it:
+//
+//   (1) RETAIN CLEARS IT. A retain is only ever emitted at a live cell's
+//       capture-store, so a retain landing on a tombstone means `calloc` has
+//       recycled the address into a NEW cell — the entry must be re-armed at 2
+//       (frame + this env), exactly as the not-present arm does, NOT
+//       incremented off the tombstone. This arm is load-bearing, not
+//       defensive: it fires on 197 of the 200 iterations of #4509's repro, and
+//       without it that loop would count `0 + 1 == 1` for a cell with two
+//       holders and free it at the FIRST release — turning #4564's latent
+//       double free into an immediate use-after-free on every iteration.
+//
+//   (2) A BOUNDED RING EVICTS IT. `g_cell_dead_ring` holds the last
+//       BZ_CELL_TOMBSTONE_RING tombstoned addresses; tombstoning a cell evicts
+//       the oldest and erases its entry. Without this the table would grow by
+//       one node per dead cell for the process lifetime — unbounded growth on
+//       every CORRECT program, which is a worse trade than the latent double
+//       free it is buying (#4509 exists because 8 B per capture was already
+//       too much). The eviction re-checks that the evicted entry is still a
+//       tombstone, so it can never drop a live cell's count.
+//
+// So the detection window is the last BZ_CELL_TOMBSTONE_RING cell deaths, and
+// past that the behaviour degrades to exactly what it was before this fix.
+// That is deliberate: an over-release is emitted by the SAME frame/envdtor
+// pair that issued the legitimate releases, so it arrives within a handful of
+// cell deaths, while the memory cost of a wider window is paid by every
+// correct program forever.
+//
+// WHY ABORT AND NOT "skip the free and carry on". A tombstone hit could in
+// principle also be a NEW, never-retained cell at a recycled address taking
+// the untracked arm — which would make the abort a false positive on a correct
+// program. It cannot be, because codegen emits `bz_cell_release` at exactly
+// two sites (the declaring scope's `Disposal::cellRelease` and the env's
+// envdtor), both gated on the same `CaptureEntry::retainCellInEnv` that gates
+// the retain, and `boxLocalSlot` allocates the cell AT the capture site that
+// retains it — so a non-null cell reaching either release site has been
+// retained. Measured on five programs covering all three armed shapes
+// (per-iteration cell, one cell shared by N envs, env outliving its frame):
+// 504 releases, of which 0 took the untracked arm. The untracked arm is kept
+// exactly as it was for the cells that legitimately never enter the table.
+// ---------------------------------------------------------------------------
+static std::unordered_map<void*, int64_t> g_cell_rc;
+static std::mutex                         g_cell_rc_mtx;
+
+// A count a live entry can never hold: the first retain records 2 and a
+// decrement that reaches 0 tombstones instead of returning.
+static const int64_t     BZ_CELL_TOMBSTONE      = 0;
+static const std::size_t BZ_CELL_TOMBSTONE_RING = 1024;
+static void*             g_cell_dead_ring[BZ_CELL_TOMBSTONE_RING];
+static std::size_t       g_cell_dead_head = 0;
+
+// Tombstone `cell` (whose entry the caller has just driven to
+// BZ_CELL_TOMBSTONE) and evict the oldest tombstone, so the table holds at
+// most BZ_CELL_TOMBSTONE_RING of them. Caller holds g_cell_rc_mtx.
+static void bz_cell_tombstone_record(void* cell) {
+    void* evicted = g_cell_dead_ring[g_cell_dead_head];
+    // `evicted == cell` is the ring having wrapped onto an earlier life of
+    // this same address; erasing then would drop the tombstone we are in the
+    // middle of installing.
+    if (evicted && evicted != cell) {
+        auto e = g_cell_rc.find(evicted);
+        // Only if it is STILL a tombstone: the address may have been recycled
+        // into a live cell since, and erasing that would lose a real count.
+        if (e != g_cell_rc.end() && e->second == BZ_CELL_TOMBSTONE)
+            g_cell_rc.erase(e);
+    }
+    g_cell_dead_ring[g_cell_dead_head] = cell;
+    g_cell_dead_head = (g_cell_dead_head + 1) % BZ_CELL_TOMBSTONE_RING;
+}
+
+extern "C" void bz_cell_retain(void* cell) {
+    if (!cell) return;
+    std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+    auto it = g_cell_rc.find(cell);
+    if (it == g_cell_rc.end()) g_cell_rc.emplace(cell, 2);  // frame + this env
+    // fix #4564 route (1): a tombstone at a retained address is a RECYCLED
+    // address, not a dead cell coming back — re-arm at frame + this env.
+    else if (it->second == BZ_CELL_TOMBSTONE) it->second = 2;
+    else ++it->second;
+}
+
+extern "C" void bz_cell_release(void* cell) {
+    if (!cell) return;
+    {
+        std::lock_guard<std::mutex> lk(g_cell_rc_mtx);
+        auto it = g_cell_rc.find(cell);
+        if (it != g_cell_rc.end()) {
+            // fix #4564: a tombstone is a cell this function already drove to
+            // zero and freed. Reaching it again is an over-release — two
+            // releases for one reference — so report it HERE, before the free
+            // below turns it into a double free that names the allocator
+            // instead of the bug (#4547's argument, same §28.9 invariant).
+            if (it->second == BZ_CELL_TOMBSTONE)
+                bz_refcount_overrelease_fail("capture cell");
+            if (--it->second > 0) return;
+            // Last drop. The free below still happens on this call; what the
+            // tombstone keeps is the knowledge that it did.
+            bz_cell_tombstone_record(cell);
+        }
+        // Not in the table: no env ever retained it, so the frame is the only
+        // holder and this release is the cell's one and only free.
+    }
+    free(cell);
 }

@@ -6,6 +6,7 @@
 //!   retains ownership, so no slot can mint an obligation from it.
 //! expect: reject
 //! diagnostic: borrowing match
+//! issue: 4763
 module Conf;
 
 public class Widget

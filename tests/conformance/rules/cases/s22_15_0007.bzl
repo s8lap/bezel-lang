@@ -15,5 +15,5 @@ public class Box
 end Box;
 
 public abstract class Ops
-  public abstract pure method Make(): owned Box;
+  public pure abstract method Make(): owned Box;
 end Ops;

@@ -526,8 +526,8 @@ BEZEL_TEST(primary_ctor_step0_unified_3583,
     auto r = runAot(
         "module M; "
         "class B(n: int, s: string) "
-        "  public constructor(n: int, s: string) "
-        "    this(n + 1, s); "
+        "  public constructor(n: int, s: string, extra: int) "
+        "    this(n + 1 + extra, s); "
         "  end constructor; "
         "  public method Show() "
         "    Console.WriteLine(n.ToString()); "
@@ -536,11 +536,11 @@ BEZEL_TEST(primary_ctor_step0_unified_3583,
         "end B; "
         "class C "
         "  public static method Main(): int "
-        "    using var b := new B(5, \"ok\"); "
+        "    using var b := new B(5, \"ok\", 2); "
         "    b.Show(); "
         "    return 0; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\nok\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("8\nok\n"));
 }

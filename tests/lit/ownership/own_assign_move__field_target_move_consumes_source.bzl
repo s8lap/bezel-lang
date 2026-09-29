@@ -6,7 +6,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class T end T; class C private owned _t: T := new T(); public method Replace() var fresh := new T(); this._t := move fresh; end Replace; end C;
+module M; class T end T; class C private owned _t: T := new T(); public method Replace() var fresh := new T(); this._t := fresh; end Replace; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

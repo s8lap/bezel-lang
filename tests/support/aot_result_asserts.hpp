@@ -101,6 +101,36 @@ inline bool diagnosticMessageContains(const JitResult& r, const char* sub) {
     return false;
 }
 
+// fix #4784 (§27.8, v0.307): how many times `sub` occurs across every
+// diagnostic in `r`. `diagnosticMessageContains` only answers "at least
+// one" — it cannot distinguish a diagnostic reported once from one reported
+// twice, which is exactly the shape #4784's regression test needs to pin
+// ("is recursive" must appear exactly once per distinct self-referencing
+// occurrence, not once per re-entrant visit of it).
+//
+// Counts SUBSTRING occurrences, not matching `Diagnostic` entries: a genuine
+// `CompileOutcome::Rejected` (the common case here) packs the driver's ENTIRE
+// captured stderr — every `<path>:<line>:<col>: <message>` line, including
+// more than one occurrence of the same wording — into a SINGLE `Diagnostic`
+// at `SourceLocation{}` (see aot_support.hpp; `failedAtCompileTimeWithRealLocation`
+// above already accounts for this by regex-scanning message TEXT rather than
+// counting entries). A per-entry count would always read 0 or 1 for this
+// path regardless of how many real diagnostic lines the compiler emitted,
+// which would make it blind to exactly the duplicate-report defect #4784
+// exists to catch.
+inline int diagnosticMessageCount(const JitResult& r, const char* sub) {
+    const std::string needle(sub);
+    int count = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        std::size_t pos = 0;
+        while ((pos = d.message.find(needle, pos)) != std::string::npos) {
+            ++count;
+            pos += needle.size();
+        }
+    }
+    return count;
+}
+
 // The STRONG claim: the driver itself rejected the program before ever
 // executing it (the IR-verification-failure text both promoted call sites
 // pin), never a runtime crash / signal / timeout / ASan report. `r.ran ==

@@ -237,6 +237,16 @@ bool has(const std::string& hay, const char* needle) {
 // The dependency every test imports. `GBox3141` is the §14.1 / #428-phase-B
 // shape: an imported GENERIC record, whose `V: T` field must be checked against
 // the instantiation's own argument rather than against the bare parameter.
+//
+// Per spec §22.10 (v0.307, line 1861) post-#4868 5458a4e1: the CLASS `PBox3141`
+// primary-ctor parameters are NOT auto-promoted to public properties. Records
+// (§9.1) auto-promote positional fields, so `record GBox3141<T>(V: T, N: int)`
+// keeps its public `V`/`N` surface; the migration renames `PBox3141`'s params
+// to camelCase (the canonical §22.10 idiom, docs/Bezel_Language_Spec.md:2042-
+// 2057) and adds explicit `public readonly property` PascalCase accessors so
+// external reads (`d.V`, `d.W`) still work. In-class body reads (`v + w` in
+// `Sum()`) still resolve to the captured primary-ctor fields per §22.10's
+// initializer-vs-body distinction (line 1859).
 const char* kLib =
     "module DepF3_3141; "
     "public record Pt3141(X: int, Y: int); "
@@ -244,8 +254,10 @@ const char* kLib =
     "public record Wide3141(U: uint, L: long); "
     "public record RefRec3141(R: Object, N: int); "
     "public record GBox3141<T>(V: T, N: int); "
-    "public class PBox3141(V: int, W: int) "
-    "  public method Sum(): int return V + W; end Sum; "
+    "public class PBox3141(v: int, w: int) "
+    "  public readonly property V: int := v; "
+    "  public readonly property W: int := w; "
+    "  public method Sum(): int return v + w; end Sum; "
     "end PBox3141; ";
 
 // The §9.7 dependency — a record with a NULLABLE borrow-carrying field, which
@@ -478,12 +490,23 @@ BEZEL_TEST(xmod_imported_positional_new_args_3141,
 // T6b — the local twin of T6: it ran correctly before the fix and must still.
 // // per §22.8 step 0 / §11.1
 // ===========================================================================
+// T6b — the local twin of T6: it ran correctly before the fix and must still.
+// // per §22.8 step 0 / §11.1
+//
+// Per spec §22.10 (v0.307, line 1861) post-#4868, `PBox3141`'s primary-ctor
+// parameters are not auto-promoted. The local twin follows the canonical
+// §22.10 idiom (docs/Bezel_Language_Spec.md:2042-2057): camelCase params
+// `v`/`w`, PascalCase properties `V`/`W`, body reads in `Sum()` resolve to
+// the captured fields (per §22.10's body-vs-init rule, line 1859). External
+// `d.V`/`d.W` reads in Main remain valid.
 BEZEL_TEST(xmod_imported_positional_new_args_3141,
            local_primary_ctor_base_positional_fields_control) {
     BEZEL_EXPECT_EQ(compileLocalAndRun3141(
         "module LocF3_3141g; "
-        "public class PBox3141(V: int, W: int) "
-        "  public method Sum(): int return V + W; end Sum; "
+        "public class PBox3141(v: int, w: int) "
+        "  public readonly property V: int := v; "
+        "  public readonly property W: int := w; "
+        "  public method Sum(): int return v + w; end Sum; "
         "end PBox3141; "
         "public class D3141(): PBox3141(5, 6) "
         "  public method Twice(): int return Sum() * 2; end Twice; "
@@ -888,12 +911,24 @@ BEZEL_TEST(xmod_imported_positional_new_args_3141,
 // T9b — the local twin of T9, byte-identical apart from the module boundary.
 // It passed before #3162 and must still. // per §22.10 / §22.8
 // ===========================================================================
+// T9b — the local twin of T9, byte-identical apart from the module boundary.
+// It passed before #3162 and must still. // per §22.10 / §22.8
+//
+// Per spec §22.10 (v0.307, line 1861) post-#4868, `PBox3141` declares
+// `public readonly property` accessors for its primary-ctor params. The
+// canonical idiom (docs/Bezel_Language_Spec.md:2042-2057) uses camelCase
+// params and PascalCase properties; this control observes the local build
+// stays working via `b.Sum()` (which reads the in-class captured fields, line
+// 1859), so the test pins that the byte-identical local behavior is unchanged
+// — the property declarations are bookkeeping-only here.
 BEZEL_TEST(xmod_imported_positional_new_args_3141,
            local_primary_ctor_class_constructs_control) {
     BEZEL_EXPECT_EQ(compileLocalAndRun3141(
         "module LocF3_3141k; "
-        "public class PBox3141(V: int, W: int) "
-        "  public method Sum(): int return V + W; end Sum; "
+        "public class PBox3141(v: int, w: int) "
+        "  public readonly property V: int := v; "
+        "  public readonly property W: int := w; "
+        "  public method Sum(): int return v + w; end Sum; "
         "end PBox3141; "
         "public class C "
         "  public static method Main(): int "

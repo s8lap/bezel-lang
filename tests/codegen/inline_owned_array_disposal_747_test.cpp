@@ -301,3 +301,93 @@ BEZEL_TEST(codegen_inline_owned_747, exception_unwind_disposes_both_slots) {
         "  return -1; "
         "end Main; end C;"), 2);
 }
+
+// fix #4552 (§15.1.1 v0.307, ruling #4388 on top of #747's shape): "the
+// array's auto-dispose pass disposes each non-null slot, in reverse slot
+// order — the same order ... as the whole-value-reassignment pass of §15.3
+// ... one pass definition governs all four of this paragraph's endings"
+// (scope end, instance-field Dispose(), whole-value reassignment, static
+// program exit). Before this fix, the scope-end and instance-field-Dispose
+// passes both iterated 0..N-1 (establishment order) while the reassignment
+// pass (#3263/#1385) already iterated N..1 — this file's own #747 leak tests
+// use a plain counter and cannot see the ORDER bug, only whether disposal
+// happened at all. These tests assert order via each slot's own printed
+// name, mirroring rule-corpus cases s15_1_1_0005/0006/0007
+// (tests/conformance/rules/cases).
+namespace {
+// Named: like Cell, but prints its own name on disposal instead of
+// incrementing a counter, so the *order* of disposal is observable on stdout.
+const char* kNamed =
+    "module M; "
+    "class Named "
+    "  public Name: string; "
+    "  public constructor(name: string) Name := name; end constructor; "
+    "  destructor Console.WriteLine($\"dispose {Name}\"); end destructor; "
+    "end Named; ";
+
+std::string runOut(const std::string& src) {
+    auto r = runAot(src);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
+}
+}  // namespace
+
+// §15.1.1 v0.307: a 2-slot owning inline-array LOCAL disposes in reverse slot
+// order at scope end — "second" (slot 1) before "first" (slot 0).
+BEZEL_TEST(codegen_inline_owned_747, local_scope_end_disposes_reverse_slot_order) {
+    BEZEL_EXPECT_EQ(runOut(std::string(kNamed) +
+        "class C public static method Main() "
+        "  do var a: [2 owned]Named := "
+        "    [new Named(\"first\"), new Named(\"second\")]; "
+        "     Console.WriteLine(a[0].Name); end; "
+        "  Console.WriteLine(\"after\"); "
+        "end Main; end C;"),
+        "first\ndispose second\ndispose first\nafter\n");
+}
+
+// §15.1.1 v0.307: a 3-slot variant, so the assertion pins a genuine reversal
+// (N..1) rather than a 2-element sequence a swap-based bug could pass by
+// accident.
+BEZEL_TEST(codegen_inline_owned_747, local_scope_end_disposes_reverse_slot_order_n3) {
+    BEZEL_EXPECT_EQ(runOut(std::string(kNamed) +
+        "class C public static method Main() "
+        "  do var a: [3 owned]Named := "
+        "    [new Named(\"a\"), new Named(\"b\"), new Named(\"c\")]; "
+        "  end; "
+        "end Main; end C;"),
+        "dispose c\ndispose b\ndispose a\n");
+}
+
+// §15.1.1 v0.307: an owning-inline-array INSTANCE FIELD's disposal (the
+// enclosing class's compiler-generated Dispose()) is reverse slot order too —
+// "one pass definition governs all four ... endings".
+BEZEL_TEST(codegen_inline_owned_747, instance_field_dispose_reverse_slot_order) {
+    BEZEL_EXPECT_EQ(runOut(std::string(kNamed) +
+        "class Pool "
+        "  private _conns: [2 owned]Named; "
+        "  public constructor() "
+        "    _conns := [new Named(\"first\"), new Named(\"second\")]; "
+        "  end constructor; "
+        "  public method FirstName(): string => _conns[0].Name; "
+        "end Pool; "
+        "class C public static method Main() "
+        "  do using var p := new Pool(); "
+        "     Console.WriteLine(p.FirstName()); end; "
+        "  Console.WriteLine(\"after\"); "
+        "end Main; end C;"),
+        "first\ndispose second\ndispose first\nafter\n");
+}
+
+// §15.1.1 v0.307 + §28.7: whole-value reassignment already disposed the
+// DISPLACED value in reverse order (#3263) — this pins that the NEW value's
+// eventual scope-end disposal is ALSO reverse order (the bug this fix closes),
+// composed with the reassignment's own reverse pass in one program, matching
+// rule-corpus case s15_1_1_0007.
+BEZEL_TEST(codegen_inline_owned_747, reassign_then_scope_end_both_reverse_slot_order) {
+    BEZEL_EXPECT_EQ(runOut(std::string(kNamed) +
+        "class C public static method Main() "
+        "  var pool: [2 owned]Named := [new Named(\"a1\"), new Named(\"a2\")]; "
+        "  pool := [new Named(\"b1\"), new Named(\"b2\")]; "
+        "  Console.WriteLine(\"stored\"); "
+        "end Main; end C;"),
+        "dispose a2\ndispose a1\nstored\ndispose b2\ndispose b1\n");
+}

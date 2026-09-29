@@ -70,6 +70,27 @@ valid Bezel, don't work around the AOT check.**
   checking — distinct from checked-disposal *mode*, `bezelc --checked-disposal`
   §28.2, which inserts `DisposedAccessException` guards.)
 
+> ⚠ **`runAot` does NOT leak-check — not even under `gate.sh --full`** (#4638).
+> `BEZEL_AOT_FORCE_SANITIZE=address` links AddressSanitizer but pins
+> `detect_leaks=0` (#1822), deliberately: §28.2 checked-disposal quarantines
+> disposed objects *on purpose*, a negative test that exits via an uncaught
+> exception legitimately leaves heap live, and LSan's `exitcode` supersedes the
+> program's own (#4532). Consequence for test authors: **if your row's subject
+> is a leak, it must be on `runAotChecked`.** Loop-amplifying a leak on
+> `runAot` buys nothing — CLAUDE.md's 50–500× rule mitigates LSan's
+> *reachable-at-exit* hazard, not an oracle that is switched off, so a
+> correctly-amplified leak row on `runAot` passes on both sides of its fix.
+> Measured: the #4619 program leaks 12,000 B in 500 allocations; `runAotChecked`
+> fires, `runAot` under forced ASan reports nothing.
+>
+> To *measure* leaks on the `runAot` path there is an opt-in third oracle,
+> `BEZEL_AOT_DETECT_LEAKS` (`off` | `report` | `strict`; see
+> `tests/support/force_sanitize.hpp`). `report` prints a `[ LEAK ]` marker and
+> leaves the row's verdict untouched, so it is safe to switch on suite-wide;
+> `scripts/check_leak_census.py` turns such a run into the frozen docket in
+> `scripts/leak_census.baseline`. `strict` fails the row. Neither is on by
+> default, and neither replaces putting a leak row on `runAotChecked`.
+
 ### Diagnostic tests → lit + FileCheck (`tests/lit/*.bzl`)
 
 Reject/accept **diagnostic** tests live as `.bzl` files with `// RUN:` directives
@@ -143,6 +164,56 @@ scripted by `scripts/extract_diag_to_lit.py`.
   **canary** subset before the authoritative full pass — fail-fast only, never
   acceptance (#2100; knobs `GATE_CANARY=0`, `GATE_CANARY_BASE`,
   `GATE_CANARY_MAX_PCT`).
+
+### The AOT build-product cache, and the one way to poison it
+
+Every `runAot` compile+link is content-addressed into a **shared, cross-worktree**
+store (`/var/tmp/bezel-scratch/aot-bincache`, symlinked to the fast disk by
+`scripts/lane_setup.sh`). Every lane and the gate write it at once. The key is
+`SHA-256(libbezel_core.a) ‖ SHA-256(libbezel_runtime.a) ‖ toolchain ‖ mode ‖
+source` — it keys on the compiler **archive**, not on the test binary, which is
+exactly what keeps the store warm across a test-only relink.
+
+That has one consequence worth knowing by heart (#2877): **a binary whose
+compiler differs from the archives it names must not write to the shared
+store.** The routine way to produce one is the cheap FAIL-WITHOUT trick —
+recompile the one changed `src/` file at its parent revision and put the object
+*ahead* of the archive on the link line, so `ld` takes it and never extracts the
+member it shadows. That binary is a different compiler under an identical key.
+Measured in #2877: it stored pre-fix executables under the post-fix archives'
+keys, and the next run of the real binary was served them — five reject rows
+"ran" and returned the pre-fix answer, while the same binary with the cache off
+was 12/12 green.
+
+Two mechanisms now stand between you and that:
+
+- **Automatic.** The archive identity is trusted only for a binary the build
+  system *declared* (`build/tests/test_binaries.txt`); anything else keys on its
+  own whole-binary hash and so isolates itself. A hand-link that lands outside
+  the manifest is covered without you doing anything.
+- **Manual, for what the guard cannot see** — an `LD_PRELOAD`, a patched
+  `libLLVM`, a doctored archive, or a run of the experimental
+  `BEZEL_OWNERSHIP_LAMBDA_DATAFLOW` / `BEZEL_VERIFY_IR` flags: set
+  **`BEZEL_AOT_CACHE_SALT=<anything>`**. It folds into every key, so the run's
+  entries are isolated in one word — no cold private `BEZEL_AOT_CACHE_DIR`, no
+  losing the cache to `BEZEL_AOT_CACHE=0`. (Those two flags salt themselves
+  automatically; the knob is for everything else.)
+
+The other half of the same rule is about the **key**: every `CodegenOptions`
+bit that changes the emitted object or the link line must appear in
+`modeString()` *and* `codegenModeString()` in `tests/support/aot_support.hpp`.
+One did not — `checkedContracts` (#4386, §22.16) — so `runAot(src)` (which
+defaults it ON) and `runAot(src, CodegenOptions{})` (the release default) keyed
+the same source identically and each served the other its binary. A
+`static_assert` on `sizeof(CodegenOptions)` in `aot_cache_key_test.cpp` now
+stops the build if an option is added without being keyed — though only once
+the `support` area is compiled, so `--target bezelc` and
+`agent_check.sh --area codegen` will not surface it; the gate will.
+
+And the diagnosis, unchanged: **a test that fails in a way your diff cannot
+reach is a cache question before it is a compiler question.** Re-run it with
+`BEZEL_AOT_CACHE=0` before believing it. A hit is silent, so a poisoned entry
+hides a regression exactly as easily as it invents one.
 
 ### Behaviour differential — the oracle for a change that ships no test
 

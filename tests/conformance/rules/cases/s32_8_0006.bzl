@@ -6,6 +6,7 @@
 //!   including a capturing lambda ... -- may be passed there.
 //! cites: 32.8
 //! expect: accept
+//! issue: 4561
 module Conf;
 import System.Interop;
 

@@ -161,19 +161,20 @@ int runUnderAsanLsan(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
@@ -182,12 +183,12 @@ int runUnderAsanLsan(const std::string& source) {
     if (std::system(linkCmd.c_str()) != 0) {
         std::remove(objPath.c_str());
         std::remove(exe.c_str());
-        return -1;
+        return -3;
     }
     int status = std::system(exe.c_str());
     std::remove(objPath.c_str());
     std::remove(exe.c_str());
-    if (!WIFEXITED(status)) return -1;
+    if (!WIFEXITED(status)) return -3;
     return WEXITSTATUS(status);
 }
 

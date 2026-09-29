@@ -167,7 +167,7 @@ BEZEL_TEST(iter_enumerator_unresolved_member_2444,
            bogus_property_on_iasyncenumerator_rejected_stdlib_4_12) {
     const std::string program =
         "module M; "
-        "class C public async static method Gen(): IAsyncEnumerator<int> "
+        "class C public static async method Gen(): IAsyncEnumerator<int> "
         "  yield return 1; "
         "end Gen; "
         "public static async method Main(): Task<int> "
@@ -212,7 +212,7 @@ BEZEL_TEST(iter_enumerator_unresolved_member_2444,
            legit_movenextasync_and_current_value_correct) {
     const std::string program =
         "module M; "
-        "class C public async static method Gen(): IAsyncEnumerator<int> "
+        "class C public static async method Gen(): IAsyncEnumerator<int> "
         "  yield return 42; "
         "  yield return 99; "
         "end Gen; "
@@ -314,7 +314,7 @@ BEZEL_TEST(iter_enumerator_unresolved_member_2444,
            tostring_declared_not_implemented_iasyncenumerator_2459) {
     const std::string program =
         "module M; "
-        "class C public async static method Gen(): IAsyncEnumerator<int> "
+        "class C public static async method Gen(): IAsyncEnumerator<int> "
         "  yield return 1; "
         "end Gen; "
         "public static async method Main(): Task<int> "

@@ -74,7 +74,7 @@ int run(const std::string& src) {
 const char* kGen =
     "module M; "
     "class C "
-    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "  public static async method Gen(): IAsyncEnumerable<int> "
     "    yield return 1; "
     "    yield return 2; "
     "    yield return 3; "

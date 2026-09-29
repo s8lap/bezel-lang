@@ -400,20 +400,27 @@ BEZEL_TEST(codegen_numeric_conv, double_int_max_boundary_739) {
 }
 
 // byte (unsigned 8-bit): 200.0 fits, 300.0 overflows; negative also overflows.
+// #4724 (§5.2 constant-operand rule, v0.307): route the overflow operand
+// through a `double` local so the runtime conversion throws
+// `OverflowException` (the test's intent), not a compile-time reject.
 BEZEL_TEST(codegen_numeric_conv, double_to_byte_range_739) {
     BEZEL_EXPECT_EQ(run(
         "var ok: double := 200.0; var v := byte(ok); "
-        "try var w := byte(300.0); return 1; "
+        "var overflow: double := 300.0; "
+        "try var w: byte := byte(overflow); return 1; "
         "catch OverflowException => return int(v); end;"),  // 200
         200);
 }
 
 // long (signed 64-bit): a value below long.MaxValue casts; 1e19 overflows.
+// #4724 (§5.2 constant-operand rule, v0.307): route the overflow operand
+// through a `double` local so the runtime conversion throws.
 BEZEL_TEST(codegen_numeric_conv, double_to_long_range_739) {
     BEZEL_EXPECT_EQ(run(
         "var a: double := 9.0e18; var b: long := long(a); "
         "var inrange := (if b > 8999999000000000000L then 1 else 0); "
-        "try var c: long := long(1.0e19); return 1; "
+        "var overflow: double := 1.0e19; "
+        "try var c: long := long(overflow); return 1; "
         "catch OverflowException => return inrange; end;"),  // 1
         1);
 }
@@ -466,7 +473,16 @@ BEZEL_TEST(codegen_numeric_conv, long_to_int_signed_unaffected_1133) {
     BEZEL_EXPECT_EQ(run(
         "var ok := 0; "
         "var a: long := -5L; if int(a) = -5 then ok := ok + 1; end; "        // in range
-        "try var b: int := int(5000000000L); catch OverflowException => ok := ok + 6; end; "
+        // The out-of-range operand is bound to a LOCAL first, deliberately.
+        // §5.2 (v0.300) rejects a faulting COMPILE-TIME-CONSTANT operand at
+        // the conversion site rather than deferring it to a runtime fault, so
+        // the inline `int(5000000000L)` this row used to spell is now a
+        // compile error and could never reach the `catch`. Binding through a
+        // local keeps the operand non-constant, so the conversion still raises
+        // `OverflowException` at runtime — which is the behaviour this row
+        // exists to pin. Measured: exit 6, the catch arm taken.
+        "var big: long := 5000000000L; "
+        "try var b: int := int(big); catch OverflowException => ok := ok + 6; end; "
         "return ok;"),                                     // 1 + 6 = 7
         7);
 }

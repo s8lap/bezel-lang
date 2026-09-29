@@ -231,7 +231,7 @@ BEZEL_TEST(for_loop_source_read_after_consume_3977,
     OwnershipResult r = parseAndCheckOwnership(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; "
         "    yield return 2; "
         "  end Gen; "

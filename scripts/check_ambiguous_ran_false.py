@@ -76,6 +76,34 @@ would be missed. That is why the count here differs from the issue's manually
 measured 60 - and why FIXING rows (the sweep) is explicitly out of THIS
 lane's scope (see #3892 and its filed follow-up).
 
+⚠ PREPROCESSOR CONDITIONAL HANDLING (C4 COMPLETION ITEM). The scanner
+does not understand preprocessor conditionals in general: only `#if 0`
+and `#if false` blocks (the explicit "always false" cases) are blanked
+out via _strip_disabled_preprocessor() before the rest of the scan runs
+(scan_file). Other shapes - `#if FOO_MACRO`, `#ifdef FOO`, `#if 1`,
+`#if true`, the `#else`/`#elif` branches of an `#if 1`/`#if 0` pair,
+nested conditionals beyond simple depth counting - are NOT handled. A
+row inside any such unhandled conditional IS still counted by this
+ratchet, even though the compiler will never see it. Issue #3935
+(2026-09-06) names this as a pre-existing, orthogonal limitation -
+the C4 completion item records it here rather than fixing it silently.
+
+⚠ SUPPORT-HEADER HELPERS (C5 COMPLETION ITEM). The `_text_checking_
+helpers()` classifier only sees the file under scan: a helper defined
+in another file - the canonical case is a shared utility in
+`tests/support/*.hpp` that issue #3892 itself recommends using -
+is INVISIBLE to it. Before C5, a test whose only protection was a
+call to such a shared helper was counted; C5 fixes this by ALSO
+collecting helpers from `tests/support/*.hpp` once per `measure()`
+call and unioning them into the per-file helper set (see
+`_support_helpers()`). The same classification rule applies:
+positive-exclusion for the SKIP-literal bail-out idiom, default-
+protective otherwise. Helpers that do NOT match NAME_MARKERS AND do
+NOT live under `tests/support/` (e.g. a per-area shared header like
+`tests/codegen/codegen_helpers.hpp`) are still NOT picked up -
+deliberate scope, mirroring the LOCALDECL-ONLY/DEBT family's
+`tests/`-wide marker search.
+
 THE BASELINE IS EXACT, NOT A CEILING - same rule every ratchet in this file's
 family uses (scripts/check_deprecated_jit_oracle.py, scripts/check_localdecl_
 only_walkers.py, ...). A count BELOW baseline fails as STALE HEADROOM: a sweep
@@ -93,6 +121,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE = ROOT / 'scripts' / 'ambiguous_ran_false.baseline'
+GRANDFATHER = ROOT / 'scripts' / 'ambiguous_ran_false.grandfather'
 
 # A result binding from a harness call whose `.ran == false` is ambiguous
 # between reject / crash / runtime-signal / timeout / ASan (issue #3892).
@@ -165,6 +194,37 @@ def _balanced_body(text, open_brace_idx):
 # of them `(`, backslash or whitespace (the C++ grammar's own limit).
 _RAW_STRING_START = re.compile(r'R"([^(\\\s]{0,16})\(')
 
+# Per-test suppression marker - C1 completion item. Mirrors the
+# LOCALDECL-ONLY marker (scripts/check_localdecl_only_walkers.py:75-100
+# and :145), itself ported from #3590 as the family-wide shape: a prose
+# marker on its own line that, with a reason after the colon, exempts the
+# next row the detector would otherwise flag. Used here to drop a row
+# deliberately preserved for some OTHER purpose (the FAIL-WITHOUT
+# vehicle in tests/support/aot_infra_loud_3007_test.cpp is the canonical
+# case: a knowingly-preserved demonstration of exactly the unsafe shape,
+# for #3007's unrelated fix) from the count, so the baseline can reach
+# zero in principle.
+AMBIGUOUS_OK_MARKER = re.compile(r'//\s*AMBIGUOUS-RAN-FALSE-OK:\s*\S')
+
+# Per-site debt marker - C2 completion item. Sibling to AMBIGUOUS-RAN-
+# FALSE-OK: like LOCALDECL-DEBT, it does NOT remove the site from the
+# count (the site is still an offender, still baselined, still meant to
+# be fixed) but justifies a rise ABOVE the per-file ceiling in
+# scripts/ambiguous_ran_false.grandfather. The `#NNNN` must sit
+# immediately after the colon; a marker with a reason but no issue
+# number is malformed and justifies nothing. `--force` alone is not
+# enough - a deliberate rise past the ceiling still needs one of these
+# at every excess site, mirroring check_localdecl_only_walkers.py:80-96.
+AMBIGUOUS_DEBT_MARKER = re.compile(r'//\s*AMBIGUOUS-RAN-FALSE-DEBT:\s*(\S.*)$')
+AMBIGUOUS_DEBT_ISSUE = re.compile(r'^#(\d+)\b')
+
+# A line-scoped BEZEL_TEST regex used by the marker-attach logic to find
+# the body the suppression marker attaches to. The body-identification
+# machinery below (scan_file) uses re.S so it can match a wrapped
+# argument list, but per-line scanning here does not need that, and the
+# `\w` class never spans a newline anyway.
+BEZEL_TEST_LINE = re.compile(r'BEZEL_TEST\s*\(\s*\w+\s*,\s*(\w+)\s*\)')
+
 # An identifier/digit character - used to find the run of characters
 # immediately preceding a `'`, to tell a C++14 digit separator (`1'000`,
 # `0xFF'FF`) apart from a genuine char-literal-opening `'` - fix #3915,
@@ -174,10 +234,67 @@ _RAW_STRING_START = re.compile(r'R"([^(\\\s]{0,16})\(')
 _WORDCHAR = re.compile(r'[0-9A-Za-z_]')
 
 
+# Partial numeric-literal grammar for the C3 completion item. The
+# pp-number grammar (C++14+) allows `9x` as a valid pp-number (digit,
+# then identifier-nondigit), so a strict pp-number check would NOT
+# reject the malformed `9x` prefix. The detector instead validates
+# against a partial NUMERIC-LITERAL grammar: a token that begins with
+# a digit (or `0x`/`0X` for hex, `0b`/`0B` for binary, `0o`/`0O` for
+# octal) and contains only digits and a small set of exponent/sign
+# markers. This rejects `9x` (the `x` is not a valid digit or exponent
+# letter) without rejecting `0xFF` (`FF` are valid hex digits) or
+# `1e+10` (the `e+` exponent is valid). See issue #3935 (2026-09-06).
+_HEX_DIGITS = set('0123456789abcdefABCDEF')
+_BIN_DIGITS = set('01')
+_OCT_DIGITS = set('01234567')
+_DEC_EXTRAS = set('eEpP+-')
+
+
+def _is_numeric_literal_run(run):
+    """True if `run` (the contiguous word-char run immediately before a
+    `'` candidate) is a syntactically coherent numeric-literal prefix.
+
+    Accepts:
+    - decimal: ``1``, ``123``, ``1e+10``, ``1.5``
+    - hex:     ``0xFF``, ``0XFF'FF`` (note `'` is not in the run; the
+      run is the chars BEFORE `'` only)
+    - binary:  ``0b1010``, ``0B1010``
+    - octal:   ``0o755``, ``0O755``
+
+    Rejects anything with a non-numeric, non-exponent character anywhere
+    in the run, e.g. `9x`, `1a`, `2ppx` (the `x` in `9x'y'` is the C3
+    bug: a numeric-literal can NEVER have an identifier-nondigit like
+    `x` immediately after a decimal digit). Partial implementation:
+    no enforcement of `e`/`E`/`p`/`P` requiring a following sign, no
+    enforcement of `.` position rules - the goal is "reject malformed
+    prefixes that happen to start with a digit", not "parse every
+    numeric literal in the C++ standard".
+    """
+    if not run:
+        return False
+    # Hex / binary / octal: 0{xXbBoO} prefix
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'xX':
+        return all(c in _HEX_DIGITS for c in run[2:])
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'bB':
+        return all(c in _BIN_DIGITS for c in run[2:])
+    if len(run) >= 2 and run[0] == '0' and run[1] in 'oO':
+        return all(c in _OCT_DIGITS for c in run[2:])
+    # Decimal: digits, e/E (exponent), p/P (hex exponent), +/- (sign)
+    for c in run:
+        if c.isdigit():
+            continue
+        if c in _DEC_EXTRAS:
+            continue
+        return False
+    return True
+
+
 def _is_digit_separator(text, i):
     """True if the `'` at `text[i]` is a C++14 digit separator (`1'000`,
     `0xFF'FF`) rather than the start of a char literal that merely abuts an
-    identifier character on both sides (`return'a'`, `x'y'`) - fix #3920.
+    identifier character on both sides (`return'a'`, `x'y'`) - fix #3920,
+    tightened by fix-C3 (issue #3935) to also reject malformed digit-
+    leading runs like `9x'y'`.
 
     Fix #3915 round 2 flagged a `'` as a separator whenever BOTH neighbours
     were word characters. That is necessary but not sufficient: an
@@ -193,6 +310,17 @@ def _is_digit_separator(text, i):
     "0xFF" starts with '0') apart from an identifier abutting a char
     literal (`return'a'` -> run "return" starts with 'r'; `x'y'` -> run
     "x" starts with 'x') without needing a full numeric-literal grammar.
+
+    fix-C3 (issue #3935) tightens this further: the FIRST-char-is-digit
+    check is necessary but not sufficient - a malformed word-char run
+    that happens to START with a digit (e.g. `9x` in `9x'y'`) but is not
+    actually a numeric-literal prefix (the `x` cannot appear in any
+    numeric literal) was still misclassified, with the subsequent `'`
+    then desyncing quote parity and hiding any trailing `//` comment.
+    The C3 check additionally validates the run against a partial
+    numeric-literal grammar - issue #3935 calls this "low priority" and
+    "unreachable in compiling C++", but the gap matters inside dead/
+    disabled text (the #if-0/-false block discussed by C4).
     """
     n = len(text)
     if not (i > 0 and i + 1 < n and _WORDCHAR.match(text[i - 1]) and
@@ -201,7 +329,92 @@ def _is_digit_separator(text, i):
     j = i - 1
     while j > 0 and _WORDCHAR.match(text[j - 1]):
         j -= 1
-    return text[j].isdigit()
+    if not text[j].isdigit():
+        return False
+    # C3: validate the run against the partial numeric-literal grammar.
+    # Reject malformed digit-leading runs like `9x` in `9x'y'`.
+    return _is_numeric_literal_run(text[j:i])
+
+
+# C4 COMPLETION ITEM: preprocessor-conditional handling. The scanner
+# does not understand preprocessor conditionals in general, but the two
+# explicit "always false" cases (`#if 0` and `#if false`) are bounded
+# enough to safely skip - they cannot be re-enabled by macro
+# definitions, so blanking their contents out for the ratchet's purpose
+# is conservative (the compiler would have skipped them anyway). Other
+# shapes (`#if FOO_MACRO`, `#ifdef FOO`, `#if 1`, `#if true`, the
+# `#else` / `#elif` branches of an `#if 1`/`#if 0` pair) are NOT
+# handled and remain a known, documented limitation.
+_IF0_DIRECTIVE = re.compile(r'^\s*#\s*if\s+(?:0|false)\b', re.M)
+_IF_DIRECTIVE = re.compile(r'^\s*#\s*if(?:def|ndef)?\b', re.M)
+_ENDIF_DIRECTIVE = re.compile(r'^\s*#\s*endif\b', re.M)
+
+
+def _strip_disabled_preprocessor(text):
+    """Blank out the contents of `#if 0` / `#if false` blocks (C4).
+    The directives themselves stay in place so the file's overall
+    structure is preserved for any tool that reads it; only the BODY
+    of the disabled block is blanked (newlines preserved, so offset
+    math elsewhere is unaffected). The matching `#endif` (with simple
+    `#if` / `#endif` depth counting so a nested conditional is also
+    handled) is left in place too. The detection result is conservative:
+    the C++ preprocessor would have skipped these blocks anyway, so
+    blanking them for the ratchet's purpose matches what the COMPILER
+    sees (which is what the ratchet is supposed to mirror).
+
+    NOT handled (see module docstring "PREPROCESSOR CONDITIONAL
+    HANDLING"):
+    - `#if FOO_MACRO` (any macro test, including `#if true` / `#if 1`)
+    - `#ifdef FOO` / `#ifndef FOO`
+    - `#else` / `#elif` branches of any conditional
+    - `#if 0` blocks containing further preprocessor directives that
+      themselves contain nested `#if 0` (depth counting handles the
+      straightforward nesting case; pathological shapes do not)
+
+    Issue #3935 (2026-09-06) names this as a pre-existing, orthogonal
+    limitation. The C4 completion item handles only the simple
+    always-false cases and documents the rest.
+    """
+    out = list(text)
+    n = len(text)
+    # Process line by line. For each line that opens an `#if 0` /
+    # `#if false` block, blank out from the end of that line to the
+    # start of the matching `#endif`.
+    pos = 0
+    while pos < n:
+        nl = text.find('\n', pos)
+        line_end = nl if nl >= 0 else n
+        line = text[pos:line_end]
+        if _IF0_DIRECTIVE.match(line):
+            # Find matching #endif with depth counting
+            depth = 1
+            k = line_end + 1
+            while k < n and depth > 0:
+                k_nl = text.find('\n', k)
+                k_line_end = k_nl if k_nl >= 0 else n
+                k_line = text[k:k_line_end]
+                if _IF_DIRECTIVE.match(k_line):
+                    depth += 1
+                elif _ENDIF_DIRECTIVE.match(k_line):
+                    depth -= 1
+                    if depth == 0:
+                        # Blank from line_end (exclusive of newline)
+                        # up to k (the matching #endif line's start),
+                        # so the BODY of the disabled block is gone
+                        # but the `#if` and `#endif` directives stay
+                        # visible.
+                        for idx in range(line_end + 1, k):
+                            if out[idx] != '\n':
+                                out[idx] = ' '
+                        pos = k_line_end + 1
+                        break
+                k = k_line_end + 1
+            else:
+                # Unmatched `#if 0` - bail without blanking anything.
+                pos = line_end + 1
+            continue
+        pos = line_end + 1
+    return ''.join(out)
 
 
 def _strip_comments(text):
@@ -380,6 +593,48 @@ def _text_checking_helpers(text):
     return out
 
 
+def _support_helpers(root):
+    """Set of helper names defined under `tests/support/*.hpp` whose
+    signature takes a `JitResult`-shaped parameter and whose body reads
+    `.message` (C5 COMPLETION ITEM). Same classification rule as
+    _text_checking_helpers, applied across the support header files -
+    the canonical case is a shared utility in tests/support/ that an
+    ordinary test file `#include`s and calls as its sole protection
+    against the ambiguous-ran-false shape (issue #3892's recommended
+    remedy is to use a shared helper, but the SHARED one was invisible
+    to this ratchet before C5: a call site in `tests/<area>/X_test.cpp`
+    to a helper defined in `tests/support/some_helpers.hpp` would not
+    match NAME_MARKERS (the helper's name might be `expectsCompileError`
+    or similar), AND `_text_checking_helpers` only sees the file under
+    scan, never the included header).
+
+    The same POSITIVE-exclusion rule applies: a helper is denied
+    protective status only when every `.find(...)` call on `.message`
+    in its body can be positively confirmed as the SKIP-literal bail-
+    out shape. Anything this function CANNOT positively confirm as
+    skip-only defaults to PROTECTIVE, matching the per-file rule.
+
+    CAVEAT: this function reads the SUPPORT HEADER as text, not the
+    compiled image. A helper that goes through a templated alias or a
+    macro layer (e.g. `#define EXPECTS_ERROR(x) checkErr(x, "...")`)
+    may not be classified as protective. The narrower `tests/<area>/`
+    -shaped checks in `check_vacuous_tests.py` have the same caveat;
+    the fix there is to write the helper as plain C++, which is the
+    discipline this ratchet enforces by the same mechanism.
+    """
+    out = set()
+    support_dir = root / 'tests' / 'support'
+    if not support_dir.is_dir():
+        return out
+    for p in sorted(support_dir.glob('*.hpp')):
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            continue
+        out.update(_text_checking_helpers(text))
+    return out
+
+
 LOC_LINE = re.compile(r'\.line\b\s*[><=!]=?\s*0')
 LOC_COLUMN = re.compile(r'\.column\b\s*[><=!]=?\s*0')
 
@@ -429,9 +684,80 @@ HAS_ERRORS_TRUE = re.compile(
     r'hasErrors\s*\(\s*\)\s*\)')
 
 
-def scan_file(path, text):
-    """-> list of (test_name, var) unprotected rows in this file's text."""
-    if 'BEZEL_TEST' not in text:
+def _ambiguous_ok_test_names(raw):
+    """Set of test names whose BEZEL_TEST body is exempted by an
+    `// AMBIGUOUS-RAN-FALSE-OK: <reason>` marker (C1). A marker exempts
+    the next BEZEL_TEST body whose opener sits within 8 lines below it
+    (mirrors scripts/check_localdecl_only_walkers.py:75-100 and :145 -
+    same mechanism as every OTHER-ONLY marker in this repo, ported from
+    #3590). A reason after the colon is REQUIRED - a marker with no
+    reason is malformed and does not exempt (mirrors LOCALDECL-ONLY,
+    which uses `\\S` in its own marker regex for the same reason).
+
+    Reads from the RAW text (marker IS a comment, deliberately -
+    check_localdecl_only_walkers.py:160-165 makes the same choice for the
+    same reason: a prose MENTION of a marker-shape in a docstring should
+    not trip the detector). The body-identification machinery below
+    (scan_file) reads the comment-stripped text, but the marker is only
+    consulted to determine which TEST NAME to skip, not as part of body
+    protection; matching by name within a file is unambiguous in practice
+    (every test name is unique within its file, and a marker that
+    exempted a sibling row would still only exempt THAT row's name).
+    """
+    out = set()
+    lines = raw.split('\n')
+    for i, ln in enumerate(lines):
+        if not AMBIGUOUS_OK_MARKER.search(ln):
+            continue
+        # Marker exempts the next BEZEL_TEST body that opens within 8 lines
+        # of it (inclusive of the marker line as the start, exclusive of
+        # the marker's own line so a marker placed AT a BEZEL_TEST does not
+        # also exempt it). Walk forward, stop on the first match.
+        for j in range(i + 1, min(i + 8, len(lines))):
+            tm = BEZEL_TEST_LINE.search(lines[j])
+            if tm:
+                out.add(tm.group(1))
+                break
+    return out
+
+
+def _ambiguous_debt_markers(raw):
+    """[(line, issue_or_None)] for AMBIGUOUS-RAN-FALSE-DEBT markers in the
+    raw text. A marker with a reason but no leading `#NNNN` returns
+    `(line, None)` - well-formed-ness is reported separately so the gate
+    can flag malformed markers as a distinct violation (mirrors
+    scripts/check_localdecl_only_walkers.py:290-304, the same
+    well-formed-vs-malformed split).
+
+    The marker is read from RAW (not the comment-stripped text) for the
+    same reason AMBIGUOUS_OK_MARKER is - it IS a comment. Reads by line
+    number; scan_file's body-attachment uses the same line numbers so
+    attaching a marker to the next row within 8 lines is straightforward.
+    """
+    out = []
+    for i, ln in enumerate(raw.split('\n')):
+        m = AMBIGUOUS_DEBT_MARKER.search(ln)
+        if not m:
+            continue
+        im = AMBIGUOUS_DEBT_ISSUE.match(m.group(1).strip())
+        if im:
+            out.append((i + 1, int(im.group(1))))
+        else:
+            out.append((i + 1, None))
+    return out
+
+
+def scan_file(path, raw, support_helpers=None):
+    """-> list of (test_name, var) unprotected rows in this file's raw
+    text. `raw` is the file's actual on-disk text (the marker-attach
+    logic reads from it directly, since both AMBIGUOUS-RAN-FALSE-OK and
+    AMBIGUOUS-RAN-FALSE-DEBT are comments and would be stripped from the
+    comment-stripped copy - check_localdecl_only_walkers.py:160-165 makes
+    the same point). `support_helpers` is the set of helper NAMES
+    collected from `tests/support/*.hpp` by `_support_helpers()` (C5);
+    a call to one of those names in a test body counts as protection
+    exactly like an in-file helper would."""
+    if 'BEZEL_TEST' not in raw:
         return []
     # fix #3915: scan a COMMENT-STRIPPED copy, never the raw text - a
     # comment quoting `BEZEL_EXPECT_FALSE(r.ran)` is not live code, whether
@@ -440,10 +766,20 @@ def scan_file(path, text):
     # is why a comment in that gap used to bleed into the PRECEDING test's
     # window - stripping it removes the only thing that made it matchable,
     # in every window it could possibly fall into).
-    text = _strip_comments(text)
+    text = _strip_comments(raw)
+    # C4: blank out `#if 0` / `#if false` block contents before the
+    # scan. See _strip_disabled_preprocessor docstring + module docstring
+    # "PREPROCESSOR CONDITIONAL HANDLING" for what is and is not handled.
+    text = _strip_disabled_preprocessor(text)
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
     text_helpers = _text_checking_helpers(text)
+    # C5: union the in-file helper names with the support-header
+    # helper names collected once per measure() call (avoiding one
+    # glob+read per scan_file invocation; the union is per-call).
+    if support_helpers:
+        text_helpers = text_helpers | support_helpers
+    ok_tests = _ambiguous_ok_test_names(raw)  # C1: suppression marker
     marks = [(m.start(), f'{m.group(1)}.{m.group(2)}', m.end())
              for m in BEZEL_TEST.finditer(text)]
     out = []
@@ -466,28 +802,105 @@ def scan_file(path, text):
         # binding (a project helper like `auto r = compileAndRun(src)`) is
         # the safer failure mode for a ratchet than over-counting an entire
         # unrelated test family.
+        # C1: a row carrying an AMBIGUOUS-RAN-FALSE-OK marker is
+        # deliberately preserved for some other purpose (the #3007
+        # demo in tests/support/aot_infra_loud_3007_test.cpp is the
+        # canonical case) and is not an accidental hole in protection.
+        suite, _, test_name = tname.partition('.')
+        test_exempt = test_name in ok_tests
         for var in sorted(claim_vars & bound_vars):
-            if not _protected(body, var, text_helpers):
+            if not _protected(body, var, text_helpers) and not test_exempt:
                 out.append((tname, var))
     return out
 
 
+def _ambiguous_debt_test_names(raw):
+    """Set of test names whose BEZEL_TEST body carries a WELL-FORMED
+    AMBIGUOUS-RAN-FALSE-DEBT marker (C2). A debt marker on a line within
+    8 lines before a BEZEL_TEST opener attaches to that body and
+    justifies one excess row above the per-file ceiling recorded in
+    scripts/ambiguous_ran_false.grandfather - same shape as the
+    suppression marker (C1 / _ambiguous_ok_test_names above) and the
+    LOCALDECL-DEBT mechanism (scripts/check_localdecl_only_walkers.py
+    :80-96 and :290-304).
+
+    A debt marker without a `#NNNN` after the colon is MALFORMED and
+    justifies nothing - mirrors LOCALDECL-DEBT's well-formed-vs-
+    malformed split (check_localdecl_only_walkers.py:290-304). Only
+    well-formed markers appear in the returned set, so debt_per_file
+    (built from it) counts only what actually justifies a rise.
+
+    Unlike _ambiguous_ok_test_names, a debt marker does NOT remove the
+    site from the count - the row is still an offender, still baselined,
+    still meant to be fixed; the marker only justifies a rise past the
+    per-file ceiling. Per-row attachment (one DEBT marker justifies one
+    excess row) is the same per-site model LOCALDECL-DEBT uses - see
+    scripts/check_localdecl_only_walkers.py:402-424.
+    """
+    out = set()
+    lines = raw.split('\n')
+    for i, ln in enumerate(lines):
+        m = AMBIGUOUS_DEBT_MARKER.search(ln)
+        if not m:
+            continue
+        if not AMBIGUOUS_DEBT_ISSUE.match(m.group(1).strip()):
+            continue  # malformed - reason with no #NNNN justifies nothing
+        for j in range(i + 1, min(i + 8, len(lines))):
+            tm = BEZEL_TEST_LINE.search(lines[j])
+            if tm:
+                out.add(tm.group(1))
+                break
+    return out
+
+
+def _per_file_counts(per_file):
+    """{path: count} - simple aggregation over measure's per_file
+    output. Used by both check_debt_floor (C2) and write_grandfather."""
+    return {p: len(rows) for p, rows in per_file.items()}
+
+
 def measure(root):
-    """-> (total, per_file) where per_file: {relpath: [(test, var), ...]}."""
+    """-> (total, per_file, debt_per_file) where
+    per_file: {relpath: [(test, var), ...]} - all unprotected rows
+    debt_per_file: {relpath: int} - count of those rows whose
+        BEZEL_TEST body carries an AMBIGUOUS-RAN-FALSE-DEBT marker
+        (C2). A debt marker attached to a body whose rows are ALL
+        protected is not counted here - it justifies nothing. The
+        returned counts are still conservative: a body with one
+        unprotected row and a debt marker contributes 1 to
+        debt_per_file, matching the per-site 1-marker-per-excess-row
+        model."""
     per_file = {}
+    debt_per_file = {}
     tests_dir = root / 'tests'
     if not tests_dir.is_dir():
-        return 0, {}
+        return 0, {}, {}
+    # C5: collect helper names from tests/support/*.hpp ONCE per
+    # measure() call (not once per file). See _support_helpers
+    # docstring for the rationale and the same-classification rule.
+    support_helpers = _support_helpers(root)
     for p in sorted(tests_dir.rglob('*_test.cpp')):
         try:
-            text = p.read_text(errors='replace')
+            raw = p.read_text(errors='replace')
         except OSError:
             continue
-        rows = scan_file(p, text)
+        rows = scan_file(p, raw, support_helpers=support_helpers)
+        rel = str(p.relative_to(root))
         if rows:
-            per_file[str(p.relative_to(root))] = rows
+            per_file[rel] = rows
+        # C2: count debt-marked unprotected rows. Rows whose body
+        # carries a debt marker count toward debt_per_file; rows in
+        # the same body that already have an OK marker do not appear
+        # in `rows` at all (they were suppressed at scan_file time),
+        # so we do not double-count them.
+        debt_tests = _ambiguous_debt_test_names(raw)
+        debt_count = sum(
+            1 for tname, _ in rows
+            if tname.split('.', 1)[1] in debt_tests)
+        if debt_count > 0:
+            debt_per_file[rel] = debt_count
     total = sum(len(v) for v in per_file.values())
-    return total, per_file
+    return total, per_file, debt_per_file
 
 
 def read_baseline(path=BASELINE):
@@ -539,23 +952,139 @@ def write_baseline(count, path=BASELINE):
         '']))
 
 
-def check(root, baseline_path=BASELINE, stale=True):
+def check(root, baseline_path=BASELINE, grandfather_path=GRANDFATHER, stale=True):
     base = read_baseline(baseline_path)
-    cur, per_file = measure(root)
+    cur, per_file, debt_per_file = measure(root)
+    grand = read_grandfather(grandfather_path)
+    msgs = []
     if cur > base:
-        return False, [
+        msgs.append(
             'ROSE: baseline %d, tree has %d (+%d). A new row pins a '
             'compile-time rejection using only `.ran`/`hasErrors()` with no '
             'message-text or real-location check - see script docstring for '
             'the fix (use tests/support/aot_result_asserts.hpp or an '
-            'equivalent).' % (base, cur, cur - base)], per_file
-    if stale and cur < base:
-        return False, [
+            'equivalent).' % (base, cur, cur - base))
+    elif stale and cur < base:
+        msgs.append(
             'baseline claims %d but the tree has %d - STALE HEADROOM (%+d). '
             'The baseline is exact, not a ceiling: re-run --update on the '
             'tree that fixed these rows so the improvement is banked.'
-            % (base, cur, cur - base)], per_file
-    return True, [], per_file
+            % (base, cur, cur - base))
+    # C2: check that no file has more unprotected rows than its
+    # grandfathered ceiling + number of AMBIGUOUS-RAN-FALSE-DEBT markers
+    # in that file. --force does NOT substitute for the marker.
+    msgs.extend(check_debt_floor(_per_file_counts(per_file), grand,
+                                 debt_per_file))
+    return (not msgs), msgs, per_file
+
+
+# ---------------------------------------------------------------------------
+# grandfather / debt floor (C2)
+# ---------------------------------------------------------------------------
+
+def _parse_per_file_counts(text, source_name):
+    """Parse a flat `<int> <path>` file (used by both the mutable baseline
+    and the frozen grandfather ceiling in this ratchet family).
+    `source_name` is what a merge-conflict error names."""
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
+            sys.stderr.write(
+                '%s has unresolved merge conflict markers. Resolve by '
+                'hand; there is no --update for a frozen ceiling file - '
+                'it changes only by a deliberate, reviewed edit.\n'
+                % source_name)
+            raise SystemExit(2)
+        if not line or line.startswith('#'):
+            continue
+        n, path = line.split(None, 1)
+        out[path] = int(n)
+    return out
+
+
+def read_grandfather(path=GRANDFATHER):
+    """The per-file ceiling for AMBIGUOUS-RAN-FALSE-DEBT - a rise above
+    the ceiling needs a per-site DEBT marker; --force alone is not
+    enough. Mirrors scripts/check_localdecl_only_walkers.py:465-473
+    (same family-wide mechanism, ported from #3590). A missing file
+    reads as an ALL-ZERO ceiling (fail closed): every unprotected row
+    needs a DEBT marker until the file is created with the initial
+    values."""
+    if not path.exists():
+        return {}
+    return _parse_per_file_counts(path.read_text(),
+                                  str(path))
+
+
+def tighten_grandfather(existing, cur):
+    """Monotone downward only: new[path] = min(existing.get(path, 0),
+    cur.get(path, 0)). A file whose tightened ceiling reaches 0 is
+    dropped entirely. Same shape as
+    scripts/check_localdecl_only_walkers.py:476-485."""
+    out = {}
+    for path in set(existing) | set(cur):
+        new = min(existing.get(path, 0), cur.get(path, 0))
+        if new > 0:
+            out[path] = new
+    return out
+
+
+def write_grandfather(existing, cur, path=GRANDFATHER):
+    """Persist the tightened ceiling. Called on EVERY successful
+    `--update`, alongside write_baseline - a drain must become the
+    new ceiling immediately, or the mechanism protects nothing during
+    a drain campaign. Returns [(path, old, new), ...] for the
+    tightening report."""
+    new = tighten_grandfather(existing, cur)
+    lines = [
+        '# ambiguous_ran_false.grandfather - per-file ceiling for #3892/#3895.',
+        '#',
+        '# Each row is one file maximum number of bare-!ran/hasErrors()',
+        '# rows allowed without per-site `// AMBIGUOUS-RAN-FALSE-DEBT:',
+        '# #NNNN <reason>` markers. The ceiling only ever falls - every',
+        '# successful `--update` tightens each file to min(existing,',
+        '# measured), so a drain becomes the new ceiling on the very',
+        '# next --update. A file whose tightened ceiling reaches 0 is',
+        '# dropped entirely. Raising a ceiling stays a deliberate,',
+        '# reviewed hand-edit to this file.',
+        '#',
+        '# See check_debt_floor() in scripts/check_ambiguous_ran_false.py',
+        '# (mirrors scripts/localdecl_only_walkers.grandfather, ported',
+        '# from #3590 as the family-wide mechanism).',
+        '',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(new.items())]
+    path.write_text('\n'.join(lines) + '\n')
+    changed = [(p, existing.get(p, 0), new.get(p, 0))
+               for p in sorted(set(existing) | set(new))
+               if new.get(p, 0) < existing.get(p, 0)]
+    return new, changed
+
+
+def check_debt_floor(cur, floor, debt_per_file):
+    """-> violation strings. A rise above the GRANDFATHERED ceiling
+    needs a per-site AMBIGUOUS-RAN-FALSE-DEBT marker; --force alone
+    is not enough. Identical mechanism to
+    scripts/check_localdecl_only_walkers.py:402-424, ported from #3590
+    as the family-wide shape."""
+    bad = []
+    for path in sorted(cur):
+        have = cur[path]
+        ceiling = floor.get(path, 0)
+        if have <= ceiling:
+            continue
+        excess = have - ceiling
+        got = debt_per_file.get(path, 0)
+        if got < excess:
+            bad.append(
+                '%s has %d row(s), %d above its grandfathered ceiling '
+                'of %d (scripts/ambiguous_ran_false.grandfather) - %d of '
+                'the %d excess row(s) carry a `// AMBIGUOUS-RAN-FALSE-DEBT: '
+                '#NNNN <reason>` marker, %d do not. --force does not '
+                'substitute for the marker.'
+                % (path, have, excess, ceiling, got, excess, excess - got))
+    return bad
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +1306,94 @@ BEZEL_TEST(aot_infra_loud_3007, legacy_negative_assertion_shape) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 ''')
+        # C1 fixture: a row carrying an `// AMBIGUOUS-RAN-FALSE-OK:
+        # <reason>` marker on the line before its BEZEL_TEST opener is
+        # suppressed from the count - mirrors the LOCALDECL-ONLY marker
+        # (check_localdecl_only_walkers.py:75-100). Used to exempt the
+        # real demonstration row in tests/support/aot_infra_loud_3007_test.cpp
+        # (the #3007 FAIL-WITHOUT vehicle), so the baseline can reach 0
+        # in principle. Without the marker this fixture WOULD count (it
+        # has bare !ran + hasErrors with no protection); with the marker
+        # it must not.
+        _mk(root, 'tests/codegen/marked_suppression_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: deliberately preserved as the FAIL-WITHOUT vehicle for issue #3007's fix in tests/support/aot_infra_loud_3007_test.cpp
+BEZEL_TEST(fixture_suite, marked_suppression_demo) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+''')
+        # C1 negative control: a marker with NO reason after the colon is
+        # malformed and does NOT exempt - mirrors LOCALDECL-ONLY's `\S`
+        # requirement (check_localdecl_only_walkers.py:112-113, "a marker
+        # with no reason after the colon does NOT exempt"). Without the
+        # reason this row WOULD count; it must still count.
+        _mk(root, 'tests/codegen/malformed_marker_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK:
+BEZEL_TEST(fixture_suite, malformed_marker_no_reason) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C1 negative control: a marker placed > 8 lines BEFORE the next
+        # BEZEL_TEST does NOT attach - mirrors the LOCALDECL-ONLY 8-line
+        # window (check_localdecl_only_walkers.py:81-82, "a marker cannot
+        # drift away from the cast it describes"). The marker below sits
+        # on its own with the body much further down; the row counts.
+        _mk(root, 'tests/codegen/drifted_marker_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: too far above the next test - marker window is 8 lines
+
+
+// padding so the BEZEL_TEST below is well outside the 8-line window
+// pad 1
+// pad 2
+// pad 3
+// pad 4
+// pad 5
+// pad 6
+// pad 7
+// pad 8
+// pad 9
+// pad 10
+// pad 11
+// pad 12
+BEZEL_TEST(fixture_suite, drifted_marker_demo) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C1 control: a marker placed on a line whose next BEZEL_TEST is
+        # out of scope (e.g. across files) does not exempt THIS file's
+        # row. This is automatic in this per-file scan but worth a
+        # negative control so future refactors do not break it: a file
+        # with a marker BUT no matching BEZEL_TEST within 8 lines must
+        # still see its bare row counted.
+        _mk(root, 'tests/codegen/marker_no_match_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-OK: no BEZEL_TEST body opens within 8 lines below
+// pad 1
+// pad 2
+// pad 3
+// pad 4
+// pad 5
+// pad 6
+// pad 7
+// pad 8
+// pad 9
+// pad 10
+// pad 11
+// pad 12
+// pad 13
+// pad 14
+// pad 15
+// pad 16
+// pad 17
+// pad 18
+// pad 19
+BEZEL_TEST(fixture_suite, marker_no_match) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
         # A test with EXPECT_TRUE(r.ran) only - not a rejection claim at all.
         _mk(root, 'tests/codegen/positive_only_test.cpp', '''
 BEZEL_TEST(fixture_suite, positive_only) {
@@ -836,7 +1453,7 @@ BEZEL_TEST(fixture_suite, bare_row_near_comment) {
     auto r = runAot("module M;");
     // NOTE: the row below genuinely uses the ambiguous anti-pattern - it
     // must still be flagged as a real unprotected row even though this
-    // very comment also quotes the pattern's literal text.
+    // very comment also quotes the pattern literal text.
     BEZEL_EXPECT_FALSE(r.ran);
 }
 ''')
@@ -850,14 +1467,14 @@ BEZEL_TEST(fixture_suite, bare_row_near_comment) {
         # only asserts the POSITIVE case; the anti-pattern's literal text
         # appears twice, both times inside a same-line trailing comment
         # immediately after a digit separator (decimal, then hex).
-        _mk(root, 'tests/codegen/digit_separator_same_line_comment_test.cpp', '''
+        _mk(root, 'tests/codegen/digit_separator_same_line_comment_test.cpp', """
 BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     int decimalWithSeparator = 1'000;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a decimal digit separator - must still be stripped
     int hexWithSeparator = 0xFF'FF;  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a hex digit separator too
 }
-''')
+""")
 
         # issue #3920: the SAME both-sides-wordchar shape as a digit
         # separator also arises from an identifier immediately abutting a
@@ -874,26 +1491,26 @@ BEZEL_TEST(fixture_suite, digit_separator_same_line_comment) {
         # importing the pre-fix module against this exact fixture pair
         # reports count=2 (both falsely flagged); the fixed module reports
         # 0. Real code here only asserts the POSITIVE case.
-        _mk(root, 'tests/codegen/char_literal_abuts_identifier_test.cpp', '''
+        _mk(root, 'tests/codegen/char_literal_abuts_identifier_test.cpp', """
 BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_return) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     int f() { return'a'; }  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a char literal that abuts an identifier - must still be stripped (issue #3920)
 }
-''')
+""")
         # Sibling shape: a single-letter identifier (not a keyword) abutting
         # a char literal - `x'y'` has the same both-sides-wordchar shape as
         # `return'a'` but with a run of length 1 before the `'`, exercising
         # the _is_digit_separator backward walk's j==i-1 boundary.
-        _mk(root, 'tests/codegen/char_literal_abuts_short_identifier_test.cpp', '''
+        _mk(root, 'tests/codegen/char_literal_abuts_short_identifier_test.cpp', """
 BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_TRUE(r.ran);
     char c = x'y';  // quoting BEZEL_EXPECT_FALSE(r.ran) right after a single-letter identifier abutting a char literal - must still be stripped (issue #3920)
 }
-''')
+""")
 
-        total, per_file = measure(root)
+        total, per_file, debt_per_file = measure(root)
         chk('bare `!ran` flagged', 'tests/codegen/bare_test.cpp' in per_file)
         chk('`!ran` + hasErrors()-only flagged (equally vulnerable)',
             'tests/codegen/haserrors_only_test.cpp' in per_file)
@@ -959,16 +1576,424 @@ BEZEL_TEST(fixture_suite, char_literal_abuts_identifier_short) {
             'separator',
             'tests/codegen/char_literal_abuts_short_identifier_test.cpp'
             not in per_file)
-        chk('exactly 6 unprotected rows across the fixture tree (bare, '
-            'hasErrors-only, the skip-guard-only row, the aliased-skip-only '
-            'row, the support/ demo, the #3915 bare-row-near-comment '
-            'control)',
-            total == 6)
+        # C3 fixture (issue #3935): a malformed digit-leading run
+        # `9x'y'` followed by a trailing `// ... BEZEL_EXPECT_FALSE(r.ran)`
+        # comment. Pre-C3, the FIRST `'` was misclassified as a digit
+        # separator (run "9x" starts with `9`, passes the #3920 check),
+        # then the SECOND `'` opened char-literal mode (its right
+        # neighbour is `;`, fails the flanking check), unterminated
+        # across the line, and the trailing `//` comment was HIDDEN
+        # (left unstripped) inside the unterminated char literal. The
+        # test then saw the comment text as a live assertion. Post-C3,
+        # the partial numeric-literal grammar rejects `9x` (the `x` is
+        # not a valid numeric-literal character), so the FIRST `'`
+        # correctly enters char-literal mode, the SECOND `'` closes it
+        # (char literal is `'y'`), and the trailing `//` comment IS
+        # stripped. The fixture is the literal `int z = 9x'y';` line
+        # from #3935 verbatim.
+        _mk(root, 'tests/codegen/malformed_digit_run_test.cpp', """
+// issue #3935 - the literal `int z = 9x'y';` line from the issue, with
+// a trailing `// ... BEZEL_EXPECT_FALSE(r.ran)` comment that MUST stay
+// stripped (the comment text leaks through as a live row if the
+// detector's quote parity desyncs - the exact bug C3 fixes).
+int z = 9x'y';  // quoting BEZEL_EXPECT_FALSE(r.ran) trailing comment must be stripped
+""")
+        chk('C3: a malformed digit-leading run `9x\'y\'` followed by a '
+            'trailing comment - the partial numeric-literal grammar '
+            'rejects `9x` so the first `\'` enters char-literal mode, the '
+            'second `\'` closes it, and the trailing `//` comment IS '
+            'stripped (no live row from the comment text)',
+            'tests/codegen/malformed_digit_run_test.cpp' not in per_file)
+        # C3 control: a VALID numeric-literal prefix with digit
+        # separator still works after the C3 tightening - `0xFF'FF` is
+        # a real C++14 hex literal, the `'` between `FF` and `FF` is a
+        # separator, not a char literal opener. The detector must keep
+        # accepting this shape (otherwise C3 over-corrects into denying
+        # every legitimate separator).
+        _mk(root, 'tests/codegen/valid_digit_separator_test.cpp', """
+// Real C++14 hex literal with a digit separator - same-shape as the
+// malformed fixture above but the run is `0xFF` (a valid hex prefix
+// followed by valid hex digits). The `'` is a real separator, the
+// trailing `// BEZEL_EXPECT_FALSE(r.ran)` is a real comment.
+int z = 0xFF'FF;  // quoting BEZEL_EXPECT_FALSE(r.ran) trailing comment must be stripped
+""")
+        chk('C3: a valid numeric-literal prefix with digit separator '
+            '(0xFF\'FF) still works after C3 tightening - the comment is '
+            'stripped, no live row from the comment text',
+            'tests/codegen/valid_digit_separator_test.cpp' not in per_file)
+        # C4 fixture: a bare `!ran` row inside `#if 0` (or `#if false`)
+        # must NOT count after _strip_disabled_preprocessor blanks it out.
+        # The C++ preprocessor would skip the block too, so the ratchet's
+        # verdict must mirror what the compiler sees - see module
+        # docstring "PREPROCESSOR CONDITIONAL HANDLING".
+        _mk(root, 'tests/codegen/inside_if0_test.cpp', '''
+BEZEL_TEST(fixture_suite, live_above) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+#if 0
+BEZEL_TEST(fixture_suite, inside_if0) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+#endif
+''')
+        chk('C4: a row inside `#if 0` does NOT count (the C++ preprocessor '
+            'would skip it; the ratchet mirrors the compiler)',
+            'tests/codegen/inside_if0_test.cpp' not in per_file)
+        _mk(root, 'tests/codegen/inside_iffalse_test.cpp', '''
+BEZEL_TEST(fixture_suite, live_above_iffalse) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+#if false
+BEZEL_TEST(fixture_suite, inside_iffalse) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+#endif
+''')
+        chk('C4: a row inside `#if false` does NOT count either '
+            '(same mechanism as #if 0)',
+            'tests/codegen/inside_iffalse_test.cpp' not in per_file)
+        # C4 negative control: a row inside `#if 1` is NOT skipped
+        # (the limitation is documented - only #if 0 and #if false are
+        # handled). The fixture is included so a future change that
+        # widens the C4 handling to #if 1 will trip this assertion
+        # and force a deliberate review.
+        _mk(root, 'tests/codegen/inside_if1_test.cpp', '''
+#if 1
+BEZEL_TEST(fixture_suite, inside_if1) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+#endif
+''')
+        # Re-measure AFTER the C4 fixtures are added so the post-C4
+        # assertions below (the `total == N` summary, the per-file
+        # counts of the C4 fixtures, and C2's `total_with_c2` delta)
+        # reflect the C4 fixtures. The earlier `measure(root)` at
+        # line ~1443 ran BEFORE C4 was added; that fresh capture is
+        # what the C1/C2/C3 assertions above correctly reference.
+        # The vacuous `not in per_file` checks above are the early-exit
+        # form of the same assertion against the post-fixture `per_file`
+        # below; the check that C4 actually blanked the disabled block
+        # body is the `in per_file` + `len(...) == 1` pair below (a
+        # file with only a `#if 0`-protected row would be absent from
+        # per_file entirely; a file with a live_above row AND a
+        # disabled block contributes exactly one).
+        total, per_file, debt_per_file = measure(root)
+        chk('C4 NEGATIVE: a row inside `#if 1` IS counted (the C4 '
+            'limitation is documented; widening the handling to #if 1 '
+            'would need a deliberate review - this assertion is the '
+            'tripwire)',
+            'tests/codegen/inside_if1_test.cpp' in per_file)
+        chk('C4 live rows are still counted: inside_if0_test.cpp has 1 '
+            '(live_above, the inside_if0 body is blanked by C4)',
+            len(per_file.get('tests/codegen/inside_if0_test.cpp', [])) == 1)
+        chk('C4 live rows are still counted: inside_iffalse_test.cpp has 1 '
+            '(live_above_iffalse, the inside_iffalse body is blanked)',
+            len(per_file.get('tests/codegen/inside_iffalse_test.cpp', [])) == 1)
+        # C5 fixtures: a helper defined in tests/support/*.hpp that
+        # takes a JitResult and reads .message must protect a calling
+        # body, even when the helper's name does NOT match NAME_MARKERS
+        # and the file under scan does NOT itself define any local
+        # helpers. Before C5, this case was silently counted as
+        # unprotected (the recommended fix in issue #3892's own
+        # rationale was "use a shared helper", but the shared helper
+        # was invisible to this ratchet).
+        _mk(root, 'tests/support/c5_shared_helper_test.hpp', '''
+#pragma once
+#include <string>
+namespace c5_test_support {
+inline bool hasExpectedRejectionMsg(const bezel::test::JitResult& r,
+                                    const char* needle) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_support_helper_test.cpp', '''
+#include "support/c5_shared_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_support_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (!c5_test_support::hasExpectedRejectionMsg(r, "expected text")) return;
+}
+''')
+        chk('C5 POSITIVE: a test whose only protection is a call to a '
+            'tests/support/*.hpp-defined helper that takes a JitResult '
+            'and reads .message does NOT count (issue #3892\'s '
+            '"use a shared helper" recommendation)',
+            'tests/codegen/uses_support_helper_test.cpp'
+            not in per_file)
+        _mk(root, 'tests/support/c5_skip_only_helper_test.hpp', '''
+#pragma once
+namespace c5_test_support {
+inline bool toolchainWasSkippedShape(const bezel::test::JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_skip_only_helper_test.cpp', '''
+#include "support/c5_skip_only_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_skip_only_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (c5_test_support::toolchainWasSkippedShape(r)) return;
+}
+''')
+        _mk(root, 'tests/support/c5_nonjit_helper_test.hpp', '''
+#pragma once
+namespace c5_test_support {
+inline bool someOtherCheck(const std::string& s) {
+    return s.find("hello") != std::string::npos;
+}
+}
+''')
+        _mk(root, 'tests/codegen/uses_nonjit_helper_test.cpp', '''
+#include "support/c5_nonjit_helper_test.hpp"
+BEZEL_TEST(fixture_suite, protected_via_non_jit_helper) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    if (c5_test_support::someOtherCheck(std::string("hello"))) return;
+}
+''')
+        # Re-measure AFTER the C5 fixtures are added so the post-C5
+        # NEGATIVE assertions below (the SKIP-only and non-JitResult
+        # helper cases both DO count) can reference a `per_file` that
+        # contains the freshly-added fixture files. The earlier
+        # `per_file` captured at line ~1443 did NOT see these
+        # fixtures yet - `in per_file` would vacuously fail for the
+        # same reason the C4 NEGATIVE needed its own re-measure.
+        total, per_file, debt_per_file = measure(root)
+        chk('C5 NEGATIVE: a tests/support/*.hpp-defined helper that '
+            'checks ONLY the SKIP literal is SKIP-only, NOT protective '
+            '(same positive-exclusion rule as in-file helpers)',
+            'tests/codegen/uses_skip_only_helper_test.cpp' in per_file)
+        chk('C5 NEGATIVE: a tests/support/*.hpp-defined helper whose '
+            'parameter is NOT a JitResult is NOT collected by '
+            '_support_helpers (the JitResult signature check is the '
+            'same as _text_checking_helpers\'s), so the row IS counted',
+            'tests/codegen/uses_nonjit_helper_test.cpp' in per_file)
+        chk('C5 POSITIVE (re-measured): real-helper case is still NOT '
+            'counted (the union with support_helpers preserves the '
+            'protection across re-measure)',
+            'tests/codegen/uses_support_helper_test.cpp' not in per_file)
+        # C1 fixtures: the suppression marker mechanism.
+        chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
+            'BEZEL_TEST body suppresses that row from the count (the '
+            'canonical use is tests/support/aot_infra_loud_3007_test.cpp'
+            '::legacy_negative_assertion_shape)',
+            'tests/codegen/marked_suppression_test.cpp' not in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker with NO reason '
+            'after the colon is malformed and does NOT exempt (mirrors '
+            'LOCALDECL-ONLY\'s \\S requirement)',
+            'tests/codegen/malformed_marker_test.cpp' in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker whose next '
+            'BEZEL_TEST is more than 8 lines below does NOT attach '
+            '(mirrors the 8-line window)',
+            'tests/codegen/drifted_marker_test.cpp' in per_file)
+        chk('C1 negative: an AMBIGUOUS-RAN-FALSE-OK marker with no '
+            'BEZEL_TEST within 8 lines below (e.g. with too many padded '
+            'comment lines) does not exempt anything in this file',
+            'tests/codegen/marker_no_match_test.cpp' in per_file)
+        chk('exactly 14 unprotected rows across the fixture tree (12 from '
+            'the C4-counted tree + 2 net C5 delta: the positive support-'
+            'helper case is correctly PROTECTED by C5 (its row is removed '
+            'from the count, a non-counting fixture by design), but the '
+            'two negative controls each contribute +1 (the SKIP-only '
+            'helper denial case and the non-JitResult-helper denial case '
+            'are both still counted as unprotected because their '
+            'protection claim is rejected by the SAME positive-exclusion '
+            'rule that applies to in-file helpers)',
+            total == 14)
+        # (Debug prints removed; count was confirmed = 14 via a temp
+        # print during the C5 fix - left the count assertion here as
+        # the tripwire for any future change that lifts the C5 net.)
+
+        # C2 fixtures: the grandfather / DEBT marker mechanism. The
+        # three malformed-marker / drifted-marker / marker-no-match
+        # fixtures above already contribute bare rows; C2 covers two
+        # additional shapes:
+        #
+        # (a) a rise above the per-file ceiling WITHOUT a DEBT marker
+        #     must fail even with --force (the load-bearing C2 case).
+        # (b) a rise above the per-file ceiling WITH one DEBT marker
+        #     per excess row must pass.
+        #
+        # These need a separate file so the grandfather ceiling for
+        # each is well-defined by the seeded `gpath` written below.
+        # C2-NEGATIVE: a single bare row in a file whose grandfathered
+        # ceiling is 0 must fail (no DEBT marker = no justification).
+        _mk(root, 'tests/codegen/rise_no_debt_test.cpp', '''
+BEZEL_TEST(fixture_suite, rise_above_ceiling_no_debt) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C2-POSITIVE: same shape but with a DEBT marker on the line
+        # before the BEZEL_TEST opener - one DEBT marker justifies one
+        # excess row above the ceiling.
+        _mk(root, 'tests/codegen/rise_with_debt_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-DEBT: #3892 deliberate rise above grandfather ceiling during C2 ramp-in
+BEZEL_TEST(fixture_suite, rise_above_ceiling_with_debt) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C2-MALFORMED: a DEBT marker with NO leading #NNNN after the
+        # colon is malformed and justifies nothing (mirrors
+        # LOCALDECL-DEBT's well-formed-vs-malformed split,
+        # check_localdecl_only_walkers.py:290-304).
+        _mk(root, 'tests/codegen/rise_malformed_debt_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-DEBT: no issue number after the colon - justifies nothing
+BEZEL_TEST(fixture_suite, rise_above_ceiling_malformed_debt) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # C2-PARTIAL: a file with TWO excess rows but only ONE DEBT
+        # marker - the marker covers only the marked row, the other
+        # rise is unjustified and must fail.
+        _mk(root, 'tests/codegen/rise_partial_debt_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-DEBT: #3892 only one of the two excess rows is marked
+BEZEL_TEST(fixture_suite, rise_partial_debt_first) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+BEZEL_TEST(fixture_suite, rise_partial_debt_second) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+
+        # Re-measure with the four C2 fixtures added; total grows by 5
+        # (rise_no_debt=1, rise_with_debt=1, rise_malformed_debt=1,
+        # rise_partial_debt=2). The grandfather seed written below is
+        # then written from this expanded per-file table; each file's
+        # initial ceiling equals its current count (so the seed tree
+        # itself passes), and the C2 assertions perturb from there.
+        total_with_c2, per_file_with_c2, debt_per_file_with_c2 = measure(root)
+        chk('C2 fixtures add 5 unprotected rows (1+1+1+2)',
+            total_with_c2 == total + 5)
+        chk('C2 fixtures include the C4 fixtures, but the C4 fixtures '
+            'also pass C4\'s blanking cleanly (no fixture has a row '
+            'inside #if 0 - all C4 live rows are outside, and the C4 '
+            'fixture is added BEFORE C2 measurement, so the C2 delta '
+            'is exactly 5)',
+            'tests/codegen/inside_if0_test.cpp' in per_file_with_c2)
+        chk('C2: a well-formed DEBT marker contributes to '
+            'debt_per_file for its file',
+            debt_per_file_with_c2.get(
+                'tests/codegen/rise_with_debt_test.cpp', 0) == 1)
+        chk('C2: a malformed DEBT marker (no #NNNN) does NOT '
+            'contribute to debt_per_file',
+            'tests/codegen/rise_malformed_debt_test.cpp'
+            not in debt_per_file_with_c2)
+        chk('C2: a partial-DEBT file (1 marker, 2 rows) contributes '
+            'only 1 to debt_per_file',
+            debt_per_file_with_c2.get(
+                'tests/codegen/rise_partial_debt_test.cpp', 0) == 1)
 
         bpath = root / 'baseline'
         write_baseline(total, bpath)
-        good, msgs, _ = check(root, bpath, stale=True)
-        chk('a tree matching its baseline passes', good and not msgs)
+        # C2: the grandfather file lives alongside the baseline in the
+        # temp tree for the self-test. Seed it with the current per-file
+        # counts so the baseline / ceiling match (the gate mode sees a
+        # balanced tree; C2's rise-above-ceiling tests below perturb it).
+        # Hand-write the initial grandfather (tighten() is monotone-
+        # downward only and cannot raise from {}).
+        gpath = root / 'grandfather'
+        initial_grand = _per_file_counts(per_file_with_c2)
+        gpath.write_text('\n'.join(
+            ['# initial grandfather for self-test'] +
+            ['%-4d %s' % (n, p) for p, n in sorted(initial_grand.items())]
+        ) + '\n')
+        # Re-write baseline to match the C2-expanded count too, so
+        # baseline = total_with_c2 (the gate must not see a ROSE from
+        # C2's own fixtures).
+        write_baseline(total_with_c2, bpath)
+        good, msgs, _ = check(root, bpath, gpath, stale=True)
+        chk('a tree matching its baseline + grandfather passes',
+            good and not msgs)
+
+        # C2 specific: a rise above the per-file ceiling without a
+        # DEBT marker must fail - the LOAD-BEARING C2 case.
+        # Pick rise_no_debt_test.cpp (ceiling=1, count=1 currently).
+        # Drop the ceiling for it to 0 by re-banking just that file.
+        _mk(root, 'tests/codegen/rise_no_debt_lower_test.cpp', '''
+// AMBIGUOUS-RAN-FALSE-DEBT: #3892 one marker covers the rise
+BEZEL_TEST(fixture_suite, with_marker_only) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # Write a grandfather with a tight ceiling (0) for this file -
+        # the existing row will then be a rise above the ceiling, and
+        # the DEBT marker above justifies it.
+        gpath_tight = root / 'grandfather_tight'
+        write_grandfather({}, {
+            'tests/codegen/rise_no_debt_test.cpp': 0,
+            'tests/codegen/rise_no_debt_lower_test.cpp': 0,
+        }, gpath_tight)
+        # The "rise_no_debt_test.cpp" file has 1 row, ceiling=0, no DEBT
+        # marker - this MUST fail.
+        good, msgs, _ = check(root, bpath, gpath_tight, stale=True)
+        chk('C2: a file with rows above its grandfathered ceiling and '
+            'no DEBT marker FAILS (the load-bearing case)',
+            not good and any(
+                'rise_no_debt_test.cpp' in m and 'above its grandfathered '
+                'ceiling' in m
+                for m in msgs))
+        # The "rise_no_debt_lower_test.cpp" file has 1 row, ceiling=0,
+        # ONE DEBT marker - this MUST pass.
+        good, msgs, _ = check(root, bpath, gpath_tight, stale=True)
+        chk('C2: a file with rows above its grandfathered ceiling and '
+            'one well-formed DEBT marker PASSES',
+            not any('rise_no_debt_lower_test.cpp' in m for m in msgs))
+        # A missing grandfather file reads as an ALL-ZERO ceiling
+        # (fail closed) - the entire unprotected count is then a rise,
+        # every excess row needs a DEBT marker.
+        good, msgs, _ = check(root, bpath, root / 'no-such-grandfather',
+                              stale=True)
+        chk('C2: a missing grandfather file reads as an ALL-ZERO '
+            'ceiling (fail closed)',
+            not good and any('above its grandfathered ceiling' in m
+                             for m in msgs))
+
+        # CLEANUP - remove all the C2-specific fixtures so the rest
+        # of the self-test (rise/run/STALE HEADROOM/--update checks)
+        # runs against the original fixture tree without the C2
+        # deltas. The C2 fixtures are assertions about C2's behavior;
+        # they should not perturb the legacy test sequence.
+        for c2_path in ['tests/codegen/rise_no_debt_test.cpp',
+                        'tests/codegen/rise_with_debt_test.cpp',
+                        'tests/codegen/rise_malformed_debt_test.cpp',
+                        'tests/codegen/rise_partial_debt_test.cpp',
+                        'tests/codegen/rise_no_debt_lower_test.cpp']:
+            p = root / c2_path
+            if p.exists():
+                p.unlink()
+        # Re-measure NOW (post-C2-cleanup) so the cleanup is reflected.
+        # The baseline and grandfather are then re-written to the
+        # CURRENT count and ceilings (C4 fixtures are still in place
+        # since they were added BEFORE C2). The legacy
+        # rise/run/STALE-HEADROOM sequence expects a baseline that
+        # matches the post-cleanup tree, not the pre-C4 baseline.
+        total_post_cleanup, per_file_post_cleanup, _ = measure(root)
+        write_baseline(total_post_cleanup, bpath)
+        existing_grand = read_grandfather(gpath)
+        write_grandfather(existing_grand,
+                          _per_file_counts(per_file_post_cleanup), gpath)
+        # Update the local `total` so subsequent assertions that compare
+        # against it use the post-cleanup count (C4 fixtures ARE in
+        # place; only the C2-specific deltas are gone).
+        total = total_post_cleanup
 
         # A RISE must fail.
         _mk(root, 'tests/codegen/new_bad_test.cpp', '''
@@ -977,11 +2002,11 @@ BEZEL_TEST(fixture_suite, new_bad) {
     BEZEL_EXPECT_FALSE(r.ran);
 }
 ''')
-        good, msgs, _ = check(root, bpath, stale=True)
+        good, msgs, _ = check(root, bpath, gpath, stale=True)
         chk('a new unprotected row FAILS the ratchet', not good)
         chk('the message names a rise', any('ROSE' in m for m in msgs))
         chk('--update REFUSES to bank a rise',
-            not check(root, bpath, stale=False)[0])
+            not check(root, bpath, gpath, stale=False)[0])
         (root / 'tests/codegen/new_bad_test.cpp').unlink()
 
         # STALE HEADROOM: a fix that forgot --update.
@@ -991,19 +2016,25 @@ BEZEL_TEST(fixture_suite, bare_ran_false) {
     BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
 }
 ''')
-        good, msgs, _ = check(root, bpath, stale=True)
+        good, msgs, _ = check(root, bpath, gpath, stale=True)
         chk('a fix that did not --update fails as STALE HEADROOM',
             not good and any('STALE HEADROOM' in m for m in msgs))
-        chk('--update ACCEPTS the drop', check(root, bpath, stale=False)[0])
-        total2, _ = measure(root)
+        chk('--update ACCEPTS the drop',
+            check(root, bpath, gpath, stale=False)[0])
+        total2, per_file2, _ = measure(root)
         write_baseline(total2, bpath)
-        chk('re-baselined tree is green again', check(root, bpath, True)[0])
+        # C2: --update also tightens the per-file ceiling.
+        existing = read_grandfather(gpath)
+        cur_counts = _per_file_counts(per_file2)
+        write_grandfather(existing, cur_counts, gpath)
+        chk('re-baselined tree is green again',
+            check(root, bpath, gpath, stale=True)[0])
         chk('the fix actually lowered the count', total2 < total)
 
         # A missing baseline must fail loudly.
         missing = root / 'no-such-baseline'
         try:
-            check(root, missing, stale=True)
+            check(root, missing, gpath, stale=True)
             chk('a missing baseline fails closed', False)
         except SystemExit as e:
             chk('a missing baseline fails closed', e.code == 2)
@@ -1030,7 +2061,7 @@ def main():
         return self_test()
 
     if a.list:
-        total, per_file = measure(ROOT)
+        total, per_file, _ = measure(ROOT)
         for f, rows in sorted(per_file.items(), key=lambda kv: -len(kv[1])):
             print('%3d  %s' % (len(rows), f))
             for tname, var in rows:
@@ -1039,7 +2070,7 @@ def main():
         return 0
 
     if a.update:
-        total, _ = measure(ROOT)
+        total, per_file, _ = measure(ROOT)
         if not BASELINE.exists():
             write_baseline(total)
             print('created baseline: count=%d' % total)
@@ -1060,12 +2091,19 @@ def main():
                     'why in the commit.\n')
                 return 1
         write_baseline(total)
-        print('re-baselined: count=%d' % total)
+        # C2: tighten the per-file ceiling on every successful --update,
+        # alongside the baseline re-bank - same model as
+        # check_localdecl_only_walkers.write_grandfather().
+        existing = read_grandfather()
+        cur_counts = _per_file_counts(per_file)
+        new_grand, _changed = write_grandfather(existing, cur_counts)
+        print('re-baselined: count=%d (grandfather tightened for %d file(s))'
+              % (total, len(_changed)))
         return 0
 
     good, msgs, per_file = check(ROOT, stale=True)
     if good:
-        total, _ = measure(ROOT)
+        total, _per_file, _ = measure(ROOT)
         print('check_ambiguous_ran_false: OK (count=%d)' % total)
         return 0
     for m in msgs:

@@ -12,6 +12,7 @@
 // the base). Symbols are owned by SemaContext (slice 1) and live for the
 // duration of compilation.
 
+#include <array>
 #include <cstdint>
 #include <functional>  // #3145: anyRecordStorageField's predicate
 #include <memory>
@@ -21,6 +22,10 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/TypeRef.hpp"  // for `PrimitiveType` (fix #4843 — fold reads
+                              // declaredPrimitiveType to recover the `float`
+                              // vs `double` precision when reading floatValue
+                              // for an imported const).
 #include "support/SourceLocation.hpp"
 
 // fix #3169: `sema::recordStorageMembers` takes an optional
@@ -117,6 +122,28 @@ struct TypeSymbol : Symbol {
     // base-first order. Local classes derive these from their AST; imported
     // classes have no AST, so the loader publishes this side-table vector.
     std::vector<ContractRecord> invariantContracts;
+    // §22.16 / §2.8.2 (fix #4592): the RE-PARSED expressions of an imported
+    // class's OWN `invariant(E);` members, in declaration order — the
+    // executable half of the vector above.
+    //
+    // `invariantContracts` is an IDENTITY channel: §2.8.2 defines a record's
+    // `canonicalText` with every name replaced by its declaration-resolved,
+    // module-qualified spelling (`invariant(v > 0)` on module `M`'s class `C`
+    // records as `M.C.v > 0`), so nothing can be lowered from it. Codegen's
+    // §22.16 instrumentation needs an `ast::Expr` bound to THIS compilation's
+    // symbols; `ModuleLoader::parseAndAttachInvariants` re-parses the
+    // exporter's verbatim clause text (`MetaTypeDecl::ownInvariantText`) in a
+    // synthetic re-declaration of the class and remaps the result onto the
+    // imported members, exactly as the ctor/method/property/field-init
+    // reconstruction paths do, and publishes the expressions here.
+    //
+    // Empty for a LOCAL class (whose `decl` carries the real AST) and for an
+    // imported class from a pre-#4592 artifact or whose clause text could not
+    // be reconstructed — in both of those the pre-fix behaviour stands: the
+    // clause is not evaluated on this side of the boundary. The two shapes
+    // that still land in the second case (a clause naming an INHERITED member,
+    // and a §11.6 nested imported class) are tracked as issue #4599.
+    std::vector<const ast::Expr*> importedInvariantExprs;
     // Scope inside which members and generic params live. Always greater
     // than `scope` (which is the type's own enclosing scope).
     ScopeId memberScope = kModuleScope;
@@ -735,6 +762,38 @@ struct MemberSymbol : Symbol {
     bool serializedSkip = false;
     bool serializedOptional = false;
     std::string_view serializedWireName;  // empty => the DECLARED name
+    // §9.2 "The `equality skip` clause" (v0.307; umbrella #3152, follow-up to
+    // fix #4643): this storage member's `equality skip` clause.
+    //
+    // §9.2 is explicit that the clause is INTERFACE, not local decoration:
+    // "the artifact interface ([§2.8.2]) carries the clause exactly as it
+    // carries `serialized` clauses". #4643 landed the clause riding
+    // `ast::FieldDecl::equality` / `ast::PropertyDecl::equality` /
+    // `ast::Param::equality` and NOTHING else, so every consumer recovered it
+    // by casting `Symbol::decl` — null for every IMPORTED member — and
+    // answered "no clause" for all of them. MEASURED on the commit that
+    // introduced it:
+    //
+    //   * `public record Pt(X: int, Cache: int equality skip)` exported from
+    //     one module: `new Pt(1,10) = new Pt(1,20)` is `True` inside the
+    //     declaring module and `False` across the import, with the same split
+    //     on `GetHashCode` — a silent wrong ANSWER, and a §8.3 hashing-
+    //     coherence split between the two sides of the boundary;
+    //   * the body-record shape (`private equality skip _count: int;`) goes
+    //     further: the skip is the clause's rescue path, so with it invisible
+    //     the importer classifies the record as not auto-hashable and `=`
+    //     becomes a COMPILE ERROR the identical same-module program accepts.
+    //
+    // Populated on BOTH sides — SymbolCollection from the three AST hosts the
+    // A.3/A.4 grammar admits the clause on (positional field, auto-property,
+    // explicit field), ModuleLoader from `MetaMember::equalitySkip` — so the
+    // predicate below needs no source switch. The `builtinExceptionBase`
+    // (#2950) / `serializedSkip` (#3140) template. Ask `memberEqualitySkip`
+    // below rather than reading this field directly: not every MemberSymbol is
+    // built by SymbolCollection/ModuleLoader (the builtin-interface shims in
+    // SemaContext.hpp are not), and the accessor is the one place that
+    // documents what `false` means for those.
+    bool equalitySkip = false;
 };
 
 struct FieldSymbol : MemberSymbol {
@@ -844,6 +903,52 @@ struct ConstMemberSymbol : MemberSymbol {
     // a legitimate zero (a `:= 0` initializer sets the value to 0, not to
     // "unset").
     std::optional<std::int64_t> intValue;
+    // fix #4843 (§5.2 / §17.14, v0.307; residual of #4801): the typed
+    // `float` / `double` value, populated for IMPORTED consts by
+    // ModuleLoader from `MetaMember::valueText` (parsed by the same
+    // `strtod` path `binaryFloatLiteralValue` uses for literals). The
+    // `#4801` `ExprTC::foldNumConstExprTC` declined an IMPORTED
+    // float/decimal const because the SEAM-DEBT it carried left no AST
+    // initializer to fall back on; the fold closures now consult this
+    // field (and `decimalValue` below) for the import case, the same
+    // pattern fix #3230 used for integers. A `float` const's value is the
+    // double-truncated single-precision value (the same shape codegen
+    // emits); the field is `std::nullopt` when the textual carrier is not
+    // a finite float (`1.0e400` is a §4.3 formation error in the producer,
+    // not a fold fault to recover here) or when the const's declared type
+    // is not a binary-float primitive.
+    std::optional<double> floatValue;
+    // fix #4843 (§5.2 / §17.14, v0.307): the typed `decimal` value as the
+    // 4-word `bz_decimal_t` layout (lo32, mid32, hi32, flags — the same
+    // shape FoldDecimal in ExprTypecheck_Calls.cpp carries). Populated
+    // for IMPORTED consts by ModuleLoader from `MetaMember::valueText`
+    // (parsed by the runtime `bz_decimal_parse_cstr` path the fold's
+    // `decimalLiteralValue` already uses). The field is `std::nullopt`
+    // when the textual carrier fails §4.4 formation or when the const's
+    // declared type is not `decimal`.
+    std::optional<std::array<std::uint32_t, 4>> decimalValue;
+    // fix #4843 (§17.14, v0.307): the typed `bool` value, populated for
+    // IMPORTED `const B := true;`-style consts by ModuleLoader from
+    // `MetaMember::valueText`. The fold's if-expression arm reads this so
+    // `int((if Lib.C.B then 1.0e30 else 0.0))` reaches the §5.2 constant-
+    // operand reject exactly as `int(Lib.C.B)` already does for integers.
+    std::optional<bool> boolValue;
+    // fix #4843 (§17.14, v0.307): the const's DECLARED primitive type,
+    // populated for BOTH local and imported consts whose declared type is a
+    // primitive (`int`, `float`, `double`, `decimal`, `bool`, etc.). For a
+    // LOCAL const the sema resolveTypes / checkConstTypes pass sets it
+    // from the AST; for an IMPORTED const `cms->decl` is null (the symbol
+    // is reconstructed from dependency metadata) and ModuleLoader sets it
+    // from `MetaMember::type.primitive`. The field exists because the
+    // fold's `floatValue`/`decimalValue`/`boolValue` readers need the
+    // destination precision (`float` is single, `double` is double) — the
+    // textual carrier was rounded to the right precision at parse time,
+    // but the fold must know which `K::` enum value to emit. Empty for a
+    // const whose declared type is not a primitive (records, classes,
+    // enums, etc.) and for a non-foldable initializer; default is
+    // `std::nullopt` so an unset type is distinguishable from a primitive
+    // type that happens to be the default value.
+    std::optional<PrimitiveType> declaredPrimitiveType;
 };
 
 struct EnumConstantSymbol : MemberSymbol {
@@ -1205,6 +1310,22 @@ struct SerializedComponentClause {
 // carried by exactly one of the two channels.
 SerializedComponentClause serializedComponentClause(const Symbol* m);
 
+// §9.2 "The `equality skip` clause" (v0.307; umbrella #3152, follow-up to fix
+// #4643): the ONE way to ask whether a storage member is removed from the
+// auto-equality membership computation.
+//
+// Reads `MemberSymbol::equalitySkip`, which SymbolCollection fills from the
+// AST and ModuleLoader fills from the dependency's metadata — so it answers
+// for a LOCAL and an IMPORTED member alike and never touches `Symbol::decl`.
+// Every consumer of the clause goes through here: sema's two auto-equality
+// membership predicates (`isAutoEqualityBearingBodyRecord` /
+// `isPositionalRecordEqualityBearing`), §9.2's inert-annotation check, and
+// codegen's `=`/`GetHashCode` synthesis. `false` for a null symbol, for a
+// non-member symbol, and for a member no collector filled — the pre-#4643
+// reading, i.e. "participates", which is the direction that keeps a member in
+// equality rather than silently dropping it.
+bool memberEqualitySkip(const Symbol* m);
+
 // §9.8 (#3140, family F2): the §9.8 wire SHAPE of a class's synthesized
 // serialization surface — "tree", "graph", "cyclic", or "" for a class that has
 // none (which is every class that does not declare
@@ -1518,6 +1639,49 @@ bool propertyGetterIsPure(const PropertySymbol* ps);
 // sema. Route new callers through this rather than re-deriving it again.
 bool recordIsPositional(const TypeSymbol* rec);
 
+// §9.9 (v0.307, proposal 0107, fix #4699): true when `rec` is
+// constructor-only, the §3.6 derived property that triggers every §9.9
+// consequence (`default(R)` rejection at §17.11, `new T()` rejection at
+// §14.2's `where T: new()`, default initialization of `R`-typed storage at
+// §7.9/§15.1, the `with` rejection at §9.5, etc.). A record is
+// constructor-only when it declares a constructor carrying a contract clause
+// (§22.16 — a `requires` clause, an `ensures` clause, or both) on ANY
+// constructor of the record, of any visibility, in any recorded tier.
+//
+// LOCAL READING (the path the cycle-23 failing rows exercise): the AST
+// `ast::RecordDecl` carries its `members` as a flat list of `ast::MemberDecl`
+// subclasses, and `ast::ConstructorDecl::contractClauses` carries the clause
+// vector (§22.16). The symbol-side `decl` points at the same `RecordDecl`,
+// so `dynamic_cast<const ast::RecordDecl*>(rec->decl)->members` enumerates
+// every declared constructor in source order.
+//
+// IMPORTED READING: per §2.8.2 the property is part of the public contract
+// and is supposed to be carried in the artifact interface (the §3.6 rule 3
+// reason this is a property rather than a local rule). The carriage
+// infrastructure is NOT built yet (issue #3301's broader impl-catch-up
+// tracks it; the cycle-23 corpus does not exercise the imported-clause case
+// — only LOCAL records appear in the failing rows). An imported record's
+// `ConstructorSymbol::decl` is null (cross-module AST is unavailable), so
+// this predicate conservatively returns false for an imported record until
+// that wire channel lands: it never INCORRECTLY says "no contract clause"
+// for a locally-declared constructor (the local AST is always available
+// when `rec->decl` is non-null), and an imported constructor-only record
+// quietly staying defaultable is the documented gap, not a silent accept
+// the cycle-23 corpus can detect.
+//
+// POSITIONAL READING: a record declaring POSITIONAL fields may not declare
+// such a constructor at all (#4702's compile error in `run()`), so a
+// positional record CANNOT be constructor-only. Returning false for the
+// positional case keeps the predicate consistent with the declaration-site
+// rule already shipped.
+//
+// Called from `ExprTC::defaultIllFormed` (§17.11), `Resolver::argSatisfiesNew`
+// (§14.2), and `isSevenNineStrictField`/`isSevenNineStrictAutoProp`/
+// `isSevenNineStrictStaticField` (§7.9) — the three failure sites the
+// cycle-23 corpus targets — and from no other site yet. Route new callers
+// through this rather than re-deriving.
+bool recordIsConstructorOnly(const TypeSymbol* rec);
+
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body
 // auto-property's type for the combined form) is an admissible component type
@@ -1526,7 +1690,7 @@ bool recordIsPositional(const TypeSymbol* rec);
 // Called from isAdmissibleComponentType (nested record check), isEqualityBearing
 // (hash-container key check), and ExprTypecheck (use-site equality error).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx);
+                                        SemaContext& ctx);
 
 // §9.2 (v0.158) auto-equality eligibility for a *body record* (a record with
 // no positional fields). Returns true iff the record is "auto-hashable":
@@ -1557,7 +1721,7 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // Returns false for positional / combined-form records (they get the §9.1
 // positional synthesis instead) and for non-record types.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
-                                     const SemaContext& ctx);
+                                     SemaContext& ctx);
 
 // §9.2 v0.210 (#2083) auto-equality eligibility for a *value-like choice*
 // (a choice whose §35.4 classification is ValueLike — every payload is a
@@ -1594,7 +1758,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // conservatively classifies borrow-bearing, so `Pair` read as inadmissible no
 // matter the argument).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx,
+                                 SemaContext& ctx,
                                  const TypeRef* inst = nullptr);
 
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
@@ -1624,7 +1788,7 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 // — the §28.1 per-instantiation erasure of `owned` payload markers applies
 // to the classification check, exactly as in isAutoEqualityBearingChoice.
 bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
-                                   const SemaContext& ctx,
+                                   SemaContext& ctx,
                                    const TypeRef* inst = nullptr);
 
 // §3.6 / §8.3 (v0.158, #1338): the **hashable** derived type property —
@@ -1641,7 +1805,7 @@ bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
 // v0.214 (#2087): a **choice** is hashable iff it is value-like
 // auto-hashable (§35.7); owning and borrow-bearing choices are not,
 // decided by the same §35.4 classifier the use-site `=`/`<>` error consults.
-bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
+bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx);
 
 // §14.2 (v0.214, #2087): given a type that has just FAILED isEqualityBearing,
 // return a component-path fragment naming the offending type + the §3.6/§9.2/
@@ -1656,7 +1820,7 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 // detail level §3.6 supports for this property. Returns empty (caller keeps the
 // flat message) for any type outside that record/choice failure shape.
 std::string hashableFailureComponentPath(const TypeRef* ty,
-                                         const SemaContext& ctx);
+                                         SemaContext& ctx);
 
 // §22.3 "Parameter modifiers" / §2.5 "Dependency resolution" (v0.237, #2659,
 // #2374): the declared modifier of constructor formal `pos` — one of "", "ref",
@@ -1687,6 +1851,31 @@ std::string_view formalParamName(const ConstructorSymbol& cs, std::size_t pos);
 
 // Arity of the constructor's formal list, same dual sourcing.
 std::size_t formalParamCount(const ConstructorSymbol& cs);
+
+// fix #4924 (§22.3 / §22.6, v0.307): the §22.3 call-site `ref`/`out`
+// applicability rule for ONE argument/formal pair. A `ref` formal is filled
+// only by a `ref` argument, an `out`/`out owned` formal only by an
+// `out`-family argument (§22.4), and any other formal only by an argument
+// carrying no `ref`/`out`. Shared by sema's chain-call check
+// (`ExprTC::checkChainRefOutModifiers`, fix #4905) and codegen's
+// constructor selector (`ctorForArgs`), so the candidate codegen picks is one
+// sema's rule admits.
+bool callSiteRefOutMatches(std::string_view argModifier,
+                           std::string_view paramModifier);
+
+// narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307): the leading
+// `this(...)` chain call of constructor `cs` (declared by `cd` in type `t`)
+// when the resolver's arity-only self-chain check (#3793,
+// `Resolver::checkTypeConstructorChains`) would fire on it but one of its
+// NAMED arguments names no parameter of `cs` — so §22.5 binding cannot bind
+// the call to `cs` at all, and the arity match is not evidence of a
+// self-chain. Null otherwise. The resolver DEFERS exactly these calls, and
+// `ExprTC::checkDeferredNamedThisChain` decides them with the argument
+// types in hand; one predicate, read by both, so the two passes cannot
+// disagree about which calls were handed over.
+const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
+                                            const ConstructorSymbol& cs,
+                                            const ast::ConstructorDecl& cd);
 
 // §22.3 / §2.5 (v0.254, #3176 — family M1 of umbrella #3152): the same three
 // accessors for a METHOD's formal list. A `MethodSymbol` covers an ordinary

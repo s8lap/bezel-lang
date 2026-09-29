@@ -33,5 +33,5 @@ class P
   end UseAsync;
 end P;
 
-// CHECK-DAG: owned parameter `ic` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 auto-drop)
-// CHECK-DAG: owned parameter `ac` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 auto-drop)
+// CHECK-DAG: owned parameter `ic` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 must-use / auto-drop)
+// CHECK-DAG: owned parameter `ac` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 must-use / auto-drop)

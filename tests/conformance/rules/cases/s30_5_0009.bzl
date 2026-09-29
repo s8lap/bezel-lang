@@ -8,6 +8,7 @@
 //!   scope-pinned slot, and `x` is an ordinary borrowed local.
 //! cites: 30.5
 //! expect: accept
+//! issue: 3048
 module Conf;
 
 public class Widget

@@ -94,7 +94,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, move_usingvar_local_into_owning_ctor_disposes_
         "end R; "
         "class Holder "
         "  public owned Item: R; "
-        "  public constructor(owned item: R) Item := move item; end constructor; "
+        "  public constructor(owned item: R) Item := item; end constructor; "
         "end Holder; "
         "class C public static method Main(): int "
         "  do "

@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cfg public _v: int := 0; public constructor(v: int) _v := v; end constructor; end Cfg; class Holder public owned _c: Cfg?; public method Set() var c := new Cfg(5); _c := move c; end Set; end Holder;
+module M; class Cfg public _v: int := 0; public constructor(v: int) _v := v; end constructor; end Cfg; class Holder public owned _c: Cfg?; public method Set() var c := new Cfg(5); _c := c; end Set; end Holder;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -269,47 +269,72 @@ BEZEL_TEST(local_const_decl_checkread_3864,
 // =============================================================================
 // #3941 REGRESSION PIN — `const y := move x;` where `x` is already
 // explicitly disposed is a TOP-LEVEL `move` initializer: §21.1 rejects the
-// shape outright (an owned production), but `recordMovesIn`'s
-// `markMovedByName` must ALSO still fire its own precise
-// "cannot move from disposed local `x` (§28.3)" ERROR — the exact
-// diagnostic `origin/main` (pre-#3864) produces. Asserts diagnostic TEXT
-// and SEVERITY (Error), not `hasErrors()`, so a silent downgrade to the
-// generic §28.2 WARNING (the #3941 regression) cannot pass unnoticed.
-// FAILS WITHOUT THE #3941 FIX: the §21.1 rejection still fires (so
-// `hasErrors()` stays true), but the precise §28.3 "cannot move from
-// disposed local" ERROR is replaced by the generic §28.2 WARNING — this
-// test's `diagContainsWithSeverity(..., Error, "cannot move from disposed
-// local ...")` assertion is what catches that silently.
+// shape outright (an owned production), and `recordMovesIn`'s
+// `markMovedByName` ALSO fires — under the v0.303 / #4450 ruling, as a
+// §28.2 dominating-kill WARNING (the consume-side wording, distinct from
+// `checkRead`'s read-side text), not the pre-ruling §28.3 "cannot move
+// from disposed local" ERROR. The §21.1 rejection still owns `hasErrors()`
+// for the `const` shape, so `hasErrors()` stays true; this row pins the
+// SEVERITY (Warning, not Error) and the precise message text, so a silent
+// re-promotion to §28.3 ERROR (which the OLD row's name suggested was the
+// invariant #3941 owned) cannot pass unnoticed. The OLD name's load-bearing
+// claim — that the precise consume diagnostic is NOT preempted by the
+// generic §28.2 read-side warning — survives the ruling too: the §28.2
+// consume-side wording `kMoveAfterDisposeWarn` is what `markMovedByName`
+// produces here, not the `checkRead` wording.
+// FAILS WITHOUT THE FIX (any of three directions):
+//   (a) pre-fix #4450 produces the §28.3 ERROR text — fails the new
+//       `diagContainsWithSeverity(..., Warning, ...)` assertion;
+//   (b) an unguarded `checkRead` call preempts `markMovedByName` and
+//       leaves only the read-side §28.2 warning — fails the
+//       `diagContainsWithSeverity(..., Warning, kMoveAfterDisposeWarn)`
+//       assertion (the read-side wording is not the consume-side wording);
+//   (c) the §21.1 rejection is lost — fails the `Error` assertion on the
+//       §21.1 text.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           const_top_level_move_of_disposed_local_keeps_precise_28_3_error_3941) {
+           const_top_level_move_of_disposed_local_emits_28_2_consume_warning_4450) {
     auto r = parseAndCheckOwnership(disposeThenMoveProg("const y := move x;"));
+    // §21.1 still rejects the `const` shape outright — that error is the
+    // load-bearing reason this program still fails to compile.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
         r, bezel::Severity::Error,
         "a `const` local (`y`) must not take an owned production"));
+    // The §28.2 CONSUME-side warning — the consume shape ("move from"),
+    // the disposed state ("already disposed at this point"), and the §28.2
+    // citation are all present, so a future reader sees the ruling's
+    // severity, the verb, and the regime change at a glance.
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
+        r, bezel::Severity::Warning,
+        "move from a local `x` already disposed at this point (§28.2)"));
+    // The §28.3 ERROR text must NOT fire — the ruling is the WHOLE POINT.
+    BEZEL_EXPECT_FALSE(diagContainsWithSeverity(
         r, bezel::Severity::Error,
         "cannot move from disposed local `x` (§28.3)"));
-    // The precise error must NOT have been downgraded to the generic
-    // use-after-dispose warning (the exact #3941 failure mode).
-    BEZEL_EXPECT_FALSE(diagContainsWithSeverity(
-        r, bezel::Severity::Warning,
-        "use of `x` after a dominating explicit Dispose() call"));
 }
 
 // =============================================================================
-// CONTROL — the var twin's pre-existing behavior (handleLocalDecl's own
-// topLevelConsume guard), unaffected by this fix, confirming both binding
-// forms now produce the identical precise §28.3 error.
+// CONTROL — the var twin. `var y := move x;` has no §21.1 rejection (var
+// accepts an owned production), so `hasErrors()` is FALSE under the
+// v0.303 / #4450 ruling — the only diagnostic is the §28.2 consume-side
+// WARNING. The §3941 preemption invariant still holds: this warning is
+// the consume-side wording, NOT the read-side wording `checkRead` would
+// emit if `isTopLevelConsumingForm` had not skipped the read-check.
 // =============================================================================
 BEZEL_TEST(local_const_decl_checkread_3864,
-           var_top_level_move_of_disposed_local_keeps_precise_28_3_error_3941_control) {
+           var_top_level_move_of_disposed_local_emits_28_2_consume_warning_4450_control) {
     auto r = parseAndCheckOwnership(disposeThenMoveProg("var y := move x;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContainsWithSeverity(
-        r, bezel::Severity::Error,
-        "cannot move from disposed local `x` (§28.3)"));
+        r, bezel::Severity::Warning,
+        "move from a local `x` already disposed at this point (§28.2)"));
+    // Preemption invariant: the read-side §28.2 wording must NOT also fire
+    // — `isTopLevelConsumingForm` is what gives `markMovedByName` the
+    // precision to emit its own consume-side wording instead.
+    BEZEL_EXPECT_FALSE(diagContainsWithSeverity(
+        r, bezel::Severity::Warning,
+        "use of `x` after a dominating explicit Dispose() call"));
 }
 
 // =============================================================================

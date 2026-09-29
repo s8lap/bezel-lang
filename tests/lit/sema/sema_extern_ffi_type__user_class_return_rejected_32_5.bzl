@@ -7,5 +7,5 @@
 
 module M; class Widget public method M() return; end M; end Widget; extern "c" public method bar(n: int): Widget; end;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method return type has type `Widget`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method return type has type `Widget`, which is not FFI-compatible
 // CHECK-SAME: (§32.5)

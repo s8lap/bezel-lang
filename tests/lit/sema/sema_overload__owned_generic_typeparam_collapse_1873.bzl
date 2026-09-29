@@ -17,5 +17,5 @@
 
 module M; class Box<T> public method Store(x: T) _ := 1; end Store; public method Store(owned x: T) _ := 2; end Store; end Box;
 
-// CHECK: overload of `Store` is indistinguishable from another overload — overloads must differ in parameter count, types, or `ref`/`out` modifiers; neither `owned` (ordinary or on an `out` parameter) nor `scoped` distinguishes
-// CHECK-SAME: (§22.6/§11.3, v0.181)
+// CHECK: overload of `Store` is indistinguishable from another overload — overloads must differ in parameter count, types, or `ref`/`out` modifiers, or by ordinary `owned` under the declaration guard; `out owned` and `scoped` never distinguish. At a position whose type fails the guard the pair collapses to one signature
+// CHECK-SAME: (§22.6/§11.3, v0.250)

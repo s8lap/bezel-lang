@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# post-checkout — warn loudly when an OWNED worktree is switched off its branch.
+#
+# WHY: see scripts/wt_owner.sh. post-checkout cannot block the switch (it runs
+# after it), so this only warns; scripts/hooks/pre-commit is what refuses the
+# commit that would follow. No bezel-owner file -> no-op.
+# Silent on a DETACHED HEAD (rebase, bisect, `switch --detach`): it warns only
+# when a NAMED branch other than the claimed one is checked out.
+# Args (githooks(5)): $1 old HEAD, $2 new HEAD, $3 = 1 for a branch checkout.
+[ "${3:-0}" = 1 ] || exit 0
+f="$(git rev-parse --git-dir 2>/dev/null)/bezel-owner"
+[ -f "$f" ] || exit 0
+owner="$(sed -n 's/^owner: *//p' "$f" | head -n 1)"
+want="$(sed -n 's/^branch: *//p' "$f" | head -n 1)"
+cur="$(git branch --show-current 2>/dev/null)"
+[ -n "$cur" ] || exit 0
+[ -n "$want" ] && [ "$cur" != "$want" ] || exit 0
+cat >&2 <<EOF
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING: this worktree is OWNED by '$owner' and bound to branch '$want'.
+  You just switched it to '$cur'. Commits here will be REFUSED.
+  If you are not '$owner', switch back (git switch $want) and use your own
+  worktree. If you are, re-claim: scripts/wt_owner.sh claim $owner
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+EOF
+exit 0

@@ -17,10 +17,12 @@
 // Every shape below was hand-verified against `build/bezelc` on a standalone
 // probe before being folded into this suite (issue #1526 report).
 
+#include "support/aot_support.hpp"   // runAotChecked (fix #4667)
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckOwnership;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -367,6 +369,53 @@ BEZEL_TEST(deferred_activation_temp, spawn_owned_arg_clean) {
         if (d.message.find("deferred-activation callee") != std::string::npos)
             sawDeferredActivationError = true;
     BEZEL_EXPECT_FALSE(sawDeferredActivationError);
+}
+
+// =====================================================================
+// fix #4667 / §28.3 (v0.307): RUNTIME companion to `spawn_owned_arg_clean`
+// above. That row only asserts the deferred-activation DIAGNOSTIC does not
+// fire; it never ran the program, so the runtime behaviour it exercises —
+// an owned `Mutex` argument auto-dropped at the end of a `Domain.Spawn`
+// entry via an unmarked `using var s := m;` borrow-pin (§28.10: a
+// borrow-pin assumes no obligation, so `m` stays undischarged and the
+// release comes from THIS auto-drop) — went unasserted (#4666's census).
+//
+// PRE-FIX: `registerUnwindOwnedParam` (LlvmBackend_Setup.cpp) registered
+// the §28.3 auto-drop for `ChannelSender`/`Channel`/`Shared` and the
+// collection family, but no other vtable-less builtin (Mutex included) —
+// `isClassOrInterfaceRef` rejects them too (no user TypeSymbol), so the
+// registration silently fell through. The diagnostic this exact call site
+// prints ("owned parameter `m` is implicitly disposed at the end of the
+// method (§28.3 auto-drop)") promised a release that never ran:
+// `bz_mutex_dispose` was hit on NEITHER the direct-call nor the
+// `Domain.Spawn`-invoked path (confirmed via a gdb breakpoint on both,
+// pre-fix). Loop-amplified 100x (a one-shot leak repro is a vacuous
+// oracle — LSan can find the leaked pointer reachable from a live stack
+// slot on a single run): pre-fix this leaked the Mutex core every
+// iteration. FAILS WITHOUT THE FIX.
+// =====================================================================
+BEZEL_TEST(deferred_activation_temp, spawn_owned_arg_no_leak_100) {
+    auto r = runAotChecked(
+        "module M; "
+        "class Worker "
+        "  public static method Run(owned m: Mutex) "
+        "    using var s := m; "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    var i := 0; "
+        "    while i < 100 do "
+        "      using var t := Domain.Spawn(Worker.Run, new Mutex()); "
+        "      await t; "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.WriteLine(\"100\"); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "100\n");
 }
 
 // §30.3 (#962): `Task.FromException<T>` takes ownership of its exception

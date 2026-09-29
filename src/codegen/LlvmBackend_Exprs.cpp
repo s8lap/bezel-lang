@@ -15,6 +15,72 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #5035 (§14.1 / §2.8.3, v0.307): true when `paramName` names a generic
+// parameter of `currentMethod` (the method whose body is CURRENTLY being
+// lowered) and every "type" constraint on that parameter is one of the bounds
+// #5009 fix-forward 4/5's own comment calls "sound at i32" — `class`,
+// `value`, `notnull`, or a synthesized builtin interface such as
+// `IEquatable<T>` / `IComparable<T>` — i.e. NOT a `new()` bound and NOT a
+// user-type bound. On success returns the canonical `int` primitive TypeRef
+// (ready to drop straight into the `#730` substitution slot); otherwise
+// nullptr.
+//
+// WHY THIS IS NOT `importedGenericLacksConstraintBody5009` RUN BACKWARDS:
+// that helper (LlvmBackend_Calls2.cpp) answers a CALL-SITE question — "does
+// this IMPORTED method's body cross the module boundary at all?" — and reads
+// only `GenericParamConstraint::importedBound`, the wire-loaded TypeRef an
+// IMPORTER sees for an external callee. Here we are inside the DEFINING
+// module's OWN compile of its OWN method body: `currentMethod`'s generic
+// parameters are LOCAL, so a "type" bound lives in `astBound` (an unresolved
+// `ast::Type*`, per Symbol.hpp's GenericParamConstraint), resolved via
+// `ctx.resolvedType`. (`importedBound` is still checked first, defensively,
+// in case a future caller ever reaches this with an imported symbol.)
+//
+// SOUNDNESS: the only way the exporter's placeholder-compiled body of a
+// public generic method ever actually EXECUTES is via a cross-module call
+// that already passed #1943/#428's width gate (rejects a concrete type
+// argument whose representation does not fit the compiled i32 placeholder)
+// and #5009's own gate (rejects a `new()` or user-type bound at the call
+// site, with a located diagnostic, before this body is ever reached). A
+// LOCAL call within the defining module never runs this placeholder at all —
+// it monomorphizes its own specialized version instead (confirmed: the
+// single-module twin already computes correctly, via the pre-existing
+// `genericSubstSemaTy_` substitution). So once we are lowering a call inside
+// this exact placeholder body, treating a still-bare `T` as `int` is not a
+// guess: it is the one representation every possible caller has already been
+// forced into.
+static sema::TypeRef* genericParamSoundAtI32ForPlaceholder(
+        sema::SemaContext& ctx, sema::MethodSymbol* currentMethod,
+        std::string_view paramName) {
+    if (!currentMethod || paramName.empty()) return nullptr;
+    const sema::GenericParamSymbol* gp = nullptr;
+    for (const sema::Symbol* s : currentMethod->genericParams) {
+        auto* cand = dynamic_cast<const sema::GenericParamSymbol*>(s);
+        if (cand && cand->name == paramName) {
+            gp = cand;
+            break;
+        }
+    }
+    if (!gp) return nullptr;
+    bool sawTypeBound = false;
+    for (const sema::GenericParamConstraint& c : gp->constraints) {
+        if (c.kind == "new") return nullptr;
+        if (c.kind != "type") continue;
+        const sema::TypeSymbol* d = nullptr;
+        if (c.importedBound) {
+            d = c.importedBound->declaration;
+        } else if (c.astBound) {
+            const sema::TypeRef* b = ctx.resolvedType(*c.astBound);
+            if (b) d = b->declaration;
+        }
+        if (!d || !d->isSynthesizedBuiltinInterface)
+            return nullptr;  // unresolved, or a genuine user-type bound
+        sawTypeBound = true;
+    }
+    if (!sawTypeBound) return nullptr;
+    return ctx.primitiveTypeRef(sema::PrimitiveType::Int);
+}
+
 // fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): the K8 full-expression
 // boundary hook. `lowerExprInner` (below) is the real lowering; this wrapper
 // tracks nesting depth so that the OUTERMOST lowerExpr call — which is exactly a
@@ -52,6 +118,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // at the await.
     if (!awaitedTaskTemps_.empty() && atBoundary)
         flushAwaitedTaskTemps();
+    // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): the same K8
+    // boundary reclaims a fresh owned-class receiver temporary whose call
+    // result is a non-nullable `string` — "disposed at the end of the full
+    // expression in which it is produced, after every use of it within that
+    // expression has completed". The inline-after-the-call reclaim the
+    // value-result family uses would run the receiver's destructor BEFORE the
+    // rest of the expression consumed the string, which §28.3 forbids and
+    // rule-corpus case s28_3_0043 pins.
+    if (!k8RecvTemps_.empty() && atBoundary)
+        flushK8RecvTemps();
     // fix #3421 (spec §4.7 *The unit type*, §21.1 *Variable declarations*,
     // v0.283): ONE representation for "this expression produced no lowered
     // value". LLVM `void` is not a value — it has no size and no alignment, so
@@ -310,13 +386,80 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 emitBoxRelease(srcEv);
             }
         };
+        // fix #4934 / #4953 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema
+        // type is a BARE type parameter (`T`, or `T?`) inside a generic body
+        // instantiated at a nullable VALUE type (`T := int?`) lowers to the
+        // tagged `{i8, T}` carrier, but `ctx_.exprType` still answers the
+        // unsubstituted `T`. No arm below matched it, so the struct was
+        // dropped and the hole rendered "" (`Show<int?>(5)` printed "<>";
+        // `new B<int?>(41).Show()` printed an empty line). Resolve the ref
+        // through the ACTIVE substitution — only when the result is a
+        // nullable value type whose carrier is EXACTLY the lowered value's
+        // struct type, so every other hole keeps its sema type unchanged.
+        auto resolveBareTParamNullableHoleTy =
+            [&](const sema::TypeRef* ty, llvm::Value* v,
+                sema::TypeRef& buf) -> const sema::TypeRef* {
+            if (!ty || !v || !v->getType()->isStructTy() ||
+                isNullableValueTy(ty) ||
+                ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
+                genericSubstSemaTy_.empty())
+                return ty;
+            const sema::TypeRef* cand = nullptr;
+            if (ty->nullable) {
+                if (nullableTypeParamConcrete(ty, buf)) cand = &buf;
+            } else {
+                cand = resolveTypeParamRef(ty);
+            }
+            if (!cand || cand == ty || !isNullableValueTy(cand) ||
+                nullableValueStructTy(cand) != v->getType())
+                return ty;
+            return cand;
+        };
+        // fix #5024 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema type is
+        // a BARE (non-nullable) type parameter `T` reached through a
+        // CAPTURED variable — not a declared lambda parameter, so #4896's
+        // `lambdaParamTypeHint_` injection (which fires only for an inferred
+        // lambda PARAMETER's formal type) never touches it — keeps its
+        // unsubstituted sema type here. `char` and every enum lower to the
+        // SAME LLVM `i32` as a genuinely unresolved placeholder, so when `T`
+        // resolves to one of them the dispatch below fell through to the
+        // LLVM-shape fallback arm (`isIntegerTy(32) -> P::Int`) and rendered
+        // the raw ordinal instead of dispatching char/enum ToString:
+        // `lambda(q: int) => $"{v}/{q}"` captured from `Go<T>`'s frame
+        // printed the code point / enum ordinal instead of the character /
+        // qualified type name. `Box<T>.Apply(lambda) `called through a
+        // generic method (`Go<U>` binding `T` to `U`) is the sibling shape
+        // (fixed separately at the call-dispatch pre-pass, LlvmBackend_Calls2.cpp).
+        //
+        // Resolve `ty` through the ACTIVE substitution, gated on the
+        // candidate's OWN LLVM shape actually matching the lowered value's
+        // shape — so a substitution meant for an unrelated, same-named type
+        // parameter in a different scope cannot mis-route this hole (mirrors
+        // the shape gate `resolveBareTParamNullableHoleTy` above uses for the
+        // nullable-value case). A candidate that resolves to a NULLABLE
+        // value type is left to that sibling helper — it builds the nullable
+        // copy via `nullableTypeParamConcrete`/the `ty->nullable` branch,
+        // which this helper does not replicate.
+        auto resolveBareTParamConcreteHoleTy =
+            [&](const sema::TypeRef* ty, llvm::Value* v) -> const sema::TypeRef* {
+            if (!ty || !v || ty->nullable || genericSubstSemaTy_.empty() ||
+                !isBareTypeParamRef(ty))
+                return ty;
+            const sema::TypeRef* cand = resolveTypeParamRef(ty);
+            if (!cand || cand == ty || isBareTypeParamRef(cand) ||
+                isNullableValueTy(cand))
+                return ty;
+            if (lowerTypeRef(cand) != v->getType()) return ty;
+            return cand;
+        };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
             if (!part.literal.empty()) {
                 // Literal part: process escape sequences (e.g. \n → newline,
                 // \t → tab) that were stored as raw chars by splitInterpolation.
-                // Wrap in quotes so processStringText's strip-quotes logic works.
+                // Wrap in quotes so the shared literal lowering's strip-quotes
+                // logic works.
                 // R36/#733: for a VERBATIM interpolated string (`$@"..."`, §18.7)
                 // the literal parts must NOT have escapes decoded — the splitter
                 // already kept the raw backslash. Thread isVerbatim through AND
@@ -326,31 +469,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 std::string wrapped =
                     (is->isVerbatim ? std::string("@\"") : std::string("\"")) +
                     part.literal + "\"";
-                std::string content =
-                    processStringText(wrapped, is->isVerbatim);
-                llvm::Constant* dataArr = llvm::ConstantDataArray::getString(
-                    llvm_, content, /*AddNull=*/true);
-                unsigned id = stringLiteralIdx_++;
-                auto* dataGV = new llvm::GlobalVariable(
-                    *module_, dataArr->getType(), true,
-                    llvm::GlobalValue::PrivateLinkage, dataArr,
-                    ".bz.istr.data." + std::to_string(id));
-                dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                dataGV->setAlignment(llvm::Align(1));
-                llvm::Constant* lenC = llvm::ConstantInt::get(
-                    i64(), content.size());
-                // The literal part is built from a byte string → width 1.
-                // #422: constant global literal — SENTINEL rc (never freed). The
-                // struct now has 4 fields {data, len, width, rc}; supply all.
-                llvm::Constant* widC = llvm::ConstantInt::get(
-                    llvm::Type::getInt8Ty(llvm_), 1);
-                llvm::Constant* strVal = llvm::ConstantStruct::get(
-                    stringType(), {dataGV, lenC, widC, stringRcSentinel()});
-                auto* strGV = new llvm::GlobalVariable(
-                    *module_, stringType(), true,
-                    llvm::GlobalValue::PrivateLinkage, strVal,
-                    ".bz.istr." + std::to_string(id));
-                pv = strGV;
+                // fix #4545 (§4.6/§18.5/§18.8, v0.306): this used to hand-roll the
+                // global via `processStringText`, which decodes UTF-8 to code
+                // points and then TRUNCATES each one to its low byte (always
+                // width 1) — the exact "code-point count used as a byte/width
+                // decision" defect #4499 fixed on the dict-key path, on the one
+                // path that fix did not touch. A non-ASCII literal segment (e.g.
+                // U+65E5 U+672C) came out as its low storage bytes ("å,").
+                // `lowerStringLiteral` is the shared, correct construction — the
+                // same `processStringCodePoints` → `codePointsWidth` →
+                // `makeCodePointArray` pipeline plain `"…"` literals already use
+                // (LlvmBackend_String.cpp:384) — so the literal segment gets the
+                // narrowest width that actually fits its code points instead of a
+                // hard-coded 1, and a hole substituting the identical text (which
+                // already went through this pipeline) and the literal segment now
+                // agree.
+                pv = lowerStringLiteral(wrapped, is->isVerbatim);
             } else if (part.expr) {
                 // Expression part: lower the expression, then convert to
                 // string. If a format spec is present (§18.5), apply it.
@@ -451,18 +585,88 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         ev = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
                 }
                 if (!ev) {
-                    // #1386: ICE — lowerExpr returned null for a non-null
-                    // interpolated-string expression part; the expression kind
-                    // is not yet handled by codegen.
-                    ctx_.diagnostics().report(
-                        Severity::Error, part.expr->span.begin,
-                        "internal: lowerExpr returned null for "
-                        "interpolated-string expression part — #1386");
-                    continue;
+                    // fix #5032 (§14.1 / §14.2, v0.307): this arm used to be an
+                    // UNCONDITIONAL #1386 Error for any non-unit null, which
+                    // false-rejects a legal generic method constrained on an
+                    // interface (`where T: IShapeN`) that interpolates a
+                    // T-typed receiver's member (`$"{v.Area()}xy"`). Every
+                    // generic method is emitted TWICE (issue #490): once as a
+                    // DEAD "unspecialized template" body where T is erased to
+                    // a placeholder LLVM type (here `i32`, non-pointer), and
+                    // once per call site as a SPECIALIZED instantiation with
+                    // the real concrete type and real vtable dispatch. Only
+                    // the specialized body is ever called; the template body's
+                    // own `v.Area()` hits emitMethodCall's #484 non-pointer-
+                    // receiver guard (LlvmBackend_Calls2.cpp) and returns
+                    // null, which reached this site unconditionally as a hard
+                    // compile error, rejecting the whole program even though
+                    // the real, called body (confirmed via BEZEL_DUMP_IR:
+                    // `$spec$SqN` computes the correct value) never observes
+                    // the failure. `LlvmBackend_Exprs2.cpp`'s lambda-body
+                    // return (fix #1255) hit the identical shape and already
+                    // degrades to a placeholder rather than erroring.
+                    //
+                    // This mirrors the THREE-OUTCOME dispatch #2434/#2491
+                    // established for the sibling value-demanding sites
+                    // (lowerLocalDecl / `return expr;`), sharing their exact
+                    // predicates rather than a fourth copy of them (#2924's
+                    // four-way-mirror finding):
+                    //   (a) UNIT-typed part — exempt, handled above.
+                    //   (b) a member call on a BUILT-IN receiver (closed
+                    //       surface, #2935) that produced no value — that is
+                    //       still a genuine defect (e.g. a real typo) — Error.
+                    //   (c) everything else, including the dead-template-body
+                    //       case above — degrade to a placeholder value and
+                    //       report only a Warning, so the compile keeps going
+                    //       and the diagnostic is visible without failing it.
+                    std::string member, appliedMember;
+                    const std::string builtinRecv = builtinReceiverOfMemberCall(
+                        part.expr.get(), &member, &appliedMember);
+                    if (!builtinRecv.empty() &&
+                        !ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, part.expr->span.begin,
+                            "`" + member + "` on built-in type `" +
+                            builtinRecv +
+                            "` produced no value, so it cannot be "
+                            "interpolated. `" + builtinRecv +
+                            "` has no user declaration, so its member "
+                            "surface is exactly what the standard library "
+                            "documents for it: either `" + member +
+                            "` is not on that surface (a misspelling), or "
+                            "it is documented but yields nothing here "
+                            "(#2935 \xE2\x80\x94 if it is documented and "
+                            "should yield a value, it is unimplemented, "
+                            "#2457)" +
+                            builtinMemberChainNote(member, appliedMember));
+                        continue;
+                    }
+                    const std::string builtinNew =
+                        unconstructedBuiltinNewName(part.expr.get());
+                    if (!builtinNew.empty() &&
+                        !ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, part.expr->span.begin,
+                            unconstructedBuiltinNewNote(builtinNew,
+                                                        "be interpolated"));
+                        continue;
+                    }
+                    if (!ctx_.diagnostics().hasErrors()) {
+                        ctx_.diagnostics().report(
+                            Severity::Warning, part.expr->span.begin,
+                            "internal: lowerExpr returned null for "
+                            "interpolated-string expression part (degraded "
+                            "to a placeholder rendering) — #1386");
+                    }
+                    ev = llvm::Constant::getNullValue(
+                        lowerTypeRef(ctx_.exprType(*part.expr)));
                 }
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
-                    auto* frt = ctx_.exprType(*part.expr);
+                    const sema::TypeRef* frt = ctx_.exprType(*part.expr);
+                    frt = resolveBareTParamConcreteHoleTy(frt, ev);  // #5024
+                    sema::TypeRef frtNvBuf4934;
+                    frt = resolveBareTParamNullableHoleTy(frt, ev, frtNvBuf4934);
                     // §18.5 / §7: a nullable VALUE part WITH a format spec —
                     // branch on hasValue (absent → "null"; present → apply the
                     // spec to the UNWRAPPED payload). emitWithFormatSpec expects
@@ -558,7 +762,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                     // emitWithFormatSpec returned null: fall through.
                 }
-                auto* rt = ctx_.exprType(*part.expr);
+                const sema::TypeRef* rt = ctx_.exprType(*part.expr);
+                rt = resolveBareTParamConcreteHoleTy(rt, ev);  // #5024
+                sema::TypeRef rtNvBuf4934;
+                rt = resolveBareTParamNullableHoleTy(rt, ev, rtNvBuf4934);
                 // CG-nullable: for nullable value types (primitives, and a
                 // nullable enum — issue #364), extract the value. If null,
                 // format as "null"; otherwise format the inner value (an enum's
@@ -978,7 +1185,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     }
     // CG37: `default(T)` is the zero value of T (0 / false / 0.0 / null).
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
-        return llvm::Constant::getNullValue(lowerType(de->type.get()));
+        llvm::Type* dty = lowerType(de->type.get());
+        // fix #4665 (§17.11 *The default operator* + §4.7 *The unit type*,
+        // v0.307): the UNIT row of §17.11's defaultable table. §17.11 lists the
+        // unit type among the defaultable types and states the row explicitly —
+        // "this row is reached by writing `default(())` … `var u: () :=
+        // default(());` and `var u: () := ();` bind the same value" — so the
+        // operator is admitted here and must lower to what `()` lowers to.
+        //
+        // `lowerType` answers LLVM `void` for exactly one thing, the unit
+        // type's `Kind::Unit` arm, and `Constant::getNullValue(void)` executes
+        // an `llvm_unreachable` that this release libLLVM compiles to `ud2`:
+        // `bezelc` died of SIGILL with NO DIAGNOSTIC (measured rc=132 on
+        // 572f5fc5 for `var u: () := default(());`, for the inferred
+        // `var u := default(());`, and for the issue's original
+        // `class Factory<T> … Make(): T return default(T);` at `Factory<()>`,
+        // where the generic substitution resolves T to `()` correctly and
+        // hands the concrete unit type to THIS arm).
+        //
+        // `nullptr` — not `unitPlaceholderTy()`'s inert byte — is the answer,
+        // because `nullptr` is the backend's ONE representation of "this
+        // expression produced no lowered value" (see `lowerExpr`'s #3421
+        // normalization above): the `()` literal (`ast::UnitExpr`) already
+        // lowers to null here, and every downstream unit rescue keys on `!v`
+        // (`boxForTarget`'s #2915 arm, its #3095 `()?` sibling,
+        // `unitValueForTarget`, `buildOrderedArgs`' placeholder-byte rescue,
+        // `lowerLocalDecl`'s #2434 zero-init fallback). Answering the byte here
+        // instead would put a real `i8` where those consumers expect nothing
+        // and re-open the mismatch #3105 closed. A STORAGE position that needs
+        // a sized slot asks `unitStorageTy` for it; a value position asks for
+        // nothing.
+        //
+        // `()?` is unaffected: `isNullableValueTy` claims it first and
+        // `lowerType` answers the tagged `{i8, i8}` optional, whose null value
+        // `{0, 0}` is exactly §17.11's "every nullable type `T?`" row.
+        if (dty && dty->isVoidTy()) return nullptr;
+        return llvm::Constant::getNullValue(dty);
     }
     // fix #499 / §9.8: RangeExpr in value position (e.g. `var r := a..b`).
     // Builds a Range struct { i64 start, i64 end, i64 step, i8 flags } so the
@@ -1195,8 +1437,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 ma->target.get())) {
                             sema::Symbol* sym = ctx_.exprSymbol(*tid);
                             auto hit = lambdaParamTypeHint_.find(sym);
-                            if (hit != lambdaParamTypeHint_.end())
+                            if (hit != lambdaParamTypeHint_.end()) {
                                 ctx_.setExprType(ma->target.get(), hit->second);
+                                lambdaHintInjectedExprs_.push_back(
+                                    ma->target.get());  // fix #4813
+                            }
                         }
                     }
                     auto* tt = ctx_.exprType(*ma->target);
@@ -1216,6 +1461,55 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Primitive)
                             tt = const_cast<sema::TypeRef*>(it->second);
+                    }
+                    // fix #5035 (§14.1, v0.307): the EXPORTER's own placeholder
+                    // compile of a public generic method (T's LLVM
+                    // representation defaults to i32, #2821) has NO active
+                    // `genericSubstSemaTy_` entry — that map is only populated
+                    // for a per-call-site monomorphization, and the placeholder
+                    // is compiled once, generically, for cross-module linkage.
+                    // So the `#730` substitution above never fires there, `tt`
+                    // stays a bare unresolved `Named` type, the CompareTo/Equals
+                    // primitive fast paths below are skipped, and the general
+                    // interface-dispatch fallback bails (`emitMethodCall`'s
+                    // "#484/§14.2" non-pointer-receiver guard: the placeholder's
+                    // `a: T` is an i32 VALUE, not a pointer) by returning
+                    // nullptr. `Emitter::lowerIf` then (per its own #2775
+                    // comment) treats that null condition as a SILENT `false` —
+                    // measured: `RO.EqC<T>(a, b) where T: IEquatable<T>` called
+                    // cross-module always took the `false` arm regardless of
+                    // `a`/`b`, i.e. `EqC(5, 5)` returned 72 instead of 71 (the
+                    // single-module twin, which DOES monomorphize per call
+                    // site, computed correctly).
+                    //
+                    // #1943/#428's width gate already rejects, at the CALL
+                    // SITE, any cross-module caller whose concrete type
+                    // argument does not fit the compiled i32 placeholder
+                    // (measured: string/long/record all reject with a located
+                    // diagnostic). #5009 fix-forward 4/5's own comment records
+                    // that a `new()` bound or a user-type bound is unsound at
+                    // i32 and blocks those at the call site too — implying (its
+                    // own words) that "builtin bounds (`class`, `value`,
+                    // `notnull`, a synthesized builtin interface) are sound at
+                    // i32". That soundness claim is about REPRESENTATION width,
+                    // and it holds — but nothing made the PLACEHOLDER BODY
+                    // ITSELF exploit it: the fast path above only fires when a
+                    // concrete substitution is already in hand. So when no
+                    // substitution resolved `tt`, but it is a bare parameter of
+                    // the method currently being compiled, and every "type"
+                    // constraint on that parameter is one of the "not counted"
+                    // bounds above (no `new()`, no user-type bound), it is safe
+                    // to treat `tt` as `int` directly: only a call that already
+                    // passed the width gate can ever reach this compiled body,
+                    // and the width gate's own definition of "fits" is exactly
+                    // this i32 placeholder.
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration &&
+                        tt->astNode && tt->astNode->name &&
+                        tt->astNode->name->parts.size() == 1) {
+                        if (auto* p = genericParamSoundAtI32ForPlaceholder(
+                                ctx_, currentMethod_, tt->headName()))
+                            tt = p;
                     }
                     // fix #2661 (spec §8.5, v0.252): `Range<T>.ToString()` —
                     // §8.5's AUTO-EQUALITY BODY-RECORD default, which §8.5
@@ -1582,6 +1876,111 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                          isUnsignedInt;
                             bool isFP  = pt == P::Double || pt == P::Float;
                             if (isInt || isFP) {
+                                // fix #4559 (§8.1/§8.4/§8.6/§5.1, v0.306):
+                                // classify the ARGUMENT from its static type
+                                // BEFORE lowering it, so a reroute below does
+                                // not lower the argument expression a second
+                                // time (§22.5, exactly-once).
+                                // `IEquatable<T>.Equals(other: T)` binds T to
+                                // the receiver's own numeric FAMILY — an
+                                // int-kind receiver meeting a wider/narrower
+                                // int-kind argument is the #730 generic-
+                                // substitution widening this arm already
+                                // handles below and must keep handling.
+                                // Anything else — `Object`, an interface, a
+                                // class, `string`, a nullable value type, or
+                                // the OTHER numeric family (an int receiver
+                                // meeting an FP argument or vice versa) —
+                                // cannot be this overload: resolution can only
+                                // have reached `.Equals` through the universal
+                                // `Object.Equals(Object?)` member (§8.1),
+                                // whose formal is `Object?` and whose value
+                                // operand boxes per §8.6. The prior code took
+                                // the scalar fast path unconditionally and
+                                // SExt'd/FPExt'd whatever `rhs` turned out to
+                                // be — malformed IR ("SExt only operates on
+                                // integer" / "FPExt only operates on FP") —
+                                // measured for an `Object` argument (the
+                                // issue's own repro), an interface, a plain
+                                // class, `string`, a nullable primitive
+                                // (`int?`), and a cross-family primitive
+                                // (`double.Equals(int)`).
+                                const sema::TypeRef* argTy =
+                                    ctx_.exprType(*call->args[0].value);
+                                // Mirror the #730 bare-type-parameter
+                                // substitution applied to `tt` above (same
+                                // predicate, same map) so a generic
+                                // `Eq<T>(a: T, b: T) where T: IEquatable<T>`
+                                // body — where BOTH operands are the bare
+                                // parameter `T` — resolves `b`'s type exactly
+                                // as `a`'s was resolved, and the family check
+                                // below agrees with the receiver's family
+                                // instead of misreading an unsubstituted `T`
+                                // as "not this family" (#863).
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Named &&
+                                    !argTy->declaration &&
+                                    !genericSubstSemaTy_.empty() &&
+                                    argTy->astNode && argTy->astNode->name &&
+                                    argTy->astNode->name->parts.size() == 1) {
+                                    auto ait = genericSubstSemaTy_.find(
+                                        argTy->headName());
+                                    if (ait != genericSubstSemaTy_.end() &&
+                                        ait->second &&
+                                        ait->second->kind ==
+                                            sema::TypeRef::Kind::Primitive)
+                                        argTy = ait->second;
+                                }
+                                // fix #5035 (§14.1, v0.307): same placeholder-
+                                // body fallback as the receiver's `tt` above —
+                                // see that comment for the full rationale. The
+                                // argument `b` is just as much a bare `T` as
+                                // the receiver `a` in the exporter's
+                                // placeholder compile, and needs the same
+                                // assumption to reach the primitive fast path
+                                // below instead of the `argSameFamily == false`
+                                // universal-equals fallback.
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Named &&
+                                    !argTy->declaration &&
+                                    argTy->astNode && argTy->astNode->name &&
+                                    argTy->astNode->name->parts.size() == 1) {
+                                    if (auto* p =
+                                            genericParamSoundAtI32ForPlaceholder(
+                                                ctx_, currentMethod_,
+                                                argTy->headName()))
+                                        argTy = p;
+                                }
+                                bool argSameFamily = argTy &&
+                                    !argTy->nullable &&
+                                    argTy->kind ==
+                                        sema::TypeRef::Kind::Primitive &&
+                                    (isFP
+                                         ? (argTy->primitive == P::Double ||
+                                            argTy->primitive == P::Float)
+                                         : (argTy->primitive == P::Int ||
+                                            argTy->primitive == P::Long ||
+                                            argTy->primitive == P::Short ||
+                                            argTy->primitive == P::SByte ||
+                                            argTy->primitive == P::Char ||
+                                            argTy->primitive == P::Bool ||
+                                            argTy->primitive == P::UInt ||
+                                            argTy->primitive == P::ULong ||
+                                            argTy->primitive == P::UShort ||
+                                            argTy->primitive == P::Byte));
+                                if (!argSameFamily) {
+                                    llvm::Value* lhs = lowerExpr(*ma->target);
+                                    if (!lhs) return nullptr;
+                                    // Box the receiver and dispatch through
+                                    // `lowerObjectEquals` — the exact shape
+                                    // `lowerValueSemUniversalEquals` already
+                                    // uses for `5.Equals(o)` (#3480) and the
+                                    // record/enum/choice receivers above, so
+                                    // this one rule stays at one call site
+                                    // rather than growing a second spelling.
+                                    return lowerValueSemUniversalEquals(
+                                        tt, lhs, *call);
+                                }
                                 llvm::Value* lhs = lowerExpr(*ma->target);
                                 llvm::Value* rhs = lowerExpr(*call->args[0].value);
                                 if (!lhs || !rhs) return nullptr;
@@ -1984,6 +2383,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     auto hit = lambdaParamTypeHint_.find(sym);
                     if (hit != lambdaParamTypeHint_.end()) {
                         ctx_.setExprType(ix->target.get(), hit->second);
+                        lambdaHintInjectedExprs_.push_back(
+                            ix->target.get());  // fix #4813
                         tt = hit->second;
                     }
                 }
@@ -3572,6 +3973,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                 }
             }
+            // fix #5013 (§2.7, §6.1, v0.307): a module-qualified
+            // (`System.Threading.CancellationToken.None`) or alias-qualified
+            // (`<alias>.CancellationToken.None`) receiver is not a bare
+            // IdentifierExpr, so the `id2` check below never matches it and
+            // the access fell through with no lowering. Sema's
+            // `resolveMemberAccess` stamps the qualified node's (`ma->target`)
+            // exprSymbol with the SAME builtin TypeSymbol the bare
+            // `CancellationToken` identifier gets, mirroring the #5012 `Task`
+            // fix — recognize it the same way, by symbol identity.
+            if (ma->member == "None") {
+                if (auto* tsym =
+                        dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
+                    if (tsym == ctx_.builtinClassSym("CancellationToken"))
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                }
+            }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {
@@ -4492,6 +4909,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
         }
     }
+    // fix #4746 (stdlib §4.1/§4.2, v0.307): `IsReadOnly` on a builtin
+    // collection is a compile-time constant `false`. §4.1 states the whole
+    // runtime story — "`IsReadOnly` is `false` for every standard collection
+    // implementing `ICollection<T>` … The standard library currently ships no
+    // read-only `ICollection<T>` implementation; the member exists for
+    // user-defined read-only implementations" — so there is no per-object
+    // state to read here, only the constant.
+    //
+    // Without this arm the property read lowered to no value at all and the
+    // #3079 silent no-op followed: `Console.WriteLine(s.IsReadOnly)` emitted
+    // NOTHING, not even the line terminator (measured on three families).
+    // The admitted family set mirrors the #4746 sema handler in
+    // `ExprTypecheck_Calls.cpp` exactly — sema types only these seven, so a
+    // receiver outside the set never reaches this arm with a typed read; the
+    // guard is repeated rather than inferred because codegen dispatch here is
+    // AST-structural, not symbol-based.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "IsReadOnly") {
+            auto* tt = ctx_.exprType(*ma->target);
+            std::string_view cn =
+                (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                 !tt->declaration && tt->astNode && tt->astNode->name &&
+                 !tt->astNode->name->parts.empty())
+                    ? tt->headName()
+                    : std::string_view();
+            if (cn == "Array" || cn == "OwningArray" ||
+                cn == "LinkedList" || cn == "OwningLinkedList" ||
+                cn == "Dictionary" ||
+                cn == "Set" || cn == "OwningSet") {
+                // Lower the receiver for its side effects and discard the
+                // value: the property does not depend on the object's state.
+                lowerExpr(*ma->target);
+                return llvm::ConstantInt::get(i1(), 0);
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.
@@ -4798,19 +5251,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     // tryLowerCollectionInstanceCall / #1426).
                                     const char* rn = isMax ? "bz_dict_max_key_str"
                                                            : "bz_dict_min_key_str";
+                                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
                                     auto* skFn = declareC(rn, i1(),
-                                        {ptrTy(), ptrTy(), ptrTy()});
+                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                                     llvm::AllocaInst* dSlot = entryAlloca(ptrTy());
                                     llvm::AllocaInst* lSlot = entryAlloca(i64());
+                                    // fix #4499: the key's §4.6 storage width.
+                                    llvm::AllocaInst* wSlot = entryAlloca(i8Ty2);
                                     builder_.CreateStore(
                                         llvm::ConstantPointerNull::get(ptrTy()), dSlot);
                                     builder_.CreateStore(builder_.getInt64(0), lSlot);
-                                    builder_.CreateCall(skFn, {obj, dSlot, lSlot});
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty2, 1), wSlot);
+                                    builder_.CreateCall(skFn,
+                                        {obj, dSlot, lSlot, wSlot});
                                     llvm::Value* kdata =
                                         builder_.CreateLoad(ptrTy(), dSlot, "sp.kd");
                                     llvm::Value* klen =
                                         builder_.CreateLoad(i64(), lSlot, "sp.kl");
-                                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                                    llvm::Value* kwid =
+                                        builder_.CreateLoad(i8Ty2, wSlot, "sp.kw");
                                     uint64_t strSz2 = module_->getDataLayout()
                                         .getTypeAllocSize(stringType());
                                     auto* callocFn2 = declareC("calloc", ptrTy(),
@@ -4822,8 +5282,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         builder_.CreateStructGEP(stringType(),sObj,0));
                                     builder_.CreateStore(klen,
                                         builder_.CreateStructGEP(stringType(),sObj,1));
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty2, 1),
+                                    builder_.CreateStore(kwid,
                                         builder_.CreateStructGEP(stringType(),sObj,2));
                                     initStringRc(sObj);
                                     return sObj;
@@ -5157,23 +5616,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // String keys: existing bz_dict_keys_str path (unchanged).
                 auto* keysOutSlot = entryAlloca(ptrTy());
                 auto* lensOutSlot = entryAlloca(ptrTy());
+                auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499
                 auto* cntSlot2 = entryAlloca(i64());
                 auto* keysFn2 = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(keysFn2, {dictObj, keysOutSlot, lensOutSlot, cntSlot2});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(keysFn2, {dictObj, keysOutSlot, lensOutSlot,
+                                              widsOutSlot, cntSlot2});
                 llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
                 llvm::Value* lensArr = builder_.CreateLoad(ptrTy(), lensOutSlot);
+                llvm::Value* widsArr = builder_.CreateLoad(ptrTy(), widsOutSlot);
                 llvm::Value* cnt2 = builder_.CreateLoad(i64(), cntSlot2);
                 auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 llvm::Value* result2 = builder_.CreateCall(allocFn2,
                     {builder_.getInt64(8), cnt2});
                 auto* addFn2 = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                         {ptrTy(), ptrTy(), i64()});
-                auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
-                auto* memcpyFn2 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-                auto* callocFn3 = declareC("calloc", ptrTy(), {i64(), i64()});
-                auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
-                uint64_t strSz2 = module_->getDataLayout().getTypeAllocSize(stringType());
                 auto* idxSlot3 = entryAlloca(i64());
                 builder_.CreateStore(builder_.getInt64(0), idxSlot3);
                 auto* condBB2b = llvm::BasicBlock::Create(llvm_, "ks2.c", currentFn_);
@@ -5184,22 +5641,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* idx3 = builder_.CreateLoad(i64(), idxSlot3);
                 builder_.CreateCondBr(builder_.CreateICmpSLT(idx3, cnt2), bodyBB2b, endBB2b);
                 builder_.SetInsertPoint(bodyBB2b);
-                llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idx3);
-                llvm::Value* kp2 = builder_.CreateLoad(ptrTy(), kpPtr2);
-                llvm::Value* lpPtr2 = builder_.CreateGEP(i64(), lensArr, idx3);
-                llvm::Value* kl3 = builder_.CreateLoad(i64(), lpPtr2);
-                llvm::Value* dataSz3 = builder_.CreateAdd(kl3, builder_.getInt64(1));
-                llvm::Value* dataCopy3 = builder_.CreateCall(mallocFn2, {dataSz3});
-                builder_.CreateCall(memcpyFn2, {dataCopy3, kp2, kl3});
-                llvm::Value* nulPtr3 = builder_.CreateGEP(i8Ty2, dataCopy3, kl3);
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 0), nulPtr3);
-                llvm::Value* strObj3 = builder_.CreateCall(callocFn3,
-                    {builder_.getInt64(1), builder_.getInt64(strSz2)});
-                builder_.CreateStore(dataCopy3, builder_.CreateStructGEP(stringType(), strObj3, 0));
-                builder_.CreateStore(kl3, builder_.CreateStructGEP(stringType(), strObj3, 1));
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 1),
-                    builder_.CreateStructGEP(stringType(), strObj3, 2));
-                    initStringRc(strObj3);  // #422: producer's reference, rc := 1
+                // fix #4499: this arm carried a FOURTH hand-written copy of the
+                // raw-bytes → bz_string decode, and it was the copy that
+                // hard-coded width 1 and `lens[i]` BYTES. Route it through the
+                // one shared decoder (narrow #3717's helper) so the width rule
+                // is stated once. Ownership is unchanged: the decode produces a
+                // fresh +1 string and does NOT free the snapshot's own blob,
+                // exactly as the inline copy did.
+                llvm::Value* strObj3 =
+                    decodeDictStringKeyAt(keysArr, lensArr, widsArr, idx3).first;
                 auto* slotK2 = entryAlloca(ptrTy());
                 builder_.CreateStore(strObj3, slotK2);
                 builder_.CreateCall(addFn2, {result2, slotK2, builder_.getInt64(8)});
@@ -6047,10 +6497,51 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 builder_.CreateStore(obj, tmp);
                 obj = tmp;
             }
-            auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                dynamic_cast<sema::PropertySymbol*>(
-                    ctx_.exprSymbol(*ma))->decl);
+            auto* ps2 = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps2 ? ps2->decl : nullptr);
+            // fix #4973 (§14.1 / §23 / §2.8.3 rule 4, v0.307): an INHERITED
+            // NAMED BLOCK-FORM PROPERTY on a generic base reached through a
+            // non-generic derived receiver (`e.Val` where `e: E: B<string>` and
+            // `Val` is in `B<T>` with declared type `T`). The expression-bodied
+            // twin at ~5989 installs the substitution via
+            // `computeAncestorGenericSubst` BEFORE inlining the getter body
+            // (#3346/#3348 fix). The BLOCK-form twin was missed because the
+            // body lowers as a STANDALONE function — `ensurePropertyBlockGetter`
+            // names the erased template `bz$prop$<name>$get` with `lowerType(T)`
+            // falling back to `i32()` when no subst is active. The call passes
+            // `obj` (which has the receiver's actual struct layout) to a
+            // function expecting the erased layout: p7_direct prints
+            // `x x <empty> <empty>` for `x x y y` because the getter returns
+            // i32 from a T=string field's first 4 bytes (and the SETTER twin
+            // silently corrupts `_v` by writing 8 bytes into a 4-byte slot).
+            //
+            // Mirror the expression-bodied twin. Save+restore the subst so
+            // nothing leaks past this read into the enclosing expression.
+            const sema::TypeRef* recvTy2 = ctx_.exprType(*ma->target);
+            std::unordered_map<std::string_view, llvm::Type*> savedSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> savedSema;
+            bool substInstalled = false;
+            if (recvTy2 && ps2 &&
+                recvTy2->kind == sema::TypeRef::Kind::Named &&
+                recvTy2->declaration &&
+                recvTy2->declaration != ps2->parent &&
+                !ps2->parent->genericParams.empty()) {
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+                if (computeAncestorGenericSubst(recvTy2, ps2->parent,
+                                                ancSubst, ancSema)) {
+                    savedSubst = std::move(genericSubst_);
+                    savedSema = std::move(genericSubstSemaTy_);
+                    genericSubst_ = std::move(ancSubst);
+                    genericSubstSemaTy_ = std::move(ancSema);
+                    substInstalled = true;
+                }
+            }
             llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+            if (substInstalled) {
+                genericSubst_ = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSema);
+            }
             llvm::Value* res = builder_.CreateCall(getterFn->getFunctionType(),
                                                    getterFn, {obj});
             // §31.1/§31.2 (FINDING [4]): a block-form getter is a standalone
@@ -6363,6 +6854,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         llvm::Value* recvPtr = nullptr;
         if (llvm::Value* addr = fieldAddr(*ma, elemTy, &recvPtr)) {
             llvm::Value* val = builder_.CreateLoad(elemTy, addr);
+            // fix #1748 (§22.7 residual, v0.306): checked-disposal watermark
+            // guard — see emitFieldWatermarkGuard for the full rationale.
+            emitFieldWatermarkGuard(*ma, val, elemTy);
             // #1039: a fresh `new <class>().valueField` read leaves the receiver
             // temp owned by nothing — dispose it now that the value is copied
             // out (no-op unless the receiver is a fresh `new` of a heap class
@@ -6406,7 +6900,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
-            return builder_.CreateLoad(gv->getValueType(), gv);
+            {
+                llvm::Value* val = builder_.CreateLoad(gv->getValueType(), gv);
+                // fix #4486 (§22.13, v0.306): the static-storage counterpart of
+                // #1748's instance-field watermark guard (see
+                // emitFieldWatermarkGuard's own comment) — a same-type forward
+                // reference that escapes emitStaticPartialReadGuard's cycle
+                // backstop (routed through a function value, virtual dispatch,
+                // or a module boundary) falls through to here still holding
+                // the field's null-watermark default; this raises
+                // NullReferenceException for it in checked-disposal mode.
+                emitFieldWatermarkGuard(e, val, gv->getValueType());
+                return val;
+            }
         }
         // fix #2547 (sibling of #2477): the third #605 / generic-new(T) silent-
         // zero family shape — a bare MemberAccessExpr read `obj.f` (no parens,
@@ -6516,8 +7022,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (!ctx_.exprType(e)) {
             sema::Symbol* sym = ctx_.exprSymbol(e);
             auto hit = lambdaParamTypeHint_.find(sym);
-            if (hit != lambdaParamTypeHint_.end())
+            if (hit != lambdaParamTypeHint_.end()) {
                 ctx_.setExprType(&e, hit->second);
+                lambdaHintInjectedExprs_.push_back(&e);  // fix #4813
+            }
         }
         // CG9: `this` (and `base`, same instance) is the receiver ptr.
         if (id->name == "this" || id->name == "base") return currentThis_;
@@ -6599,13 +7107,30 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* fsym = dynamic_cast<const sema::MemberSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
-            return builder_.CreateLoad(gv->getValueType(), gv);
+            {
+                llvm::Value* val = builder_.CreateLoad(gv->getValueType(), gv);
+                // fix #4486 (§22.13, v0.306): the static-storage counterpart of
+                // #1748's instance-field watermark guard — see the identical
+                // comment at the qualified `Type.Count` static-read site above.
+                emitFieldWatermarkGuard(e, val, gv->getValueType());
+                return val;
+            }
         }
         // CG9: a bare identifier resolving to an instance field is an
         // implicit-`this` field read.
         llvm::Type* elemTy = nullptr;
         if (llvm::Value* addr = implicitFieldAddr(e, elemTy)) {
-            return builder_.CreateLoad(elemTy, addr);
+            llvm::Value* val = builder_.CreateLoad(elemTy, addr);
+            // fix #1748 (§22.7 residual, v0.306): checked-disposal watermark
+            // guard — see emitFieldWatermarkGuard for the full rationale.
+            // The bare-identifier form (`_name` inside a `this`-capturing
+            // closure) is exactly the shape the issue's probe uses: rule 3
+            // ("closures observe at invocation, not at capture") is not
+            // gated by rule 1's DA check, so a closure invoked synchronously
+            // from the constructor body before `_name` is assigned reaches
+            // this CG9 path with no compile-time diagnostic.
+            emitFieldWatermarkGuard(e, val, elemTy);
+            return val;
         }
         // #625 / §12 / §31: bare `Message` inside a user class that inherits
         // a built-in exception — sema resolved it as the inherited Exception
@@ -7195,12 +7720,38 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     // so this function must be able to derive the value type without `pd`
     // too, instead of bailing out — the value type rides the
     // importedMemberType side table, exactly like the getter already reads.
+    //
+    // fix #4947 (§11.2/§14.1/§23, v0.307): the call-site parameter type MUST
+    // be computed from the sema-resolved, SUBSTITUTED type of the assignment
+    // TARGET first — not from `pd->type.get()` unconditionally, as this used
+    // to do. `pd->type` is the bare AST declaration on the INTERFACE (or base
+    // class) member; for a generic interface property (`property Q: T;` on
+    // `I<T>`) lowering that bare `T` with no active genericSubst_ at this call
+    // site resolves to the i32 ERASED PLACEHOLDER, while the per-instantiation
+    // itable/vtable slot the call dispatches through expects the SPECIALIZED
+    // parameter type (e.g. `ptr` for `T = string`, per §11.2 "parameter types
+    // that are exactly equal under the interface's substitution"). The
+    // mismatch aborts the build: "Call parameter type does not match function
+    // signature! ptr @.bz.str.N  i32  call void %pset(ptr %r, ptr @.bz.str.N)".
+    // `ctx_.exprType(target)` is the post-substitution sema type (§14.1) —
+    // exactly the same call already used two lines below this at
+    // `boxForTarget(v, ctx_.exprType(target), valueExpr)` — and mirrors the
+    // getter twin's identical #2944 fix above (`lowerVirtualPropertyGet`),
+    // which computes `valTy` from `ctx_.exprType(e)` first for the same
+    // reason. `pd->type.get()` and the imported side table remain the
+    // fallbacks for when sema did not annotate the target (no static type) or
+    // `pd` is null (an imported property with no local AST).
     llvm::Type* valTy = nullptr;
-    if (pd) {
-        valTy = lowerType(pd->type.get());
-    } else {
-        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
-            valTy = lowerTypeRef(tr);
+    if (sema::TypeRef* resolved = ctx_.exprType(target)) {
+        valTy = lowerTypeRef(resolved);
+    }
+    if (!valTy) {
+        if (pd) {
+            valTy = lowerType(pd->type.get());
+        } else {
+            if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+                valTy = lowerTypeRef(tr);
+        }
     }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(
@@ -7961,10 +8512,11 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 // String key fast path.
                 llvm::Value* kdata = loadStringData(key);
                 llvm::Value* klen  = loadStringLen(key);
+                llvm::Value* kwid  = loadStringWidth(key);   // fix #4499
                 auto* fn = declareC("bz_dict_contains_str", i1(),
-                                    {ptrTy(), ptrTy(), i64()});
+                                    {ptrTy(), ptrTy(), i64(), i8()});
                 llvm::Value* r =
-                    builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
+                    builder_.CreateCall(fn, {dict, kdata, klen, kwid}, "dict.in");
                 // fix #3703 / §28.9: `key in dict` never stores the key — the
                 // table copies kdata/klen's bytes, never retaining `key`
                 // itself (unlike a VALUE slot, per #429). Release a fresh +1
@@ -7998,6 +8550,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* elem = lowerExpr(*bin.left);
                 llvm::Value* coll = lowerExpr(*bin.right);
                 if (!elem || !coll) return nullptr;
+                // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
+                // bare-value-typed LHS into the Object/interface element
+                // slot ONCE, before either scan — see `boxMembershipQuery`
+                // (LlvmBackend_Layout.cpp). Placed above the LinkedList
+                // arm's `entryAlloca(elem->getType())` spill so both arms
+                // see the boxed shape.
+                elem = boxMembershipQuery(elem, elemRef, bin.left.get());
 
                 if (isLL) {
                     // fix #560 / §17.5/§4.6/§8.3: walk the linked list applying
@@ -8136,6 +8695,11 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
 
                 llvm::Value* target = lowerExpr(*bin.left);
                 if (!target) return nullptr;
+                // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
+                // bare-value-typed LHS into the Object/interface element
+                // slot ONCE, before the scan — see `boxMembershipQuery`
+                // (LlvmBackend_Layout.cpp).
+                target = boxMembershipQuery(target, elemRef, bin.left.get());
 
                 if (N == 0) return builder_.getFalse();
 
@@ -8244,6 +8808,87 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         } else if (isThisIdent(bin.right.get())) {
             if (llvm::Type* st = bareRecordOrChoiceStructTy(bin.left.get(), r, l))
                 r = builder_.CreateLoad(st, r, "this.val");
+        }
+    }
+    // fix #4511 (§8.4 / §8.6 / §5.1, v0.306): `Object = value` / `value =
+    // Object`, either order. §5.1's reference conversions include "any type to
+    // `Object`", a VALUE type reaching it by boxing (§8.6); §8.4 then defines
+    // `a = b` as `a.Equals(b)` with the null-safe wrapper, and §8.1 fixes
+    // `Object`'s member surface to include `Equals(Object?)`. The pair is
+    // therefore well-formed, and sema admits it on exactly that authority —
+    // #4501's §5.1 operand-pair gate deliberately exempts `Object` on either
+    // side (pinned by
+    // `sema_binary_operand_pair_4501.t5_object_operand_not_rejected_by_this_rule_spec_5_1`).
+    //
+    // Codegen had NO arm for the pair: the value operand was never boxed, so it
+    // arrived at the scalar fall-through as `icmp eq ptr %o, i32 %i` and the
+    // compile died in IR verification. A RECORD value operand was worse than
+    // malformed — `Point = (Object)p` reached the §8.3 struct-equality dispatch
+    // with a POINTER on the other side and SEGFAULTED the compiler.
+    //
+    // Box the value operand exactly as an assignment to an `Object` location
+    // would (`boxValue` — the mint `boxForTarget` makes, keyed by the same
+    // `isObjectOrInterfaceTarget` predicate) and dispatch through
+    // `lowerObjectEquals`: the vtable `kEqualsSlot` route, null-safe on the
+    // receiver and on `other`. §8.4 makes the LEFT operand the receiver, so the
+    // box takes whichever position its operand held. The box is minted here and
+    // only READ by the equals thunk, so it is released immediately after the
+    // comparison — fix #3480's reasoning, and the exact shape
+    // `lowerValueSemUniversalEquals` already uses for `5.Equals(o)`.
+    //
+    // Placed HERE, before every shape-keyed arm below, because those arms
+    // classify by LLVM operand shape and each mis-claims one spelling of this
+    // pair: the decimal block would feed an `Object` pointer to `bz_decimal_cmp`
+    // for `Object = decimal`, and the struct arm is the record segfault above.
+    if (bin.op == "=" || bin.op == "<>") {
+        auto objectOperand = [&](const ast::Expr* e, llvm::Value* v) -> bool {
+            if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
+                return false;
+            if (!v->getType()->isPointerTy()) return false;
+            return isObjectOrInterfaceTarget(ctx_.exprType(*e));
+        };
+        // The boxable side: a value-typed operand that did NOT lower to a
+        // pointer. The pointer test is what keeps `Object = string` and
+        // `Object = someClass` on their existing reference paths — `string` is
+        // a reference type (§4.6) that keeps its bare `bz_string*` in an
+        // `Object` slot, and a class pointer coerced to `Object` never boxes.
+        auto boxableOperand =
+            [&](const ast::Expr* e, llvm::Value* v) -> const sema::TypeRef* {
+            if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
+                return nullptr;
+            if (v->getType()->isPointerTy()) return nullptr;
+            const sema::TypeRef* t = ctx_.exprType(*e);
+            if (!t || isObjectOrInterfaceTarget(t)) return nullptr;
+            return (isBoxableValueType(t) || isNullableValueTy(t)) ? t : nullptr;
+        };
+        const sema::TypeRef* boxTy = nullptr;
+        bool boxIsLeft = false;
+        if (objectOperand(bin.left.get(), l)) {
+            boxTy = boxableOperand(bin.right.get(), r);
+        } else if (objectOperand(bin.right.get(), r)) {
+            boxTy = boxableOperand(bin.left.get(), l);
+            boxIsLeft = boxTy != nullptr;
+        }
+        if (boxTy) {
+            llvm::Value* raw = boxIsLeft ? l : r;
+            // `boxValue` publishes its mint in `lastBoxMint_` for #2865's
+            // reader; this box is claimed HERE, so restore the caller's view.
+            llvm::Value* savedMint = lastBoxMint_;
+            llvm::Value* boxed = boxValue(raw, boxTy);
+            lastBoxMint_ = savedMint;
+            // A value kind with no box descriptor returns its input unchanged;
+            // fail closed to the existing paths rather than emit a bad call.
+            if (boxed && boxed != raw && boxed->getType()->isPointerTy()) {
+                llvm::Value* recv  = boxIsLeft ? boxed : l;
+                llvm::Value* other = boxIsLeft ? r : boxed;
+                if (llvm::Value* eq = lowerObjectEquals(recv, other)) {
+                    auto* relFn = declareC("bz_box_release",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()});
+                    builder_.CreateCall(relFn, {boxed});  // null-safe (§28.9)
+                    return bin.op == "=" ? eq : builder_.CreateNot(eq);
+                }
+            }
         }
     }
     bool lUnwrapped_ = false;
@@ -9173,27 +9818,78 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         }
     }
     } // end eitherNull2 guard
-    // §8.4 (#1106): `=`/`<>` on USER-CLASS-typed operands invokes the class's
-    // `Equals` (null-safe), never a raw pointer compare. Classes cannot overload
-    // `=`/`<>` (§25.2); they customize equality via an `Equals` override, and `=`
-    // must dispatch it. Route both operands through lowerObjectEquals (vtable
-    // kEqualsSlot dispatch — the override, or the default reference-identity
-    // thunk for a class with none, so a non-overriding class keeps ptr-compare
-    // semantics; null-safe on the receiver). Excludes a null-literal operand
-    // (`a = null` is the reference-equality-to-null form, handled by the scalar
-    // path below) and fires only when BOTH operands are user-class pointers
-    // (Object/interface/record/builtin handled elsewhere). Without this, `a = b`
-    // on a class with an overridden Equals did a raw ICmp ptr-compare and
-    // bypassed the override (defect 2).
+    // §8.4 (#1106, widened by fix #4560): `=`/`<>` on USER-CLASS-typed operands
+    // invokes the class's `Equals` (null-safe), never a raw pointer compare.
+    // Classes cannot overload `=`/`<>` (§25.2); they customize equality via an
+    // `Equals` override, and `=` must dispatch it. Route both operands through
+    // lowerObjectEquals (vtable kEqualsSlot dispatch — the override, or the
+    // default reference-identity thunk for a class with none, so a non-
+    // overriding class keeps ptr-compare semantics; null-safe on the receiver).
+    // Excludes a null-literal operand (`a = null` is the reference-equality-to-
+    // null form, handled by the scalar path below).
+    //
+    // fix #4560 (§8.1/§8.3/§8.4, v0.306): the original #1106 predicate required
+    // BOTH operands to be `Kind::Named && TypeDeclKind::Class` — which a
+    // statically-`Object`-typed operand never is (`Object` lowers to
+    // `Kind::Primitive`/`PrimitiveType::Object`, isObjectOrInterfaceTarget's own
+    // test). So a pair with an `Object`-typed operand fell all the way through
+    // to CG4's raw `ICmpEQ`/`ICmpNE` below — reference identity — while
+    // `.Equals()` on the identical pair already dispatched virtually through
+    // this same `lowerObjectEquals` helper (§9.6). `Object` is itself
+    // `public class Object` (§8.1) with a **virtual** `Equals` (§8.1's
+    // declaration), and §8.4/§25.2 make `=` invoke `Equals` UNCONDITIONALLY for
+    // classes — there is no carve-out keyed on the operand's *static* type, only
+    // on its *kind* (class vs. record/enum/etc.). The fix widens the per-operand
+    // predicate to also accept `Object`, which — because it is applied to each
+    // operand independently and then ANDed — naturally covers `Object = Object`
+    // (the issue's own repro: two distinct boxes of `5` answered `False` via
+    // identity while `.Equals` answered `True` via the box's value-comparison
+    // override) and the mixed `Object = someClass` / `someClass = Object` pair
+    // (measured equally broken pre-fix: an `Object`-typed local holding a class
+    // WITH an `Equals` override answered `False` against a same-typed local of
+    // the concrete class, in both operand orders, while `.Equals` answered
+    // `True` both ways — the identical root cause, not a separate defect).
+    // fix #4615 (§8.4/§25.2, v0.307): #4560 widened this predicate to accept
+    // `Object` but deliberately left `TypeDeclKind::Interface` untouched,
+    // filing the analogous bug separately. An INTERFACE-typed operand's
+    // runtime value is always a class instance (interfaces cannot be
+    // instantiated on their own, §11.2) — §8.4's "For classes, `=` always
+    // invokes `Equals`" (§25.2) applies to it exactly as it does to a
+    // concretely-typed or `Object`-typed operand; there is no carve-out keyed
+    // on the operand's *static* type, only on the runtime kind (class vs.
+    // record/enum/etc.). Pre-fix, `I = I` fell through this arm (Interface is
+    // `Kind::Named` but `declaration->kind != Class`) all the way to CG4's raw
+    // `ICmpEQ`/`ICmpNE` below — reference identity — while `.Equals()` on the
+    // identical pair already dispatched virtually through the SAME
+    // `lowerObjectEquals` helper (fix #4594 established this exact reasoning
+    // for an interface-typed *collection element*'s `Equals`: "every class's
+    // vtable slot 4 is unconditionally filled ... so routing an interface
+    // through `lowerObjectEquals` is total, not a fast path" — an interface
+    // element/operand with no override still answers identity, unchanged).
+    // Widen the per-operand predicate to also accept `Interface`, folded into
+    // the existing `isObjectOrInterfaceTarget` helper (already Object+
+    // Interface, used identically at the `.Equals()` dispatch site a few
+    // hundred lines above) rather than hand-rolling a second Object-only arm,
+    // which both simplifies this predicate and keeps the two call sites from
+    // drifting.
     if ((op == "=" || op == "<>") &&
         l->getType()->isPointerTy() && r->getType()->isPointerTy()) {
-        auto isUserClassExpr = [&](const ast::Expr* e) -> bool {
+        auto isUserClassObjectOrInterfaceExpr = [&](const ast::Expr* e) -> bool {
             if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
             const sema::TypeRef* t = ctx_.exprType(*e);
-            return t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
-                   t->declaration->kind == ast::TypeDeclKind::Class;
+            if (!t) return false;
+            if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                t->declaration->kind == ast::TypeDeclKind::Class)
+                return true;
+            // §8.1/§11.2: `Object` (Kind::Primitive/PrimitiveType::Object) and
+            // interface types (Kind::Named/TypeDeclKind::Interface) are both
+            // always backed by a class instance at runtime;
+            // `isObjectOrInterfaceTarget` already recognizes exactly this pair
+            // (used identically by the `.Equals()` dispatch site above).
+            return isObjectOrInterfaceTarget(t);
         };
-        if (isUserClassExpr(bin.left.get()) && isUserClassExpr(bin.right.get())) {
+        if (isUserClassObjectOrInterfaceExpr(bin.left.get()) &&
+            isUserClassObjectOrInterfaceExpr(bin.right.get())) {
             if (llvm::Value* eq = lowerObjectEquals(l, r))
                 return op == "=" ? eq : builder_.CreateNot(eq);
         }

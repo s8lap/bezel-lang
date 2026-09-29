@@ -32,10 +32,18 @@
 //     root cause (no PropertySymbol closure-dispatch arm in lowerCall at all).
 //     Bites locally too; out of scope for this field-specific fix.
 //   - #2590: reading/invoking a function-typed field of an imported RECORD
-//     segfaults (bad closure pointer across --import). The fix here is
+//     segfaulted (bad closure pointer across --import). The fix here was
 //     deliberately gated to CLASS receivers because the record field-READ ABI
-//     is a separate, deeper defect; routing the record case through the
-//     closure dispatch would only turn its silent zero-init into a segfault.
+//     was a separate, deeper defect; routing the record case through the
+//     closure dispatch would only have turned its silent zero-init into a
+//     segfault. ⚠ RETIRED: #2590 (v0.306) fixed the read via the
+//     #2874/#3671/#3723 initializer replay and then admitted `Record` to this
+//     arm's fallback, which now asks the shared
+//     `importedMemberTypeAdmitsClosureDispatch` predicate instead of its own
+//     Class-only allowlist. No oracle in THIS file changes — every row here
+//     uses a class receiver — but the rationale above no longer describes the
+//     code; the record rows live in
+//     tests/module/xmod_imported_record_func_member_invoke_2590_test.cpp.
 
 #include <cstdio>
 #include <cstdlib>

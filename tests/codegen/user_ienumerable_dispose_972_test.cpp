@@ -53,7 +53,12 @@ static const char* kCountingEnum = R"(
   class CountingRange
     private limit: int;
     public constructor(limit: int) this.limit := limit; end constructor;
-    public method GetEnumerator(): CountingEnum return new CountingEnum(limit); end GetEnumerator;
+    // §28.3 announcement table row 4 (v0.307): a duck-typed `GetEnumerator`
+    // returning a plain CONCRETE class (not the `IEnumerator<T>` interface)
+    // is outside the mint-announcing family and is an ordinary instance
+    // return — `owned` here changes nothing this test exercises (the
+    // disposal-count assertions below), it only legalizes the declaration.
+    public method GetEnumerator(): owned CountingEnum return new CountingEnum(limit); end GetEnumerator;
     destructor end destructor;
   end CountingRange;
 )";

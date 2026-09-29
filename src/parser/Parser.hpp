@@ -294,6 +294,13 @@ private:
     // first — `serialized` is contextual so we identify by text.
     bool isSerializedClauseStart() const;
     std::unique_ptr<ast::SerializedClause> parseSerializedClause();
+    // §9.2 / fix #4643: parse `equality skip` (A.4 EqualityClause). The
+    // caller checks `isEqualityClauseStart()` first — `equality` is
+    // contextual (App. B.2) so we identify by text. Only the `skip` form
+    // exists (no name, no `optional`); the parser rejects other forms
+    // (§9.2 line 1385 — vocabulary is one word, closed).
+    bool isEqualityClauseStart() const;
+    std::unique_ptr<ast::EqualityClause> parseEqualityClause();
     // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);` member
     // clause — populates decl.serializedClass->polyCases.
     void parsePolymorphicMember(ast::TypeDecl& decl);

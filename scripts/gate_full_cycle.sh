@@ -713,6 +713,219 @@ if ! python3 scripts/check_ambiguous_ran_false.py --strict \
 fi
 say "ambiguous-ran-false phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_ranfalse.log"))"
 
+# ── NATIVE-ASAN-LEG SKIP PHASE (#3682) ────────────────────────────────────
+# The per-test ASan leg funnels through sanitizerRuntimeMaster() (via
+# asanRuntimeObject() or buildRuntimeSanitizerObject()), and every
+# caller follows the same shape: bind the result, then `if (rc < 0)
+# return;` (or `== -1`) — a guard that swallows the empty result as a
+# silent SKIP. ~49 sites banked across 14 files at #3682 (the rest of
+# the >150 the spec's line-based grep counted were unbound variables,
+# not real swallows). The conflating_helpers count is post-#3676
+# (commit 1 of this ratchet) AND post-#3682-fix-forward (cycle-9 round-2:
+# the brace-matching bug fix uncovered 72 additional real conflations
+# in 71 files, rebanked from 0 → 73 in scripts/native_asan_leg_skips.baseline).
+#
+# Two banked per-file counts, exact-not-ceiling baseline + a per-file
+# grandfather ceiling. Marker protocol: `// ASAN-LEG-ONLY: <reason>`
+# exempts the next swallow, `// ASAN-LEG-DEBT: #NNNN <reason>`
+# justifies a rise above the grandfathered ceiling (same shape as
+# LOCALDECL-ONLY / LOCALDECL-DEBT, check_localdecl_only_walkers.py).
+say "native-asan-leg phase: detector self-test + skip-swallow ratchet (#3682)"
+if ! python3 scripts/check_native_asan_leg_skips.py --self-test \
+      > "$LOGDIR/${TAG}_asanleg.log" 2>&1; then
+  say "CYCLE FAILURE: check_native_asan_leg_skips SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_asanleg.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_asanleg.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_native_asan_leg_skips.py --strict \
+      >> "$LOGDIR/${TAG}_asanleg.log" 2>&1; then
+  say "CYCLE FAILURE: the native ASan-leg skip surface ROSE (#3682) — a"
+  say "  new \`if (<asan-var> == -1|<0) return;\` site, a new"
+  say "  \`-fsanitize=address\` helper with a post-link \`return -1;\`, or"
+  say "  a marked-rather-than-fixed swallowing guard. Each row reports a"
+  say "  clean PASS while the ASan leg is unavailable — the failure mode"
+  say "  #3653's \`detect_leaks\` regression reached the gate unseen for."
+  say "  See $LOGDIR/${TAG}_asanleg.log"
+  sed -n '/NATIVE ASAN LEG SKIPS:/,$p' "$LOGDIR/${TAG}_asanleg.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "native-asan-leg phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_asanleg.log"))"
+
+# ── UNINSTRUMENTED-EMIT PHASE (#3917) ──────────────────────────────────────
+# Hand-rolled `codegen::emitObjectFile` runners that bypass
+# `bezel::test::forceSanitizeAddress()` (the predicate `--full` flows
+# through) leave gate.sh --full blind to generated-code ASan on those
+# programs. The capability gap is real: a 3-arg call defaults
+# `sanitizeAddress` to false at src/codegen/LlvmBackend.hpp:102, LSan
+# still catches a leak, but a use-after-free read performed by
+# generated code is invisible - no shadow-memory check is emitted on
+# the program's own loads/stores.
+#
+# Spec §5 ("Ratchet first, fix second" per #4452): there is no runtime
+# half available for this hole, and that is worth stating rather than
+# leaving implicit. The source shape is the only observable, so this
+# ratchet freezes the bypassing_call and overpromising_row surfaces
+# while the burn-down (wrapper + 87-file repoint + 42-row name audit)
+# runs separately. See scripts/check_uninstrumented_emit_runners.py
+# docstring for the full counting criteria.
+say "uninstrumented-emit phase: detector self-test + source ratchet (#3917)"
+if ! python3 scripts/check_uninstrumented_emit_runners.py --self-test \
+      > "$LOGDIR/${TAG}_emitasan.log" 2>&1; then
+  say "CYCLE FAILURE: check_uninstrumented_emit_runners SELF-TEST failed —"
+  say "  the detector is broken, so its verdict on the tree means nothing."
+  say "  See $LOGDIR/${TAG}_emitasan.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_emitasan.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_uninstrumented_emit_runners.py --strict \
+      >> "$LOGDIR/${TAG}_emitasan.log" 2>&1; then
+  say "CYCLE FAILURE: a test lowers a program with emitObjectFile() without"
+  say "  threading forceSanitizeAddress(), so --full does not instrument"
+  say "  that program's generated code — a \"no UAF\" row there can only"
+  say "  observe a signal death (#3917). See $LOGDIR/${TAG}_emitasan.log"
+  sed -n '/UNINSTRUMENTED-EMIT RUNNERS:/,/See issue #3917/p' \
+    "$LOGDIR/${TAG}_emitasan.log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "uninstrumented-emit phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_emitasan.log"))"
+# ── TOOLCHAIN-SKIP PHASE (#3733) ────────────────────────────────────────────
+# `runAotCheckedImpl`'s `clang --version` probe at tests/support/aot_support.hpp
+# returns the SKIP branch on failure, and the literal diagnostic it emits
+# ("<name>: SKIP — C toolchain (clang) unavailable for the ASan link") is
+# read by 1,518 `wasSkipped` / `SKIP (not a failure)` guards across 270
+# files (#3733, measured 2026-09-17 at b57a712e). On a box without clang
+# the whole ASan/LSan tier silently reports clean PASS having run no
+# sanitizer at all — the #3633 silent-skip class, counted nowhere. The
+# runtime half of #3733 makes the absence LOUD (counter + print + shard
+# JSON field + run_parallel.sh floor); this phase freezes the
+# 2,305-call-site surface so it cannot grow while the burn-down runs.
+#
+# Both halves are wired into the same gate cycle: a rise in the script's
+# source-side count without a contemporaneous drop in absorbing_sites
+# fails here, and a nonzero `checked_toolchain_skips` total at the
+# shard level fails inside tests/run_parallel.sh (which gate.sh already
+# consumes). The script's --self-test plants six fixtures in
+# TemporaryDirectory() and asserts the detector's own behaviour; this
+# phase runs --self-test FIRST for the same reason every sibling phase
+# does — a green from a matcher that matched nothing is worth nothing.
+say "toolchain-skip phase: detector self-test + surface ratchet (#3733)"
+if ! python3 scripts/check_toolchain_skip_surface.py --self-test \
+      > "$LOGDIR/${TAG}_toolchainskip.log" 2>&1; then
+  say "CYCLE FAILURE: check_toolchain_skip_surface SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_toolchainskip.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_toolchainskip.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_toolchain_skip_surface.py --strict \
+      >> "$LOGDIR/${TAG}_toolchainskip.log" 2>&1; then
+  say "CYCLE FAILURE: the runAotChecked toolchain-SKIP surface GREW — a new"
+  say "  call site absorbs \"SKIP — C toolchain (clang) unavailable\" without"
+  say "  asserting, so a box without clang runs that row's ASan tier vacuously"
+  say "  (#3733). See $LOGDIR/${TAG}_toolchainskip.log"
+  sed -n '/check_toolchain_skip_surface:/,$p' "$LOGDIR/${TAG}_toolchainskip.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "toolchain-skip phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_toolchainskip.log"))"
+# ── NESTED-BODY-SCOPE PHASE (Family L anchor, defect-campaign-2026-09 §2.8)
+# ─────────────────────────────────────────────────────────────────────────
+# Block getters, indexer accessors, property thunks and disposer cores
+# lower a user body into a standalone MEMOIZED function from the middle
+# of expression lowering. Any per-body emitter field they fail to save
+# and reset leaks the caller's context into the callee, and the cached
+# function is baked once - whichever caller was lowered first in
+# `std::unordered_map` pointer-hash order freezes the result for the
+# whole module. #2702 closed six emitters under one RAII guard
+# (`Emitter::NestedBodyScope`); the open members are emitters not on the
+# guard (#3936 emitDisposerCore, #4151 makePropertyThunk, #2748's three
+# unguarded sites) and fields missing from its canonical set.
+#
+# This phase ratchets coverage so a new lazily-memoized emitter cannot
+# ship without the guard. Two banked counts: `uncovered_emitters` (a
+# function in src/codegen matching the seven #2702 + #4151 named
+# patterns whose body lacks `NestedBodyScope VAR(*this);`) and
+# `incomplete_field_saves` (a `NestedBodyScope` constructor DEFINITION
+# whose init list omits a canonical field).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched
+# nothing is worth nothing.
+say "nested-body-scope phase: detector self-test + LazyBodyEmitter ratchet (Family L, #2702)"
+if ! python3 scripts/check_nested_body_scope_coverage.py --self-test \
+      > "$LOGDIR/${TAG}_nbscope.log" 2>&1; then
+  say "CYCLE FAILURE: check_nested_body_scope_coverage SELF-TEST failed —"
+  say "  the detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_nbscope.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_nbscope.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_nested_body_scope_coverage.py --strict \
+      >> "$LOGDIR/${TAG}_nbscope.log" 2>&1; then
+  say "CYCLE FAILURE: a lazily-memoized emitter does not construct"
+  say "  NestedBodyScope, OR constructs it without the canonical field set —"
+  say "  the caller's state leaks module-wide (#3936, #2723, #2628, #4150,"
+  say "  #4151, #2748). See $LOGDIR/${TAG}_nbscope.log"
+  sed -n '/check_nested_body_scope_coverage:/,$p' "$LOGDIR/${TAG}_nbscope.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "nested-body-scope phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nbscope.log"))"
+
+# ── TIMEOUT-NEGATIVES PHASE (#3732) ────────────────────────────────────────
+# The compile / run TIMEOUT is the third member of the #3007 family
+# (#3007 infra, #3733 toolchain-SKIP, #3732 timeout) that surfaced as a
+# Severity::Error diagnostic byte-for-byte indistinguishable from a real
+# compile REJECT. The harness's channel routes it through
+# `aot_detail::markTimeout()` instead — Severity::NOTE, current test failed,
+# `hasErrors()` stays FALSE — so every `BEZEL_EXPECT_TRUE(hasErrors())` and
+# `BEZEL_EXPECT_FALSE(<var>.ran)` site across tests/ is structurally immune
+# to a timeout in one edit per harness. The source half freezes the small
+# residual (~24 hand-rolled `.line > 0 && .column > 0` rows at
+# b57a712e+channel — measured 4 actual bare-location rows today) so the
+# surface cannot grow while the burn-down runs; the channel half retires
+# the SHAPE the script counts, so the script is RETIRED at done criterion
+# (unlike the toolchain-skip / native-asan-leg / ambiguous-ran-false
+# ratchets, which freeze permanent shape hazards — spec §4 burn-down).
+#
+# Phase order: immediately after toolchain-skip, before null-guard-vacuous
+# (spec §0.3 ordering: toolchain-skip, native-asan-leg, timeout-negatives,
+# uninstrumented-emit; this lane lands the third of the four new phases,
+# wired beside the existing ratchet phases that already proved the pattern).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched nothing
+# is worth nothing, and this detector's own self-test plants the seven
+# fixtures that partition the surface against the sibling
+# check_ambiguous_ran_false ratchet.
+say "timeout-negatives phase: detector self-test + ratchet (#3732)"
+if ! python3 scripts/check_timeout_satisfiable_negatives.py --self-test \
+      > "$LOGDIR/${TAG}_timeoutneg.log" 2>&1; then
+  say "CYCLE FAILURE: check_timeout_satisfiable_negatives SELF-TEST failed"
+  say "  — the detector is broken, so its verdict on the tree means"
+  say "  nothing. See $LOGDIR/${TAG}_timeoutneg.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_timeoutneg.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_timeout_satisfiable_negatives.py --strict \
+      >> "$LOGDIR/${TAG}_timeoutneg.log" 2>&1; then
+  say "CYCLE FAILURE: a new row pins a compile-time rejection with a"
+  say "  hand-rolled location check that a compile TIMEOUT can satisfy — a"
+  say "  negative test can go green because the harness gave up (#3732)."
+  say "  See $LOGDIR/${TAG}_timeoutneg.log"
+  sed -n '/check_timeout_satisfiable_negatives:/,$p' \
+      "$LOGDIR/${TAG}_timeoutneg.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "timeout-negatives phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_timeoutneg.log"))"
+
 # ── NULL-GUARD VACUOUS PHASE (#3992) ───────────────────────────────────────
 # A pointer-typed local bound from a lookup/finder call and then guarded with
 # a bare truthy `if (ptr) { ...EXPECT... }` (braced or brace-less) before any
@@ -755,6 +968,97 @@ if ! python3 scripts/check_null_guard_vacuous.py --strict \
 fi
 say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))"
 
+# ── LEAK-EXEMPT STATUS PHASE (#4557) ───────────────────────────────────────
+# scripts/gate/sanitizer_leak_exempt.txt declares every test whose
+# generated-code sanitizer LEAK report is a deliberate assertion (#4537), not
+# a defect. Measured 2026-09-21: 38 rows, 19 citing no issue at all, and of
+# 15 distinct issues cited, 13 CLOSED — a fix had landed on the CENTRAL case
+# and left a residual axis leaking, with the axis's own tracker lost the
+# moment the issue closed. The file had become the project's only record of
+# a set of known, unfixed leaks, with no owner and no way to tell a
+# deliberate, permanent leak-vs-crash/leak-vs-UAF trade from a fix nobody has
+# scoped out yet.
+#
+# Every row's reason now must open with a required status:{defect,trade,
+# residue} token (sanitizer_leak_exempt.txt's own header has the full
+# contract); defect/residue rows also require issue:NNNN naming their OPEN
+# tracker, cross-checked against the committed snapshot
+# scripts/gate/leak_exempt_issue_state.tsv (refreshed by the separate,
+# explicitly-manual scripts/check_leak_exempt_issue_state.sh — the gate stays
+# hermetic; see that snapshot's own header for why the state check cannot be
+# a live `gh` call here).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: a green from a matcher that matched nothing is
+# worth nothing, and this detector's own self-test proves both the structural
+# half and the snapshot cross-check fail closed on synthetic fixtures,
+# including the exact #4557 shape (a status:defect/residue row citing an
+# issue the snapshot marks CLOSED).
+say "leak-exempt-status phase: detector self-test + status ratchet (#4557)"
+if ! python3 scripts/check_leak_exempt_status.py --self-test \
+      > "$LOGDIR/${TAG}_leakexempt.log" 2>&1; then
+  say "CYCLE FAILURE: check_leak_exempt_status SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_leakexempt.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_leakexempt.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_leak_exempt_status.py --strict \
+      >> "$LOGDIR/${TAG}_leakexempt.log" 2>&1; then
+  say "CYCLE FAILURE: a sanitizer_leak_exempt.txt row has no status: token, an"
+  say "  invalid one, a defect/residue row with no issue: tracker, or a"
+  say "  defect/residue row citing an issue the committed snapshot marks"
+  say "  CLOSED (#4557) — a known leak has lost its owner again. See"
+  say "  $LOGDIR/${TAG}_leakexempt.log"
+  sed -n '/check_leak_exempt_status:/,$p' "$LOGDIR/${TAG}_leakexempt.log" 2>/dev/null \
+    | head -60 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "leak-exempt-status phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_leakexempt.log"))"
+
+# ── SEAM-ACCESSOR CONFORMANCE PHASE (#4539) ────────────────────────────────
+# check_imported_symbol_reads.py ratchets the READS of the AST-vs-symbol-table
+# import seam; #4539 named the class it is blind to: a read that is correct
+# and necessary for the local path, consumed by code with no imported-side
+# fallback on its failure branch. Three such consumers shipped silently in one
+# cycle (#4480, #4508, #4510) before anyone wrote a cross-module test for the
+# shape. #4510's own fix gave its consumer a BOTH-SOURCES ACCESSOR — resolves
+# through the AST when present, through the symbol table when not — joining
+# two pre-existing ones (formalOutParamType2 #2657/#3186/#3188/#3206,
+# formalCtorOutParamType #2668/#3772). This phase ratchets that every
+# registered accessor keeps at least one tests/module/ (cross-module) test
+# citing one of its issues — #4539's own "cheapest, already demonstrated
+# twice" candidate (a conformance obligation), not the harder "detect a
+# missing fallback automatically" one (investigated and declined for this
+# script — see its own module docstring for why a text-pattern scanner over
+# src/ cannot reliably tell a real gap from an ALREADY-CORRECT or
+# structurally-unreachable site without the same judgement a human lane
+# applied to find #4589/#4590/#4591/#4592).
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above.
+say "seam-accessor-conformance phase: detector self-test + coverage ratchet (#4539)"
+if ! python3 scripts/check_seam_accessor_conformance.py --self-test \
+      > "$LOGDIR/${TAG}_seamaccessor.log" 2>&1; then
+  say "CYCLE FAILURE: check_seam_accessor_conformance SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_seamaccessor.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_seamaccessor.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_seam_accessor_conformance.py --strict \
+      >> "$LOGDIR/${TAG}_seamaccessor.log" 2>&1; then
+  say "CYCLE FAILURE: a registered both-sources accessor (#4539) has lost its"
+  say "  tests/module/ cross-module conformance coverage — an accessor with"
+  say "  no test proving the imported path still matches the local twin is"
+  say "  the exact regression #4480/#4508/#4510 shipped silently. See"
+  say "  $LOGDIR/${TAG}_seamaccessor.log"
+  sed -n '/check_seam_accessor_conformance:/,$p' "$LOGDIR/${TAG}_seamaccessor.log" \
+    2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamaccessor.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
@@ -791,7 +1095,22 @@ say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))
 # phase instead of quietly joining them.
 say "gate-selftest phase: scripts/gate/tests (#3415)"
 _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
-_gs_floor=560
+# Bumped 560 -> 824 (r21-jobserver, non-author review follow-up): the floor
+# had sat at its introduction value for months while the directory grew to
+# 809 tests unbanked, then +15 for three new jobserver test modules/cases
+# added alongside this comment. Same discipline as the rule-corpus floor
+# below ("the floor is the harness's current test count, so headroom cannot
+# accumulate unbanked. It only ever moves up") — measured via
+# `python3 -m unittest discover -s scripts/gate/tests`, not guessed.
+# Bumped 824 -> 895 (r21-orch-tools): measured 860 before the coordinator
+# tooling tests, 895 with them (35 added: pick_stage/ledger, handback_check,
+# run_status, worktree ownership), 2 skipped. Then 895 -> 899 for the
+# subject-only issue-rule tests (scripts/pick_issues.sh), then 899 -> 905
+# for the recorded/inferred --kind tests, then 905 -> 927 for the review
+# round-4 tests (rebase/bisect hooks, patch-id note recovery, --continue,
+# empty picks, trailing-flag hangs, handback read-only), then 927 -> 934 for
+# the duplicate-patch-id / pruned-target / quoted-recipe tests.
+_gs_floor=934
 _gs_skip_cap=4
 # fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
 #
@@ -836,6 +1155,63 @@ if [ "$_gs_skipped" -gt "$_gs_skip_cap" ]; then
 fi
 say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
 
+# ── GATE-SMART-PUSH-SELFTEST PHASE (smart-push, user directive 2026-09-18) ──
+# The smart-push block at scripts/gate_and_push.sh's push boundary sits on the
+# critical path: every gate run that is about to push goes through it. The four
+# cases (no-op / remote-advanced / normal / diverged) are pinned by source AND
+# by functional tests in scripts/gate/tests/test_gate_and_push_smart_push.py,
+# and those tests are also picked up by the existing gate-selftest phase
+# (discover scans scripts/gate/tests/). This phase re-runs JUST them so a
+# failure surfaces as its own line in the cycle log — the gate_selftest floor
+# of 560 + skip cap of 4 lets a regression slip silently if the smart-push
+# tests stop running for any reason; this phase pins that they ran AND that
+# they ran in non-trivial number.
+#
+# Smart-push tests are fast (~0.2s, all git/text work in temp dirs), so the
+# re-run cost is negligible. Build-free, fail-closed, with the same floor/cap
+# ratchet pattern the sibling phases use.
+say "gate-smart-push-selftest phase: test_gate_and_push_smart_push (smart-push, 2026-09-18)"
+_sps_log="$LOGDIR/${TAG}_smart_push_selftest.log"
+_sps_floor=10
+_sps_skip_cap=0
+# Same isolation pattern as gate-selftest: redirect the gate's terminal
+# markers away from the live gate's paths. The smart-push tests do not
+# actually invoke scripts/gate_and_push.sh (they extract the block and
+# source it in a subprocess), but the markers redirect is cheap defence
+# in depth — a future test in this file might.
+_sps_markers="$LOGDIR/${TAG}_smart_push_selftest_markers"
+mkdir -p "$_sps_markers" 2>/dev/null || true
+if ! BEZEL_GATE_PIDFILE="$_sps_markers/gate.pid" \
+     BEZEL_GATE_DONEFILE="$_sps_markers/gate.done" \
+     python3 -m unittest scripts.gate.tests.test_gate_and_push_smart_push -v \
+      > "$_sps_log" 2>&1; then
+  say "CYCLE FAILURE: the smart-push self-tests failed — the push-boundary"
+  say "  race detector (no-op / remote-advanced / normal / diverged) is broken"
+  say "  or out of date, so a green gate followed by 'PUSH FAILED' on a remote"
+  say "  advance could reappear (smart-push, user directive 2026-09-18). See $_sps_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_sps_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_sps_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_sps_log" | tail -1)"
+_sps_skipped="$(sed -n 's/^OK (.*skipped=\([0-9]*\).*/\1/p' "$_sps_log" | tail -1)"
+[ -n "$_sps_skipped" ] || _sps_skipped=0
+if [ -z "$_sps_ran" ] || [ "$_sps_ran" -lt "$_sps_floor" ]; then
+  say "CYCLE FAILURE: the smart-push self-tests reported OK but ran only"
+  say "  ${_sps_ran:-0} tests (floor $_sps_floor) — discovery collected almost"
+  say "  nothing, so the OK certifies nothing. See $_sps_log"
+  exit 1
+fi
+if [ "$_sps_skipped" -gt "$_sps_skip_cap" ]; then
+  say "CYCLE FAILURE: the smart-push self-tests skipped $_sps_skipped tests (cap"
+  say "  $_sps_skip_cap) — an unenforced guard with a green tick is worse than"
+  say "  an honest gap. See $_sps_log"
+  sed -n '/skipped/p' "$_sps_log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "gate-smart-push-selftest phase: GREEN ($_sps_ran tests, $_sps_skipped skipped)"
+
 # src/ citation phase (#4455). Build-free: it cross-references the §-citations
 # in src/ against the section headings every document defines, so it sits here
 # beside the gate self-tests rather than in the compile path.
@@ -849,6 +1225,25 @@ say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
 # Self-test first, as every other ratchet here does: the checker reads ALL the
 # documents' headings, and a checker that read only the spec's would call every
 # rationale citation dangling — which is exactly what the first measurement did.
+say "commit-trailer phase: scripts/check_commit_trailers.py"
+_ct_log="$LOGDIR/${TAG}_commit_trailers.log"
+if ! python3 scripts/check_commit_trailers.py --self-test > "$_ct_log" 2>&1; then
+  say "CYCLE FAILURE: check_commit_trailers SELF-TEST failed — the checker"
+  say "  cannot be trusted to report on the batch. See $_ct_log"
+  tail -20 "$_ct_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_commit_trailers.py --range origin/main..HEAD >> "$_ct_log" 2>&1; then
+  say "CYCLE FAILURE: a commit in this batch does not end with exactly the one"
+  say "  trailer CLAUDE.md mandates. Five lanes in cycle 17 emitted a Sonnet"
+  say "  trailer plus a Claude-Session line because a host reminder told them"
+  say "  to; CLAUDE.md overrides it. Rewrite with git filter-branch --msg-filter."
+  say "  See $_ct_log"
+  tail -40 "$_ct_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "commit-trailer phase: GREEN (every commit carries exactly one mandated trailer)"
+
 say "src-citation phase: scripts/check_src_citations.py"
 _sc_log="$LOGDIR/${TAG}_src_citations.log"
 if ! python3 scripts/check_src_citations.py --self-test > "$_sc_log" 2>&1; then
@@ -878,13 +1273,15 @@ say "src-citation phase: GREEN (every §-citation in src/ resolves)"
 #   3. `corpus.py lint` — the manifest/cases bijection and the case-header
 #      contract.
 # The corpus itself is not run here: it needs a bezelc and a classified
-# baseline (tests/conformance/rules/README.md, "Gate wiring").
+# baseline (tests/conformance/rules/README.md, "Gate wiring") — see the
+# RULE-CORPUS BASELINE PHASE below the doc-example conformance sweep, which
+# runs it against baseline.tsv once a bezelc exists (#4621).
 say "rule-corpus phase: tests/conformance/rules harness"
 _rc_log="$LOGDIR/${TAG}_rule_corpus.log"
 # Exact-not-a-ceiling, as the deprecated-JIT-oracle baseline is: the floor is
 # the harness's current test count, so headroom cannot accumulate unbanked. It
 # only ever moves up — a lane that deletes a test lowers it deliberately.
-_rc_floor=150
+_rc_floor=154
 if ! python3 -m unittest discover -s tests/conformance/rules -v \
       > "$_rc_log" 2>&1; then
   say "CYCLE FAILURE: the rule-corpus harness self-tests failed — the ratchet"
@@ -909,6 +1306,73 @@ if ! python3 tests/conformance/rules/corpus.py check >> "$_rc_log" 2>&1; then
   exit 1
 fi
 say "rule-corpus phase: GREEN ($_rc_ran harness tests, manifest current)"
+
+# Conformance-harness self-test phase (tests/conformance, #4506). Build-free
+# and fast, so it sits beside the gate self-tests and the rule-corpus harness
+# tests above rather than in the conformance phase below, which needs a built
+# bezelc. This directory holds the DOC-EXTRACTED conformance harness's own
+# unit tests — the code that decides which spec examples are wrapped,
+# chained, `env`-bound and classified (classify_wrap, needs_async_main, the
+# `env` anchor regex, the chaining provider, `_snippet`, etc.) — as distinct
+# from the spec-example sweep run later in this script
+# (tests/conformance/run_conformance.sh), which actually needs a built
+# bezelc. Until now nothing ran these: a regression here could flip
+# conformance rows silently and the sweep would just report a different
+# PASS/SKIP split with exit 0 (#4506). (tests/conformance/rules is a
+# SEPARATE, hand-authored corpus with its own harness/self-tests, already
+# covered by the rule-corpus phase above; this phase does not touch it.)
+#
+# Same ratchet shape as gate-selftest (#3415) and rule-corpus above: COUNT
+# RATCHETS, NOT JUST THE EXIT STATUS. `unittest` exits 0 for "Ran 0 tests"
+# and for "OK (skipped=N)" alike, so a bare exit-status check would accept
+# precisely the outcome this phase exists to prevent — the directory
+# unenforced with a green tick on top. So this phase asserts a FLOOR on
+# tests run and a CAP on tests skipped.
+say "conformance-harness-selftest phase: tests/conformance/test_conformance.py (#4506)"
+_ch_log="$LOGDIR/${TAG}_conformance_harness_selftest.log"
+# Exact-not-a-ceiling, as the deprecated-JIT-oracle and rule-corpus baselines
+# are: this is the harness's current test count (95 at #4506's filing,
+# raised to 101 by fix #4556's runner.py/_snippet changes — re-measure with
+# `python3 -m unittest discover -s tests/conformance -p 'test_conformance.py'`
+# rather than trusting either number) — it only ever moves up; a lane that
+# deletes a test lowers it deliberately in the same commit.
+_ch_floor=101
+_ch_skip_cap=0
+# `-p 'test_conformance.py'` (not a bare `-s tests/conformance`) so this phase
+# can never silently absorb tests/conformance/rules/test_rules.py (already
+# run, with its own floor, by the rule-corpus phase above) even if discovery
+# behavior around subdirectories without __init__.py changes across Python
+# versions — confirmed empirically that a bare `-s tests/conformance` does
+# NOT currently descend into rules/, but the explicit pattern removes the
+# dependency on that behavior entirely.
+if ! python3 -m unittest discover -s tests/conformance -p 'test_conformance.py' -v \
+      > "$_ch_log" 2>&1; then
+  say "CYCLE FAILURE: the conformance harness's own self-tests failed — the"
+  say "  code that decides which spec examples are wrapped, chained, env-bound"
+  say "  and classified is broken, so the conformance sweep's PASS/SKIP split"
+  say "  cannot be trusted (#4506). See $_ch_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_ch_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_ch_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_ch_log" | tail -1)"
+_ch_skipped="$(sed -n 's/^OK (.*skipped=\([0-9]*\).*/\1/p' "$_ch_log" | tail -1)"
+[ -n "$_ch_skipped" ] || _ch_skipped=0
+if [ -z "$_ch_ran" ] || [ "$_ch_ran" -lt "$_ch_floor" ]; then
+  say "CYCLE FAILURE: the conformance harness self-tests reported OK but ran"
+  say "  only ${_ch_ran:-0} tests (floor $_ch_floor) — discovery collected"
+  say "  almost nothing, so the OK certifies nothing (#4506). See $_ch_log"
+  exit 1
+fi
+if [ "$_ch_skipped" -gt "$_ch_skip_cap" ]; then
+  say "CYCLE FAILURE: the conformance harness self-tests skipped $_ch_skipped"
+  say "  tests (cap $_ch_skip_cap) — an unenforced guard with a green tick is"
+  say "  worse than an honest gap (#4506). See $_ch_log"
+  sed -n '/skipped/p' "$_ch_log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "conformance-harness-selftest phase: GREEN ($_ch_ran tests, $_ch_skipped skipped)"
 
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
@@ -1015,11 +1479,171 @@ if ! "$REPO/tests/conformance/run_conformance.sh" "$REPO/build/bezelc" \
     | tee -a "$CYCLE_LOG" >/dev/null
   exit 1
 fi
-# Surface the PASS/FAIL/SKIP tally in the cycle log. The healthy green over the
-# current manifest is 100/0 (16 error + 83 fragment + 1 program, 337 skip).
-grep -E '^(PASS|FAIL|SKIP):' "$LOGDIR/${TAG}_conformance.log" \
+# Surface the PASS/FAIL/SKIP tally in the cycle log, and ratchet it (#4506
+# item 3). This comment used to just NAME the healthy green ("100/0, 16 error
+# + 83 fragment + 1 program, 337 skip") without checking it — that is the
+# v0.138-era 437-row corpus, and the comment had been silently wrong (the
+# committed corpus's actual PASS/SKIP split moved on) for over a year with
+# nothing noticing, because a comment is not a check. `run_conformance.sh`'s
+# own Plan-A 5.1 guard only asserts PASS>0, so a corpus regression that drops
+# PASS from 254 to, say, 60 (every doc-example case in one section starts
+# erroring) would still exit 0 here.
+#
+# Floor on PASS (can only rise — a drop below the last-measured count is a
+# regression), ceiling on SKIP (can only fall — a rise means something that
+# used to run now doesn't, e.g. a case flipping from `fragment` to
+# `skip:*`). Measured against $REPO/build/bezelc at this cycle's HEAD:
+# PASS=254 (40 error + 211 fragment + 3 program), SKIP=414, FAIL=0 — exactly
+# the 2026-09-21 coverage-pass numbers recorded in
+# tests/conformance/README.md. Update both in the SAME commit that changes
+# the corpus (a regeneration per #4505, or a coverage pass per the README's
+# precedent), exactly as the rule-corpus floor above is updated when that
+# harness's own test count changes.
+_cf_log="$LOGDIR/${TAG}_conformance.log"
+_cf_pass_floor=254
+_cf_skip_cap=414
+_cf_pass="$(sed -n 's/^PASS: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+_cf_fail="$(sed -n 's/^FAIL: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+_cf_skip="$(sed -n 's/^SKIP: *\([0-9]*\)/\1/p' "$_cf_log" | tail -1)"
+grep -E '^(PASS|FAIL|SKIP):' "$_cf_log" \
   | sed 's/^/  conformance /' | tee -a "$CYCLE_LOG" >/dev/null
+if [ -z "$_cf_pass" ] || [ -z "$_cf_skip" ]; then
+  say "CYCLE FAILURE: could not parse PASS:/SKIP: tallies out of $_cf_log —"
+  say "  the conformance sweep's own output format changed underneath this"
+  say "  check (#4506 item 3)."
+  exit 1
+fi
+if [ "$_cf_pass" -lt "$_cf_pass_floor" ]; then
+  say "CYCLE FAILURE: conformance sweep PASS=$_cf_pass, below the floor of"
+  say "  $_cf_pass_floor (FAIL=${_cf_fail:-?}, SKIP=${_cf_skip:-?}) — a case"
+  say "  that used to compile/run no longer does (#4506 item 3). See $_cf_log"
+  exit 1
+fi
+if [ "$_cf_skip" -gt "$_cf_skip_cap" ]; then
+  say "CYCLE FAILURE: conformance sweep SKIP=$_cf_skip, above the cap of"
+  say "  $_cf_skip_cap (PASS=${_cf_pass:-?}, FAIL=${_cf_fail:-?}) — a case that"
+  say "  used to run has fallen back to skip (#4506 item 3). See $_cf_log"
+  exit 1
+fi
 say "conformance phase: GREEN"
+say "  PASS=$_cf_pass (floor $_cf_pass_floor), SKIP=$_cf_skip (cap $_cf_skip_cap), FAIL=${_cf_fail:-0}"
+
+# ── RULE-CORPUS BASELINE PHASE (#4621) ─────────────────────────────────────
+# The rule-corpus phase far above (tests/conformance/rules) only runs the
+# corpus HARNESS's own self-tests and `corpus.py check` (manifest currency) —
+# it never actually runs the corpus itself against baseline.tsv, so a
+# REGRESSION (banked pass, observed fail) or an UNBANKED row (banked fail,
+# observed pass) could sit red indefinitely with no cycle ever seeing it.
+# That is exactly what happened: v0.307 (#4608) changed 3 case files and
+# added 35 more without re-banking baseline.tsv, and nothing failed (#4621).
+# This phase is the missing half, run HERE rather than beside the build-free
+# harness phase because it needs a real bezelc — same reason the doc-example
+# conformance sweep just above needs one, and the corpus's own README.md
+# ("Gate wiring") says so explicitly: "a phase that can only be green [before
+# classification] is not a check." Classification has now happened (v0.306,
+# refreshed by #4621's banking pass), so REGRESSION/UNBANKED are real,
+# checkable failure conditions.
+#
+# --self-test runs FIRST and is not optional, exactly like every sibling
+# ratchet phase above: it proves, build-free, that runner.py's compare()
+# still classifies all five (banked, observed) combinations per README.md's
+# ratchet table, and that this checker's own summary-line parser and
+# floor/cap logic fail closed on a vacuous or malformed summary rather than
+# passing by default.
+say "rule-corpus-baseline phase: detector self-test + full-corpus ratchet (#4621)"
+_rcb_log="$LOGDIR/${TAG}_rule_corpus_baseline.log"
+if ! python3 scripts/gate_rule_corpus_baseline.py --self-test \
+      > "$_rcb_log" 2>&1; then
+  say "CYCLE FAILURE: gate_rule_corpus_baseline SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $_rcb_log"
+  sed -n '1,30p' "$_rcb_log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if [ ! -x "$REPO/build/bezelc" ]; then
+  say "CYCLE FAILURE: $REPO/build/bezelc not executable — the rule corpus"
+  say "  cannot run"
+  exit 1
+fi
+if ! python3 scripts/gate_rule_corpus_baseline.py --strict \
+      --bezelc "$REPO/build/bezelc" \
+      >> "$_rcb_log" 2>&1; then
+  say "CYCLE FAILURE: the rule corpus has a REGRESSION or UNBANKED row"
+  say "  against tests/conformance/rules/baseline.tsv, or ran an"
+  say "  unexpectedly small number of cases (#4621). See $_rcb_log"
+  tail -30 "$_rcb_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "rule-corpus-baseline phase: GREEN ($(tail -1 "$_rcb_log"))"
+
+# ── INTERNAL-RESIDUAL PHASE (#4761) ─────────────────────────────────────────
+# The compiler has a deliberate "I cannot lower this but I will return something"
+# convention: a lowering arm that fails its job emits `ctx_.diagnostics().
+# report(Severity::Warning, span, "internal: ...")` and continues, rather than
+# aborting compilation. The literal `internal:` prefix is the project's marker
+# for silent-wrong-code paths — "not a diagnostic" in the spec-cited wording,
+# because the program compiles and exits 0, and three measurable reasons
+# (per the issue body) keep that shape from being caught today:
+#
+#   1. runAot's JitResult::diagnostics is populated ONLY on a REJECT; a
+#      Warning / Note / `internal:` on a program that compiles and runs is
+#      never surfaced through the harness. The stderr that carried it is
+#      discarded on success.
+#   2. lit FileCheck: only 27 of the lit corpus pin `CHECK-NOT: internal:`.
+#   3. The rule-corpus verdict cannot see it on accept rows either.
+#
+# The `#3079` / `#2434` silent-degrade class has been sighted 7 times. Every
+# sighting: an `internal:` warning on a program that COMPILED and EXITED 0.
+# None of the above can see it; the script below can.
+#
+# `scripts/check_internal_residual.py` measures the total `internal:` count
+# across the lit corpus + non-rejects main-conformance cases + run/accept
+# rules-cases (per the script's docstring: three populations, one shared
+# diagnostic prefix). The baseline in scripts/internal_residual.baseline is
+# EXACT, not a ceiling — a count below the baseline fails as STALE HEADROOM
+# (a fix landed but was not banked), and `--update` refuses to raise without
+# `--force` (a rise is a deliberate act that names the new emitter in its
+# commit body).
+#
+# The baseline was measured at r20-c25 (5a528344) against
+# /mnt/fast/lane-builds/r20-l1-e031b0e1/bezelc (SHA = 5a528344 = r20-c25):
+# `total_internal_lines = 0` — the current tree emits none on the corpus.
+# Update it with `python3 scripts/check_internal_residual.py --update` after
+# porting a fix that removes the last remaining emission; the script refuses
+# a rise without `--force`.
+#
+# Like rule-corpus-baseline (#4621), this phase needs a built bezelc, so it
+# sits beside that one rather than in the source-ratchet block above. The
+# --self-test runs FIRST for the same reason every sibling phase pins: a green
+# from a matcher that matched nothing is worth nothing, and the detector's
+# self-test (synthetic tree + fake bezelc) is build-free.
+say "internal-residual phase: detector self-test + \`internal:\` count ratchet (#4761)"
+_ir_log="$LOGDIR/${TAG}_internal_residual.log"
+if ! python3 scripts/check_internal_residual.py --self-test \
+      > "$_ir_log" 2>&1; then
+  say "CYCLE FAILURE: check_internal_residual SELF-TEST failed — the"
+  say "  detector is broken, so its verdict on the tree means nothing."
+  say "  See $_ir_log"
+  sed -n '1,30p' "$_ir_log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if [ ! -x "$REPO/build/bezelc" ]; then
+  say "CYCLE FAILURE: $REPO/build/bezelc not executable — the internal-"
+  say "  residual detector cannot run against the corpus"
+  exit 1
+fi
+if ! python3 scripts/check_internal_residual.py --strict \
+      --bezelc "$REPO/build/bezelc" \
+      >> "$_ir_log" 2>&1; then
+  say "CYCLE FAILURE: the \`internal:\` emission count moved against"
+  say "  scripts/internal_residual.baseline — a silent-wrong-code"
+  say "  emitter shipped green, or the baseline is stale headroom (#4761)."
+  say "  See $_ir_log"
+  tail -30 "$_ir_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "internal-residual phase: GREEN ($(tail -1 "$_ir_log"))"
 
 # ── CLANG-TIDY PHASE (fix #3666) — ADVISORY, ONCE PER CYCLE ────────────────
 # The clang-tidy tier (scripts/check_tidy.sh, changed TUs only) used to be a

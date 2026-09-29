@@ -27,7 +27,7 @@ class B
   private owned _f: Res;
   private _n: int;
   public constructor(owned a: Res, b: int := 3)
-    _f := move a;
+    _f := a;
     _n := b;
   end constructor;
   public constructor(owned x: Res, y: bool)

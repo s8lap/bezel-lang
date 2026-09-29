@@ -8,15 +8,16 @@
 //! cites: 31.2.1
 //! expect: reject
 //! diagnostic: convert
+//! issue: 4644
 module Conf;
 
 public class SiblingA: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end SiblingA;
 
 public class SiblingB: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end SiblingB;
 

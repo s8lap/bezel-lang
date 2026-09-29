@@ -320,6 +320,51 @@ if [[ -n "$fail_lines" ]]; then
     echo "$fail_lines"
 fi
 
+# ── sanitizer evidence lift (fix #4533) ─────────────────────────────────────
+# WHY THIS LIVES HERE AND NOT IN THE GATE.
+#
+# scripts/gate.sh treats a fired generated-code sanitizer report as
+# DETERMINISTIC evidence of a memory error and hard-fails on it. It looked for
+# one by grepping the log it captured from THIS SCRIPT'S STDOUT — but a shard's
+# PROGRAM output never reaches that stream. Every shard is redirected into
+# $logdir/shard.<name>.<i>.log (the queue above), and the only thing lifted back
+# out of those files was the `^[ FAIL ]` block immediately above. So the
+# headline the harness re-emits to fd 2 (aot_support.hpp's
+# emitSanitizerReportToStderr, #1822) landed in the per-shard log and NOWHERE
+# ELSE, and the gate's grep could not match. Measured on the 2026-09-21 --full
+# cycle at e89577e4: seven programs printed `ERROR: LeakSanitizer` and
+# `grep -cE 'ERROR: (Address|Leak)Sanitizer' e89577e4_full.log` returned 0 while
+# the gate recorded `shard_asan rc=0 (no ASan report)`.
+#
+# Lifting HERE is the only placement that works in BOTH directions. _rp_keep
+# (the EXIT trap above) REAPS $logdir on a clean run and only moves it aside on
+# a non-clean one, so a later reader — the gate, a human — has nothing to grep
+# after a green run. The lift runs while the logs still exist, so the evidence
+# survives the reaping either way. The alternative, pointing the gate at the
+# kept logdir, is evidence only on the runs that already failed.
+#
+# THE ACCOUNTING LINE IS UNCONDITIONAL, AND THAT IS THE POINT. `0 reports` and
+# `the channel is not wired` are indistinguishable to a grep that returns 0 —
+# which is precisely the defect #4533 reports. The line is printed on EVERY run
+# and carries the number of shard logs actually SCANNED, so gate.sh can assert
+# it READ something before believing a zero. Same shape as the #3626 / #3733
+# oracle floors below, which print "0" as positive confirmation.
+#
+# OBSERVATION ONLY — this script never fails on a report, it only reports what
+# it saw; gate.sh decides what it means. run_parallel is also a lane's runner
+# (scripts/agent_check.sh), and a report is not uniformly a defect: rows that
+# deliberately assert a leak, and rows that deliberately run a program the spec
+# leaves UNDEFINED, both emit one and PASS. The scan therefore ATTRIBUTES each
+# report to the test that produced it (test_main.cpp's `[san-scope]` markers,
+# on the same unbuffered fd as the report) and reports the split; the judgement
+# lives in scripts/gate/sanitizer.py, which is where it can be unit-tested.
+if ! PYTHONPATH="$repo_root/scripts" python3 -m gate.sanitizer scan "$logdir"; then
+    # NEVER silent. A scanner that failed leaves the gate with no accounting
+    # line, and gate.sh fails the cycle on its absence rather than reading the
+    # silence as clean.
+    echo "run_parallel: gate.sanitizer scan FAILED — no sanitizer accounting produced (#4533)" >&2
+fi
+
 # Phantom-name warning + GATE FAILURE banner (#2100, #1861) — the
 # culprit-extraction grep + the distinct-names warning live in gate.summary
 # (clearer and testable in Python). The 'shard crash / undercount' +
@@ -493,7 +538,37 @@ if [[ "$sanitizer_unavailable_total" -gt 0 ]]; then
     echo "############################################################"
 fi
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 || "$sanitizer_unavailable_total" -gt 0 ]]; then
+# ── checked-toolchain oracle floor (#3733) ─────────────────────────────────
+# Every shard's structured JSON summary also carries `checked_toolchain_skips`
+# (test_main.cpp, sourced from the ONE harness chokepoint:
+# tests/support/aot_support.hpp's runAotCheckedImpl — the `toolchainOk` probe
+# at the early-return when `clang --version` fails or
+# `BEZEL_AOT_FORCE_NO_TOOLCHAIN=1` forces it). 2,046 runAotChecked( call
+# sites in 634 files reach that branch (#3733, measured 2026-09-17); on a
+# box without clang the whole ASan/LSan tier reports clean PASS having run
+# no sanitizer at all unless this floor fails the run. Same shape as the
+# #3626 floor above: sum the additive key across every shard's JSON directly
+# via grep/awk (NOT summary.py — narrow, no schema change), print
+# unconditionally ("0" is positive confirmation), fail the sharded run when
+# the total is nonzero. A missing field on an older/foreign JSON degrades to
+# 0, never a parse error.
+checked_toolchain_total=$(grep -aho '"checked_toolchain_skips":[0-9]*' \
+    "$logdir"/summary.*.json 2>/dev/null \
+    | grep -oE '[0-9]+$' | awk '{t+=$1} END{print t+0}')
+checked_toolchain_total="${checked_toolchain_total:-0}"
+echo "CHECKED TOOLCHAIN (all shards): $checked_toolchain_total skip(s) (clang unavailable for the ASan link)"
+if [[ "$checked_toolchain_total" -gt 0 ]]; then
+    echo "############################################################"
+    echo "## GATE FAILURE: checked-toolchain oracle UNAVAILABLE for $checked_toolchain_total check(s)"
+    echo "##   runAotChecked's `clang --version` probe failed for this many rows,"
+    echo "##   so those checks silently could not run the ASan/LSan tier (#3733)"
+    echo "##   — an acceptance run must not pass with this verification leg"
+    echo "##   switched off. See tests/support/aot_support.hpp"
+    echo "##   runAotCheckedImpl and the per-shard logs in $logdir."
+    echo "############################################################"
+fi
+
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 || "$sanitizer_unavailable_total" -gt 0 || "$checked_toolchain_total" -gt 0 ]]; then
     exit 1
 fi
 exit 0

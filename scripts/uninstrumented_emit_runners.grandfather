@@ -1,0 +1,60 @@
+# uninstrumented_emit_runners.grandfather - the ceiling for #3917.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling
+# (to min(existing, measured) - a drain becomes the new ceiling on the
+# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a
+# deliberate, reviewed hand-edit to this file. A path whose tightened
+# ceiling reaches 0 is dropped entirely. See tighten_ceiling() in
+# check_uninstrumented_emit_runners.py (same rationale/mechanism as
+# scripts/localdecl_only_walkers.grandfather / scripts/enumerable_grid_
+# spellings.grandfather / scripts/imported_symbol_reads.grandfather,
+# #3590).
+#
+# One row per file: the number of codegen::emitObjectFile( calls with
+# FEWER THAN FOUR arguments (so sanitizeAddress defaults to false at
+# src/codegen/LlvmBackend.hpp:102) in a file that nowhere reads the
+# bezel::test::forceSanitizeAddress() predicate and is not a
+# tests/support/ wrapper that consults it.
+
+1    tests/codegen/alias_owning_collection_disposal_1462_test.cpp
+1    tests/codegen/argpass_string_probe_test.cpp
+1    tests/codegen/async_lambda_488_test.cpp
+2    tests/codegen/buffer_545_test.cpp
+1    tests/codegen/bug_465_test.cpp
+1    tests/codegen/bug_474_string_slice_test.cpp
+1    tests/codegen/closure_call_string_return_429_test.cpp
+1    tests/codegen/collection_indexer_test.cpp
+1    tests/codegen/collection_literal_user_type_fcl_2957_test.cpp
+1    tests/codegen/console_write_leak_test.cpp
+1    tests/codegen/console_write_unicode_592_test.cpp
+1    tests/codegen/cstring_tobytes_1000_test.cpp
+1    tests/codegen/dict_clear_test.cpp
+1    tests/codegen/dict_get_or_add_test.cpp
+1    tests/codegen/domain_spawn_choice_valuearg_3181_test.cpp
+1    tests/codegen/event_leak_480_test.cpp
+1    tests/codegen/free_on_dispose_test.cpp
+1    tests/codegen/fresh_owned_receiver_disposal_1039_test.cpp
+1    tests/codegen/generic_owned_field_disposal_test.cpp
+1    tests/codegen/generic_spec_cache_test.cpp
+1    tests/codegen/interface_indexer_test.cpp
+1    tests/codegen/iter_second_dispose_idempotent_1107_test.cpp
+1    tests/codegen/json_550_test.cpp
+1    tests/codegen/json_options_687_test.cpp
+1    tests/codegen/local_generic_class_method_monomorphization_3347_test.cpp
+1    tests/codegen/objinit_usingvar_disposal_test.cpp
+1    tests/codegen/owned_collection_iface_619_test.cpp
+1    tests/codegen/owned_dict_drain_628_test.cpp
+1    tests/codegen/ref_string_param_string_refcount_2321_test.cpp
+1    tests/codegen/serialization_668_669_test.cpp
+1    tests/codegen/serialization_tier2_classes_test.cpp
+1    tests/codegen/serialization_tier4_poly_test.cpp
+1    tests/codegen/set_dispose_leak_1012_test.cpp
+1    tests/codegen/shared_sync_689_contention_test.cpp
+1    tests/codegen/shared_weak_603_test.cpp
+1    tests/codegen/shared_weak_nullable_620_test.cpp
+1    tests/codegen/static_class_enum_owned_field_1557_1564_test.cpp
+1    tests/codegen/stringbuilder_tostring_borrow_consume_leak_1637_test.cpp
+1    tests/codegen/tsan_704_bz_exc_threadlocal_test.cpp
+1    tests/codegen/xmod_imported_generic_indexer_property_3346_3348_test.cpp
+1    tests/module/xmod_owned_class_return_707_test.cpp
+1    tests/module/xmod_owned_return_autodrop_1415_test.cpp

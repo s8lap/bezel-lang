@@ -203,13 +203,30 @@ BEZEL_TEST(binary_op_object_operand_rejected_3903, nullable_object_plus_int) {
         "var o: Object? := 5; var d := o + 1; return 0;", "+");
 }
 
-// ── MUST-PASS controls: `=`/`<>` on Object are UNAFFECTED (§8.4: every
-//    type gets `=`/`<>` via `Equals`; Object's inherited reference-equality
-//    Equals answers them through ordinary dispatch, not this gate) ────────
+// ── MUST-PASS controls: `=`/`<>` on Object are UNAFFECTED by #3903's gate
+//    (§8.4: every type gets `=`/`<>` via `Equals`, answered through ordinary
+//    virtual dispatch, not this gate) ──────────────────────────────────────
+//
+// fix #4560 (§8.1/§8.3/§8.4, v0.306): the first two rows below were WRONG
+// until #4560 and are corrected here, not merely re-pinned. Pre-#4560,
+// `Object = Object` lowered to a raw pointer `ICmpEQ` (reference identity)
+// instead of dispatching the box's `Equals` override — so two distinct boxes
+// of the SAME int value answered `o = p` false while `o.Equals(p)` on the
+// identical pair answered true (see object_object_equality_dispatch_4560_test
+// .cpp for the full repro and the §8.4/§25.2 authority: "For classes, `=`
+// always invokes `Equals`" is unconditional, and `Object` is itself
+// `public class Object`, §8.1). This file's own comment header used to claim
+// these rows were "UNAFFECTED" controls proving `=` already dispatched
+// `Equals` on Object — that premise was false; the rows were pinning the
+// pre-#4560 reference-identity bug. The renamed/reworded assertions below
+// pin the CORRECTED, §8.4-compliant answer instead.
 
 BEZEL_TEST(binary_op_object_operand_rejected_3903,
-           object_equals_reference_equality_still_works) {
-    // Two distinct boxes of the same int value are NOT reference-equal.
+           object_equals_dispatches_equals_not_reference_identity_spec_8_4_4560) {
+    // Two distinct boxes of the same int value ARE `Equals`-equal (§8.3: a
+    // primitive's default Equals is value comparison), so `o = p` (§8.4:
+    // `=` invokes `Equals`) is true even though the boxes are distinct
+    // references. Pre-#4560 this answered false (raw pointer compare).
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var o: Object := 5; "
@@ -218,12 +235,14 @@ BEZEL_TEST(binary_op_object_operand_rejected_3903,
         "  return (if eq then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 BEZEL_TEST(binary_op_object_operand_rejected_3903,
            object_equals_same_reference_still_works) {
-    // The SAME box compares equal to itself.
+    // The SAME box compares equal to itself (true under either reading —
+    // identity and Equals-dispatch agree here — so this control is
+    // unaffected by #4560 and kept as-is).
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var o: Object := 5; "
@@ -236,7 +255,10 @@ BEZEL_TEST(binary_op_object_operand_rejected_3903,
 }
 
 BEZEL_TEST(binary_op_object_operand_rejected_3903,
-           object_not_equals_still_works) {
+           object_not_equals_dispatches_equals_not_reference_identity_spec_8_4_4560) {
+    // `<>` is the negation of `=` (§8.4): two Equals-equal boxes are NOT
+    // `<>`. Pre-#4560 this answered true (raw pointer compare said the
+    // distinct boxes were unequal).
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var o: Object := 5; "
@@ -245,7 +267,7 @@ BEZEL_TEST(binary_op_object_operand_rejected_3903,
         "  return (if neq then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // ── MUST-PASS control: ordinary numeric arithmetic is unaffected ─────────

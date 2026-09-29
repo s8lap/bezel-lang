@@ -18,6 +18,7 @@
 5    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
+1    src/sema/ExprTypecheck.cpp
 4    src/sema/ExprTypecheck_Calls.cpp
 5    src/sema/ExprTypecheck_Exprs.cpp
 1    src/sema/PureChecker.cpp
@@ -34,15 +35,15 @@
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
 20   src/codegen/LlvmBackend_Assign.cpp
-29   src/codegen/LlvmBackend_Calls2.cpp
-3    src/codegen/LlvmBackend_Disposal.cpp
-8    src/codegen/LlvmBackend_Exprs.cpp
+31   src/codegen/LlvmBackend_Calls2.cpp
+4    src/codegen/LlvmBackend_Disposal.cpp
+7    src/codegen/LlvmBackend_Exprs.cpp
 11   src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-11   src/codegen/LlvmBackend_Setup.cpp
-4    src/codegen/LlvmBackend_Stmts.cpp
-22   src/codegen/LlvmBackend_impl.hpp
+12   src/codegen/LlvmBackend_Setup.cpp
+5    src/codegen/LlvmBackend_Stmts.cpp
+23   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
 4    src/module/ModuleLoader.cpp
 10   src/module/ModuleMetadataBuilder.cpp
@@ -50,11 +51,11 @@
 3    src/ownership/Ownership_Checks.cpp
 2    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
-10   src/sema/ExprTypecheck.cpp
-18   src/sema/ExprTypecheck_Calls.cpp
+11   src/sema/ExprTypecheck.cpp
+20   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 7    src/sema/PureChecker.cpp
-5    src/sema/StaticInitCycles.cpp
+7    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
-2    src/sema/TypeResolution_Checks.cpp
+4    src/sema/TypeResolution_Checks.cpp
 3    src/sema/TypeResolution_Names.cpp

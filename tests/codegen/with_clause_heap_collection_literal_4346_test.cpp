@@ -47,6 +47,7 @@
 // (ownership/disposal of the materialized result).
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation, diagnosticMessageContains
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
@@ -73,6 +74,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
@@ -98,6 +101,13 @@ int runChecked(const std::string& src) {
 // §9.5 / §15.4 / #4346: `b1 with(Items := [])` where `Items: Array<IHolder>`.
 // Empty literal targeting a heap Array<T>. Before fix: #1386 ICE on the
 // with-replacement value. Expected: 0 (count of an empty heap Array).
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): a heap-collection LITERAL used directly as a `with` replacement
+// value is a §9.7 temporary and is rejected. The fix: bind the literal to a
+// named local first (`var items2: Array<IHolder> := []`), then pass the local
+// in the `with` (no longer a temporary at the `with` site). The named local's
+// scope extends through the `with` evaluation, satisfying §9.7.
 BEZEL_TEST(with_heap_collection_literal_4346,
            array_empty_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -111,7 +121,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var items1: Array<IHolder> := []; "
         "    var b1 := new HeapBox(items1); "
-        "    var b2 := b1 with(Items := []); "
+        "    var items2: Array<IHolder> := []; "   // §9.7: named local, not a temporary
+        "    var b2 := b1 with(Items := items2); "
         "    return b2.Items.Count; "
         "  end Main; "
         "end C;"), 0);
@@ -120,6 +131,10 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 // §9.5 / §15.4 / #4346: `b1 with(Items := [null])` where `Items: Array<IHolder?>`.
 // Non-empty literal with a nullable element type targeting a heap Array<T>.
 // Before fix: same #1386 ICE. Expected: 42 (the first element is null).
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): bind the heap-collection literal to a named local first so it is
+// not a §9.7 temporary at the `with` site.
 BEZEL_TEST(with_heap_collection_literal_4346,
            array_nullable_element_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -133,7 +148,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var items1: Array<IHolder?> := [null]; "
         "    var b1 := new NullableBox(items1); "
-        "    var b2 := b1 with(Items := [null]); "
+        "    var items2: Array<IHolder?> := [null]; "   // §9.7: named local
+        "    var b2 := b1 with(Items := items2); "
         "    return (if b2.Items[0] = null then 42 else 0); "
         "  end Main; "
         "end C;"), 42);
@@ -141,6 +157,10 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 
 // §9.5 / §15.4 / #4346: a non-empty Array<T> literal `[1,2,3]` as a `with`
 // replacement. The heap materializer populates the new array (sum = 15).
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): bind the heap-collection literal to a named local first so it is
+// not a §9.7 temporary at the `with` site.
 BEZEL_TEST(with_heap_collection_literal_4346,
            array_nonempty_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -151,7 +171,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var items1: Array<int> := [1, 2, 3]; "
         "    var b1 := new Box(items1); "
-        "    var b2 := b1 with(Items := [4, 5, 6]); "
+        "    var items2: Array<int> := [4, 5, 6]; "   // §9.7: named local
+        "    var b2 := b1 with(Items := items2); "
         "    return b2.Items[0] + b2.Items[1] + b2.Items[2]; "
         "  end Main; "
         "end C;"), 15);
@@ -161,6 +182,10 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 // replacement for a Dictionary field. The heap materializer's internal
 // delegation routes empty-literal-with-dict-target to materializeHeapDictLiteral.
 // Expected: 0 (count of an empty Dictionary).
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): bind the heap-collection literal to a named local first so it is
+// not a §9.7 temporary at the `with` site.
 BEZEL_TEST(with_heap_collection_literal_4346,
            dict_empty_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -171,7 +196,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var d1: Dictionary<string, int> := []; "
         "    var b1 := new DictBox(d1); "
-        "    var b2 := b1 with(Map := []); "
+        "    var map2: Dictionary<string, int> := []; "   // §9.7: named local
+        "    var b2 := b1 with(Map := map2); "
         "    return b2.Map.Count; "
         "  end Main; "
         "end C;"), 0);
@@ -179,6 +205,10 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 
 // §9.5 / §15.4 / #4346: a non-empty Dictionary literal `["a":1,"b":2]` as a
 // `with` replacement. Expected: 3 (sum of values).
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): bind the heap-collection literal to a named local first so it is
+// not a §9.7 temporary at the `with` site.
 BEZEL_TEST(with_heap_collection_literal_4346,
            dict_nonempty_literal_with_replacement_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -189,7 +219,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var d1: Dictionary<string, int> := []; "
         "    var b1 := new DictBox(d1); "
-        "    var b2 := b1 with(Map := [\"a\": 1, \"b\": 2]); "
+        "    var map2: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "   // §9.7: named local
+        "    var b2 := b1 with(Map := map2); "
         "    return b2.Map[\"a\"] + b2.Map[\"b\"]; "
         "  end Main; "
         "end C;"), 3);
@@ -199,6 +230,10 @@ BEZEL_TEST(with_heap_collection_literal_4346,
 // after the `with`. Two-field record; `with` replaces only `Items`, `Tag`
 // is copied from the source. The heap-collection literal in `Items` no longer
 // ICEs; the `Tag` field keeps its source value via the unmodified copy.
+//
+// STRATEGY A (§9.7 / §28.3 borrow-lifetime rule, fix #4330/#4344 cherry-pick
+// 4b93e229): bind the heap-collection literal to a named local first so it is
+// not a §9.7 temporary at the `with` site.
 BEZEL_TEST(with_heap_collection_literal_4346,
            multi_field_other_field_preserved_4346) {
     BEZEL_EXPECT_EQ(run(
@@ -212,7 +247,8 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "  public static method Main(): int "
         "    var items1: Array<IHolder> := []; "
         "    var b1 := new TwoFields(items1, \"old\"); "
-        "    var b2 := b1 with(Items := []); "
+        "    var items2: Array<IHolder> := []; "   // §9.7: named local
+        "    var b2 := b1 with(Items := items2); "
         "    return (if b2.Tag = \"old\" then b2.Items.Count else -1); "
         "  end Main; "
         "end C;"), 0);
@@ -234,42 +270,6 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "end Main; end C;"), 12);
 }
 
-// ── #4350 regression: heap-collection literal in with-expression leaks ────────
-//
-// fix #4350 / §28.9 / §21.1 / §9.5: a `with(Items := [...])` on a record
-// with a heap-collection field materializes the replacement array (fix #4346),
-// stores the pointer into the result record's `Items` slot, and returns the
-// result record by value. Records have no Dispose method (§9.7: "no disposer");
-// the result record is a bare value type with no scope-end disposal walk of its
-// field slots. Without the fix, the materialized bz_array_t (and its backing
-// allocation) leaks — measured as 56 bytes / 1 allocation (direct) + 64 bytes /
-// 1 allocation (indirect / backing) under LSan.
-//
-// The fix (LlvmBackend_Exprs2.cpp lowerWith): after materializing the heap
-// collection and storing the pointer into the result record's field slot,
-// also create a shadow alloca and register it on the disposeStack_ so the
-// scope-end disposal emits a bz_array_free call for the materialized collection.
-// This mirrors the pattern that every other heap-collection materialization site
-// (LocalDecl, FieldDecl, call-arg, return) already follows.
-//
-// This test uses runChecked (ASan+LSan): the leak manifests as a non-zero exit
-// code with a LeakSanitizer report. Before the fix: LSan reports 120 bytes
-// leaked in 2 allocations. After the fix: clean exit 0.
-BEZEL_TEST(with_heap_collection_literal_4346,
-           heap_collection_literal_disposed_at_scope_end_4350) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "import System.Collections.Generic; "
-        "record R(Items: Array<int>); "
-        "class C "
-        "  public static method Main(): int "
-        "    var items1: Array<int> := [1, 2, 3]; "
-        "    var b1 := new R(items1); "
-        "    var b2 := b1 with(Items := [4, 5, 6]); "
-        "    return b2.Items[0]; "
-        "  end Main; "
-        "end C;"), 4);
-}
 
 // ── #4350 v2 regression: heap-collection literal local is freed even when
 // passed to a record constructor (the pre-existing #4c33bcd with-clause
@@ -316,4 +316,37 @@ BEZEL_TEST(with_heap_collection_literal_4346,
         "    return 1; "
         "  end Main; "
         "end C;"), 1);
+}
+
+// ── §9.7 REGRESSION PIN — heap-collection literal in with-expression ──────────
+//
+// fix #4330 / #4344 (§9.7 / §28.3, cherry-pick 4b93e229, v0.298):
+// `checkRecordWithFromTemporary` now rejects a HEAP-COLLECTION LITERAL
+// (Array<T>, Dictionary<K,V>) used directly as a `with` replacement value,
+// because the literal is a §9.7 temporary whose lifetime ends at the
+// `with(...)` expression. This test pins that the reject fires.
+//
+// Strategy A (naming the local first) is the correct workaround — the
+// named-local forms above compile and run correctly. This test pins
+// the negative: the literal form is rejected.
+BEZEL_TEST(with_heap_collection_literal_4346,
+           section_9_7_heap_collection_literal_with_replacement_rejected) {
+    auto r = runAot(
+        "module M; "
+        "import System.Collections.Generic; "
+        "record Box(Items: Array<int>); "
+        "class C "
+        "  public static method Main(): int "
+        "    var items1: Array<int> := [1, 2, 3]; "
+        "    var b1 := new Box(items1); "
+        "    var b2 := b1 with(Items := [4, 5, 6]); "   // §9.7: temporary rejected
+        "    return b2.Items[0]; "
+        "  end Main; "
+        "end C;");
+    // The program should NOT compile: the literal [4,5,6] is a §9.7 temporary.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a borrow-bearing record may not be constructed from a temporary"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "via `with(...)`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""9.7"));
 }

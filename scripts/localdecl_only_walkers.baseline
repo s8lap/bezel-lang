@@ -19,12 +19,13 @@
 3    src/codegen/LlvmBackend_Async.cpp
 1    src/codegen/LlvmBackend_Disposal.cpp
 1    src/codegen/LlvmBackend_Exprs.cpp
-3    src/codegen/LlvmBackend_Exprs2.cpp
+5    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Iterators.cpp
+2    src/codegen/LlvmBackend_Setup.cpp
 1    src/codegen/LlvmBackend_Stmts.cpp
 1    src/codegen/LlvmBackend_String.cpp
 1    src/driver/ScopedAwaitBind.cpp
-1    src/ownership/Ownership.cpp
+2    src/ownership/Ownership.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/ExprTypecheck_Calls.cpp
 1    src/sema/TypeResolution_Checks.cpp

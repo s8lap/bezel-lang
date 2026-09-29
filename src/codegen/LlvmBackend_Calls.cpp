@@ -1635,48 +1635,162 @@ sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
 }
 
 
-// issue #400 / §25.2: the per-element comparison `Array<T>`/`OwningArray<T>`'s
-// `.Remove(item)` uses to match `el` (a stored element, borrowed) against
-// `target` (the query, a pure borrow — neither operand is consumed). The spec
-// requires collections to use the element type's `Equals` (§25.2: "which use
-// `Equals` rather than `=`"), defaulting per §8.3:
-//   - class WITH a user `Equals` override → virtual `el.Equals(target)` (§8.4),
-//     guarded so a null slot or null query falls back to reference identity
-//     (matching §8.4's null-safe `=`: null = null is true; null = nonNull false);
-//   - class WITHOUT an override → reference identity (§8.3 default);
-//   - record → structural field-by-field equality (§8.3, emitStructEquality —
-//     consistent with the record's auto `Equals`/`GetHashCode`);
-//   - string → content equality (§4.6);
-//   - primitive/enum (value type) → `==`.
+// issue #400 / §25.2: the per-element comparison every membership lowering
+// shares — `Array<T>`/`OwningArray<T>`'s `.Contains`/`.IndexOf`/`.Remove`, the
+// `x in coll` of §17.5, the span scans, the `LinkedList<T>` node walk, and the
+// array-backed `Set<T>`/`OwningSet<T>` dedup insert — matching `el` (a stored
+// element, borrowed) against `target` (the query, a pure borrow — neither
+// operand is consumed). The spec requires collections to use the element type's
+// `Equals` (§25.2: "which use `Equals` rather than `=`"), defaulting per §8.3.
+//
+// fix #4573 (§8.3/§8.4/§4.3.1/§25.2, v0.306): this function used to be a list
+// of arms each guarded on the OPERANDS' CURRENT LLVM SHAPE, ending in a scalar
+// `ICmpEQ`/`FCmpOEQ` tail. That shape is what made it an OPEN arm list: when an
+// element's shape matched no arm the control fell through to the scalar tail,
+// which `ICmpInst` rejects for a struct/array operand — so a missing arm was
+// not a compile-time gap but a **runtime IR-verification crash**, found only
+// once somebody wrote that spelling. Four arms were hand-added in as many weeks
+// on exactly that discovery path (#4553 nullable-value, #4571 decimal, #4579
+// the insert-side sibling, #4580 the bare query operand), and three of the four
+// were ultimately fixed by routing to a helper that already knew the answer.
+//
+// It now dispatches on the element's **sema type**, resolved once, and coerces
+// both operands up front; the value family is handed WHOLE to `emitValueEquality`
+// (LlvmBackend_Layout.cpp), the single canonical per-value equality helper that
+// `=`, record-field equality, the dictionary/set key trampolines (#1464) and
+// `lowerValueSemMethodOn` (#4562) already share. `emitValueEquality` is a strict
+// superset of the retired tail: struct recursion (`emitStructEquality`), the
+// memoized nested-record helper (#4234), inline arrays (§15.1.2), choices
+// (§35.7), scale-invariant `decimal` (§4.4, `bz_decimal_cmp`), the §8.4
+// null-safe nullable-value rule (#364) and — the one silent divergence the old
+// tail carried — §4.3.1's NaN-REFLEXIVE float equality ("NaN = NaN is true"),
+// which the old `FCmpOEQ` tail answered `false` for.
+//
+// The ordering below is by SEMA KIND, and each branch coerces rather than
+// declines, so "a new element kind" is a visible hole in this enumeration
+// instead of malformed IR:
+//
+//   1. class / interface — the one caller-supplied discriminator (`elemIsClass`,
+//      the §28.11 owned/borrow column): a user `Equals` override dispatches
+//      virtually (§8.4), else reference identity (§8.3's Class row);
+//   2. nullable VALUE (`int?`, `enum?`, `record?`, `choice?`, `decimal?`,
+//      `Guid?`, a monomorphized `T?`) — both operands coerced up to the tagged
+//      `{i8 hasValue, T}` struct, then §8.4's null-safe rule;
+//   3. `string` / `string?` — content equality (§4.6), null-safe;
+//   4. `Object` / `Object?` — §8.4's `a.Equals(b)` through the box/class vtable
+//      (`lowerObjectEquals`, the §9.6 helper an `o.Equals(x)` call already uses);
+//   5. any OTHER reference-shaped element (a function value, a builtin heap
+//      collection such as the inner `Array<int>` of an `Array<Array<int>>`, a
+//      `Shared<T>` handle) — §8.3's reference-type default, identity;
+//   6. every VALUE element — `emitValueEquality`.
+//
+// Step 2 MUST precede any record handling: a nullable record is a nullable
+// VALUE, not a bare record. The retired arm order asked `recordTypeOfRef` first,
+// and that predicate ignores `nullable`, so `Array<P?>` took the record arm and
+// `emitStructEquality` compared the tagged struct's field 0 (the `i8 hasValue`
+// tag) against the record's own field 0 — `Array<P?>{P(1)}.Contains(P(99))`
+// answered TRUE (measured), and `.Contains(null)` built `icmp eq i8 %t, i32 %x`
+// and died in IR verification.
+//
+// ⚠ CALLER PRECONDITION (fix #4619, §8.6, v0.307): a caller-supplied QUERY must
+// already have been §8.6-boxed into the element slot's type — call
+// `boxMembershipQuery` (LlvmBackend_Layout.cpp) ONCE, outside the per-element
+// loop, on the value `lowerExpr` produced. Without it a bare-value query against
+// an `Object`/interface element reaches neither the Object arm (step 4 needs
+// BOTH operands to be pointers) nor a correct value comparison, and the guard
+// that opens step 6 refuses the shape rather than reading the element's box
+// header.
 llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
                                                 llvm::Value* target,
                                                 const sema::TypeRef* elemTy,
                                                 bool elemIsClass) {
-    // Record element: structural value equality (§8.3). The Remove loop loads
-    // `el` from the slot and lowers `target` as the record's struct value; an
-    // ICmp on a struct is invalid, so this path is mandatory (not an extension).
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(elemTy)) {
-        // issue #462 / §14.1: a GENERIC record element (`Array<Box<string>>`)
-        // must use the specialized struct (load size + field offsets) and resolve
-        // each `T`-typed field to its concrete type for per-field equality. A
-        // no-op for a non-generic record element.
-        RecordSubstGuard elemSubst(this, elemTy);
-        llvm::StructType* st = recordStruct(rec);
-        llvm::Value* l = el, *r = target;
-        if (l->getType()->isPointerTy()) l = builder_.CreateLoad(st, l);
-        if (r->getType()->isPointerTy()) r = builder_.CreateLoad(st, r);
-        if (l->getType()->isStructTy() && r->getType()->isStructTy())
-            return emitStructEquality(l, r, st, rec);  // §8.3 structural
-        // Shape mismatch (defensive): no match rather than an invalid compare.
-        return builder_.getFalse();
-    }
+    using K = sema::TypeRef::Kind;
+    if (!el || !target) return nullptr;
 
-    // Class element: dispatch through a user `Equals` override when present.
-    if (elemIsClass && el->getType()->isPointerTy() &&
-        target->getType()->isPointerTy()) {
+    // ── 0. The element's SEMA type, resolved ONCE (§14.1) ──────────────────
+    // Inside a monomorphized generic body a collection's `genericArgs[0]` is
+    // still the placeholder parameter (`T`), so every kind test below would
+    // answer "unknown" and the function would be shape-driven again. Resolve it
+    // through the active substitution, in the two shapes it takes: a bare `T`
+    // (resolveTypeParamRef) and a nullable `T?` (nullableTypeParamConcrete —
+    // resolveTypeParamRef alone STRIPS the `?`, see its own comment).
+    sema::TypeRef nvBuf;
+    const sema::TypeRef* ty = elemTy;
+    if (ty && ty->nullable && ty->kind == K::Named && !ty->declaration &&
+        nullableTypeParamConcrete(ty, nvBuf))
+        ty = &nvBuf;
+    else
+        ty = resolveTypeParamRef(ty);
+
+    const bool bothPtr =
+        el->getType()->isPointerTy() && target->getType()->isPointerTy();
+
+    // ── 1. CLASS / INTERFACE element ───────────────────────────────────────
+    // The one discriminator this function cannot read off the element type
+    // alone: `elemIsClass` is the caller's §28.11 owned/borrow classification
+    // (`elementPolicyFor`, widened to Class|Interface by #619), and the
+    // array-backed set insert passes it unconditionally because its backing
+    // slot is a pointer by construction. Kept as the named parameter it is.
+    if (elemIsClass && bothPtr) {
         const sema::TypeSymbol* cls =
-            (elemTy && elemTy->kind == sema::TypeRef::Kind::Named)
-                ? elemTy->declaration : nullptr;
+            (ty && ty->kind == K::Named) ? ty->declaration : nullptr;
+        // fix #4642 (§8.6/§8.4/§28.11, v0.307): an `Object` element reaches
+        // this arm whenever the CALLER classified it class-shaped — which is
+        // now every array-backed `Set<Object>` operation (`arrElemIsClass`,
+        // widened below) and `emitArrayBackedSetInsert`, whose `elemIsClass`
+        // argument is hardcoded `true` because its backing slot is a pointer
+        // by construction. `cls` is ALWAYS null for `Object` (`Kind::Primitive`,
+        // never `Kind::Named`), so without this arm `classEqualsOverride(null)`
+        // answers "no override" and control falls to the class default at the
+        // bottom of this block — `CreateICmpEQ(el, target)`, RAW BOX-POINTER
+        // IDENTITY. Two §8.6 boxes of the same `int` are distinct heap
+        // allocations, so `s.TryAdd(1)` twice would both insert and
+        // `s.Contains(1)` would answer false against a freshly boxed query:
+        // #4619's `Array<Object>.Contains` defect reproduced one level up, and
+        // the reason the two gate widenings are NOT separable from this arm.
+        //
+        // The dispatch is step 4's, verbatim (`lowerObjectEquals` — null →
+        // identity, `bz_string*` → content equality, class/box →
+        // `vtable[kEqualsSlot]`, which for a box is `bz$boxeq$<T>`'s value
+        // comparison). It is placed here rather than left to step 4 because
+        // step 1 RETURNS on every path once entered; the two arms must agree,
+        // and they do — the same helper, reached from callers that differ only
+        // in how they classified the slot. Same reasoning as the Interface arm
+        // immediately below (fix #4594): the runtime `Equals` is not knowable
+        // from the declared element type, so it is read off the object itself.
+        if (ty && ty->kind == K::Primitive &&
+            ty->primitive == sema::PrimitiveType::Object)
+            if (llvm::Value* objEq = lowerObjectEquals(el, target)) return objEq;
+        // fix #4594 (§8.4/§25.2, v0.306): an INTERFACE-typed element's
+        // `Equals` override lives on the RUNTIME implementing class, which is
+        // not statically knowable at the element type — `classEqualsOverride`
+        // walks a class's OWN base chain and (correctly, for the class case)
+        // answers "no override" for an interface declaration, so this arm used
+        // to fall straight to the reference-identity default below even when
+        // the implementing class overrides `Equals`. §8.4 ("`a = b` invokes
+        // `a.Equals(b)`") and §25.2 (collections "use `Equals` rather than
+        // `=`") require the override to be dispatched regardless of whether it
+        // is reached through the class or the interface. `lowerObjectEquals`
+        // (LlvmBackend_String.cpp, #946/#947) already performs exactly that
+        // dispatch — virtually, through `vtable[kEqualsSlot]` on the runtime
+        // object — for an `Object`/interface receiver, and step 4 below routes
+        // `Object` through it for the identical reason. Every class's slot 4 is
+        // unconditionally filled (`classEqualsThunk`: the override if one
+        // exists, else the §8.3 reference-identity default), so this is total,
+        // not merely a fast path for the override case — an interface element
+        // with no override still answers identity, unchanged from before.
+        //
+        // Deliberately NOT widening `classEqualsOverride`'s own Class guard:
+        // that would require walking from the STATIC interface type, which
+        // cannot name the implementing class's override at all; routing
+        // through the vtable instead reads the RIGHT (runtime) class. Scoped
+        // to `cls->kind == Interface` only, so a CLASS-typed element (the
+        // shared blast radius `emitRemoveElementEquality` serves — every
+        // `Array<SomeClass>.Contains`/`.IndexOf`/`.Remove`/`Set` dedup) takes
+        // the unchanged `classEqualsOverride` path immediately below.
+        if (cls && cls->kind == ast::TypeDeclKind::Interface) {
+            if (llvm::Value* eq = lowerObjectEquals(el, target)) return eq;
+        }
         if (sema::MethodSymbol* eqm = classEqualsOverride(cls)) {
             // §8.4: `el.Equals(target)`. Guard against a null element slot or a
             // null query: dispatching through a null `el` would load a null
@@ -1719,23 +1833,136 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         return builder_.CreateICmpEQ(el, target);
     }
 
-    // String element: content equality (§4.6).
-    if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
+    // ── 2. NULLABLE VALUE element (§17.5 / §8.4) ───────────────────────────
+    // `Array<int?>`, `Set<Color?>`, `Array<P?>`, `Array<Guid?>`, a `T?` span
+    // slot: the tagged `{i8 hasValue, T value}` struct. §17.5: "Where the
+    // selected `Contains` parameter is **itself** nullable … a nullable left
+    // operand is **admitted**: the test performed is the null-safe equality of
+    // §8.4, total over an absent operand" — which `emitValueEquality`'s
+    // nullable-value branch implements (#364).
+    //
+    // BOTH operands are coerced, not merely checked (#4580): `el` always
+    // arrives tagged (it is loaded at the element stride) but the QUERY need
+    // not — `3 in xs` over `Array<int?>` lowers the literal from its `int` type
+    // and arrives as a bare `i32`, and §5.1 admits that (`T` converts to `T?`,
+    // §7.2's present-value wrapping) before §17.5's admissibility rule even
+    // engages. `ensureNullableElementValue` (the helper #4579 extracted for the
+    // insert side) is a no-op on an already-tagged value and maps a null
+    // pointer to the all-zero tagged null.
+    if (isNullableValueTy(ty)) {
+        llvm::Value* l = ensureNullableElementValue(ty, el);
+        llvm::Value* r = ensureNullableElementValue(ty, target);
+        if (l->getType()->isStructTy() && r->getType()->isStructTy())
+            return emitValueEquality(l, r, ty);
+    }
+
+    // ── 3. STRING element: content equality (§4.6) ─────────────────────────
+    // `string` and `string?` alike — `emitStringEq` opens with a same-pointer
+    // test and an either-null guard, so it is already the §8.4 null-safe rule
+    // for the nullable spelling. Gated on the DECLARED type: the retired arm
+    // gated on "both operands are pointers", which content-compared every
+    // OTHER pointer-shaped element as if it were a `%bz.string` (see step 5).
+    if (bothPtr && ty && ty->kind == K::Primitive &&
+        ty->primitive == sema::PrimitiveType::String)
         return emitStringEq(el, target);
 
-    // Value type (primitive/enum): `==`. Widen mismatched integer widths.
-    llvm::Value* elN = el, *tN = target;
-    if (el->getType() != target->getType() &&
-        el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
-        unsigned ew = el->getType()->getIntegerBitWidth();
-        unsigned tw = target->getType()->getIntegerBitWidth();
-        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
-        elN = builder_.CreateSExt(el, wide);
-        tN  = builder_.CreateSExt(target, wide);
+    // ── 4. `Object` / `Object?` element: §8.4 through the vtable ───────────
+    // §8.4 is "`a = b` invokes `a.Equals(b)`" and §8.3's Primitive row gives a
+    // boxed primitive's `Equals` as "Value comparison", so `Array<Object>`
+    // holding boxed `1`/`2` must answer `Contains(2)` true and `Contains(5)`
+    // false. `lowerObjectEquals` (the §9.6 helper #946/#947 built for
+    // `o.Equals(x)` at an `Object`/interface receiver) is exactly that
+    // dispatch: null → identity, a bare `bz_string*` → content equality when
+    // the other side is also a string, a class/box → `vtable[kEqualsSlot]`,
+    // which for a box is the `bz$boxeq$<T>` value comparison. The retired arm
+    // instead read word 1 of each operand as a `%bz.string` length
+    // (`loadStringLen`) and memcmp'd on it: measured NON-DETERMINISTICALLY
+    // WRONG — `Array<Object>{1,2}.Contains(5)` answered `true` on the default
+    // build and `false` under ASan, the allocator changing the garbage.
+    if (bothPtr && ty && ty->kind == K::Primitive &&
+        ty->primitive == sema::PrimitiveType::Object)
+        if (llvm::Value* objEq = lowerObjectEquals(el, target)) return objEq;
+
+    // ── 5. Any OTHER reference-shaped element: §8.3 identity ───────────────
+    // A function value, a builtin heap collection (the inner `Array<int>` of an
+    // `Array<Array<int>>`, a `StringBuilder`, a `Task`), a `Shared<T>` handle:
+    // none is a class DECLARATION, so `collectionElemIsClass` answers false and
+    // step 1 declines — but each is a reference type, whose §8.3 default
+    // `Equals` is reference equality. None has a `%bz.string` header, so the
+    // retired arm's `emitStringEq` read two unrelated heap words as a length
+    // and a data pointer (measured: `Array<(int) -> int>{f}.Contains(g)`
+    // answered `true` for a DIFFERENT function on the default build).
+    if (bothPtr) return builder_.CreateICmpEQ(el, target);
+
+    // ── 6. Every VALUE element: the one authority ──────────────────────────
+    // Primitive (incl. §4.3.1-reflexive float and §4.4 scale-invariant
+    // decimal), enum, record (§8.3 field-by-field, via #4234's memoized
+    // per-instantiation helper), choice (§35.7 active-case-then-payload),
+    // inline array (§15.1.2 element-by-element) and the struct-shaped value
+    // builtins (`Guid` {i64,i64}, `Range` {i64,i64,i64,i8}, the {ptr,i32,i32}
+    // spans, `JsonOptions`) — `emitValueEquality` covers all of them, the last
+    // group through its struct fallback (`emitStructEquality`, field-wise).
+    // Coerce first, so the authority is never handed operands it would build
+    // invalid IR from:
+    llvm::Value* l = el, *r = target;
+    //  fix #4619 (§8.6/§25.2/§8.4, v0.307) — a PRECONDITION, stated as code.
+    //      Coercion (a) below is only meaningful when the pointer operand is a
+    //      SPILLED VALUE (a record materialized into an alloca). When the
+    //      element's sema type is a REFERENCE — `Object`/interface/class — the
+    //      pointer IS the object, and loading through it reads the §8.6 box's
+    //      `{ vtable*, i64 rc, payload }` HEADER as if it were the other side's
+    //      own value. MEASURED on `var a: Array<Object> := [1, 2];`:
+    //      `%h = load i32, ptr %el; icmp eq i32 %h, 1` — the low half of the
+    //      box vtable's address — so `.Contains(1)` answered false for a
+    //      PRESENT element, and with a `bool` query (`load i1`)
+    //      `.Contains(true)` answered TRUE on an array holding only ints.
+    //
+    //      Every membership caller now §8.6-boxes its query first
+    //      (`boxMembershipQuery`), so both operands are pointers for a
+    //      reference element and step 4/5 answer above. Refusing the shape here
+    //      keeps a caller added later WITHOUT that step deterministic
+    //      ("no match") instead of garbage-dependent; it is step (c)'s own
+    //      "not comparable" answer, applied one coercion earlier.
+    {
+        const bool refElem =
+            ty && ((ty->kind == K::Primitive &&
+                    (ty->primitive == sema::PrimitiveType::Object ||
+                     ty->primitive == sema::PrimitiveType::String)) ||
+                   (ty->kind == K::Named && ty->declaration &&
+                    (ty->declaration->kind == ast::TypeDeclKind::Class ||
+                     ty->declaration->kind == ast::TypeDeclKind::Interface)));
+        if (refElem &&
+            l->getType()->isPointerTy() != r->getType()->isPointerTy())
+            return builder_.getFalse();
     }
-    if (elN->getType()->isFloatingPointTy())
-        return builder_.CreateFCmpOEQ(elN, tN);
-    return builder_.CreateICmpEQ(elN, tN);
+    //  (a) a SPILLED aggregate operand (a record materialized into an alloca):
+    //      load it at the other side's type. The retired record arm did this
+    //      with `recordStruct(rec)`; the other side's type is that same struct.
+    if (l->getType()->isPointerTy() && !r->getType()->isPointerTy())
+        l = builder_.CreateLoad(r->getType(), l);
+    else if (r->getType()->isPointerTy() && !l->getType()->isPointerTy())
+        r = builder_.CreateLoad(l->getType(), r);
+    //  (b) mismatched INTEGER widths (`Array<short>.Contains(1)` — the literal
+    //      lowers at its own `int` width). Widen both to the wider type, the
+    //      retired tail's rule kept verbatim so no narrowing/sign change is
+    //      introduced by this refactor.
+    if (l->getType() != r->getType() &&
+        l->getType()->isIntegerTy() && r->getType()->isIntegerTy()) {
+        unsigned lw = l->getType()->getIntegerBitWidth();
+        unsigned rw = r->getType()->getIntegerBitWidth();
+        llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
+        l = builder_.CreateSExt(l, wide);
+        r = builder_.CreateSExt(r, wide);
+    }
+    //  (c) a residual AGGREGATE shape mismatch is not comparable — answer "no
+    //      match" rather than emit an `extractvalue`/`icmp` pair over two
+    //      different layouts. This is the retired record arm's own defensive
+    //      `getFalse()`, kept and widened to every aggregate.
+    if (l->getType() != r->getType() &&
+        (l->getType()->isStructTy() || l->getType()->isArrayTy() ||
+         r->getType()->isStructTy() || r->getType()->isArrayTy()))
+        return builder_.getFalse();
+    return emitValueEquality(l, r, ty);
 }
 
 
@@ -1762,6 +1989,20 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
                                        llvm::Function* dupDisposer,
                                        int64_t esz) {
     if (!setArr || !item) return false;
+    // fix #4642 (§8.6/§4.10, v0.307): the array-backed set's slot is a POINTER
+    // by construction — this function loads each element as `ptrTy()` and
+    // `collectionElemSize` gives 8 for every element type that reaches here —
+    // so a non-pointer `item` is never storable. Before `Object` was admitted
+    // as an element type the shape could not arise (a class/interface value is
+    // already a pointer); now a caller that has NOT §8.6-boxed a bare value
+    // element would reach `bz_array_add` with, say, a 4-byte `i32` alloca and
+    // an 8-byte stride — a stack-buffer-overflow READ of the slot's redzone,
+    // then a garbage pointer stored as an element and dereferenced by the next
+    // `lowerObjectEquals`. Refuse instead: the caller reports its own
+    // internal-failure diagnostic and no unsafe IR is emitted. Every correct
+    // caller boxes first (`boxForTarget`, the three `.Add`/`.TryAdd` arms
+    // below), so this is an assertion of their precondition, not a live arm.
+    if (!item->getType()->isPointerTy()) return false;
     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
     llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
     auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
@@ -3089,9 +3330,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // numeric type. Sema types it likewise (ExprTypecheck_Calls);
                 // derive the accumulator width from the element so a long/uint/
                 // ulong/float/double element is summed at its own width.
+                // fix #4695 / stdlib §5.1 + §2.19 (v0.307): the four NARROW
+                // integers belong here too. #1836 listed five (Int being the
+                // initialiser and decimal taking the path above), so a
+                // byte/sbyte/short/ushort element fell to `retP = Int` while
+                // `elemTy` stayed i8/i16 — and the reconciliation below then
+                // spelled the i8→i32 WIDENING as `CreateTrunc`, which LLVM's
+                // verifier rejects ("DestTy too big for Trunc"). Keying the
+                // accumulator off the element removes the mismatch at its
+                // source rather than patching the cast: per stdlib §5 "a
+                // narrow integer element type accumulates in that type".
                 sema::TypeRef* e = recvTy->genericArgs[0];
                 if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
                     switch (e->primitive) {
+                        case sema::PrimitiveType::Byte:
+                        case sema::PrimitiveType::SByte:
+                        case sema::PrimitiveType::Short:
+                        case sema::PrimitiveType::UShort:
                         case sema::PrimitiveType::UInt:
                         case sema::PrimitiveType::Long:
                         case sema::PrimitiveType::ULong:
@@ -3144,10 +3399,45 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 accLLTy->isIntegerTy())
                 val = builder_.CreateTrunc(val, accLLTy);
             llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
-            builder_.CreateStore(
+            // fix #4695 / stdlib §5 + §5.1, spec §6.1 (v0.307): the
+            // accumulation is `+` AT THE RESULT TYPE (stdlib §5.1's
+            // `Sum(): owned T` folds with `T.Zero()` and `T`'s `+`), so it
+            // carries §6.1's checked-overflow posture — "a narrow integer
+            // element type accumulates in that type and is overflow-checked in
+            // it … `bytes.Sum()` over an `Array<byte>` raises
+            // `OverflowException` past 255" (stdlib §5). The plain `CreateAdd`
+            // this replaces wrapped silently at EVERY integer width, not just
+            // the narrow ones: measured, `Array<int>` summing 2e9 + 2e9 printed
+            // -294_967_296 where §6.1 requires a throw.
+            //
+            // The intrinsic's SIGNEDNESS is the accumulator's own
+            // (`isUnsignedPrim`), and it is load-bearing rather than
+            // cosmetic: `byte` and `sbyte` are the same i8, yet 100 + 100 =
+            // 200 is in range for one and out of range for the other. One
+            // intrinsic for both is wrong in a direction no single-element-type
+            // test can see, which is why the regression rows come in
+            // signed/unsigned pairs at each width.
+            //
+            // Guarded on the operands actually sharing an integer type: a
+            // non-numeric element (bool, a pointer-typed element) still lands
+            // on the `int` fallback with a mismatched `val`, and those shapes
+            // are sema over-accepts to be rejected at their own layer — this
+            // arm leaves their (already malformed) lowering exactly as it was
+            // rather than silently minting a value for them.
+            const bool checkedAdd = !accIsFP && accLLTy->isIntegerTy() &&
+                                    val->getType() == accLLTy;
+            llvm::Value* nextAcc =
                 accIsFP ? builder_.CreateFAdd(acc, val)
-                        : builder_.CreateAdd(acc, val),
-                accSlot);
+                        : (checkedAdd
+                               ? emitCheckedArith(
+                                     isUnsignedPrim(retP)
+                                         ? llvm::Intrinsic::uadd_with_overflow
+                                         : llvm::Intrinsic::sadd_with_overflow,
+                                     acc, val)
+                               : builder_.CreateAdd(acc, val));
+            // NB: emitCheckedArith leaves the insert point in its `chk.cont`
+            // block, so everything below continues on the non-throwing path.
+            builder_.CreateStore(nextAcc, accSlot);
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
@@ -3309,12 +3599,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 : lowerLinqLambda(call.args[0].value.get(), selRetRef);
             if (!call.args.empty() && !closure) return nullptr;
             llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+            // fix #4728 (spec §29.1, stdlib §5 + §11.1 Average widening, v0.305):
+            // the no-selector Average() widening must honor the element's
+            // signedness — UIToFP for `byte`/`ushort`/`uint`/`ulong`/`char`, SIToFP
+            // for the signed family. Before this fix the `toDouble` lambda used
+            // `CreateSIToFP` unconditionally, so a `byte` 250 was reinterpreted
+            // as i8 -6 → double -6.0, and the accumulator's double sum no longer
+            // matched the element's numeric value. stdlib §11.1's
+            // narrowing/widening table promotes an unsigned element to `double`
+            // BEFORE the sum; that is the contract this widens-to. The selector
+            // form mirrors the no-selector form via `selRetRef`'s primitive
+            // (already derived at line 3513 above).
+            bool srcIsUnsigned = false;
+            if (call.args.empty() && recvTy && !recvTy->genericArgs.empty() &&
+                recvTy->genericArgs[0] &&
+                recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+                !recvTy->genericArgs[0]->nullable) {
+                srcIsUnsigned = isUnsignedPrim(recvTy->genericArgs[0]->primitive);
+            } else if (!call.args.empty() && selRetRef &&
+                       selRetRef->kind == sema::TypeRef::Kind::Primitive &&
+                       !selRetRef->nullable) {
+                srcIsUnsigned = isUnsignedPrim(selRetRef->primitive);
+            }
             // Coerce an int/float numeric value to double.
             auto toDouble = [&](llvm::Value* v) -> llvm::Value* {
                 if (v->getType()->isDoubleTy()) return v;
                 if (v->getType()->isFloatingPointTy())
                     return builder_.CreateFPExt(v, dblTy);
-                return builder_.CreateSIToFP(v, dblTy);
+                return srcIsUnsigned ? builder_.CreateUIToFP(v, dblTy)
+                                     : builder_.CreateSIToFP(v, dblTy);
             };
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
@@ -3492,9 +3805,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // generic i32 path below loads the element and truncs it to i32
             // (`trunc ptr … to i32` → malformed IR). Instead, dispatch the
             // element ordering through the element's `CompareTo` (string:
-            // ordinal strcmp on the data pointers, mirroring the Sort()
-            // comparator), returning the winning element pointer. (Related:
-            // Math.Min/Max IComparable, #1148/#1141.)
+            // `bz_str_compare_cp`, the width-aware §9.6 relation #4487/#4495
+            // route every ordinal string comparison through), returning the
+            // winning element pointer. (Related: Math.Min/Max IComparable,
+            // #1148/#1141.)
             if (call.args.empty()) {
                 sema::TypeRef* elemTypeRef =
                     (recvTy && !recvTy->genericArgs.empty())
@@ -3577,22 +3891,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         ptrFn, {recv, idx, builder_.getInt64(esz)});
                     llvm::Value* el  = builder_.CreateLoad(ptrTy(), ep, "mm.el");
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
-                    // cmp = (el <=> acc): el.CompareTo(acc), or strcmp(el, acc).
+                    // cmp = (el <=> acc): el.CompareTo(acc), or the §9.6
+                    // ordinal string relation.
+                    //
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to
+                    // extract each string's raw `.data` pointer and call
+                    // plain `strcmp` — byte-wise AND NUL-terminated, disagreeing
+                    // with `CompareTo`/`SortedSet<string>` after #4487 moved
+                    // those to `bz_str_compare_cp`. `el`/`acc` are already the
+                    // full string OBJECTS (not just `.data`), so this routes to
+                    // the SAME width-aware relation #4487 established rather
+                    // than a second spelling of "ordinal string comparison"
+                    // (the drift #2590 records).
                     llvm::Value* cmp = nullptr;
                     if (isStrElem) {
-                        llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), el, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {el, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (ifaceCmpFn) {
                         // fix #2770: §13 itable dispatch of the element's own
                         // `CompareTo` — the identical dispatch a written-out
@@ -3718,7 +4034,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // IComparable<U> (§14.2) or string (§9.6). Mirror the no-selector
             // pointer path (above), but project each element through the
             // selector first; compare the projected values via CompareTo /
-            // ordinal strcmp and return the winning projection. The result is a
+            // `bz_str_compare_cp` (§9.6) and return the winning projection. The
+            // result is a
             // borrow (§28.3, tracked in the ownership pass); codegen returns the
             // pointer and takes no disposal obligation. ---
             if (uRef) {
@@ -3793,20 +4110,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
                     llvm::Value* cmp = nullptr;
                     if (uIsStr) {
-                        llvm::Value* pvData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), pv, 0));
-                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                            builder_.CreateStructGEP(stringType(), acc, 0));
-                        auto* strcmpFn = module_->getFunction("strcmp");
-                        if (!strcmpFn) {
-                            auto* ft = llvm::FunctionType::get(
-                                i32(), {ptrTy(), ptrTy()}, false);
-                            strcmpFn = llvm::Function::Create(
-                                ft, llvm::Function::ExternalLinkage, "strcmp",
-                                module_.get());
-                        }
-                        cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
-                                                  "mm.cmp");
+                        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                        // through the same width-aware relation #4487
+                        // established — see the no-selector Min()/Max() arm
+                        // above for the full citation. `pv`/`acc` are already
+                        // the full string OBJECTS.
+                        auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                                 {ptrTy(), ptrTy(), i32()});
+                        cmp = builder_.CreateCall(
+                            cmpCpFn, {pv, acc, builder_.getInt32(0)}, "mm.cmp");
                     } else if (uIfaceCmpFn) {
                         // fix #2770: the thunk's ABI is slot ADDRESSES, and the
                         // projection `pv` is a value, so spill it to an entry
@@ -3859,14 +4171,39 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // returns the element's own numeric type T (long/uint/ulong/
                 // float/double), not int. (Decimal took the §5.1 decimal path
                 // above; class/string took the pointer-comparable path.)
+                // fix #4695 / stdlib §5.1 (v0.307): the four NARROW integers
+                // belong here for the same reason they do in `Sum` above — a
+                // byte/short element otherwise kept the i32 accumulator and
+                // the reconciliation below emitted `trunc i8 -> i32`, which the
+                // IR verifier rejects. Keying `retP` off the element also feeds
+                // `accIsUnsigned` below, so `byte`/`ushort` get `icmp ult` /
+                // `icmp ugt`: read as signed i8, 200 is -56 and `Min`/`Max`
+                // over `[200, 50]` come back INVERTED. That is the same
+                // unsigned-compare requirement #1836 recorded for `ulong`,
+                // one width family down.
                 sema::TypeRef* e = recvTy->genericArgs[0];
                 if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
                     switch (e->primitive) {
+                        case sema::PrimitiveType::Byte:
+                        case sema::PrimitiveType::SByte:
+                        case sema::PrimitiveType::Short:
+                        case sema::PrimitiveType::UShort:
                         case sema::PrimitiveType::UInt:
                         case sema::PrimitiveType::Long:
                         case sema::PrimitiveType::ULong:
                         case sema::PrimitiveType::Float:
                         case sema::PrimitiveType::Double:
+                            retP = e->primitive;
+                            break;
+                        // fix #4731 (stdlib §5.1, v0.286): char satisfies
+                        // IComparable<char> per §3.4 / §9.5 but is not an
+                        // §2.19 INumber conformer (the eleven primitives
+                        // `isNoSelectorAggregationElem` keys on). Including it
+                        // here lets `Array<char>.Min()` / `.Max()` key the
+                        // accumulator at char (i32 width, unsigned compare via
+                        // `isUnsignedPrim`), so `Console.WriteLine` reaches
+                        // `bz_char_to_string` and prints "a" rather than "97".
+                        case sema::PrimitiveType::Char:
                             retP = e->primitive;
                             break;
                         default:
@@ -3982,6 +4319,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
                 : (recvTy && !recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
+            // fix #4729 (spec §29.1, stdlib §5 line 3641-3645, v0.305): the
+            // numeric-element comparison below must honor the element's
+            // signedness — `byte`/`ushort`/`uint`/`ulong`/`char` order
+            // UNSIGNED (the bit pattern), the signed family orders signed.
+            // The legacy Min/Max arm above already does this via
+            // `accIsUnsigned` / `isUnsignedPrim(retP)` at line ~4229-4236;
+            // the *OrNull sibling, added in #2783, did not carry the same
+            // dispatch. `isUnsignedPrim(Char) == true` makes the string
+            // arm's synthetic `Char` substitution (above, fix #3786) order
+            // unsigned — char is unsigned for §11.1 widening anyway.
+            const bool elemIsUnsigned = elemTypeRef &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Primitive &&
+                !elemTypeRef->nullable &&
+                isUnsignedPrim(elemTypeRef->primitive);
             llvm::Type* elemLLTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
@@ -4027,7 +4378,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* el  = builder_.CreateLoad(elemLLTy, ep, "mon.el");
             llvm::Value* acc = builder_.CreateLoad(elemLLTy, accSlot, "mon.acc");
             // For class/string/interface (pointer) elements, use
-            // ordinal strcmp (string), itable CompareTo (interface,
+            // bz_str_compare_cp (string, §9.6), itable CompareTo (interface,
             // #2770), or direct CompareTo call (class). For numeric
             // primitive elements, use direct icmp/fcmp.
             llvm::Value* shouldUpdate;
@@ -4056,26 +4407,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
             if (isStrElem || cmpMs || ifaceCmpFn) {
-                // Pointer-typed element: string-ordinal strcmp (string),
+                // Pointer-typed element: §9.6 ordinal string relation,
                 // itable CompareTo (interface, #2770), or direct
                 // CompareTo call (class).
                 llvm::Value* cmp = nullptr;
                 if (isStrElem) {
-                    llvm::Value* elData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), el, 0));
-                    llvm::Value* accData = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(stringType(), acc, 0));
-                    auto* strcmpFn = module_->getFunction("strcmp");
-                    if (!strcmpFn) {
-                        auto* ft = llvm::FunctionType::get(
-                            i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn = llvm::Function::Create(
-                            ft, llvm::Function::ExternalLinkage, "strcmp",
-                            module_.get());
-                    }
-                    cmp = builder_.CreateCall(strcmpFn,
-                                              {elData, accData},
-                                              "mon.cmp");
+                    // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): route
+                    // through the same width-aware `bz_str_compare_cp`
+                    // relation #4487 established — see the Min()/Max() arm
+                    // above for the full citation. `el`/`acc` are already
+                    // the full string OBJECTS.
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmp = builder_.CreateCall(
+                        cmpCpFn, {el, acc, builder_.getInt32(0)}, "mon.cmp");
                 } else if (ifaceCmpFn) {
                     cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
                                               "mon.cmp");
@@ -4092,8 +4437,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     : builder_.CreateICmpSLT(cmp, zero);
             } else if (elemLLTy->isIntegerTy()) {
                 shouldUpdate = isMaxOrNull
-                    ? builder_.CreateICmpSGT(el, acc)
-                    : builder_.CreateICmpSLT(el, acc);
+                    ? (elemIsUnsigned ? builder_.CreateICmpUGT(el, acc)
+                                      : builder_.CreateICmpSGT(el, acc))
+                    : (elemIsUnsigned ? builder_.CreateICmpULT(el, acc)
+                                      : builder_.CreateICmpSLT(el, acc));
             } else if (elemLLTy->isFloatTy() ||
                        elemLLTy->isDoubleTy()) {
                 shouldUpdate = isMaxOrNull
@@ -4866,7 +5213,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<M.Name>,
             // interface IComparable → bz$ifacecmp$<M.Name>,
-            // string → bz$strcmp, int/other → bz$intcmp.  Both reference-type
+            // string → bz$strcmp (routes through bz_str_compare_cp, fix #4495),
+            // int/other → bz$intcmp.  Both reference-type
             // names are MODULE-QUALIFIED (`mangledTypeName`), per §2.8.3
             // rule 3 — see buildObjectCompareToThunk for what the unqualified
             // class name cost (#3512).
@@ -4899,7 +5247,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // bz_array_sort as the comparator and called through.
                 if (!cmpFn) return nullptr;
             } else if (isStringElem) {
-                // String comparator: load two ptr elements, call strcmp on their data.
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this thunk used
+                // to extract each element's raw `.data` pointer and call plain
+                // `strcmp` — byte-wise AND NUL-terminated, disagreeing with
+                // `CompareTo`/`SortedSet<string>` after #4487 moved those to
+                // `bz_str_compare_cp`. `bz$strcmp` (the internal name is
+                // unchanged so no other reference to it needs to move) now
+                // routes through that SAME width-aware relation instead of
+                // being a second spelling of "ordinal string comparison" —
+                // the drift #2590 records.
                 auto* cmpName2 = "bz$strcmp";
                 cmpFn = module_->getFunction(cmpName2);
                 if (!cmpFn) {
@@ -4909,24 +5265,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
                     llvm::IRBuilder<> cmpB2(bb2);
                     // Each argument is a ptr* (pointer to bz.string*).
-                    // Load the bz.string* from each slot, then load data pointer.
+                    // Load the bz.string* from each slot — bz_str_compare_cp
+                    // takes the string OBJECTS directly, so no further
+                    // `.data`-field extraction is needed.
                     llvm::Value* aSlot = &*cmpFn->arg_begin();
                     llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    // Load data pointer (field 0) from bz.string struct
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    // Call strcmp
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn2 = declareC("bz_str_compare_cp", i32(),
+                                              {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn2, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 // Integer comparator
@@ -4982,6 +5331,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            // fix #4631 (Reverse half) per §29.12, v0.307: the in-place
+            // Sort()/Reverse() are structural — "they reposition" — so each
+            // must invalidate a live enumerator. Sort() gets its bump inside
+            // bz_array_sort; this swap loop is emitted inline and calls into
+            // the runtime nowhere, so the epoch is bumped explicitly here.
+            // The runtime helper no-ops when nothing can have repositioned
+            // (count <= 1), matching bz_array_sort's own guard.
+            {
+                auto* bumpFn = declareC("bz_array_note_repositioned",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(bumpFn, {recv});
+            }
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §5 LINQ: .OrderBy / .OrderByDescending are LAZY — see
@@ -5175,6 +5536,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // would reach bz_array_sort as the comparator and be called.
                 if (!cmpFn2) return nullptr;
             } else if (isStringElem2) {
+                // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): the `.Sorted()`
+                // twin of the `Sort()` thunk above — both build the SAME
+                // internal function name `bz$strcmp`, so only whichever runs
+                // first in a module actually emits the body, but the source is
+                // a separate inline copy (per narrow #3488's own note that this
+                // arm has drifted from Sort()'s before) and must be fixed here
+                // too. See the Sort() arm's comment for the full citation.
                 auto* cmpName = "bz$strcmp";
                 cmpFn2 = module_->getFunction(cmpName);
                 if (!cmpFn2) {
@@ -5187,17 +5555,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
                     llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
                     llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
-                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
-                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
-                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
-                    auto* strcmpFn2 = module_->getFunction("strcmp");
-                    if (!strcmpFn2) {
-                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
-                                                           "strcmp", module_.get());
-                    }
-                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                             {ptrTy(), ptrTy(), i32()});
+                    cmpB2.CreateRet(cmpB2.CreateCall(
+                        cmpCpFn, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
                 auto* cmpName = "bz$intcmp";
@@ -5341,9 +5702,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // reference identity (for emitRemoveElementEquality).  Per §28.11 v0.135
         // fix #619: Interface is now included (elementPolicyFor returns ClassOwned/
         // ClassBorrow for interface elements, collectionElemIsClass widened).
+        // fix #4642 (§8.6/§8.3/§4.10, v0.307): `Object` joins the row. A §8.6
+        // box is reference-shaped at the slot (a heap pointer bearing the §8.3
+        // object header) exactly like a class or interface element, but
+        // `elementPolicyFor` classifies it `Value` — §28.11 v0.135's table has
+        // no "boxed value" row, and deciding what its OWNING column should be
+        // (which disposer discharges a box?) is a §28.11 question this fix does
+        // not answer, so the policy table is deliberately left alone and the
+        // widening is made HERE, at the one predicate that asks the narrower
+        // question this dispatcher actually needs: "is this element slot a
+        // §8.3-object-header-bearing pointer?". `hasObjectHeaderEquality` is
+        // the existing named authority for exactly that property (the same one
+        // `genericBackingType`'s dictionary row and `collectionElemIsClass`
+        // use), not a new spelling of it.
+        //
+        // Leaving the policy table alone is safe here because the OWNING column
+        // is unreachable for `Object` regardless: sema rejects `OwningSet<Object>`
+        // / `OwningArray<Object>` at instantiation ("requires a class or
+        // interface element type … a primitive value type has no disposal
+        // obligation", stdlib §4.2/§14.4, #1327 — VERIFIED by probe, not
+        // assumed), so every `arrIsOwning && arrElemIsClass` gate below stays
+        // dead for `Object` and only the BORROWING `Set<Object>` arms and the
+        // shared membership scans (`Contains`/`IndexOf`/`Remove`) change. For
+        // those three the policy row is `ClassBorrow`-equivalent anyway: a null
+        // disposer and a pointer slot.
         bool arrElemIsClass =
             arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
-            arrElemPol.cat == ElementPolicy::Category::ClassBorrow;
+            arrElemPol.cat == ElementPolicy::Category::ClassBorrow ||
+            hasObjectHeaderEquality(arrElemRef);
 
         // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
         // found. Match semantics (issue #424 / §25.2): dispatched per element
@@ -5351,17 +5737,71 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // class user Equals/reference (§8.3/§8.4), string content (§4.6), value
         // type `==`. The query `target` is a PURE BORROW — not consumed or
         // disposed by IndexOf (§4.4/§4.5).
-        if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+        //
+        // fix #4744 (stdlib §4.4, v0.307): the declared signature is
+        // `IndexOf(item: T, startIndex: int := 0): int` — "first occurrence at
+        // or after startIndex, or -1; 0 <= startIndex <= Count required,
+        // IndexOutOfRangeException otherwise; startIndex = Count is legal and
+        // returns -1". This arm was gated on `args.size() == 1`, so the
+        // two-argument spelling typed as `int` in sema (ExprTypecheck_Calls'
+        // `m == "IndexOf"` arm types Array/OwningArray unconditionally) and
+        // then matched NO codegen arm — the #3079 "compiles, emits nothing"
+        // class: `Console.WriteLine(arr.IndexOf(7, 2))` printed nothing at all
+        // and `_ := arr.IndexOf(1, 4)` never raised. The scan below is
+        // unchanged; only the loop's start index and the §4.4 bounds guard are
+        // new.
+        //
+        // The two-argument form is `Array<T>`'s ALONE: stdlib §4.5 declares
+        // `OwningArray<T>.IndexOf(item: T): int` with no `startIndex`, and
+        // sema has already narrowed this head to exactly those two families
+        // (every other array-like head gets "no member `IndexOf`"), so
+        // `!arrIsOwning` is the `Array<T>`-only gate. An `OwningArray` receiver
+        // with two arguments keeps its existing behaviour rather than gaining
+        // surface the document does not declare.
+        if (m == "IndexOf" &&
+            (call.args.size() == 1 ||
+             (call.args.size() == 2 && call.args[1].value && !arrIsOwning)) &&
+            call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass from arrElemPol (hoisted above)
             // instead of calling collectionElemIsClass(recvTy, 0) per-handler.
             const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // fix #4744 / stdlib §4.4 (v0.307): the optional `startIndex`.
+            // Evaluated AFTER `item` — §22.5 fixes a call's argument
+            // expressions in call-site textual order — so the guard lands
+            // after the query is materialized. The admissible
+            // range is the CLOSED interval [0, Count] — `startIndex = Count` is
+            // legal and falls straight out of the loop as -1, which is why the
+            // upper guard is `>` and not `>=`.
+            llvm::Value* startIdx = builder_.getInt64(0);
+            if (call.args.size() == 2) {
+                llvm::Value* s = lowerExpr(*call.args[1].value);
+                if (!s) return nullptr;
+                if (!s->getType()->isIntegerTy()) return nullptr;
+                if (!s->getType()->isIntegerTy(64))
+                    s = builder_.CreateSExt(s, i64(), "iof.st64");
+                emitGuardThrow(
+                    builder_.CreateOr(
+                        builder_.CreateICmpSLT(s, builder_.getInt64(0),
+                                               "iof.stneg"),
+                        builder_.CreateICmpSGT(s, len, "iof.stoob")),
+                    "IndexOutOfRangeException");
+                startIdx = s;
+            }
             auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(startIdx, idxSlot);
             auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
             auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
             auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
@@ -5415,30 +5855,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // bare T value into the SAME tagged {i8, T} struct the (now 8-byte) esz
         // and the caller-side `arr[i]` decode expect. Without this the bare value
         // was stored at the nullable element's stride → garbage tag/value on read.
+        // fix #4579: the body moved verbatim to `ensureNullableElementValue`
+        // (LlvmBackend_impl.hpp) so the node-backed `LinkedList<T>` family —
+        // a different function in a different file, which never got this rule
+        // and stored bare inner bytes at the tagged stride — applies the SAME
+        // rule rather than a second spelling of it. Behaviour here is unchanged.
         auto ensureNullableElem = [&](llvm::Value* v) -> llvm::Value* {
-            const sema::TypeRef* elemTyRef =
-                (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
-            if (!elemTyRef) return v;
-            sema::TypeRef nvBuf;
-            const sema::TypeRef* nvTy = nullptr;
-            if (isNullableValueTy(elemTyRef)) {
-                nvTy = elemTyRef;
-            } else if (elemTyRef->nullable &&
-                       elemTyRef->kind == sema::TypeRef::Kind::Named &&
-                       !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
-                if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
-                    isNullableValueTy(&nvBuf))
-                    nvTy = &nvBuf;
-            }
-            if (!nvTy) return v;
-            llvm::StructType* expected = nullableValueStructTy(nvTy);
-            if (!expected || v->getType() == expected) return v;
-            // (b) null pointer → null tagged struct.
-            if (v->getType()->isPointerTy())
-                return nullableValueNull(nvTy);
-            // (a) inner scalar/struct value → {hasValue=1, v}.
-            return wrapNullableValue(nvTy, v);
+            return ensureNullableElementValue(
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr,
+                v);
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)
@@ -5470,6 +5896,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool isOwnedSetRecv = recvTy && recvTy->astNode &&
             recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
             recvTy->headName() == "OwningSet";
+        // fix #3491 / stdlib §4.10: isBorrowingSetRecv — the borrowing
+        // counterpart of isOwnedSetRecv, i.e. this call's receiver is exactly
+        // a `Set<T>` (class T). Gates the dedup handling for `.Add`/`.TryAdd`
+        // below on a BORROWING class-element set — Array<T>/Stack<T>/Queue<T>
+        // (which share the generic Add/Push/Enqueue handler further down)
+        // must keep their plain-append behavior.
+        bool isBorrowingSetRecv = recvTy && recvTy->astNode &&
+            recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "Set";
         // stdlib §4.10 / §8.3 (#837): OwningSet<T>.Add(owned item) for class-typed
         // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
         // user `Equals` override) it silently disposes the passed item rather than
@@ -5479,6 +5914,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): §8.6-box a bare value into an
+            // `Object`/interface element slot before the dedup scan and the
+            // append — `boxForTarget` is a byte-identical no-op for a class
+            // element or an already-reference source, so `OwningSet<C>` is
+            // unchanged. UNREACHABLE for `Object` today (sema rejects
+            // `OwningSet<Object>`, #1327); written for symmetry with the two
+            // borrowing arms below so the three set-insert sites cannot drift.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
             if (!emitSetDedupInsert(item)) return nullptr;
             // fix #1970 / §28.4 / §28.6: OwningSet<T>.Add takes `owned item`
             // (the dup branch disposes `item`, the non-dup branch transfers
@@ -5494,6 +5937,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // call on the dup branch). Mirrors the OwningArray.Add/Insert and
             // user-method nulling paths (#1955 / #1918).
             nullTransferredOwnedLocalSlot(call.args[0].value.get());
+            return llvm::ConstantInt::get(i32(), 0);  // unit
+        }
+        // fix #3491 / stdlib §4.10 / §8.3: Set<T>.Add(item: T) for class-typed
+        // T must DEDUPLICATE exactly like OwningSet<T>.Add above — "the
+        // element type supplies the identity" (§4.10) and adding an
+        // already-present element leaves the set unmodified. Before this fix
+        // a borrowing Set<T> with a class element fell through to the generic
+        // array Add/Push/Enqueue handler further below, which just appends
+        // unconditionally: `Count` grew and the element was stored twice even
+        // though `Contains` already reported it present (issue #3491).
+        // Uses the SAME shared emitArrayBackedSetInsert helper as
+        // OwningSet<T>.Add — the one fix-at-the-shared-path-once — but with a
+        // NULL dupDisposer (arrElemPol was computed with owningFamily=false
+        // above, so its ClassBorrow row already carries a null disposerThunk,
+        // per §28.11 v0.135: a BORROWING Set<T> must never dispose a rejected
+        // duplicate, unlike OwningSet<T>). `item` is a pure borrow
+        // (`Add(item: T)`, no `owned`) either way — appended or not.
+        // fix #1881 / §28.3: mirror the generic borrowing Add path's rule for
+        // a fresh owned producer argument used only as a borrow (`st.Add(new
+        // C(...))`) — Set<T>.Add never takes ownership of `item`, dup or not,
+        // so such a producer must still be disposed at the end of this full
+        // expression.
+        if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
+            isBorrowingSetRecv && arrElemIsClass && !arrIsOwning) {
+            llvm::Value* item = lowerExpr(*call.args[0].value);
+            if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): see the OwningSet.Add arm above.
+            // This is the reachable half — `Set<Object>.Add(1)` must store the
+            // §8.6 box, not the raw `i32`, or the dedup scan compares a value
+            // against a pointer and `bz_array_add` copies 8 bytes out of a
+            // 4-byte slot.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
+            if (!emitSetDedupInsert(item)) return nullptr;
+            if (isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return llvm::ConstantInt::get(i32(), 0);  // unit
         }
         // fix #1474 / stdlib §4.10: OwningSet<T>.UnionWith(owned other:
@@ -5894,10 +6372,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Semantics: scan the array for an EQUAL element; if not found, append
         // and return true; if found, dispose the passed item (caller transferred
         // ownership; §4.10 "on false, the item is disposed") and return false.
+        // fix #3491: widened to also cover the BORROWING Set<T>.TryAdd(item):
+        // bool (isBorrowingSetRecv) — before this fix no handler existed for a
+        // class-element receiver with arrIsOwning=false, so the call lowered
+        // to nullptr and the caller's local degraded to codegen's #2434
+        // zero-init fallback (the `bool` result was silently `false`
+        // regardless of the answer). arrElemPol was computed with
+        // owningFamily=arrIsOwning above, so on the borrowing arm its
+        // ClassBorrow row already carries a null disposerThunk — the
+        // `if (arrElemPol.disposerThunk)` dup-branch guard below therefore
+        // already does the right thing unmodified: a borrowing Set<T> must
+        // NOT dispose a rejected duplicate (§28.11 v0.135), only
+        // OwningSet<T> does.
         if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
-            arrElemIsClass && arrIsOwning) {
+            arrElemIsClass && (arrIsOwning || isBorrowingSetRecv)) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
+            // fix #4642 (§8.6/§4.10, v0.307): §8.6-box a bare value into an
+            // `Object`/interface element slot before this handler's own dedup
+            // scan and append (it does not route through
+            // `emitArrayBackedSetInsert`, so it needs the box in its own right).
+            // THE arm the issue's repro reaches: `s.TryAdd(1)` on a
+            // `Set<Object>`. A no-op for a class element or a reference source.
+            item = boxForTarget(item, arrElemRef, call.args[0].value.get());
+            if (!item->getType()->isPointerTy()) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "ta.len");
             // Create all BBs upfront to avoid CFG wiring errors.
@@ -5955,6 +6453,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "ta.r");
             phi->addIncoming(builder_.getFalse(), foundBB);
             phi->addIncoming(builder_.getTrue(), newBB);
+            // fix #3491 / #1881 / §28.3: a BORROWING Set<T>.TryAdd never takes
+            // ownership of `item` (dup or newly-inserted alike — the dup
+            // branch above deliberately does NOT dispose it, per §28.11's
+            // borrowing-column rule). Mirror the generic borrowing Add path's
+            // rule for a fresh owned producer argument used only as a borrow
+            // (`st.TryAdd(new C(...))`): dispose it here so it does not leak.
+            // Not applicable to the owning arm — OwningSet<T>.TryAdd's `owned
+            // item` always has its ownership resolved above (transferred into
+            // the array on insert, disposed on the dup path).
+            if (!arrIsOwning && isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(item);
             return phi;
         }
         // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T): owned T —
@@ -6315,6 +6824,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol
             // (hoisted above) instead of per-handler collectionElemIsClass calls.
@@ -6785,6 +7302,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
+            // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
+            // query into the Object/interface element slot ONCE, here, outside
+            // the per-element loop — otherwise the raw scalar never becomes the
+            // boxed pointer `emitRemoveElementEquality`'s Object arm requires
+            // and the value tail reads the element's BOX HEADER instead. See
+            // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            target = boxMembershipQuery(target, arrElemRef,
+                                        call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
             // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol.
             const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
@@ -7043,11 +7568,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // and Interface correctly per §28.11 v0.135 fix #619.
         llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
 
-        // Helper: extract string data/len from bz.string ptr
-        auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+        // Helper: extract the (data, code-point length, storage width) TRIPLE
+        // every string-key runtime entry point takes. fix #4499 (spec §4.6 /
+        // §8.3, v0.306): the width is not optional — a string's byte size is
+        // `len * width`, so a table given only (data, len) treats a code-point
+        // count as a byte count and truncates every width>1 key.
+        auto strDataLen = [&](llvm::Value* s)
+                -> std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> {
             llvm::Value* data = loadStringData(s);
             llvm::Value* len  = loadStringLen(s);
-            return {data, len};
+            llvm::Value* w    = loadStringWidth(s);   // i8, fix #4499
+            return {data, len, w};
         };
         // issues #343 / D3: spill a generic key value to a stack slot and return
         // the byte pointer the generic runtime entry points expect. A record key
@@ -7437,14 +7968,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (non-string) key keeps the pre-existing `bz_dict_keys_gen`
             // path unchanged.
             llvm::Value* dtLensArr = nullptr;
+            llvm::Value* dtWidthsArr = nullptr;   // fix #4499
             if (dtIsStringKey) {
                 auto* dtLensOutSlot = entryAlloca(ptrTy());
+                // fix #4499: the snapshot's third parallel spine — the per-key
+                // §4.6 storage width `decodeDictStringKeyAt` needs to rebuild
+                // the key at its true byte size (`len * width`).
+                auto* dtWidthsOutSlot = entryAlloca(ptrTy());
                 auto* kfnStr = declareC("bz_dict_keys_str",
                     llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(kfnStr,
-                    {recv, dtKeysOutSlot, dtLensOutSlot, dtCntSlot});
-                dtLensArr = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                    {recv, dtKeysOutSlot, dtLensOutSlot, dtWidthsOutSlot,
+                     dtCntSlot});
+                dtLensArr   = builder_.CreateLoad(ptrTy(), dtLensOutSlot);
+                dtWidthsArr = builder_.CreateLoad(ptrTy(), dtWidthsOutSlot);
             } else {
                 auto* kfn = declareC("bz_dict_keys_gen",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
@@ -7479,9 +8017,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (dtIsStringKey) {
                     auto* sortStrFn = declareC("bz_sort_kv_str",
                         llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #4499: the width spine is permuted with keys/lens/
+                    // values — otherwise a sorted key's bytes and its width
+                    // come from different entries.
                     builder_.CreateCall(sortStrFn,
-                        {dtKeysArr, dtLensArr, dtValsArr, dtCnt});
+                        {dtKeysArr, dtLensArr, dtWidthsArr, dtValsArr, dtCnt});
                 } else if (llvm::Function* cmpFn =
                                buildSortedKeyComparator(keyTy)) {
                     auto* sortFn = declareC("bz_sort_kv_gen",
@@ -7506,7 +8047,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // (see this arm's opening comment), or safely leaked otherwise.
             llvm::Value* dtKeyDecoded =
                 dtIsStringKey
-                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtIdx).first
+                    ? decodeDictStringKeyAt(dtKeysArr, dtLensArr, dtWidthsArr,
+                                            dtIdx).first
                     : decodeDictGenericKeyAt(dtKeyLlvm, dtKeysArr, dtIdx,
                                              "dictterm.kgen").first;
 
@@ -7557,8 +8099,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // spine from `dtKeysArr`, freed by the for-in path's own endBB
             // (`lensArr`) the same way — a generic key never allocates one
             // (`dtLensArr` stays null).
-            if (dtIsStringKey)
+            if (dtIsStringKey) {
                 builder_.CreateCall(dtFreeFn, {dtLensArr});
+                builder_.CreateCall(dtFreeFn, {dtWidthsArr});   // fix #4499
+            }
             builder_.CreateCall(dtFreeFn, {dtValsArr});
 
             // #1013-style reclaim: a fresh unbound Dictionary/SortedDictionary
@@ -7638,9 +8182,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
             }
-            auto [kd, kl] = strDataLen(k);
-            auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
-            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            auto [kd, kl, kw] = strDataLen(k);
+            auto* fn = declareC("bz_dict_contains_str", i1(),
+                                {ptrTy(), ptrTy(), i64(), i8()});
+            llvm::Value* r = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.contains");
             // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into
             // the table BY VALUE (bz_dict_contains_str reads kd/kl, never the
             // bz_string* itself — unlike the VALUE slot, which is retained
@@ -7672,10 +8217,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy()});
                 isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "tryadd.dup");
             } else {
-                auto [kd0, kl0] = strDataLen(k);
+                auto [kd0, kl0, kw0] = strDataLen(k);
                 auto* cf = declareC("bz_dict_contains_str", i1(),
-                                    {ptrTy(), ptrTy(), i64()});
-                isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "tryadd.dup");
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "tryadd.dup");
             }
             auto* dupBB = llvm::BasicBlock::Create(llvm_, "tryadd.dup.disp",
                                                    currentFn_);
@@ -7706,11 +8251,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_set_str",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             }
             llvm::BasicBlock* insEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
@@ -7777,11 +8322,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "add.dup"),
                         "ArgumentException");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
                     llvm::Value* isDup =
-                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                        builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                     // fix #3703 / §28.9: the real insert below re-derives
                     // kd/kl from `k` a SECOND time and releases a fresh +1 KEY
                     // producer only after that insert — which never runs on
@@ -7818,10 +8363,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)},
                                                 "add.dup");
                 } else {
-                    auto [kd0, kl0] = strDataLen(k);
+                    auto [kd0, kl0, kw0] = strDataLen(k);
                     auto* cf = declareC("bz_dict_contains_str",
-                                        i1(), {ptrTy(), ptrTy(), i64()});
-                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup");
+                                        i1(), {ptrTy(), ptrTy(), i64(), i8()});
+                    isDup = builder_.CreateCall(cf, {recv, kd0, kl0, kw0}, "add.dup");
                 }
                 auto* dupBB  = llvm::BasicBlock::Create(
                     llvm_, "add.dup.disp", currentFn_);
@@ -7871,10 +8416,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     nullTransferredOwnedLocalSlot(call.args[1].value.get());
                 return llvm::ConstantInt::get(i32(), 0);
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                                {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+            builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
             // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for
             // OwningDictionary<K,V> with a string key, the value (arg 1) has
             // just been transferred. Null the caller's bare owned local/param
@@ -7938,18 +8483,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
-            auto [kd, kl] = strDataLen(k);
+            auto [kd, kl, kw] = strDataLen(k);
             llvm::Value* removeResult;
             if (valDisp) {
                 // OwningDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
                 removeResult = builder_.CreateCall(
-                    fn, {recv, kd, kl, llvm::cast<llvm::Value>(valDisp)},
+                    fn, {recv, kd, kl, kw, llvm::cast<llvm::Value>(valDisp)},
                     "dict.remove");
             } else {
-                auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
-                removeResult = builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+                auto* fn = declareC("bz_dict_remove_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), i8()});
+                removeResult = builder_.CreateCall(fn, {recv, kd, kl, kw}, "dict.remove");
             }
             // fix #3703 / §28.9: Remove never throws (absent key just returns
             // false), so `k`'s single use above (kd/kl) is unconditionally
@@ -7979,10 +8525,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "pv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "pv.found");
                 // fix #3703 / §28.9: this call is the sole use of `k`'s
                 // buffer (kd2/kl2 alias it); release a fresh +1 KEY producer
@@ -8049,10 +8595,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
                                             "tpv.found");
             } else {
-                auto [kd2, kl2] = strDataLen(k);
+                auto [kd2, kl2, kw2] = strDataLen(k);
                 auto* fn = declareC("bz_dict_pop_value_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, kw2, tmpSlot},
                                             "tpv.found");
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryPopValue
                 // never throws, so release a fresh +1 KEY producer now.
@@ -8147,10 +8693,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; TryGetValue
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8240,10 +8786,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                     {ptrTy(), ptrTy(), ptrTy()});
                 found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
-                auto [kd, kl] = strDataLen(k);
+                auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
                 // fix #3703 / §28.9: sole use of `k`'s buffer; GetOrNull
                 // never throws, so release a fresh +1 KEY producer now.
                 if (isPlusOneStringProducer(call.args[0].value.get()))
@@ -8374,8 +8920,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             llvm::Value* genKey = keyTy ? genKeyPtr(k) : nullptr;
-            llvm::Value* strKd = nullptr, *strKl = nullptr;
-            if (!keyTy) { auto p = strDataLen(k); strKd = p.first; strKl = p.second; }
+            llvm::Value* strKd = nullptr, *strKl = nullptr, *strKw = nullptr;
+            if (!keyTy) {
+                auto p = strDataLen(k);
+                strKd = std::get<0>(p); strKl = std::get<1>(p);
+                strKw = std::get<2>(p);   // fix #4499
+            }
 
             // Lower the factory closure (K) -> V. Build a synthetic Function
             // TypeRef so an unannotated lambda param/return picks up the right
@@ -8461,8 +9011,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, genKey, tmpSlot});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot});
             }
 
             auto* missBB = llvm::BasicBlock::Create(llvm_, "goa.miss", currentFn_);
@@ -8496,8 +9046,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, encoded});
             } else {
                 auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, encoded});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, encoded});
             }
             // Re-read the now-stored slot so the returned value is the BORROW of the
             // stored slot (mirrors the indexer-get-borrow; for a record value this
@@ -8509,8 +9059,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateCall(fn, {recv, genKey, tmpSlot2});
             } else {
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
-                builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot2});
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, strKw, tmpSlot2});
             }
             llvm::Value* missSlot = builder_.CreateLoad(ptrTy(), tmpSlot2, "goa.mslot");
             llvm::Value* missVal = decodeSlot(missSlot);
@@ -8617,22 +9167,29 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                               : "bz_dict_min_key_str";
                 auto* dataSlot = entryAlloca(ptrTy());
                 auto* lenSlot  = entryAlloca(i64());
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                // fix #4499: the key's §4.6 storage width is a third out-slot.
+                // Pre-fix this site stamped width 1 on every returned key, so a
+                // width>1 MinKey/MaxKey was reinterpreted as `len` Latin-1 code
+                // points over a buffer that actually held `len * width` bytes.
+                auto* wSlot    = entryAlloca(i8Ty);
                 builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), dataSlot);
                 builder_.CreateStore(builder_.getInt64(0), lenSlot);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), wSlot);
                 auto* mmStrFn = declareC(rtNameStr, i1(),
-                                         {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot});
-                // data and len are now filled; build a heap bz_string object.
+                                         {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot, wSlot});
+                // data, len and width are now filled; build a heap bz_string.
                 llvm::Value* kdata = builder_.CreateLoad(ptrTy(), dataSlot, "sd.kd");
                 llvm::Value* klen  = builder_.CreateLoad(i64(), lenSlot, "sd.kl");
-                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* kwid  = builder_.CreateLoad(i8Ty, wSlot, "sd.kw");
                 uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
                 auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
                 llvm::Value* strObj = builder_.CreateCall(callocFn,
                     {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
                 builder_.CreateStore(kdata, builder_.CreateStructGEP(stringType(), strObj, 0));
                 builder_.CreateStore(klen,  builder_.CreateStructGEP(stringType(), strObj, 1));
-                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStore(kwid,
                     builder_.CreateStructGEP(stringType(), strObj, 2));
                 initStringRc(strObj);
                 return strObj;
@@ -9982,7 +10539,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // static handlers an EMPTY `cls` (which matches no class name) when the
     // receiver is non-identifier so they all fall through to the instance
     // handlers. (No code after this point dereferences `id` except `cls`.)
-    const std::string_view cls = id ? id->name : std::string_view{};
+    //
+    // fix #5012 (§2.7, §6.7, v0.307): a module-qualified
+    // (`System.Threading.Task.FromResult(...)`) or alias-qualified
+    // (`<alias>.Task.FromResult(...)`) `Task` receiver is not a bare
+    // IdentifierExpr, so `id` is null and `cls` would otherwise be empty —
+    // matching no class name and silently falling through to the instance
+    // handlers below (which do nothing useful for a class-name receiver, so
+    // the call failed to lower and either degraded to a zero value or
+    // silently no-op'd depending on call context). Sema's
+    // `resolveMemberAccess` stamps this node's exprSymbol with the SAME
+    // builtin TypeSymbol the bare `Task` identifier gets (mirroring
+    // `ExprTypecheck_Exprs.cpp`'s `setExprSymbol`), so recognize it the same
+    // way sema's `colName` does — by symbol identity, not by re-deriving the
+    // qualifier structurally (codegen has no access to sema's private
+    // alias/module-path state).
+    std::string_view cls = id ? id->name : std::string_view{};
+    if (cls.empty()) {
+        if (auto* tsym = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
+            if (tsym == ctx_.builtinClassSym("Task")) cls = "Task";
+        }
+    }
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes
@@ -10070,8 +10647,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.SetInsertPoint(deadBB);
             return llvm::ConstantInt::get(i32(), 0);  // nominal value, never reached
         }
-        // Environment.GetEnvironmentVariable(name): string? — getenv
-        if (m == "GetEnvironmentVariable" && call.args.size() == 1 &&
+        // fix #2348 (stdlib §2.4, v0.307): `Environment.Get(name): string?`.
+        // The member was renamed at v0.231 (`GetEnvironmentVariable` → `Get`,
+        // the BREAKING item of that revision's migration note, whose in-tree
+        // exposure it counts as exactly this one codegen dispatch site). Only
+        // the pre-rename spelling was matched here, so the CURRENT spelling
+        // reached no arm at all: `var v := Environment.Get("HOME");` compiled,
+        // exited 0, and degraded its local to a zero-initialized slot behind
+        // `internal: … #2434` — measured printing `<null>` for a variable that
+        // is set. The long spelling is gone, not aliased: §2.4 declares `Get`.
+        if (m == "Get" && call.args.size() == 1 &&
             call.args[0].value) {
             llvm::Value* nameStr = lowerExpr(*call.args[0].value);
             if (!nameStr) return nullptr;
@@ -10124,6 +10709,53 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             phi->addIncoming(nullPtr, entBB);
             phi->addIncoming(strObj, okEnd);
             return phi;
+        }
+        // fix #2348 (stdlib §2.4, v0.307): `Set(name: string, value: string?)`
+        // — "value = null removes the variable; an empty name, or one
+        // containing \"=\", raises ArgumentException". Never implemented under
+        // any spelling, and a UNIT-returning statement call that reaches no arm
+        // is the SILENT end of the #3079 family: it leaves no local to degrade,
+        // so not even the `#2434` note fires. Measured pre-fix:
+        // `Environment.Set("K", "v"); Console.WriteLine(Environment.Get("K"))`
+        // compiled clean and wrote nothing.
+        if (m == "Set" && call.args.size() == 2 && call.args[0].value &&
+            call.args[1].value) {
+            llvm::Value* nameStr = lowerExpr(*call.args[0].value);
+            llvm::Value* valStr  = lowerExpr(*call.args[1].value);
+            if (!nameStr || !valStr) return nullptr;
+            llvm::Value* nameData = loadStringData(nameStr);
+            auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+            // §2.4 band-1 argument defects: empty name, or a name containing
+            // '='. `strchr(name, '=') != null` is the containment test.
+            llvm::Value* emptyName = builder_.CreateICmpEQ(
+                builder_.CreateLoad(i8Ty3, nameData),
+                llvm::ConstantInt::get(i8Ty3, 0), "envs.empty");
+            auto* strchrFn = declareC("strchr", ptrTy(), {ptrTy(), i32()});
+            llvm::Value* eqPos = builder_.CreateCall(
+                strchrFn, {nameData, builder_.getInt32('=')}, "envs.eq");
+            llvm::Value* hasEq = builder_.CreateICmpNE(
+                eqPos, llvm::ConstantPointerNull::get(ptrTy()), "envs.hasEq");
+            emitGuardThrow(builder_.CreateOr(emptyName, hasEq, "envs.bad"),
+                           "ArgumentException");
+            // value = null → unsetenv(name); otherwise setenv(name, value, 1).
+            auto* setBB   = llvm::BasicBlock::Create(llvm_, "envs.set",   currentFn_);
+            auto* unsetBB = llvm::BasicBlock::Create(llvm_, "envs.unset", currentFn_);
+            auto* joinBB  = llvm::BasicBlock::Create(llvm_, "envs.join",  currentFn_);
+            llvm::Value* isNullVal = builder_.CreateICmpEQ(
+                valStr, llvm::ConstantPointerNull::get(ptrTy()), "envs.isNull");
+            builder_.CreateCondBr(isNullVal, unsetBB, setBB);
+            builder_.SetInsertPoint(setBB);
+            auto* setenvFn =
+                declareC("setenv", i32(), {ptrTy(), ptrTy(), i32()});
+            builder_.CreateCall(setenvFn, {nameData, loadStringData(valStr),
+                                           builder_.getInt32(1)});
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(unsetBB);
+            auto* unsetenvFn = declareC("unsetenv", i32(), {ptrTy()});
+            builder_.CreateCall(unsetenvFn, {nameData});
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            return llvm::ConstantInt::get(i32(), 0);  // unit
         }
     }
 
@@ -10897,27 +11529,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return t && t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::String;
         };
-        // fix #2785: ORDINAL comparison on the two data pointers — the same
+        // fix #2785: ORDINAL comparison on the two string OBJECTS — the same
         // lowering `Array<string>.Min()` already uses (tryLowerCollectionInstanceCall's
         // `isStrElem` arm), so `Math.Min` and the collection form agree by
         // construction. stdlib §9.6 fixes string ordering as ordinal.
+        //
+        // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this used to extract
+        // each operand's raw `.data` pointer and call plain `strcmp` —
+        // byte-wise AND NUL-terminated, disagreeing with `CompareTo`/
+        // `SortedSet<string>` after #4487 moved those to `bz_str_compare_cp`.
+        // Routes through that SAME width-aware relation now, keeping the
+        // "agree by construction" comment above true post-#4487 too.
         auto emitStrCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
             if (!a || !b || !a->getType()->isPointerTy() ||
                 !b->getType()->isPointerTy())
                 return nullptr;
-            llvm::Value* aData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), a, 0));
-            llvm::Value* bData = builder_.CreateLoad(
-                ptrTy(), builder_.CreateStructGEP(stringType(), b, 0));
-            auto* strcmpFn = module_->getFunction("strcmp");
-            if (!strcmpFn) {
-                auto* ft =
-                    llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                strcmpFn = llvm::Function::Create(
-                    ft, llvm::Function::ExternalLinkage, "strcmp",
-                    module_.get());
-            }
-            return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
+            auto* cmpCpFn = declareC("bz_str_compare_cp", i32(),
+                                     {ptrTy(), ptrTy(), i32()});
+            return builder_.CreateCall(cmpCpFn, {a, b, builder_.getInt32(0)},
+                                       "mm.strcmp");
         };
         // fix #2786 (stdlib §2.2, spec §14.2, v0.240): the float fallback below
         // is reached by anything the integer, CompareTo (#1141/#1148/#2782) and
@@ -13060,17 +13690,36 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             {rng, builder_.getInt32(0),
                              builder_.getInt32(2147483647)});
                     }
+                    // stdlib §2.7: `Next(maxValue)` is documented
+                    // "0..<maxValue; maxValue < 0:
+                    // ArgumentOutOfRangeException". The guard is emitted
+                    // BEFORE the call, the same order `Math.DivRem` (#3580)
+                    // and `/` (§6.1) emit their zero-divisor trap in, so the
+                    // fault is raised rather than a nonsense range reaching
+                    // `bz_random_next_int`.
                     if (mname == "Next" && call.args.size() == 1 && call.args[0].value) {
                         llvm::Value* hi = lowerExpr(*call.args[0].value);
+                        if (!hi) return nullptr;
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(
+                                hi, llvm::ConstantInt::get(hi->getType(), 0)),
+                            "ArgumentOutOfRangeException");
                         auto* fn = declareC("bz_random_next_int", i32(),
                                             {ptrTy(), i32(), i32()});
                         return builder_.CreateCall(fn,
                             {rng, builder_.getInt32(0), hi});
                     }
+                    // stdlib §2.7: `Next(minValue, maxValue)` is documented
+                    // "minValue > maxValue: ArgumentOutOfRangeException".
+                    // `minValue = maxValue` is the documented empty range,
+                    // not a fault, so the test is strictly greater-than.
                     if (mname == "Next" && call.args.size() == 2 &&
                         call.args[0].value && call.args[1].value) {
                         llvm::Value* lo = lowerExpr(*call.args[0].value);
                         llvm::Value* hi = lowerExpr(*call.args[1].value);
+                        if (!lo || !hi) return nullptr;
+                        emitGuardThrow(builder_.CreateICmpSGT(lo, hi),
+                                       "ArgumentOutOfRangeException");
                         auto* fn = declareC("bz_random_next_int", i32(),
                                             {ptrTy(), i32(), i32()});
                         return builder_.CreateCall(fn, {rng, lo, hi});

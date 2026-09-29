@@ -1,7 +1,15 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901)
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 
 namespace bezel::codegen {
+
+// fix #4901: defined in LlvmBackend_Calls2.cpp beside the `.Subscribe`/`.Add`
+// arms it also gates; shared with tryLowerEventCompound's `+=` route below.
+bool sharedEventHandlerAdmissible(
+        sema::SemaContext& ctx, const ast::Expr* handler,
+        const ast::Expr* receiver, const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName);
 
 namespace {
 // §23.4 (#774): exact structural match between an indexer's first parameter
@@ -615,10 +623,31 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return nullptr;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. The runtime reads `key_size`
+    // bytes from the key pointer (bz_dict_try_get_gen -> dict_find_gen ->
+    // hash_fn/eq_fn, both `key_size`-byte memcpys); with a bare `int` key the
+    // codegen lowered the value as i32, spilled it to a 4-byte stack slot, and
+    // the runtime then read 12 B of stack redzone past it — MEASURED under
+    // ASan as a stack-buffer-overflow in bz$valkey$hash at
+    // bz_dict_try_get_gen. boxForTarget (LlvmBackend_Layout.cpp) mints a fresh
+    // §8.6 box (24 B / 1 alloc for an int payload) and returns the box
+    // pointer; the runtime then reads a 16-byte box (vtable, rc, payload)
+    // align. boxForTarget is a no-op for a reference source (the pre-boxed
+    // `var o: Object := 1;` spelling) and for a non-Object/interface key
+    // (Dictionary<int, V> etc.), so every already-correct shape stays
+    // byte-identical — control rows in
+    // dict_object_bare_value_key_indexer_set_4640_test.cpp prove that.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     auto* tmpSlot = entryAlloca(ptrTy());
     llvm::Value* found;
     if (keyTy) {
         // spill the key value to a slot (record keys arrive as an address).
+        // fix #4640: a freshly-boxed key is already a pointer; the spill arm
+        // is skipped for it (k->getType()->isPointerTy()) — the box pointer IS
+        // the key slot's content.
         llvm::Value* keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
@@ -631,9 +660,10 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     } else {
         llvm::Value* kd = loadStringData(k);
         llvm::Value* kl = loadStringLen(k);
+        llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
         // fix #3703 / §28.9: a Dictionary<K,V> string KEY is copied into the
         // table BY VALUE (bz_dict_try_get_str reads kd/kl and never retains
         // the bz_string* itself — unlike the VALUE slot, which stores the
@@ -852,13 +882,25 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);     // evaluate once
     if (!k) return nullptr;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. Same defect as
+    // lowerCollectionIndexerGet: bz_dict_try_get_gen reads `key_size` bytes
+    // from the key pointer, so a bare-int key on a 4-byte stack slot is a
+    // stack-buffer-overflow in bz$valkey$hash. See that site for the full
+    // rationale; boxForTarget is a no-op for reference / non-Object keys.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     auto* tmpSlot = entryAlloca(ptrTy());
     llvm::Value* found;
     llvm::Value* keyPtr = nullptr;     // generic-key path needs it again to null
     llvm::Value* kd = nullptr;         // string-key path needs it again to null
     llvm::Value* kl = nullptr;
+    llvm::Value* kw = nullptr;         // fix #4499: storage width rides along
     if (keyTy) {
         keyPtr = k;
+        // fix #4640: a freshly-boxed key is already a pointer; the spill arm
+        // is skipped for it (k->getType()->isPointerTy()).
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
             builder_.CreateStore(k, slot);
@@ -870,9 +912,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     } else {
         kd = loadStringData(k);
         kl = loadStringLen(k);
+        kw = loadStringWidth(k);        // fix #4499
         auto* fn = declareC("bz_dict_try_get_str", i1(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
     }
     // §4.8/§4.9: a `move` of an absent key raises, same as the indexer get.
     // fix #3703 / §28.9: unlike lowerCollectionIndexerGet (a SINGLE read of
@@ -911,8 +954,8 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         builder_.CreateCall(fn, {recv, keyPtr, nullV});
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, nullV});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, nullV});
         // fix #3703 / §28.9: kd/kl alias k's own buffer and are read TWICE in
         // this function (the try_get probe above and this null-store); only
         // now, after the last read, is it safe to discharge a fresh +1 KEY
@@ -921,6 +964,71 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             emitStringRelease(k);
     }
     return moved;   // owned class object pointer, taken out of the slot
+}
+
+
+// fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): shared
+// promotion half of the dictionary-VALUE encode — see the declaration in
+// LlvmBackend_impl.hpp for the full rationale. Lifts `v` to the nullable-
+// value tagged `{i8,T}` struct when `valTy` is a nullable value type and `v`
+// is not already that exact struct; returns `v` unchanged otherwise. This is
+// verbatim the promotion block `lowerCollectionIndexerSet`'s `encodeValue`
+// used to run inline (issue #544 / #5078), factored out so
+// `materializeHeapDictLiteral`'s `encodeVal` (LlvmBackend_Setup.cpp) can call
+// the SAME logic for a dictionary LITERAL's `["k": v]` entries instead of
+// passing `v` straight through — the gap that let a literal `null` reach the
+// runtime as a bare `ptr null` (Bug A) and let a literal non-null scalar
+// (`["k": 99]` against `Dictionary<K, long?>`) reach the runtime as a raw,
+// untagged inttoptr'd value that later crashed a read-back AND the disposing
+// overwrite's `free()` of it (Bug B — MEASURED: both bugs share this one
+// root cause; #5084's own "Bug B" repro's `d["k"] := null;` overwrite
+// SIGABRTs freeing the bogus untagged `99` stored by the literal, not
+// anything wrong with `bz_dict_set_str_disposing` itself).
+llvm::Value* Emitter::liftDictValueToNullableStruct(
+        llvm::Value* v, const sema::TypeRef* valTy,
+        const ast::Expr* valueExpr) {
+    if (!valTy || !isNullableValueTy(valTy)) return v;
+    if (!v->getType()->isStructTy()) {
+        if (v->getType()->isPointerTy() &&
+            llvm::isa<llvm::ConstantPointerNull>(v)) {
+            return nullableValueNull(valTy);   // null literal → {i8=0, T=0}
+        }
+        if (!v->getType()->isPointerTy()) {
+            // fix #5005 (§5.1 `S → T → T?`, v0.307): widen a narrower numeric
+            // `v` to the nullable's payload width BEFORE `wrapNullableValue`,
+            // which otherwise hands an undersized value to its
+            // `reinterpretToType` alloca round-trip.
+            llvm::StructType* nst = nullableValueStructTy(valTy);
+            llvm::Type* payloadTy = nst ? nst->getElementType(1) : nullptr;
+            if (payloadTy &&
+                (v->getType()->isIntegerTy() ||
+                 v->getType()->isFloatingPointTy()) &&
+                v->getType() != payloadTy)
+                v = coerceNumericToType(
+                    v, payloadTy, valueExpr && isUnsignedTargetExpr(*valueExpr));
+            return wrapNullableValue(valTy, v);  // scalar T → {i8=1, T=v}
+        }
+        return v;
+    }
+    // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — the caller
+    // passed the inner record struct directly (e.g. `d["k"] := new Item(42)`
+    // implicitly coerced to Item?): wrap into {i8=1, Item} before boxing so
+    // decode always finds the full tagged struct. Detect by comparing against
+    // the outer tagged struct.
+    if (v->getType() != nullableValueStructTy(valTy)) {
+        // fix #5078 (§5.1 "Nullable conversions", v0.307): `v` may instead
+        // ALREADY be the tagged `{i8, S}` struct of a DIFFERENT nullable-
+        // VALUE type — try the shared unwrap/convert/rewrap lift first (a
+        // no-op unless `v` is itself the tagged shape) and fall back to the
+        // inner-record wrap only when it declines.
+        llvm::StructType* wantSt = nullableValueStructTy(valTy);
+        llvm::Value* lifted = liftNullableValueToSlot(
+            v, wantSt, valueExpr && isUnsignedTargetExpr(*valueExpr));
+        return (lifted->getType() == wantSt)
+                   ? lifted
+                   : wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
+    }
+    return v;
 }
 
 
@@ -1113,8 +1221,66 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 if (expected && val->getType() != expected) {
                     if (val->getType()->isPointerTy())
                         val = nullableValueNull(elemTyRef);  // null → tagged null
-                    else
+                    else {
+                        // fix #5078 (§5.1 "Nullable conversions", v0.307):
+                        // `val` may ALREADY be the tagged `{i8, S}` struct of
+                        // a DIFFERENT nullable-value type — a nullable-VALUE
+                        // RHS (`arr[0] := ki;` with `ki: int?`,
+                        // `arr: Array<double?>`) lowers to `{i8, i32}` before
+                        // it ever reaches here. The #5017 lift for this exact
+                        // shape lives in lowerStmt's shared `elemTy`-based
+                        // preamble (LlvmBackend_Stmts.cpp), but this
+                        // indexer-setter arm is a SEPARATE `IndexExpr` branch
+                        // that `return`s before reaching it, so a tagged-
+                        // struct `val` reached the scalar-only #5005 widen
+                        // below unconverted (not `isIntegerTy()` /
+                        // `isFloatingPointTy()`) and then `wrapNullableValue`
+                        // — whose `reinterpretToType` round-trip does not
+                        // reshape a MISMATCHED struct — handed its
+                        // `insertvalue` a `{i8, i32}` where a `double` payload
+                        // was expected. MEASURED: "Invalid InsertValueInst
+                        // operands!" / IR verification failed on
+                        // `arr[0] := ki;` (`Array<double?>`, `ki: int?`), and
+                        // identically for `??=`, a null source, and an
+                        // unsigned (`uint?`) source. `liftNullableValueToSlot`
+                        // is a no-op (returns `val` unchanged) unless `val` is
+                        // ITSELF that tagged shape, so trying it first is safe
+                        // before the bare-scalar #5005 path below, which still
+                        // handles the non-tagged (`int`/`double`) RHS case.
+                        llvm::Value* lifted = liftNullableValueToSlot(
+                            val, expected,
+                            valueExpr && isUnsignedTargetExpr(*valueExpr));
+                        if (lifted->getType() == expected) {
+                            val = lifted;
+                        } else {
+                        // fix #5005 (§5.1 `S → T → T?`, v0.307): a NARROWER
+                        // numeric `val` (e.g. an `int` at an `Array<long?>`
+                        // element, `a[i] := k;`) reached `wrapNullableValue`
+                        // at its source width — `wrapNullableValue`'s
+                        // `reinterpretToType` round-trips through an alloca
+                        // sized to the DESTINATION (payload) type, so an
+                        // undersized `i32` store there left the high bytes
+                        // uninitialized and the subsequent `insertvalue`
+                        // rejected the width mismatch outright: MEASURED
+                        // "Invalid InsertValueInst operands!" / IR
+                        // verification failure on `Array<long?>[i] := k;`
+                        // with `k: int`. Widen against the payload width
+                        // FIRST — the same `coerceNumericToType` widen the
+                        // declaration-initializer path (fix #839) and the
+                        // local/field reassignment path (fix #5005, above in
+                        // LlvmBackend_Stmts.cpp) both perform — so
+                        // `wrapNullableValue` always receives a value already
+                        // at the payload's width.
+                        llvm::Type* payloadTy = expected->getElementType(1);
+                        if ((val->getType()->isIntegerTy() ||
+                             val->getType()->isFloatingPointTy()) &&
+                            val->getType() != payloadTy)
+                            val = coerceNumericToType(
+                                val, payloadTy,
+                                valueExpr && isUnsignedTargetExpr(*valueExpr));
                         val = wrapNullableValue(elemTyRef, val);  // scalar → {1, val}
+                        }
+                    }
                 }
             }
         }
@@ -1305,24 +1471,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // {i8,T} struct BEFORE the struct-boxing branch below, so the box always
     // holds the full tagged struct and the decode path (lowerCollectionIndexerGet
     // / TryGetValue) can safely load {i8,T} from the box.
+    // fix #5084 (stdlib §4.8 / §5.1, v0.307): this promotion now lives in the
+    // shared `liftDictValueToNullableStruct` (declared in LlvmBackend_impl.hpp,
+    // defined just above this function) so `materializeHeapDictLiteral`'s own
+    // value encode (LlvmBackend_Setup.cpp) can reuse it verbatim instead of
+    // re-deriving it — see that function's header comment for the bug this
+    // sharing fixes.
     auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
-        if (valNullableVal && !v->getType()->isStructTy()) {
-            if (v->getType()->isPointerTy() &&
-                llvm::isa<llvm::ConstantPointerNull>(v)) {
-                v = nullableValueNull(valTy);    // null literal → {i8=0, T=0}
-            } else if (!v->getType()->isPointerTy()) {
-                v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
-            }
-        }
-        // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — when the
-        // caller passes the inner record struct directly (e.g. `d["k"] := new Item(42)`
-        // implicitly coerced to Item?), the value is an Item struct (not the
-        // tagged {i8,Item} struct).  The promotion above skips it (isStructTy() is
-        // true).  Wrap into {i8=1, Item} before boxing so decode always finds the
-        // full tagged struct.  Detect by comparing against the outer tagged struct.
-        if (valNullableVal && v->getType()->isStructTy() &&
-            v->getType() != nullableValueStructTy(valTy))
-            v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
+        v = liftDictValueToNullableStruct(v, valTy, valueExpr);
         // fix #3780 (§4.8 / §28.9, v0.286): route the boxing decision through
         // the #3770/#3768 shared predicate instead of this arm's own
         // `(valRec || valNullableVal) && isStructTy()` copy — see
@@ -1405,6 +1561,32 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return false;
+    // fix #4640 (§8.6 / stdlib §4.8, v0.307): §8.6-box a bare-value key against
+    // an Object/interface-typed Dictionary slot. The runtime reads `key_size`
+    // bytes from the key pointer (bz_dict_set_gen -> memcpy(kc, key,
+    // d->key_size)); with a bare `int` key the codegen lowered the value as
+    // i32, spilled it to a 4-byte stack slot, and the runtime then read 12 B
+    // of stack redzone past it — MEASURED under ASan as a stack-buffer-overflow
+    // in bz$valkey$hash at bz_dict_set_gen:925. boxForTarget
+    // (LlvmBackend_Layout.cpp) mints a fresh §8.6 box (24 B / 1 alloc for an
+    // int payload) and returns the box pointer; the runtime then reads a
+    // 16-byte box (vtable, rc, payload) align. boxForTarget is a no-op for a
+    // reference source (the pre-boxed `var o: Object := 1;` spelling) and for
+    // a non-Object/interface key (Dictionary<int, V> etc.), so every
+    // already-correct shape stays byte-identical — control rows in
+    // dict_object_bare_value_key_indexer_set_4640_test.cpp prove that.
+    //
+    // ⚠ MEASURED LEAK, deliberately not discharged. The runtime's
+    // bz_dict_set_gen memcpys the 16 box bytes into a freshly malloc'd table
+    // entry (kc) and frees its own copy; the original box allocation is then
+    // unreferenced — 24 B / 1 alloc per call. Per the same trade #4619
+    // declined for the Array<Object> membership-query residual (24 B per
+    // call, same `Box<` spelling carries the same residual, runtime
+    // box-vtable guard is the way out): recorded here as a decline-with-
+    // reasons rather than taken silently.
+    if (keyTy) {
+        k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+    }
     // §4.9: an OWNING dictionary (OwningDictionary<K,V> where V: class/interface)
     // disposes the displaced value before storing the new owner. Unlike owning
     // ARRAYS (whose owned element is genericArgs[0]), an owning dictionary's
@@ -1456,6 +1638,10 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
         llvm::Value* keyPtr = k;
+        // fix #4640: a freshly-boxed key is already a pointer (boxForTarget
+        // returned the box pointer); the spill arm is skipped for it
+        // (k->getType()->isPointerTy()) — the box pointer IS the key slot's
+        // content. Records are still pointers and still skip the spill arm.
         if (!(keyIsRecord && k->getType()->isPointerTy())) {
             llvm::AllocaInst* slot = entryAlloca(k->getType());
             builder_.CreateStore(k, slot);
@@ -1521,11 +1707,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     }
     llvm::Value* kd = loadStringData(k);
     llvm::Value* kl = loadStringLen(k);
+    llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
     if (valDisp) {
         auto* fn = declareC("bz_dict_set_str_disposing",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr, valDisp});
+            {ptrTy(), ptrTy(), i64(), i8(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr, valDisp});
         // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for an
         // OwningDictionary<K,V> with string key the value has just been
         // transferred; null the caller's slot for a bare owned local/param RHS.
@@ -1533,8 +1720,8 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             nullTransferredOwnedLocalSlot(valueExpr);
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                            {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, kw, vPtr});
         // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
         // borrow": the borrowing Dictionary<K,V> string-key branch of the
         // indexer-set `d[k] := rhs` — identical to the gen-key branch above
@@ -2287,9 +2474,53 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             callArgs.push_back(argVal);
             idxArgVals.push_back(argVal);
         }
+        // fix #4973 (§14.1 / §23.4 / §2.8.3 rule 4, v0.307): the BLOCK-FORM
+        // INDEXER GETTER twin of the property-block-getter fix on
+        // 4973-getter-draft (commit 9dcc51d7) and the setter fix on the same
+        // branch (1c6a95c5). Mirror the expression-bodied indexer pattern at
+        // LlvmBackend_Assign.cpp:4284 (`setupReceiverGenericSubst`). The
+        // block-bodied indexer call was MISSED for the same reason as the
+        // block-form property getter: the body lowers as a STANDALONE function
+        // — `ensureIndexerBlockGetter` builds the signature from
+        // `lowerType(pd->type.get())` which falls back to `i32()` when no subst
+        // is active, so an inherited indexer on a generic base reached through
+        // a non-generic derived receiver (`e[i]` where `e: E`, `E: B<T>`,
+        // `[i]: T` declared on `B<T>`) reads only the first 4 bytes of the
+        // substituted `_v: T` field (where T=string is 8 bytes). Install
+        // `computeAncestorGenericSubst` BEFORE the call; save+restore keeps
+        // the subst from leaking past this read into the enclosing expression.
+        // Same gate as the getter fix: explicit receiver (IndexExpr target is
+        // always explicit for `[i]`), Named type, declaration != ps->parent,
+        // declaring class has genericParams.
+        const sema::TypeRef* idxRecvTy4973 = ctx_.exprType(*ix.target);
+        std::unordered_map<std::string_view, llvm::Type*> savedIdxSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedIdxSema;
+        bool idxSubstInstalled = false;
+        if (idxRecvTy4973 &&
+            idxRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+            idxRecvTy4973->declaration &&
+            idxRecvTy4973->declaration != ps->parent &&
+            !ps->parent->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(idxRecvTy4973, ps->parent,
+                                            ancSubst, ancSema)) {
+                savedIdxSubst = std::move(genericSubst_);
+                savedIdxSema = std::move(genericSubstSemaTy_);
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                idxSubstInstalled = true;
+            }
+        }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         llvm::Value* res =
             builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        // fix #4973 restore: drop the ancestor subst installed above before the
+        // indexer block-getter build/call.
+        if (idxSubstInstalled) {
+            genericSubst_ = std::move(savedIdxSubst);
+            genericSubstSemaTy_ = std::move(savedIdxSema);
+        }
         // §31.1/§31.2: a throw inside the standalone getter leaves the pending
         // exception set and returns; route it to the enclosing unwind target,
         // exactly as an ordinary method call does.
@@ -4199,8 +4430,47 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
             callArgs.push_back(v);
         }
+        // fix #4973 (§14.1 / §23.4 / §2.8.3 rule 4, v0.307): the COMPOUND
+        // INDEXER GETTER twin of the property-block-getter fix on
+        // 4973-getter-draft (9dcc51d7) and the setter fix on the same branch
+        // (1c6a95c5). The expression-bodied twin at line 4284 already uses
+        // `setupReceiverGenericSubst` (the #585/#902/#3347 mechanism); this
+        // block-bodied twin was MISSED for the same reason as the setter and
+        // the read indexer: the body lowers as a STANDALONE function whose
+        // signature is built from `lowerType(pd->type.get())` (falls back to
+        // `i32()` without an active subst), so an inherited indexer on a
+        // generic base reached through a non-generic derived receiver reads
+        // only the first 4 bytes of the substituted `_v: T` field. Install
+        // `computeAncestorGenericSubst` BEFORE the build; save+restore keeps
+        // the subst from leaking past this read into the compound-op dispatch.
+        const sema::TypeRef* cidxRecvTy4973 = ctx_.exprType(*ix->target);
+        std::unordered_map<std::string_view, llvm::Type*> savedCidxSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedCidxSema;
+        bool cidxSubstInstalled = false;
+        if (cidxRecvTy4973 &&
+            cidxRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+            cidxRecvTy4973->declaration &&
+            cidxRecvTy4973->declaration != ps->parent &&
+            !ps->parent->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(cidxRecvTy4973, ps->parent,
+                                            ancSubst, ancSema)) {
+                savedCidxSubst = std::move(genericSubst_);
+                savedCidxSema = std::move(genericSubstSemaTy_);
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                cidxSubstInstalled = true;
+            }
+        }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         cur = builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        // fix #4973 restore: drop the ancestor subst installed above before
+        // the indexer block-getter build/call.
+        if (cidxSubstInstalled) {
+            genericSubst_ = std::move(savedCidxSubst);
+            genericSubstSemaTy_ = std::move(savedCidxSema);
+        }
         emitPendingCheck();
     } else {
         // Expression-body getter: inline against obj and pre-computed params.
@@ -5998,7 +6268,17 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 bool classField = cls && cls->kind == ast::TypeDeclKind::Class;
                 bool strField = classField && isStringStorageMember(ps) &&
                                 valArg.getType()->isPointerTy();
-                bool closureField = classField && !strField &&
+                // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): a bare-`T`
+                // auto-property at `T = string` (this accessor is emitted per
+                // instantiation with its substitution active). Retain the new
+                // value so the backing field owns the +1 the specialized
+                // disposer releases; keep the old value (leak) rather than
+                // release it — a caller in a generic body may hold it in a
+                // `T` local that owns no +1 (see isTypeParamBoundToString).
+                bool tpStrField = classField && !strField &&
+                                  isTypeParamStringStorageMember(ps) &&
+                                  valArg.getType()->isPointerTy();
+                bool closureField = classField && !strField && !tpStrField &&
                                     isClosureStorageMember(ps) &&
                                     valArg.getType()->isPointerTy();
                 // fix #2500 (§23.3/§28.9): box-typed (Object/interface) CLASS
@@ -6008,8 +6288,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // confirms the field ONLY ever holds boxes, so bz_box_retain/
                 // release are type-correct here (never called on a class-ref
                 // pointer, which lacks a box header).
-                bool boxField = classField && !strField && !closureField &&
-                                isBoxStorageMember(ps) &&
+                bool boxField = classField && !strField && !tpStrField &&
+                                !closureField && isBoxStorageMember(ps) &&
                                 valArg.getType()->isPointerTy();
                 if (strField) {
                     llvm::Value* oldVal = builder_.CreateLoad(
@@ -6017,6 +6297,9 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                     emitStringRetain(&valArg);
                     builder_.CreateStore(&valArg, slot);
                     emitStringRelease(oldVal);
+                } else if (tpStrField) {
+                    emitStringRetain(&valArg);
+                    builder_.CreateStore(&valArg, slot);
                 } else if (closureField) {
                     llvm::Value* oldVal = builder_.CreateLoad(
                         ptrTy(), slot, "propset.clo.old");
@@ -6856,6 +7139,111 @@ bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) 
 }
 
 
+// fix #4614(b) (§22.16, v0.306): §22.16's instrumentation set names
+//
+//   "- **Entry and normal exit** of every `public` **setter** — block-form,
+//      auto-property, indexer, `set(owned)` alike."
+//
+// and NO accessor path emitted it. `grep -n emitInvariantCheck src/codegen/`
+// found six call sites — the public-method entry (`emitFunctionBody`), the
+// public-method exit (`armEnsuresEpilogue` -> `finalizeEnsuresEpilogue`) and
+// four construction-exit sites — so the whole setter row of the set was
+// absent. Measured on this HEAD before this fix: a `public property Q: int`
+// whose block-form setter drives the instance through a state the class
+// invariant rejects ran to completion and returned 42, where §22.16 requires
+// ContractViolationException (99). That is a SILENT UNDER-CHECK, the
+// direction §22.16's observable-boundary property exists to prevent.
+//
+// This predicate answers "does a store written at `target`, through `ps`'s
+// setter, sit on one of those boundaries?" and returns the class whose
+// conjunction to evaluate, or null.
+//
+// THE `this`-REENTRANCY EXEMPTION IS PART OF THE ANSWER, not a separate
+// concern: §22.16's "A call whose receiver is `this` — explicit or implicit
+// — from inside any instance member of the class or a subclass enters the
+// member's unchecked face" governs setters exactly as it governs methods,
+// and instrumenting without it would turn a silent under-check into a loud
+// OVER-check — a public method that legitimately drives its own instance
+// through a broken intermediate state via its own setter would fault. The
+// test is on the SYNTAX, character for character the one `emitMethodCall`
+// applies (#4597): `this.P := v`, `base.P := v`, a bare `P := v` inside an
+// instance member, and the indexer spellings of each.
+//
+// fix #4651 (§22.16 / §2.8.2, v0.307): the predicate is now two functions.
+// `setterInstrumentationClass` (immediately below) is its RECEIVER-INDEPENDENT
+// half — everything decided from the DECLARATION alone: mode, class kind,
+// `static`, §13.6 accessor visibility, and a non-empty conjunction. It is
+// split out because the exporter-side §22.16 checked face
+// (`emitExportedPropertySetters`) asks exactly that question and has no
+// `ast::Expr` target to ask the other one with — and needs none, since every
+// caller of that face is an importer, never a `this` receiver inside the
+// declaring class. `instrumentedSetterClass` keeps the `this`-reentrancy
+// exemption and is unchanged in behaviour.
+const sema::TypeSymbol* Emitter::setterInstrumentationClass(
+    const sema::PropertySymbol* ps, const ast::PropertyDecl* pd) const {
+    // §22.16 / #4386: nothing is instrumented in release mode.
+    if (!checkedContracts_ || !ps) return nullptr;
+    // §22.16 "Never instrumented: non-public methods and setters, static
+    // members, destructors, and `Dispose`". Records and enums have no class
+    // invariant (the member is a class member, §22.16).
+    if (!ps->parent || ps->parent->kind != ast::TypeDeclKind::Class)
+        return nullptr;
+    if (isStaticProperty(ps)) return nullptr;
+    if (ps->visibility != ast::Visibility::Public) return nullptr;
+    // §13.6 accessor visibility: `public property Id: int private set;` is a
+    // public property with a NON-public setter, and §22.16's row is about the
+    // setter.
+    //
+    // `pd` is the declaration the caller has already resolved. For
+    // `lowerPropertySetValue` it is on that path only because
+    // `computedSetterOf` returned a `pd->accessors` element, which requires
+    // `ps->decl` to be a block-form `ast::PropertyDecl`; for
+    // `emitExportedPropertySetters` it is that loop's own
+    // `dynamic_cast<…>(ps->decl)`, which it already requires to be non-null.
+    // Taking it as a parameter rather than re-deriving it with a second
+    // `dynamic_cast` keeps this predicate off the imported-symbol
+    // classification seam (umbrella #3152): there is no null-`decl` arm here
+    // to answer "no visibility refinement" for an imported property, because
+    // an imported property reaches neither caller. Null-tolerant so a future
+    // caller that has no declaration degrades to "no accessor-level
+    // refinement" explicitly rather than by a silent cast failure.
+    if (pd) {
+        if (pd->hasAutoAccessorVis && pd->autoAccessorIsSet &&
+            pd->autoAccessorVis != ast::Visibility::Public)
+            return nullptr;
+        for (const auto& a : pd->accessors)
+            if (a.isSet && a.visibility != ast::Visibility::None &&
+                a.visibility != ast::Visibility::Public)
+                return nullptr;
+    }
+    if (!hasClassInvariant(ps->parent)) return nullptr;
+    return ps->parent;
+}
+
+
+const sema::TypeSymbol* Emitter::instrumentedSetterClass(
+    const ast::Expr& target, const sema::PropertySymbol* ps,
+    const ast::PropertyDecl* pd) const {
+    if (!setterInstrumentationClass(ps, pd)) return nullptr;
+    // The §22.16 `this`-reentrancy exemption, decided from the receiver's own
+    // SYNTAX (see the header). `currentThis_` guards the implicit spelling so
+    // a bare name lowered outside any instance member is never mistaken for
+    // one.
+    const ast::Expr* recvExpr = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+        recvExpr = ma->target.get();
+    else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target))
+        recvExpr = ix->target.get();
+    else if (dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return currentThis_ ? nullptr : ps->parent;  // implicit `this`
+    if (recvExpr)
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(recvExpr))
+            if ((tid->name == "this" || tid->name == "base") && currentThis_)
+                return nullptr;
+    return ps->parent;
+}
+
+
 bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
                                     const ast::Expr* valueExpr) {
     const ast::PropertyAccessor* setter = computedSetterOf(target);
@@ -7029,6 +7417,111 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         }
     }
     if (!recv) return false;
+    // fix #4614(b) (§22.16, v0.306): the setter ENTRY boundary. Emitted
+    // before the inlined setter body so the instance is observed in the
+    // state the caller handed over, exactly as the public-method entry
+    // check is emitted before the method body (`emitFunctionBody`).
+    const sema::TypeSymbol* invCls4614 = instrumentedSetterClass(target, ps, pd);
+    if (invCls4614) emitInvariantCheck(recv, invCls4614);
+    // fix #4973 / fix #4983 (§14.1 / §23 / §2.8.3 rule 4, v0.307): the SETTER
+    // twin of the block-form property GETTER fix on branch 4973-getter-draft
+    // (commit 9dcc51d7). Mirror the expression-bodied getter path at
+    // LlvmBackend_Exprs.cpp:5910-5994 (which has both the SAME-CLASS branch
+    // and the INHERITED branch). An inlined setter body that touches a
+    // `T`-typed field needs the substitution installed BEFORE the inline
+    // body, otherwise the body lowers against the erased T->i32 placeholder
+    // and writes `_v` at the wrong offset.
+    //
+    // Two receiver shapes are broken without this fix:
+    //
+    //   (1) INHERITED (#4973, commit c0076598): the receiver is a non-generic
+    //       derived class whose base is generic (`e: E`, `E: B<T>`, `Val: T`
+    //       declared on `B<T>`). Walk the base chain via
+    //       `computeAncestorGenericSubst` to install the ancestor subst
+    //       `{T → string}`. Without the subst, `_v := value` writes the
+    //       8-byte `value` into a 4-byte slot (opaque-ptr store), corrupting
+    //       the upper 4 bytes of `_v`.
+    //
+    //   (2) SAME-CLASS (#4983, this commit): the receiver declaration EQUALS
+    //       the property's declaring class (`b: B<string>`, `Val: T`
+    //       declared on `B<T>`). The #4973 gate's `declaration != ps->parent`
+    //       arm correctly skipped this shape — `computeAncestorGenericSubst`
+    //       refuses on `cur == ancestor` (LlvmBackend_Calls2.cpp:13110) because
+    //       there is no "ancestor walk" needed — but the substitution is
+    //       still REQUIRED for the inline body to see the substituted
+    //       layout, not the i32-erased template layout. Without the subst,
+    //       `_v := value` writes the 8-byte `value` into the i32-shaped
+    //       offset 12 instead of the specialized offset 16 (the bug prints
+    //       `x\n\n` instead of `x\ny\n`). The substitution is read DIRECTLY
+    //       off the receiver's own genericArgs (`B<string>` carries
+    //       `genericArgs = [string]`), mirrored on
+    //       LlvmBackend_Exprs.cpp:5922-5960 (the same-class GETTER inline
+    //       path that already works correctly for `b.Val` reads) and on
+    //       LlvmBackend_Layout.cpp:6285-6310 (the same-class GETTER thunk
+    //       path).
+    //
+    // Both branches share the same save+restore discipline to keep the
+    // installed subst from leaking past this write into the enclosing
+    // statement. The implicit-`this` case (`ma->target` is null) is
+    // correctly skipped — no receiver expression means no static type to
+    // read genericArgs off of.
+    const sema::TypeRef* setRecvTy4973 = nullptr;
+    if (auto* ma4973 = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+        if (ma4973->target) setRecvTy4973 = ctx_.exprType(*ma4973->target);
+    std::unordered_map<std::string_view, llvm::Type*> savedGSubstSet;
+    std::unordered_map<std::string_view, const sema::TypeRef*> savedGSemaSet;
+    bool substInstalledSet = false;
+    if (setRecvTy4973 && setRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+        setRecvTy4973->declaration &&
+        !ps->parent->genericParams.empty()) {
+        if (setRecvTy4973->declaration != ps->parent) {
+            // INHERITED (#4973): walk the base chain via
+            // `computeAncestorGenericSubst`.
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(setRecvTy4973, ps->parent,
+                                            ancSubst, ancSema)) {
+                savedGSubstSet = std::move(genericSubst_);
+                savedGSemaSet = std::move(genericSubstSemaTy_);
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                substInstalledSet = true;
+            }
+        } else if (!setRecvTy4973->genericArgs.empty()) {
+            // SAME-CLASS (#4983): read the subst off the receiver's own
+            // genericArgs directly — mirrors Exprs.cpp:5922-5960.
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(ps->parent);
+            if (gpNames.size() == setRecvTy4973->genericArgs.size()) {
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view,
+                                   const sema::TypeRef*> newSema;
+                bool argsOk = true;
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                    if (auto* lt = lowerTypeRef(
+                            setRecvTy4973->genericArgs[gi])) {
+                        newSubst[gpNames[gi]] = lt;
+                    } else {
+                        argsOk = false; break;
+                    }
+                    newSema[gpNames[gi]] =
+                        resolveTypeParamRef(
+                            setRecvTy4973->genericArgs[gi]);
+                }
+                if (argsOk) {
+                    // fix #768 (§14.1): a generic nullable field read with
+                    // the wrong type can produce wrong values / mismatched
+                    // ICmp, so build the SEMA-side subst too, matching the
+                    // getter's #768 mechanism.
+                    savedGSubstSet = std::move(genericSubst_);
+                    savedGSemaSet = std::move(genericSubstSemaTy_);
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                    substInstalledSet = true;
+                }
+            }
+        }
+    }
     // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
     llvm::AllocaInst* slot = entryAlloca(v->getType());
     builder_.CreateStore(v, slot);
@@ -7055,11 +7548,24 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
+    // fix #4614(b) (§22.16, v0.306): the setter NORMAL-EXIT boundary.
+    // `accEndBB` is the join every non-throwing path through the inlined
+    // body reaches (§21.7's accessor-end target, #739), which is exactly
+    // §22.16's "normal exit" — "throw exits check nothing" is why an
+    // unwinding path must not reach it.
+    if (invCls4614 && !builder_.GetInsertBlock()->getTerminator())
+        emitInvariantCheck(recv, invCls4614);
     // fix #2568 (§23.3/§28.9/§4.6, v0.236): the INSTANCE-PATH twin of the
     // static-path emitProducerRelease above. Same gate (classOwned) for the
     // same record-UAF reason. See the long comment above the static branch
     // for the full rationale and LSan reproduction.
     if (classOwned) emitProducerRelease();
+    // fix #4973 / fix #4983 restore: drop the subst installed at the top
+    // of this instance branch before the inline body emission.
+    if (substInstalledSet) {
+        genericSubst_ = std::move(savedGSubstSet);
+        genericSubstSemaTy_ = std::move(savedGSemaSet);
+    }
     return true;
 }
 
@@ -7999,27 +8505,91 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
 }
 
 
-// per §24: inside the declaring class, `event += handler` and
-// `event -= handler` are a fixed, language-defined desugaring to
-// `event.Add(handler)` and `event.Remove(handler)`. They are NOT the
-// compound-assignment statements of §17 (they neither read nor assign the
-// event), and `event` here has static type EventSource<T>, available only
-// inside the declaring class. Returns true when handled.
+// per §24 / §6.5: `event += handler` and `event -= handler` are a fixed,
+// language-defined desugaring to `event.Add(handler)` and
+// `event.Remove(handler)`. They are NOT the compound-assignment statements of
+// §17 (they neither read nor assign the event). The form is available wherever
+// the source is in scope, i.e. to the declaring class for an owned field, and
+// for either of two shapes the codegen must recognize:
+//
+//   1. The legacy member-kind form (`public event Clicked: Ev;` — retired in
+//      v1) — `eventSymbolOf(*as.target)` returns a non-null `EventSymbol`. The
+//      source pointer comes from `eventSourcePtr` (which loads the EventSymbol
+//      backing source via the field slot / itable accessor / static global).
+//   2. The v1 §6.5 pattern (an `owned [readonly] EventSource<T>` /
+//      `AsyncEventSource<T>` / `SharedEventSource<T>` field, with or without a
+//      separate `IEvent<T>` property face) — the target expression carries a
+//      regular VariableSymbol/MemberSymbol with static type one of the three
+//      event-source classes. There is no EventSymbol; the runtime rep IS the
+//      field's loaded value (a bz_event_source_t*, the same `lowerExpr`
+//      produces for any other field/parameter of the same type).
+//
+// Returns true when handled.
 bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
     if (as.op != "+=" && as.op != "-=") return false;
-    const sema::EventSymbol* es = eventSymbolOf(*as.target);
-    if (!es) return false;
-    llvm::Value* src = eventSourcePtr(*as.target);
-    if (!src) return false;
+    const sema::TypeRef* payloadTy = nullptr;
+    llvm::Value* src = nullptr;
+    if (const sema::EventSymbol* es = eventSymbolOf(*as.target)) {
+        // Legacy member-kind event (§24, retired in v1).
+        src = eventSourcePtr(*as.target);
+        if (!src) return false;
+        payloadTy = eventPayloadType(es);
+    } else {
+        // v1 §6.5 pattern: target's STATIC type identifies the field as an
+        // event source. The runtime value is the loaded field — load via
+        // lowerExpr exactly as any other field/parameter of the type would
+        // be read; the runtime rep (bz_event_source_t*) is the same one
+        // `eventSourcePtr` would produce for the legacy form, and the same
+        // one `dispatchEventMethods` consumes for a method-call spelling
+        // (`_e.Add(h)`). genericArgs[0] carries the payload type, matching
+        // the sema branch at #4792 (the parameter-inference fix whose
+        // payload source this codegen reads from — ExprTypecheck.cpp).
+        const sema::TypeRef* tgtTy = ctx_.exprType(*as.target);
+        if (!isEventSourceTypeName(tgtTy) && !isSharedEventSourceTypeName(tgtTy))
+            return false;
+        if (tgtTy && !tgtTy->genericArgs.empty()) payloadTy = tgtTy->genericArgs[0];
+        // fix #4901 (stdlib §6.5 "Capture-freedom at every subscribe
+        // position", spec §28.14, v0.307): `+=` on a SharedEventSource<T> is
+        // the desugaring of `.Add(handler)` (spec §17.2), a subscribe position
+        // of the shared pair. Sema (#4920) rejects a capturing handler here,
+        // and its assignability check rejects a wrong arity, a mismatched
+        // parameter type or an `owned` formal, but it judges an overload group
+        // by the overload it happens to bind and admits a non-capturing
+        // lambda. Codegen lowers only what it has measured sound,
+        // so apply the SAME gate the `.Subscribe`/`.Add` call arms use
+        // (sharedEventHandlerAdmissible, LlvmBackend_Calls2.cpp): a static,
+        // non-overloaded method reference of exactly `(T) -> ()`. Unlike those
+        // arms there is no #2457 backstop behind this statement, so reject
+        // here. Lowering a capture-free lambda on this pair is #4972 (a
+        // spurious reject today). `-=` (Remove, "call-bounded: compares only")
+        // is not a subscribe position and is left as it was; its per-call
+        // closure-record leak is #4970.
+        if (as.op == "+=" && isSharedEventSourceTypeName(tgtTy) &&
+            !sharedEventHandlerAdmissible(
+                ctx_, as.value.get(), as.target.get(), payloadTy,
+                [this](std::string_view n) { return isBuiltinTypeRefName(n); })) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "`+=` on a `SharedEventSource<T>` is lowered only for a "
+                "static, non-overloaded method reference whose signature is "
+                "exactly `(T) -> ()` for the source's payload type `T` "
+                "(stdlib §6.5); this handler is not one — a lambda handler on "
+                "this pair is not yet lowered (#4972), and an overloaded, "
+                "`owned`-formal or mistyped method group is rejected");
+            return true;
+        }
+        src = lowerExpr(*as.target);
+        if (!src) return true;  // error path; avoid bad fallthrough
+    }
     // Lower the handler to a closure, hinting the expected (payload)->() type
     // so an untyped lambda param resolves the payload type.
     const sema::TypeRef* saved = expectedFunctionType_;
     sema::TypeRef handlerTy;
     handlerTy.kind = sema::TypeRef::Kind::Function;
-    if (const sema::TypeRef* pt = eventPayloadType(es)) {
+    if (payloadTy) {
         sema::TypeRef::FuncParam p;
-        p.type = const_cast<sema::TypeRef*>(pt);
+        p.type = const_cast<sema::TypeRef*>(payloadTy);
         handlerTy.funcParams.push_back(p);
     }
     expectedFunctionType_ = &handlerTy;
@@ -8365,6 +8935,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // value-disposer argument is null.
     if (actualTy && (actualTy->headName() == "SortedSet" ||
                      builtinTypeName(actualTy) == "SortedSet")) {
+        // fix #4099 (stdlib §4.18, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedSet<T>` coerced to
+        // `IEnumerable<T>` here used to silently admit an element type that
+        // is eligible ONLY via the auto-hashable (§9.2) or class/interface
+        // (hasObjectHeaderEquality) branches — both of which establish
+        // hashing/equality but not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). Reuses the shared authority
+        // `reportSortedElementNeedsCompareTo` (LlvmBackend_Calls3.cpp) rather
+        // than a fourth inline copy of the predicate (LANE_RULES §15). The
+        // poison-value return mirrors the indexer's own — well-formed no-op.
+        if (reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<T>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (outWrapMade) *outWrapMade = true;
         // Snapshot the source FIRST, then free the source. The snapshot is
         // built FROM the live source dict (bz_dict_keys_gen reads the key
@@ -8433,6 +9020,32 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // splits that obligation into the half the source free discharges and
         // the half the snapshot's slot-1 Dispose does — so the gate is handed
         // the SOURCE type and admits every shape those two disposers cover.
+        //
+        // fix #4099 (stdlib §4.17, v0.306 follow-up): the widening-coercion
+        // twin of #3976's indexer/for-in check. A `SortedDictionary<K, V>`
+        // coerced to `IEnumerable<DictionaryEntry<K, V>>` here used to
+        // silently admit a key type eligible ONLY via the auto-hashable
+        // (§9.2) or class/interface (hasObjectHeaderEquality) branches —
+        // hashing/equality, not ordering. Reject before the wrap so the
+        // compile fails consistently with `.Add`/`.Contains` (fix #3947) and
+        // the indexer/for-in (fix #3976). The plain `Dictionary<K, V>` arm
+        // is unaffected — its `where K: IEquatable<K>` constraint (§4.8)
+        // admits any key with structural equality, which is the right
+        // contract for an unordered map. The poison-value return mirrors
+        // the indexer's own — well-formed no-op. This check fires BEFORE
+        // `dictEntryWrapShapeSupported` so a SortedDictionary<Pt, int> widened
+        // to `IEnumerable<DictionaryEntry<Pt, int>>` is rejected even when
+        // the wrap helper declines (the helper's own decline is the
+        // historical fail-loud path, not a silent admit — but it was
+        // unreachable in the rejection lane without this check landing
+        // first).
+        if (builtinTypeName(actualTy) == "SortedDictionary" &&
+            reportSortedElementNeedsCompareTo(
+                actualTy, actualTy->genericArgs[0], srcExpr->span.begin,
+                "the `IEnumerable<DictionaryEntry<K, V>>` coercion")) {
+            if (outWrapMade) *outWrapMade = false;
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (!dictEntryWrapShapeSupported(targetTy, actualTy)) return v;
         // The two halves are derived TOGETHER, at the one site that decides
         // both, so a shape can never take one without the other. Both stay null
@@ -9493,6 +10106,49 @@ llvm::Type* Emitter::owningDrainElemType(const sema::TypeRef* iOwnEnumTy) {
     return ptrTy();
 }
 
+// fix #4750 / #4772 (§29.1 / §31.4, v0.307): see the declaration. Mirrors the
+// iterator-method TakeCurrent (LlvmBackend_Iterators.cpp, #1349): the uniform
+// kExcObjSize exception block, the InvalidOperationException vtable, the
+// `bz_exc_addr` signal, and a null return the dispatching caller's pending-
+// exception check turns into the raise.
+void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
+                                             llvm::StructType* stTy,
+                                             unsigned pendIdx) {
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
+    auto* okBB = llvm::BasicBlock::Create(llvm_, "tc.ok", tcFn);
+    auto* ioeBB = llvm::BasicBlock::Create(llvm_, "tc.ioe", tcFn);
+    llvm::IRBuilder<> b(entryBB);
+    llvm::Value* self = &*tcFn->arg_begin();
+    llvm::Value* pendF = b.CreateStructGEP(stTy, self, pendIdx);
+    llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "odtc.pend");
+    b.CreateCondBr(
+        b.CreateICmpEQ(pend, llvm::ConstantPointerNull::get(ptrTy()),
+                       "odtc.pend.null"),
+        ioeBB, okBB);
+
+    b.SetInsertPoint(ioeBB);
+    auto* callocTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+    auto* callocC = module_->getOrInsertFunction("calloc", callocTy).getCallee();
+    llvm::Value* excObj = b.CreateCall(
+        callocTy, callocC,
+        {llvm::ConstantInt::get(i64(), 1),
+         llvm::ConstantInt::get(i64(), kExcObjSize)},
+        "odtc.excobj");
+    auto vit = builtinVtable_.find("InvalidOperationException");
+    if (vit != builtinVtable_.end()) b.CreateStore(vit->second, excObj);
+    auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+    auto* excAddrC =
+        module_->getOrInsertFunction("bz_exc_addr", excAddrTy).getCallee();
+    b.CreateStore(excObj, b.CreateCall(excAddrTy, excAddrC, {}, "odtc.exc"));
+    b.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+
+    // Transfer: null the slot BEFORE returning so a later TakeCurrent /
+    // MoveNext / Dispose sees an empty pending (§29.1 single consumption).
+    b.SetInsertPoint(okBB);
+    b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+    b.CreateRet(pend);
+}
+
 llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
     llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
@@ -9665,26 +10321,22 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     }
 
-    // --- TakeCurrent(self) -> ptr — move pending out, null slot, return. ---
+    // --- TakeCurrent(self) -> ptr — null pending raises IOE; else transfer. ---
+    // fix #4750 / #4772 (§29.1, v0.307): this used to hand back a null
+    // pending as-is ("null in, null out"), deferring to the caller's
+    // `if en.MoveNext()` guard. §29.1 makes the raise normative for every
+    // `IOwningEnumerator<T>.TakeCurrent()`: "a second take without an
+    // intervening advance, or a take before the first advance / after
+    // exhaustion, raises InvalidOperationException". The §29.2 for-in
+    // desugaring takes exactly once per successful MoveNext, so the raise
+    // arm is unreachable there; only the manual protocol observes it.
     auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
     if (!tcFn) {
         tcFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = tcFn->arg_begin();
-        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
-        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
-        // Null the slot before returning so a subsequent TakeCurrent / Dispose
-        // / MoveNext sees an empty pending. (The IOE check on a null pending
-        // is raised by the iterator-frame's TakeCurrent wrapper when the
-        // enumerator is a yield-iterator frame; for THIS manual-protocol
-        // wrapper we just hand back the pointer as-is — null in, null out —
-        // and let the caller's `if en.MoveNext() then ...` guard the take.)
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
-        b.CreateRet(pend);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same
@@ -9926,20 +10578,15 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
     }
 
-    // --- TakeCurrent(self) -> ptr — move pending out, null the slot. ---
+    // --- TakeCurrent(self) -> ptr — null pending raises IOE; else transfer. ---
+    // fix #4750 / #4772 (§29.1, v0.307): the same body as the array leaf.
     auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
     if (!tcFn) {
         tcFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = tcFn->arg_begin();
-        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
-        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "olltc.pend");
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
-        b.CreateRet(pend);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH frame over the same borrowed
@@ -11631,6 +12278,7 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // --- snapshot keys + values ---
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -11644,8 +12292,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy(), ptrTy()});
@@ -11655,6 +12304,9 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -11693,7 +12345,8 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
         // #3576's arm — see LlvmBackend_impl.hpp for the helpers) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto [strObj, kp] = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto [strObj, kp] =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             // Free the raw key bytes from bz_dict_keys_str.
             builder_.CreateCall(freeFn, {kp});
             keyDecoded = strObj;
@@ -11725,7 +12378,10 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
 
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // Wrap the materialised entries as an OWNING vtable-backed IEnumerable
@@ -13049,6 +13705,48 @@ bool Emitter::fillOmittedParamDefaults(
         const std::vector<ast::Param>& params,
         std::vector<llvm::Value*>& ordered,
         std::vector<const ast::Expr*>* orderedExprs) {
+    // fix #4967 (§5.1 "Nullable conversions", v0.307): the `S? → T?` lifted
+    // widening at a CALL ARGUMENT. §5.1: "The two rules compose through at
+    // most one `?` on each side", so an `int?` argument binds a `long?`
+    // formal (and `float?` a `double?` one). The argument is already the
+    // tagged `{i8, S}` struct, so neither the exact-payload wrap nor the
+    // #4922 widen-then-wrap applied, and it reached the call as `{i8, i32}`
+    // against `{i8, i64}` — IR verification failure. Rebuild the struct with
+    // the payload WIDENED and the hasValue tag kept, as lowerLocalDecl does
+    // (#840). `coerceNumericToType` is §5.1's widening direction only, so no
+    // narrowing pair is produced; nullptr for any shape not covered (a
+    // non-`{i8, numeric}` source or formal, or a pair §5.1 does not widen).
+    // A lambda, not a member, to keep LlvmBackend_impl.hpp (160 includers)
+    // untouched; buildOrderedArgs below carries the same body — keep the two
+    // in step.
+    auto widenNullableArgPayload = [this](llvm::Value* v,
+                                          llvm::StructType* expectedSt,
+                                          const ast::Expr* srcExpr)
+        -> llvm::Value* {
+        auto* vSt = v ? llvm::dyn_cast<llvm::StructType>(v->getType())
+                      : nullptr;
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (!vSt || !expectedSt || vSt == expectedSt ||
+            vSt->getNumElements() != 2 ||
+            vSt->getElementType(0) != nullablePrimHasValTy() ||
+            expectedSt->getNumElements() != 2 ||
+            expectedSt->getElementType(0) != nullablePrimHasValTy() ||
+            !numeric(vSt->getElementType(1)) ||
+            !numeric(expectedSt->getElementType(1)))
+            return nullptr;
+        llvm::Type* dstPay = expectedSt->getElementType(1);
+        llvm::Value* conv = coerceNumericToType(
+            builder_.CreateExtractValue(v, {1u}, "arg.lift.in"), dstPay,
+            srcExpr && isUnsignedTargetExpr(*srcExpr));
+        if (conv->getType() != dstPay) return nullptr;
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(expectedSt),
+            builder_.CreateExtractValue(v, {0u}, "arg.lift.has"), {0u});
+        return builder_.CreateInsertValue(res, conv, {1u});
+    };
     // §22.5: a default-value expression may reference an EARLIER parameter
     // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
     // already lowered into `ordered[k]` (k < j). To make a reference to such a
@@ -13107,8 +13805,22 @@ bool Emitter::fillOmittedParamDefaults(
             // value type — exactly the zero value `default(T)` denotes, already
             // in the parameter's representation.
             if (dynamic_cast<const ast::DefaultExpr*>(dv)) {
+                // fix #4665 (§17.11 + §4.7, v0.307): asked through
+                // `unitStorageTy`, the ONE spelling of "the storage form of a
+                // lowered type". A UNIT-typed parameter with an omitted
+                // `default(())` argument lowered its own `: ()` annotation to
+                // LLVM `void`, and `Constant::getNullValue(void)` is an
+                // `llvm_unreachable` this release libLLVM compiles to `ud2` —
+                // `bezelc` died of SIGILL with no diagnostic (measured rc=132
+                // on 572f5fc5 for `Take(p: () := default(()))` called as
+                // `Take()`). Unlike the value-position `DefaultExpr` arm, this
+                // site owes a REAL operand: `lowerParamType` substitutes the
+                // §4.7 placeholder byte in the callee's signature, so the
+                // caller must pass one byte to keep the call's types matching
+                // — the same `i8 0` the explicit-argument rescue in
+                // `buildOrderedArgs` substitutes for a null `v`.
                 ordered[j] = llvm::Constant::getNullValue(
-                    lowerType(params[j].type.get()));
+                    unitStorageTy(lowerType(params[j].type.get())));
             } else {
                 ordered[j] = lowerExpr(*dv);
                 // fix #1235 / §22.5 / §22.7: a bare `null` literal default
@@ -13130,6 +13842,24 @@ bool Emitter::fillOmittedParamDefaults(
                                        expectedSt->getElementType(1)) {
                                 ordered[j] =
                                     wrapNullableValue(formalTy, ordered[j]);
+                            } else if (llvm::Value* lifted =
+                                           widenNullableArgPayload(
+                                               ordered[j], expectedSt, dv)) {
+                                // fix #4967 (§5.1 `S? → T?`, v0.307): the
+                                // omitted-default twin — `b: long? := a` with
+                                // an earlier `a: int?` formal (§22.5).
+                                ordered[j] = lifted;
+                            } else if (ordered[j]->getType()->isIntegerTy() ||
+                                       ordered[j]->getType()
+                                           ->isFloatingPointTy()) {
+                                // fix #4922 (§5.1 `S → T → T?`, v0.307): the
+                                // omitted-default twin of the explicit-arg
+                                // widen-then-wrap in buildOrderedArgs —
+                                // `c: long? := 7` lowers its default at i32.
+                                ordered[j] = coerceReturnToNullableValue(
+                                    ordered[j], formalTy,
+                                    isUnsignedTargetExpr(*dv),
+                                    /*sourceIsNullableRef=*/false, dv);
                             }
                         }
                     }
@@ -13152,6 +13882,36 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       std::vector<const ast::Expr*>* outExprs,
                       bool nullTransferredOwned,
                       std::vector<AccessorRefArg>* accessorRefArgs) {
+    // fix #4967 (§5.1 `S? → T?`, v0.307): the same lifted widening as the
+    // identically-named lambda in fillOmittedParamDefaults above — see there.
+    auto widenNullableArgPayload = [this](llvm::Value* v,
+                                          llvm::StructType* expectedSt,
+                                          const ast::Expr* srcExpr)
+        -> llvm::Value* {
+        auto* vSt = v ? llvm::dyn_cast<llvm::StructType>(v->getType())
+                      : nullptr;
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (!vSt || !expectedSt || vSt == expectedSt ||
+            vSt->getNumElements() != 2 ||
+            vSt->getElementType(0) != nullablePrimHasValTy() ||
+            expectedSt->getNumElements() != 2 ||
+            expectedSt->getElementType(0) != nullablePrimHasValTy() ||
+            !numeric(vSt->getElementType(1)) ||
+            !numeric(expectedSt->getElementType(1)))
+            return nullptr;
+        llvm::Type* dstPay = expectedSt->getElementType(1);
+        llvm::Value* conv = coerceNumericToType(
+            builder_.CreateExtractValue(v, {1u}, "arg.lift.in"), dstPay,
+            srcExpr && isUnsignedTargetExpr(*srcExpr));
+        if (conv->getType() != dstPay) return nullptr;
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(expectedSt),
+            builder_.CreateExtractValue(v, {0u}, "arg.lift.has"), {0u});
+        return builder_.CreateInsertValue(res, conv, {1u});
+    };
     std::vector<llvm::Value*> ordered(params.size(), nullptr);
     // issue #421 / #410: parallel source expression per parameter position, so
     // the caller can recover each argument's signedness for numeric widening.
@@ -13408,7 +14168,24 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // lvalue; an ordinary parameter receives the argument's value.
         // §22.4: `out var x` — ensureOutVarSlots already allocated the
         // slot; lvalueAddr will find it via locals_ lookup.
-        llvm::Value* v;
+        //
+        // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): INITIALIZED. This was a
+        // bare `llvm::Value* v;`, and not every arm below assigns it — the
+        // §15.4 inline-array arm assigns only when `lowerTypeRef` of the
+        // formal yields an `llvm::ArrayType`, and falls straight through when
+        // it yields the i32 placeholder instead (an inline-array formal whose
+        // extent did not fold — see `lowerTypeRef`'s `arraySizeValue < 0`
+        // fallback). Every subsequent read of `v` in this loop then touched an
+        // indeterminate value: MEASURED as `v = 0xffffffff` and a SIGSEGV at
+        // `v->getType()` about 200 lines down, on the issue's repro (a
+        // `const`-named extent `[MAX]int` on an IMPORTED GENERIC constructor's
+        // parameter, whose importer-side reconstruction left the extent
+        // unfolded). A null here routes that same shape into the `#1386`
+        // internal-error diagnostic below — a clean compile-time failure with
+        // a real location — instead of a crash. This is the general guard: any
+        // future arm that declines without assigning now fails loudly rather
+        // than reading garbage. // per §15.1
+        llvm::Value* v = nullptr;
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
@@ -13430,6 +14207,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // with nobody to discharge it, §28.6). It keeps today's
             // compile-time rejection through the #1386 fallback below; the
             // missing dedicated §22.3 diagnostic is filed separately.
+            //
+            // The #4805 fix-forward places the clean §22.3 ref-mismatch
+            // diagnostic block (below) AFTER this fallback so an indexer-slot
+            // or property-slot `ref` argument still goes through copy-in /
+            // copy-out rather than being rejected with the §22.3 message.
             if (!v && accessorRefArgs &&
                 (params[idx].modifier == "ref" || params[idx].modifier == "out")) {
                 llvm::Type* paramTy = nullptr;
@@ -13440,6 +14222,45 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 v = emitAccessorRefArgCopyIn(
                     *a.value, paramTy,
                     /*isOut=*/params[idx].modifier == "out", *accessorRefArgs);
+            }
+            // fix #4805 (§22.3, §9.3, v0.307): only AFTER the
+            // `emitAccessorRefArgCopyIn` indexer/property fallback above has
+            // had a chance to recover do we conclude this argument is a true
+            // non-lvalue (e.g. `new Rec(6)` where `Rec` has
+            // `constructor(ref x: int)`). `lvalueAddr` does NOT itself handle
+            // indexer/property slots — only `emitAccessorRefArgCopyIn` does
+            // (see #1302 above). The block fires only when BOTH `lvalueAddr`
+            // returned null AND the accessor fallback did not assign `v`,
+            // emitting the clean §22.3 diagnostic instead of falling through
+            // to the generic #1386 ICE.
+            if (!v) {
+                // `currentCallee_` is a Member* (MethodDecl/ConstructorDecl)
+                // for method calls but may be null or non-Member for
+                // `new Record(...)` — resolve the name via `initialSymbol`
+                // which is always a NamedSymbol for any callable.
+                std::string pname = params[idx].name.empty()
+                                        ? "(unnamed)"
+                                        : std::string(params[idx].name);
+                std::string calleeName = "(unknown)";
+                if (currentCallee_) {
+                    if (auto* md = dynamic_cast<const ast::MethodDecl*>(currentCallee_))
+                        calleeName = std::string(md->name);
+                    else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(currentCallee_))
+                        ;  // ConstructorDecl has no name field; use "(unknown)"
+                    else if (const ast::IdentifierExpr* id =
+                                 dynamic_cast<const ast::IdentifierExpr*>(currentCallee_))
+                        calleeName = std::string(id->name);
+                }
+                std::string modifierStr(params[idx].modifier);
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    "call to `" + calleeName +
+                        "` has a call-site `ref`/`out` mismatch: parameter `" +
+                        pname + "` is `" + modifierStr +
+                        "` — pass the argument with `ref` at the call site "
+                        "(§22.3 — the caller writes `ref`/`out` at the call site, "
+                        "and only for a `ref`/`out` parameter)");
+                return false;
             }
         } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                        a.value.get())) {
@@ -13460,6 +14281,19 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // scope exit (on the normal AND unwind paths via disposeStack_).
             const sema::TypeRef* pt =
                 params[idx].type ? ctx_.resolvedType(*params[idx].type) : nullptr;
+            // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): the literal is built
+            // at the FORMAL's type, and a generic callee's own type parameter
+            // in it (`xs: Array<T>` of `C<T>`) belongs to the callee. The
+            // active maps are the caller's, so lowering it here read an unbound
+            // placeholder (i32 for any element type), or the caller's same-named
+            // `T`, while the callee body is specialized at its real `T`:
+            // `C<int>([11, 22])` inside `B<T>` at T = string built 8-byte
+            // elements the body read as 4-byte ones (ASan stack-buffer-overflow
+            // in bz_array_add; `11,0`). Resolve it through the callee's own
+            // bindings, computed from the same call by lowerCallDispatch.
+            if (pt && calleeFormalSubstParams_ == &params &&
+                !calleeFormalSemaSubst_.empty())
+                pt = substituteTypeRefLocal(pt, calleeFormalSemaSubst_);
             // fix #1382 / §15.4: an INLINE-ARRAY parameter `[N]T` receiving a
             // collection literal `[e1, …, eN]`. materializeCollectionLiteralForArg
             // only handles heap collections; for a value-type inline array it
@@ -13507,6 +14341,32 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                  builder_.getInt32(static_cast<unsigned>(k))}));
                     }
                     v = builder_.CreateLoad(aty, aslot);
+                } else {
+                    // fix #4514 (§15.1 / §2.8.3 rule 3, v0.306): sema says the
+                    // formal IS an inline array, but `lowerTypeRef` answered
+                    // something other than an `llvm::ArrayType` — which it does
+                    // for exactly one shape, an extent that is neither an AST
+                    // literal nor a folded `arraySizeValue >= 0`, where it
+                    // returns the bare `i32` placeholder ("what keeps an
+                    // unfoldable size failing loudly", LlvmBackend_Layout.cpp).
+                    // Say so HERE rather than letting the null `v` fall through
+                    // to the generic `#1386` "lowerExpr returned null" line: the
+                    // argument expression is fine, the PARAMETER's type is what
+                    // could not be lowered, and naming the extent is what points
+                    // a reader at the real defect (cross-module, this is a
+                    // §2.8.3 rule 3 reconstruction gap — see #4514's other
+                    // half). Returning false declines the call cleanly.
+                    ctx_.diagnostics().report(
+                        Severity::Error, a.value->span.begin,
+                        "the inline-array parameter `" +
+                            std::string(params[idx].name) +
+                            "` has an extent that is not a compile-time "
+                            "constant at this call site, so the argument "
+                            "cannot be laid out (§15.1); for an IMPORTED "
+                            "declaration this means the dependency's metadata "
+                            "did not carry the folded extent (§2.8.3 rule 3, "
+                            "#4514)");
+                    return false;
                 }
             } else {
                 llvm::Value* coll =
@@ -13767,6 +14627,34 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         v = nullableValueNull(formalTy);
                     } else if (v->getType() == expectedSt->getElementType(1)) {
                         v = wrapNullableValue(formalTy, v);
+                    } else if (llvm::Value* lifted = widenNullableArgPayload(
+                                   v, expectedSt, a.value.get())) {
+                        // fix #4967 (§5.1 "Nullable conversions", v0.307):
+                        // `S?` → `T?` — an `int?` argument at a `long?` formal
+                        // arrives as `{i8, i32}`; see widenNullableArgPayload.
+                        v = lifted;
+                    } else if (v->getType()->isIntegerTy() ||
+                               v->getType()->isFloatingPointTy()) {
+                        // fix #4922 (§5.1 "Nullable conversions", v0.307):
+                        // `S` converts to `T?` via `S → T → T?`, so an `int`
+                        // argument at a `long?` formal must first widen to the
+                        // payload and THEN wrap. Only the exact-payload case
+                        // wrapped here, so the bare value escaped: the call
+                        // site's per-arg `coerceExprValueToSlot` widened it to
+                        // i64 but never wraps (`call @F(i64 5)` against
+                        // `{i8, i64}` — IR verify failure), and a `new` took
+                        // the inline-ctor path on the type mismatch, bound the
+                        // formal in a scalar slot, and `a ?? -1` then ran
+                        // `extractvalue` on an i64 — a bezelc SEGFAULT.
+                        // `coerceReturnToNullableValue` is the existing
+                        // widen-then-wrap for exactly this composition (#843,
+                        // sema-gated narrowing per #2925), as #4904 uses at a
+                        // ctor-chain argument; it leaves `v` unchanged for a
+                        // pair §5.1 does not cover.
+                        v = coerceReturnToNullableValue(
+                            v, formalTy,
+                            a.value ? isUnsignedTargetExpr(*a.value) : false,
+                            /*sourceIsNullableRef=*/false, a.value.get());
                     }
                 }
             } else if (formalTy) {
@@ -13778,7 +14666,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 // the parameter's bare value here — mirroring the unwrap local-init
                 // / return / assignment already apply. A no-op when `v` is not that
                 // struct (reference args and already-scalar values pass through).
+                llvm::Value* carrier = v;
                 v = unwrapNarrowedNullable(v, lowerTypeRef(formalTy));
+                // fix #4899 (§14.1 / §7 / §7.10, v0.307): a BARE type-parameter
+                // formal (`v: T`) lowers here to the i32 placeholder, because the
+                // callee's substitution is not installed until after argument
+                // lowering — so this unwrap also fires when `T := int?`, where
+                // the carrier's tag is the value. Record it so the call site can
+                // restore the carrier once `T` is known
+                // (restoreBareTParamNullableCarriers).
+                if (v != carrier && isBareTypeParamRef(formalTy))
+                    bareTParamNarrowUnwraps_.push_back({idx, v, carrier});
             }
             // §8.6: a value-typed argument bound to an Object/interface
             // parameter is boxed, so a later `is`/`as` or virtual dispatch on

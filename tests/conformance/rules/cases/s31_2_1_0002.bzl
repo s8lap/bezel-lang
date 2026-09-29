@@ -15,7 +15,7 @@ public class AmountException: Exception
 
   public property Amount: int => _amount;
 
-  public constructor(message: string, amount: int) base(message)
+  public constructor(message: string, amount: int) base(message);
     _amount := amount;
   end constructor;
 end AmountException;

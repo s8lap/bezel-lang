@@ -34,7 +34,7 @@ BEZEL_TEST(async_iter_manual_protocol_759, reads_values_and_terminates) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerator<int> "
+        "  public static async method Gen(): IAsyncEnumerator<int> "
         "    yield return 42; "
         "    yield return 99; "
         "  end Gen; "
@@ -60,7 +60,7 @@ BEZEL_TEST(async_iter_manual_protocol_759, move_next_async_branches_as_bool) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerator<int> "
+        "  public static async method Gen(): IAsyncEnumerator<int> "
         "    yield return 7; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
@@ -81,7 +81,7 @@ BEZEL_TEST(async_iter_manual_protocol_759, await_using_disposes_finally_once) {
         "module M; "
         "class C "
         "  public static cleaned: int := 0; "
-        "  public async static method Gen(): IAsyncEnumerator<int> "
+        "  public static async method Gen(): IAsyncEnumerator<int> "
         "    try "
         "      yield return 42; "
         "      yield return 99; "

@@ -79,13 +79,44 @@ foreach(g IN LISTS BEZEL_TEST_GROUPS)
     list(APPEND BEZEL_TEST_CLAIMED_DIRS ${BEZEL_TEST_GROUP_${g}_DIRS})
 endforeach()
 
+# fix #4530: glob each CLAIMED directory's `*.cpp` pattern EXACTLY ONCE at
+# CONFIGURE time and reuse the result everywhere below, instead of the THREE
+# separate `file(GLOB ... CONFIGURE_DEPENDS ...)` calls this used to make per
+# directory (once here to populate `_d_srcs` for the truthy check below, once
+# more inside the flat "everything" builder, and a third time inside the
+# per-group builder). `VerifyGlobs.cmake_force` (a zero-input phony) forces
+# ninja to re-run `cmake -P VerifyGlobs.cmake` on EVERY invocation regardless
+# — that check-time triplication was already free there, because CMake's own
+# glob-verification manager merges identical glob EXPRESSIONS into one watched
+# entry (confirmed by inspecting a configured build's generated
+# VerifyGlobs.cmake: each entry is annotated with every consuming variable/
+# line, e.g. `_d_srcs`, `BEZEL_TEST_ALL_SOURCES` and `BEZEL_TEST_SOURCES_codegen`
+# all cite the SAME single `tests/codegen/*.cpp` block). What the triplication
+# actually tripled was CONFIGURE-TIME work: every full reconfigure (the
+# `RERUN_CMAKE` this same force-check can trigger, per #4530's title) re-listed
+# and re-processed each claimed directory's files three times over instead of
+# once. Discovery semantics are unchanged — every claimed dir is still globbed,
+# both FATAL_ERROR invariants below are unchanged, and a new file is picked up
+# exactly as before (see the commit body for the before/after proof).
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    file(GLOB _bezel_claimed_srcs_${_d} CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+endforeach()
+
 # Invariant (2): no unclaimed area.
 file(GLOB _bezel_test_entries RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
      CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*)
 foreach(_d IN LISTS _bezel_test_entries)
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${_d})
-        file(GLOB _d_srcs CONFIGURE_DEPENDS
-             ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        if(_d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
+            # Already globbed above; reuse it instead of re-globbing (#4530).
+            set(_d_srcs ${_bezel_claimed_srcs_${_d}})
+        else()
+            # An unclaimed dir (e.g. tests/lit/) — this IS the only place that
+            # glob is needed, so it stays a fresh call.
+            file(GLOB _d_srcs CONFIGURE_DEPENDS
+                 ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        endif()
         if(_d_srcs AND NOT _d IN_LIST BEZEL_TEST_CLAIMED_DIRS)
             message(FATAL_ERROR
                 "Bezel: tests/${_d}/ contains test sources but no group in "
@@ -96,26 +127,27 @@ foreach(_d IN LISTS _bezel_test_entries)
     endif()
 endforeach()
 
-# The flat "everything" list invariant (1) is checked against.
-set(_bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
-foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
-    list(APPEND _bezel_all_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
-endforeach()
-file(GLOB BEZEL_TEST_ALL_SOURCES CONFIGURE_DEPENDS ${_bezel_all_globs})
-
-# Root-level tests (everything but the shared entry point).
-file(GLOB BEZEL_TEST_ROOT_SOURCES CONFIGURE_DEPENDS
+# Root-level tests (everything but the shared entry point) — also the "root
+# pattern" contribution to the flat "everything" list below, globbed once.
+file(GLOB _bezel_root_srcs CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+set(BEZEL_TEST_ROOT_SOURCES ${_bezel_root_srcs})
 list(REMOVE_ITEM BEZEL_TEST_ROOT_SOURCES ${BEZEL_TEST_ENTRY})
 
-# Per-group source lists.
+# The flat "everything" list invariant (1) is checked against — built from the
+# already-globbed per-dir results above instead of re-globbing them (#4530).
+set(BEZEL_TEST_ALL_SOURCES ${_bezel_root_srcs})
+foreach(_d IN LISTS BEZEL_TEST_CLAIMED_DIRS)
+    list(APPEND BEZEL_TEST_ALL_SOURCES ${_bezel_claimed_srcs_${_d}})
+endforeach()
+
+# Per-group source lists — reuse the already-globbed per-dir results (#4530).
 set(_bezel_assigned "")
 foreach(g IN LISTS BEZEL_TEST_GROUPS)
-    set(_g_globs "")
+    set(BEZEL_TEST_SOURCES_${g} "")
     foreach(_d IN LISTS BEZEL_TEST_GROUP_${g}_DIRS)
-        list(APPEND _g_globs ${CMAKE_CURRENT_SOURCE_DIR}/${_d}/*.cpp)
+        list(APPEND BEZEL_TEST_SOURCES_${g} ${_bezel_claimed_srcs_${_d}})
     endforeach()
-    file(GLOB BEZEL_TEST_SOURCES_${g} CONFIGURE_DEPENDS ${_g_globs})
     if(g STREQUAL BEZEL_TEST_ROOT_GROUP)
         list(APPEND BEZEL_TEST_SOURCES_${g} ${BEZEL_TEST_ROOT_SOURCES})
     endif()
@@ -174,6 +206,13 @@ message(STATUS
 # include dirs the 12 PCH headers need; bezel_warnings for -Wall/-Wextra
 # /-Wpedantic) and compile definitions identically to bezel_tests_pch AND
 # every group target, from ONE place, so they cannot drift apart.
+# #5074: see bezel_test_apply_common_compile_settings below.
+set(BEZEL_TEST_BUILD_PATH_POISON
+    BEZEL_RUNTIME_LIB_PATH=bezel_include_support_build_paths_hpp
+    BEZEL_CORE_LIB_PATH=bezel_include_support_build_paths_hpp
+    BEZELC_PATH=bezel_include_support_build_paths_hpp
+    BEZEL_RUNTIME_SRC_DIR=bezel_include_support_build_paths_hpp
+    BEZEL_REPO_ROOT_DIR=bezel_include_support_build_paths_hpp)
 function(bezel_test_apply_common_compile_settings tgt)
     target_include_directories(${tgt} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -193,56 +232,83 @@ function(bezel_test_apply_common_compile_settings tgt)
     # Driver::compileFile child needs full frames, since that is the code
     # being tested, not the harness driving it.
     target_compile_options(${tgt} PRIVATE -gline-tables-only)
-    # Teach the AOT harness's content-addressed link-cache
-    # (support/aot_support.hpp) the path to libbezel_runtime.a, so it can fold
-    # the runtime archive's identity into the cache key (constraint (b)/(d)): a
-    # runtime rebuilt WITHOUT relinking the test binaries must invalidate cached
-    # link products. Mirrors the same definition on bezel_core (which is where
-    # Driver.cpp reads it to drive the actual link). BEZEL_CORE_LIB_PATH is the
-    # k2 compiler-identity refinement (#2100): the cache keys on the COMPILER
-    # archive, not on the test binary — so a test-only relink no longer
-    # invalidates the cache, AND every per-area binary shares one cache (they
-    # all embed the same compiler). Soundness guard + fallback live in
-    # aot_support.hpp combinedIdentity(); its STALE-CORE guard already handles
-    # the new "only one area was relinked against a newer core.a" case by
-    # falling back to the conservative whole-binary identity.
-    target_compile_definitions(${tgt} PRIVATE
-        BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>"
-        BEZEL_CORE_LIB_PATH="$<TARGET_FILE:bezel_core>"
-        # fix #3084: the bezelc --version regression test (tests/support/
-        # bezelc_version_test.cpp) needs to exec the driver binary to check
-        # the output. Same generator expression as the lit track uses; not on
-        # a separate target so a test-only build misses nothing.
-        BEZELC_PATH="$<TARGET_FILE:bezelc>"
-        # The ABSOLUTE path to src/runtime, for native_test_harness.hpp's
-        # runtimeSourceDir(). It used to derive that path from the header's own
-        # __FILE__, which is only absolute when the compiler is invoked with an
-        # absolute -I -- and a path-REWRITING compiler wrapper breaks exactly
-        # that assumption. ccache's `base_dir` rewrites every absolute path
-        # under it into one relative to the compiler's cwd (the CMake build
-        # dir) and passes the REWRITTEN argv to the real compiler, so __FILE__
-        # became `../../../../../home/.../tests/native_test_harness.hpp`. That
-        # resolves from the build dir and nowhere else; gate.sh runs the test
-        # binaries from the WORKTREE ROOT (`cd $(git rev-parse --show-toplevel)`,
-        # gate.sh:71), where it does not resolve at all -- so
-        # runtimeSourceFiles() came back empty, asanRuntimeObject() returned "",
-        # and the ASan leg of 123 test files silently degraded (a handful FAILED
-        # loudly; the rest treat "" as "toolchain missing -> SKIP" and passed
-        # VACUOUSLY). A -D value is not a path argument, so no wrapper rewrites
-        # it; this is the only channel that is absolute by construction.
-        BEZEL_RUNTIME_SRC_DIR="${CMAKE_SOURCE_DIR}/src/runtime"
-        # fix #3627: the SAME defect class, one directory over. Four source-
-        # scanning ratchet tests each derived the repo root from their own
-        # __FILE__ (tests/support/repo_root.hpp); under the same ccache
-        # base_dir rewrite this becomes unresolvable-from-the-worktree-root,
-        # and (worse than the runtime case) a directory walk over an
-        # unresolvable root silently visits zero files instead of erroring,
-        # so a "zero hits expected" ratchet passes having scanned nothing.
-        # Same fix: an absolute -D no path-rewriting wrapper touches.
-        BEZEL_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}")
+    # #5010: the five per-build absolute paths the harness needs
+    # (BEZEL_RUNTIME_LIB_PATH, BEZEL_CORE_LIB_PATH, BEZELC_PATH,
+    # BEZEL_RUNTIME_SRC_DIR, BEZEL_REPO_ROOT_DIR — see the generated
+    # build_paths.cpp below for what each is for) used to be -D's on EVERY test
+    # TU. A -D value is part of the ccache key and the headers expanded it into
+    # every TU's preprocessed text, so all ~2,000 test TUs missed the cache in a
+    # fresh worktree at the same commit. They now live as `extern const char[]`
+    # definitions in ONE generated TU (bezel_test_build_paths), and
+    # support/build_paths.hpp maps the old macro names onto the constants, so
+    # every `#ifdef BEZEL_X` / use site is unchanged. The values are still
+    # absolute and still per-build, so the #3468 / #3627 absolute-path
+    # guarantees (runtime_source_dir_absolute_test, repo_root_absolute_test)
+    # are untouched.
+    # #5074: every test TU gets the five names as VALUE-FREE POISON defines
+    # (identical in every tree, so the ccache keys stay tree-independent).
+    # `#ifdef BEZEL_X` is therefore always true, and a TU that USES one without
+    # including support/build_paths.hpp (which #undef's and redefines them)
+    # fails to compile with "use of undeclared identifier
+    # 'bezel_include_support_build_paths_hpp'" -- instead of silently taking
+    # an #ifdef fallback branch (a fail-open cache identity, or a __FILE__
+    # root) and passing vacuously.
+    target_compile_definitions(${tgt} PRIVATE ${BEZEL_TEST_BUILD_PATH_POISON})
+    if(BEZEL_CCACHE_RELOCATABLE)
+        # #5010: clang stamps each input header's mtime into the PCH and
+        # ccache then refuses to reuse a PCH whose inputs have a new mtime
+        # ("Precompiled header includes ./CMakeFiles/bezel_tests_pch.dir/
+        # cmake_pch.hxx, which has a new mtime") — every tree writes
+        # cmake_pch.hxx at configure time, so the PCH and every PCH'd TU missed
+        # across worktrees. The ccache manual requires -fno-pch-timestamp for
+        # clang PCH. Applied to the owner AND every consumer: REUSE_FROM needs
+        # identical options.
+        target_compile_options(${tgt} PRIVATE
+            "SHELL:-Xclang -fno-pch-timestamp")
+    endif()
 endfunction()
 
 set(BEZEL_TEST_TARGETS "")
+
+# #5010: the ONE translation unit that carries the harness's per-build absolute
+# paths (declared in support/build_paths.hpp). Generated into the BINARY dir, so
+# it is invisible to the tests/**/*.cpp glob and the partition invariants above,
+# and file(GENERATE) resolves the $<TARGET_FILE:...> expressions to literals.
+# It is an OBJECT library compiled once and linked into every group binary. It
+# is the one test TU that (correctly) misses ccache in a new worktree.
+#
+# What each path is for (moved here from the old per-TU -D comments):
+#  - kRuntimeLibPath: libbezel_runtime.a, folded into the AOT link-cache key
+#    (support/aot_support.hpp, constraint (b)/(d)); must equal the value
+#    compiled into Driver.cpp (soundness guard in combinedIdentity()).
+#  - kCoreLibPath: libbezel_core.a, the k2 compiler identity (#2100): the
+#    bincache keys on the COMPILER archive, not the test binary.
+#  - kBezelcPath: the driver binary, exec'd by CLI-surface tests (#3084,
+#    #4386).
+#  - kRuntimeSrcDir: ABSOLUTE src/runtime for native_test_harness.hpp's
+#    runtimeSourceDir() (#3468). It must not derive from __FILE__: a
+#    path-rewriting compiler wrapper (ccache base_dir, and now also
+#    -ffile-prefix-map) makes __FILE__ relative, and the ASan leg of ~123 test
+#    files then silently SKIPs when run from the worktree root.
+#  - kRepoRootDir: ABSOLUTE repo root for support/repo_root.hpp (#3627), same
+#    defect class: a directory walk over an unresolvable root visits zero files.
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/build_paths.cpp CONTENT
+"// GENERATED by tests/CMakeLists.txt (#5010) -- do not edit.
+#include \"support/build_paths.hpp\"
+namespace bezel::test::build_paths {
+const char kRuntimeLibPath[] = \"$<TARGET_FILE:bezel_runtime>\";
+const char kCoreLibPath[] = \"$<TARGET_FILE:bezel_core>\";
+const char kBezelcPath[] = \"$<TARGET_FILE:bezelc>\";
+const char kRuntimeSrcDir[] = \"${CMAKE_SOURCE_DIR}/src/runtime\";
+const char kRepoRootDir[] = \"${CMAKE_SOURCE_DIR}\";
+}  // namespace bezel::test::build_paths
+")
+add_library(bezel_test_build_paths OBJECT
+    ${CMAKE_CURRENT_BINARY_DIR}/build_paths.cpp)
+target_include_directories(bezel_test_build_paths PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(bezel_test_build_paths PRIVATE
+    ${BEZEL_TEST_BUILD_PATH_POISON})
 
 # The PCH owner: one dummy, never-edited TU, written into the BINARY dir (not
 # tests/) so it is invisible to the tests/**/*.cpp glob and the two partition
@@ -262,7 +328,8 @@ bezel_test_apply_common_compile_settings(bezel_tests_pch)
 # part of the ccache key.
 # NOTE (machine-local, not tracked): ccache needs `sloppiness =
 # pch_defines,time_macros` (~/.config/ccache/ccache.conf) to cache PCH
-# builds — see the build-accelerators note in CLAUDE.md.
+# builds — see the build-accelerators note in CLAUDE.md. (In
+# BEZEL_CCACHE_RELOCATABLE mode the launcher passes them itself, #5073.)
 target_precompile_headers(bezel_tests_pch PRIVATE
     <cstddef> <cstdlib> <functional> <memory>
     <string> <string_view> <utility> <vector>
@@ -270,10 +337,60 @@ target_precompile_headers(bezel_tests_pch PRIVATE
     <llvm/IR/Module.h>
     <llvm/ExecutionEngine/Orc/LLJIT.h>
     <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
+if(BEZEL_CCACHE_RELOCATABLE)
+    # #5073: in relocatable-ccache mode the PCH is compiled per tree, never
+    # served from ccache (a clang PCH embeds its tree's absolute input paths,
+    # so a PCH cached by tree A breaks every consumer in tree B once A is
+    # removed). The launcher also writes a content-derived, tree-independent
+    # <pch>.sum that the consumers' ccache hashes instead of the PCH bytes
+    # (ccache pch_external_checksum=true, set on the launcher in the top-level
+    # CMakeLists.txt), so PCH'd test TUs still hit across trees. The .sum is
+    # deleted before every PCH compile and written only after it succeeds;
+    # with no .sum ccache falls back to the PCH bytes. See the script header.
+    set_target_properties(bezel_tests_pch PROPERTIES CXX_COMPILER_LAUNCHER
+        "${CMAKE_CURRENT_SOURCE_DIR}/pch_sum_launcher.sh;${CMAKE_SOURCE_DIR};${BEZEL_SOURCE_DIR_REAL};${BEZEL_CCACHE_RELOCATABLE_LAUNCHER};--")
+    set_property(TARGET bezel_tests_pch APPEND PROPERTY ADDITIONAL_CLEAN_FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.sum
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.inputs)
+    # #5085: before every build, re-check the content of every PCH input
+    # against the hashes the launcher recorded, and delete a PCH whose inputs
+    # changed. make alone keys on mtimes, which a package update can leave OLDER
+    # than the PCH, and clang does not revalidate system headers from a PCH.
+    # Always-run (a SYMBOLIC output); ordered before the PCH rule by the
+    # target dependency, and every group reaches the PCH through REUSE_FROM.
+    #
+    # #5088: under Ninja, deleting the .pch is not enough. Ninja computes its
+    # dirty set before the build starts and never re-stats the .pch, so the
+    # build would finish rc=0 on stale objects and recover only on the NEXT
+    # build. So verify also owns a stamp, declared as a BYPRODUCT (which gives
+    # the edge `restat = 1` under Ninja) and as an OBJECT_DEPENDS of the PCH
+    # compile. It is touched ONLY when the PCH is deleted. Ninja then keeps the
+    # PCH and its consumers dirty, or restat-cleans them when the stamp did not
+    # move. make needs no help: it evaluates the PCH rule after verify ran. The
+    # stamp is deliberately NOT in the target's DEPENDS, because the Makefile
+    # generator has no rule for a byproduct.
+    set(_pch_verify_stamp ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.stamp)
+    set(_pch_verify_always ${CMAKE_CURRENT_BINARY_DIR}/bezel_tests_pch_verify.always)
+    add_custom_command(OUTPUT ${_pch_verify_always}
+        BYPRODUCTS ${_pch_verify_stamp}
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/pch_verify.sh
+                CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch
+                ${_pch_verify_stamp}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Checking the test PCH inputs (#5085)"
+        VERBATIM)
+    set_source_files_properties(${_pch_verify_always} PROPERTIES SYMBOLIC TRUE)
+    add_custom_target(bezel_tests_pch_verify DEPENDS ${_pch_verify_always})
+    set_source_files_properties(
+        ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.cxx
+        PROPERTIES OBJECT_DEPENDS ${_pch_verify_stamp})
+    add_dependencies(bezel_tests_pch bezel_tests_pch_verify)
+endif()
 
 function(bezel_add_test_binary group)
     set(tgt bezel_tests_${group})
-    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}})
+    add_executable(${tgt} ${BEZEL_TEST_ENTRY} ${BEZEL_TEST_SOURCES_${group}}
+        $<TARGET_OBJECTS:bezel_test_build_paths>)
     bezel_test_apply_common_compile_settings(${tgt})
     target_precompile_headers(${tgt} REUSE_FROM bezel_tests_pch)
     # Force all bezel_runtime object files in, then export-dynamic so a
@@ -285,6 +402,36 @@ function(bezel_add_test_binary group)
     # target_link_libraries), so a fresh tree building one test target alone
     # never builds the archive; make the edge explicit.
     add_dependencies(${tgt} bezel_runtime)
+    # fix #4386: CLI-surface tests (e.g. checked_contracts_4386_cli) exec the
+    # real bezelc binary via BEZELC_PATH (set with $<TARGET_FILE:bezelc>);
+    # the option produces no dependency edge of its own, so make the build
+    # edge explicit.
+    add_dependencies(${tgt} bezelc)
+    # fix #4529 (follow-up to #2877): state the link's provenance instead of
+    # leaving the harness to infer it from mtimes. The AOT bincache keys on
+    # SHA-256(libbezel_core.a) for a binary that was linked from that archive,
+    # and it decided "was it?" by comparing mtimes — which a no-op re-archive
+    # (identical bytes, new timestamp; llvm-ar is deterministic here) inverts,
+    # cooling the whole shared store and failing aot_cache_key's safety pin.
+    # This step records the digest the link actually consumed, so the harness
+    # can compare CONTENT. It runs on every link, so the record can never be
+    # stale with respect to its binary. See aot_support.hpp's LINK-TIME
+    # PROVENANCE comment.
+    #
+    # No BYPRODUCTS: `$<TARGET_FILE:${tgt}>` is rejected there ("No target
+    # bezel_tests_<g>") because BYPRODUCTS of a POST_BUILD command is evaluated
+    # without the owning target in scope, and the record is a 65-byte file that
+    # is rewritten on every link — nothing downstream consumes it as a build
+    # input, so ninja does not need to know about it.
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DBEZEL_CORE_LIB=$<TARGET_FILE:bezel_core>
+                -DBEZEL_OUT=$<TARGET_FILE:${tgt}>.coreid
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/record_core_identity.cmake
+        COMMENT "Recording libbezel_core.a identity for ${tgt} (#4529)"
+        VERBATIM)
+    set_property(TARGET ${tgt} APPEND PROPERTY
+        ADDITIONAL_CLEAN_FILES $<TARGET_FILE:${tgt}>.coreid)
     add_test(NAME ${tgt} COMMAND ${tgt})
     set(BEZEL_TEST_TARGETS ${BEZEL_TEST_TARGETS} ${tgt} PARENT_SCOPE)
 endfunction()

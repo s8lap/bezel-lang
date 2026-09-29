@@ -23,12 +23,22 @@
 // from the PropertyDecl's declared type (or, for an IMPORTED property with no
 // AST decl, from `ctx_.importedMemberType`), then read the closure pointer via
 // `lowerExpr(*call.callee)` (which dispatches the property GET) and
-// `emitClosureCall`. The imported-type fallback is gated on a CLASS receiver,
+// `emitClosureCall`. The imported-type fallback was gated on a CLASS receiver,
 // mirroring #2300's record gate: an imported RECORD function-typed property
-// read shares the separate deeper defect #2590 (bad cross-module closure
-// pointer), so routing it through emitClosureCall would only convert its
-// silent zero-init into a segfault; the LOCAL record case (sound read path)
-// is covered by the `pd->type` branch.
+// read shared the separate deeper defect #2590 (bad cross-module closure
+// pointer), so routing it through emitClosureCall would only have converted
+// its silent zero-init into a segfault; the LOCAL record case (sound read
+// path) is covered by the `pd->type` branch.
+//
+// ⚠ THAT CARVE-OUT IS RETIRED (fix #2590, §2.8.2/§9.2/§23.1/§28.9, v0.306).
+// The imported-record field-initializer replay (#2874/#3671/#3723) now lands a
+// real closure pointer at the consumer's `new` site, so `Record` joins `Class`
+// and `Interface` in the single shared
+// `importedMemberTypeAdmitsClosureDispatch` predicate that replaced this arm's
+// and #2300's separate allowlists. Nothing in THIS file's oracles changes —
+// no row here uses a record receiver — but the rationale above no longer
+// describes the code, and the record rows now live in
+// tests/module/xmod_imported_record_func_member_invoke_2590_test.cpp.
 //
 // TEST GRID — every case asserts the VALUE (not just "compiles"), since the
 // defect was a silent wrong-value miscompile:
@@ -42,10 +52,14 @@
 //   T5 local-bind on an auto-property (regression)    — unchanged (11 either way)
 //   T6 IMPORTED interface function-typed property     — the fix (0→11); the
 //     direct invoke                                         imported-type fallback
-//                                                           is gated on Class ||
-//                                                           Interface (Record is
+//                                                           was gated on Class ||
+//                                                           Interface (Record was
 //                                                           excluded — #2590 ABI
-//                                                           defect segfaults).
+//                                                           defect segfaulted;
+//                                                           since #2590 landed,
+//                                                           Record is admitted
+//                                                           too — see the ⚠ note
+//                                                           above).
 
 #include <cstdio>
 #include <cstdlib>
@@ -271,8 +285,9 @@ BEZEL_TEST(xmod_func_property_invoke_2589,
 // ===========================================================================
 // T6 — IMPORTED interface function-typed property direct invoke: `i.F(10)`
 // where `i: IFunc` is reached through `--import`. The imported-type fallback
-// in the new PropertySymbol arm is gated on Class || Interface (Record is
-// excluded — its cross-module closure READ segfaults, the #2590 ABI defect).
+// in the new PropertySymbol arm was gated on Class || Interface (Record was
+// excluded — its cross-module closure READ segfaulted, the #2590 ABI defect;
+// #2590's fix retired that exclusion — see this file's header ⚠ note).
 // Pre-fix: 0 (no PropertySymbol arm at all). Post-fix: 11. Proves the
 // imported interface property read (itable dispatch) yields a sound closure
 // pointer that emitClosureCall can dispatch.

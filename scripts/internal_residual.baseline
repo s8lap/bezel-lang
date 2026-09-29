@@ -1,0 +1,29 @@
+# internal_residual.baseline - the ratchet for silent-wrong-
+# code `internal: ...` emissions across the lit + main-
+# conformance + rules corpus (per the lane-24-E brief,
+# 2026-09-24).
+#
+# The count is EXACT, not a ceiling. A count below its
+# baseline fails as STALE HEADROOM: a fix landed but was
+# not banked. Re-run with --update on the merged tree so
+# the drop is recorded.
+#
+# Regenerate with scripts/check_internal_residual.py
+# --update. --update REFUSES to raise the count without
+# --force: landing a rise (a new silent-wrong-code emitter)
+# is a deliberate act.
+#
+# Measured by compiling every
+#   tests/lit/**/*.bzl
+# + every non-rejects case in tests/conformance/cases/ (wrapped
+#   via tests/conformance/conformance.py)
+# + every run/accept case in tests/conformance/rules/cases/ (as-is)
+# against real bezelc, summing lines matching the diagnostic
+# prefix `:[0-9]+:[0-9]+: internal:` in the merged
+# stdout+stderr.
+#
+# gtest programs are NOT measured (JitResult::diagnostics is
+# REJECT-only; see scripts/check_vacuous_tests.py for the same
+# coverage caveat, and feedback-run-aot-discards-stderr-on-
+# success for the gtest blind spot).
+total_internal_lines = 86

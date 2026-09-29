@@ -249,7 +249,7 @@ enum class EscapeScope {
 // §28.3 states the two kinds as ONE category — "a captured owned binding — an
 // owned local or `owned` parameter of the enclosing body" — and *Auto-drop
 // (affine)* gives the parameter its scope end explicitly: "for an `owned`
-// parameter, at the end of the method". `checkClosureEscapesOnReturn`'s §28.9
+// parameter, at the end of the method". `checkClosureEscapesOnReturn`'s §28.3
 // leg has always answered for BOTH (it reads `states_`, which `run()` seeds
 // with the `owned` parameters, and it has a `ParameterSymbol` arm), while
 // `ownedLocalBorrowSource` answered for locals only. Two channels of ONE escape
@@ -508,9 +508,9 @@ public:
     //     method level by `checkBorrowStoreEscape`'s `Dest::OuterLocal` arm
     //     since fix #3520; inside a lambda body it compiled clean and
     //     heap-use-after-freed (measured rc=139 / ASan UAF on 5d052b3).
-    //   * #3564 — the §28.9 owned-scope-bound-local RETURN channel (`using var
+    //   * #3564 — the §28.3 owned-scope-bound-local RETURN channel (`using var
     //     r := new R(); return lambda() => r.V();` inside a lambda body).
-    //     Rejected at method level by `checkClosureEscapesOnReturn`'s §28.9
+    //     Rejected at method level by `checkClosureEscapesOnReturn`'s §28.3
     //     leg; inside a lambda body it compiled clean and leaked its 56 bytes
     //     while the returned closure read storage the lambda invocation owns.
     // Both are closed by giving this driver the lambda body's OWN scope
@@ -527,7 +527,7 @@ public:
     void checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam);
 
     // fix #3564: seed `states_` with the owned scope-bound locals declared in
-    // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.9 leg (and
+    // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.3 leg (and
     // `checkBorrowStoreEscape`'s owned-source legs) can answer about that
     // body. Resolution goes through `findLocalSymbol` (node-keyed, so it
     // matches a `LocalConstDecl` too) and `localIsOwnedObligation` — the
@@ -559,6 +559,37 @@ public:
     void forEachBorrowStoreCallInExpr(
         const ast::Expr& e,
         const std::function<void(const ast::CallExpr&)>& fn) const;
+
+    // fix #4628 (§28.9 / §15.3): "Capturing a move-only local follows the
+    // same rule [as capturing an owned class-typed local] — the closure
+    // captures a borrow whose source is the local's enclosing scope; reads
+    // of slots through the captured borrow are admitted, `move arr[i]`
+    // through it is not, because the closure does not own the array."
+    // (§28.9). The general move-only-array leak scan
+    // (`moveOnlyArrayLeakScan`/`moveOnlyArrayLive_`, driven from the
+    // METHOD's own scope) deliberately stops at the `LambdaExpr` boundary —
+    // its own comment records the assumption that nothing reachable only
+    // through a lambda body can slot-move an outer array, which this rule
+    // shows is false. This is the dedicated lambda-body check for exactly
+    // that shape, run from `checkOneLambdaBodyEscapes` alongside its
+    // siblings above. Mirrors `scanLambdaBodyBorrowStores` /
+    // `forEachBorrowStoreCallInStmt` / `forEachBorrowStoreCallInExpr`
+    // shape-for-shape (never crosses into a nested lambda; a nested
+    // lambda's own moves are walked when the flat lambda list in
+    // `checkOneLambdaBodyEscapes` reaches it).
+    void scanLambdaBodyMoveOnlyArraySlotMoves(const ast::LambdaExpr& lam);
+    void checkMoveOnlyArraySlotMovesInStmt(const ast::Stmt& s,
+                                            const ast::LambdaExpr& lam);
+    void checkMoveOnlyArraySlotMovesInExpr(const ast::Expr& e,
+                                            const ast::LambdaExpr& lam);
+    // The check point: `move X[i]` where the IndexExpr `ix` is the operand.
+    // Reports iff `X` resolves to a move-only inline-array LOCAL declared
+    // OUTSIDE `lam` (a capture, by the same span-containment
+    // `declaredInLambda` test `checkClosureEscapesOnReturn`'s §28.8 leg
+    // uses above) — a same-lambda-declared array is an ordinary local, not
+    // a capture, and stays governed by the regular §15.3 rules.
+    void reportIfCapturedMoveOnlyArraySlotMove(const ast::IndexExpr& ix,
+                                                const ast::LambdaExpr& lam);
 
     // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
     // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
@@ -606,6 +637,20 @@ public:
     void applyLambdaBodyDiscardStmtFlags(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void applyLambdaBodyDiscardStmtFlagsBody(const ast::LambdaExpr& lam);
+
+    // prep #4146 Stage 2-A (§28.3, v0.298): run the ownership CFG dataflow
+    // over one lambda body, seeded with the outer-scope captured states. Mirrors
+    // MethodOwnership::run but skips the method-body-only checks that have no
+    // lambda-body analogue: checkAsyncSignatureBorrowBearing,
+    // checkBorrowBearingLocalsAcrossSuspension, and the IOwningEnumerable check.
+    // Expression-bodied lambdas are handled by building a single-block CFG that
+    // records the exprBody; block-bodied lambdas use the same Builder path as
+    // buildCFG. The capturedStates parameter is the outer scope's BlockState at
+    // the point the lambda is defined — it seeds the dataflow entry state for
+    // any captured locals.
+    void runLambdaBody(
+        const ast::LambdaExpr* lam,
+        const BlockState& capturedStates);
     void applyLambdaBodyDiscardStmtFlagsStmt(const ast::Stmt& s);
 
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
@@ -616,6 +661,22 @@ public:
     // bound to a borrow-carrying field is a temporary (not a named place). Keeps
     // long-lived-borrow construction (`var xs := […]; new Bag(xs)`) legal.
     void checkRecordFromTemporary(const ast::NewExpr& ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(name := value, …)` non-
+    // destructive-update sibling of `checkRecordFromTemporary`. Same rule, same
+    // reject, but the `WithExpr::assigns` list is name-keyed (`InitAssign{name,
+    // value}`), so each override is matched to its borrow-carrying field by
+    // walking the source record's `members` and matching `name` (not by
+    // positional indexing as `NewExpr::args` does). The sema phase already
+    // validated every `InitAssign.name` against the source record's declared
+    // members (ExprTypecheck_Exprs.cpp:10843-10872), so an unresolvable name
+    // is impossible here. The predicate deliberately OMITS the inline-array
+    // arm of `fieldTypeIsBorrowCarrying`: an inline-array-of-references
+    // literal moves its elements into the new record at the `with(...)`
+    // boundary (the record OWNS the elements), so there is no §9.7 violation
+    // there — see `checkRecordWithFromTemporary`'s implementation comment
+    // for the asymmetry rationale and #4330's
+    // `positional_field_conforming_accepted_control` test pin.
+    void checkRecordWithFromTemporary(const ast::WithExpr& we);
     // True when `ft` is a borrow-carrying field type (a class/interface
     // reference — including the BUILTIN heap collections Array/Dictionary/… that
     // carry no user TypeDecl — an inline array of references, or a transitively
@@ -639,6 +700,28 @@ public:
     // header comment for the rationale and the #2666 walk-through.
     bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
 
+    // narrow #4743: the TYPE-classification half of `localIsTrivialDisposeNewBinding`,
+    // factored out so the owned-PARAMETER must-use gate reads the same
+    // authority as the owned-LOCAL one instead of a second, looser spelling.
+    //
+    // POSITIVE predicate: true only when `t` is PROVABLY a trivial-dispose
+    // class. That polarity is the whole point. `common::isNonTrivialDispose
+    // Class` asks the opposite question and its `false` is NOT a
+    // trivial-dispose certificate — it is also `false` for a null TypeRef, a
+    // non-`Named` kind, a declaration-less builtin head (`OwningArray<T>`, an
+    // iterator/async FRAME), an uninstantiated bare type parameter, and every
+    // non-`Class` declaration kind (an INTERFACE above all). §28.9 names
+    // those as NEVER trivial-dispose in so many words — "an interface type is
+    // never trivial-dispose, its conformance set being open across modules",
+    // "it is therefore not defined for a compiler-synthesized frame", and
+    // "the owned-element variants of the standard collection types … are
+    // **not** trivial-dispose at any instantiation" — so negating the
+    // non-trivial predicate to drive an EXEMPTION suppresses obligations the
+    // spec still requires be announced. A wrong answer here is a retained
+    // (noisy) warning rather than a hidden obligation, the same direction
+    // `localIsTrivialDisposeNewBinding`'s header commits to. // per §28.9
+    bool typeIsProvablyTrivialDisposeClass(const sema::TypeRef* t);
+
     // §28.8.1 / fix #3586 — test-only accessor: true when `s` was recorded
     // as lexically inside a `try` by collectStmtsInsideTry. Exposed so the
     // walker-coverage regression tests for fix #3586 can verify the CaseStmt
@@ -653,6 +736,20 @@ public:
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
+    // fix #4141 (§21.5/§28.3, v0.298): pending `break`/`continue` arm
+    // end-states to be JOINED into the IMMEDIATELY enclosing loop's
+    // post-loop join, rather than folded into the if/case's own join
+    // (which would be a false-reject — see `armDivertsToEnclosingLoop`).
+    // Each entry is a snapshot of `states_` at the point of an unlabeled
+    // `break`/`continue` (offset 0) that terminates an if/case arm
+    // inside this walker; the immediately enclosing `While`/`For`
+    // handler pops and joins every entry pushed during its body's walk.
+    // Labeled forms targeting an OUTER loop (offset > 0) are deferred to
+    // #4146's Stage 2 ("lambda bodies through the real CFG") — this
+    // walker has no mechanism to skip past intervening loop constructs
+    // when joining, and the over-conservative fallback (folding the arm
+    // into the immediate join) is sound-direction only.
+    std::vector<BlockState> pendingDivertedStates_;
     // Async-readiness 3c: true while analysing an `async` method/lambda body.
     // Gates the at-await-site Pattern A/B checks and the SuspendLocal
     // annotation so they never affect a synchronous body. // per §30.5
@@ -724,6 +821,10 @@ private:
     // parameter-sourced borrow returns. Defaults true (a no-op) so a non-bare-T
     // method is never affected. // per §28.3 v0.194
     bool bareReturnSourceSetEmpty_ = true;
+    // prep #4146 Stage 2-A (§28.3, v0.298): CFG build options for lambda body
+    // CFGs constructed by runLambdaBody. Initialised to the default (full CFG
+    // with exception edges, same as buildCFG's default for method bodies).
+    flow::CFGBuildOptions buildOpts_;
     // §28.3 v0.194 *Bare-type-parameter returns* Callee side, per-instantiation-
     // category admission (#2064): true when the returned parameter is constrained
     // `where T: class` at its own level, so every substitution is class/interface
@@ -1176,7 +1277,16 @@ private:
 
     // §28.3 arm-meet (v0.184, #1661): reject an if-expression / expression-
     // position `case`/`when` whose arms mix an owned value with a borrow.
+    // fix #4964 (§28.3 `a ?? b` row, K7.3, v0.307): also the built-in `??`,
+    // whose operands are the two arms of the same K7 meet.
     void checkArmMeetMixed(const ast::Expr& e);
+
+    // fix #4964: the `??` half of checkArmMeetMixed, and the set of `??`
+    // nodes already diagnosed. The `??` check runs from every read position
+    // (checkRead's BinaryExpr arm) as well as from the binding / return
+    // drivers, so one node can be reached more than once on the emit pass.
+    void checkCoalesceMeetMixed(const ast::BinaryExpr& be);
+    std::unordered_set<const ast::Expr*> coalesceMeetReported_;
 
     // fix #4286 (§28.3 / §28.6, v0.298): `fromLambdaBody` mirrors the
     // established `fromLambdaBody` convention (`checkCollectionBorrowStoreEscape`
@@ -1470,6 +1580,25 @@ private:
     // MovedFrom/Disposed/Poisoned source was already diagnosed by the preceding
     // checkRead). // per §15.3 bullet 1
     void noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src);
+    // §15.3 (#4587) bullet 1 sibling, for the OTHER move-only kind (§35.4's
+    // owning-classified choice): a bare-identifier read of an owning-choice
+    // LOCAL at a local-to-local transfer position (the `var y := x;`
+    // initializer, or the RHS of a plain `y := x;`) MOVES the whole value —
+    // mark the source moved-from in `states_` so a later read/move/dispose is
+    // the use-after-move compile error §15.3 mandates. This function checks
+    // only the SOURCE shape — a bare identifier naming a plain (non-`const`,
+    // non-parameter) `ast::LocalDecl`-backed local of owning-classified type
+    // whose current state is live. The `handleLocalDecl` caller's target is
+    // always such a local by construction (a fresh binding); the
+    // `handleAssignment` caller additionally gates on the TARGET being one
+    // too, matching #4566's codegen counterpart
+    // (`Emitter::markOwningChoiceLocalMovedFrom`) exactly — see that call
+    // site for why (a field / index / discard target is deliberately left
+    // out of THIS fix's scope). A no-op when `src` is not such an identifier,
+    // its type is not owning-classified, or its state is not a live source (a
+    // MovedFrom/Disposed/Poisoned source was already diagnosed by the
+    // preceding checkRead). // per §15.3, §28.7, v0.306, #4587
+    void noteOwningChoiceWholeMoveRead(const ast::Expr& src);
     struct MoveOnlyArraySlots {
         long long size = 0;
         std::unordered_set<long long> movedSlots;  // provably moved-from
@@ -2057,7 +2186,7 @@ private:
     //   * the §31.1 caught-exception leg runs — `isCatchBorrow` reads a
     //     sema-set flag (`sema::LocalSymbol::isCatchBinding`, issue 3521), so
     //     it classifies the captured identifier exactly from anywhere;
-    //   * the §28.9 owned-local leg runs (fix #3564) — the caller has cleared
+    //   * the §28.3 owned-local leg runs (fix #3564) — the caller has cleared
     //     `states_` and re-seeded it from the lambda body's own owned
     //     obligations, so `isOwnedTrackedLocal` now answers about the right
     //     scope. A method-scope local resolves to nothing there, deliberately:
@@ -2305,6 +2434,30 @@ private:
         const ast::Stmt& s,
         std::vector<const ast::IdentifierExpr*>& out) const;
 
+    // fix #4271 (§28.3 / §28.6 / §28.7, v0.298): SEED `states_` with entries
+    // from `outerStates` for every LocalSymbol this lambda body CAPTURES
+    // (declared outside the body). The lambda-body pre-pass clears `states_`
+    // on entry so the dataflow it stands in for doesn't leak lambda-local
+    // bookkeeping into the enclosing scope; that clear, however, also
+    // discards the outer-scope state for captured locals, so the
+    // lambda-body AssignmentStmt / .Dispose() arms' `for (auto& [sym, st] :
+    // states_) if (sym->name != tid->name) continue;` and `lookupState(name)`
+    // lookups find NOTHING for them and the bookkeeping (producer-state
+    // adoption, disposeAliasSource clear, becomesOwnedViaReassign flag,
+    // disposeReclaimsReassignedBorrow stamping) silently does not run — a
+    // fresh owned value reassigned to a captured local inside the lambda and
+    // then explicitly `.Dispose()`'d leaks the heap block. Restored to
+    // `outerStates` after the body walk so the enclosing scope's state is
+    // untouched.
+    void seedCapturedOuterLocals(
+        const ast::LambdaExpr& lam,
+        const BlockState& outerStates);
+    // fix #4271: derive the declaration-time `LocalOwnership` of a captured
+    // LocalSymbol from its `LocalDecl` AST and insert into `states_`. See
+    // `seedCapturedOuterLocals`'s declaration for why this runs in the
+    // pre-pass (BEFORE the dataflow populates `outerStates`).
+    void seedCapturedLocalFromDecl(sema::LocalSymbol* ls);
+
     // §9.7 borrow-bearing-record escape (issue #360, D2): a returned
     // expression whose static type is a borrow-bearing record that
     // carries a borrow of a scope-bound (`using var` / owned) local.
@@ -2345,6 +2498,31 @@ private:
     // §28.3, §28.9, §9.7, v0.194
     sema::Symbol* carriedEscapeBoundSourceLiveAt(const sema::Symbol* holder,
                                                  std::uint32_t atOffset) const;
+
+    // §9.7 / stdlib §4.14 / §4.15 (v0.307): given an expression whose STATIC
+    // TYPE is a borrow-bearing record or a builtin span view, return the live
+    // escape-bound binding (`isEscapeBoundLocal` — an owned scope-bound local
+    // still Owned, or a §31.1 catch binding) whose scope the carried borrow is
+    // rooted at, or null.
+    //
+    // This is the value-carried sibling of `ownedLocalBorrowSource`, which
+    // DECLINES this shape on purpose ("those keep their existing type-based
+    // store handling untouched"). It recognizes the same three forms
+    // `checkRecordBorrowEscapesOnReturn` does at the return site:
+    //   (a) construction — `new Span<T>(buf, 0, n)` / `new Rec(local)`: the
+    //       first argument whose `identifierRoot` is escape-bound. Every
+    //       argument is scanned, which is safe at this precision because a
+    //       record may not have `owned` fields (§9.7's first paragraph), so a
+    //       class-typed argument is necessarily bound to a borrow-carrying
+    //       field;
+    //   (b) projection — `buf.AsSpan()`, `sp.Slice(1)`, `rec.Field`: the
+    //       receiver root;
+    //   (c) alias — a bare span/record local whose carried provenance the
+    //       §28.3 freeze pre-pass recorded in `recordBorrowLocalSource_`,
+    //       resolved through `carriedEscapeBoundSourceLiveAt`.
+    // Conservative throughout: an unrecognized shape returns null rather than
+    // guessing a source. // per §9.7, stdlib §4.14, §4.15
+    sema::Symbol* carriedBorrowSourceOfValueExpr(const ast::Expr& e);
 
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). The
     // unified CALLER-side classification of a call whose result is an
@@ -2839,6 +3017,403 @@ private:
     void collectCaseArmBorrowSourcesExpr(const ast::Expr& e);
     void registerCaseArmBorrowSources(const std::vector<ast::CaseArm>& arms,
                                       const ast::Expr* scrutinee);
+
+    // fix #4635 (§28.3 K8.3/K8.4 + §35.5 *The owning match*, v0.307): true
+    // when `scrutinee` is one of §35.5's two ANNOUNCING scrutinee forms over
+    // an OWNING-classified choice — "an unbound owned temporary of
+    // owning-choice classification" (a call: §35.3's case construction and an
+    // owning-choice-returning call both mint) or "a named owned binding under
+    // an explicit scrutinee transfer marker" (`case move o of …`). The sema-
+    // side twin of codegen's `unboundOwningChoiceTemp` /
+    // `markedOwningChoiceScrutineeSlot` pair, which gate the SAME two forms
+    // for the construct-completion reclaim. // per §35.5, v0.307
+    bool owningMatchScrutineeForm(const ast::Expr* scrutinee);
+
+    // fix #4635 (§28.3 K8.4, v0.307): reject an EXPRESSION-position owning
+    // match whose arm result is a borrow of a payload the arm's own pattern
+    // bound. §35.5 makes such a binding "an owned local of the arm body's
+    // scope", and §28.3's arm-meet row makes an UNMARKED named owned binding
+    // written as an arm a BORROW arm — so the construct's value is a borrow
+    // of a value whose owner (the arm scope, or the consumed scrutinee's
+    // construct-completion reclaim, K8.3) is gone when the construct
+    // completes. K8.4: "a borrow or frame that would escape it is rejected,
+    // never lifetime-extended". Syntactic and flow-insensitive, so it runs in
+    // the once-only pre-pass beside registerCaseArmBorrowSources rather than
+    // in the fixpoint. // per §28.3 K8.4, §35.5, v0.307
+    void checkOwningMatchArmEscape(const ast::CaseExpr& ce);
+
+    // fix #4663 (§28.3 K8.3/K8.4 + §35.5, v0.307): the STATEMENT-position twin
+    // of #4635's `checkOwningMatchArmEscape` — #4635 closed the construct's
+    // own VALUE (an expression-position arm's result); this closes a STORE
+    // written out of a BLOCK-form arm's body (`do outer := w; end`), which is
+    // the identical K8.4 escape by a different spelling: `outer` (or any
+    // pre-existing local/field/slot, or a `return`) outlives the construct,
+    // so writing a borrow of the payload into it hands out exactly the
+    // dangling reference K8.4 forbids. Syntactic and flow-insensitive, one
+    // hop (the store's own value, `identifierRoot`-peeled) — matching #4635's
+    // shape rather than a second, drifting escape analysis. A store whose
+    // TARGET is itself a local declared WITHIN this same arm does not escape
+    // (it dies with the arm's own block, inside the construct's boundary) —
+    // `var tmp := w; ... ` reading `tmp` inside the arm stays admitted.
+    void checkOwningMatchArmStmtEscape(const ast::CaseStmt& cs);
+
+    // fix #4663 (§28.3 K8.4, §35.5, v0.307): a CLOSURE literal reachable from
+    // `e` (an arm's own result value, or a statement-position store's value)
+    // that CAPTURES one of `transferred`'s bindings is the SAME K8.4 escape
+    // by a THIRD route, on top of #4635/#4663's own direct `identifierRoot`
+    // shape: `lambda(): int => w.Ping()` assigned out of the arm, or
+    // returned as the arm's own value, hands the captured borrow to
+    // whatever the closure escapes into. #4664's own investigation
+    // established that `collectCaseArmBorrowSourcesExpr`'s walker never
+    // descends into a `LambdaExpr` body at all (deliberately, for an
+    // unrelated reason — a `case` NESTED INSIDE a closure has its own,
+    // closure-scoped obligations, not this method's) — so neither
+    // `checkOwningMatchArmEscape` nor `checkOwningMatchArmStmtEscape` had
+    // ever looked inside a lambda literal that is ITSELF the escaping
+    // value. Reuses `collectLambdaIdentifiers` — the SAME free-variable
+    // walk `checkClosureEscapesOnReturn`'s own capture-rejection arms
+    // already consult for the catch-borrow / ref-out-param / borrow-bearing-
+    // record cases — rather than a second, hand-rolled lambda-body walk.
+    // Returns the first captured transferring-binding identifier found, or
+    // null. // per §28.3 K8.4, §35.5, v0.307
+    // fix #4715 extends this with `aliases` — the same same-arm alias map
+    // `owningMatchEscapeRoot` traces, so an ALIASED capture (`const c := w;
+    // f := lambda(): int => c.Ping();`) is caught exactly as the direct one
+    // is, rather than the two routes disagreeing about what roots at a
+    // transferred binding.
+    // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the per-arm MAY-TAINT
+    // set. Keys are the DECL NODES of arm-declared locals (the identity
+    // `sema::LocalSymbol::decl` carries, the same one `aliases` and
+    // `localDeclsInArm` are keyed by); the value is the transferred-binding
+    // identifier that tainted the local, kept so the diagnostic can name the
+    // BINDING (`w`) and its `move w` remedy rather than the intermediate.
+    // An UNORDERED map is deliberate and safe here: the set is only ever
+    // looked up by key and merged wholesale, never iterated on a decision
+    // path (#2116), so its iteration order cannot reach a diagnostic.
+    using OwningMatchArmTaint =
+        std::unordered_map<const ast::Node*, const ast::IdentifierExpr*>;
+
+    // fix #4720: the state the ordered arm walk threads. The three pointers
+    // are per-arm constants computed once by `checkOwningMatchArmStmtEscape`;
+    // `tainted` is the only field that flows, and `silent` is set during a
+    // loop body's fixpoint passes so they cannot double-report.
+    struct OwningMatchArmEscapeCtx {
+        const std::vector<const sema::Symbol*>* transferred = nullptr;
+        std::unordered_map<const ast::Node*, const ast::Expr*>* aliases =
+            nullptr;
+        const std::set<const ast::Node*>* localDeclsInArm = nullptr;
+        OwningMatchArmTaint tainted;
+        bool silent = false;
+    };
+
+    const ast::IdentifierExpr* findOwningMatchCaptureInLambdas(
+        const ast::Expr& e,
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted = nullptr);
+
+    // fix #4715 (§28.3 K8.4, §35.5, v0.307): the SAME-ARM local aliases a K8.4
+    // escape candidate may be routed THROUGH. #4635's and #4663's checks both
+    // resolved a candidate with `identifierRoot`, which is a ONE-HOP peel: for
+    // a bare identifier it returns that identifier. So `const c := w; outer :=
+    // c;` rooted at `c` — never in the arm's `transferred` set, only `w` is —
+    // and the store passed. Maps each such alias's DECL NODE (the identity
+    // `sema::LocalSymbol::decl` carries) to the initializer the trace must
+    // continue into.
+    //
+    // Collected from the arm's own statements, both `ast::LocalDecl` and
+    // `ast::LocalConstDecl` — unlike the assignment-TARGET exemption set in
+    // `checkOwningMatchArmStmtEscape`, which is LocalDecl-only for a
+    // structural reason (§21.1: a `const` is not an assignable location).
+    // Both spellings alias identically on the VALUE side, measured.
+    //
+    // An arm-local that is ASSIGNED anywhere in the arm is deliberately NOT
+    // recorded: its value at the escaping store is not its initializer's, so
+    // tracing it would reject `var c := w; c := alt; outer := c;` — a program
+    // that stores `alt` and is sound (measured accepted, and it must stay
+    // accepted). The converse shape (`var c := alt; c := w; outer := c;`) is
+    // therefore still admitted; that is an assignment-sourced residual this
+    // fix does not close, recorded rather than silently absorbed, because
+    // closing it needs a real per-arm dataflow rather than a syntactic trace.
+    // // per §28.3 K8.4, §35.5, v0.307
+    void collectOwningMatchArmAliasInits(
+        const ast::CaseArm& arm,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& out);
+
+    // fix #4715: peel `e` to its root identifier EXACTLY as `identifierRoot`
+    // does (#4715 delegated to it; since #4818 the chain arms are mirrored
+    // instead, see below) while registering every §17.15 binding-atom clause met on the
+    // peel path into `aliases`. The binding atom `(var c := w; c)` is the
+    // EXPRESSION-position spelling of the same indirection an arm-body
+    // `const`/`var` is in statement position, and `identifierRoot` peels a
+    // `BindExpr` straight to its body, so without this the trace stops dead
+    // at `c`. // per §17.15, §28.3 K8.4, v0.307
+    //
+    // fix #4818 (§28.3 K7.2/K2.2, K8.4, §35.5, v0.307): renamed from
+    // `owningMatchAliasPeel` and widened from ONE root to a SET. The peel was
+    // `identifierRoot`, which stops dead at a value-selecting form, so
+    // `(if p then w else other)`, `(case k of 1 => w, _ => other)`,
+    // `(… ) ?? other` and a derived `(if p then w.In() else other)` rooted at
+    // nothing and escaped the arm unchecked — measured accepted, and a
+    // heap-use-after-free under #4634's arm-end drop. K7.2 gives such a
+    // value "the union of the arms' source sets (K2.2)", so this now FANS
+    // OUT at a `ConditionalExpr` (both values), an expression-position
+    // `CaseExpr` (every arm's result) and a `??` (both operands) — never
+    // into a condition, scrutinee or guard, which are only read — and
+    // appends every root identifier reached to `out`. Its chain arms mirror
+    // `identifierRoot`'s one for one, so a value with no selecting form in
+    // it roots exactly where it did before. // per §28.3 K7.2, K8.4, v0.307
+    //
+    // fix #4942 (§28.3 producer table, §17.4, §17.8, v0.307): the chain arms
+    // are now a SUPERSET of `identifierRoot`'s — this also peels `x as T`
+    // and `x!`, which carry `x`'s source unchanged, so `(w as Widget)!` and
+    // `(w as Widget) ?? other` root at `w` instead of at nothing.
+    // `identifierRoot` itself is left alone: widening it moves every one of
+    // its callers at once, which is its own §18 blast radius.
+    void collectOwningMatchSourceRoots(
+        const ast::Expr& e,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        std::vector<const ast::IdentifierExpr*>& out);
+
+    // fix #4943 (§19.3, §28.3 K2.2/K8.4, §35.5, v0.307): a pattern binding
+    // "is a borrow whose source is the scrutinee's source" (§19.3). So inside
+    // an owning-match arm, the `q` of a nested borrowing
+    // `(case w of var q: Widget => q, _ => other)` carries `w`. #4818's
+    // fan-out reached `q`, but `q` is neither a transferred binding nor an
+    // arm-local alias, so the trace stopped there and the payload escaped.
+    // This registers every binding anchor of `cx`'s arms (the `decl` its
+    // LocalSymbol carries, via `collectArmBindingAnchors`) into `aliases`
+    // with the SCRUTINEE as its initializer, so the ordinary alias hop in
+    // `owningMatchEscapeRoot` follows it. An expression arm holds no
+    // statement, so the binding is single-assignment there, which is the
+    // map's contract. The statement-position `case` is covered by the ordered
+    // walk's taint instead (see `walkOwningMatchArmEscapeStmt`), because its
+    // block arms can reassign the binding.
+    void registerOwningMatchCasePatternAliases(
+        const ast::CaseExpr& cx,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases);
+
+    // fix #4715: `identifierRoot`'s one-hop resolution, extended into a
+    // BOUNDED trace through same-arm local aliases. Returns the identifier
+    // naming a member of `transferred` that `value` ultimately roots at —
+    // directly, or through any chain of arm-local aliases — or null.
+    //
+    // THE BOUND, which #4715 asks for explicitly, is two-layered:
+    //   * `seen` — each symbol is traced through AT MOST ONCE, so a cycle is
+    //     structurally impossible even on a malformed AST. A straight-line arm
+    //     body cannot cycle (an initializer may only name locals declared
+    //     earlier), but sema mis-resolving a shadowing `var c := c;` to the
+    //     inner symbol would otherwise spin, and one set insert removes the
+    //     question rather than arguing it.
+    //   * `kMaxOwningMatchAliasHops` — a hard cap on top, because `seen` bounds
+    //     the walk by the arm's local COUNT, which machine-generated code can
+    //     make large. 32 is far past any real chain (the deepest shape
+    //     measured for #4715 is 2) while keeping the walk constant-time.
+    // // per §28.3 K8.4, §35.5, v0.307
+    // fix #4720 extends it with `tainted` — the ORDERED per-arm taint the
+    // statement-position walk carries. `aliases` answers "this local's value
+    // is its initializer's at EVERY point in the arm", which is why an
+    // assigned local is excluded from it; `tainted` answers the
+    // program-point question "this local MAY hold the payload HERE", which is
+    // the only way to see `var c := alt; c := w; outer := c;`. A hit returns
+    // the identifier naming the TRANSFERRED BINDING that tainted the local
+    // (not the local), so the diagnostic names `w` and its `move w` remedy
+    // exactly as the direct and initializer-aliased routes already do.
+    // fix #4818: the trace is a WORKLIST, fed by
+    // `collectOwningMatchSourceRoots`' root SET, so every selected branch is
+    // followed (and each branch's aliases in turn); the hop cap now bounds
+    // total worklist pops rather than one chain's length.
+    const ast::IdentifierExpr* owningMatchEscapeRoot(
+        const ast::Expr& value,
+        const std::vector<const sema::Symbol*>& transferred,
+        std::unordered_map<const ast::Node*, const ast::Expr*>& aliases,
+        const OwningMatchArmTaint* tainted = nullptr);
+
+    // fix #4720 (§28.3 K8.3/K8.4, §35.5, v0.307): the ORDERED,
+    // taint-carrying replacement for #4663's flat `forEachNestedStmt` sweep
+    // over an owning-match arm's statements.
+    //
+    // #4715 closed the INITIALIZER-sourced indirect escape and recorded the
+    // residual it deliberately left open: an arm-local that reaches the
+    // payload by ASSIGNMENT is excluded from the alias map, because including
+    // it would falsely reject `var c := w; c := alt; outer := c;` — a program
+    // that stores `alt` and is sound. Both facts are program-POINT facts, and
+    // a flat unordered sweep cannot hold one. This walk is ordered and keeps
+    // a may-taint set instead.
+    //
+    // THE TWO ERROR DIRECTIONS ARE NOT SYMMETRIC HERE EITHER, and the shape
+    // follows from that: under-rejecting leaves today's leak (the status quo),
+    // while over-rejecting breaks a working program. So a KILL (`c := alt;`
+    // clears `c`) applies only along a straight-line statement sequence, and
+    // a nested CONDITIONAL contributes its taint by UNION while its kills stay
+    // inside it — `var c := w; if p then c := alt; end; outer := c;` is then
+    // still rejected, correctly, because the `!p` path really does escape. A
+    // `do â¦ end` block is unconditional, so its kills do propagate. A loop
+    // body is walked to a taint fixpoint SILENTLY first, so a loop-carried
+    // taint (`while p do outer := c; c := w; end`) is seen on the reporting
+    // pass without the fixpoint passes double-reporting.
+    void walkOwningMatchArmEscapeStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx);
+    void walkOwningMatchArmEscapeStmt(const ast::Stmt& cur,
+                                      OwningMatchArmEscapeCtx& cx);
+    // The loop-body arm of the walk above: silent fixpoint passes, then one
+    // reporting pass from the fixpoint taint.
+    void owningMatchArmEscapeLoopBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& list,
+        OwningMatchArmEscapeCtx& cx);
+
+    // fix #4635: the symbols `arm`'s pattern binds to a TRANSFERRING slot of
+    // `chDecl`'s named case — a whole-slot binding (`W(var w, _)`, or the
+    // naked `W(w, _)` spelling) of an `owned`-marked or move-only payload,
+    // which §35.5 transfers into the binding at arm selection. A discard, a
+    // constant, a nested pattern, and a plain (borrowing) payload slot are
+    // NOT transferring and are excluded. // per §35.5, v0.307
+    // `classPayloadsOnly` narrows the result to CLASS/INTERFACE-typed payload
+    // slots. #4635's escape check wants the full set (over-collecting there
+    // only rejects more, the safe direction); #4633's transfer ADMISSION wants
+    // the narrow one, because admitting more is the unsafe direction and the
+    // class/interface bound is exactly `consumeMarkedArmTransfer`'s own
+    // first-landing operand bound.
+    void collectOwningMatchTransferBindings(
+        const ast::CaseArm& arm, const sema::TypeRef* scrutRef,
+        std::vector<const sema::Symbol*>& out,
+        bool classPayloadsOnly = false);
+
+    // fix #4633 (§35.5 *The owning match* + §28.3 K3.4, v0.307): is `sym` a
+    // TRANSFERRING payload binding of `arm`'s pattern, in an owning match over
+    // `scrutinee`? §35.5 makes such a binding "an **owned local of the arm
+    // body's scope**", so §35.5's transfer out of the arm (`move w` /
+    // `owned w`) names a named owned binding exactly as K3.4 requires — which
+    // `consumeMarkedArmTransfer` could not see, because the ownership dataflow
+    // tracks no `states_` entry for a pattern binding and its LOCALDECL-ONLY
+    // operand bound excludes one besides. // per §35.5, §28.3 K3.4, v0.307
+    bool isOwningMatchTransferBinding(const ast::CaseArm& arm,
+                                      const ast::Expr* scrutinee,
+                                      sema::Symbol* sym);
+
+    // fix #4664 (§35.5 *The borrowing match* + §28.3 K8.3/K3.1, §19.3,
+    // v0.307): the class/interface-typed arm pattern bindings that the `case`
+    // construct does NOT transfer ownership into — every binding of a
+    // BORROWING match ("the construct never moves from the scrutinee",
+    // §35.5), and the non-transferring slots of an owning one. §19.3 makes
+    // each one "a borrow whose source is the scrutinee's source", so `move`
+    // on it is K3.1's forbidden move of a borrow: the scrutinee's owner
+    // still disposes the payload and the transfer's new holder disposes it a
+    // second time (MEASURED heap-use-after-free, issue #4664).
+    //
+    // The map is keyed by SYMBOL, so a same-named local in another scope is
+    // untouched, and it is populated by `registerBorrowOnlyArmBindings` from
+    // the same once-only pre-pass (`collectCaseArmBorrowSources`) that
+    // registers the arm borrow sources — which visits a `case` construct
+    // BEFORE descending into its arm bodies, so every binding is registered
+    // before any `move` inside its own arm is read.
+    // // per §35.5, §19.3, §28.3 K8.3/K3.1, v0.307
+    struct BorrowOnlyArmBinding {
+        std::string_view name;
+        // True when the SCRUTINEE announced a consume (§35.5's owning match)
+        // but THIS slot is not one the match transfers — a nested pattern, an
+        // unmarked named slot, a non-`owned` payload, or a non-destructuring
+        // arm. The two cases differ only in the diagnostic's explanation.
+        bool owningMatch = false;
+    };
+    std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
+        borrowOnlyArmBindings_;
+    void registerBorrowOnlyArmBindings(const std::vector<ast::CaseArm>& arms,
+                                       const ast::Expr* scrutinee);
+
+    // fix #4734 (§35.5 *The owning match*, §28.6 "Who may call Dispose()",
+    // §17.13, §28.8, v0.307): the COMPLEMENT of `borrowOnlyArmBindings_` —
+    // the class/interface-typed arm bindings an OWNING match genuinely
+    // transfers a payload into. §35.5 makes each one "an **owned local of
+    // the arm body's scope**", to which "§28.3's standard rules apply … on
+    // every arm-exit edge", and names four warning-free discharges:
+    //
+    //   `using var u := move r;`  an owned-consuming call  `r.Dispose()`  `_ := r;`
+    //
+    // Only the first worked. The other three each asked a predicate that
+    // keys on the binding's DECL kind — `decl` is a `BindingPattern` — and
+    // answered with §19.3's BORROWING-match rule, which §35.5 scopes to the
+    // borrowing match alone:
+    //
+    //   * `r.Dispose()`   — Ownership.cpp's dispose-receiver gate rejected
+    //     "a pattern binding is a non-destructive borrow" (§28.6's borrow-
+    //     receiver list names "a pattern binding (§19.3)", i.e. the §19.3
+    //     borrowing-match binding; the owner disposing its own value is the
+    //     very remedy §35.5 names).
+    //   * an owned-consuming call — `ownedArgSourceIsBorrow`'s #1280
+    //     record-destructuring branch flagged EVERY `BindingPattern`-decl
+    //     local as a borrow, so `Take(move r)` drew §28.8's borrow-into-an-
+    //     `owned`-sink error. This is the statement-position, call-argument
+    //     sibling of #4633, which fixed only the expression-position arm
+    //     RESULT spelling.
+    //   * `_ := r;`       — the §17.13 announced-consume path is gated on
+    //     `lookupState(name)->state == Owned`, and the dataflow keeps no
+    //     `states_` entry for a pattern binding, so `discardOutOwnedVar` was
+    //     never set and the discard emitted NOTHING. MEASURED: a silent
+    //     24-byte LeakSanitizer leak on an accepted program.
+    //
+    // Keyed by SYMBOL and populated by the same once-per-method pre-pass
+    // that fills `borrowOnlyArmBindings_`, which visits a `case` construct
+    // before descending into its arm bodies — so the set is complete before
+    // any statement of the arm is checked. Narrowed to CLASS/INTERFACE
+    // payloads, #4633's own admission bound: a move-only value payload
+    // transfers too (§35.5), but its per-path discharge machinery is
+    // separate and unmeasured here, and admitting more is the unsafe
+    // direction. // per §35.5, §28.6, §17.13, §28.8, v0.307
+    std::unordered_set<const sema::Symbol*> owningMatchTransferBindings_;
+    bool isOwningMatchTransferredArmBinding(const sema::Symbol* sym) const {
+        return sym != nullptr && owningMatchTransferBindings_.count(sym) != 0;
+    }
+    // fix #4664: every binding `p` introduces, at every nesting level, as the
+    // dynamic_cast-safe anchor Node the arm binding's LocalSymbol carries as
+    // its `decl` (the `var x` BindingPattern, or #1271's synthesized anchor
+    // for the naked `W(w, _)` spelling). // per §19.3, v0.307
+    static void collectArmBindingAnchors(const ast::Pattern* p,
+                                         std::vector<const ast::Node*>& out);
+    // fix #4664: the check point — one `move` the pre-pass walk reached.
+    // Reports iff its operand is a bare identifier resolving to a
+    // `borrowOnlyArmBindings_` entry. // per §35.5, §28.3 K3.1, v0.307
+    void reportIfBorrowOnlyArmBindingMove(const ast::UnaryExpr& mv);
+
+    // fix #4803 (§15.3 *Pattern binding* / *Local-to-local assignment* /
+    // *Parameter passing*, §19.3, §35.5, §28.3 K3.12, v0.307): the UNMARKED
+    // twin of the `move` check above, for a borrow-only arm binding of
+    // MOVE-ONLY VALUE type (an owning-classified choice or an owning inline
+    // array). §15.3 makes such a binding "a **borrow** of the value;
+    // consuming operations through the binding … are rejected", and §35.5
+    // repeats it for a move-only payload binding ("the binding does not
+    // own"). A move-only value has no borrow reading at a store: "the plain
+    // binding can only move" (§15.3's scope note) — `var z := y;`, `z := y;`,
+    // `_ := y;`, `return y;`, a plain or `owned` argument `Take(y)` (K3.12,
+    // marker-free) are each a whole-value MOVE of `y`, i.e. a consume of a
+    // borrow. Accepted, the new holder disposed the payloads and the
+    // scrutinee's owner disposed them again: MEASURED heap-use-after-free
+    // (#4803) at every one of those positions, over a choice scrutinee, a
+    // nested move-only choice payload, an owning inline array scrutinee, and
+    // a borrowed parameter scrutinee. An owning match's NON-DESTRUCTURING arm
+    // binding (`case move o of var y => do var z := y; end`) is EXEMPT and
+    // was measured ASan-clean: codegen's #4609 whole-value moved-from mark
+    // makes the consume dispose exactly once. Whether §35.5 rejects that
+    // consume is the open ruling #4821.
+    //
+    // Keyed by SYMBOL; filled by `registerBorrowOnlyArmBindings` with every
+    // non-transferred arm binding whose type is move-only (both kinds —
+    // the class-scoped `borrowOnlyArmBindings_` skips inline arrays), except
+    // the owning-match non-destructuring binding above.
+    // // per §15.3, §19.3, §35.5, §28.3 K3.12, v0.307
+    std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
+        borrowOnlyMoveOnlyArmBindings_;
+    // The check point: `e` is an expression in a consuming (move) position —
+    // a local initializer, an assignment / discard RHS, a `return` operand,
+    // or a plain / `owned` call argument. Reports iff `e` (looking through
+    // the value arms of an if-expression or expression-`case`, whose selected
+    // arm IS the value moved) is a bare identifier naming a
+    // `borrowOnlyMoveOnlyArmBindings_` entry. `position` names the site for
+    // the diagnostic. // per §15.3, §35.5, §28.3 K3.12, v0.307
+    void reportIfBorrowOnlyMoveOnlyArmBindingConsume(const ast::Expr& e,
+                                                     const char* position);
+
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.
@@ -3291,6 +3866,41 @@ private:
     // closure that escapes the method produces a dangling pointer. // per §27.5
     bool isRefOutParam(sema::Symbol* sym) const;
 
+    // fix #4709 (§27.5 / §28.3, v0.298/v0.307): true when `sym` is a PLAIN
+    // (no `owned`/`ref`/`out`/`out owned`/`scoped` modifier — an EMPTY
+    // ParameterSymbol::modifier) class/interface-typed PARAMETER of the
+    // enclosing method. §28.3's closure-source-set rule: "a captured
+    // borrowed local or parameter contributes that binding's source" — a
+    // plain parameter's own source is "this call" (§22.3: "a plain
+    // [function-typed] parameter ... is call-bounded"; the same call-bound
+    // premise, applied here to a class/interface-typed borrow parameter
+    // rather than a function-typed one), which a returned or field-stored
+    // closure necessarily outlives. `scoped` is excluded because it is the
+    // ONE route §28.14 admits for a captured borrow to outlive a call (a
+    // `scoped` field store, under §28.14's own storage-bounded admission);
+    // `owned`/`out`/`out owned` are excluded because they name a different
+    // obligation, handled by the owned-capture leg
+    // (`checkClosureEscapesOnReturn`'s §28.3 Owned leg) and `isRefOutParam`
+    // respectively. Distinct from `isRefOutParam`: a ref/out param is a
+    // dangling STACK pointer once the call returns; a plain borrow param's
+    // hazard is that the closure may read the referent after the CALLER's
+    // own borrow ends — no stack frame is at risk, but the source's
+    // lifetime is equally bounded by the call.
+    //
+    // fix #4757 (§28.3, v0.307): restricted to a parameter of the BODY BEING
+    // ANALYSED (`methodParamSet_`). A lambda's OWN parameter is a
+    // `ParameterSymbol` with an empty modifier and (often) a class-typed
+    // declared type, so without that gate `oa.Where(lambda(p) => p.Tag > 4)`
+    // — `p` bound BY the lambda, nothing captured at all — was rejected as
+    // an escaping capture. §28.3's closure bullet counts only "the free
+    // bindings of every lambda nested in its body THAT RESOLVE OUTSIDE THAT
+    // BODY"; a self-bound parameter resolves inside it and is re-bound per
+    // invocation. `collectLambdaIdentifiers` is a raw identifier walk (its
+    // own declaration says consumers disambiguate by resolving against
+    // `states_`), so this predicate must do its own filtering — as
+    // #2342/#2527 already settled for the §28.14 capture walk.
+    bool isPlainBorrowParam(sema::Symbol* sym);
+
     // §27.5 / §28.6 (#1217): reject a lambda stored to a FIELD or OUT-PARAM
     // (both escaping locations that outlive the method call) when the lambda
     // captures a ref/out parameter. The captured pointer is to the caller's
@@ -3470,6 +4080,45 @@ private:
     // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
     // Returns null if the root isn't a bare identifier.
     const ast::IdentifierExpr* identifierRoot(const ast::Expr& e);
+
+    // fix #4948 (§17.4, §17.8, §28.3 producer table, v0.307): `identifierRoot`
+    // that ALSO peels the two source-preserving operators, `x as T` and the
+    // postfix `x!`, at any depth of the chain — so `(x as W)!.Self()` roots at
+    // `x`. Neither operator is a new source (§28.3: `x as T` is "Borrowed
+    // (source: same as `x`'s source …; `x` itself if `x` is owned)"; §17.8: `x!`
+    // carries `x`'s ownership state and source). Deliberately a SEPARATE entry
+    // point rather than a change to `identifierRoot`: its 24 callers include
+    // three that treat "no root" as the conservative answer (§30.1 frame
+    // residence, §28.14 scoped admission, §28.14 reachability), where a peel
+    // would ADMIT programs, so it is used only at the escape checks #4948
+    // measured as heap-use-after-frees. Caller beware: `x!` over an OWNED bare
+    // identifier is the owned value itself (a move-out at a return), not a
+    // borrow of it — see `isBangOverBareIdentifier`.
+    const ast::IdentifierExpr* identifierRootThroughCastBang(
+        const ast::Expr& e);
+    // fix #4948: strip `x!` and `x as T` layers off the TOP of `e` only.
+    // Returns `e` itself when there is none.
+    static const ast::Expr* peelTopCastBang(const ast::Expr* e);
+    // fix #4948 (§17.8): true iff `e` is one or more postfix `!` directly over
+    // a bare identifier (`x!`, `x!!`). Such a value has `x`'s own ownership
+    // state — an owned `x!` is `x` — so return-site borrow checks leave it to
+    // the bare-identifier path exactly as they leave `x`.
+    static bool isBangOverBareIdentifier(const ast::Expr& e);
+    // fix #4948 (§28.3 K7.2/K2.2, §17.4, §17.8, v0.307): the return-borrow
+    // root set. Walks `identifierRoot`'s chain arms plus `x as T` and `x!`,
+    // and FANS OUT at `??` (both operands can be the returned value), so
+    // `((x as W) ?? g).Self()` yields `x` and `g`. Each root carries HOW it
+    // was reached: kRootTop (only `!` / binding atoms — the pre-#4948 single
+    // root, whose verdict is unchanged), kRootCoalesceOperand (a `??` operand
+    // reached without a deriving step — for an owned plain local a borrow
+    // ARM of the `??`, fix #4959, §28.3 `a ?? b` row), or kRootDerived
+    // (through member / call / index / `as`).
+    static constexpr int kRootTop = 0;
+    static constexpr int kRootCoalesceOperand = 1;
+    static constexpr int kRootDerived = 2;
+    void collectReturnBorrowRoots(
+        const ast::Expr& e, int how,
+        std::vector<std::pair<const ast::IdentifierExpr*, int>>& out);
 
     // §28.3 join. Per the spec the join is asymmetric: matching states
     // carry forward (with their auxiliary data, e.g. Owned's discharge

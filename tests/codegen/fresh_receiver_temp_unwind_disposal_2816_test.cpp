@@ -54,7 +54,9 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+// (`runAot` is no longer used here: the last plain-oracle row — the `string`
+// result EXCLUSION control — moved onto the ASan+LSan `run()` helper when
+// #4552 reversed it.)
 using bezel::test::runAotChecked;
 
 namespace {
@@ -477,14 +479,28 @@ BEZEL_TEST(fresh_receiver_temp_unwind_2816,
         "  return Src._live;")), 0);
 }
 
-// EXCLUSION control: a `string` result may alias into the receiver, so
-// `freshNewReceiverTempEligible` declines — and because registration and reclaim
-// share that one predicate, the throw edge must decline too.  Nothing is freed
-// (the receiver leaks by design, the sound direction); what is asserted is that
-// the run completes with no ASan fault and the exception still propagates.  Run
-// through plain `runAot`, since the deliberate leak would redden LSan.
+// REVERSED by #4552 (§28.3, v0.306).  This row used to be the EXCLUSION
+// control: `freshNewReceiverTempEligible` declined a `string` result on the
+// reasoning that it "may alias into the receiver", registration and reclaim
+// share that one predicate, so the throw edge declined too and the receiver
+// leaked by design — the row asserted `_live == 20`, twenty leaked receivers.
+//
+// The premise was wrong for a NON-NULLABLE `string`: such a return is minted
+// `+1` BY THE CALLEE (the `bz_string_retain` on the return path and its
+// expression-body twin, both gated `!nullable`), so `S(k): string return _s;`
+// hands back its own reference and disposing the receiver cannot dangle it.
+// #4552 therefore reclaims that receiver at §28.3's K8 full-expression
+// boundary, with the disposal established AT ITS PRODUCTION — which is what
+// makes this throw edge, where the argument `T2.Boom()` throws after the
+// receiver exists but before the call, dispose it during unwinding.
+//
+// So the expectation flips to ZERO live receivers, and the row moves onto the
+// `run()` helper's ASan+LSan oracle: the leak it was written to tolerate is
+// gone, and an over-release on this edge now faults instead of passing.  A
+// `string?` result is still declined (#2196 leaves that path un-refcounted);
+// `unbound_owned_receiver_string_result_4552_test.cpp` pins that half.
 BEZEL_TEST(fresh_receiver_temp_unwind_2816,
-           string_result_receiver_still_not_disposed_on_throw_edge_spec_28_3) {
+           string_result_receiver_disposed_on_throw_edge_spec_28_3) {
     std::string src =
         "module M; "
         "class Src2 "
@@ -510,6 +526,5 @@ BEZEL_TEST(fresh_receiver_temp_unwind_2816,
         "  if caught <> 20 then return 90; end if; "
         "  return Src2._live; "
         "end Main; end C;";
-    auto r = runAot(src);
-    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 20);
+    BEZEL_EXPECT_EQ(run(src), 0);
 }

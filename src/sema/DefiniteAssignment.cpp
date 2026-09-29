@@ -12,6 +12,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
+#include "sema/TypeResolution.hpp"  // typeHasNoDefault — §7.9 / §17.11 defaultable, #4419
 
 namespace bezel::sema {
 
@@ -116,6 +117,21 @@ bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
                     enumHasZeroConstant(*rt->declaration);
                 return hasZero && !*hasZero;
             }
+            // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only
+            // record has no well-defined zero value (§17.11's "Not
+            // defaultable" list names it directly) — so default
+            // initialization of `R`-typed storage (§7.9) leaves the slot
+            // holding a value with no constructor behind it, in violation
+            // of §9.9's provenance property. §7.9-strict: the constructor
+            // must assign it on every normal-exit path. The fields may all
+            // be defaultable value types (the cycle-23 s9_9_0006 case is
+            // exactly that — `record Port { readonly property Value: int; … }`),
+            // so this is NOT covered by the existing "fields non-defaultable"
+            // chain (which would otherwise subsume it).
+            if (rt->declaration->kind == ast::TypeDeclKind::Record &&
+                recordIsConstructorOnly(rt->declaration)) {
+                return true;
+            }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         default:
@@ -178,6 +194,34 @@ bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
     }
 }
 
+// fix #4699 (§9.9, v0.307, proposal 0107): does the type of this field /
+// auto-property carry the §9.9 constructor-only derived property? Used by
+// the `fieldsNeedingInit_` push sites below to populate
+// `constructorOnlyTypedFields_`, the set `checkCtorFieldCompletion`
+// consults to name the §9.9 reason in the §7.9 diagnostic. Mirrors the
+// `isSevenNineStrict*Field` shape: the field's own resolved type, not
+// its declaration's nominal form. Returns false when the field has no
+// resolvable type, when the type is not a Record, or when the record is
+// not constructor-only.
+static bool fieldTypeIsConstructorOnlyRecord(const ast::FieldDecl& f,
+                                             SemaContext& ctx) {
+    if (!f.type) return false;
+    const TypeRef* rt = ctx.resolvedType(*f.type);
+    if (!rt || rt->nullable) return false;
+    if (rt->kind != TypeRef::Kind::Named || !rt->declaration) return false;
+    if (rt->declaration->kind != ast::TypeDeclKind::Record) return false;
+    return recordIsConstructorOnly(rt->declaration);
+}
+static bool propTypeIsConstructorOnlyRecord(const ast::PropertyDecl& p,
+                                            SemaContext& ctx) {
+    if (!p.type) return false;
+    const TypeRef* rt = ctx.resolvedType(*p.type);
+    if (!rt || rt->nullable) return false;
+    if (rt->kind != TypeRef::Kind::Named || !rt->declaration) return false;
+    if (rt->declaration->kind != ast::TypeDeclKind::Record) return false;
+    return recordIsConstructorOnly(rt->declaration);
+}
+
 // fix #4015 / §7.9: the STATIC twin of isSevenNineStrictField above — §7.9's
 // own text requires assignment "in every constructor (for instance fields) or
 // in the static constructor (for static fields)" generically, and nothing in
@@ -217,6 +261,21 @@ bool isSevenNineStrictStaticField(const ast::FieldDecl& f, SemaContext& ctx) {
                 std::optional<bool> hasZero =
                     enumHasZeroConstant(*rt->declaration);
                 return hasZero && !*hasZero;
+            }
+            // fix #4699 (§9.9, v0.307, proposal 0107): a constructor-only
+            // record has no well-defined zero value (§17.11's "Not
+            // defaultable" list names it directly) — so default
+            // initialization of `R`-typed storage (§7.9) leaves the slot
+            // holding a value with no constructor behind it, in violation
+            // of §9.9's provenance property. §7.9-strict: the constructor
+            // must assign it on every normal-exit path. The fields may all
+            // be defaultable value types (the cycle-23 s9_9_0006 case is
+            // exactly that — `record Port { readonly property Value: int; … }`),
+            // so this is NOT covered by the existing "fields non-defaultable"
+            // chain (which would otherwise subsume it).
+            if (rt->declaration->kind == ast::TypeDeclKind::Record &&
+                recordIsConstructorOnly(rt->declaration)) {
+                return true;
             }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
@@ -268,6 +327,16 @@ bool isSevenNineStrictStaticAutoProp(const ast::PropertyDecl& p,
                 std::optional<bool> hasZero =
                     enumHasZeroConstant(*rt->declaration);
                 return hasZero && !*hasZero;
+            }
+            // fix #4699 (§9.9, v0.307, proposal 0107): see the parallel
+            // arm in `isSevenNineStrictStaticField` above — same property,
+            // same rule. A static auto-property's backing storage follows
+            // the same provenance contract as a static field's, so a
+            // constructor-only record type demands the static initializer /
+            // static-constructor path.
+            if (rt->declaration->kind == ast::TypeDeclKind::Record &&
+                recordIsConstructorOnly(rt->declaration)) {
+                return true;
             }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
@@ -521,8 +590,11 @@ public:
         std::vector<std::string_view> readonlyInitialized;
         for (const auto& m : klass.members) {
             if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                if (isSevenNineStrictField(*f, ctx_))
+                if (isSevenNineStrictField(*f, ctx_)) {
                     fieldsNeedingInit_.push_back(f->name);
+                    if (fieldTypeIsConstructorOnlyRecord(*f, ctx_))
+                        constructorOnlyTypedFields_.insert(f->name);
+                }
                 bool isStatic = false, isReadonly = false;
                 for (auto mod : f->modifiers) {
                     if (mod == "static") isStatic = true;
@@ -532,8 +604,11 @@ public:
                     readonlyInitialized.push_back(f->name);
             } else if (auto* p =
                            dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                if (isSevenNineStrictAutoProp(*p, ctx_))
+                if (isSevenNineStrictAutoProp(*p, ctx_)) {
                     fieldsNeedingInit_.push_back(p->name);
+                    if (propTypeIsConstructorOnlyRecord(*p, ctx_))
+                        constructorOnlyTypedFields_.insert(p->name);
+                }
             }
         }
         // Seed out-params (constructors normally have none; kept for parity
@@ -641,8 +716,11 @@ public:
                 // the same §7.9-strict-storage shape isSevenNineStrictField
                 // classifies for an instance field — isSevenNineStrictStatic
                 // Field is its static-required twin (see its comment).
-                if (isSevenNineStrictStaticField(*f, ctx_))
+                if (isSevenNineStrictStaticField(*f, ctx_)) {
                     fieldsNeedingInit_.push_back(f->name);
+                    if (fieldTypeIsConstructorOnlyRecord(*f, ctx_))
+                        constructorOnlyTypedFields_.insert(f->name);
+                }
                 if (!f->initializer) continue;
                 bool isStatic = false, isReadonly = false;
                 for (auto mod : f->modifiers) {
@@ -658,8 +736,11 @@ public:
                 // backing field's assignment or read" (§22.7) applies to a
                 // static auto-property's backing storage exactly as to an
                 // instance one.
-                if (isSevenNineStrictStaticAutoProp(*p, ctx_))
+                if (isSevenNineStrictStaticAutoProp(*p, ctx_)) {
                     fieldsNeedingInit_.push_back(p->name);
+                    if (propTypeIsConstructorOnlyRecord(*p, ctx_))
+                        constructorOnlyTypedFields_.insert(p->name);
+                }
             }
         }
         for (const auto& s : cd.body) {
@@ -729,8 +810,11 @@ public:
                 // shape isSevenNineStrictField already classifies for a
                 // class field — the predicate reads only the field's own
                 // modifiers/type/initializer, nothing class-specific.
-                if (isSevenNineStrictField(*f, ctx_))
+                if (isSevenNineStrictField(*f, ctx_)) {
                     fieldsNeedingInit_.push_back(f->name);
+                    if (fieldTypeIsConstructorOnlyRecord(*f, ctx_))
+                        constructorOnlyTypedFields_.insert(f->name);
+                }
                 if (!f->initializer) continue;
                 bool isStatic = false, isReadonly = false;
                 for (auto mod : f->modifiers) {
@@ -746,8 +830,11 @@ public:
                 // read" — a record's auto-property backing storage is the
                 // §7.9 obligation §7.9's "Default initialization" subsection
                 // states for any non-defaultable storage, record or class.
-                if (isSevenNineStrictAutoProp(*p, ctx_))
+                if (isSevenNineStrictAutoProp(*p, ctx_)) {
                     fieldsNeedingInit_.push_back(p->name);
+                    if (propTypeIsConstructorOnlyRecord(*p, ctx_))
+                        constructorOnlyTypedFields_.insert(p->name);
+                }
             }
         }
         // fix #4067 / §22.3, mirroring runConstructor: seed the record
@@ -864,6 +951,15 @@ private:
     // to §22.7 rule 2 (virtual dispatch from a constructor body).
     bool classSealedNonAbstract_ = false;
     std::vector<std::string_view> fieldsNeedingInit_;
+    // fix #4699 (§9.9, v0.307, proposal 0107): the subset of
+    // `fieldsNeedingInit_` whose TYPE is a constructor-only record. The
+    // §7.9 diagnostic itself is generic — "constructor does not initialize
+    // non-nullable field" — and the constructor-only reason is invisible
+    // without this tag. Populated by the same sites that push to
+    // `fieldsNeedingInit_`; consulted by `checkCtorFieldCompletion` to
+    // append "(constructor-only record §9.9, has no well-defined default
+    // value)" so the §9.9 property the rule names reaches the diagnostic.
+    std::unordered_set<std::string_view> constructorOnlyTypedFields_;
     std::unordered_set<std::string_view> assignedFields_;
 
     // fix #2187 / §22.8 (single-assignment of readonly fields). Active while
@@ -1115,11 +1211,27 @@ private:
                 if (ld->initializer) {
                     assigned_.insert(ld->name);
                 } else if (ld->type) {
-                    // §15.1: inline arrays are zero-initialized when declared
-                    // without an initializer (the declaration is the init);
-                    // treat them as definitely assigned.
+                    // §7.9 (v0.299, #4419): a local of DEFAULTABLE type
+                    // (§17.11 "defaultable" glossary entry) declared without an
+                    // initializer holds that type's default from its
+                    // declaration and may be read — `int`→0, `bool`→false,
+                    // `char`→'\0', nullable types→null, records with all
+                    // defaultable fields→all-fields-default, inline arrays of
+                    // defaultable elements→per-slot default, the unit `()`→`()`.
+                    // A non-defaultable type (a non-nullable reference type
+                    // like `string`/`Object`/a class, a choice, a record or
+                    // inline array with a non-defaultable component) still
+                    // requires explicit assignment before read.
+                    //
+                    // Replaces the previous InlineArray-only carve-out, which
+                    // silently admitted `var a: [3]NonDefaultable;` (non-
+                    // defaultable element slots left as garbage) and over-
+                    // rejected every other defaultable type — including `int`
+                    // and `string?`, both admitted by the v0.298/§7.9 prose.
+                    // `typeHasNoDefault` recurses into inline-array element
+                    // types, so `[N]T` is admitted iff `T` is defaultable.
                     if (auto* rt = ctx_.resolvedType(*ld->type)) {
-                        if (rt->kind == sema::TypeRef::Kind::InlineArray)
+                        if (!typeHasNoDefault(rt, ctx_))
                             assigned_.insert(ld->name);
                     }
                 }
@@ -1687,6 +1799,48 @@ private:
         }
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             if (ue->operand) visitExpr(*ue->operand);
+            // §28.8.1 / §7.9 (v0.300, #4686): the bare in-scope spelling of an
+            // `owned` field of the enclosing instance as the operand of a
+            // `move` — `move _resource` is `move this._resource` per §28.8.1 —
+            // is a definite-assignment violation when the field has not yet
+            // been assigned on the reaching path. The case (s28_8_1_0009) is
+            // a constructor whose only `owned` field has no initializer, so
+            // the body's first statement is `var old := move _resource;` and
+            // the field has no value to move. §7.9 / §28.8.1: "Inside a
+            // constructor body, the field has no value to move until it has
+            // been assigned; a `move x.f` before the field's first assignment
+            // is a definite-assignment violation, the same rule as for any
+            // other read of an unassigned non-nullable slot."
+            //
+            // The plain `visitExpr(operand)` above does not catch this:
+            // checkRead (line ~2131) only flags unassigned locals, not
+            // fields. Detect the bare-identifier-move pattern here and gate
+            // on the ctor-mode field-assignment state. We deliberately do
+            // NOT extend this to `this.f` member-access form — the case
+            // corpus spells the bare identifier and the spec names that
+            // form, and widening to member-access would require resolving
+            // the receiver expression's `this` kind and confirming `f` is
+            // an `owned` instance field of the enclosing type (a wider
+            // change with more fallout risk on existing tests).
+            if (ctorMode_ && ue->op == "move" && ue->operand) {
+                if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get())) {
+                    if (id->name != "this" && id->name != "base" &&
+                        std::find(fieldsNeedingInit_.begin(),
+                                  fieldsNeedingInit_.end(),
+                                  id->name) != fieldsNeedingInit_.end() &&
+                        !assignedFields_.count(id->name)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ue->span.begin,
+                            std::string("`move` of field `") +
+                            std::string(id->name) +
+                            "` before its first constructor assignment — "
+                            "the field has no value to move until it is "
+                            "assigned (definite-assignment rule, §7.9, "
+                            "§28.8.1)");
+                    }
+                }
+            }
             return;
         }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -2069,13 +2223,24 @@ private:
             if (!assignedFields_.count(n)) {
                 SourceLocation sl;
                 if (loc) sl = *loc;
-                ctx_.diagnostics().report(
-                    Severity::Error, sl,
+                // fix #4699 (§9.9, v0.307, proposal 0107): when the
+                // field's type carries the §9.9 constructor-only property,
+                // append that to the §7.9 diagnostic so the §9.9 reason the
+                // field MUST be initialized (the type has no well-defined
+                // default) is named — rather than a generic "non-nullable
+                // field" reading that misses the §9.9 root cause.
+                std::string msg =
                     std::string("constructor does not initialize non-nullable "
                                 "field `") +
-                        std::string(n) +
-                        "` (§7.9 — every constructor's normal-exit path must "
-                        "assign it, or chain to `this(…)`)");
+                    std::string(n) +
+                    "` (§7.9 — every constructor's normal-exit path must "
+                    "assign it, or chain to `this(…)`)";
+                if (constructorOnlyTypedFields_.count(n)) {
+                    msg += " — the field's type is a constructor-only record "
+                           "(\xC2\xA7""9.9), which has no well-defined "
+                           "default value";
+                }
+                ctx_.diagnostics().report(Severity::Error, sl, msg);
             }
         }
     }

@@ -196,7 +196,15 @@ BEZEL_TEST(sema_lambda_out_2631, block_body_throw_only_accepted_spec_17_12_22_3)
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
-        "  public method Thrower(): Exception => new Exception(); "
+        // `owned` is REQUIRED here, not decoration (#4759). Per §28.3
+        // announcement table row 4 (v0.307), a plain concrete class-typed
+        // instance return admits only a receiver-sourced borrow, and
+        // `new Exception()` is a fresh owned value. This row runs on
+        // `parseAndCheckDA` (parse + definite assignment — the ownership pass
+        // never runs), so the unmarked spelling would surface only on a port to
+        // `runAot` (#3439). The marker does not change the §22.3 obligation
+        // this row measures: the `throw` path still carries none.
+        "  public method Thrower(): owned Exception => new Exception(); "
         "  public static method Main(): int "
         "    var init: (out int) -> () := "
         "      lambda(out n: int) => do throw new C().Thrower(); end; "
@@ -252,7 +260,15 @@ BEZEL_TEST(sema_lambda_out_2631, block_body_normal_assigns_and_throw_branch_acce
     auto r = parseAndCheckDA(
         "module M; "
         "class C "
-        "  public method Thrower(): Exception => new Exception(); "
+        // `owned` is REQUIRED here, not decoration (#4759). Per §28.3
+        // announcement table row 4 (v0.307), a plain concrete class-typed
+        // instance return admits only a receiver-sourced borrow, and
+        // `new Exception()` is a fresh owned value. This row runs on
+        // `parseAndCheckDA` (parse + definite assignment — the ownership pass
+        // never runs), so the unmarked spelling would surface only on a port to
+        // `runAot` (#3439). The marker does not change the §22.3 obligation
+        // this row measures: the `throw` path still carries none.
+        "  public method Thrower(): owned Exception => new Exception(); "
         "  public static method Main(): int "
         "    var init: (int, out int) -> () := "
         "      lambda(cond: int, out n: int) => "

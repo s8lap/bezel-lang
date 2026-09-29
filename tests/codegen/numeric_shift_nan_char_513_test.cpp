@@ -208,23 +208,37 @@ BEZEL_TEST(codegen_cg_514, float_nan_not_equal_nan_is_false_spec_4_3_1) {
 // ---------------------------------------------------------------------------
 
 // §5.2 (L421): char(0xD800) — first surrogate — raises OverflowException.
+//
+// fix #4405 / v0.300 (spec §5.2/§17.14): a CONSTANT-operand `char(0xD800)`
+// is now a compile error at the conversion site (§5.2 constant-operand
+// rule, posture of §5.1/§5.4/§6.5/§17.14). The runtime exception still
+// holds for a NON-CONSTANT operand, so the test binds the literal to a
+// `var` first — `var n := 0xD800; char(n);` is the runtime path the
+// original pinning was actually exercising. The `char_surrogate_high_*`
+// and `char_above_max_codepoint_*` tests below follow the same recipe.
 BEZEL_TEST(codegen_cg_517, char_surrogate_low_raises_overflow_spec_5_2) {
     BEZEL_EXPECT_EQ(run(
-        "try var c := char(0xD800); return int(c); "
+        "var n := 0xD800; "
+        "try var c := char(n); return int(c); "
         "catch OverflowException => return 99; end;"), 99);
 }
 
 // §5.2: char(0xDFFF) — last surrogate — raises OverflowException.
+// See the comment at `char_surrogate_low_*` above for the constant-vs-var
+// reshaping (fix #4405 / v0.300 makes the constant form a compile error).
 BEZEL_TEST(codegen_cg_517, char_surrogate_high_raises_overflow_spec_5_2) {
     BEZEL_EXPECT_EQ(run(
-        "try var c := char(0xDFFF); return int(c); "
+        "var n := 0xDFFF; "
+        "try var c := char(n); return int(c); "
         "catch OverflowException => return 98; end;"), 98);
 }
 
-// §5.2 (L2283): char(0x110000) — one above U+10FFFF — raises OverflowException.
+// §5.2 (L2283): char(0x110000) — one above U+10FFFF — raises
+// OverflowException. Same constant-vs-var reshaping as above.
 BEZEL_TEST(codegen_cg_517, char_above_max_codepoint_raises_overflow_spec_5_2) {
     BEZEL_EXPECT_EQ(run(
-        "try var c := char(0x110000); return int(c); "
+        "var n := 0x110000; "
+        "try var c := char(n); return int(c); "
         "catch OverflowException => return 97; end;"), 97);
 }
 

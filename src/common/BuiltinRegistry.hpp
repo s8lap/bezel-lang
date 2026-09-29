@@ -425,6 +425,22 @@ bool isVtableLessBuiltinClassName(std::string_view n);
 // that set — the predicate covers the case where a user class may legitimately
 // implement a built-in interface head, which the derived vtable-less
 // predicate excludes by construction.
+// fix #5044 (§2.3 Row 10, stdlib §4, v0.307): the §2.3 always-available
+// bare-name Row 10 collection/iterator heads — `Array`, `Stack`, `Queue`,
+// `Set`, `Dictionary`, `LinkedList`, `FrozenArray`, and the `Owning*` forms,
+// plus every `I*` interface in stdlib §4 (enumerable, collection, span).
+//
+// This is a PURPOSE-BUILT subset for §2.3's "alias collision" gate: it
+// answers whether `n` is one of the names that blocks `import Foo as Bar`
+// where `Bar` collides with an always-available bare name. It is NOT a
+// general-purpose collection-name predicate — callers needing broader sets
+// use the existing `isArrayBackedCollectionName`, `isDictionaryName`,
+// `isLinkedListName`, `isIterableInterfaceHead`, or `isBuiltinForInEnumerableHead`
+// predicates, which each answer different questions with intentionally
+// different membership.
+// per §2.3 / stdlib §4, fix #5044
+bool isAlwaysAvailableBareNameCollection(std::string_view n);
+
 // per §8.1 / §8.5 / §18.5 / §28.9
 bool isBuiltinInterfaceHead(std::string_view n);
 
@@ -824,5 +840,55 @@ bool isLinqLazyPassthroughOperatorName(std::string_view m);
 // lazy-element lowering shape with no measured coverage here.
 // per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763
 bool isLazyReverseDirectReceiverHead(std::string_view head);
+
+// fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type HEADS that declare a
+// `readonly property Length : int` per the stdlib, used by
+// `ExprTC::resolveMemberAccess`'s narrow #4766 arm to type the otherwise-untyped
+// `.Length` read on a declared-null builtin collection. The set covers:
+//   - §4.4/§4.5/§4.11: Array/OwningArray/Stack/OwningStack/Queue/OwningQueue
+//     — the structural `Count` alias that codegen lowers through the same
+//     runtime length call (`isLengthAlias`, the #2459 exemption in
+//     LlvmBackend_Layout). ⚠ stdlib §4.4 (and its Count-vs-Length note) gives
+//     these types `Count` ONLY — whether the alias should exist at all is
+//     tracked by #4811. Typed here only so §5.1 is not skipped while it does.
+//   - §3.1 StringBuilder.
+//   - §4.14 OwningBuffer<T>.
+//   - §4.19 FrozenArray<T> (the annotation shape only; the `From(...)` result
+//     carries a builtinClassSym declaration and takes the declared-type
+//     lookup path instead, never reaching this predicate).
+//
+// ⚠ This is NOT `isArrayBackedCollectionName` / `isDictionaryName` — the
+// PROPERTY-TYPE axis of the #4766 arm is fundamentally distinct from the
+// ARRAY-BACKED-COLLECTION axis (`isArrayBackedCollectionName`) and the
+// DICTIONARY axis (`isDictionaryName`). `Set`/`OwningSet`/`LinkedList`/
+// `OwningLinkedList` are `isArrayBackedCollectionName`-true (bz_array_t* rep)
+// but declare no `Length` property — they declare `Count`, handled by the
+// `Count` arm at ExprTypecheck_Calls.cpp:~20867 — so they are deliberately
+// OUT here. `StringBuilder`/`FrozenArray`/`SortedDictionary`/`SortedSet`/
+// `Channel` are NOT array-backed and not dictionary-backed but DO declare an
+// int `Length` or `Count` property per the stdlib — so they belong here, not
+// there. Two different questions over overlapping name sets is exactly why
+// both predicates exist and are each named for their own question.
+// per §5.1 / §3.1 / §4.4 / §4.5 / §4.11 / §4.14 / §4.19, fix #4766 + #4833
+bool isBuiltinIntLengthPropertyHead(std::string_view head);
+
+// Same question for `.Count` reads that the upper arm at
+// ExprTypecheck_Calls.cpp:~20867 does NOT cover. The upper arm answers
+// `.Count` for Array/OwningArray/Stack/OwningStack/Queue/OwningQueue/Set/
+// OwningSet/LinkedList/OwningLinkedList/Dictionary/OwningDictionary/
+// OwningBuffer (the bz_array_t*-backed collection set plus the bz_dict_t*-
+// backed collection set). This predicate covers the heads whose `Count`
+// property the upper arm does not type:
+//   - §4.17 SortedDictionary<K, V>.
+//   - §4.18 SortedSet<T>.
+//   - §6.9 Channel<T>.
+// All three declare `readonly property Count : int`; the upper arm missed
+// them because SortedDictionary alone (of the three) is
+// `isDictionaryName`-true — and the upper arm treats `.Count` on
+// `SortedDictionary` as the bz_array_t*-side path, not the stdlib §4.17
+// property. The narrow #4766 arm is what gives the .Count read a typed
+// result on these three heads.
+// per §5.1 / §4.17 / §4.18 / §6.9, fix #4766 + #4833
+bool isBuiltinIntCountPropertyHead(std::string_view head);
 
 }  // namespace bezel::common

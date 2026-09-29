@@ -20,6 +20,21 @@
 // choice, and the two-call-form disagreement (direct vs interpolation) made
 // it observable in one program without the boxed shape at all.
 //
+// §15.1.1 NOTE (v0.307, added when `ade3b1d6` began enforcing the rule).
+// This file originally spelled its owning rows over `int` and `string`
+// elements. §15.1.1 admits the `owned` marker only over a CLASS or INTERFACE
+// element type ("T must be a class or interface type; value types and
+// runtime-managed reference types are not admitted with the `owned` marker"),
+// so `[3 owned]int` and `[2 owned]string` are not well-formed programs and
+// were never valid subjects for a rendering assertion. The owning rows now
+// run over class `R`, class `S` and interface `I` — the two element kinds
+// §15.1.1 does admit. Nothing about the SUBJECT moves: §8.5's rendering rule
+// is element-kind-independent and the defect was in the direct-call arm's
+// hand-built spelling, which never read the element kind either. The
+// NON-owning rows keep `int` and `string` verbatim — §15.1.1 restricts the
+// `owned` marker only — so the issue's original element axis survives there
+// and now doubles as the control that the restriction is owning-form-only.
+//
 // MEASURED on `9c643e7` (i.e. with #2804's box fix and #2913's interpolation
 // fix already in — the OTHER two renderings were correct, only the direct
 // arm was wrong):
@@ -66,6 +81,14 @@ namespace {
 std::string out(const std::string& body) {
     auto r = runAot("module M; "
                     "class R public constructor() end constructor; end R; "
+                    "class S public constructor() end constructor; end S; "
+                    "interface I "
+                    "  method GetV(): int; "
+                    "end I; "
+                    "class W: I "
+                    "  public constructor() end constructor; "
+                    "  public method GetV(): int => 1; "
+                    "end W; "
                     "class C public static method Main(): int " +
                     body + " return 0; end Main; end C;");
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
@@ -73,37 +96,46 @@ std::string out(const std::string& body) {
 
 } // namespace
 
-// The issue's own repro (a,b,c axis: int / class / string all in one
+// The issue's own repro (a,b,c axis: three distinct owning arrays in one
 // program, each rendered both ways). Brackets around the part so a wrong
 // render is visible as `[X]` rather than as a blank line.
+//
+// The three axes were int / class / string as the issue spelled them; under
+// §15.1.1 (v0.307) the `owned` marker admits only class and interface
+// elements, so they are now class `R` at arity 2, class `S` at arity 3, and
+// interface `I` at arity 2 — still three distinct owning types, still both
+// arities, still one program. The defect was in `tryLowerInlineArrayCall`'s
+// hand-built `"[" + N + "]" + <element name>`, which read neither the
+// element's KIND nor the marker, so the element kind is not a load-bearing
+// axis of this assertion; the two CALL FORMS are.
 //
 // PRE-FIX this printed
 //   [2]R
 //   [2 owned]R
-//   [3]int
-//   [3 owned]int
-//   [2]string
-//   [2 owned]string
+//   [3]S
+//   [3 owned]S
+//   [2]I
+//   [2 owned]I
 // (the direct calls dropped `owned`, the interpolations kept it). POST-FIX
 // every line is the type name with its `owned` marker, in either form.
 BEZEL_TEST(inline_array_owning_tostring_2959,
            direct_and_interpolated_agree_on_owning_form_spec_8_5) {
     BEZEL_EXPECT_EQ(
         out("  var own: [2 owned]R := [new R(), new R()]; "
-            "  var oi:  [3 owned]int := [10, 20, 30]; "
-            "  var os:  [2 owned]string := [\"x\", \"y\"]; "
+            "  var os3: [3 owned]S := [new S(), new S(), new S()]; "
+            "  var oif: [2 owned]I := [new W(), new W()]; "
             "  Console.WriteLine($\"[{own.ToString()}]\"); "
             "  Console.WriteLine($\"[{own}]\"); "
-            "  Console.WriteLine($\"[{oi.ToString()}]\"); "
-            "  Console.WriteLine($\"[{oi}]\"); "
-            "  Console.WriteLine($\"[{os.ToString()}]\"); "
-            "  Console.WriteLine($\"[{os}]\");"),
+            "  Console.WriteLine($\"[{os3.ToString()}]\"); "
+            "  Console.WriteLine($\"[{os3}]\"); "
+            "  Console.WriteLine($\"[{oif.ToString()}]\"); "
+            "  Console.WriteLine($\"[{oif}]\");"),
         "[[2 owned]R]\n"
         "[[2 owned]R]\n"
-        "[[3 owned]int]\n"
-        "[[3 owned]int]\n"
-        "[[2 owned]string]\n"
-        "[[2 owned]string]\n");
+        "[[3 owned]S]\n"
+        "[[3 owned]S]\n"
+        "[[2 owned]I]\n"
+        "[[2 owned]I]\n");
 }
 
 // AXIS (c) — class-typed element on its own. The axis "class element" is
@@ -117,24 +149,31 @@ BEZEL_TEST(inline_array_owning_tostring_2959,
                     "[2 owned]R\n[2 owned]R\n");
 }
 
-// AXIS (a) — int element owning. A direct call on `[3 owned]int` must keep
-// the `owned` marker; this is the other form the interpolation + box paths
-// already agreed on (#2804's `[3]int` test is the non-owning baseline; this
-// is the owning form of the same shape).
+// AXIS (a) — arity 3. The issue spelled this axis `[3 owned]int`; §15.1.1
+// (v0.307) does not admit a value-type element under the `owned` marker, so
+// the axis is carried at the same arity over class `S`. What this row pins
+// is the ARITY-3 owning form against #2804's non-owning `[3]int` baseline
+// (kept verbatim in non_owning_form_unaffected_spec_8_5 below): a direct
+// call must keep the `owned` marker at an arity the two-element rows do not
+// cover. The int element itself was never the subject — §8.5's spelling rule
+// and the defective hand-built renderer are both element-kind-blind.
 BEZEL_TEST(inline_array_owning_tostring_2959,
-           owning_inline_array_of_int_renders_owned_spec_8_5) {
-    BEZEL_EXPECT_EQ(out("  var own: [3 owned]int := [10, 20, 30]; "
+           owning_inline_array_of_class_at_arity_three_renders_owned_spec_8_5) {
+    BEZEL_EXPECT_EQ(out("  var own: [3 owned]S := [new S(), new S(), new S()]; "
                         "  Console.WriteLine(own.ToString()); "
                         "  Console.WriteLine($\"{own}\");"),
-                    "[3 owned]int\n[3 owned]int\n");
+                    "[3 owned]S\n[3 owned]S\n");
 }
 
 // ACCEPT-CONTROL — the non-owning form is the #2804/#2913 baseline and must
 // stay unchanged. Without this, a fix that simply dropped the `owned` marker
 // from the interpolation arm as well would look like it passed.
 //
-// (Both [3]int and [2]string — the same element types the issue's repro used
-// in the owning rows — render identically across the two call forms.)
+// (Both [3]int and [2]string are the element types the issue's repro used,
+// kept verbatim. §15.1.1 restricts only the `owned` marker, so the NON-owning
+// form still admits a value type and a runtime-managed reference type — which
+// makes this row double as the control that the §15.1.1 element restriction
+// is owning-form-only and did not leak into `[N]T`.)
 BEZEL_TEST(inline_array_owning_tostring_2959,
            non_owning_form_unaffected_spec_8_5) {
     BEZEL_EXPECT_EQ(out("  var na: [3]int := [1, 2, 3]; "

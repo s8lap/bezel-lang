@@ -18,11 +18,25 @@
 // REMOVES the receiver-owned-field carve-out for owning collections at the
 // definition site: every such borrow return is rejected, mirroring #1660's
 // removal of the IOwningEnumerable carve-out. The spec-correct remedies are:
-// (a) return the borrow through the non-owning collection type (`Array<T>`) —
+// (a) return the borrow through a non-owning READ-ONLY VIEW —
 //     read-only access; (b) declare `owned` for a transfer (caller becomes
 //     owner). Test (1)/(2) exercise form (a) here; form (b)'s codegen has a
 //     pre-existing latent issue tracked separately. Tests (4)–(7) test the
 //     non-carve-out rules and are unchanged.
+//
+// The view type in form (a) is `IReadOnlyList<T>`, NOT `Array<T>`. stdlib
+// §4.3 (v0.307): "The two hierarchies share `IEnumerable<T>`,
+// `IReadOnlyCollection<T>`, and `IReadOnlyList<T>` as common ancestors. A
+// function that wants to read elements without taking ownership accepts one
+// of these interfaces; both borrowing and owning collections of T conform"
+// — with that section's own worked example being this exact shape
+// (`OwningArray<Connection> → IReadOnlyList<Connection> ✓`). The concrete
+// classes do NOT convert across the families: "`IList<T>` (borrowing) and
+// `IOwningList<T>` (owning) are unrelated types with no subtyping." This
+// file had spelled the view `Array<Cell>`, a cross-family conversion the
+// stdlib never granted and which `4195a745` now rejects; the subject of
+// every row below — a receiver-sourced borrow of an `owned` owning-
+// collection field, disposed exactly once — is unchanged by the spelling.
 //
 // Disposal is observed through a static Cell counter (ctor ++ / dtor --): a net
 // Cell.n of 0 after the owning scope ends proves dispose-exactly-once.
@@ -79,13 +93,14 @@ bool compileFails(const std::string& source) {
 }
 
 // A Cell with a disposal counter, and a Holder owning an OwningArray<Cell> field
-// with a read-only BORROW accessor `GetItems` (return type `Array<Cell>`, the
-// non-owning counterpart of `OwningArray<Cell>` — the §28.6 L7003 / L7363
+// with a read-only BORROW accessor `GetItems` (return type `IReadOnlyList<Cell>`,
+// the shared read-only ancestor of both collection families per stdlib §4.3 —
+// the §28.6 L7003 / L7363
 // remedy for read-only borrow through the non-owning view, still required at
 // v0.240 since the §28.6 carve-out only admits a return of an OWNED field of
 // THE RECEIVER; `Holder._items` here is `owned` and `GetItems` reads it as
 // the borrow admitted by the §28.6 carve-out — the return TYPE itself is
-// `Array<Cell>` so the borrow is on the non-owning view).
+// `IReadOnlyList<Cell>` so the borrow is on the non-owning read-only view).
 const char* prelude =
     "module M; "
     "class Cell public static n: int := 0; "
@@ -94,23 +109,23 @@ const char* prelude =
     "class Holder public owned _items: OwningArray<Cell>; "
     "  public constructor() _items := new OwningArray<Cell>(); _items.Add(new Cell()); end constructor; "
     "  destructor end destructor; "
-    "  public method GetItems(): Array<Cell> => _items; "
+    "  public method GetItems(): IReadOnlyList<Cell> => _items; "
     "  public method DrainSelf(): int "
     "    for var c in _items.Drain() do c.Dispose(); end; return 0; "
     "  end DrainSelf; "
     "end Holder; ";
 }  // namespace
 
-// (1) The receiver-field read is returned through the NON-OWNING view
-// (`Array<Cell>`, the spec-correct remedy for read-only borrow per #1760).
-// The caller reads it (Count), and the Holder disposes its field + element
-// exactly once → Cell.n == 0.
+// (1) The receiver-field read is returned through the NON-OWNING read-only
+// view (`IReadOnlyList<Cell>`, the spec-correct remedy for read-only borrow
+// per #1760 + stdlib §4.3). The caller reads it (Count), and the Holder
+// disposes its field + element exactly once → Cell.n == 0.
 BEZEL_TEST(borrowed_owning_1008c, borrow_field_read_disposed_once) {
     BEZEL_EXPECT_EQ(compileAndRun(
         std::string(prelude) +
         "class P public static method Main(): int "
         "  do using var h := new Holder(); "
-        "     var items := h.GetItems(); var n := items.Count(); end; "
+        "     var items := h.GetItems(); var n := items.Count; end; "
         "  return Cell.n; "                       // 0 — disposed once
         "end Main; end P;"), 0);
 }
@@ -121,7 +136,7 @@ BEZEL_TEST(borrowed_owning_1008c, borrow_field_read_disposed_once) {
 // carve-out removed (#1760, the test that admitted this return now REJECTS),
 // the original test's premise is gone — the borrow is no longer expressible
 // through a non-`owned` owning-collection return type. The natural
-// replacement would be a borrow through the non-owning view (`Array<Cell>`),
+// replacement would be a borrow through the non-owning view (`IReadOnlyList<Cell>`),
 // but the spec-correct form `=> _items;` for the `owned _items: OwningArray<
 // Cell>` field is not currently a no-op Dispose on the borrowed view (the
 // underlying OwningArray<Cell> spine is double-freed; tracked separately), so

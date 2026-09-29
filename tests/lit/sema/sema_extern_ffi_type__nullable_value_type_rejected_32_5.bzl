@@ -16,7 +16,7 @@ extern "c"
   public method takes_intptr_opt(x: IntPtr?): int;
 end;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `int?`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `int?`, which is a nullable value type — nullable value types are rejected at the FFI boundary
 // CHECK-SAME: (§32.5)
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `IntPtr?`, which is not permitted at the FFI boundary
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: extern method parameter `x` has type `IntPtr?`, which is a nullable value type — nullable value types are rejected at the FFI boundary
 // CHECK-SAME: (§32.5)

@@ -80,8 +80,21 @@ std::string compileAndCaptureIR(const std::string& source) {
     static int counter = 0;
     std::string bezelc = bezelcPath();
     if (bezelc.empty() || !fs::exists(bezelc)) return "";
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_3073_" + std::to_string(counter++);
+    // fix #4618: the stem must be unique across PROCESSES, not just within one.
+    // `counter` is function-static, so every sharded worker starts it at 0 and
+    // several processes raced on the same path: measured 8/8 pass single-process
+    // but 4/8 fail at BEZEL_SHARD_COUNT=6, with a different failing subset each
+    // run — a regression-shaped signature that is really a test-isolation bug.
+    // getpid() disambiguates the shards; the counter still disambiguates calls
+    // within one process. The directory also moves off fs::temp_directory_path()
+    // (/tmp), which is a 16 GB tmpfs this project forbids for scratch, onto the
+    // harness's own scratchBase().
+    std::error_code sdec;
+    fs::path dir = fs::path(bezel::test::aot_detail::scratchBase());
+    fs::create_directories(dir, sdec);
+    if (sdec) dir = fs::temp_directory_path();
+    std::string stem = "bezel_3073_" + std::to_string(static_cast<long>(getpid())) +
+                       "_" + std::to_string(counter++);
     std::string src = (dir / (stem + ".bzl")).string();
     std::string obj = (dir / (stem + ".o")).string();
     {

@@ -364,3 +364,212 @@ four. Use the measured numbers.
   become live `error` rows.
 - **The signature classes stay skipped on evidence**, not assumption: their
   blocks are API sketches whose bodies the documents deliberately elide.
+
+---
+
+## Coverage pass — 2026-09-21 (191 → 254 active)
+
+Batch G of `docs/proposals/next-run-queue-2026-08-13.md` ("the spec is already a
+test suite, and we run a quarter of it"). Every number below names the command
+that produced it; the oracle is `build/bezelc` built at this worktree's HEAD
+(`d3b36b1c`) against docs v0.306.
+
+### Counts
+
+`tests/conformance/run_conformance.sh build/bezelc`, whole sweep, before and
+after:
+
+| | before | after |
+|---|---|---|
+| manifest rows | 668 | 668 |
+| **sweep PASS** | **191** | **254** |
+| sweep FAIL | 0 | 0 |
+| sweep SKIP | 477 | 414 |
+| class `fragment` | 149 | 211 |
+| class `error` | 40 | 40 |
+| class `program` | 2 | 3 |
+| class `skip` | 477 | 414 |
+| `env.bzl` entries | 13 | 73 |
+| rows carrying `env:` | 18 | 62 |
+| rows carrying `preamble` | 17 | 36 |
+| `test_conformance.py` tests | 82 | 95 |
+
+(`awk -F'\t' 'NR>1{print $4}' tests/conformance/manifest.tsv | sort | uniq -c`
+for the class rows; `manifest.tsv` and `cases/` remain a bijection — 668/668.)
+
+**A counting note.** `scripts/gate_full_cycle.sh`'s conformance-phase comment
+still documents the healthy green as `100/0 (16 error + 83 fragment + 1 program,
+337 skip)`. That is the **v0.138-era 437-row corpus** and has been stale since
+the v0.247 regeneration; it is a comment, not an assertion, so nothing enforced
+it. The runner's own notion of "active" is simply `class != skip`, which is why
+the manifest arithmetic and the sweep tally agree exactly (191 then, 254 now).
+
+### What changed in the harness
+
+1. **The synthesized `Main` is promoted to `async` when the body awaits**
+   (`conformance.py`: `needs_async_main` / `main_header`, used by `classify_wrap`
+   step 7 and `wrap_mixed`). spec §33.2 (v0.306) admits
+   `public static async method Main(): Task` as one of the four accepted
+   entry-point signatures, so this is enclosing scaffolding in exactly the sense
+   `wrap_mixed` already is — no token of the document is added, rewritten,
+   reordered or dropped. Measured: **25** cases carried
+   ``\`await\` is valid only inside an \`async\` method or \`async\` lambda`` and
+   **all 25 lose it** under the promotion. It is a necessary enabler rather than
+   a sufficient one: alone it flipped 0 rows, because those 25 blocks also assume
+   unbound names. The `local` env anchor regex was widened to match both `Main`
+   spellings, or an async-promoted case would have failed `env-error`.
+2. **The extractor no longer chains a provider whose types the block itself
+   redeclares** (`scripts/extract_doc_examples.py`, `build_section_context`).
+   The docs routinely re-show a declaration in a later block of the same section
+   (a positional record restated beside its serialization form); the block then
+   both defines and references the name, so the old `ptypes & my_refs` test
+   prepended the earlier copy and the case failed on *"a top-level type named `X`
+   is already declared in this module (§11.3)"* — an artifact of the
+   scaffolding, not a claim of the document. Re-extracting the **v0.278 docs**
+   (`git archive a368a060 docs`, the commit that produced the committed corpus)
+   with and without the fix differs in exactly **8** case files —
+   `codegen_0034 spec_0021 spec_0040 stdlib_0019 stdlib_0020 stdlib_0072
+   stdlib_0074 stdlib_0080` — each a pure removal of the duplicated prefix, and
+   each byte-identical to the committed file before the fix. Those 8 files are
+   what is committed here.
+3. **`env.bzl` grew 13 → 73 entries and `preamble.bzl`'s `Connection` /
+   `Transaction` stubs grew the members the §28/§29.12 fragments read.** Each
+   entry carries its derivation, as the file's own rule requires. Two entries are
+   keyed differently from the name they bind (`userRecord` binds `user`), because
+   two documents assume the same pronoun at two types; the file now states that
+   key-vs-name convention explicitly.
+
+### How the 63 activations were chosen
+
+Every skipped row was compiled under the harness's **own** wrap functions
+(`classify_wrap` / `wrap_mixed` / `splice_preamble` / `splice_env`) across
+`{cascade, mixed} x {preamble on, off} x {env keys drawn only from the names that
+row's own diagnostics reported unbound}`, growing the key set to a fixpoint. The
+smallest note-token set that compiles **and runs without a crash/signal** was
+then minimised key-by-key and preamble-flag-wise, so every token in every
+activated row's `notes` is load-bearing. A row was activated only if the
+extractor's own classification of that block is `fragment` or `program`
+(checked for all 63: 62 fragment, 1 program) and the block carries no
+`// ERROR` / ✗ marker.
+
+Where the 63 came from, by the label they carried:
+
+| previous label | activated |
+|---|---|
+| `skip:incomplete-fragment` | 45 |
+| `skip:literal-listing` | 9 |
+| `skip:signature-listing` | 3 |
+| `skip:mixed` | 3 |
+| `skip:multi-module` | 1 |
+| `skip:stdlib-unresolved` | 1 |
+| `blocked-on-#2741` | 1 |
+
+Six of the 63 exit **70** at run time (the runtime unhandled-exception code,
+which `evaluate_run` accepts for `compiles` and `is_crash` does not classify as a
+crash) — and in each the exception is the one the document itself predicts or
+the obvious consequence of an empty ambient: `spec_0012` is §6.6's
+``byte(264) -> OverflowException``, `codegen_0034` reads `args[0]` with no
+argv, and `spec_0076 / spec_0088 / spec_0089 / guide5_0010` index an ambient
+collection that starts empty.
+
+### Anti-vacuity, and the four defects it surfaced
+
+Minimality proves an entry is *needed*. A second pass proves its *type* is
+load-bearing: each entry is rebound to a deliberately wrong shape and every
+opting-in row re-compiled. **94 (row, entry) pairs tested, 78 went red.** The 16
+survivors are listed at the foot of `env.bzl` with the issue each one is: they
+survive because the compiler accepts the mistyped form, which is the same way
+#3153 and #3155 were found in the 2026-08-13 pass.
+
+Filed from this pass:
+
+| issue | defect | worst observed |
+|---|---|---|
+| **#4500** | binary arithmetic with a `bool` operand is accepted (§6.2/§5.1) | `decimal * bool` and `double * bool` compile with **no diagnostic** and print `-2`; `int * bool` / `int + bool` emit malformed IR and fail LLVM's verifier |
+| **#4501** | `=` / `<>` on unrelated operand types reaches codegen (§17.3/§8.4) | `string = 0` and `bool = "x"` **abort bezelc** (SIGABRT 134, `ICmpInst::AssertOK`); `bool = 0` silently answers `True` |
+| **#4502** | subscripting a non-indexable value compiles (§23.4) — the `[…]` analogue of #3153 | `b[0]` on a `bool`/`int`/`decimal` local exits **0** with only the #2434 degraded-lowering warning, and the program runs |
+| **#4503** | `x is T` between unrelated types is accepted and narrows (§12.7/§17.4) | `animal.Bark()` compiles on a `bool` binding |
+
+The relational path already rejects `bool < 0` with a well-worded §3.5
+diagnostic, so #4500 is the arithmetic path missing a check its sibling has.
+
+### Re-labelling (the record was wrong, not just incomplete)
+
+- **7 rows -> `blocked-on-#2354`.** `codegen_0037`, `guide2_0008`, `guide2_0009`,
+  `spec_0310`, `stdlib_0037`, `stdlib_0038`, `stdlib_0039` fail because
+  spec §35.3's **declared-result target-typing** is not implemented: `return
+  Error($"...")` in a body declared `Result<int, string>` is rejected as
+  `unresolved identifier \`Error\``, while the qualified
+  `Result<int, string>.Error(...)` compiles. **§35.3's own worked example does not
+  compile.** #2354 is open and is the dominant blocker for all seven.
+- **8 rows off `skip:literal-listing`.** The v0.278 regen's `literal-listing`
+  heuristic ("short lines of whitespace-separated expressions") mislabelled
+  ordinary Bezel: `spec_0028` is §9.9's constructor-only record *with a body*,
+  `codegen_0005` is a plain method with contracts. Nine such rows compiled as
+  written and are now active; eight more whose only blocker is an unbound
+  illustrative name are relabelled `skip:incomplete-fragment`, which is what they
+  are. `spec_0012`'s `blocked-on-#2741` label was likewise wrong — #2741 is about
+  §5.1 constant narrowing, not §6.6 write-back — and the row now compiles.
+
+### What remains skipped, and why (414 rows, measured)
+
+Each row re-compiled under all four strategies; the strategy with the fewest
+non-name diagnostics is the one reported, and the label is the row's label AFTER
+this pass's re-labelling (a relabelled row's note keeps its previous label as
+provenance, so grepping the notes column double-counts those seven).
+
+| label | unbound name | parse | bodyless member | other semantic | no diagnostic | total |
+|---|---|---|---|---|---|---|
+| `skip:incomplete-fragment` | 99 | 3 | 2 | 25 | 0 | 129 |
+| `skip:signature-listing` | 4 | 24 | 33 | 5 | 0 | 66 |
+| `skip:signature` | 1 | 35 | 17 | 1 | 0 | 54 |
+| `skip:literal-listing` | 0 | 24 | 2 | 6 | 0 | 32 |
+| `skip:mixed` | 6 | 8 | 4 | 7 | 0 | 25 |
+| `skip:syntax-snippet` | 1 | 20 | 0 | 1 | 0 | 22 |
+| `blocked-on-#1394` | 4 | 0 | 0 | 14 | 0 | 18 |
+| `blocked-on-#3056` | 0 | 5 | 0 | 4 | 0 | 9 |
+| `skip:elided` | 0 | 8 | 0 | 0 | 0 | 8 |
+| `skip:not-implemented` | 0 | 3 | 0 | 4 | 0 | 7 |
+| `blocked-on-#2354` | 6 | 0 | 0 | 1 | 0 | 7 |
+| `skip:ebnf-grammar` | 1 | 6 | 0 | 0 | 0 | 7 |
+| `skip:compile-failed` | 0 | 5 | 0 | 2 | 0 | 7 |
+| `skip:stdlib-unresolved` | 4 | 0 | 0 | 1 | 0 | 5 |
+| `blocked-on-#2942` | 2 | 0 | 0 | 0 | 2 | 4 |
+| `skip:multi-module` | 0 | 3 | 0 | 0 | 0 | 3 |
+| `blocked-on-#1721` | 0 | 0 | 0 | 2 | 0 | 2 |
+| `blocked-on-#1723` | 1 | 0 | 0 | 1 | 0 | 2 |
+| `blocked-on-#1376` | 1 | 0 | 0 | 1 | 0 | 2 |
+| `blocked-on-#3050` | 0 | 2 | 0 | 0 | 0 | 2 |
+| `blocked-on-#1409` | 0 | 1 | 0 | 0 | 0 | 1 |
+| `blocked-on-#3051` | 0 | 0 | 0 | 1 | 0 | 1 |
+| `(other)` | 0 | 1 | 0 | 0 | 0 | 1 |
+| **total** | **130** | **148** | **58** | **76** | **2** | **414** |
+
+The three structural classes, restated with this pass's evidence:
+
+- **`parse` (148).** Grammar text, ✗/✓ diff snippets, `...`-elided sketches, and
+  bodyless `constructor` / `operator` declarations, which Appendix A does not
+  admit. Not Bezel; no wrap reaches them.
+- **`bodyless member` (58).** An API listing whose members have no bodies is,
+  inside a concrete `class`, a set of abstract members — so the class must be
+  `abstract`. That is a token **inside** the document's block, not scaffolding
+  around it, and synthesizing bodies would change what the document says. The
+  2026-08-13 pass ruled these out on the same evidence; this pass reproduces it.
+- **`unbound name` (130).** Still the reachable class, and still one entry at a
+  time: the remaining names either have no type the fragment forces
+  (`factory.CloneBuffer()`, `Probes(8)`), or need a typed helper object the
+  preamble would have to grow. 99 of the 130 sit under
+  `skip:incomplete-fragment`.
+
+### Gaps this pass found but did not close
+
+- **`test_conformance.py` is not gate-wired.** `gate_full_cycle.sh` discovers
+  `tests/conformance/rules` and runs `run_conformance.sh`, but nothing runs
+  `tests/conformance/test_conformance.py`, so the harness's 95 unit pins do not
+  fail a cycle. Wiring it is a gate-script change and was left out of this batch.
+- **The committed corpus is a v0.278 extraction; the docs are at v0.306.**
+  A fresh extraction today yields **671** blocks against the committed 668, and
+  **426 of 668** case files differ in content
+  (`diff -rq` against a scratch extraction). A regeneration renumbers every id
+  and is a batch of its own — the v0.247/v0.278 records above document the
+  merge-by-content protocol it must follow.

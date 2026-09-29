@@ -8,6 +8,7 @@
 //! cites: 30.5
 //! expect: reject
 //! diagnostic: using var
+//! issue: 4670
 module Conf;
 
 public class Widget

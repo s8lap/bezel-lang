@@ -215,7 +215,7 @@ BEZEL_TEST(diagnostics_646_8_1, stopwatch_elapsed_timespan_zero) {
         "var ts := sw.Elapsed; "
         // ts.TotalMilliseconds is the TimeSpan accessor; but we can also
         // check that Ticks == 0 since Reset state has 0 elapsed.
-        "if ts >= 0L then return 1; end; "
+        "if ts.Ticks >= 0L then return 1; end; "
         "return 0; ")), 1);
 }
 

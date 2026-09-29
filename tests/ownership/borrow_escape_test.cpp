@@ -69,11 +69,34 @@ BEZEL_TEST(own_escape, return_member_call_on_param_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_escape, return_bare_local_not_borrow_escape) {
-    // `return c;` where c is a plain `var` is a discharge (the local's
-    // ownership transfers to the caller); not a borrow escape.
+// FLIPPED by `fe95b173` (§28.3 announcement table row 4). The old expectation
+// — that `return c;` through a PLAIN `Connection` return is a move-out — is
+// refuted by the spec twice over: row 4 admits only a receiver-sourced borrow
+// through a plain concrete class/interface return (§28.3, and the worked
+// interface/implementation example at spec line 1945), and §28.6's fresh-value
+// rule states that "a fresh literal returned through a non-`owned` instance
+// return is rejected exactly as any freshly-produced owned value is".
+// Ownership transfers only through an `owned` return — which the diagnostic
+// itself names as the remedy, and which the control row below pins.
+BEZEL_TEST(own_escape, return_bare_local_rejected_row4_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(): Connection "
+        "  var c := new Connection(); "
+        "  return c; "
+        "end Take;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Pin the SPECIFIC rule, not a bare section number — a section number is
+    // the #4716 vacuous shape (it matches surrounding prose, so an unrelated
+    // rejection satisfies it).
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "may return only a receiver-sourced borrow"));
+}
+
+// The remedy the row-4 diagnostic names, pinned so the rejection above cannot
+// be "fixed" by making the whole shape inexpressible.
+BEZEL_TEST(own_escape, return_bare_local_accepted_through_owned_return_28_8) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Take(): owned Connection "
         "  var c := new Connection(); "
         "  return c; "
         "end Take;"));
@@ -504,19 +527,22 @@ BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
         r, "§28.3 borrow-lifetime rule"));
 }
 
-// §28.3 (#1960 POSITIVE control — must NOT be over-rejected): a bare-identifier
-// return of a plain `var` owned local is a MOVE-OUT (the ownership transfers to
-// the caller), not a borrow escape. Duplicates return_bare_local_not_borrow_
-// escape's intent to pin that the relaxed gate did not perturb the move-out
-// path (handleReturn's earlier bare-identifier fast-path handles it before this
-// check ever runs).
-BEZEL_TEST(own_escape, return_bare_plain_var_still_moveout_1960) {
+// §28.3 (#1960): this row was written as a POSITIVE control against
+// over-rejection, asserting that a bare-identifier return of a plain `var`
+// owned local is a move-out. `fe95b173` reversed that, and the spec is on the
+// fix's side — see return_bare_local_rejected_row4_28_3 above for the two
+// citations. The row is KEPT rather than deleted because its axis is still
+// worth pinning: it is the same repro as that row, so if a future change ever
+// re-admits the shape, both fail together and the disagreement is visible.
+BEZEL_TEST(own_escape, return_bare_plain_var_rejected_row4_1960) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(): Connection "
         "  var c := new Connection(); "
         "  return c; "
         "end Take;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "may return only a receiver-sourced borrow"));
 }
 
 // ===========================================================================
@@ -561,16 +587,27 @@ BEZEL_TEST(own_escape, return_span_of_using_var_array_diagnosed) {
         r, "returned span views"));
 }
 
-// §9.7 / §4.14 (#1959 POSITIVE control — must NOT be over-rejected): a span
-// viewing a PARAM Array outlives the caller's frame (the caller's array
-// persists past this method's exit), so returning it is sound.
-BEZEL_TEST(own_escape, return_span_of_param_array_clean) {
+// fix #4428 (§9.7, v0.301): a span viewing a PARAM Array — `View(a:
+// Array<int>): ArraySpan<int> { return a.AsSpan(); }` — is REJECTED at the
+// return site. The pre-#4428 text ("a span viewing a PARAM Array outlives
+// the caller's frame, so returning it is sound") conflated the §28.3
+// caller-side rule (a parameter-source is fine to bind at the call site) with
+// the §9.7 callee-side rule (a parameter-source cannot be the ADMITTED return
+// arm of a borrow-bearing record or span). The §9.7 v0.301 ruling closes the
+// parameter arm — "a caller has nothing but the receiver to re-establish and
+// a parameter-sourced record return would hand back a borrow no call site
+// could bound" (v0.301). The receiver-sourced (`this._buf.AsSpan()`)
+// counterpart stays accepted — the `this`-rooted arm is the §9.7 ADMITTED
+// return shape. // per §9.7, §4.14, §4.15, v0.301.
+BEZEL_TEST(own_escape, return_span_of_param_array_rejected_9_7_v301) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method View(a: Array<int>): ArraySpan<int> "
         "    return a.AsSpan(); "
         "  end View; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned span is rooted at parameter `a`"));
 }
 
 // §9.7 / §4.14 (#1959 POSITIVE control): a span viewing an owned FIELD of

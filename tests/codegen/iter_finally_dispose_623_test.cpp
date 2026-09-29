@@ -108,7 +108,7 @@ module M;
 class C
   public static counter: int := 0;
 
-  public async static method Gen(): IAsyncEnumerable<int>
+  public static async method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield return 2;

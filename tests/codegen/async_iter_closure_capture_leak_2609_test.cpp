@@ -85,7 +85,7 @@ bool wasSkipped(const JitResult& r) {
 // capture list empty isolates #2609's closure cell + env block.
 const char* kAsyncGen =
     "class C "
-    "  public async static method Gen(make: () -> int): IAsyncEnumerable<int> "
+    "  public static async method Gen(make: () -> int): IAsyncEnumerable<int> "
     "    yield return make(); "
     "    yield return make(); "
     "  end Gen; ";
@@ -160,7 +160,7 @@ BEZEL_TEST(async_iter_closure_capture_leak_2609,
         "  destructor Cell.live := Cell.live - 1; end destructor; "
         "end Cell; "
         "class C "
-        "  public async static method Gen(owned c: Cell, make: () -> int): IAsyncEnumerable<int> "
+        "  public static async method Gen(owned c: Cell, make: () -> int): IAsyncEnumerable<int> "
         "    yield return c.V + make(); "
         "    yield return make(); "
         "  end Gen; "
@@ -190,7 +190,7 @@ BEZEL_TEST(async_iter_closure_capture_leak_2609,
     auto r = runAotChecked(
         "module M; "
         "class C "
-        "  public async static method Gen(make: () -> int): IAsyncEnumerable<int> "
+        "  public static async method Gen(make: () -> int): IAsyncEnumerable<int> "
         "    Console.WriteLine(\"gen=\" + make().ToString()); "
         "  end Gen; "
         "  public static async method Main(): Task<int> "

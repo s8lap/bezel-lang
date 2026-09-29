@@ -178,7 +178,7 @@ BEZEL_TEST(stack_ienumerable_coercion_order_2486, all_five_coercion_paths_agree_
         "  public static method ViaArg(src: IEnumerable<int>): owned Array<int> "
         "    var acc := new Array<int>(0); "
         "    for var x in src do acc.Add(x); end; "
-        "    return move acc; "
+        "    return acc; "
         "  end ViaArg; "
         "  public static method ViaReturn(s: Stack<int>): IEnumerable<int> "
         "    return s; "

@@ -12,5 +12,5 @@
 
 module M; enum Color Red, Green, Blue; end Color; class App public static _c: Color := Color.Red; public static method Main(): int => 0; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_c` has type `Color` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_c` has type `Color` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

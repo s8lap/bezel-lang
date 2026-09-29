@@ -110,9 +110,16 @@ BEZEL_TEST(static_borrow_return_1547, local_reborrow_of_param_rejected) {
 // The rule also covers a FIELD read reached through a parameter (`h.Ref`,
 // a non-owned field) — the field's source is `h`, itself a borrowed
 // parameter with no receiver-rooted proof of outliving the call.
+// The fixture declares `Ref` as an explicit public field: it used to be
+// `class Holder(Ref: Res)` with no `end Holder;`, which nested `P` inside
+// `Holder`. Once #4868 (§22.10, v0.307) stopped promoting primary-constructor
+// parameters, the `h.Ref` read failed as "no member", before this rule ran.
 BEZEL_TEST(static_borrow_return_1547, field_through_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
-        "class Holder(Ref: Res) "
+        "class Holder "
+        "  public Ref: Res; "
+        "  public constructor(r: Res) Ref := r; end constructor; "
+        "end Holder; "
         "class P "
         "  public static method GetField(h: Holder): Res => h.Ref; "
         "end P;"));

@@ -48,12 +48,14 @@
 //   t5  CONTROL: field → LATER field — still rejected (the pre-existing rule,
 //                                     unchanged by this fix).
 //   t6  CONTROL: INSTANCE auto-properties — untouched (§22.13 is static-only).
-//   t7  RUNTIME BACKSTOP: a property→later-property reference routed through a
-//                                     static helper's BODY — the shape §22.13's
-//                                     compile-time check calls "a deliberate
-//                                     approximation" and leaves to the runtime
-//                                     re-entrancy backstop. Must raise
-//                                     TypeInitializationException, not read 0.
+//   t7  a property→later-property reference routed through a static helper's
+//                                     BODY — REJECTED. (Written at v0.286
+//                                     asserting a runtime TIE; FLIPPED to
+//                                     compile-time rejection by fix #4531,
+//                                     which implements §22.13's "transitively
+//                                     through the bodies of
+//                                     statically-resolvable calls" clause. The
+//                                     row's own comment quotes the sentences.)
 //   t8  CONTROL: the same helper routing in CORRECT declaration order — no
 //                                     raise, correct value.
 //   t9  CONTROL (over-reject guard): a later static FIELD reading an EARLIER
@@ -262,16 +264,56 @@ BEZEL_TEST(sema_static_autoprop_forward_ref_3774,
     BEZEL_EXPECT_EQ(r.stdoutText, "A=1 B=2\n");
 }
 
-// t7 — RUNTIME BACKSTOP. §22.13 calls the compile-time forward-reference check
-// "a deliberate approximation, not a completeness guarantee"; a reference
-// routed through a helper method's BODY is one the implementation's syntactic
-// walk does not see, and §22.13 rule 2 hands those to the runtime: a re-entrant
-// touch "raises a runtime-synthesized `TypeInitializationException`" and
-// "Partially-initialized statics are **never observable through a re-entrant
-// touch**." Before the fix a property read never reached the guard AND the
-// property arm never advanced init-progress, so this printed `P1=1 P2=77`.
+// t7 — FLIPPED by fix #4531 (§22.13, v0.306): rejected AT COMPILE TIME, not
+// left to a runtime raise.
+//
+// This row was written (v0.286) asserting a runtime TypeInitializationException,
+// on the reading that a reference routed through a helper method's BODY is one
+// §22.13's "deliberate approximation" leaves to rule 2's runtime backstop. That
+// reading does not survive the section's own text, on either half:
+//
+//   * The compile-time rule already covers this route. §22.13: "if the
+//     initializer expression for a `static readonly` field F reads a `static
+//     readonly` field G of the same type declared *after* F in the source —
+//     **directly, or transitively through the bodies of statically-resolvable
+//     calls** (the same call set as the cross-type dependency graph below —
+//     static methods and static property getters reached by direct name within
+//     the compilation unit, §2.5; function values, virtual dispatch, and code
+//     outside the compilation unit contribute nothing) — the reference is
+//     rejected at compile time." `C3774T7.Helper()` IS a static method reached
+//     by direct name within the compilation unit, so it is IN that call set,
+//     and the escapes the approximation actually grants are named exhaustively
+//     in the next sentence: "a same-type forward read routed through a function
+//     value, virtual dispatch, or a module boundary compiles". A direct static
+//     call is none of the three.
+//
+//   * Rule 2's backstop never governed this shape. It fires on "a touch of a
+//     type whose static initialization is in progress on the same thread,
+//     arriving from **outside that type's own initialization**" — "a touch of T
+//     is *re-entrant* when that innermost initialization belongs to a different
+//     type — the T → U → T signature — and is *ordinary execution* when it is
+//     T's own". Here C3774T7's own initializer reads C3774T7's own later
+//     static, so the touch is ordinary execution. The paragraph says so again
+//     itself: "(A type's *own* initialization code observing its own later
+//     statics is governed by the forward-reference rule and its recorded
+//     residual above, not by this backstop.)"
+//
+// So the TIE this row asserted was the runtime raising where §22.13 does not
+// ask it to. Fix #4486 stopped that raise — correctly, per the paragraph above
+// — and the shape then reached `Main` and printed the silently-wrong
+// `P1=1 P2=77` (measured at 87313e75), which is exactly the outcome #3774
+// exists to eliminate. The defect the two fixes together expose is that the
+// compile-time check implemented only the DIRECT half of its own rule. Fix
+// #4531 implements the transitive half in StaticInitCycles.cpp — the pass that
+// already owns §22.13's statically-resolvable call set — so the program is now
+// refused at compile time, which is both what the spec says and a strictly
+// stronger oracle than the runtime raise this row used to accept.
+//
+// The residual #4486 pins (static_same_type_forward_ref_residual_4486_test.cpp)
+// is untouched: its rows route through a LAMBDA, one of the three named
+// escapes, which this check deliberately does not walk.
 BEZEL_TEST(sema_static_autoprop_forward_ref_3774,
-           t7_property_forward_ref_through_helper_body_raises_tie_22_13) {
+           t7_property_forward_ref_through_helper_body_rejected_22_13) {
     auto r = runAot(
         "module M; "
         "public class H3774T7 "
@@ -288,12 +330,22 @@ BEZEL_TEST(sema_static_autoprop_forward_ref_3774,
         "    return 0; "
         "  end Main; "
         "end Main3774T7;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    // The uncaught TypeInitializationException path: §33.3's exit code for an
-    // uncaught exception, and NOTHING on stdout — in particular not the
-    // silently-wrong "P1=1 P2=77" this fix removes.
-    BEZEL_EXPECT_EQ(r.exitCode, 70);
-    BEZEL_EXPECT_EQ(r.stdoutText, "");
+    // Never runs at all: the program does not compile. In particular it never
+    // reaches the silently-wrong "P1=1 P2=77" (P2's §7.9 `int` default of 0,
+    // plus one) that #3774 exists to eliminate.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasForwardRefError(r));
+    // Names BOTH members, per §22.13's "The error message names both fields
+    // and points to the textual ordering rule" — the same obligation t1b pins
+    // for the direct arm. Without this the row would also be satisfied by an
+    // unrelated rejection.
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`P1`") != std::string::npos &&
+            d.message.find("`P2`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
 }
 
 // t8 — CONTROL for t7: the same helper routing with the two properties in the

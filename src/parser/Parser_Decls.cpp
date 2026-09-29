@@ -1420,6 +1420,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 if (isSerializedClauseStart()) {
                     pd->serialized = parseSerializedClause();
                 }
+                if (isEqualityClauseStart()) {
+                    pd->equality = parseEqualityClause();
+                }
                 if (!consumePunctuator(";")) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
@@ -1454,6 +1457,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 }
                 if (isSerializedClauseStart()) {
                     pd->serialized = parseSerializedClause();
+                }
+                if (isEqualityClauseStart()) {
+                    pd->equality = parseEqualityClause();
                 }
                 if (!consumePunctuator(";")) {
                     diagnostics_.report(
@@ -1496,6 +1502,21 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         const bool isPure =
             std::find(modifiers.begin(), modifiers.end(),
                       std::string_view("pure")) != modifiers.end();
+        // fix #4414 (§30.1, v0.300): `async` is not admitted on a
+        // constructor — only methods and lambdas carry it (A.4 admits it in
+        // MethodDecl and LambdaExpr only). The shared member-modifier
+        // prefix above over-admits `async`; the ConstructorDecl AST does
+        // not preserve the modifiers vector, so reject here at parse time
+        // rather than in sema (same shape as the `pure`-not-admitted-on-
+        // event check at line ~1300).
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("async")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`async` is not admitted on a constructor — `async` is a "
+                "method/lambda modifier (A.4 admits it in MethodDecl and "
+                "LambdaExpr only; §30.1, v0.300)");
+        }
         if (!isStatic && visibility == ast::Visibility::None) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected member visibility before "
@@ -1561,6 +1582,33 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 Severity::Error, current_.location,
                 "destructor has no visibility per §A.4");
         }
+        // fix #4414 (§30.1, v0.300): same as the constructor branch above
+        // — the shared member-modifier prefix over-admits `async` and the
+        // DestructorDecl AST does not preserve the modifiers vector, so
+        // reject at parse time rather than in sema.
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("async")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`async` is not admitted on a destructor — `async` is a "
+                "method/lambda modifier (A.4 admits it in MethodDecl and "
+                "LambdaExpr only; §30.1, v0.300)");
+        }
+        // fix #4871 (§22.15, v0.307): mirror the async rejection for `pure`.
+        // `pure` is rejected on destructors (disposal is the effect context
+        // purity fences off). The DestructorDecl AST also does not carry the
+        // modifiers vector, so the sema arm at
+        // TypeResolution_Checks.cpp:15442-15454 that carries the rule text is
+        // dead code in the current AST — it is preserved here defensively,
+        // but the load-bearing rejection happens at parse time, with the
+        // SAME diagnostic text so the §22.15 needle is byte-identical.
+        if (std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("pure")) != modifiers.end()) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`pure` is not admitted on a destructor — disposal is the "
+                "effect context purity fences off (§22.15)");
+        }
         auto dtor = std::make_unique<ast::DestructorDecl>();
         advance(); // past `destructor`
         while (!isKeyword("end") &&
@@ -1616,6 +1664,26 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto inv = std::make_unique<ast::InvariantDecl>();
         inv->isStatic = isStatic;
         inv->loc = current_.location;
+        // fix #4449 (§22.16, v0.303): a `static invariant` clause is parsed
+        // from day one and is INERT — neither rejected nor instrumented
+        // (codegen's `Emitter::emitInvariantCheck` excludes `isStatic`
+        // invariants by design) — until the contract-proving prover fragment
+        // lands. §22.16's "Out of scope in this revision" rule names the
+        // diagnostic obligation: "the compiler **must** emit a warning at
+        // the clause naming that fact". Fires once at the clause's
+        // declaration site (here, where the AST is built), on `static
+        // invariant` only — plain `invariant` is unaffected. The warning is
+        // WITHDRAWN (not silenced) when the prover fragment lands — the rule
+        // states the condition itself, so the diagnostic cannot outlive its
+        // reason. The wording is fixed by the issue for a citation trail;
+        // minor punctuation paraphrases are not.
+        if (isStatic) {
+            diagnostics_.report(
+                Severity::Warning, current_.location,
+                "`static invariant` is not instrumented in this revision — "
+                "the clause is parsed and otherwise inert until the "
+                "contract-proving prover fragment lands (§22.16)");
+        }
         advance();  // past `invariant`
         // §22.16 v0.207: structural parens around the predicate. The `;` is
         // the ordinary member terminator.
@@ -1655,16 +1723,39 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         reportDiscardNotDeclarable("field");
         return nullptr;
     }
-    if (current_.kind != TokenKind::Identifier) {
-        diagnostics_.report(
-            Severity::Error, current_.location,
-            "expected field name or member kind keyword");
-        return nullptr;
-    }
+    // §9.2 / A.4 FieldDecl grammar (v0.298): the visibility+modifiers are
+    // followed by an optional EqualityClause BEFORE the Identifier. The
+    // `equality` contextual keyword is itself lexed as an Identifier, so a
+    // first-glance "is this an Identifier" check would happily read it as
+    // a (wrong) field name. We pre-recognize `equality` and consume it
+    // here; the Identifier check that follows validates the next token as
+    // the field name in either branch.
+    const bool hadEqualityClause = isEqualityClauseStart();
 
     auto field = std::make_unique<ast::FieldDecl>();
     field->visibility = visibility;
     field->modifiers = std::move(modifiers);
+    // §9.2 / A.4 FieldDecl: EqualityClause appears BEFORE the Identifier
+    // (the unusual placement — `serialized` is never on an explicit
+    // FieldDecl, so this slot is reserved for the equality package only).
+    // Grammar: `Visibility "static"? ("owned" | "scoped")? "readonly"?
+    //            EqualityClause? Identifier ":" Type (":=" Expression)? ";"`.
+    if (hadEqualityClause) {
+        field->equality = parseEqualityClause();
+    }
+    if (current_.kind != TokenKind::Identifier) {
+        if (hadEqualityClause) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected field name after `equality skip` clause "
+                "(A.4 FieldDecl)");
+        } else {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected field name or member kind keyword");
+        }
+        return nullptr;
+    }
     field->name = current_.text;
     advance();
 
@@ -1763,10 +1854,19 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         }
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = ast::Visibility::None; // implicit public in iface
-        if (readonlyMod) pd->modifiers.push_back("readonly");
         // §22.15 (v0.202, #2052): IfaceProperty/IfaceIndexer admit `pure?`
-        // before `readonly?` per A.4.
+        // before `readonly?` per A.4 — and §11.5's canonical order likewise
+        // puts the `(async|pure)` slot ahead of `readonly`. This function
+        // scans the prefix into FLAGS (the `while` above accepts any spelling
+        // order and discards source order), so these push_backs are the one
+        // place the order is re-established: they must emit the canonical
+        // sequence. Emitting `readonly` first made checkMemberModifierOrder
+        // (#4719) observe a slot DECREASE (readonly=6 then pure=3) and
+        // falsely reject every `pure readonly property` — including §11.2's
+        // own `IReadOnlyCollection<out T>` example, which is what broke the
+        // spec-example conformance phase. per §11.5, v0.307
         if (pureMod) pd->modifiers.push_back("pure");
+        if (readonlyMod) pd->modifiers.push_back("readonly");
         if (consumePunctuator("[")) {
             pd->isIndexer = true;
             pd->indexerParams = parseParamList();
@@ -2241,6 +2341,34 @@ std::unique_ptr<ast::SerializedClause> Parser::parseSerializedClause() {
             "(A.4 SerializedClause)");
     }
     return sc;
+}
+
+// §9.2 / fix #4643 (v0.298): EqualityClause. Mirrors `serialized skip`'s
+// grammar (App. A.3/A.4), but only the `skip` form exists — rename and
+// `optional` have no equality analogue, so the clause is one word, closed
+// (spec §9.2 line 1385). The caller checks `isEqualityClauseStart()`
+// first (`equality` is contextual, App. B.2, lexed as Identifier; we
+// identify by text exactly the way `serialized` does above).
+bool Parser::isEqualityClauseStart() const {
+    return current_.kind == TokenKind::Identifier &&
+           current_.text == "equality";
+}
+
+std::unique_ptr<ast::EqualityClause> Parser::parseEqualityClause() {
+    advance(); // past `equality`
+    auto ec = std::make_unique<ast::EqualityClause>();
+    // Only `skip` is admitted (line 1385); anything else is an error.
+    if (current_.kind == TokenKind::Identifier && current_.text == "skip") {
+        ec->isSkip = true;
+        advance();
+        return ec;
+    }
+    diagnostics_.report(
+        Severity::Error, current_.location,
+        "`equality` requires `skip` — rename and `optional` have no "
+        "equality analogue (§9.2, A.3/A.4 EqualityClause; vocabulary is "
+        "one word, closed)");
+    return ec;
 }
 
 // §9.8 v0.141 (P6): class-body member clause
@@ -2970,6 +3098,9 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
         if (isSerializedClauseStart()) {
             p.serialized = parseSerializedClause();
         }
+        if (isEqualityClauseStart()) {
+            p.equality = parseEqualityClause();
+        }
         return p;
     };
     fields.push_back(parseOne());
@@ -2983,7 +3114,7 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
 
 // §A.3 / §35.1 (v0.200, #2044):
 //   CasePayload ::= "(" CaseField ("," CaseField)* ")"
-//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause?
+//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause? EqualityClause?
 // CaseField is PositionalField plus the optional leading `owned` payload
 // marker; the marker is stored in `Param::modifier` (semantically the same
 // slot `owned` parameters use, per §35.3 / §28.3).
@@ -3019,6 +3150,9 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
         p.type = parseType();
         if (isSerializedClauseStart()) {
             p.serialized = parseSerializedClause();
+        }
+        if (isEqualityClauseStart()) {
+            p.equality = parseEqualityClause();
         }
         return p;
     };

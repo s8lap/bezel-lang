@@ -118,6 +118,100 @@ llvm::Value* Emitter::rescueUnitAssignRhs(llvm::Value* rhs,
 }
 
 
+// fix #4646 (§22.16, v0.307): the AUTO-PROPERTY row of §22.16's
+// instrumentation set.
+//
+// §22.16, verbatim:
+//
+//   "- **Entry and normal exit** of every `public` **setter** — block-form,
+//      auto-property, indexer, `set(owned)` alike. (Auto-property assignments
+//      inside constructors are backing-field stores, not accessor
+//      invocations, so construction does not double-check.)"
+//
+// #4614(b) emitted that row at `lowerPropertySetValue` — the path a BLOCK-FORM
+// setter's inlined body takes — and #4651 made the exported cross-module stub
+// the same checked face. Neither reaches an AUTO-property: a same-module
+// `c.P := v` on a non-virtual auto-property has no setter body at all, so
+// `computedSetterOf` returns null and `lowerPropertySet` declines; the store
+// falls through to the generic `lvalueAddr` arm of the AssignmentStmt lowering
+// and lands directly in the backing field. MEASURED on this HEAD before this
+// fix, with `--checked-contracts`, on the issue's own repro: 42 where §22.16
+// requires ContractViolationException (99) — a SILENT UNDER-CHECK, which is
+// the direction §22.16's observable-boundary property exists to prevent.
+//
+// This predicate answers whether an assignment target IS such a store, and
+// whose conjunction it evaluates. Every §22.16 and §13.6 question — release
+// mode, class kind, `static`, accessor visibility, a non-empty conjunction,
+// and the `this`-reentrancy exemption decided on the receiver's SYNTAX — is
+// deferred to `instrumentedSetterClass` (#4614(b)), deliberately: the two
+// setter shapes must not be able to drift apart, and re-deciding the
+// exemption here is exactly how a silent under-check becomes a loud
+// OVER-check (`this.P := v` inside an instance member is EXEMPT, and the
+// constructor's own `P := v` is the spelling §22.16's parenthetical names).
+//
+// Declines for a FIELD target (`ctx_.exprSymbol` yields a FieldSymbol, never a
+// PropertySymbol — §22.16 makes a public field no instrumentation point at
+// all) and for an INDEXER (its own row is reached through `lowerIndexerSet`).
+const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
+    const ast::Expr& target) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
+    if (!ps || ps->isIndexer) return nullptr;
+    // fix #4682 (§22.16 / §2.8.2, v0.307): decline for an IMPORTED property,
+    // and RETIRE the SEAM-DEBT #4686 marker that stood here. That marker
+    // asserted "an imported property never reaches this predicate" as a
+    // premise about the ORDER of the sibling arms. The premise is TRUE for
+    // the `:=` arm and FALSE for the two arms #4682 adds — MEASURED on this
+    // HEAD with a real two-module build (`--import`) of a class carrying
+    // `invariant(k > 0);` and a public auto-property `P`, by reading the
+    // importer object's undefined symbols (`nm -u`):
+    //
+    //     c.P := 7   ->  U bz$<Lib>.CX$P$propset   (#4651's checked face)
+    //     c.P += 1   ->  no propset reference
+    //     c.P++      ->  no propset reference
+    //
+    // `lowerImportedPropertySet` claims the `:=` store before the generic
+    // `lvalueAddr` fall-through, but `lowerImportedPropertyCompound` and
+    // `lowerImportedPropertyIncrDecr` both DECLINE for an imported
+    // AUTO-property (neither has an accessor body to call), so those two
+    // spellings reach `lvalueAddr` and store straight into the backing field.
+    //
+    // Declining here is a deliberate SCOPE choice, not an oversight. §22.16
+    // requires the check for all three spellings; what differs is WHOSE
+    // `--checked-contracts` governs it. #4651 settled that for the setter row
+    // with a measured 2x2 mode grid — the check lives in the EXPORTER's
+    // object, so the exporter's flag governs, exactly as §22.16's
+    // public-METHOD row has behaved since #2941. Instrumenting the imported
+    // compound/increment HERE would put it in the IMPORTER's object instead,
+    // so one property would answer to two different build flags depending on
+    // which spelling the caller used. The coherent fix routes the imported
+    // compound/increment through the exported checked stub, which lives in
+    // the imported-property lowering rather than in these arms; it is
+    // recorded as #4705. Until then the imported spellings keep their
+    // pre-existing unchecked behaviour instead of acquiring a second,
+    // contradictory mode policy.
+    //
+    // `ctx_.isImported` is the repo's settled spelling of this question
+    // (SemaContext.hpp): an imported `PropertySymbol` is minted by
+    // `makeImportedSymbol`, which inserts it into `imported_`. Preferred over
+    // a `ps->decl == nullptr` test, which conflates "externally defined" with
+    // "carries no local AST" (imported-symbol-audit-2026-08-13.md §4).
+    if (ctx_.isImported(ps)) return nullptr;
+    // `pd` is the OPTIONAL §13.6 accessor-visibility refinement input, not a
+    // classification read; `setterInstrumentationClass` documents its
+    // null-`pd` arm as "no accessor-level refinement". With the guard above,
+    // every property that reaches here carries one.
+    //
+    // SEAM-DEBT: #4686 ps->decl read — now guarded unreachable-for-imports by
+    // the `ctx_.isImported(ps)` decline immediately above, MEASURED with a
+    // two-module program (see the `nm -u` table in the block above), rather
+    // than relying on the ordering of the sibling `lowerImported*` arms as the
+    // retired marker did. Same posture as DefiniteAssignment.cpp's #4030
+    // marker. The read stays a class-3 AST-gated read and keeps its marker.
+    const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    return instrumentedSetterClass(target, ps, pd);
+}
+
+
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // fix #3377 / §28.3: a `using var` is a SCOPE-BOUND consumer — §28.3
@@ -145,6 +239,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 loopBodyDeclaredSlots_.insert(lit->second);
         }
         if (diverged_) return true;  // CG40: diverging initializer
+        // fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from
+        // and null* (v0.306): `var c := b;` is the spec's OWN spelling of the
+        // move-only local-to-local move ("`var y := x;`: copies for an
+        // ordinary value type; moves for a move-only value type"), and it
+        // double-freed exactly as the `:=` form did — both slots kept the
+        // owned payload and both scope-end active-case passes disposed it.
+        // Runs after `lowerLocalDecl` has stored the initializer into the new
+        // binding's slot, and after the `diverged_` bail (a diverging
+        // initializer never reached the store, so there is no transfer to
+        // record). // per §15.3, §28.7, v0.306, #4566
+        markOwningChoiceLocalMovedFrom(ld, ld->initializer.get());
         // §15.3 (#747): a move-only owning inline-array local auto-disposes its
         // slots at scope end, independent of `using var` (§28.10 line 2025).
         // When handled, bypass the using/task/unwind chain (none applies to a
@@ -326,6 +431,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return diverged_;  // CG40
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #5017 (§5.1 "Nullable conversions", v0.307): the lifted
+        // `S? → T?` conversion at an assignment into a nullable-VALUE slot.
+        // `rhs` is a `{i8 hasValue; S}` struct and `slotTy` the `{i8; T}`
+        // slot with S ≠ T: convert the payload by §5.1's underlying widening
+        // and carry the source's hasValue through unchanged ("a present value
+        // converts by the underlying conversion, `null` converts to `null`").
+        // Mirrors the declaration-initializer path (#840, lowerLocalDecl). A
+        // no-op unless both sides are the tagged-struct shape, the types
+        // differ, and a §5.1 payload widening applies.
+        //
+        // fix #5078: hoisted to the member function `liftNullableValueToSlot`
+        // (LlvmBackend_impl.hpp) so the indexer-setter arm in
+        // `lowerCollectionIndexerSet` (LlvmBackend_Assign.cpp) — a SEPARATE
+        // `IndexExpr` branch below that `return`s before reaching this shared
+        // preamble — can reuse the identical logic instead of a second copy.
         if (as->target && as->value) {
             // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound
@@ -649,8 +769,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // value struct `{i8, T}`; wrap the bare inner value so the
                     // hasValue byte is set (this fast path bypasses the general
                     // CG-nullable wrapping below).
+                    // fix #5005 (§5.1 `S → T → T?`, v0.307): thread the RHS
+                    // expression's signedness so a narrower UNSIGNED source
+                    // (e.g. a `byte`/`uint` element assign into a `long?`
+                    // slot) widens via ZExt, not the default SExt — mirrors
+                    // issue #421/#410 at every other widen-then-wrap site.
                     builder_.CreateStore(
-                        coerceToNullableSlot(elemTy2, rhsOnce), addr2);
+                        coerceToNullableSlot(
+                            elemTy2, rhsOnce,
+                            isUnsignedTargetExpr(*as->value)),
+                        addr2);
                     return false;
                 }
             } else if (as->op != "??=") {
@@ -771,6 +899,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = nullptr;
             llvm::Value* rhs = nullptr;
+            // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+            // boundary for `obj.P := v`. `invRecv4646` receives the receiver
+            // pointer `lvalueAddr` already lowered for the field store (see
+            // `instrumentedAutoPropertyStoreClass` above); `invCls4646` is the
+            // class whose conjunction to evaluate, or null when §22.16
+            // instruments nothing here.
+            llvm::Value* invRecv4646 = nullptr;
+            const sema::TypeSymbol* invCls4646 = nullptr;
             // #736: a whole-array collection-literal assignment
             // `target := [e0, e1, ...]` to an inline-array lvalue (field or
             // local). A CollectionLiteralExpr is not a general expression value
@@ -1020,7 +1156,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         lowerAccessorNullCoalescingAssign(*as))
                         return false;
                 }
-                addr = lvalueAddr(*as->target, elemTy);
+                // fix #4732 (§22.16 / §6.6, v0.307): ask for the receiver
+                // pointer here too. This is the `??=` twin of the #4646 request
+                // on the `:=` arm's `lvalueAddr` a few dozen lines below, and it
+                // exists for the same reason: an auto-property `??=` has no
+                // setter body, so the store falls through to the generic
+                // backing-field path and the §22.16 boundary has to be emitted
+                // around it. Threading the out-parameter keeps the receiver
+                // expression evaluated exactly once and puts the boundary check
+                // AFTER §28.2's disposed guard, which `fieldAddr` emits
+                // internally.
+                addr = lvalueAddr(*as->target, elemTy, &invRecv4646);
                 // fix #2905 (§7.7/§6.6/§23.3/§23.4, v0.240): no address means
                 // an ACCESSOR-MEDIATED target — a property or an indexer, which
                 // has no backing slot and is reachable only through its
@@ -1095,7 +1241,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
             } else {
-                addr = lvalueAddr(*as->target, elemTy);
+                // fix #4646 (§22.16, v0.307): ask for the receiver pointer
+                // here, on the ONE `lvalueAddr` call that an `obj.P := v`
+                // auto-property store reaches. Threading the out-parameter
+                // (rather than re-lowering `ma->target` at the boundary) keeps
+                // the receiver expression evaluated exactly once — and puts
+                // the boundary check AFTER §28.2's disposed guard, which
+                // `fieldAddr` emits internally. That order is not incidental:
+                // #4651 measured it on the public-METHOD row, where a class
+                // whose `destructor` zeroes the field its own invariant reads
+                // must answer DisposedAccessException, not
+                // ContractViolationException.
+                addr = lvalueAddr(*as->target, elemTy, &invRecv4646);
                 // fix #4045 (§28.3/§28.9, v0.294): the generic lvalueAddr
                 // fallback's null-address exit was silently dropping the write
                 // with NO diagnostic of any severity, and the RHS was never
@@ -1199,8 +1356,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 // §5.1: numeric widening to the target slot (mirror the `:=`
                 // path's coerceNumericToType, issue #408 / #421 / #410).
+                // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?`
+                // via `S → T → T?` — v0.307): `??=`'s target is nullable by
+                // construction (a non-nullable target returns false at the
+                // `!isNull` check above), so `elemTy` here is always the
+                // CG-nullable tagged struct `{i8 hasValue, T}` for a nullable-
+                // VALUE target. Widening against the whole struct type is a
+                // no-op (neither an integer nor a float type), leaving `rhs`
+                // at its narrower width; the wrap block below then requires an
+                // EXACT payload-width match and silently falls through
+                // unwrapped, storing a bare narrow int over the struct's
+                // leading byte — MEASURED as `x ??= k;` (`k: int`, `x: long?`)
+                // printing `0` instead of the widened `4`. `slotPayloadTy` is
+                // the same unwrap the `:=` arm (a few hundred lines up) and
+                // the declaration-initializer path (fix #839) already use.
+                // A no-op for every non-nullable-value / already-payload-width
+                // / non-numeric `elemTy`.
                 if (elemTy)
                     rhs = coerceNumericToType(
+                        rhs, slotPayloadTy(elemTy),
+                        isUnsignedTargetExpr(*as->value));
+                // fix #5017: the lifted `S? → T?` twin of the `:=` arm below
+                // (same mechanism, same measurement: `x ??= ki;` with
+                // `ki: int? := 4`, `x: double?` printed `0`).
+                if (elemTy)
+                    rhs = liftNullableValueToSlot(
                         rhs, elemTy, isUnsignedTargetExpr(*as->value));
                 // CG-nullable: wrap a plain primitive RHS into the target's
                 // {hasValue, value} struct (or normalize a null literal).
@@ -1220,6 +1400,73 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // fix #4732 (§22.16 / §6.6, v0.307): the §22.16 AUTO-PROPERTY
+                // setter boundary for `obj.P ??= e`.
+                //
+                // §22.16 instruments "Entry and normal exit of every `public`
+                // setter — block-form, auto-property, indexer, `set(owned)`
+                // alike", and §6.6 says of this very spelling: "`??=` is not a
+                // read-modify-write: `x ??= e` assigns `e` only when `x`'s
+                // current value is null … `e` is evaluated — and THE SETTER
+                // INVOKED — only when the assignment actually occurs." So when
+                // control reaches here (inside `coaleq.do`, the LHS-was-null
+                // branch) a setter invocation is happening and both boundaries
+                // are owed. #4646 emitted them on the `:=` arm and #4682 on the
+                // compound / `++` arms; this arm returns before either, so it
+                // evaluated nothing at all.
+                //
+                // MEASURED on 6221ed38 with `--checked-contracts`, on a class
+                // with `public property P: int? := null; invariant(P = null);`:
+                // `c.P ??= 7;` gave 42 where §22.16 requires
+                // ContractViolationException (99), while the byte-identical
+                // `c.P := 7;` on the same class already gave 99. That is a
+                // SILENT UNDER-CHECK — the direction §22.16's
+                // observable-boundary property exists to prevent — and it is
+                // the ONLY write form §6.6 admits on a nullable target
+                // ("Rejected … every compound-assignment form; and `++`/`--`.
+                // Retained: … `??=`"), so for a `T?` auto-property this arm was
+                // the whole of §22.16's setter row.
+                //
+                // Both checks sit INSIDE the null branch, never on the
+                // short-circuit path: §6.6 makes a non-null LHS no setter
+                // invocation at all, so instrumenting it would be an OVER-check
+                // (and would fault on an instance a caller is legitimately
+                // mid-repair on). The ENTRY check is emitted after the RHS has
+                // been lowered and coerced — §22.16 binds arguments before any
+                // clause runs — and before the whole store sequence, so a
+                // violating entry state throws before the `+1` retain below
+                // rather than after it (a retained string that is never stored
+                // would leak).
+                //
+                // `invRecv4646` is non-null only when `lvalueAddr` resolved an
+                // `obj.f`-shaped target through `fieldAddr`; a shape whose
+                // receiver pointer never materialised (an implicit-`this`
+                // `P ??= e`, §22.16-exempt anyway) degrades to the pre-fix
+                // behaviour rather than checking over a null pointer.
+                //
+                // WHAT DOES NOT REACH HERE, AND WHAT DOES. A BLOCK-FORM,
+                // VIRTUAL or INTERFACE property is claimed above by
+                // `lowerAccessorNullCoalescingAssign` — by the virtual/
+                // interface gate for the dispatching shapes, by the `!addr`
+                // fallback for the rest — and its store routes through
+                // `lowerPropertySetValue` (#4614(b)), already instrumented.
+                // An IMPORTED AUTO-property, by contrast, DOES reach here:
+                // #2478 made it real storage in the importer's layout, so
+                // `lvalueAddr` succeeds and the accessor path is never taken.
+                // `instrumentedAutoPropertyStoreClass` then declines for it on
+                // `ctx_.isImported` (#4682), so the imported spelling keeps its
+                // pre-existing unchecked behaviour — MEASURED on a real
+                // two-module build with BOTH halves `--checked-contracts`:
+                // `c.P ??= 7` gives 42 where `c.P := 7` on the identical
+                // imported property gives 99. That divergence is #4705's, and
+                // the same measurement shows it covers `OP=` and `++` too; it
+                // is deliberately unchanged here, because closing it belongs in
+                // the exporter's checked stub (§22.16's checked face, #4651),
+                // not in this arm.
+                const sema::TypeSymbol* invCls4732 =
+                    invRecv4646 ? instrumentedAutoPropertyStoreClass(*as->target)
+                                : nullptr;
+                if (invCls4732) emitInvariantCheck(invRecv4646, invCls4732);
                 // #429 / §4.6 / §28.9: `field ??= e` stores into a (currently
                 // null) CLASS string field/auto-property only when null, so
                 // there is no old value to release — but the field still takes
@@ -1231,8 +1478,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     rhs->getType()->isPointerTy() &&
                     !isPlusOneStringProducer(as->value.get()))
                     emitStringRetain(rhs);
+                // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): the bare-`T`
+                // field at `T = string` twin — always retain (see
+                // lowerStringFieldStore); the slot is null here, so there is
+                // no old value either way.
+                else if (isTypeParamStringFieldLvalue(*as->target) &&
+                         rhs->getType()->isPointerTy())
+                    emitStringRetain(rhs);
                 builder_.CreateStore(rhs, addr);
-                builder_.CreateBr(endBB);
+                // §22.16's "throw exits check nothing": a store sequence that
+                // left the current block terminated (an unwind edge) must not
+                // have an exit check appended, and appending one to a
+                // terminated block is malformed IR besides. Mirrors #4646's
+                // `:=` exit guard and #4682's compound one.
+                if (invCls4732 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4646, invCls4732);
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
                 return false;
             }
@@ -1259,9 +1521,47 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // issue #421 / #410: thread the RHS signedness so an unsigned source
             // (`d := someUint` with `d: double`) widens via UIToFP/ZExt, not the
             // signed default — otherwise a large uint would store as negative.
+            // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?` via
+            // `S → T → T?` — v0.307): when the slot is a nullable-VALUE struct
+            // `{i8 hasValue, T}` (e.g. `long?`), the width to widen against is
+            // the PAYLOAD `T`, not the tagged struct itself — `slotPayloadTy`
+            // is the one place that unwrap already lives (used by
+            // `coerceInitializerToSlot` / `coerceExprValueToSlot` for the
+            // declaration-initializer and return/argument paths). Before this,
+            // `coerceNumericToType(rhs, elemTy, …)` was called with the WHOLE
+            // struct type as the target — neither an integer nor a float type,
+            // so every one of its §5.1 arms declined and `rhs` reached the
+            // CG-nullable wrap block below still at its narrower width (e.g. a
+            // bare `i32` against a `long?` slot's `i64` payload). The wrap
+            // block's `rhs->getType() == st->getElementType(1)` check then
+            // failed too, so the store fell through UNWRAPPED: a bare `i32`
+            // stored at the struct's address overwrites only the leading
+            // `hasValue` byte (plus padding), leaving the `i64` payload bytes
+            // at their prior value (0 for a freshly-`null`-initialized local)
+            // — MEASURED as `x := k;` (`k: int`, `x: long?`) printing `0`
+            // instead of the widened `4`. The declaration-initializer form
+            // (`var w: long? := k;`) was already correct — fix #839 widens
+            // against the payload there — this mirrors that fix for
+            // REASSIGNMENT. A no-op for every non-nullable / already-payload-
+            // width / non-numeric `elemTy`, since `slotPayloadTy` returns
+            // `elemTy` unchanged unless it IS the tagged struct shape.
             if (elemTy)
-                rhs = coerceNumericToType(rhs, elemTy,
+                rhs = coerceNumericToType(rhs, slotPayloadTy(elemTy),
                                           isUnsignedTargetExpr(*as->value));
+            // fix #5017 (§5.1 "Nullable conversions", v0.307: "`S?`
+            // implicitly converts to `T?` whenever `S` implicitly converts to
+            // `T` — a present value converts by the underlying conversion,
+            // `null` converts to `null`"): a NULLABLE-VALUE RHS of a narrower
+            // payload (`x := ki;` with `ki: int?`, `x: double?`) lowers to the
+            // `{i8, i32}` struct. The #5005 widening above is a no-op on a
+            // struct, and the wrap block below matches only a bare payload,
+            // so the `{i8, i32}` was stored over the `{i8, double}` slot —
+            // MEASURED printing `lift 0` instead of `lift 4`. Convert the
+            // payload and KEEP the source's hasValue (null stays null), the
+            // same shape the declaration-initializer path uses (#840).
+            if (elemTy)
+                rhs = liftNullableValueToSlot(
+                    rhs, elemTy, isUnsignedTargetExpr(*as->value));
             // CG-nullable: if target slot is a nullable-prim struct and
             // rhs is a plain primitive, wrap it (or fix null literal).
             if (elemTy && llvm::isa<llvm::StructType>(elemTy)) {
@@ -1281,6 +1581,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (as->op == ":=") {
+                // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+                // ENTRY boundary. Emitted here — after the RHS has been lowered
+                // and coerced ("after argument binding") and before ANY part of
+                // the store sequence below runs — so the instance is observed
+                // in exactly the state the caller handed over, mirroring
+                // `lowerPropertySetValue`'s entry check (#4614(b)) and
+                // `emitFunctionBody`'s public-method entry check.
+                //
+                // `invRecv4646` is non-null only when `lvalueAddr` resolved an
+                // `obj.f`-shaped target through `fieldAddr` (a class receiver);
+                // a shape whose receiver pointer never materialized degrades to
+                // the pre-fix behaviour rather than checking over a null
+                // pointer.
+                invCls4646 = invRecv4646
+                    ? instrumentedAutoPropertyStoreClass(*as->target)
+                    : nullptr;
+                if (invCls4646) emitInvariantCheck(invRecv4646, invCls4646);
                 // §28.7 / §15.3 (#1385): whole-value reassignment of a move-only
                 // OWNING inline-array local or field (`[N owned]T` / `[N owned]T?`)
                 // disposes each non-null slot of the displaced value in reverse
@@ -1425,6 +1742,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     handled = lowerClosureLocalReassign(*as->target, addr,
                                                         elemTy, rhs,
                                                         as->value.get());
+                // fix #4227: captured-cell twin of lowerClosureLocalReassign above.
+                // A captured closure-typed local (its cell slot is in cellVars_)
+                // reassigned from INSIDE the capturing lambda body reaches here with
+                // addr = the heap cell address (from boxedStorage in lvalueAddr),
+                // but lowerClosureLocalReassign's own currentFn_ ==
+                // closureReleaseEligibleFn_ gate is false (the analyzed function is
+                // the outer scope, not this lambda body), so it returns false and
+                // the store falls through to a plain store with no release — the
+                // displaced closure value leaks. The new helper handles this
+                // captured-cell path unconditionally (mirrors lowerClosureFieldStore
+                // / lowerClosureLocalReassign's retain-before-release ordering).
+                // No null guard on slot in cellVars_ needed: the capture check
+                // itself proves the cell exists.
+                if (!handled) {
+                    if (llvm::AllocaInst* slot = localSlot(*as->target)) {
+                        if (cellVars_.count(slot)) {
+                            const sema::TypeRef* tt = ctx_.exprType(*as->target);
+                            if (tt && tt->kind == sema::TypeRef::Kind::Function &&
+                                !tt->nullable) {
+                                handled = lowerCapturedClosureLocalReassign(
+                                    *as->target, addr, elemTy, rhs,
+                                    as->value.get());
+                            }
+                        }
+                    }
+                }
                 // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
                 // a CLASS Object/interface field whose every store (per the
                 // collectBoxStorageFields pre-pass) uses a boxable value source
@@ -1597,12 +1940,43 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (!as->lhsMovedFromAtStore)
                         disposeDisplacedOwnedClassLocal(as->target.get(), addr,
                                                         elemTy, rhs);
+                    // fix #4552 / §35.4 *Drop-on-overwrite is defined and
+                    // automatic* + §35.9 (v0.306): the owning-CHOICE sibling of
+                    // the class drop above. "Whole-value reassignment of an
+                    // owning-choice local or field disposes the displaced value
+                    // per §28.7"; `o := null` on an owned-state `C?` location
+                    // does the same. A choice is a VALUE type, so the class
+                    // helper's `unwindOwnedLocalClass` gate declines it and no
+                    // other path ever saw the displaced value — the scope-end
+                    // active-case pass only sees whatever the slot holds LAST.
+                    // Same §28.7 moved-from suppression as the class sibling,
+                    // and the same position in the sequence (RHS already
+                    // lowered into `rhs`; the store is emitted below).
+                    if (!as->lhsMovedFromAtStore)
+                        disposeDisplacedOwningChoiceLocal(as->target.get(), addr,
+                                                          as->value.get());
                     // #914: a narrowed value-nullable RHS (sema proved non-null)
                     // assigned to a non-nullable target — unwrap the {flag,value}
                     // struct to its value. No-op for a nullable target (elemTy is
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    // fix #4566 / §15.3 *Local-to-local assignment* + §28.7
+                    // *Moved-from and null* (v0.306): the MOVE half of the
+                    // drop-on-overwrite pass above. An owning choice is a
+                    // move-only value type, so `c := b;` TRANSFERS — "After
+                    // the move, `x` is in moved-from state" — and §15.3's
+                    // *Local lifetime* bullet says the source then "holds no
+                    // value", so "no pass walks it". Codegen only ever
+                    // plain-stored the struct, leaving BOTH slots holding the
+                    // same owned payload pointer for BOTH scope-end
+                    // active-case passes to dispatch `Dispose` through (a
+                    // measured SIGSEGV / ASan heap-use-after-free). Emitted
+                    // AFTER the store, so the value the store read out of the
+                    // source slot is already in the target's.
+                    // // per §15.3, §28.7, v0.306, #4566
+                    markOwningChoiceLocalMovedFrom(as->target.get(),
+                                                   as->value.get());
                     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): the
                     // path-sensitive walker change in `collectBorrowingArray
                     // FreeEligible` (LlvmBackend_Setup.cpp ~24423 / ~28134)
@@ -1697,6 +2071,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             ctx_.exprSymbol(*as->value))
                         nullTransferredOwnedLocalSlot(as->value.get());
                 }
+                // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
+                // NORMAL-EXIT boundary. This is the end of the whole `:=` store
+                // sequence, so the instance is observed in the state the store
+                // left it — the auto-property analogue of `lowerPropertySetValue`'s
+                // `accEndBB` check (#4614(b)) and of the public-method
+                // `finalizeEnsuresEpilogue` check.
+                //
+                // The terminator guard is §22.16's "throw exits check nothing":
+                // a store path that left the current block terminated (an
+                // unwind edge) must not have an exit check appended to it, and
+                // appending one to a terminated block is malformed IR besides.
+                if (invCls4646 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4646, invCls4646);
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`
                 // whose underlying binary operator resolves to a user-defined
@@ -1776,6 +2163,57 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // arrives already correctly shaped for `emitCompoundOp`'s
                 // existing line-370 nullable-VALUE-LEFT-OPERAND arm).
                 rhs = unwrapNarrowedNullableOperand(rhs, as->value.get());
+                // fix #4682 (§22.16 / §6.6, v0.307): the §22.16 AUTO-PROPERTY
+                // setter boundaries for a COMPOUND store `obj.P OP= v`.
+                //
+                // §6.6 makes `x op= e` a read-modify-write "equivalent to
+                // `x := x op e`", so the store half is a setter invocation and
+                // sits on the same §22.16 boundary #4646 instrumented for the
+                // plain `:=`: "Entry and normal exit of every `public` setter
+                // — block-form, auto-property, indexer, `set(owned)` alike."
+                // The READ half is a getter, which §22.16 exempts by name.
+                // MEASURED on this HEAD before this fix, with
+                // `--checked-contracts`, on the issue's own repro
+                // (`invariant(P > 0);`, `c.P -= 4;` from P == 1): 42, where
+                // §22.16 requires ContractViolationException (99) — the same
+                // SILENT UNDER-CHECK #4646 closed one arm over.
+                //
+                // `invRecv4646` is the receiver `lvalueAddr` already lowered
+                // for the field store (the shared preamble threads the
+                // out-parameter for BOTH the `:=` and the compound arm), so
+                // the receiver expression of an `f().P -= 1` is evaluated
+                // exactly ONCE — the specific hazard a read-modify-write adds
+                // over a plain store, and pinned by its own row.
+                //
+                // WHY TWO LAMBDAS AND NOT ONE HOISTED PAIR. This arm has FOUR
+                // store paths — the §25.1/§25.2 user-operator desugaring, the
+                // §4.6 string concat, the §6.4 decimal helper, and the CG31
+                // built-in numeric one — each with its own `return false`, and
+                // an auto-property can be typed to reach any of them. The
+                // ENTRY check belongs after the operand is computed, not
+                // before: §22.16's evaluation table binds arguments before any
+                // clause runs, §6.6's desugared argument IS `x op e`, and
+                // #4646 placed the `:=` entry check after the RHS is lowered
+                // and coerced for exactly that reason. So the pair cannot be
+                // hoisted out of the four paths without changing which
+                // exception a compound assignment that BOTH overflows and
+                // violates the invariant raises (§6.1's overflow must win, as
+                // it does pre-fix).
+                const sema::TypeSymbol* invCls4682 =
+                    invRecv4646 ? instrumentedAutoPropertyStoreClass(*as->target)
+                                : nullptr;
+                auto invEntry4682 = [&] {
+                    if (invCls4682) emitInvariantCheck(invRecv4646, invCls4682);
+                };
+                // The terminator guard is §22.16's "throw exits check
+                // nothing": a store path that left the current block
+                // terminated (an unwind edge) must not have an exit check
+                // appended to it, and appending one to a terminated block is
+                // malformed IR besides. Mirrors #4646's `:=` exit guard.
+                auto invExit4682 = [&] {
+                    if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                        emitInvariantCheck(invRecv4646, invCls4682);
+                };
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
                 sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
@@ -1813,6 +2251,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // Borrow / value / ref / static / record / indexer
                         // targets keep the plain store (no drop-on-overwrite
                         // entry — no double-free).
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         if (!lowerOwnedClassFieldStore(*as->target, addr, res)) {
                             // fix #3950 — ⚠ STILL UNREACHABLE, for a DIFFERENT
                             // reason since fix #3969; kept deliberately.
@@ -1862,6 +2301,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // null for a non-local).
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                     return false;
                 }
@@ -1916,11 +2356,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                        !tgtTy->nullable &&
                                        currentFn_ == stringReleaseEligibleFn_;
                         bool isField = isStringFieldLvalue(*as->target);
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (isLocal || isField)
                             emitStringRelease(curS);  // release the old value
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                         return false;
                     }
                 }
@@ -1948,9 +2390,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                               isUnsignedTargetExpr(*as->value));
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     if (llvm::Value* res = emitDecimalArith(op, cur, rhs)) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                     return false;
                 }
@@ -1980,21 +2424,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
                     isUnsignedTargetExpr(*as->value));  // §6.2/§6.6 #2140 rUns
                 if (res) {
+                    invEntry4682();  // §22.16 setter ENTRY (#4682)
                     builder_.CreateStore(res, addr);
                     // §27.5 / #673: sync back to original alloca.
                     if (llvm::AllocaInst* ns = localSlot(*as->target))
                         syncCellToOrigSlot(ns, res);
+                    invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                 }
             }
         }
         return false;
     }
     // CG31: `x++` / `x--` — overflow-checked increment/decrement.
-    // §17.6 / §25: when the target's type is a user-defined record or class
-    // that declares `static method operator ++` (resp. `--`), dispatch to that
-    // operator method and write the result back:
-    //   x++ ≡ x := T.operator++(x)   (per §17.6).
-    // For built-in numeric operands keep the existing x := x + 1 path.
+    // §17.6 / §25.1 (v0.295, #3978): `++`/`--` are NOT user-overloadable. The
+    // only operands this arm ever sees are the built-in numeric primitives of
+    // §6.6's compound form (integer, floating-point, `decimal`, `char`) and
+    // the §17.6 indexer-slot desugaring (`a[i]++`); all class/record/enum/
+    // choice operands are rejected up front by the IncrementStmt handler in
+    // ExprTypecheck.cpp (see #2585/#2599/#3978/#4107/#4108). The pre-#3978
+    // operator-method scan (`opMethod`) and the dispatch arm gated on it are
+    // therefore unreachable from any program that passes sema — retired here
+    // per #4109. For built-in numeric operands keep the x := x ± 1 path.
     //
     // fix #587 / §17.6: `++`/`--` on a computed property or user-defined indexer
     // slot must call the setter to write the incremented value back.
@@ -2016,23 +2466,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     //       reads from.
     if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (inc->target) {
-            // §25: look for a user-defined operator on the target's Named type.
-            const std::string_view opTok = inc->op; // "++" or "--"
-            sema::MethodSymbol* opMethod = nullptr;
-            if (const sema::TypeRef* targetTy = ctx_.exprType(*inc->target)) {
-                if (targetTy->kind == sema::TypeRef::Kind::Named &&
-                    targetTy->declaration) {
-                    for (sema::Symbol* m : targetTy->declaration->members) {
-                        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                        if (ms && ms->isOperator &&
-                            ms->operatorToken == opTok &&
-                            ms->params.size() == 1) {
-                            opMethod = ms;
-                            break;
-                        }
-                    }
-                }
-            }
             // fix #2858 (§17.6/§12.1/§11.2, v0.240): a VIRTUAL / OVERRIDE /
             // ABSTRACT / INTERFACE property increments through its vtable or
             // itable, exactly as `P := v` and `P OP= v` already do (this
@@ -2042,98 +2475,52 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // so the direct store below would land in the base's field while
             // every read goes through the dispatched getter to the override's —
             // MEASURED as a silently dropped write (0 where 1 is correct).
-            // Gated on `!opMethod` per §17.6, verbatim: "For a value-type
-            // operand whose type T overloads `operator ++`, the statement `x++`
-            // is equivalent to `x := T.operator++(x)`" — that shape keeps the
-            // operator path below, unchanged.
-            if (!opMethod && lowerVirtualPropertyIncrDecr(*inc)) return false;
+            if (lowerVirtualPropertyIncrDecr(*inc)) return false;
             llvm::Type* elemTy = nullptr;
-            llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
+            // fix #4682 (§22.16 / §17.6, v0.307): the §22.16 AUTO-PROPERTY
+            // setter boundaries for `obj.P++` / `obj.P--`.
+            //
+            // §17.6 does not merely liken the increment to the compound form,
+            // it DEFINES it as one: "`expr[i]++` desugars to a
+            // read-modify-write", and for the named-property spelling `x++` is
+            // "`x := x + 1`" (this file's own #4109 note). The store half is
+            // therefore a setter invocation on §22.16's boundary — "Entry and
+            // normal exit of every `public` setter — block-form,
+            // auto-property, indexer, `set(owned)` alike" — and the read half
+            // is a getter, which §22.16 exempts by name. MEASURED on this HEAD
+            // before this fix, with `--checked-contracts`, on the issue's own
+            // repro (`invariant(P < 10);`, `c.P++` from P == 9): 42, where
+            // §22.16 requires ContractViolationException (99).
+            //
+            // The receiver out-parameter is threaded for the same reason
+            // #4646 threaded it on the `:=` arm: `fieldAddr` lowers
+            // `ma->target` exactly once and hands back that pointer, so
+            // `f().P++` evaluates its receiver ONCE and the boundary check
+            // lands AFTER §28.2's disposed guard (which `fieldAddr` emits
+            // internally), keeping DisposedAccessException ahead of
+            // ContractViolationException on a disposed instance.
+            llvm::Value* invRecv4682 = nullptr;
+            llvm::Value* addr = lvalueAddr(*inc->target, elemTy, &invRecv4682);
+            // Resolved only when `lvalueAddr` produced a receiver pointer; a
+            // shape whose receiver never materialised (an implicit-`this`
+            // `P++`, which reaches `implicitFieldAddr` and is §22.16-exempt
+            // anyway) degrades to the pre-fix behaviour rather than checking
+            // over a null pointer.
+            const sema::TypeSymbol* invCls4682 =
+                (addr && invRecv4682)
+                    ? instrumentedAutoPropertyStoreClass(*inc->target)
+                    : nullptr;
+            auto invEntry4682 = [&] {
+                if (invCls4682) emitInvariantCheck(invRecv4682, invCls4682);
+            };
+            // §22.16's "throw exits check nothing" — see the compound arm's
+            // twin for the full note.
+            auto invExit4682 = [&] {
+                if (invCls4682 && !builder_.GetInsertBlock()->getTerminator())
+                    emitInvariantCheck(invRecv4682, invCls4682);
+            };
             if (addr) {
-                if (opMethod) {
-                    // §17.6 / §25: dispatch to user-defined operator ++/--.
-                    // Load the current value (struct by value, class as pointer),
-                    // call the operator method, store the result back.
-                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                    std::vector<llvm::Value*> args{cur};
-                    // #1219 (per #1059 / §25.2 / §14 / §9.5): operator ++/-- on a
-                    // GENERIC record is a static method whose parameter and return
-                    // types reference the declaring type's type parameter T.  Set
-                    // up the per-instantiation substitution from the target's
-                    // concrete generic args (e.g. Box<string> → T=string) so
-                    // emitMethodCall specializes the operator, emitting/calling the
-                    // specialized form whose param type matches the already-
-                    // specialized struct (record.Box$spec0).  Without this the
-                    // unspecialized bz$Box$op$++ (param type record.Box) is called
-                    // with a record.Box$spec0 argument → LLVM IR verifier:
-                    // "Call parameter type does not match function signature".
-                    auto savedOpSubst = genericSubst_;
-                    auto savedOpSema  = genericSubstSemaTy_;
-                    if (const sema::TypeRef* tgtTy =
-                            ctx_.exprType(*inc->target)) {
-                        if (tgtTy->kind == sema::TypeRef::Kind::Named &&
-                            tgtTy->declaration == opMethod->parent &&
-                            !tgtTy->genericArgs.empty()) {
-                            // fix #3143 (§14.1 / §2.5, v0.254): parameter names
-                            // through the one both-sources walk — an IMPORTED
-                            // generic record's `operator ++` was called
-                            // unspecialized with a specialized operand.
-                            const std::vector<std::string_view> gpNames =
-                                sema::genericParamNames(tgtTy->declaration);
-                            if (!gpNames.empty() &&
-                                gpNames.size() == tgtTy->genericArgs.size()) {
-                                std::unordered_map<std::string_view,
-                                                   llvm::Type*> ns;
-                                std::unordered_map<std::string_view,
-                                    const sema::TypeRef*> nsem;
-                                for (std::size_t gi = 0;
-                                     gi < gpNames.size(); ++gi) {
-                                    ns[gpNames[gi]] =
-                                        lowerTypeRef(tgtTy->genericArgs[gi]);
-                                    nsem[gpNames[gi]] =
-                                        resolveTypeParamRef(
-                                            tgtTy->genericArgs[gi]);
-                                }
-                                genericSubst_       = std::move(ns);
-                                genericSubstSemaTy_ = std::move(nsem);
-                            }
-                        }
-                    }
-                    llvm::Value* res =
-                        emitMethodCall(opMethod, args, /*baseQualified=*/false);
-                    genericSubst_       = std::move(savedOpSubst);
-                    genericSubstSemaTy_ = std::move(savedOpSema);
-                    if (res) {
-                        // §28.7 / §17.6 (#1702): `c++` ≡ `c := T.operator++(c)` —
-                        // the store must drop-on-overwrite (dispose the displaced
-                        // value). For an owned class/interface FIELD, route through
-                        // lowerOwnedClassFieldStore — the field analog of the local
-                        // disposal below — which self-contains load-old /
-                        // null+identity-guard / dispose-old / store-new (§17.6: the
-                        // operator result is produced first, then the displaced
-                        // previous value is disposed implicitly, then the new value
-                        // is stored). Without this the displaced field value leaked
-                        // (the plain path stored only via the local branch, which is
-                        // a no-op for a field). Returns false for non-owned-field
-                        // targets (locals, ref params, static/record/borrow fields),
-                        // which fall through to the LOCAL path below. Mirrors the
-                        // plain-assignment path's lowerOwnedClassFieldStore call.
-                        if (!lowerOwnedClassFieldStore(*inc->target, addr, res)) {
-                            // §28.7 (#913): reassigning an owned class LOCAL disposes
-                            // the displaced old value first (the operator already
-                            // borrowed `cur` above, so it is safe to dispose now,
-                            // before the store). No-op for a borrow local/param (no
-                            // disposal entry → no double-free).
-                            disposeDisplacedOwnedClassLocal(inc->target.get(), addr,
-                                                            elemTy, res);
-                            builder_.CreateStore(res, addr);
-                        }
-                        // §27.5 / #673: sync to original alloca (a no-op for a field
-                        // target — localSlot returns null for a non-local).
-                        if (llvm::AllocaInst* ns = localSlot(*inc->target))
-                            syncCellToOrigSlot(ns, res);
-                    }
-                } else if (elemTy == decimalStructType()) {
+                if (elemTy == decimalStructType()) {
                     // §6.4 (sweep #6): decimal `d++` / `d--`. decimal is a
                     // Kind::Primitive struct; the integer path below would build
                     // ConstantInt of a struct type and feed it to an integer
@@ -2142,9 +2529,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     if (llvm::Value* res = emitDecimalArith(
                             inc->op == "++" ? "+" : "-", cur, emitDecimalOne())) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                 } else {
                     // Built-in numeric increment/decrement.
@@ -2164,10 +2553,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         isCharTargetExpr(*inc->target))  // §6.6/§5.2 #1961
                         : nullptr;
                     if (res) {
+                        invEntry4682();  // §22.16 setter ENTRY (#4682)
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
+                        invExit4682();  // §22.16 setter NORMAL EXIT (#4682)
                     }
                 }
             } else {
@@ -2545,8 +2936,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // lowerLocalDecl so that whoever does extend it changes ONE predicate,
         // not a fifth copy of it — #2924's four-way-mirror finding about this
         // very diagnostic.
+        // fix #4665 (§14.2 *Constraints* + §4.7 / §17.11, v0.307): resolve the
+        // returned expression's type through the ACTIVE monomorphization before
+        // the unit test. A bare type parameter substituted at `()` arrives here
+        // as a `Named T` with no declaration — its `kind` is `Named`, NOT
+        // `Unit` — so exemption (a) below missed it and a *correct* unit return
+        // inside a specialized generic body drew the #2491 "failed to lower"
+        // internal warning. Measured on 572f5fc5 + the `default(())` fix, for
+        // the issue's `class Factory<T> … Make(): T return default(T);` at
+        // `Factory<()>`: `Factory$Make$spec` emits a correct `ret void` and the
+        // program runs, while the compile prints an internal note about it.
+        // `resolveTypeParamRef` is the predicate the repo already settled for
+        // exactly this shape — `buildOrderedArgs`' #3137 unit-argument rescue
+        // resolves a `Named T`→`()` formal through it before its own
+        // `Kind::Unit` test — so this is that one predicate, not a second
+        // spelling of it. It is a no-op outside a specialization
+        // (`genericSubstSemaTy_` empty) and for every non-type-parameter ref.
         const sema::TypeRef* retValTy =
-            rs->value ? ctx_.exprType(*rs->value) : nullptr;
+            rs->value ? resolveTypeParamRef(ctx_.exprType(*rs->value))
+                      : nullptr;
         const bool unitReturnValue =
             retValTy && retValTy->kind == sema::TypeRef::Kind::Unit;
         std::string retMember, retAppliedMember;
@@ -3155,10 +3563,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before
         // `ret`, giving the caller a dangling pointer.
+        //
+        // fix #4955 (§17.8, §28.3, v0.307): `return y!;` is the same transfer.
+        // §17.8: "if `x` has ownership state owned …, `x!` is owned" — the
+        // null-forgiving operator neither moves nor copies, so `y!` IS `y` and
+        // the returned local must be excluded from its scope-end auto-drop
+        // exactly as a bare `return y;` is. Before this the `!` hid the
+        // identifier, `y` was auto-dropped before `ret`, and the caller read
+        // (and disposed) the freed object — a heap-use-after-free. Peel only
+        // postfix `!` layers (never `as`, whose result is a borrow, §17.4).
         llvm::AllocaInst* retSlot = nullptr;
+        const ast::Expr* retCore = rs->value.get();
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(retCore)) {
+            if (!pb->operand) break;
+            retCore = pb->operand.get();
+        }
         if (rs->value) {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(rs->value.get())) {
-                sema::Symbol* sym = ctx_.exprSymbol(*rs->value);
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(retCore)) {
+                sema::Symbol* sym = ctx_.exprSymbol(*id);
                 if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     auto lit = locals_.find(loc->decl);
                     if (lit != locals_.end()) retSlot = lit->second;
@@ -3179,8 +3601,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // `using var` (class dispose etc.) are excluded here; the
                             // runtime-managed cell free is preserved, or the cell
                             // leaks (the #1418 4-byte leak on `return count`).
+                            // fix #4509: `cellRelease` is preserved beside
+                            // them and for the same reason — returning the
+                            // local yields a COPY of the cell's contents, not
+                            // the frame's counted reference to the cell, which
+                            // still has to be dropped here.
                             return e.slot == retSlot &&
-                                   !e.boxedCellFree && !e.boxedCellFreeDeferred;
+                                   !e.boxedCellFree &&
+                                   !e.boxedCellFreeDeferred && !e.cellRelease;
                         }),
                     scope.end());
             }
@@ -4506,9 +4934,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // reference — the same use-after-free trade
                         // `inlineOwnedArrayCell` is in the list to avoid. The
                         // residue is the pre-existing §27.5 leak, unchanged.
+                        // fix #4509 (§27.5 / §28.9, v0.306): `cellRelease`
+                        // joins the list for the same reason as its
+                        // neighbours — it drops a COUNTED reference held by
+                        // the declaring frame, and the scope exit already
+                        // dropped it. Replaying it on the abandonment /
+                        // Dispose edge would be a second drop of one
+                        // reference: an over-release, and with an env still
+                        // holding the cell, a use-after-free.
                         if (d.closureRelease || d.boxedCellFree ||
                             d.boxedCellFreeDeferred || d.inlineOwnedArrayCell ||
-                            d.capturedCellContentRelease)
+                            d.capturedCellContentRelease || d.cellRelease)
                             continue;
                         if (d.iterEnumDispose) {
                             auto* alloca =
@@ -7269,26 +7705,24 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
 
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* keysFn = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-    builder_.CreateCall(keysFn, {dictObj, keysOutSlot, lensOutSlot, cntSlot});
+                            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(keysFn, {dictObj, keysOutSlot, lensOutSlot, widsOutSlot,
+                                 cntSlot});
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // char**
     llvm::Value* lensArr = builder_.CreateLoad(ptrTy(), lensOutSlot);  // i64*
+    llvm::Value* widsArr = builder_.CreateLoad(ptrTy(), widsOutSlot);  // i8*
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
-    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
     auto* freeFn   = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-    uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
 
     auto* idxSlot = entryAlloca(i64());
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
     auto* varSlot = entryAlloca(ptrTy());  // loop var is a string-object pointer
     locals_[&fs] = varSlot;
     registerForLoopSpillSlots(fs, {dkEpochSlot, keysOutSlot, lensOutSlot,
-                                   cntSlot, idxSlot, varSlot});
+                                   widsOutSlot, cntSlot, idxSlot, varSlot});
     // #1058 / §28/§4.8: initialise to null so the endBB break-path release is
     // null-safe when the loop body is never entered (cnt == 0).
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
@@ -7312,22 +7746,14 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
 
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-    llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
-    llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);     // char*
-    llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-    llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);       // i64 len
-    llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-    llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-    llvm::Value* strObj = builder_.CreateCall(callocFn,
-        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-    builder_.CreateStore(dataCpy, builder_.CreateStructGEP(stringType(), strObj, 0));
-    builder_.CreateStore(kl, builder_.CreateStructGEP(stringType(), strObj, 1));
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-        builder_.CreateStructGEP(stringType(), strObj, 2));
-    initStringRc(strObj);  // #422: producer's reference, rc := 1
+    // fix #4499: this loop carried its own copy of the raw-bytes → bz_string
+    // decode, hard-coding width 1 and copying `lens[i]` BYTES (a code-point
+    // count read as a byte count). Route it through the one shared decoder so
+    // the §4.6 width rule is stated in exactly one place. Ownership is
+    // unchanged: a fresh +1 string per iteration, released in incBB/endBB, and
+    // the snapshot's own blob still freed by incBB below.
+    llvm::Value* strObj =
+        decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB).first;
     builder_.CreateStore(strObj, varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
@@ -7361,6 +7787,7 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     }
     builder_.CreateCall(freeFn, {keysArr});
     builder_.CreateCall(freeFn, {lensArr});
+    builder_.CreateCall(freeFn, {widsArr});   // fix #4499: third snapshot spine
     return true;
 }
 
@@ -7516,8 +7943,8 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
 // See the declarations in LlvmBackend_impl.hpp for the full rationale;
 // snapshotting, sorting and freeing stay copy-specific at each call site.
 std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
-        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx) {
-    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* widthsArr,
+        llvm::Value* idx) {
     auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
     auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
@@ -7526,18 +7953,31 @@ std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
     llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
     llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idx);
     llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-    llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-    llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+    // fix #4499 (spec §4.6, v0.306): the snapshot's third parallel spine is the
+    // key's storage WIDTH. Pre-fix this decode hard-coded width 1 and copied
+    // `kl` BYTES — i.e. it read a code-point count as a byte count, the same
+    // confusion the storage layer had, so every width>1 key came back as a
+    // truncated, mis-widthed string. The byte size is `len * width`, and the
+    // rebuilt string carries the source key's own width so `=` against a
+    // literal (emitStringEquals' equal-width memcmp path) still answers §4.6's
+    // code-point-sequence question.
+    llvm::Value* wpPtr = builder_.CreateGEP(i8Ty, widthsArr, idx);
+    llvm::Value* kwB   = builder_.CreateLoad(i8Ty, wpPtr, "dk.width");
+    llvm::Value* kw64  = builder_.CreateZExt(kwB, i64(), "dk.w64");
+    llvm::Value* kbytes = builder_.CreateMul(kl, kw64, "dk.bytes");
+    // One extra width-sized zero slot, matching how bz_string data buffers are
+    // terminated (and what bz_key_dup writes on the runtime side).
+    llvm::Value* dataSz  = builder_.CreateAdd(kbytes, kw64);
+    llvm::Value* dataCpy = builder_.CreateCall(callocFn,
+        {dataSz, builder_.getInt64(1)});
+    builder_.CreateCall(memcpyFn, {dataCpy, kp, kbytes});
     llvm::Value* strObj = builder_.CreateCall(callocFn,
         {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
     builder_.CreateStore(dataCpy,
         builder_.CreateStructGEP(stringType(), strObj, 0));
     builder_.CreateStore(kl,
         builder_.CreateStructGEP(stringType(), strObj, 1));
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+    builder_.CreateStore(kwB,
         builder_.CreateStructGEP(stringType(), strObj, 2));
     initStringRc(strObj);
     return {strObj, kp};
@@ -7655,6 +8095,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // --- key snapshot ---
     auto* keysOutSlot = entryAlloca(ptrTy()); // char** (string) or void** (gen)
     auto* lensOutSlot = entryAlloca(ptrTy()); // i64*   (string only; unused gen)
+    auto* widsOutSlot = entryAlloca(ptrTy()); // i8*    (string only; fix #4499)
     auto* cntSlot     = entryAlloca(i64());
 
     // --- value snapshot ---
@@ -7675,9 +8116,9 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     } else {
         // String-key dict: bz_dict_keys_str + bz_dict_values_str
         auto* kfn = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
-                             {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn,
-                            {dictObj, keysOutSlot, lensOutSlot, cntSlot});
+                             {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dictObj, keysOutSlot, lensOutSlot,
+                                  widsOutSlot, cntSlot});
         auto* vfn = declareC("bz_dict_values_str", llvm::Type::getVoidTy(llvm_),
                              {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(vfn, {dictObj, valsOutSlot, entryAlloca(i64())});
@@ -7685,6 +8126,9 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -7709,12 +8153,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
             // String-key: sort keys (char**), lens (i64*), and values together.
             auto* sortKvStrFn = declareC("bz_sort_kv_str",
                 llvm::Type::getVoidTy(llvm_),
-                {ptrTy(), ptrTy(), ptrTy(), i64()});
+                {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
             llvm::Value* lensForSort = lensArr
                 ? lensArr
                 : llvm::ConstantPointerNull::get(ptrTy());
+            // fix #4499: the width spine is permuted with the others.
+            llvm::Value* widsForSort = widsArr
+                ? widsArr
+                : llvm::ConstantPointerNull::get(ptrTy());
             builder_.CreateCall(sortKvStrFn,
-                {keysArr, lensForSort, valsArr, cnt});
+                {keysArr, lensForSort, widsForSort, valsArr, cnt});
         }
     }
 
@@ -7765,7 +8213,8 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         // in LlvmBackend_impl.hpp) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            keyDecoded = decodeDictStringKeyAt(keysArr, lensArr, idxB).first;
+            keyDecoded =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB).first;
         } else if (useGen) {
             // bz_dict_keys_gen returns void** where each element is a malloc'd
             // copy of the key's raw bytes (NOT inttoptr-encoded — the raw bytes
@@ -7853,6 +8302,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         d.dictEntryForSnapshot = true;
         d.dictEntryForKeysOutSlot = keysOutSlot;
         d.dictEntryForLensOutSlot = isStringKey ? lensOutSlot : nullptr;
+        d.dictEntryForWidsOutSlot = isStringKey ? widsOutSlot : nullptr;  // #4499
         d.dictEntryForValsOutSlot = valsOutSlot;
         d.dictEntryForCntSlot = cntSlot;
         d.dictEntryForIdxSlot = idxSlot;
@@ -7955,8 +8405,10 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         builder_.SetInsertPoint(clEndBB);
     }
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey)
+    if (isStringKey) {
         builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
     // fix #4129: the manual frees just above did EXACTLY what the
     // dictEntryForSnapshot scope pushed before loopStack_ would do — pop it
@@ -8440,6 +8892,8 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     // Alloca for temp key/val outputs from the runtime pop function.
     auto* keyOutSlot = entryAlloca(ptrTy());   // char** (str) or void** (gen)
     auto* keyLenSlot = entryAlloca(i64());     // int64_t (str key_len only)
+    // fix #4499: the popped key's §4.6 storage width (string mode only).
+    auto* keyWidSlot = entryAlloca(llvm::Type::getInt8Ty(llvm_));
     auto* valOutSlot = entryAlloca(ptrTy());   // void** for value
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "dd.cond", currentFn_);
@@ -8459,9 +8913,11 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
         //                        char** key_out, int64_t* key_len_out,
         //                        void** val_out) → bool
         auto* drainFn = declareC("bz_dict_drain_next_str", i1(),
-                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy(),
+                                  ptrTy()});
         popped = builder_.CreateCall(drainFn,
-            {dictObj, cursorSlot, keyOutSlot, keyLenSlot, valOutSlot},
+            {dictObj, cursorSlot, keyOutSlot, keyLenSlot, keyWidSlot,
+             valOutSlot},
             "dd.popped");
     } else {
         // bz_dict_drain_next_gen(dict, int64_t* cursor,
@@ -8489,19 +8945,21 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
             // rawKeyPtr is a malloc'd char* (the key bytes; null-terminated).
             // Build a bz_string_t object from it — same pattern as
             // lowerDictEntryFor's string-key decode.
-            auto* mallocFn  = declareC("malloc", ptrTy(), {i64()});
             auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
             auto* i8Ty      = llvm::Type::getInt8Ty(llvm_);
             uint64_t strSz  = module_->getDataLayout().getTypeAllocSize(stringType());
-            // rawKeyPtr is char*; key_len_out holds the byte length.
+            // rawKeyPtr is char*; key_len_out holds the CODE-POINT count and
+            // key_w_out the storage width (fix #4499). The comment here used to
+            // read "the byte length" — that was the #4499 defect stated in a
+            // comment: the buffer is `len * width` bytes.
             llvm::Value* kl = builder_.CreateLoad(i64(), keyLenSlot);
-            // Allocate and null-terminate the data buffer.
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            // The char* from bz_dict_drain_next_str is already a malloc'd copy;
-            // use it directly as the string data buffer (no extra malloc+memcpy).
-            // Null-terminate: write '\0' at offset kl.
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, rawKeyPtr, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* kw = builder_.CreateLoad(i8Ty, keyWidSlot, "dd.kw");
+            // The char* from bz_dict_drain_next_str is already a malloc'd copy
+            // (bz_key_dup, which allocates `len * width` bytes PLUS a
+            // width-sized zero terminator); use it directly as the string data
+            // buffer. Pre-fix this site wrote a NUL at byte offset `kl` into
+            // that buffer, which strndup had sized to strnlen(key)+1 — past
+            // the allocation whenever the key held an embedded U+0000.
             // Allocate the bz_string_t header.
             llvm::Value* strObj = builder_.CreateCall(callocFn,
                 {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
@@ -8509,11 +8967,10 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
                 builder_.CreateStructGEP(stringType(), strObj, 0));
             builder_.CreateStore(kl,
                 builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+            builder_.CreateStore(kw,
                 builder_.CreateStructGEP(stringType(), strObj, 2));
             initStringRc(strObj);
             keyDecoded = strObj;
-            (void)dataSz;
         } else if (useGen) {
             // Generic key: rawKeyPtr is a malloc'd copy of the key bytes.
             // Load the key value out of the raw bytes.
@@ -10265,6 +10722,13 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // disposes the temp), and emit a normal-path disposal at endBB top.
     llvm::AllocaInst* scrutOwnedSlot = nullptr;
     bool scrutOwnIsOwningCollection = false;
+    // fix #4552 / §35.5 *The owning match* + §35.4 (v0.306): the owning-CHOICE
+    // spelling of the same K8.3 boundary. An owning choice is a VALUE type, so
+    // `scrut` is a struct in a register and every gate above (which requires a
+    // pointer) declines it — the scrutinee temporary was owned by nothing and
+    // its payloads leaked outright. See `unboundOwningChoiceTemp`.
+    llvm::AllocaInst* scrutChoiceSlot = nullptr;
+    const sema::TypeRef* scrutChoiceRef = nullptr;
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
@@ -10305,6 +10769,85 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                 d.collection = true;      // owning-collection free path
             if (!disposeStack_.empty())
                 disposeStack_.back().push_back(d);
+        }
+        // fix #4552 / §35.5 (v0.306): the owning-CHOICE scrutinee temporary.
+        // §35.5: "payloads not transferred into bindings (discarded slots like
+        // `Fetched(_)`, and the payloads of the value when a `_` or
+        // non-destructuring arm is selected) are disposed when the construct
+        // completes, by the same unbound-temporary pass that disposes the
+        // container."
+        //
+        // EXACTLY-ONCE. §35.5's owning match TRANSFERS the selected case's
+        // owned payloads into the arm's bindings, and its own adoption
+        // spelling (`using var u := move r;` in a `do … end` arm) then
+        // disposes the payload at the arm's scope end. Disposing the container
+        // wholesale at construct completion double-frees exactly that shape —
+        // MEASURED as a SIGSEGV on rule-corpus case s35_5_0002, which is
+        // written from the spec and was passing before the reclaim was added.
+        //
+        // fix #4609 (§35.5, v0.306): the discharge is now PER ARM, at the top
+        // of the selected arm's body, instead of #4552's whole-construct
+        // `armsBind` gate. Same safety, strictly more precision: a construct
+        // that mixes a binding arm with a discarding one (`A(var x) => …,
+        // B(_) => …`) had its reclaim disabled on EVERY arm by the coarse
+        // gate, so selecting `B(_)` leaked a payload §35.5 says is "disposed
+        // at construct completion". The discharge is a runtime zero-store over
+        // the temp slot, so it also covers the UNWIND edge (an exception out
+        // of a binding arm must not re-dispose what the arm's `using var`
+        // already owns) with no second mechanism — the same #4566 moved-from
+        // encoding used everywhere else for a choice. What remains open is
+        // unchanged from #4552: arm-selection transfer is not implemented, so
+        // a binding arm's UN-transferred siblings (`Fetched(var w, _)`) still
+        // leak rather than double-free — the sound direction.
+        //
+        // fix #4609: §35.5's SECOND announcing scrutinee form — `case move o
+        // of …` over a named owned binding — is admitted here alongside the
+        // unbound temporary. The two are one construct in §35.5; only the
+        // announcement differs. The marked form additionally CONSUMES its
+        // source ("the consumed binding is left moved-from when the construct
+        // completes"), which `markedOwningChoiceScrutineeSlot` records with
+        // the same zero-store, so the source's own scope-end active-case pass
+        // becomes a no-op instead of disposing payloads the arms already took.
+        llvm::AllocaInst* markedSrcSlot =
+            markedOwningChoiceScrutineeSlot(cs.scrutinee.get(), scrutTy);
+        if (!scrutOwnedSlot && scrut &&
+            (unboundOwningChoiceTemp(cs.scrutinee.get(), scrutTy) ||
+             markedSrcSlot) &&
+            !scrut->getType()->isPointerTy() && !disposeStack_.empty()) {
+            scrutChoiceSlot = entryAlloca(scrut->getType());
+            builder_.CreateStore(scrut, scrutChoiceSlot);
+            scrutChoiceRef = scrutTy;
+            Disposal d{scrutChoiceSlot, nullptr};
+            // fix #4609 (§35.5, v0.306): NOT `unwindOnly`. #4552 registered
+            // this entry for the throw edge only, because the normal edge is
+            // the reclaim at endBB — but a `return` (or `break`/`continue`)
+            // out of an arm body takes neither: `emitDisposals` skips an
+            // `unwindOnly` entry when `dropUndischarged` is false, and endBB
+            // is never reached. MEASURED on
+            // `case move o of W(_) => do Console.WriteLine("hit");
+            // return 5; end, X => () end case;` — `LeakSanitizer: 16 byte(s)
+            // leaked in 1 allocation(s)`, where the pre-#4609 compiler printed
+            // `widget disposed` (the source local's scope-end pass covered the
+            // return path). A plain entry covers every edge, and the two
+            // runtime zero-stores keep it exactly-once: endBB zeroes after its
+            // reclaim (so a later traversal is a no-op) and a BINDING arm
+            // zeroes at its body top (so a return out of an adopting arm does
+            // not re-dispose what the arm's `using var` owns).
+            d.unwindOnly = false;
+            d.owningChoice = true;
+            d.owningChoiceTy = scrutTy->declaration;
+            d.owningChoiceRef = scrutTy;
+            disposeStack_.back().push_back(d);
+            // §35.5 form 2 is a CONSUME of the named binding: mark it
+            // moved-from now that the value is captured in the temp above,
+            // which is the only owner from here on. Emitted at the consume
+            // site — not at construct completion — so a `return` or `throw`
+            // out of an arm body finds the source already discharged.
+            if (markedSrcSlot)
+                builder_.CreateStore(
+                    llvm::Constant::getNullValue(
+                        markedSrcSlot->getAllocatedType()),
+                    markedSrcSlot);
         }
     }
     auto* endBB =
@@ -10352,7 +10895,7 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             llvm::AllocaInst* slot = entryAlloca(scrut->getType());
             builder_.CreateStore(scrut, slot);
             if (!disposeStack_.empty())
-                declScopeDepth_[bp] = disposeStack_.size();
+                recordDeclScopeDepth(bp);  // fix #4523
             locals_[bp] = slot;
         }
         if (arm.guard) {
@@ -10367,6 +10910,33 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             builder_.CreateCondBr(pm, bodyBB, nextBB);
         }
         builder_.SetInsertPoint(bodyBB);
+        // fix #4609 / §35.5 *The owning match* (v0.306): the per-arm discharge
+        // of the owning-choice scrutinee's construct-completion reclaim.
+        // §35.5 disposes at completion only what was "not transferred into
+        // bindings"; an arm that BINDS takes the payloads (its `using var u :=
+        // move r;` adoption then owns them), so for THAT arm the reclaim must
+        // decline. `bodyBB` is reached only on selection — a guard-declined
+        // arm branches to `nextBB` and "transfers nothing" (§35.5 *Guards*) —
+        // so zeroing here is exactly the §35.5 boundary. The zero-store is
+        // #4566's moved-from encoding, so ONE store discharges every reclaim
+        // the value has — the one at endBB, and the dispose-stack entry that
+        // covers a `throw`, `return` or `break` out of this arm body; the
+        // bindings were filled from the scrutinee VALUE above, not re-read
+        // from this slot, so nothing in the arm observes the zeros.
+        //
+        // fix #4617 / §35.5 (v0.307): the discharge is now PER SLOT. §35.5
+        // states BOTH halves at slot granularity — the arm "transfers the
+        // case's `owned` and move-only value payloads into its bindings" and
+        // "the un-transferred remainder — unlisted fields, unmarked named
+        // slots, discarded siblings — is disposed at construct completion" —
+        // but #4609 marked the WHOLE value as soon as the arm bound anything,
+        // so `W(var w, _)` over `W(owned a: Widget, owned b: Widget)` adopted
+        // `a` and left `b` reclaimed by nobody. `dischargeOwningMatchTransfers`
+        // marks exactly the transferred slots and falls back to this same
+        // whole-value store for any shape it cannot decide per slot.
+        if (scrutChoiceSlot && patternBindsAnySlot(arm.pattern.get()))
+            dischargeOwningMatchTransfers(scrutChoiceSlot, scrutChoiceRef,
+                                          arm.pattern.get());
         bool armTerm = lowerScopedBlock(arm.stmts);
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);
@@ -10427,6 +10997,33 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             llvm_, "casescrut.end", currentFn_);
         builder_.CreateBr(scrutEndBB);
         builder_.SetInsertPoint(scrutEndBB);
+    }
+    // fix #4552 / §35.5 (v0.306): the owning-CHOICE scrutinee temporary's
+    // NORMAL-edge disposal, at the construct's completion — K8.3's boundary,
+    // which §35.5 applies "in statement position exactly as in expression
+    // position". Emitted at the top of endBB, after every arm body has
+    // finished, so a pattern binding (a borrow of the scrutinee, §19.3) is
+    // never read past it.
+    if (scrutChoiceSlot && scrutChoiceRef) {
+        emitOwningChoiceLocationDisposal(scrutChoiceSlot, scrutChoiceRef);
+        // Zero the slot so any later traversal of this Disposal entry is a
+        // no-op at RUNTIME as well as after the compile-time erasure below:
+        // a zeroed choice reads tag 0 with null payload pointers, and every
+        // payload disposal in the active-case walk is null-guarded. (The
+        // erasure alone is edge-order-dependent — #2816's lesson — so the
+        // runtime discharge is what actually makes the reclaim exactly-once.)
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(scrutChoiceSlot->getAllocatedType()),
+            scrutChoiceSlot);
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == scrutChoiceSlot) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
     }
     return false;
 }

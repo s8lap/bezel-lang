@@ -33,5 +33,5 @@ class C
   end Main;
 end C;
 
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: indexer-setter RHS expression failed to lower (degraded — target retains its previous value) — #3025
-// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}: internal: ??= short-circuit RHS expression failed to lower (degraded — target retains its previous value) — #3025
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: indexer-setter RHS expression failed to lower (degraded — target retains its previous value) — #3025
+// CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: ??= short-circuit RHS expression failed to lower (degraded — target retains its previous value) — #3025

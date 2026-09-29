@@ -36,7 +36,8 @@ from gate import telemetry as T  # noqa: E402
 TOP_LEVEL_FIELDS = [
     "schema", "ts", "epoch", "host", "mode", "head", "head_short", "dirty",
     "result", "failed_phase", "total_s", "gtests", "littests",
-    "expected_gtests", "coverage_floor_enforced", "cold", "cache_n",
+    "expected_gtests", "coverage_floor_enforced", "coverage_floor_satisfied",
+    "cold", "cache_n",
     "shard_timeout_s", "aot", "binaries", "shard_count", "shard_reported_s",
     "arbitration_suspects", "serial_attempts", "serial_total",
     "asan_shards_reported", "asan_errors", "shard_times", "mem", "phases",
@@ -75,13 +76,21 @@ class SchemaFieldOrderTest(unittest.TestCase):
         rec = _basic_record()
         self.assertEqual(list(rec.keys()), TOP_LEVEL_FIELDS)
 
-    def test_top_level_field_count_is_30(self):
-        # 30 keys — adding or dropping one is a schema break the dual-run
+    def test_top_level_field_count_is_31(self):
+        # 31 keys — adding or dropping one is a schema break the dual-run
         # would catch, but this count is a cheap first-line defense.
         # 29 -> 30 on 2026-08-21: `mem` (gate audit F1 Tier-0, the shard
         # phase's anon high-water mark) joined the record.
+        # 30 -> 31, fix #3737: `coverage_floor_enforced` used to conflate two
+        # concepts — "the floor check ran" and "the floor's ran>=expected
+        # comparison passed" — in one bool, which made gate.trend's R5 fire on
+        # a record whose floor genuinely ran and correctly reported
+        # result=fail (misread as "ran WITHOUT the floor"). Split into
+        # `coverage_floor_enforced` (now presence-based: was the check
+        # invoked at all) + the new `coverage_floor_satisfied` (the old
+        # value-based semantics: did the comparison pass).
         rec = _basic_record()
-        self.assertEqual(len(rec), 30)
+        self.assertEqual(len(rec), 31)
 
     def test_mem_sub_object_field_order(self):
         rec = _basic_record()
@@ -190,18 +199,40 @@ class NullVsZeroTest(unittest.TestCase):
     def test_cold_false_when_zero(self):
         self.assertIs(self._bare(cold="0")["cold"], False)
 
-    def test_coverage_floor_null_when_unset(self):
-        # per gate.sh:329: same rule as cold. R5 fires on false, not null.
+    def test_coverage_floor_enforced_null_when_unset(self):
+        # per gate.sh:329: unset => null (the check code path never ran).
         self.assertIsNone(self._bare()["coverage_floor_enforced"])
 
-    def test_coverage_floor_true_when_one(self):
+    def test_coverage_floor_enforced_true_whenever_the_flag_is_passed(self):
+        # fix #3737: coverage_floor_enforced is now PRESENCE-based — True iff
+        # gate.sh actually invoked the floor check, regardless of whether the
+        # comparison itself passed. This is the field gate.trend R5 now reads
+        # (a `result=pass` record with this NOT True means the floor was
+        # skipped, the real "coverage-floor-disabled" signature).
         self.assertIs(
             self._bare(coverage_floor_ok="1")["coverage_floor_enforced"], True)
-
-    def test_coverage_floor_false_when_zero(self):
-        # This is the R5 signal: a gate that ran WITHOUT the floor.
         self.assertIs(
-            self._bare(coverage_floor_ok="0")["coverage_floor_enforced"], False)
+            self._bare(coverage_floor_ok="0")["coverage_floor_enforced"], True)
+
+    def test_coverage_floor_satisfied_null_when_unset(self):
+        # fix #3737: the new field carries the OLD value-based semantics
+        # (did the ran>=expected comparison pass) that coverage_floor_enforced
+        # used to conflate with "did the check run at all".
+        self.assertIsNone(self._bare()["coverage_floor_satisfied"])
+
+    def test_coverage_floor_satisfied_true_when_one(self):
+        self.assertIs(
+            self._bare(coverage_floor_ok="1")["coverage_floor_satisfied"], True)
+
+    def test_coverage_floor_satisfied_false_when_zero(self):
+        # fix #3737: this is the 466a28e2 record-1185 shape — the floor
+        # genuinely ran and found a real shortfall. Before the fix this value
+        # (then named coverage_floor_enforced) made gate.trend's R5 fire with
+        # the misleading "the gate ran without the #3002 floor" message on a
+        # record whose `result` was already correctly "fail". R5 is now scoped
+        # to result=pass and fires on enforced-not-True OR satisfied-False.
+        self.assertIs(
+            self._bare(coverage_floor_ok="0")["coverage_floor_satisfied"], False)
 
     def test_failed_phase_null_when_empty(self):
         self.assertIsNone(self._bare()["failed_phase"])
@@ -304,6 +335,7 @@ class SerializeByteIdentityTest(unittest.TestCase):
         self.assertIn('"dirty":true', line)
         self.assertIn('"cold":false', line)
         self.assertIn('"coverage_floor_enforced":true', line)
+        self.assertIn('"coverage_floor_satisfied":true', line)
 
     def test_round_trips_through_json_loads(self):
         # The emitted line is valid JSON that parses back to the same values.

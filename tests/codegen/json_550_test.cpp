@@ -115,19 +115,20 @@ int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -137,14 +138,17 @@ int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=" +
         std::string(detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
         " > /dev/null 2>&1";
     int raw = std::system(runCmd.c_str());
     cleanup();
-    if (raw == -1) return -1;
+    if (raw == -1) return bezel::test::asanExecFailure("system");
     int code = WIFEXITED(raw) ? WEXITSTATUS(raw) : -1;
     if (code == 99) return 99;   // asan/leak
     if (code == 0)  return 0;    // clean
@@ -718,7 +722,7 @@ BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
         "  public owned Shared: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned shared: Node, alias: Node?) "
-        "    Shared := move shared; Alias := alias; "
+        "    Shared := shared; Alias := alias; "
         "  end constructor; "
         "end Diamond; "
         "class C public static method Main(): int "
@@ -750,7 +754,7 @@ BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139
         "  public owned Target: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned target: Node, alias: Node?) "
-        "    Target := move target; Alias := alias; "
+        "    Target := target; Alias := alias; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
@@ -780,7 +784,7 @@ BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
-        "    Target := move target; Alias := alias; "
+        "    Target := target; Alias := alias; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
@@ -856,7 +860,7 @@ BEZEL_TEST(codegen_json_675, tree_json_unchanged_spec_2_15_v0139) {
         "class Root : ISerializable, IDeserializable "
         "  public owned L: Leaf; "
         "  public Id: int := 0; "
-        "  public constructor(id: int, owned l: Leaf) Id := id; L := move l; end constructor; "
+        "  public constructor(id: int, owned l: Leaf) Id := id; L := l; end constructor; "
         "end Root; "
         "class C public static method Main(): int "
         "  using var r := new Root(7, new Leaf(35)); "
@@ -900,7 +904,7 @@ BEZEL_TEST(codegen_json_675,
         "  public owned Shared: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned shared: Node, alias: Node?) "
-        "    Shared := move shared; Alias := alias; "
+        "    Shared := shared; Alias := alias; "
         "  end constructor; "
         "end Diamond; "
         "class C public static method Main(): int "

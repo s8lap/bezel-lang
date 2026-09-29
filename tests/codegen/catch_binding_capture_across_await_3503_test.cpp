@@ -244,7 +244,7 @@ BEZEL_TEST(catch_binding_capture_across_await_3503,
     auto r = runAotCheckedLenient(
         "module M; import System; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    var a := 0; "
         "    var b := 0; "
         "    try "

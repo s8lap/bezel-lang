@@ -309,6 +309,78 @@ BEZEL_TEST(module_metadata_builder, choice_kind_recorded_spec_35_2121) {
     BEZEL_EXPECT_TRUE(dcc->kind == cc->kind);
 }
 
+// §35.7 "Equality, hashing, ToString" / §9.2 "The `equality skip` clause"
+// (v0.307, issue #4652, follow-up to fix #4643/#3152 family F9): the
+// WIRE-CARRIAGE half of closing the gap #4643 explicitly declared out of
+// scope for the choice-payload site (tests/parser/equality_skip_clause_test.cpp).
+// A choice payload field's clause now rides
+// `MetaChoicePayloadField::equalitySkip`: this test pins that it (a) is built
+// from the AST correctly (the clause on `Cache`, not on `X`), (b) survives a
+// bitstream round trip, and (c) folds into the semantic hash under the SAME
+// predicate as its emission — §9.2 states that "Adding or removing
+// `equality skip` on a public type's member is a breaking change ([§3.6] rule
+// 3)", so a consumer's staleness check (§2.8.3 rule 3) must be able to see
+// the clause's presence via the hash exactly as it already does for the
+// record-side `MetaMember::equalitySkip` (fix #3152/0892d092).
+//
+// This test does NOT exercise §35.7's actual equality/hashing SEMANTICS
+// (comparison skip, hash skip, the admissibility rescue) — those still have
+// no reader in sema or codegen as of this commit (see #4652); it pins only
+// that the clause now travels intact across the artifact boundary, which is
+// this commit's scope.
+BEZEL_TEST(module_metadata_builder, choice_payload_equality_skip_wire_4652) {
+    auto withSkip = buildFromSource(
+        "module Lib4652; "
+        "public choice Pt4652 "
+        "  Pos(X: int, Cache: int equality skip); "
+        "end Pt4652;");
+    BEZEL_EXPECT_TRUE(withSkip->ok);
+    const MetaTypeDecl* ty = findType(withSkip->meta, "Pt4652");
+    BEZEL_EXPECT_TRUE(ty != nullptr);
+    if (!ty) return;
+    BEZEL_EXPECT_TRUE(ty->choiceCases.size() == 1);
+    if (ty->choiceCases.size() != 1) return;
+    const MetaChoiceCase& cc = ty->choiceCases[0];
+    BEZEL_EXPECT_TRUE(cc.payload.size() == 2);
+    if (cc.payload.size() != 2) return;
+    BEZEL_EXPECT_TRUE(cc.payload[0].name == "X");
+    BEZEL_EXPECT_TRUE(!cc.payload[0].equalitySkip);
+    BEZEL_EXPECT_TRUE(cc.payload[1].name == "Cache");
+    BEZEL_EXPECT_TRUE(cc.payload[1].equalitySkip);
+
+    // Round trip: serialize -> deserialize reproduces the clause exactly,
+    // and the decoded metadata compares structurally equal to the built one
+    // (MetaChoicePayloadField::operator== now includes equalitySkip).
+    std::vector<std::uint8_t> bytes = serialize(withSkip->meta);
+    BEZEL_EXPECT_TRUE(!bytes.empty());
+    std::optional<ModuleMetadata> decoded = deserialize(bytes);
+    BEZEL_EXPECT_TRUE(decoded.has_value());
+    if (!decoded) return;
+    BEZEL_EXPECT_TRUE(*decoded == withSkip->meta);
+    const MetaTypeDecl* dty = findType(*decoded, "Pt4652");
+    BEZEL_EXPECT_TRUE(dty != nullptr);
+    if (!dty) return;
+    BEZEL_EXPECT_TRUE(dty->choiceCases.size() == 1);
+    if (dty->choiceCases.size() != 1) return;
+    BEZEL_EXPECT_TRUE(dty->choiceCases[0].payload.size() == 2);
+    if (dty->choiceCases[0].payload.size() != 2) return;
+    BEZEL_EXPECT_TRUE(!dty->choiceCases[0].payload[0].equalitySkip);
+    BEZEL_EXPECT_TRUE(dty->choiceCases[0].payload[1].equalitySkip);
+
+    // §3.6 rule 3 / §2.8.3 rule 3: adding the clause is a breaking change on a
+    // public type's member — the semantic hash MUST differ from the
+    // otherwise-identical clause-free sibling, so a consumer's staleness
+    // check can see it.
+    auto withoutSkip = buildFromSource(
+        "module Lib4652; "
+        "public choice Pt4652 "
+        "  Pos(X: int, Cache: int); "
+        "end Pt4652;");
+    BEZEL_EXPECT_TRUE(withoutSkip->ok);
+    BEZEL_EXPECT_TRUE(semanticHash(withSkip->meta) !=
+                      semanticHash(withoutSkip->meta));
+}
+
 // §2.5/§2.6: built metadata survives serialize → deserialize unchanged (the
 // builder produces a schema the Increment-1 codec round-trips).
 BEZEL_TEST(module_metadata_builder, built_metadata_roundtrips_spec_2_5) {

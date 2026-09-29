@@ -158,7 +158,45 @@ enum RecordCode : unsigned {
     // MetaTypeDecl::baseCtorArgsText for the byte-identical-serialization
     // rationale and the dependency-direction staleness contract.
     REC_BASE_CTOR_ARGS = 15,
-    // 16.. additive; unknown codes are skipRecord()'d by the reader
+    // §22.16 / §2.8.2 (#4592, additive within v7): TYPE_BLOCK — this class's
+    // OWN `invariant(E);` members re-rendered as source text, as a string
+    // payload under its OWN code. Emitted only when non-empty, so a module
+    // whose classes declare no invariant is byte-identical to a pre-#4592
+    // build. A distinct code rather than a further positional REC_STRING for
+    // the same reason REC_BASE_CTOR_ARGS / REC_EXC_BASE are coded: TYPE_BLOCK
+    // already carries three independent optional strings, and a fourth
+    // positional one would make every reader's capture ordering load-bearing.
+    // Absent (an OLD artifact) reads as "" — the pre-fix behaviour, which IS
+    // the #4592 silent-no-check defect the importer-side
+    // `parseAndAttachInvariants` closes, so a stale dependency degrades to
+    // exactly what it did before rather than to anything new.
+    REC_INVARIANT_TEXT = 16,
+    // §9.2 "The `equality skip` clause" (v0.307, additive within v7; follow-up
+    // to fix #4643): MEMBER_BLOCK — a storage member's `equality skip` clause
+    // as a single scalar under its OWN code. Emitted only when TRUE, so a
+    // module whose members carry no `equality skip` is byte-identical to a
+    // pre-#4643 build. A distinct code rather than a third scalar appended to
+    // REC_SER_CLAUSE because the two clauses are independent: §9.2's table
+    // ("The two-package skip model") makes participation per-package, so a
+    // member may carry either, both, or neither, and folding them would make
+    // one clause's presence decide the other's encoding. Absent (a pre-#4643
+    // blob) reads as `false` = "participates in equality", which is exactly
+    // what that dependency's own compiler produced.
+    REC_EQ_CLAUSE = 17,
+    // §35.7 / §9.2 "The `equality skip` clause" (v0.307, additive within v7;
+    // issue #4652, follow-up to fix #4643/#3152 family F9): CHOICE_PAYLOAD_BLOCK
+    // — a choice payload field's `equality skip` clause as a single scalar
+    // under its OWN code, the CHOICE_PAYLOAD_BLOCK twin of REC_EQ_CLAUSE above
+    // (a distinct code because it lives in a different block's record-code
+    // namespace, and CHOICE_PAYLOAD_BLOCK's own scalars are read as a fixed
+    // sequence — see readChoicePayloadFieldBody). Emitted only when TRUE, so a
+    // module using no `equality skip` on a choice payload is byte-identical to
+    // a pre-#4652 build. Absent (a pre-#4652 blob, or ANY blob written before
+    // this fix, since no compiler ever wrote this clause for a choice payload)
+    // reads as `false` = "participates in equality", exactly what every
+    // dependency's own compiler produced.
+    REC_CHOICE_EQ_CLAUSE = 18,
+    // 19.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -337,6 +375,13 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
         hashBool(h, m.serializedOptional);
         hashStr(h, m.serializedWireName);
     }
+    // §9.2 (v0.307): `equality skip` flips comparison results and hash values
+    // for clients and can flip the §3.6 auto-hashable/hashable derived
+    // properties, so §9.2 names adding or removing it a BREAKING change
+    // (§3.6 rule 3) — it must fold into the semantic hash or a consumer's
+    // staleness check cannot see it. GUARDED BY THE SAME PREDICATE AS THE
+    // EMISSION, for the reason the `serialized` fold directly above states.
+    if (m.equalitySkip) hashBool(h, m.equalitySkip);
     // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 3, v0.254): a positional
     // primary-ctor parameter's default-value text is part of the cross-module
     // contract — a library adding or removing (or changing) a `:= Expr`
@@ -398,6 +443,14 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     // a fold the writer never wrote moves the VBR-encoded header hash of
     // every artifact for a change that wrote nothing.
     if (!ty.baseCtorArgsText.empty()) hashStr(h, ty.baseCtorArgsText);
+    // §22.16 / §2.8.6 (#4592): this class's own invariant source text.
+    // §2.8.6's delta table classifies "`invariant` removed or text changed" as
+    // BREAKING, so it is public-interface content §2.8.3 rule 3's staleness
+    // check must track. GUARDED ON EXACTLY THE EMISSION'S CONDITION, the same
+    // rule every conditional field above states: a fold the writer never wrote
+    // moves the VBR-encoded header hash of every artifact for a change that
+    // wrote nothing.
+    if (!ty.ownInvariantText.empty()) hashStr(h, ty.ownInvariantText);
     // §12 / §31.4 (#2950): the built-in exception base. It decides the class's
     // LAYOUT on both sides of the boundary, so it is public-interface content
     // that staleness detection must track — a dependency that gains or loses
@@ -447,6 +500,15 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
                 hashBool(h, pf.serializedOptional);
                 hashStr(h, pf.serializedName);
                 hashType(h, pf.type);
+                // §35.7 / §9.2 (v0.307, #4652): `equality skip` on a choice
+                // payload flips `=`/`GetHashCode` results and can flip the
+                // choice's §35.7 auto-hashable / §3.6 hashable derived
+                // properties, so §9.2 names adding or removing it a BREAKING
+                // change (§3.6 rule 3) — it must fold into the semantic hash.
+                // GUARDED BY THE SAME PREDICATE AS THE EMISSION (see
+                // emitChoicePayloadField), the reason hashMember's REC_EQ_CLAUSE
+                // fold directly above gives for the record-side sibling.
+                if (pf.equalitySkip) hashBool(h, pf.equalitySkip);
             }
         }
     }
@@ -571,7 +633,11 @@ bool MetaChoicePayloadField::operator==(const MetaChoicePayloadField& o) const {
            hasSerialized == o.hasSerialized &&
            serializedSkip == o.serializedSkip &&
            serializedOptional == o.serializedOptional &&
-           serializedName == o.serializedName;
+           serializedName == o.serializedName &&
+           // §35.7 / §9.2 (v0.307, #4652): the `equality skip` clause is part
+           // of a choice payload field's identity — see hashTypeDeclContent's
+           // choiceCases loop and the field's comment in ModuleMetadata.hpp.
+           equalitySkip == o.equalitySkip;
 }
 
 bool MetaChoiceCase::operator==(const MetaChoiceCase& o) const {
@@ -623,7 +689,9 @@ MetaMember::MetaMember(const MetaMember& o)
       enumWireName(o.enumWireName),
       serializedSkip(o.serializedSkip),
       serializedOptional(o.serializedOptional),
-      serializedWireName(o.serializedWireName) {
+      serializedWireName(o.serializedWireName),
+      // §9.2 (v0.307): same shape as the `serialized` trio above.
+      equalitySkip(o.equalitySkip) {
     if (o.nestedType)
         nestedType = std::make_unique<MetaTypeDecl>(*o.nestedType);
 }
@@ -655,6 +723,8 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         serializedSkip = o.serializedSkip;
         serializedOptional = o.serializedOptional;
         serializedWireName = o.serializedWireName;
+        // §9.2 (v0.307): same shape as the `serialized` trio above.
+        equalitySkip = o.equalitySkip;
         nestedType = o.nestedType
             ? std::make_unique<MetaTypeDecl>(*o.nestedType)
             : nullptr;
@@ -719,6 +789,10 @@ bool MetaMember::operator==(const MetaMember& o) const {
            serializedSkip == o.serializedSkip &&
            serializedOptional == o.serializedOptional &&
            serializedWireName == o.serializedWireName &&
+           // §9.2 (v0.307): the `equality skip` clause is part of a storage
+           // member's identity — see hashMember; §9.2 names adding or removing
+           // it a breaking change (§3.6 rule 3).
+           equalitySkip == o.equalitySkip &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
            fieldInitText == o.fieldInitText &&
@@ -744,6 +818,11 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            // staleness must track it), so two metadata values differing only
            // in it are NOT equal.
            baseCtorArgsText == o.baseCtorArgsText &&
+           // §22.16 / §2.8.6 (#4592): an `invariant` removed or re-worded is
+           // a BREAKING delta in §2.8.6's own table, so two metadata values
+           // differing only in this text are NOT equal — this operator backs
+           // the round-trip tests.
+           ownInvariantText == o.ownInvariantText &&
            builtinExceptionBase == o.builtinExceptionBase &&
            builtinInterfaceBases == o.builtinInterfaceBases &&
            // §35.1 (#3144): the case list is part of a choice's identity.
@@ -853,10 +932,17 @@ void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
     w.ExitBlock();
 }
 
-// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. Everything
-// inside this block is UNCONDITIONAL — the block itself only exists for a
-// choice, so no non-choice module pays a byte for it (the conditionality that
-// matters lives at the TYPE_BLOCK level, see emitTypeDecl).
+// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. The
+// scalars/strings/type below are UNCONDITIONAL — the block itself only exists
+// for a choice, so no non-choice module pays a byte for it (the
+// conditionality that matters lives at the TYPE_BLOCK level, see
+// emitTypeDecl). The `equality skip` clause (#4652) is the one CONDITIONAL
+// piece of this block's content: it did not exist before this fix, so it
+// rides its own coded record — REC_CHOICE_EQ_CLAUSE, not a 4th positional
+// scalar in `sc` below, for the reason REC_EQ_CLAUSE is coded rather than a
+// 3rd REC_SER_CLAUSE scalar on the record side (RecordCode enum comment): an
+// unconditional 4th scalar would perturb every choice payload's bytes and
+// header hash whether or not it uses the clause.
 void emitChoicePayloadField(llvm::BitstreamWriter& w,
                             const MetaChoicePayloadField& pf) {
     w.EnterSubblock(CHOICE_PAYLOAD_BLOCK, 4);
@@ -870,6 +956,13 @@ void emitChoicePayloadField(llvm::BitstreamWriter& w,
     emitString(w, pf.modifier);
     emitString(w, pf.serializedName);
     emitType(w, pf.type);
+    // §35.7 / §9.2 (v0.307, #4652): emitted ONLY when true, so a module using
+    // no `equality skip` on a choice payload is byte-identical to a pre-#4652
+    // build — `hashTypeDeclContent` is guarded by the SAME predicate.
+    if (pf.equalitySkip) {
+        llvm::SmallVector<std::uint64_t, 1> ev{1u};
+        w.EmitRecord(REC_CHOICE_EQ_CLAUSE, ev);
+    }
     w.ExitBlock();
 }
 
@@ -1077,6 +1170,14 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
             sv.push_back(static_cast<std::uint8_t>(c));
         w.EmitRecord(REC_SER_CLAUSE, sv);
     }
+    // §9.2 "The `equality skip` clause" (v0.307; schema v7 additive): emitted
+    // ONLY when the member carries the clause, so a module using none is
+    // byte-identical to before — and `hashMember` is guarded by the SAME
+    // predicate, the half c97a49f had to correct for REC_SER_CLAUSE.
+    if (m.equalitySkip) {
+        llvm::SmallVector<std::uint64_t, 1> ev{1u};
+        w.EmitRecord(REC_EQ_CLAUSE, ev);
+    }
     // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): a positional
     // primary-ctor parameter's default-value expression text, under its
     // OWN record code (REC_POSPARAM_DEFAULT, see enum RecordCode above).
@@ -1201,6 +1302,17 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // mirrors the order hashTypeDecl folds them in.
     if (!ty.baseCtorArgsText.empty())
         emitStringAs(w, REC_BASE_CTOR_ARGS, ty.baseCtorArgsText);
+    // §22.16 / §2.8.2 (#4592): this class's OWN `invariant(E);` members as
+    // source text, under its own record code so it is independent of the
+    // trailing `dtorBodyText` REC_STRING and of the two other coded strings
+    // TYPE_BLOCK already carries. Emitted only when non-empty, so a module
+    // whose classes declare no invariant is BYTE-IDENTICAL to a pre-#4592
+    // build. Position among the trailing records is immaterial — the code is
+    // self-describing and every reader this format has had `skipRecord()`s an
+    // unknown one — so it goes after `baseCtorArgsText`, mirroring the order
+    // `hashTypeDecl` folds them in.
+    if (!ty.ownInvariantText.empty())
+        emitStringAs(w, REC_INVARIANT_TEXT, ty.ownInvariantText);
     // §12 / §31.4 (#2950): the built-in exception base, under its own record
     // code so it is independent of the trailing dtorBodyText string above.
     // Emitted only when non-empty, so a module with no exception subclass
@@ -1600,7 +1712,19 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                      // this new slot so an absent record is still `skipRecord()`'d
                      // for a reader predating the field — the pre-fix reading.
                      unsigned thirdCapturedCode = 0,
-                     std::string* thirdCodedCapture = nullptr) {
+                     std::string* thirdCodedCapture = nullptr,
+                     // §22.16 / §2.8.2 (#4592): a FOURTH coded string capture,
+                     // for REC_INVARIANT_TEXT. Same independent, self-
+                     // describing shape as the second and third slots; a
+                     // fourth slot rather than a shared one for the reason
+                     // `thirdCodedCapture`'s comment states — TYPE_BLOCK now
+                     // holds FOUR independent optional strings, and conflating
+                     // any two of them via one slot would be exactly the
+                     // silent misparse `emitTypeDecl`'s 8th-scalar ⚠ block
+                     // warns about. nullptrable, so this stays a strict
+                     // extension of the previous API.
+                     unsigned fourthCapturedCode = 0,
+                     std::string* fourthCodedCapture = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1611,7 +1735,8 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
         }
         if (n == Next::Record) {
             if (captureString != nullptr || codedCapture != nullptr ||
-                disposeVerdict != nullptr || thirdCodedCapture != nullptr) {
+                disposeVerdict != nullptr || thirdCodedCapture != nullptr ||
+                fourthCodedCapture != nullptr) {
                 // Read this record; capture it if it is one we are waiting for.
                 llvm::SmallVector<std::uint64_t, 32> vals;
                 auto got = r.cursor.readRecord(id, vals);
@@ -1657,6 +1782,17 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                     // Absent leaves the field empty, the pre-fix reading.
                     dst = thirdCodedCapture;
                     thirdCodedCapture = nullptr;
+                } else if (fourthCodedCapture != nullptr &&
+                           code == fourthCapturedCode) {
+                    // §22.16 / §2.8.2 (#4592): the fourth coded-capture slot.
+                    // Same shape and semantics as the second and third arms
+                    // above (decode bytes; clear the pointer so a second
+                    // REC_INVARIANT_TEXT cannot silently overwrite the first
+                    // — at most one exists per type, so that is unreachable
+                    // in practice). Absent leaves the field empty, the
+                    // pre-fix reading.
+                    dst = fourthCodedCapture;
+                    fourthCodedCapture = nullptr;
                 }
                 if (dst != nullptr) {
                     dst->clear();
@@ -1771,6 +1907,15 @@ bool readParam(Reader& r, MetaParam& p) {
 
 // §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. The caller
 // has already entered CHOICE_PAYLOAD_BLOCK.
+//
+// §35.7 / §9.2 (v0.307, #4652): the trailing scan below (in place of a plain
+// `finishBlock(r)`) captures REC_CHOICE_EQ_CLAUSE BY CODE — a coded record is
+// self-describing and skipRecord()'d by every reader this format has had, so
+// it is read whatever its position relative to the fixed scalar/string/type
+// sequence above, and its absence (a pre-#4652 blob, or any blob no compiler
+// before this fix ever wrote the clause into) simply leaves `equalitySkip`
+// false — "participates in equality", the reading every such dependency's
+// own compiler already produced. Mirrors readMemberBody's REC_EQ_CLAUSE arm.
 bool readChoicePayloadFieldBody(Reader& r, MetaChoicePayloadField& pf) {
     llvm::SmallVector<std::uint64_t, 4> sc;
     if (!expectScalars(r, sc) || sc.size() < 3) return false;
@@ -1781,7 +1926,28 @@ bool readChoicePayloadFieldBody(Reader& r, MetaChoicePayloadField& pf) {
     if (!expectString(r, pf.modifier)) return false;
     if (!expectString(r, pf.serializedName)) return false;
     if (!readType(r, pf.type)) return false;
-    return finishBlock(r);
+    while (true) {
+        unsigned id = 0;
+        Next n = nextEntry(r, id);
+        if (n == Next::EndBlock) {
+            if (r.cursor.ReadBlockEnd()) return false;
+            return true;
+        }
+        if (n == Next::Record) {
+            llvm::SmallVector<std::uint64_t, 8> vals;
+            auto got = r.cursor.readRecord(id, vals);
+            if (!got) { llvm::consumeError(got.takeError()); return false; }
+            if (got.get() == REC_CHOICE_EQ_CLAUSE && !vals.empty()) {
+                pf.equalitySkip = vals[0] != 0;
+            }
+            continue;
+        }
+        if (n == Next::SubBlock) {
+            if (r.cursor.SkipBlock()) return false;
+            continue;
+        }
+        return false;  // Error
+    }
 }
 
 // §35.1 (#3144): one choice case. The caller has already entered
@@ -2038,6 +2204,17 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                             static_cast<char>(vals[vi] & 0xFF));
                     continue;
                 }
+                // §9.2 "The `equality skip` clause" (v0.307): captured BY CODE
+                // for the same reason REC_SER_CLAUSE above is — a coded record
+                // is self-describing and `skipRecord()`'d by every reader this
+                // format has had, so a pre-#4643 reader never sees it and a
+                // pre-#4643 BLOB simply leaves `equalitySkip` false, which is
+                // the "participates in equality" reading that dependency's own
+                // compiler produced.
+                if (got.get() == REC_EQ_CLAUSE && vals.size() >= 1) {
+                    m.equalitySkip = vals[0] != 0;
+                    continue;
+                }
                 // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): the
                 // positional primary-ctor parameter's default-value text,
                 // captured BY CODE for the same reason REC_SER_CLAUSE /
@@ -2177,7 +2354,14 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
         REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases,
         &ty.nonTrivialDispose,
         REC_SER_TYPE_SHAPE, &ty.serializedShape, &ty.serializedPolyCases,
-        REC_BASE_CTOR_ARGS, &ty.baseCtorArgsText);
+        REC_BASE_CTOR_ARGS, &ty.baseCtorArgsText,
+        // §22.16 / §2.8.2 (#4592): this class's own `invariant(E);` source
+        // text, through the new `fourthCodedCapture` slot. Same independent,
+        // self-describing record-code shape as the three captures above —
+        // absent leaves the field empty, the pre-fix reading, which is
+        // exactly the #4592 silent-no-check defect the importer-side
+        // `parseAndAttachInvariants` closes.
+        REC_INVARIANT_TEXT, &ty.ownInvariantText);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

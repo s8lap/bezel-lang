@@ -27,7 +27,7 @@ const char* prelude =
     "module M; import System.Threading; "
     "class T public static cleaned: bool := false; end T; "
     "class C "
-    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "  public static async method Gen(): IAsyncEnumerable<int> "
     "    try "
     "      yield return 1; "
     "      yield return 2; "

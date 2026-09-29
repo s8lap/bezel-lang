@@ -36,4 +36,4 @@
 
 module M; class C public method M(o: Object): Object return o.Anything(); end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: return-value expression failed to lower to a value (degraded to a zero/null return value) — #2491
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: return-value expression failed to lower to a value (degraded to a zero/null return value) — #2491

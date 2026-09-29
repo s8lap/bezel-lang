@@ -128,9 +128,12 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_value_typed_capture_admitted) {
 BEZEL_TEST(scoped_builtin_1420, subscribe_declaration_order_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var b := new Button(); "
-        "    using var sub := b.Clicked.Subscribe(lambda() => ()); "
+        "    using var sub := b.Clicked.Subscribe(lambda(_) => ()); "
         "    return 0; "));
     // Control: capture-free is fine even with nothing declared before.
+    // (fix #4968: the handler takes the `int` payload — stdlib §6.5's
+    // `(T) -> ()`; the former zero-parameter `lambda()` was ill-typed and is
+    // now rejected at the Subscribe argument, v0.307.)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto r2 = parseAndCheckOwnership(prog(
         "    var b := new Button(); "

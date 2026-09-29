@@ -291,7 +291,11 @@ BEZEL_TEST(llenum_struct_element_cache_key_3663,
     JitResult r = runAot(kPlainSameSizeDifferentLayout);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "t=21"));
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "sum=3e+02"));
+    // "sum=300", not "sum=3e+02": fix #5079 (stdlib §2.18, v0.307) corrected
+    // double no-format ToString()'s shortest-round-trip rendering to prefer
+    // fixed-point notation over scientific when it round-trips and is not
+    // longer.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "sum=300"));
     BEZEL_EXPECT_FALSE(has(r.stdoutText, "sum=0"));
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -317,7 +321,9 @@ BEZEL_TEST(llenum_struct_element_cache_key_3663,
     JitResult r = runAot(kOwnedSameSizeDifferentLayout);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "t=21"));
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "sum=3e+02"));
+    // "sum=300", not "sum=3e+02": fix #5079 (stdlib §2.18, v0.307), see the
+    // sibling row above.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "sum=300"));
     BEZEL_EXPECT_FALSE(has(r.stdoutText, "sum=0"));
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

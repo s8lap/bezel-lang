@@ -341,12 +341,57 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
         ma *= 10; ++extra;
     }
     __uint128_t q = ma / mb;
+    // fix #4870 / §6.4, v0.307: keep the remainder so the quotient can be
+    // extended with its TRUE digits below (exact long division) instead of
+    // appended zeros. ma <= kMax96 here, so q * mb <= ma and rem < mb fit.
+    __uint128_t rem = ma - q * mb;
     // Scale: sa + extra (from ma) - sb (denominator's scale) → net scale.
     int32_t rs_signed = (int32_t)(sa + extra) - (int32_t)sb;
     if (rs_signed < 0) {
-        // Result scale is negative: multiply q by 10^|rs| to compensate.
-        while (rs_signed < 0 && q <= kMax96 / 10) { q *= 10; ++rs_signed; }
-        if (rs_signed < 0) { dec_store(out, q, 0, rsign, ove_vtable); return; }
+        // Result scale is negative: the quotient needs -rs_signed more integer
+        // digits to reach scale 0 (the minimum representable scale).
+        // fix #4870 / §6.4, v0.307: generate each digit by long division on
+        // the remainder — floor(10*N/mb) == 10*floor(N/mb) + floor(10*rem/mb)
+        // — so the result is the exact quotient truncated at scale 0. The
+        // previous `q *= 10` appended zeros instead: with a dividend near
+        // kMax96 (so `extra` stays 0) and a large-scale divisor, `q` kept a
+        // single significant digit (decimal.MaxValue /
+        // 1.0000000000000000000000000001m printed
+        // 70000000000000000000000000000), and the #4864 overflow check below
+        // was never reached for quotients just above MaxValue.
+        while (rs_signed < 0) {
+            if (q > kMax96 / 10) {
+                // fix #4864 / §6.4, v0.307: q still needs more integer digits
+                // than the 96-bit mantissa can hold at scale 0 — the exact
+                // quotient's magnitude exceeds decimal's range. Raise
+                // OverflowException (matching how every other overflow path
+                // in this file signals via bz_set_exc).
+                bz_set_exc(ove_vtable);
+                return;
+            }
+            __uint128_t r10 = rem * 10;  // rem < mb <= kMax96: no wrap
+            q = q * 10 + r10 / mb;
+            rem = r10 % mb;
+            ++rs_signed;
+            if (q > kMax96) {
+                // fix #4870 / §6.4, v0.307: the last true digit pushes the
+                // truncated quotient past MaxValue (e.g. decimal.MaxValue /
+                // 0.9999999999999999999999999999m).
+                bz_set_exc(ove_vtable);
+                return;
+            }
+        }
+    }
+    if (rs_signed > 28) {
+        // fix #4870 / §4.4, v0.307: `extra` may bring sa + extra to 29, which
+        // with sb == 0 gives a scale-29 result — outside the 0..28 scale range
+        // every other decimal operation in this file produces (0.1m / 3m
+        // printed 29 fractional digits, and 0.0000000000000000000000000001m /
+        // 3m printed 0.00000000000000000000000000003, below the smallest
+        // non-zero decimal). Drop the excess digit, truncating like the rest
+        // of this division.
+        q /= kPow10[rs_signed - 28];
+        rs_signed = 28;
     }
     uint32_t rs = (uint32_t)rs_signed;
     dec_store(out, q, rs, rsign, ove_vtable);
@@ -447,6 +492,10 @@ extern "C" void bz_decimal_from_uint64(uint64_t v, bz_decimal_t* out) {
 // Conversion from double (explicit per §5.2).
 // per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
 // call emitPendingCheck() after this function.
+// per fix #4845: %.15g + bz_decimal_parse_cstr can land on a scale > 28
+// (e.g. 1e-40 parses to scale 40, which §4.4 forbids).  Post-process the
+// parsed value so scale is always ≤ 28 with half-up rounding (consistent
+// with dec_store's existing rounding rule).
 extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
                                         void* ove_vtable) {
     // Use snprintf to get the decimal representation.
@@ -460,6 +509,26 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     // ove_vtable also covers the (very unlikely) case where the string
     // produced by snprintf overflows (e.g. 1e29 edge case).
     bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
+    if (bz_exc) return;  // let OverflowException / FormatException propagate
+
+    // §5.2 (fix #4845): nearest-representable decimal value, scale ≤ 28.
+    // The %.15g + parser pipeline produces a (m, s) representation of the
+    // double's nearest-15-significant-digit value. For sub-scale-28 magnitudes
+    // (e.g. `decimal(1e-40)`), s > 28 — round the mantissa down to scale 28
+    // with half-up rounding (matches dec_store's rem >= 5 → m += 1 rule).
+    uint32_t s = dec_scale(out);
+    if (s > 28) {
+        __uint128_t m = dec_mantissa(out);
+        int neg = dec_sign(out);
+        uint32_t drop = s - 28;
+        for (uint32_t k = 0; k < drop; ++k) {
+            __uint128_t q = m / 10;
+            __uint128_t r = m - q * 10;
+            m = q;
+            if (r >= 5) m += 1;
+        }
+        dec_store(out, m, 28, neg, ove_vtable);
+    }
 }
 
 // Conversion to double (explicit per §5.2).
@@ -518,13 +587,17 @@ extern "C" int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable) 
         return 0;
     }
     __uint128_t trunc = m / pow10_128[s];
-    // Overflow check: truncated value must fit in int64.
-    if (trunc > (__uint128_t)(uint64_t)INT64_MAX) {
+    // Overflow check: sign-aware magnitude bound.
+    // Positive decimals: max = INT64_MAX (2^63 - 1).
+    // Negative decimals: max = INT64_MAX + 1 (2^63), so |long.MinValue| is admitted.
+    bool neg = dec_sign(a);
+    __uint128_t limit = neg ? (__uint128_t)(uint64_t)INT64_MAX + 1 : (__uint128_t)(uint64_t)INT64_MAX;
+    if (trunc > limit) {
         bz_set_exc(ove_vtable);
         return 0;
     }
-    int64_t v = (int64_t)trunc;
-    return dec_sign(a) ? -v : v;
+    // Negate as unsigned then cast to avoid signed overflow of INT64_MIN.
+    return neg ? (int64_t)(0 - (uint64_t)trunc) : (int64_t)trunc;
 }
 
 // Conversion to int32 (explicit per §5.2).
@@ -539,6 +612,71 @@ extern "C" int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable) 
         return 0;
     }
     return (int32_t)v;
+}
+
+// Conversion to uint64 (explicit per §5.2, fix #4785).
+// §5.2: truncates toward zero; raises OverflowException when the truncated
+// value does not fit in uint64 — i.e. when the source decimal is negative
+// OR its magnitude exceeds 2^64-1.  Decimal.MaxValue
+// (79228162514264337593543950335 ≈ 7.9e28) is well above uint64.MaxValue
+// (18446744073709551615 ≈ 1.8e19), so the upper-bound check is load-bearing
+// here and was the silently-wrong-rejection root cause of #4785: the codegen
+// `ulong(decimal)` arm at LlvmBackend_Exprs2.cpp:9825-9833 reused the SIGNED
+// `bz_decimal_to_int64` helper, which enforces `trunc <= (uint64_t)INT64_MAX`
+// and rejects every value in (int64.MaxValue, uint64.MaxValue] — half of
+// `ulong`'s range.  A NEGATIVE decimal also makes this helper raise; the
+// pre-fix signed helper silently converted -1m to 1 (and downstream, the
+// ulong conversion reinterpreted that as ulong(1)), so this side of the bug
+// is fixed structurally here too.
+extern "C" uint64_t bz_decimal_to_uint64(const bz_decimal_t* a, void* ove_vtable) {
+    // Same truncation logic as bz_decimal_to_int64 (the decimal-to-int helper
+    // shares the truncation math because the only target-specific bits are
+    // the upper-bound check and the sign application); we duplicate the
+    // mantissa / scale / pow10 extraction rather than add an out-parameter
+    // to the signed helper, mirroring the from-side pattern (the int64 and
+    // uint64 FROM helpers are also separate — bz_decimal_from_int64 /
+    // bz_decimal_from_uint64 — per fix #743).  Duplication is the smaller
+    // refactor: threading a signedness flag through would touch every caller.
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s = dec_scale(a);
+    static const __uint128_t pow10_128[29] = {
+        (uint64_t)1, (uint64_t)10, (uint64_t)100, (uint64_t)1000,
+        (uint64_t)10000, (uint64_t)100000, (uint64_t)1000000,
+        (uint64_t)10000000, (uint64_t)100000000, (uint64_t)1000000000,
+        (uint64_t)10000000000ULL, (uint64_t)100000000000ULL,
+        (uint64_t)1000000000000ULL, (uint64_t)10000000000000ULL,
+        (uint64_t)100000000000000ULL, (uint64_t)1000000000000000ULL,
+        (uint64_t)10000000000000000ULL, (uint64_t)100000000000000000ULL,
+        (uint64_t)1000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL * 10,
+        (__uint128_t)10000000000000000000ULL * 100,
+        (__uint128_t)10000000000000000000ULL * 1000,
+        (__uint128_t)10000000000000000000ULL * 10000,
+        (__uint128_t)10000000000000000000ULL * 100000,
+        (__uint128_t)10000000000000000000ULL * 1000000,
+        (__uint128_t)10000000000000000000ULL * 10000000,
+        (__uint128_t)10000000000000000000ULL * 100000000,
+        (__uint128_t)10000000000000000000ULL * 1000000000,
+    };
+    if (s >= 29) {
+        // Any decimal with scale >= 29 has integer part = 0 — a valid ulong(0).
+        return 0;
+    }
+    __uint128_t trunc = m / pow10_128[s];
+    // §5.2 (fix #4785 amend, v0.307): truncate-toward-zero means a negative
+    // decimal like -0.5m truncates to 0, which is a valid ulong.  A negative
+    // sign is only an error when the truncated magnitude is non-zero:
+    //   -0.5m  → trunc=0, sign=1 → 0      (fits, no overflow)
+    //   -1m    → trunc=1, sign=1 → -1     (does not fit in uint64 → overflow)
+    //   -0m    → trunc=0, sign=1 → 0      (canonical zero, fits)
+    // The upper-bound check is unchanged: any magnitude exceeding uint64.MaxValue
+    // raises regardless of sign.
+    if ((dec_sign(a) && trunc != 0) || trunc > (__uint128_t)UINT64_MAX) {
+        bz_set_exc(ove_vtable);
+        return 0;
+    }
+    return (uint64_t)trunc;
 }
 
 // A code-point sequence to parse (fix #2273).  The parser reads by INDEX over
@@ -601,6 +739,18 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     // the stored mantissa loses; it must be absorbed by scale (a '.' fraction
     // or a negative exponent) or the value is out of range — settled below.
     uint32_t dropped_int = 0;
+    // §4.3 (v0.307) / #4876: when the mantissa is at the 96-bit limit and a
+    // fractional digit cannot be stored, the pre-fix code silently dropped it.
+    // §4.3 ("A floating-point literal denotes the nearest representable value
+    // of its type") and §5.2 ("decimal(x) for binary-float x yields the nearest
+    // representable decimal value") support rounding over truncation; the
+    // runtime's dec_store overflow-reduction path rounds half-up
+    // (`rem >= 5 → m += 1`), so a folded literal must agree.  Track the FIRST
+    // dropped fractional digit only: subsequent dropped digits cannot change
+    // the rounding direction (the first one decides).  After the loop, if that
+    // digit is >= 5, increment m by 1; dec_store handles overflow.
+    bool saw_dropped_frac = false;
+    uint32_t dropped_frac_digit = 0;
     for (; i < src.len; ++i) {
         uint32_t c = dec_src_at(src, i);
         if (c == '.') {
@@ -677,10 +827,20 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             // §4.4 / §9.3 (fix #1829): the 96-bit mantissa is full and this
             // digit is in the integer part, so it cannot be stored.  Count it:
             // it is a factor of 10 in the magnitude that must be paid for by
-            // scale or reported as out of range.  (Fractional digits beyond
-            // the 29th significant are dropped: they change neither the
-            // magnitude nor the scale, only the precision.)
+            // scale or reported as out of range.
             ++dropped_int;
+        } else {
+            // #4876 / §4.3 (v0.307): the 96-bit mantissa is full and this
+            // digit is in the fractional part.  Track the FIRST such dropped
+            // digit's value so the post-loop half-up rounding (matching
+            // dec_store's `rem >= 5 → m += 1`) can round the stored mantissa
+            // to the nearest representable value at scale 0.  Subsequent
+            // dropped fractional digits cannot change the rounding direction:
+            // once the first dropped digit decides, only its value matters.
+            if (!saw_dropped_frac) {
+                saw_dropped_frac = true;
+                dropped_frac_digit = (uint32_t)(c - '0');
+            }
         }
     }
     if (!any_digit) {
@@ -706,6 +866,14 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             return;
         }
         sc -= dropped_int;
+    }
+    // §4.3 (v0.307) / #4876: if a fractional digit was dropped because the
+    // mantissa was at the 96-bit limit, round the stored mantissa half-up to
+    // match dec_store's `rem >= 5 → m += 1` rule (§6.4).  dec_store handles
+    // overflow — a literal like `MaxValue.5m` correctly raises OverflowException
+    // because m would exceed kMax96 with sc=0 after the +1.
+    if (saw_dropped_frac && dropped_frac_digit >= 5) {
+        m += 1;
     }
     dec_store(out, m, sc, neg, ove_vtable);
 }

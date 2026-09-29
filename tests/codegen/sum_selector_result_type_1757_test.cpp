@@ -70,21 +70,54 @@ BEZEL_TEST(sum_selector_result_type_1757, double_selector_result_is_double) {
         "end C;"), "2.5");
 }
 
-// A `uint`-returning selector selects `Sum(selector: (T) -> uint): uint`. The
-// summed 12_000_000_000 wraps in 32-bit unsigned arithmetic to 3_410_065_408 —
-// a value above int range, confirming both the 32-bit-unsigned accumulator and
-// the unsigned result typing (WriteLine formats it unsigned).
+// A `uint`-returning selector selects `Sum(selector: (T) -> uint): uint`.
+// 3 x 1_000_000_000 = 3_000_000_000 is inside uint's range and ABOVE int's
+// (2_147_483_647), so an `int`-typed accumulator could not produce it: the row
+// pins the unsigned 32-bit result type and the unsigned formatting.
+//
+// UPDATED BY #4695 (stdlib §5 + spec §6.1, v0.307). This row previously summed
+// 3 x 4_000_000_000 and asserted 3_410_065_408 — the 32-bit WRAPAROUND of
+// 12_000_000_000 — using silent wrap as the observable for "the accumulator is
+// uint-wide". §6.1 makes integer `+` checked at every width and stdlib §5 says
+// `Sum` "is overflow-checked in" its result type, so that input now raises
+// `OverflowException` and the old expectation pinned behaviour the spec
+// forbids. The property the row exists to pin is preserved and SPLIT IN TWO,
+// which is strictly stronger than the single wrap assertion: the in-range sum
+// below rules out an `int` accumulator, and `uint_selector_overflow_is_checked`
+// rules out a `long`/`ulong` one (neither would raise at 12e9).
 BEZEL_TEST(sum_selector_result_type_1757, uint_selector_result_is_uint) {
-    // spec §22.6, v0.196 / stdlib §5
+    // spec §22.6, v0.196 / stdlib §5 / spec §6.1, v0.307
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
-        "    var total := a.Sum(lambda(x: int) => 4000000000U); "
+        "    var total := a.Sum(lambda(x: int) => 1000000000U); "
         "    Console.WriteLine(total); return 0; "
         "  end Main; "
-        "end C;"), "3410065408");
+        "end C;"), "3000000000");
+}
+
+// The other half of the split above: 3 x 4_000_000_000 = 12_000_000_000 does
+// not fit `uint`, so §6.1's checked `+` raises `OverflowException` rather than
+// wrapping to 3_410_065_408. A `long`/`ulong` accumulator would print the exact
+// total instead of raising, so this row is what now pins the accumulator's
+// 32-bit width (#4695).
+BEZEL_TEST(sum_selector_result_type_1757, uint_selector_overflow_is_checked) {
+    // spec §6.1 / stdlib §5, v0.307
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); "
+        "    try "
+        "      Console.WriteLine(a.Sum(lambda(x: int) => 4000000000U)); "
+        "    catch "
+        "      OverflowException => Console.WriteLine(\"caught\") "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), "caught");
 }
 
 // A selector whose return type converts co-equally to more than one Sum

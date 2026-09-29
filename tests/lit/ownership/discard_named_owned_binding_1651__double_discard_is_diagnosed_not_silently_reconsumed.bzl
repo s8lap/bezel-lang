@@ -15,5 +15,5 @@
 
 module M; class R public _h: int := 0; destructor _h := 1; end destructor; end R; class C public static method Main(): int var x := new R(); _ := x; _ := x; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: use of `x` after a dominating explicit Dispose() call — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} use of `x` after a dominating explicit Dispose() call — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
 // CHECK-SAME: (§28.2)

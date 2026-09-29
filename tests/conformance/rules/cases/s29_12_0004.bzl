@@ -5,10 +5,14 @@
 //! rule: The §29.2 protocol-elision optimization must preserve these
 //!   faults: a `for` loop the compiler lowers to direct indexing still
 //!   raises `InvalidOperationException` at the iteration boundary following
-//!   a structural modification, exactly as the enumerator path would.
+//!   a structural modification, exactly as the enumerator path would. The
+//!   in-loop structural call on the iterated binding also draws the
+//!   mutation-during-iteration warning; the program stays accepted.
 //! cites: 29.12, 29.2
 //! expect: run
+//! warns: yes
 //! stdout: caught
+//! issue: 4603
 module Conf;
 
 public class Program

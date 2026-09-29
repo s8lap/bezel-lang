@@ -120,6 +120,20 @@ bool compileFails(const std::string& source) {
 // ===========================================================================
 // (A) Task.WhenAll<T> — stdlib §6.7 line 2875
 // ===========================================================================
+//
+// fix #4670 / §30.5 (v0.307): `Task.WhenAll<T>(tasks)` returns `Task<Array<T>>`
+// — a Pattern A producer (`Array<T>` is class-like regardless of T), so
+// `await wa` produces a BORROW. §30.5's consumer-side rules admit that
+// borrow only to a plain `var`, never `using var` — every
+// `using var arr := await wa;` row below (and in the `task_delay_1378`
+// starvation row further down this file) used that shape before #4670
+// landed; #4670 correctly rejects it now, so each is converted to
+// `var arr := await wa;` here. `wa` itself keeps its own `using var` (the
+// Task<Array<T>> task's own disposal is unaffected — the rule is about the
+// AWAIT RESULT's binding, not the task's). The sibling `WhenAllOwned<T>`
+// rows below (`when_all_owned_451` suite) return `OwningTask<OwningArray<T>>`
+// — Pattern B — and are NOT affected; their `using var arr := await wa;`
+// stays exactly as-is.
 
 // §6.7 line 2875: WhenAll<T> over Task<int> — collects three int results
 // into Array<int>. The indexed results should be [10, 20, 30] in order.
@@ -134,7 +148,7 @@ BEZEL_TEST(whenall_generic_results_451, int_results_sum) {
         "    tasks.Add(Task.FromResult(20)); "
         "    tasks.Add(Task.FromResult(30)); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2]; "
         "  end Main; end C;"),
         60);
@@ -149,7 +163,7 @@ BEZEL_TEST(whenall_generic_results_451, empty_array_produces_empty_result) {
         "  public static async method Main(): Task<int> "
         "    using var tasks := new Array<Task<int>>(); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    return arr.Count; "
         "  end Main; end C;"),
         0);
@@ -167,7 +181,7 @@ BEZEL_TEST(whenall_generic_results_451, bool_results_collected) {
         "    tasks.Add(Task.FromResult(true)); "
         "    tasks.Add(Task.FromResult(true)); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    var n := 0; "
         "    if arr[0] then n := n + 1; end; "
         "    if arr[1] then n := n + 1; end; "
@@ -193,7 +207,7 @@ BEZEL_TEST(whenall_generic_results_451, async_producers_cross_thread) {
         "    tasks.Add(Produce(8)); "
         "    tasks.Add(Produce(9)); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2]; "
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
@@ -214,7 +228,7 @@ BEZEL_TEST(whenall_generic_results_451, one_faulted_propagates) {
         "    tasks.Add(Task.FromResult(1)); "
         "    tasks.Add(Boom()); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    return arr[0]; "
         "  end Main; end C;"),
         70);
@@ -235,7 +249,7 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
         "    tasks.Add(Boom()); "
         "    using var wa := Task.WhenAll(tasks); "
         "    try "
-        "      using var arr := await wa; "
+        "      var arr := await wa; "
         "      x := arr[0]; "
         "    catch Exception => x := 42; "
         "    end; "
@@ -585,7 +599,7 @@ BEZEL_TEST(task_delay_1378, starvation_regression_concurrent_delays) {
         "    tasks.Add(D()); "
         "    tasks.Add(D()); "
         "    using var wa := Task.WhenAll(tasks); "
-        "    using var arr := await wa; "
+        "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2] + arr[3] + arr[4]; "
         "  end Main; end C;";
     auto [code, elapsed_ms] = compileAndRunTimed(src);

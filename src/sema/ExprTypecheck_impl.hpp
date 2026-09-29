@@ -140,6 +140,24 @@ public:
     void run(const ast::SourceFile& src);
 
 private:
+    // §22.16 contract-clause static-requires state. The `static` qualifier
+    // on a clause demands the proven tier; sema's enforcement fires from
+    // the IdentifierExpr handler and from the per-clause walker. The bit
+    // is detected by pointer-matching `&e` against
+    // `currentMethodDecl_->clauses[i].expr.get()` — only the TOP-LEVEL
+    // visitExpr of a clause expression matches, never a recursive visit,
+    // so a single guard at the top of visitExpr is sufficient. RAII so the
+    // flag is restored on every return path through visitExpr (including
+    // the IdentifierExpr branch's many early returns on a bare-name
+    // identifier that is itself a clause expression, e.g. the
+    // `static requires(myConst)` shape).
+    struct ClauseStaticGuard {
+        ExprTC* tc;
+        bool saved;
+        bool entered;
+        ClauseStaticGuard(ExprTC* t, const ast::Expr& e);
+        ~ClauseStaticGuard();
+    };
     // Per-walker scope for identifier lookups inside method bodies (slice 3b).
     struct Scope {
         std::unordered_map<std::string_view, Symbol*> names;
@@ -551,6 +569,18 @@ private:
     // sema layer does not pull in the AST header for a 3-valued flag.
     enum class ContractClauseKind { None, Requires, Ensures };
     ContractClauseKind currentClauseKind_ = ContractClauseKind::None;
+    // §22.16: a `static` clause qualifier demands the proven tier. The
+    // clause loop in ExprTypecheck.cpp's runMethodBody sets the kind and
+    // `inContractClause_` flags before calling visitExpr(*c.expr); this
+    // third flag carries the `static` bit (the AST node has it; the
+    // sema layer keeps a mirrored bool to avoid an AST header include).
+    // Set / restored inside visitExpr via a clause-entry guard that
+    // matches the clause expression by pointer (the only AST node whose
+    // pointer matches `currentMethodDecl_->clauses[i].expr.get()` is the
+    // top-level clause visit — sub-expression visits never match, so
+    // the flag stays set throughout the recursive walk and restores
+    // cleanly on return).
+    bool currentClauseIsStatic_ = false;
 
     // per §24: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
@@ -583,6 +613,24 @@ private:
     // current IndexExpr is NOT a ref/out operand and the gate fires
     // normally for write-only indexers.
     const ast::Expr* refOutArgTargetNode_ = nullptr;
+
+    // fix #4806 (§12.7 / §22.3, v0.307): the bare `ref`/`out` operands whose
+    // §12.7 narrowing the IdentifierExpr visit deliberately did NOT apply
+    // (they name the DECLARED location). Read only by the two §22.3
+    // exact-referent diagnostics, which append a copy-out hint when the
+    // mismatching operand is in this map: the user almost certainly meant
+    // the narrowed type, and the sound way to pass it is a fresh local.
+    //
+    // narrow #4806 (§12.7 / §22.3, v0.307): maps to the NARROWED TypeRef
+    // captured at the moment the narrowing was suppressed (rather than a bare
+    // presence set), because the call-argument visit that runs right after
+    // this one unconditionally erases `narrowings_[sym]` for every ref/out
+    // operand (§7.4 invalidation, ExprTypecheck_Exprs.cpp ~9192) — by the
+    // time checkArgsAgainstParams builds the diagnostic, `narrowings_` no
+    // longer has the entry. Capturing the type here, before that erasure, is
+    // what lets the hint verify the copy-out it suggests actually type-checks
+    // (narrow #4806's Note A).
+    std::unordered_map<const ast::Expr*, TypeRef*> refOutSuppressedNarrowing_;
 
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
@@ -641,8 +689,16 @@ private:
     bool pendingLambdaArgContext_ = false;
 
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
-    // (the async task wrapper). Used to detect a forgotten `await`.
+    // (the async task wrapper). Used to detect a forgotten `await`. STRICT
+    // (non-nullable): use for §30.1 / §30.6's declared-wrapper checks where a
+    // `Task?` is a different question.
     bool isTaskShapedRef(const TypeRef* t) const;
+
+    // fix #4443 (v0.302, §17.13 / §28.3 Keying rule): the task-family
+    // predicate with nullability STRIPPED. Used by §17.13's discard + anonymous-
+    // binding halves and by §28.3's mint-announcing sites (calls-mint, function-
+    // slot threading) where the rule keys on "is this a Task-family value".
+    bool isTaskFamilyRef(const TypeRef* t) const;
 
     // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
     // class-or-interface slot that triggers the Concrete-slot function bodies
@@ -825,8 +881,13 @@ private:
     // too. `target` must already be resolved to the collection's own type
     // (`[N]T` or a §15.4 builtin-collection head); a non-collection or
     // unresolved target is a no-op.
+    // `freeTypeParamNames` (narrow #4915): at a generic call's argument, the
+    // callee's own unsubstituted method type parameters, forwarded to each
+    // element's `checkAssignable` exactly as the argument-level check does.
     void checkCollectionLiteralElementAssignability(
-        const ast::CollectionLiteralExpr& cl, TypeRef* target);
+        const ast::CollectionLiteralExpr& cl, TypeRef* target,
+        const std::unordered_set<std::string_view>* freeTypeParamNames =
+            nullptr);
 
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
@@ -834,6 +895,14 @@ private:
     // before visiting the lambda argument so an untyped LINQ lambda parameter
     // is typed as the element type (its body can then resolve `p.x`).
     TypeRef* linqLambdaElementType(const ast::Expr* callee);
+
+    // stdlib §2.20 / spec §35.2: the parameter type of the function argument
+    // of a compiler-provided `Result<T, E>` value-payload combinator —
+    // `Map(f: (T) -> U)` / `AndThen(f: (T) -> Result<U, E>)` take T,
+    // `MapError(f: (E) -> F)` takes E. Used to set pendingLambdaParamType_
+    // before visiting the lambda argument, exactly as the LINQ/event-handler
+    // threads above do. Null when the call is not such a combinator.
+    TypeRef* resultCombinatorLambdaParamType(const ast::Expr* callee);
 
     // stdlib §5 / §9.6: the element type T of a LINQ *source* TypeRef (a
     // collection, lazy IEnumerable sentinel, Range<T>, or string). Factored out
@@ -1175,6 +1244,20 @@ private:
         std::vector<TypeRef*>& out,
         std::vector<std::unique_ptr<TypeRef>>& owned);
 
+    // fix #4892 (§5.1 reference conversions, §12.9, v0.307): does the
+    // user-declared Named type `from` reach an instantiation of the BUILTIN
+    // generic interface head of `to` (null declaration, e.g. `IEnumerable<T>`)
+    // that converts to `to` under §12.9? Walks `from`'s user ancestors with
+    // substitution (as collectAncestorInstantiationsOf), their no-TypeSymbol
+    // builtin bases, and the builtin hierarchy table from each. Returns true
+    // (conservative accept) when no instantiation of the head is found — base
+    // conformance is userTypeImplementsBuiltinIface's question, not this one's
+    // — or when an unmodeled builtin base leaves the closure incomplete; false
+    // only when every instantiation found is provably incompatible.
+    bool userTypeBuiltinInstantiationConverts(
+        const TypeRef* from, const TypeRef* to,
+        const std::unordered_set<std::string_view>* freeNames);
+
     // §14.1/§14.5 phase 1 (#785, #850, #896, #4089/#4183): structurally
     // unify a value parameter's declared type (`pt`, AST) against the call
     // argument's resolved type (`argTy`), binding each method type
@@ -1472,6 +1555,72 @@ private:
     // distinct). Identity is handled by the caller.
     static bool primitiveWidens(PrimitiveType from, PrimitiveType to);
 
+    // fix #4655 (§5.1, v0.307): names the specific §5.1 "never implicit" /
+    // "constant narrowing" sub-rule that rejects a Primitive-Primitive pair
+    // `checkAssignable` has already determined is neither identity nor a
+    // `primitiveWidens` widening — in the spec's own wording — or returns
+    // empty when none of the closed-form rules names the pair. `fromExpr`
+    // (nullable) is consulted for the constant-narrowing case; see the
+    // definition for the precedence rationale.
+    std::string primitiveNeverImplicitReason(const ast::Expr* fromExpr,
+                                             PrimitiveType from,
+                                             PrimitiveType to);
+
+    // fix #4501 (§5.1/§6.2/§17.3/§8.4, v0.306): THE answer to "does §5.1
+    // admit an implicit conversion between these two operand types?", asked
+    // once for every binary operator that needs it. `typeBinary` carried TWO
+    // copies of this question — one in the equality/relational arm, one in the
+    // §6.2 arithmetic-promotion arm — and BOTH bailed out on any pair that was
+    // not numeric-vs-numeric, which is how `string = 0`, `bool = 0`,
+    // `bool = "x"` and `decimal = "x"` reached codegen. Reports and returns
+    // true iff the pair is inadmissible; the caller then does its own
+    // error-recovery typing.
+    //
+    // `allowLiteralAdoption` is the §5.1 constant-narrowing escape ("`uint >
+    // 1000`"): the equality/relational arm has had it since #1204. fix #4512
+    // (§5.1/§6.2, v0.306) enables it for the arithmetic arm too (`ulong +
+    // 1000` now admits, matching `ulong > 1000`) and narrows the escape's own
+    // predicates (`isLiteralDerivedExpr`, and the true-integer-only target
+    // check inside this function) to §5.1's exact domain — see that fix's
+    // citation trail for why the escape needed narrowing before it could be
+    // safely enabled for a second call site.
+    bool reportNoImplicitConversionBetweenOperands(const ast::BinaryExpr& be,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption);
+
+    // fix #4513 (§5.1/§6.2/§6.6, v0.306): the SAME question as above, asked
+    // from a position with no `ast::BinaryExpr` to hand — the §6.6 compound-
+    // assignment family check (ExprTypecheck.cpp), whose "operands" are an
+    // AssignmentStmt's `target`/`value`. The BinaryExpr overload delegates
+    // here; `leftExpr`/`rightExpr` are only consulted for the §5.1 constant-
+    // narrowing escape's literal-derived test (`isLiteralDerivedExpr`) and may
+    // be null (then the escape never applies from that side).
+    bool reportNoImplicitConversionBetweenOperands(SourceLocation loc,
+                                                   std::string_view op,
+                                                   const TypeRef* lt,
+                                                   const TypeRef* rt,
+                                                   bool allowLiteralAdoption,
+                                                   const ast::Expr* leftExpr,
+                                                   const ast::Expr* rightExpr);
+
+    // fix #4513 (§3.5/§6.6, v0.306): the §3.5 per-operand-type table's `bool`
+    // exclusion from the arithmetic (`+ - * /`) and ordering (`< <= > >=`)
+    // families — fix #4500's typeBinary gate, extracted so the §6.6 compound-
+    // assignment family check can ask the IDENTICAL question about the SAME
+    // (target, right-hand-operand) pair instead of falling through to the
+    // §6.6 write-back diagnostic, which names a binary result type (`bool`)
+    // the binary path no longer computes for that pair. `+` defers to string
+    // concatenation when either operand is `string` (§4.6 is the more
+    // specific authority there), exactly as the typeBinary gate does. Reports
+    // and returns true iff the pair is excluded; unlike the BinaryExpr call
+    // site, the caller here does its own consequence (typeBinary does
+    // error-recovery typing; the compound-assignment check just stops).
+    bool reportBoolOperandExcludedFromArithmeticOrOrdering(
+        SourceLocation loc, std::string_view op, const TypeRef* lt,
+        const TypeRef* rt);
+
     // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
     // `from`'s transitive base-type chain (base class or implemented
     // interface)? BFS, cycle-guarded.
@@ -1543,6 +1692,26 @@ private:
         const std::unordered_set<std::string_view>* freeTypeParamNames =
             nullptr);
 
+    // fix #4897 (§27.1.1 v0.307 / §27.6): a BARE (unqualified) method-group
+    // identifier — `OnS` where `OnS` names an enclosing method, as opposed to
+    // the qualified `C.OnS` / `obj.OnS` spelling — never receives a Function
+    // TypeRef from the ordinary IdentifierExpr name-lookup cascade
+    // (ExprTypecheck_Exprs.cpp's "Slice 3b" symbol-kind arms cover
+    // LocalSymbol/ParameterSymbol/FieldSymbol/PropertySymbol/ConstMemberSymbol
+    // but not MethodSymbol), so `checkAssignable`'s `from` arrives null and
+    // the parameter-slot check is skipped entirely — silently accepting any
+    // param-type mismatch. This helper builds the Function TypeRef a bare
+    // method-group reference denotes, mirroring the MethodSymbol branch
+    // `resolveMemberAccess` already applies for the QUALIFIED spelling
+    // (ExprTypecheck_Calls.cpp, `else if (auto* ms = dynamic_cast<
+    // MethodSymbol*>(member))`) — that function is out of scope for this fix
+    // (a different lane owns chain/ctor applicability), so the shape is
+    // duplicated here rather than refactored out. Called from checkAssignable
+    // and from checkEventHandlerArgument (the `+=`/`-=` desugaring), which
+    // shares the same null-`from`/null-`h` gap for a bare event handler.
+    // Returns nullptr when `ms` is null or has no synthesizable shape.
+    TypeRef* functionTypeFromBareMethodSymbol(MethodSymbol* ms);
+
     // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
     // every §5.1 conversion site. Verbatim (v0.240):
     //
@@ -1565,6 +1734,27 @@ private:
     // hand-maintained list of statement kinds.
     TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                        TypeRef* from, TypeRef* to);
+
+    // §25.2 "the ordinary argument rules" / §5.1 "Constant narrowing" (#5063,
+    // v0.307): does a PRIMITIVE operand of static type `at` (from expression
+    // `operandExpr`, when known) match a PRIMITIVE operator/parameter type
+    // `pt`? Identity and §5.1 numeric widening always match. When
+    // `allowConstantNarrowing` is set and neither applies, an in-range
+    // compile-time integer CONSTANT operand additionally narrows to `pt` —
+    // §25.2: "a derived-typed operand satisfies a base-typed parameter by the
+    // ordinary argument rules," and §5.1: constant narrowing "applies at
+    // every position where this section's implicit conversions apply … and
+    // it participates in overload-resolution applicability." Delegates to
+    // narrowIntConstantToTarget — the ONE §5.1 implementation — rather than
+    // duplicating its range table; `operandExpr` may be null (an operator's
+    // non-constant operand, e.g. a compound assignment's target, which is
+    // never itself a constant), in which case narrowing is simply
+    // unavailable and only identity/widening are tested. Shared by
+    // findBinaryOperator (ExprTypecheck_Exprs.cpp) and the compound-
+    // assignment Named-target operator search (ExprTypecheck.cpp) so the
+    // two candidate-matching copies ask the SAME primitive-operand question.
+    bool primitiveOperandMatchesParam(const ast::Expr* operandExpr, TypeRef* at,
+                                      TypeRef* pt, bool allowConstantNarrowing);
 
     // §14.1 (#2926): does `t` mention a generic type parameter that is still
     // UNSUBSTITUTED at this point — one of the enclosing type's (currentType_)
@@ -1605,6 +1795,52 @@ private:
     void collectExtensionTargetTypeParamNames(
         const ast::Type& target,
         std::unordered_set<std::string_view>& out) const;
+
+    // fix #4810 (§14.2): does the named type parameter carry ANY `where`-
+    // clause constraint in the current enclosing type/method/extension
+    // declaration? The #4810 arm rejects primitive-literal initializers into a
+    // type-parameter-typed storage slot at the DECLARATION (per the issue
+    // body's "unconstrained type parameter" wording), but the spec's
+    // instantiation-time check (§14.2: "operations that copy T (assignment,
+    // parameter passing by value, returning by value) are checked at
+    // instantiation") deliberately keeps the CONSTRAINED case as a deferred-
+    // to-instantiation conversion; the deferred-to-instantiation path is the
+    // one an existing test (`generic_ref_out_exact_unification_1686__…`) pins
+    // and the fix's narrow issuance must not collide with. Answering "does
+    // ANY `where T: …` clause in scope name this param?" is enough — a clause
+    // for a name means the parameter is constrained and we skip; absent any
+    // clause the parameter is unconstrained and we fire.
+    bool isCurrentScopeTypeParamConstrained(std::string_view name) const;
+
+    // fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4, §19.3, v0.300): does
+    // `t` mention a free/rigid type parameter of the ENCLOSING scope anywhere —
+    // the shape (`Named` + no decl + no args + non-empty head) used as a proxy
+    // by the file-local `refMentionsTypeVariable` (~7448) is ALSO the shape
+    // every null-declaration stdlib builtin (`Task`, `Exception`, `IDisposable`,
+    // `Mutex`, `Semaphore`, `DateTime`, `TimeSpan`, `Guid`, `StringBuilder`,
+    // `Random`, `File`, `Path`, `IntPtr`, `CString`, ~50 names — #4229) takes
+    // after type resolution, so the structural guess returns TRUE for those
+    // builtins and the #1927/#1939/#2006/#2012/#2018 erasure guards silently
+    // admit `MyExc<Task>` arms / `Wrap<Task>` `is` tests / `var x: Wrap<Task>`
+    // case bindings at a non-distinguishable runtime descriptor (the
+    // §2.8.3 rule 4 confusion class). The fix: thread the actual declared
+    // names in via `currentScopeGenericParamNames()` and reuse
+    // `refOutParamTypeMentionsTypeParam`'s exact-match walk — the same authority
+    // `mentionsUnsubstitutedTypeParam` (line ~3805) and
+    // `variantGenericAssignable`'s `freeNames` set (#4199) already trust, so
+    // a null-declaration builtin that isn't one of the enclosing scope's
+    // generic parameters returns FALSE here, and the downstream guard proceeds
+    // to its reification check (#2022's `typeArgRuntimeReified`).
+    //
+    // Used by the catch-arm surface (#1939, ExprTypecheck.cpp ~17400),
+    // `typeTestInterfaceBindAmbiguous` (#1927, ExprTypecheck.cpp ~7691), the
+    // plain `is`/`as` surface (#2006, ExprTypecheck_Exprs.cpp ~2409), and the
+    // value-form case binding (#2018, ExprTypecheck_Exprs.cpp ~10360).
+    bool refMentionsTypeVariable(const TypeRef* t) const;
+    // Sibling of `refMentionsTypeVariable` for the value/expression `case`
+    // handler — was `typeTestTargetMentionsTypeVariable` in
+    // ExprTypecheck_Exprs.cpp's anonymous namespace, identical defect class.
+    bool typeTestTargetMentionsTypeVariable(const TypeRef* t) const;
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
@@ -1832,6 +2068,46 @@ private:
     // mutable-static-rule-2 (§22.12) for a field operand.
     void checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
                                  const char* kind);
+    // §9.4 (v0.236 / v0.307 "Value receivers are borrows"): in a record
+    // method body (not ctor, not static), reject any store that would land
+    // in the receiver's own storage — `this.F := e`, bare `F := e`, the
+    // same chain passed as `ref`/`out`, and `++`/`--` over the same shape.
+    // Called from checkReadonlyAssignment (every AssignOp), from
+    // checkRefOutOperandCategory (ref/out arguments), and from the
+    // IncrementStmt site. Returns true if a diagnostic was reported.
+    bool checkRecordReceiverStore(const ast::Expr& target,
+                                  std::string_view op,
+                                  const SourceLocation& loc);
+
+    // fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): true iff `sym` (a local
+    // or parameter) is CURRENTLY §12.7-narrowed (`narrowings_`), its
+    // DECLARED type is the box-holding `Object`/interface location
+    // (mirrors `narrowFromTypeTest`'s own `isBoxHoldingLocation` lambda so
+    // the two agree by construction), and the narrowed type is a VALUE
+    // type — i.e. narrowing put a §8.6 box in play, as opposed to an
+    // ordinary reference-type narrowing, which §12.7 states is unaffected
+    // ("Narrowing to a *reference* type is unaffected: no box is
+    // involved, and writes through the narrowed binding are ordinary
+    // reference-type writes").
+    bool narrowedToBoxedValue(Symbol* sym);
+
+    // fix s12_7_0002 / s12_7_0003 (§12.7, v0.307): §12.7's box-write rule,
+    // positions (i) (assignment/compound-assignment/++/--) and (ii) (a
+    // `ref`/`out` argument) — "A write whose store would land in the box
+    // is a compile error ... an lvalue chain (grammar A.6 `LValue`)
+    // extending the binding with a `.` or `[...]` hop." Walks `target`
+    // exactly as `checkLValueChainNotCallBased` does (peeling
+    // `.member`/`[index]`/postfix-`!` hops down to the chain's base) and,
+    // when the base is a §12.7-narrowed-to-a-boxed-value binding AND at
+    // least one `.`/`[...]` hop was peeled, reports the box-write error
+    // and returns true. A hop count of zero (a bare `o := …` / `ref o`)
+    // is the admitted bare-binding form and is left untouched — position
+    // (i)'s bare-binding carve-out is `checkReadonlyAssignment`'s own
+    // business, and (ii) never passes a bare identifier through this
+    // function's hop gate in the first place.
+    bool checkNarrowedBoxWrite(const ast::Expr& target, std::string_view verb,
+                               const SourceLocation& loc);
+
     // Shared by the MemberAccess and Index cases of
     // checkRefOutOperandCategory: no-setter / readonly-auto-outside-context /
     // setter-visibility for a property (incl. indexer) operand — mirrors the
@@ -2014,6 +2290,30 @@ private:
     // (a literal/arithmetic/const may; a variable or call result may not).
     std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
+    // fix #4801 (§5.2 / §17.14 / §6.3 / §6.4, v0.307): the floating/decimal
+    // sibling of foldIntConstExprTC. Folds a §17.14 constant expression whose
+    // static type is `float`, `double`, `decimal` or an integer type to its
+    // value under the run-time semantics §17.14 requires: IEEE 754 for the
+    // binary floats (a `float`-typed node computes in single precision, as
+    // codegen does; overflow to ±Infinity and NaN are VALUES), and the
+    // runtime's own exact decimal ops for `decimal`. Accepted forms: literals,
+    // `const` references (local, class-level, qualified `C.K`, and the
+    // primitive-wrapper constants `double.MaxValue` / `double.NaN` / …),
+    // unary `+`/`-`, binary `+ - * /` (and `mod` on decimal), parentheses (no
+    // AST node), and integer subtrees via foldIntConstExprTC. nullopt for
+    // anything else, and for a subexpression that itself faults (a decimal
+    // overflow or division by zero, a literal that failed §4.3/§4.4
+    // formation) — the conversion-site rule then stays silent rather than
+    // cascading.
+    struct FoldedNumConst {
+        enum class Kind { Int, Float, Double, Decimal } kind = Kind::Int;
+        long long i = 0;          // Kind::Int (ULong values are declined)
+        double d = 0.0;           // Kind::Float (exactly a float) / Double
+        std::uint32_t dec[4] = {0, 0, 0, 0};  // Kind::Decimal, bz_decimal_t
+    };
+    std::optional<FoldedNumConst> foldNumConstExprTC(const ast::Expr& e,
+                                                     int depth = 0);
+
     // fix #3617 (§17.14 / §15.1 / §22.12 / §2.8.3 rule 4, v0.286): the ONE
     // bare-identifier resolver the three ExprTC §17.14 constant folds share.
     // Resolves `name` through `lookupName` (the lexical scope chain plus the
@@ -2028,6 +2328,36 @@ private:
     // (foldIntConstExprTC's) carried #3230's imported arm; see the definition
     // for what the other two silently answered.
     std::optional<long long> foldConstIdentTC(std::string_view name, int depth);
+
+    // fix #4856 (§17.14 / §2.8.3 / §22.12, v0.307): a `const` reference
+    // denotes that const's value, and the names in its initializer were bound
+    // where it was DECLARED — visitMember's ConstDecl arm typechecks a class
+    // const's initializer with `currentScope_` = the module scope and
+    // `currentType_` = the declaring type, looking bare names up in value
+    // position. The §17.14 folds used to follow the initializer and re-resolve
+    // its names at the USE site, so a same-named local or member there
+    // (`A.K := M1` read from a class that also declares `M1`) substituted the
+    // wrong value. `inConstDeclScope(s, f)` runs `f` with lookup positioned as
+    // that visit had it when `s` is a class const with a known declaring type
+    // (otherwise `f` runs unchanged); `foldInDeclScope_` makes the folds'
+    // bare-name lookups use the same value-position order the visit used.
+    bool foldInDeclScope_ = false;
+    template <class F>
+    auto inConstDeclScope(const Symbol* s, F&& f) -> decltype(f()) {
+        auto* cms = dynamic_cast<const ConstMemberSymbol*>(s);
+        if (!cms || !cms->parent || !moduleScope_) return f();
+        Scope* const saveScope = currentScope_;
+        TypeSymbol* const saveType = currentType_;
+        const bool saveFlag = foldInDeclScope_;
+        currentScope_ = moduleScope_.get();
+        currentType_ = cms->parent;
+        foldInDeclScope_ = true;
+        auto r = f();
+        currentScope_ = saveScope;
+        currentType_ = saveType;
+        foldInDeclScope_ = saveFlag;
+        return r;
+    }
 
     // §17.14 (v0.184, #1688): does `e` contain a `/` or `mod` node whose RHS
     // folds to a compile-time zero, using the SAME identifier resolution as
@@ -2057,6 +2387,26 @@ private:
                                const ast::Expr& countExpr,
                                std::string_view opSpelling,
                                SourceLocation fallbackLoc);
+
+    // fix #4843 / §5.3 / §5.2 / §17.14 (v0.307): `T?(x)` carries "its
+    // constant-operand compile error (§5.2, §5.4)" — `T?(x)` is `T(x)` for
+    // §5.2's constant-operand rule. The non-nullable arm of the rule
+    // already runs in `typeCall` for the `CallExpr` shape (`T(x)`); the
+    // nullable arm runs through this helper from the `NullCondCallExpr`
+    // handler in ExprTypecheck_Exprs.cpp (`T?(x)`, where `?(` parses as a
+    // 2-char punctuator). `target` is the cast's destination primitive
+    // type; `targetName` is its textual spelling (e.g. `"int"` for
+    // `PrimitiveType::Int`) for the diagnostic; `operand` is the
+    // conversion's single argument; `loc` is the source location for the
+    // diagnostic. The decimal-fault arm of `foldNumConstExprTC` already
+    // emits its own §17.14 error at the constant expression (#4844); this
+    // helper adds the integer-narrowing and float/double/decimal → integer
+    // checks so `uint?(-1)` and `int?(1.0e30)` are §5.2 compile errors at
+    // the conversion site.
+    void checkNullableCastConstantOperand(const ast::Expr& operand,
+                                          PrimitiveType target,
+                                          std::string_view targetName,
+                                          SourceLocation loc);
 
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type
@@ -2521,6 +2871,64 @@ private:
     // §22.8-step-0 body serves the chain site as well as the `new` site. See
     // the definition in ExprTypecheck_Calls.cpp.
     void publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd);
+    // narrow #4791 (§12.8 / §22.5 / §22.6 / §22.10, v0.307): decide a
+    // `this(...)` chain call the resolver's arity-only self-chain check
+    // (#3793) deferred because a named argument names no parameter of the
+    // containing constructor (`deferredNamedThisChain`, SymbolCollection.cpp).
+    // Accepts only when exactly one OTHER constructor of the type binds the
+    // call by §22.5 name binding, that one is §22.6-applicable to the typed
+    // arguments, and its own chain edges cannot lead back to `cd`; rejects
+    // with a specific diagnostic otherwise. See the definition in
+    // ExprTypecheck_Calls.cpp.
+    void checkDeferredNamedThisChain(const ast::ConstructorDecl& cd);
+    // fix #4905 (§22.3 / §22.5 / §22.6, v0.307): the §22.3 call-site
+    // `ref`/`out` rule at a `this(...)` / `base(...)` chain call — reports a
+    // mismatch only when no candidate constructor binding the call accepts
+    // its modifiers. See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainRefOutModifiers(const ast::ConstructorDecl& cd);
+    // fix #4824 (§22.5 / §22.6 / §12.8, v0.307): reject a `this(...)` /
+    // `base(...)` chain call that NO candidate constructor of the target
+    // type §22.5-binds (an unbound required parameter, an unknown name, too
+    // many arguments). See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainCallBinding(const ast::ConstructorDecl& cd);
+    // fix #4854 (§12.8 / §22.5 / §22.6 / §5.1, v0.307): the §5.1 / §22.6
+    // applicability of a chain call that `binders` (explicit constructors of
+    // `target`) §22.5-bind — `checkArgsAgainstParams` for one candidate,
+    // `resolveOverload` for several. Called only from `checkChainCallBinding`.
+    // See the definition in ExprTypecheck_Calls.cpp.
+    void checkChainCallApplicability(
+        const ast::CallExpr& chain, const TypeSymbol& target, bool isThis,
+        const std::vector<ConstructorSymbol*>& binders,
+        const std::string& desc);
+    // fix #4484 (§22.5 / §22.8 step 0 / §22.10, v0.306): the `base(...)` twin
+    // of the above — the §22.5 binding of a derived constructor's leading
+    // `base(...)` arguments to the BASE class's primary-constructor parameter
+    // list, read by codegen's `prePopulateBasePositionalFields`. Called only
+    // from `publishPrimaryCtorChainBinding`, which owns the chain-call
+    // recognition both arms share. Since #4496 the binder runs with
+    // `emit=true`, so this also CHECKS the call; since #4519 a ZERO-argument
+    // `base()` reaches it too (§12.8's "requires the base class to have a
+    // parameterless constructor"). See the definition in
+    // ExprTypecheck_Calls.cpp.
+    void publishBaseChainPrimaryBinding(const ast::CallExpr& chain);
+    // fix #4549 (§12.8 / §22.5 / §22.7 / §22.10, v0.306): §12.8's
+    // "which requires the base class to have a parameterless constructor",
+    // as ONE predicate read by BOTH spellings of the same call — the
+    // IMPLICIT chain (`visitTopDecl`) and the explicit zero-argument
+    // `base()` (`publishBaseChainPrimaryBinding`). The two cannot drift
+    // because there is one body; see the definition in
+    // ExprTypecheck_Calls.cpp for what "parameterless" means for each of
+    // the three constructor forms a class can carry.
+    bool baseHasParameterlessConstructor(const TypeSymbol* base,
+                                         SourceLocation loc);
+    // fix #4549: the two spellings' diagnostics, reported from the two call
+    // sites above. `implicitSpelling` picks the remedy §12.8 names for the
+    // inserted chain ("otherwise the chain must be explicit") over the one
+    // an explicit `base()` admits (supply the arguments); the predicate and
+    // the sentence naming the defect are shared.
+    void reportNoParameterlessBaseCtor(const TypeSymbol* base,
+                                       SourceLocation loc,
+                                       bool implicitSpelling);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,
@@ -2763,6 +3171,22 @@ private:
     // apply to the same node.
     bool rejectNewOnEnumOrChoice(const ast::NewExpr& ne, const TypeRef* rt);
 
+    // fix s17_7_0003 (§17.7 / §15.1, v0.307; sibling of `rejectNewOnEnumOrChoice`
+    // just above, same shape): inline arrays declare no constructors — §17.7,
+    // verbatim: "`new [3]int(0, 1, 2)` is rejected by the type checker —
+    // inline arrays do not declare constructors, and the `new` syntax has no
+    // meaning on them." `rt->kind` for an inline-array type spelling (`[N]T`,
+    // §15.1) is `TypeRef::Kind::InlineArray`, a kind every existing `new`-
+    // classification predicate in this file guards past with
+    // `rt->kind == TypeRef::Kind::Named` — so `new [3]int(0, 1, 2)` fell
+    // through every one of them, typed cleanly with its args silently
+    // discarded, instead of being rejected. Single authority for both the
+    // explicit `new T(...)` arm (ExprTypecheck_Exprs.cpp) and the four
+    // §17.7 shorthand call sites in ExprTypecheck.cpp, mirroring
+    // `rejectNewOnEnumOrChoice`. Returns true iff `rt` is an inline-array
+    // type (i.e. iff it rejected).
+    bool rejectNewOnInlineArray(const ast::NewExpr& ne, const TypeRef* rt);
+
     // fix #4176 (§3.1/§3.2, §11.7, §12.5, §17.7, v0.298): sibling of
     // `rejectNewOnEnumOrChoice` just above, same shape — the single
     // authority for "does `new` construct a value of this NAMED
@@ -2785,6 +3209,54 @@ private:
     // constructor to check args against.
     bool rejectNewOnNonInstantiableKind(const ast::NewExpr& ne,
                                          const TypeRef* rt);
+
+    // fix #4249 (§17.7, v0.306; third sibling of `rejectNewOnEnumOrChoice`
+    // and `rejectNewOnNonInstantiableKind` above, same shape): the single
+    // authority for "§17.7 does not admit the `new()` shorthand HERE".
+    // §17.7's written-declared-type family gives its member (v) three
+    // declared-result positions, and the shorthand's own subset takes only
+    // the first: "The shorthand is permitted at the written-declared-type
+    // positions (i), (ii), (iii) and the `return e;` statement of (v) ...
+    // It is **not** permitted at an expression body or at a lambda's
+    // ascribed return". #4208 wired position (iii) and the `return e;`
+    // statement of (v), and gated that wiring on `!inLambda_` so the
+    // carve-out held — but declining to TYPE the shorthand is not the same
+    // as DIAGNOSING it. The untyped NewExpr simply fell through to codegen's
+    // #2491 zero/null backstop, so both spellings of a lambda's ascribed
+    // return — `lambda(): W => do return new(); end` (an `internal:` Warning,
+    // measured) and `lambda(): W => new()` (no diagnostic at all, measured) —
+    // compiled and then SEGV'd (exit 139, 60/60 runs) on the first member
+    // read of the null they returned. That is the same silent-wrong-answer
+    // class #4170/#4176 closed at the other shorthand sites, and #4208
+    // removed from the method-return position, left standing at this one.
+    // Reports the §17.7 exclusion at the operand's own span. `rt` may be
+    // null (a lambda whose return type would arrive only by target
+    // inference — outside the written-declared-type family entirely, per
+    // §17.7's "A lambda whose return type arrives only by target inference
+    // ... [is] outside the family"); it is used only to name the type in
+    // the suggested explicit spelling.
+    void rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                           const TypeRef* rt);
+
+    // fix s17_7_0008 (§17.7, v0.307; fourth sibling of
+    // `rejectNewShorthandAtLambdaReturn` just above, same shape — the OTHER
+    // half of the SAME exclusion clause it closes): "It is **not** permitted
+    // at an expression body (`=> new()`) or at a lambda's ascribed return."
+    // #4249 closed the lambda's-ascribed-return half (both its block-form
+    // `do return new(); end` and bare-arrow spellings); this closes the
+    // expression-body half — a member (method/operator/property-getter/
+    // accessor) whose body is `=> new()` with no target-type wiring at this
+    // position (§17.7's written-declared-type family (v) grants the
+    // shorthand only the `return e;` STATEMENT, not the expression-body
+    // spelling of the same declared-result member). Runs in
+    // `runMethodBody`'s `exprBody` branch (ExprTypecheck.cpp), BEFORE the
+    // body visit — for a typeless NewExpr the visit types nothing and
+    // reports nothing on its own, so without this call the shorthand fell
+    // straight through to codegen's #2491 zero/null backstop exactly as the
+    // two #4249 spellings did pre-fix. `rt` is the member's declared return
+    // type (may be null; handled like the lambda sibling).
+    void rejectNewShorthandAtExpressionBody(const ast::NewExpr& ne,
+                                             const TypeRef* rt);
 
     // narrow #4059 further (§9.1 / §9.2 / §9.5, v0.295): true iff
     // `new T()` is permitted on this body record (i.e. NOT the
@@ -2838,6 +3310,14 @@ private:
     // symbol the positional fields belong to (the new-target class, or the
     // enclosing class for a chain); `t->genericParams` drives the substitution
     // walk exactly as the inlined loop did. See the body in ExprTypecheck_Calls.cpp.
+    // fix #4806 (§12.7 / §22.3, v0.307): suffix for the §22.3 exact-referent
+    // diagnostic when the mismatching `ref`/`out` operand is a bare
+    // identifier whose §12.7 narrowing was suppressed (it names the DECLARED
+    // location). Empty otherwise. Names the copy-out remedy.
+    std::string refOutNarrowedCopyOutHint(const ast::Expr& operand,
+                                          const TypeRef* paramTy,
+                                          std::string_view mod) const;
+
     void checkPositionalArgsAssignable(
         const std::vector<const Symbol*>& fields, const BindResult& b,
         const std::vector<ast::CallArgument>& args,
@@ -3039,6 +3519,28 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+
+    // §2.7 (v0.307) / fix #5012, #5013: does `headExpr` denote the builtin
+    // `System.Threading.<clsName>` class through a QUALIFIED
+    // (`System.Threading.<clsName>`) or ALIASED (`<alias>.<clsName>` under
+    // `import System.Threading as <alias>;`) spelling? `System.Threading`
+    // is a stdlib pseudo-module with no real loaded artifact
+    // (ctx_.importedTypesOf("System.Threading") is always null), so the
+    // general §2.2/§2.7 machinery in resolveMemberAccess (partialModulePaths_
+    // / sourceImports_, which only track real imported-module metadata)
+    // never recognizes it; this is the narrow additional case for the two
+    // builtin class names that have a static-dispatch special case
+    // elsewhere in this file (`Task`, stdlib §6.7; `CancellationToken`,
+    // stdlib §6.1). Guards against the two shadowing pitfalls named in
+    // #5012/#5013: a user module `System.Threading.Tasks` (plural) never
+    // matches, because it requires the immediate qualifier to be exactly
+    // `System.Threading` (member == "Threading"); and a local declaration
+    // that shadows `System` or the alias name (`!lookupName(...)`) is
+    // preferred over the builtin per §2.7 rule 1 ("local scope ... before
+    // import aliases").
+    bool isQualifiedBuiltinThreadingHead(const ast::Expr* headExpr,
+                                         std::string_view clsName);
+
     // fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §7.5, v0.254): the
     // #2884 + #2943 imported-property access declines, asked ONCE for both
     // the `.` and the `?.` spelling (they are distinct AST nodes and only
@@ -3080,6 +3582,30 @@ private:
     bool inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
                                    bool* outNeedsInfer);
 
+    // fix #4895 (§14.5 phase 3 + §15.4, v0.307): true iff the collection
+    // literal argument `cl` at a generic-method parameter position actually
+    // binds the method's type parameter named `tpName`. A literal binds T
+    // only when its elements share a single DETERMINED type — the element
+    // type is what unifies with the parameter's element type and
+    // substitutes in for T. Heterogeneous elements (`["s", new A()]`),
+    // empty literals, dictionary literals (`[k: v]`), and elements whose
+    // typecheck cascaded to Error all leave T unbound.
+    bool collectionLiteralBindsTypeParam(const ast::CollectionLiteralExpr& cl,
+                                         std::string_view tpName);
+
+    // fix #4895 rework-redo (§14.5 + §15.4, v0.307): true iff the literal's
+    // elements do not all share a single TypeRef (heterogeneous elements).
+    // Empty literals and dict-form literals return false (not
+    // heterogeneous — no element to coerce, or different slots entirely);
+    // elements that resolved to Error cascade as not-heterogeneous (already
+    // failing elsewhere). The heterogeneous-literal classifier catches the
+    // silent binder-coercion class (D1 `F(["s", 1], xs: Array<int>)` printed
+    // v=4435280) where the binder coerces heterogeneous elements against a
+    // type parameter T that another argument has already bound, without
+    // checking that the literal's element types actually fit T.
+    bool collectionLiteralIsHeterogeneous(
+        const ast::CollectionLiteralExpr& cl);
+
     // Recursive unification of a declared return TypeRef against a concrete
     // target TypeRef, binding any type-parameter names in `paramNames` into
     // `solved`. Returns false on a structural mismatch that prevents solving.
@@ -3113,6 +3639,38 @@ private:
     // event declared on a base class (§24). `Subscribe` is never flagged.
     void checkEventVisibilityFence(EventSymbol* es, std::string_view op,
                                    SourceLocation loc);
+
+    // fix #4869 (§17.2 / §27.1.1 / §5.1, v0.307; stdlib §6.5): the handler
+    // of an event-subscription form `lhs += h` / `lhs -= h` is the argument
+    // of the desugared `lhs.Add(h)` / `lhs.Remove(h)`, whose parameter is
+    // `(T) -> ()` (`(T) -> Task` on AsyncEventSource<T>). Checks the
+    // already-visited handler `as.value` against that parameter's slot
+    // shape given the payload type `payload`. Defined in ExprTypecheck.cpp.
+    // fix #4968: `payload` null is a no-payload event (handler `() -> ()`);
+    // `isAsync` selects the `Task` return slot, checked only when
+    // `asyncKnown`.
+    void checkEventSubscriptionHandler(const ast::AssignmentStmt& as,
+                                       TypeRef* payload, bool isAsync,
+                                       bool asyncKnown);
+
+    // fix #4968 (stdlib §6.5; spec §27.1.1/§27.6, v0.307): the handler check
+    // shared by the `+=`/`-=` forms and the direct Subscribe/Add/Remove calls
+    // on a plain event. `op` is the operator for the `+=`/`-=` forms and
+    // empty for a call; `callee` names the resolved method. Defined in
+    // ExprTypecheck.cpp.
+    void checkEventHandlerArgument(const ast::Expr* value, TypeRef* payload,
+                                   bool isAsync, bool asyncKnown,
+                                   std::string_view op,
+                                   std::string_view callee);
+
+    // fix #4968: if `callee` is `Subscribe`/`Add`/`Remove` on a plain event
+    // (an `event` member, EventSource<T>/AsyncEventSource<T>, or — for
+    // `Subscribe` only — IEvent<T>/IAsyncEvent<T>), fill the handler slot's
+    // payload (null for no payload), async-ness and whether that is known,
+    // and return true. The shared pair is excluded: codegen's #4901 gate
+    // owns it. Defined in ExprTypecheck_Calls.cpp.
+    bool plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
+                               bool& isAsync, bool& asyncKnown);
 
     // §13.1 member-visibility enforcement (issue #432). Checks that the
     // member `msym` accessed at `loc` is visible from the current type
@@ -3207,6 +3765,15 @@ private:
                                                          std::size_t arity);
 
     void typeBinary(const ast::BinaryExpr& be);
+    // fix-forward #4807 (§4.6/§3.5/§6.1, v0.307): the body of `typeBinary`.
+    // `typeBinary` runs it, then applies the §4.6 string-operand rule for
+    // `-`/`*`/`/`/`mod` only where no more specific rule already rejected.
+    // `stringArithRuleReached` is set when the body reaches the built-in
+    // arithmetic arm's §4.6 position — never on the §25 user-operator path
+    // (§25.2: an overload may pair its type with `string`), so the wrapper
+    // applies the rule exactly where #4807 originally did.
+    void typeBinaryRules(const ast::BinaryExpr& be,
+                         bool& stringArithRuleReached);
 
     // §17.1 result-type table for unary operators (slice 3c).
     // §25: a user-defined unary `operator <op>` (one parameter) declared on
@@ -3230,6 +3797,22 @@ private:
     // OWNING `Span<T>` (over an `OwningBuffer`) is NOT matched here.
     std::string moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const;
 
+    // §4.14 (#4670-class, l4_14_0010): if `operand` is `buf[i]` whose receiver
+    // has an `OwningBuffer<T>` static type and T is value-typed (a primitive,
+    // record, enum, value-like or borrow-bearing choice, inline array of
+    // values, function value, value builtin, or the unit type — anything
+    // whose slot semantics dispatch on the value-presentation arm), return
+    // the receiver's display name; otherwise the empty string. Such a slot
+    // holds no ownership to transfer: the value-typed `OwningBuffer<T>`
+    // presentation stores T directly (no nullability wrapper), so `move`
+    // would read a plain value and pretend an ownership transfer happened.
+    // Spec §4.14's *Value-typed T* bullet: "`move buf[i]` is not admitted;
+    // values are read with the plain indexer and copied at the use site."
+    // The class-typed presentation of `OwningBuffer<T>` (slots hold `T?`)
+    // IS admitted by `move` and is NOT matched here.
+    std::string moveThroughOwningBufferValueElementName(
+        const ast::Expr& operand) const;
+
     // §19.3 / §15.3 (v0.184, #1665): if `operand` is `s[i]` where `s` is a
     // `case`/`when` pattern binding (a LocalSymbol whose `decl` is a pattern
     // `BindingPattern`, not a plain `var`-declared LocalDecl) over a MOVE-ONLY
@@ -3251,6 +3834,28 @@ private:
     // the original scrutinee still holds.
     std::string moveThroughBorrowedMoveOnlyArrayWholeBindingName(
         const ast::Expr& operand) const;
+
+    // §28.3 / §28.8.1 (issue #4284): if `operand` is a read of a non-`owned`
+    // FIELD (`recv.f` via MemberAccessExpr, or the bare-identifier implicit
+    // `this.f` form), return the field's display name (the bare identifier for
+    // the implicit-`this` form, the textual receiver.field for the explicit
+    // form); otherwise the empty string. A class-typed field with no `owned`
+    // annotation holds a borrow (§28.3: "An unmarked read of a class-typed
+    // binding never consumes…"), so `move <field>` is rejected at compile
+    // time — accepting it would classify the read as an owned transfer, the
+    // program's reclaim-eligibility walk would treat the moved-from slot as a
+    // fresh owned value, and disposing both the `move` result and the original
+    // owner would free the same backing storage twice (a heap-use-after-free
+    // measured in the issue's repro under `--sanitize=address`). The leaf
+    // field's `owned` modifier is the single authority here — the receiver's
+    // ownership status (a borrow of a non-owned field is also a borrow) is
+    // irrelevant; only the field-shape "this slot owns storage" qualifies it
+    // for a `move` transfer. The legal forms `move obj.f` / `move this.f` /
+    // `move _f` / `move obj.f!` / `move this.f!` / `move _f!` over an
+    // `owned`-modified field are NOT matched (the modifier check excludes them),
+    // and `move obj.f!` over a STATIC `owned` field is rejected elsewhere by
+    // the #2021 receiver classification.
+    std::string moveOnNonOwnedFieldName(const ast::Expr& operand) const;
 
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a

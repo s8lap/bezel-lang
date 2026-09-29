@@ -33,7 +33,7 @@ end ICounter;
 class Impl : IFactory, ICounter
   private owned _x: T? := null;
   public method Absorb(owned x: T)
-    _x := move x;
+    _x := x;
   end Absorb;
   public method Bump(ref n: int)
     n := n + 1;

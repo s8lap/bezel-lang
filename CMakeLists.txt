@@ -134,10 +134,107 @@ endif()
 #  * lld: a much faster linker than the default bfd/gold for the 60M test
 #    binary, which is relinked on every change.
 find_program(BEZEL_CCACHE ccache)
+#  * #5010 RELOCATABLE ccache keys (cross-worktree hits). By default every
+#    object's ccache key embeds its worktree's absolute path (the -c/-I
+#    arguments, and the cwd via DWARF comp_dir), so a fresh worktree at the SAME
+#    commit misses on every TU. When the build dir lives PHYSICALLY inside the
+#    source tree (a real ./build, no symlink between them) we make the keys
+#    tree-independent:
+#      - ccache `base_dir=<tree>`, passed on the launcher command line
+#        (`ccache KEY=VALUE compiler ...`), so it is per-build and never read
+#        from or written to the user's global ccache.conf;
+#      - `-ffile-prefix-map=<tree>=.` on every TU, so the OBJECT is
+#        tree-independent too (DW_AT_comp_dir "./build", __FILE__ "./src/..."),
+#        which is what makes serving tree A's object to tree B correct rather
+#        than merely a hit (ccache logs "Relocating debuginfo from <tree> to .");
+#      - per-tree absolute paths only in the TUs that need them (Driver.cpp for
+#        the runtime archive; one generated TU for the test harness — see
+#        tests/CMakeLists.txt), so those few TUs miss, correctly, and the rest
+#        hit;
+#      - `-Xclang -fno-pch-timestamp` on the test PCH (tests/CMakeLists.txt);
+#      - the test PCH itself is NEVER served from ccache (#5073): a clang PCH
+#        embeds its own tree's absolute input paths, so a PCH from tree A is
+#        unusable once A is removed. It is compiled per tree, and its
+#        consumers key on a content-derived, tree-independent `<pch>.sum`
+#        (ccache option `pch_external_checksum=true`) instead of the PCH
+#        bytes -- see tests/pch_sum_launcher.sh for the staleness argument.
+#        NB it is a BOOLEAN OPTION, not a sloppiness value: ccache silently
+#        ignores an unknown sloppiness word, which left every PCH'd TU
+#        missing across trees. The launcher also passes
+#        `sloppiness=pch_defines,time_macros`, which REPLACES the ccache.conf
+#        value for this build (the two values CLAUDE.md requires there).
+#    Measured (#4991, #5010): a PCH'd test TU 6-9 s cold -> ~1.4 s from the
+#    cache of a sibling worktree.
+#    WHY ONLY IN-TREE: base_dir rewrites paths relative to the compiler's
+#    PHYSICAL cwd. With build/ a symlink to /mnt/fast/lane-builds/<name> the
+#    rewritten paths still contain the lane name (no hit — #4991 measured 0/3),
+#    and worse, the relative paths in the -MD depfiles are then joined by CMake
+#    against the LOGICAL build dir, i.e. resolve to the wrong file: header edits
+#    would stop triggering rebuilds. So the mode is OFF for that layout and
+#    FATAL if forced on there.
+#    DEBUGGING a relocatable build: debug paths are relative to the worktree
+#    root. Start gdb from the worktree root (or `directory <tree>` /
+#    `set substitute-path . <tree>`); addr2line/llvm-symbolizer/ASan print
+#    `./build/../src/x.cpp:N`-style paths, which read correctly from the root.
+set(_bezel_in_tree_build OFF)
+file(RELATIVE_PATH _bezel_bin_rel "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+if(NOT _bezel_bin_rel STREQUAL "" AND NOT _bezel_bin_rel MATCHES "^\\.\\.(/|$)"
+   AND NOT IS_ABSOLUTE "${_bezel_bin_rel}")
+    file(REAL_PATH "${CMAKE_SOURCE_DIR}" _bezel_src_real)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _bezel_bin_real)
+    # No symlink anywhere between the tree root and the build dir: the
+    # physical and logical `..` chains then agree (see WHY ONLY IN-TREE).
+    if(_bezel_bin_real STREQUAL "${_bezel_src_real}/${_bezel_bin_rel}")
+        set(_bezel_in_tree_build ON)
+    endif()
+endif()
+option(BEZEL_CCACHE_RELOCATABLE
+    "Tree-independent ccache keys (#5010); default ON for an in-tree build dir"
+    ${_bezel_in_tree_build})
 if(BEZEL_CCACHE)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
-    set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
-    message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
+    if(BEZEL_CCACHE_RELOCATABLE AND NOT _bezel_in_tree_build)
+        # A cached ON from an earlier layout must not survive a move to a
+        # symlinked/out-of-tree build dir: that combination mis-resolves
+        # depfiles (see WHY ONLY IN-TREE above).
+        message(FATAL_ERROR
+            "BEZEL_CCACHE_RELOCATABLE=ON requires the build dir to be a real "
+            "directory inside the source tree (${CMAKE_BINARY_DIR} is not). "
+            "Reconfigure with -DBEZEL_CCACHE_RELOCATABLE=OFF.")
+    endif()
+    if(BEZEL_CCACHE_RELOCATABLE)
+        set(BEZEL_CCACHE_RELOCATABLE_LAUNCHER
+            "${BEZEL_CCACHE}" "base_dir=${CMAKE_SOURCE_DIR}"
+            "sloppiness=pch_defines,time_macros" "pch_external_checksum=true")
+        # #5073: pch_external_checksum is what lets PCH'd test TUs hit across
+        # trees. An old ccache without the option would ignore it (correct,
+        # but every PCH consumer misses), so say so instead of degrading
+        # silently.
+        execute_process(COMMAND "${BEZEL_CCACHE}" -k pch_external_checksum
+            RESULT_VARIABLE _bezel_ccache_extsum_rc OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _bezel_ccache_extsum_rc EQUAL 0)
+            message(WARNING "ccache (${BEZEL_CCACHE}) does not know "
+                "pch_external_checksum: test TUs using the PCH will not hit "
+                "the cache across worktrees (#5073).")
+        endif()
+        # The real path of the tree, for tests/pch_sum_launcher.sh (#5073).
+        set(BEZEL_SOURCE_DIR_REAL "${_bezel_src_real}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${BEZEL_CCACHE_RELOCATABLE_LAUNCHER})
+        set(CMAKE_C_COMPILER_LAUNCHER ${BEZEL_CCACHE_RELOCATABLE_LAUNCHER})
+        add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
+        if(NOT _bezel_src_real STREQUAL CMAKE_SOURCE_DIR)
+            # The tree reached through a symlinked ancestor (e.g. a worktrees
+            # dir that points at the NVMe): clang may see either spelling.
+            add_compile_options("-ffile-prefix-map=${_bezel_src_real}=.")
+        endif()
+        message(STATUS "Bezel: using ccache (${BEZEL_CCACHE}), relocatable "
+                       "keys (base_dir + prefix map, #5010)")
+    else()
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+        set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+        message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
+    endif()
+elseif(BEZEL_CCACHE_RELOCATABLE)
+    set(BEZEL_CCACHE_RELOCATABLE OFF CACHE BOOL "" FORCE)
 endif()
 #    mold is preferred when available (faster than lld on the large test-binary
 #    link and on incremental relinks); lld is the fallback, then the default.
@@ -145,9 +242,11 @@ find_program(BEZEL_MOLD ld.mold)
 find_program(BEZEL_LLD ld.lld)
 if(BEZEL_MOLD)
     add_link_options(-fuse-ld=mold)
+    set(BEZEL_FUSE_LD -fuse-ld=mold)
     message(STATUS "Bezel: using mold linker")
 elseif(BEZEL_LLD)
     add_link_options(-fuse-ld=lld)
+    set(BEZEL_FUSE_LD -fuse-ld=lld)
     message(STATUS "Bezel: using lld linker")
 endif()
 #  * split DWARF: the RelWithDebInfo build carries full `-g` debug info, and
@@ -161,6 +260,63 @@ if(CMAKE_BUILD_TYPE MATCHES "Deb" AND
    (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
     add_compile_options(-gsplit-dwarf)
     message(STATUS "Bezel: using split DWARF (-gsplit-dwarf)")
+    set(BEZEL_SPLIT_DWARF ON)
+endif()
+#  * no GNU pubnames (#5069): under -gsplit-dwarf clang defaults to emitting
+#    .debug_gnu_pubnames/.debug_gnu_pubtypes, an accelerator table meant for a
+#    linker-built .gdb_index. Nothing here builds one (no --gdb-index), so the
+#    tables are pure write volume: 1.3 MB of a 2 MB bezel_core object and 77 MB
+#    of the 311 MB codegen test binary, rewritten on every relink. Without them
+#    gdb/lldb/llvm-symbolizer still resolve symbols (they index the DWARF
+#    themselves, a little slower on first load). Gated on the compiler accepting
+#    the flag, with a clang-style feature check rather than a version test.
+if(BEZEL_SPLIT_DWARF)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-gno-gnu-pubnames BEZEL_HAS_GNO_GNU_PUBNAMES)
+    if(BEZEL_HAS_GNO_GNU_PUBNAMES)
+        add_compile_options(-gno-gnu-pubnames)
+        message(STATUS "Bezel: not emitting GNU pubnames (-gno-gnu-pubnames)")
+    endif()
+endif()
+#  * compressed debug sections (#5069): the debug info that remains is still
+#    most of the bytes written. .debug_line alone is 178 MB of the codegen test
+#    binary, and each .dwo is 2-3x its object. `-gz=<fmt>` compresses the debug
+#    sections of every object AND .dwo at compile time, and
+#    `--compress-debug-sections=<fmt>` makes the linker keep them compressed in
+#    the output; without it the linker inflates them back. zlib, NOT zstd:
+#    Fedora's gdb 17.2 is built with a BFD that lacks zstd and REFUSES a
+#    zstd-compressed binary outright ("not in executable format"), as do the
+#    BFD-based binutils (addr2line). zlib is read by every consumer here: gdb,
+#    addr2line, llvm-symbolizer (ASan and LLVM backtraces), mold and GNU ld.
+#    Each half is gated on its own feature check (the link check uses the
+#    linker chosen above), so a toolchain without one just keeps that half
+#    uncompressed. Directory-level, so the test PCH owner and all six
+#    consumers get the identical flag, as REUSE_FROM requires.
+#    BEZEL_DEBUG_COMPRESSION is also what the driver's link recipe uses for
+#    generated programs (#5062, see the Driver.cpp properties below).
+set(BEZEL_DEBUG_COMPRESSION "")
+if(CMAKE_BUILD_TYPE MATCHES "Deb")
+    include(CheckCXXCompilerFlag)
+    include(CheckLinkerFlag)
+    check_cxx_compiler_flag(-gz=zlib BEZEL_HAS_GZ_zlib)
+    if(BEZEL_HAS_GZ_zlib)
+        set(BEZEL_DEBUG_COMPRESSION zlib)
+    endif()
+    if(BEZEL_DEBUG_COMPRESSION)
+        add_compile_options(-gz=${BEZEL_DEBUG_COMPRESSION})
+        set(CMAKE_REQUIRED_LINK_OPTIONS ${BEZEL_FUSE_LD})
+        check_linker_flag(CXX
+            "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}"
+            BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+        unset(CMAKE_REQUIRED_LINK_OPTIONS)
+        if(BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+            add_link_options(
+                "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}")
+        endif()
+        message(STATUS "Bezel: compressing debug sections "
+            "(-gz=${BEZEL_DEBUG_COMPRESSION}; link: "
+            "${BEZEL_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION}})")
+    endif()
 endif()
 
 # --- LLVM (codegen backend) -------------------------------------------------
@@ -246,6 +402,7 @@ add_library(bezel_core STATIC
     src/sema/TypeResolution_Names.cpp
     src/sema/TypeResolution_Checks.cpp
     src/sema/ExprTypecheck.cpp
+    src/sema/SubstArgs.cpp
     src/sema/ExprTypecheck_Exprs.cpp
     src/sema/ExprTypecheck_Calls.cpp
     src/sema/DefiniteAssignment.cpp
@@ -298,9 +455,33 @@ target_compile_definitions(bezelc PRIVATE
 # Teach the driver the path to libbezel_runtime.a so it can pass it to clang
 # when compiling standalone Bezel programs (generator expression → literal path).
 # NOTE: Driver.cpp is compiled as part of bezel_core, so the definition must
-# be added to bezel_core (not bezelc which only compiles main.cpp).
-target_compile_definitions(bezel_core PRIVATE
-    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
+# be added to bezel_core's Driver.cpp (not bezelc which only compiles main.cpp).
+# #5010: scoped to the ONE source that reads it, not the whole target — a
+# per-worktree absolute path on the command line is part of the ccache key, so
+# on all 52 bezel_core TUs it made every one of them miss in a fresh worktree.
+set_source_files_properties(src/driver/Driver.cpp PROPERTIES
+    COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
+# APPENDED after the #5010 SET above (a SET after it would drop this).
+# #5062: every program the driver links statically pulls in the runtime
+# archive's debug sections (the Bezel objects themselves carry no DWARF). The
+# runtime is compiled with -gz (above), but the DEFAULT linker the driver
+# invokes (plain `clang`, no -fuse-ld) inflates compressed input sections
+# unless told otherwise. So when that linker accepts
+# --compress-debug-sections, hand the flag to the driver's link recipe.
+# Nothing is lost: ASan/llvm-symbolizer and gdb still resolve runtime frames to
+# file:line. The flag is part of Driver::linkRecipeSignature, so the AOT
+# bincache link key moves exactly once. Scoped to Driver.cpp, the one TU
+# that reads it.
+if(BEZEL_DEBUG_COMPRESSION)
+    check_linker_flag(C
+        "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}"
+        BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+    if(BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+        set_property(SOURCE src/driver/Driver.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS
+            BEZEL_LINK_COMPRESS_DEBUG="-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}")
+    endif()
+endif()
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()

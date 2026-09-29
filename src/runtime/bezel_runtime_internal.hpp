@@ -77,6 +77,39 @@
     abort();
 }
 
+// ---- refcount over-release (§28.9, v0.306 / fix #4547) ----
+//
+// The runtime-managed types (string, closure, box — §28.9) are acyclic
+// reference-counted; codegen emits exactly one release per retain, so a
+// correct program's count reaches exactly 0 at the true last release and
+// never goes negative. An OVER-RELEASE — two releases issued for one
+// reference — is always a defect at the call site, never in the refcount
+// machinery itself (§28.9 leaves runtime-managed lifecycle unspecified, so
+// this is an implementation invariant, not a spec rule); but before #4547
+// the release guard on string/closure/box tested `count > 0` on the value
+// AFTER decrementing, so an over-release's -1 fell through to the last-drop
+// free() path exactly like a genuine 0 would — a SECOND free() of the same
+// block. Measured in #4540: two threads raced to release one closure, the
+// loser's decrement produced -1, and both callers freed the same block — a
+// double free that, one release earlier, was a single detectable bad release.
+//
+// bz_refcount_overrelease_fail reports and terminates AT THAT EARLIER POINT
+// — the release that drives the count negative — instead of silently falling
+// through to the free the following release would perform. It is
+// deliberately unconditional, not the `assert` macro: this project's
+// canonical RelWithDebInfo build (CMakeLists.txt's #3013 note) compiles
+// `assert` out via CMake's default `-DNDEBUG`, so an assert-based check here
+// would be a no-op in the very builds it must guard. Same fputs+abort() shape
+// as bz_alloc_fail above — every build gets one loud, named failure instead
+// of an intermittent double-free that names the allocator rather than the bug.
+[[noreturn]] inline void bz_refcount_overrelease_fail(const char* what) {
+    fputs("bezel: fatal: refcount over-release (", stderr);
+    fputs(what ? what : "unspecified", stderr);
+    fputs(") — two releases for one reference; terminating per §28.9\n", stderr);
+    fflush(stderr);
+    abort();
+}
+
 // ---- shared object-layout constants ----
 static const int64_t BZ_EXC_OBJ_SIZE = 40;
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
@@ -254,6 +287,24 @@ struct bz_domain_t {
 struct bz_task_t {
     std::mutex mtx;
     std::condition_variable cv;
+    // fix #3460 (§28.3 / §30.1): reference count for the TASK OBJECT ITSELF,
+    // separate from the existing per-`result` ownership (which `result_disposer`
+    // / `chained_source` track). A task object is created with refcount == 1
+    // (the producer / caller's reference, the one they balance with
+    // `bz_task_free`). Codegen's async-method entry additionally calls
+    // `bz_task_retain` on `outerTask` immediately after storing it into the
+    // heap frame's outerTask field; `emitAsyncComplete` (and the fault-boundary
+    // path) calls `bz_task_release` immediately before `free(self)`. That makes
+    // the FRAME hold a strong reference to `outerTask` for its entire lifetime,
+    // so the worker's resume continuation can read `frame[OUTER_TASK_FIELD]`
+    // safely even when the caller's `bz_task_free(outerTask)` from `using var t`
+    // scope-end disposal has already run. Pre-#3460 this read was a UAF when
+    // the caller's scope end won the race against the worker's resume — the
+    // `heap-use-after-free in bz$async$M.C$Fill$Resume` of #3460. The retain
+    // is unconditional for every async method (named or lambda), so a task that
+    // never suspends (synchronous body) simply retains + immediately releases
+    // inside `emitAsyncComplete`, leaving the caller's count undisturbed.
+    std::atomic<int32_t> refcount{1};
     bool done = false;
     bool is_error = false;
     // §30.5 (v0.162 / #1352): OwningTask single-consumer affine tracking. Set to

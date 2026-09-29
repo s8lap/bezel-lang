@@ -26,7 +26,7 @@ BEZEL_TEST(async_get_async_enumerator_757, repro_no_crash) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
@@ -44,7 +44,7 @@ BEZEL_TEST(async_get_async_enumerator_757, drives_iteration) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 42; "
         "    yield return 99; "
         "  end Gen; "
@@ -70,7 +70,7 @@ BEZEL_TEST(async_get_async_enumerator_757, inlined_source) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C "
-        "  public async static method Gen(): IAsyncEnumerable<int> "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 7; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "

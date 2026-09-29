@@ -245,7 +245,7 @@ BEZEL_TEST(labeled_break_continue_2051, labeled_await_for_break_spec_30_7) {
     BEZEL_EXPECT_EQ(run(R"(
 module M;
 class C
-  public async static method Gen(items: Array<int>): IAsyncEnumerable<int>
+  public static async method Gen(items: Array<int>): IAsyncEnumerable<int>
     for var x in items do yield return x; end;
   end Gen;
   public static async method Main(): Task<int>

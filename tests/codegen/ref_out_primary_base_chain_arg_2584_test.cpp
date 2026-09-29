@@ -77,12 +77,17 @@ int run(const std::string& prog) {
 
 // §22.3 / fix #2584: the issue's exact repro — `base(n + 1)` reads the derived
 // ctor's own ref param n (which aliases the caller's x=10) and passes n+1=11
-// to the primary-ctor base's positional field x. Pre-fix: malformed IR.
-// Post-fix: d.x = 11.
+// to the primary-ctor base's positional field. Per spec §22.10 (v0.307), the
+// base's primary-ctor param `x` is NOT auto-promoted to a public property
+// after #4868, so the test must declare the property explicitly and read it
+// through the declared accessor (per spec §11 / §22.10 idiom, doc line 1861).
+// Pre-fix: d.x compiled via the public-stamped posParam surface defect. Post-fix
+// (both #4868 and post-migration): d.X = 11.
 BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_reads_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Base(x: int) "
+        "  public readonly property X: int := x; "
         "end Base; "
         "public class Derived: Base "
         "  public constructor(ref n: int) base(n + 1); end constructor; "
@@ -91,19 +96,20 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_reads_value) {
         "  public static method Main(): int "
         "    var x := 10; "
         "    using var d := new Derived(ref x); "
-        "    return d.x; "
+        "    return d.X; "
         "  end Main; "
         "end C;"), 11);
 }
 
 // §22.3 / fix #2584: a BARE read of the ref param — `base(n)` (no arithmetic).
-// The primary-ctor base's field x gets n = 10. Pre-fix: storing the loaded
-// pointer into the i32 field slot is a type mismatch -> malformed IR.
-// Post-fix: d.x = 10.
+// The primary-ctor base's field gets n = 10. Per spec §22.10 (v0.307, line
+// 1861) the base's primary-ctor param `x` requires an explicit `public readonly
+// property X` to be readable out-of-class after #4868.
 BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_bare_read) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Base(x: int) "
+        "  public readonly property X: int := x; "
         "end Base; "
         "public class Derived: Base "
         "  public constructor(ref n: int) base(n); end constructor; "
@@ -112,7 +118,7 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_bare_read) {
         "  public static method Main(): int "
         "    var x := 10; "
         "    using var d := new Derived(ref x); "
-        "    return d.x; "
+        "    return d.X; "
         "  end Main; "
         "end C;"), 10);
 }
@@ -121,11 +127,13 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_bare_read) {
 // (bound via refParams_) and k is a plain value param (bound via paramSlots_).
 // Confirms the fix's per-param branch: ref params go to refParams_, plain
 // params keep paramSlots_. Pre-fix: malformed IR (n loaded as ptr).
-// Post-fix: d.x = 10 + 5 = 15.
+// Post-fix: d.X = 10 + 5 = 15. Per §22.10 (v0.307) post-#4868: Base.x is not
+// auto-promoted, so the test reads d.X via an explicit property declaration.
 BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_mixed_ref_and_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Base(x: int) "
+        "  public readonly property X: int := x; "
         "end Base; "
         "public class Derived: Base "
         "  public constructor(ref n: int, k: int) base(n + k); end constructor; "
@@ -134,7 +142,7 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_mixed_ref_and_value
         "  public static method Main(): int "
         "    var x := 10; "
         "    using var d := new Derived(ref x, 5); "
-        "    return d.x; "
+        "    return d.X; "
         "  end Main; "
         "end C;"), 15);
 }
@@ -143,11 +151,15 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_mixed_ref_and_value
 // then the derived ctor BODY mutates the alias (n := n + 100 -> caller's
 // x=110). Confirms the chain read the RIGHT initial value (the fix) AND the
 // alias stays live into the body (bindParameters' refParams_). Pre-fix:
-// malformed IR. Post-fix: caller's x = 110.
+// malformed IR. Post-fix: caller's x = 110. Base.x is declared as a public
+// readonly property (per §22.10 idiom, v0.307) so the test could read it
+// directly — but this row observes the caller's x after the alias mutation,
+// not Base.X, so the property declaration is bookkeeping only here.
 BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_chain_then_body_mutate) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Base(x: int) "
+        "  public readonly property X: int := x; "
         "end Base; "
         "public class Derived: Base "
         "  public constructor(ref n: int) base(n + 1); n := n + 100; end constructor; "
@@ -170,11 +182,13 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_arg_chain_then_body_mut
 
 // §12.8 / fix #2584: `base(m + 1)` with a plain value param m — no ref/out, no
 // refParams_ binding; the existing paramSlots_ value-passing path. Pinned so
-// the fix does not regress it.
+// the fix does not regress it. Per §22.10 (v0.307) post-#4868 the test reads
+// the base's primary-ctor param via an explicit `public readonly property X`.
 BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_value_param_control) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Base(x: int) "
+        "  public readonly property X: int := x; "
         "end Base; "
         "public class Derived: Base "
         "  public constructor(m: int) base(m + 1); end constructor; "
@@ -182,7 +196,7 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_value_param_control) {
         "public class C "
         "  public static method Main(): int "
         "    using var d := new Derived(10); "
-        "    return d.x; "
+        "    return d.X; "
         "  end Main; "
         "end C;"), 11);
 }

@@ -11,14 +11,29 @@
 # changes. Idempotent: safe to re-run, refuses to clobber a real (non-symlink)
 # build dir that already holds objects.
 #
-# Usage:  bash scripts/lane_setup.sh
+# Usage:  bash scripts/lane_setup.sh [--owner <name>]
+#   --owner <name>  also bind this worktree to <name> and its current branch
+#                   (scripts/wt_owner.sh claim), so the ownership hooks refuse
+#                   a commit here from anyone who switches it to another branch.
+#                   Without the flag nothing about ownership changes.
 set -u
+
+OWNER=""
+if [ "${1:-}" = "--owner" ]; then
+  OWNER="${2:-}"
+  [ -n "$OWNER" ] || { echo "[lane_setup] --owner needs a name" >&2; exit 64; }
+fi
 
 FAST_ROOT="${BEZEL_LANE_BUILD_ROOT:-/mnt/fast/lane-builds}"
 
 # Resolve the worktree root from git, not $PWD, so it works from a subdir.
 WT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "[lane_setup] not inside a git worktree — skipping (build stays local)"; exit 0; }
+# Before every early `exit 0` below, so the claim happens however build/ is set up.
+if [ -n "$OWNER" ]; then
+  bash "$(dirname -- "${BASH_SOURCE[0]}")/wt_owner.sh" claim "$OWNER" \
+    || echo "[lane_setup] ownership claim failed — continuing without it"
+fi
 # fix #3213: KEY THE BUILD DIR ON THE FULL PATH, NOT THE BASENAME.
 #
 # This was `NAME="$(basename "$WT")"`. Two worktrees whose directories share a
@@ -172,6 +187,27 @@ if [ -d "$WT/build" ]; then
   fi
   rmdir "$WT/build" 2>/dev/null || {
     echo "[lane_setup] build/ is a non-empty real dir and not configured; leaving as is"; exit 0; }
+fi
+
+# #5010: A WORKTREE THAT ALREADY LIVES ON THE FAST DISK GETS A REAL build/.
+#
+# The symlink exists only to move the build tree OFF the slow disk. When the
+# worktree itself is on the fast filesystem there is nothing to move, and the
+# symlink is actively harmful: CMake turns on relocatable ccache keys
+# (BEZEL_CCACHE_RELOCATABLE — base_dir + -ffile-prefix-map, CMakeLists.txt)
+# only for a build dir physically inside the tree, because ccache's base_dir
+# rewrites paths relative to the PHYSICAL cwd. Through the symlink the keys
+# keep the lane name and a fresh worktree misses on every TU (#4991 measured
+# 0 of 3 shareable TUs); in-tree, it hits on everything but the handful of TUs
+# that embed a per-tree path. "Same filesystem" is decided by device number,
+# not by path prefix (the #3008 lesson: inspect what the name resolves to).
+_wt_dev="$(stat -L -c %d "$WT" 2>/dev/null)"
+_fast_dev="$(stat -L -c %d "$FAST_ROOT" 2>/dev/null)"
+if [ -n "$_wt_dev" ] && [ "$_wt_dev" = "$_fast_dev" ]; then
+  mkdir -p "$WT/build" || { echo "[lane_setup] could not create $WT/build"; exit 0; }
+  echo "[lane_setup] worktree is on the fast disk — build/ is a REAL in-tree dir" \
+       "(cross-worktree ccache hits, #5010)"
+  exit 0
 fi
 
 mkdir -p "$TARGET" || { echo "[lane_setup] could not create $TARGET"; exit 0; }

@@ -7,15 +7,60 @@
 //   - storing lambdas in locals and passing them later
 // Captures (closures over outer variables) are deferred.
 
+#include "support/aot_support.hpp"   // runAot — strict AOT oracle for ported rows
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+#include <cctype>      // std::isspace (runStdoutInt trims before std::stoll)
+
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
     auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
+}
+// Rows ported off the deprecated lenient JIT oracle (#4419). Only rows that
+// pass the strict AOT path are ported; the four formerly-red rows
+// (method_reference_stored_in_local, once_pattern, partial_application,
+// function_typed_field_call) were rewritten under #5030 so they too admit
+// the strict AOT oracle (each touches §28.14 v0.307 — function-typed
+// `scoped` storage and closure-capture of borrowing parameters). The
+// `runA` / `runStdoutInt` helpers select the strict oracle for these.
+int runA(const std::string& prog) {
+    auto r = runAot(prog);
+    return r.ran ? r.exitCode : -999;
+}
+// §28.14 v0.307 conformance (#5030): run `prog` and parse the program's trimmed
+// stdout as a base-10 long long. The two rewritten rows below (negated integer
+// and value > 255) cannot round-trip `runAot`'s exitCode (8-bit, signed; see
+// CLAUDE.md "8-bit exit truncation is not a compiler bug"), so they route the
+// observable through stdoutText and assert here. Returns nullopt on any compile
+// reject or non-numeric/empty stdout — both the strict AOT-oracle refuses and
+// a behavioural regression produces the same red.
+std::optional<long long> runStdoutInt(const std::string& prog) {
+    auto r = runAot(prog);
+    if (!r.ran) return std::nullopt;
+    std::string s = r.stdoutText;
+    // Trim trailing whitespace (stdoutText carries the trailing '\n').
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+        s.pop_back();
+    }
+    size_t i = 0;
+    while (i < s.size() &&
+           std::isspace(static_cast<unsigned char>(s[i]))) {
+        ++i;
+    }
+    if (i >= s.size()) return std::nullopt;
+    try {
+        size_t pos = 0;
+        long long v = std::stoll(s.substr(i), &pos);
+        if (i + pos != s.size()) return std::nullopt;
+        return v;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 }
 
@@ -203,8 +248,12 @@ BEZEL_TEST(codegen_cg60, static_method_reference) {
 }
 
 BEZEL_TEST(codegen_cg60, method_reference_stored_in_local) {
-    // Method reference stored in a local, then called.
-    BEZEL_EXPECT_EQ(run(
+    // Method reference stored in a local, then called. The observable is
+    // `-7`, which the strict AOT oracle's 8-bit exit-code mask turns into
+    // 249 — move the value to stdout (per CLAUDE.md "8-bit exit truncation
+    // is not a compiler bug"). The program shape itself (H.Negate stored
+    // in a local and passed to Apply) is otherwise spec-valid.
+    BEZEL_EXPECT_EQ(runStdoutInt(
         "module M; class H "
         "  public static method Negate(x: int): int => -x; "
         "end H; "
@@ -214,7 +263,9 @@ BEZEL_TEST(codegen_cg60, method_reference_stored_in_local) {
         "  end Apply; "
         "  public static method Main(): int "
         "    var neg := H.Negate; "
-        "    return Apply(neg, 7); "
+        "    var r := Apply(neg, 7); "
+        "    Console.WriteLine(r.ToString()); "
+        "    return 0; "
         "  end Main; "
         "end C;"), -7);
 }
@@ -269,10 +320,13 @@ BEZEL_TEST(codegen_cg60, curried_add) {
 
 BEZEL_TEST(codegen_cg60, array_element_call) {
     // Calling a closure stored in an inline array element: `handlers[i]()`.
-    BEZEL_EXPECT_EQ(run(
+    // Explicit initializer: a function type is not defaultable (§17.11,
+    // v0.307), so an uninitialised `[3](int) -> int` is rejected (§15.1 /
+    // §7.9, v0.307; #4419).
+    BEZEL_EXPECT_EQ(runA(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [3](int) -> int; "
+        "    var fns: [3](int) -> int := [lambda(x: int) => 0, lambda(x: int) => 0, lambda(x: int) => 0]; "
         "    fns[0] := lambda(x: int) => x + 1; "
         "    fns[1] := lambda(x: int) => x * 2; "
         "    fns[2] := lambda(x: int) => x - 1; "
@@ -282,39 +336,62 @@ BEZEL_TEST(codegen_cg60, array_element_call) {
 
 // ── Advanced closure patterns ─────────────────────────────────────────────
 BEZEL_TEST(codegen_cg60, once_pattern) {
-    // A `once` function: call compute only on first invocation.
-    BEZEL_EXPECT_EQ(run(
+    // §28.14 v0.307 conformance (#5030): `Once` was rewritten so that (a) the
+    // returned closure does NOT capture the function-typed `f` parameter
+    // (call-bounded), and (b) the cache state lives in two value-typed locals
+    // (`v` and `done`) the closure captures by cell — exempt per §27.5. The
+    // eager call inside `Once(f)` happens once at Once-invocation time, so
+    // three subsequent `f()` calls all return the cached `v`. The resulting
+    // observable (r1+r2+r3-acc._c == 99*3-1 == 296) is unchanged from the
+    // pre-rewrite program. The 296 observable is routed through stdout
+    // (CLAUDE.md "8-bit exit truncation").
+    BEZEL_EXPECT_EQ(runStdoutInt(
         "module M; "
-        "class Cache public _v: int := 0; public _done: bool := false; destructor end destructor; end Cache; "
         "class Acc public _c: int := 0; destructor end destructor; end Acc; "
         "class C "
-        "  public static method Once(f: () -> int, ca: Cache): () -> int "
-        "    return lambda() => do "
-        "      if ca._done then return ca._v; end; "
-        "      ca._v := f(); ca._done := true; return ca._v; "
-        "    end; "
+        "  public static method Once(f: () -> int): () -> int "
+        "    var v := f(); "
+        "    return lambda() => v; "
         "  end Once; "
         "  public static method Main(): int "
-        "    using var ca := new Cache(); "
         "    using var acc := new Acc(); "
-        "    var f := Once(lambda() => do acc._c := acc._c + 1; return 99; end, ca); "
+        "    var f := Once(lambda() => do acc._c := acc._c + 1; return 99; end); "
         "    var r1 := f(); var r2 := f(); var r3 := f(); "
-        "    return r1 + r2 + r3 - acc._c; "
+        "    var s := r1 + r2 + r3 - acc._c; "
+        "    Console.WriteLine(s.ToString()); "
+        "    return 0; "
         "  end Main; "
-        "end C;"), 296);  // 99+99+99-1=296
+        "end C;"), 296);  // 99+99+99-1 = 296
 }
 
 BEZEL_TEST(codegen_cg60, partial_application) {
-    // Partial application: bind first arg of (int,int)->int.
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Partial(f: (int, int) -> int, a: int): (int) -> int "
-        "    return lambda(b: int) => f(a, b); "
-        "  end Partial; "
+    // §28.14 v0.307 conformance (#5030): the static `Partial` factory cannot
+    // forward a `scoped` function-typed parameter to a constructor (§28.14,
+    // v0.175 — it may only be invoked, stored into a `scoped` field of
+    // `this`, or forwarded to a `scoped` parameter of a call on `this`).
+    // The spec-valid shape is direct construction: the caller binds the
+    // partial-application state by instantiating `Partial` directly, with a
+    // scoped ctor parameter (s28_14_0001 is this exact idiom). The original
+    // closure-call (`add10(5) + add10(3)`) is replaced by `p.Apply(5) +
+    // p.Apply(3)` — the observable (15 + 13 = 28) is unchanged. `add` is
+    // value-typed-equivalent at the call site, exempt from §28.14 per the
+    // v1-admission bound #1.
+    BEZEL_EXPECT_EQ(runA(
+        "module M; "
+        "class Partial "
+        "  private scoped _f: (int, int) -> int; "
+        "  public _a: int; "
+        "  public constructor(scoped f: (int, int) -> int, a: int) "
+        "    _f := f; _a := a; "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "  public method Apply(b: int): int => _f(_a, b); "
+        "end Partial; "
+        "class C "
         "  public static method Main(): int "
         "    var add := lambda(x: int, y: int) => x + y; "
-        "    var add10 := Partial(add, 10); "
-        "    return add10(5) + add10(3); "
+        "    using var p := new Partial(add, 10); "
+        "    return p.Apply(5) + p.Apply(3); "
         "  end Main; "
         "end C;"), 28);  // 15 + 13 = 28
 }
@@ -324,13 +401,17 @@ BEZEL_TEST(codegen_cg60, partial_application) {
 // dropped the call. Now dispatches through emitClosureCall.
 
 BEZEL_TEST(codegen_cg60, function_typed_field_call) {
-    // Class with a function-typed field; calling it should invoke the closure.
-    BEZEL_EXPECT_EQ(run(
+    // §28.14 v0.307 conformance (#5030): the function-typed field `_cb` and
+    // the constructor's `f` parameter must both be declared `scoped` (a
+    // plain function-typed parameter may not be stored in a field of any
+    // object — §28.14 v0.177). The observable (r1 + r2 == 10 + 15 == 25) is
+    // unchanged.
+    BEZEL_EXPECT_EQ(runA(
         "module M; "
         "class Acc public _v: int := 0; destructor end destructor; end Acc; "
         "class T "
-        "  public _cb: (int) -> int; "
-        "  public constructor(f: (int) -> int) _cb := f; end constructor; "
+        "  public scoped _cb: (int) -> int; "
+        "  public constructor(scoped f: (int) -> int) _cb := f; end constructor; "
         "  destructor end destructor; "
         "end T; "
         "class C public static method Main(): int "
@@ -384,10 +465,10 @@ BEZEL_TEST(codegen_cg60, positional_record_fn_field_second_slot_747) {
 BEZEL_TEST(codegen_cg60, array_element_string_return) {
     // Verify that calling a `(int)->string` through an array element correctly
     // types the result as string (enabling .Length etc.).
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runA(
         "module M; class C "
         "  public static method Main(): int "
-        "    var fns: [2](int) -> string; "
+        "    var fns: [2](int) -> string := [lambda(n: int) => \"\", lambda(n: int) => \"\"]; "
         "    fns[0] := lambda(n: int) => (if n > 0 then \"abc\" else \"xy\"); "
         "    fns[1] := lambda(n: int) => \"hello\"; "
         "    var r0 := fns[0](5); "   // = "abc", length 3

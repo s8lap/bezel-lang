@@ -12,12 +12,12 @@
 module Conf;
 
 public class CauseException: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end CauseException;
 
 public class WrapException: Exception
-  public constructor(message: string, cause: Exception) base(message, cause)
+  public constructor(message: string, cause: Exception) base(message, cause);
   end constructor;
 end WrapException;
 

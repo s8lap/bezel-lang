@@ -41,6 +41,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
@@ -112,19 +113,19 @@ int runUnderAsanNoCorruption(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -2;
     }
 
     auto cleanup = [&] {
@@ -134,7 +135,10 @@ int runUnderAsanNoCorruption(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
 
     // exitcode=99: a DISTINCT ASan error code so a double-free can never be
     // confused with the program legitimately returning its own exit code.
@@ -143,7 +147,7 @@ int runUnderAsanNoCorruption(const std::string& source) {
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -4;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 99;  // ASan error
     return 0;                                                       // clean
 }
@@ -178,19 +182,19 @@ int runUnderLeakSanitizer(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -2;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -2;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -2;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -2;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return -2;
     }
 
     auto cleanup = [&] {
@@ -200,14 +204,17 @@ int runUnderLeakSanitizer(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -3; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " + exe +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -4;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 99;
     return 0;
 }

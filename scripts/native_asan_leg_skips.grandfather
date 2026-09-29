@@ -1,0 +1,29 @@
+# native_asan_leg_skips.grandfather - the ceiling for #3682.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file
+# ceiling (to min(existing, measured) — a drain becomes the new
+# ceiling on the very next --update) and MAY NEVER RAISE one;
+# raising a ceiling stays a deliberate, reviewed hand-edit to this
+# file. See tighten_ceiling() / check_debt_floor() in
+# check_native_asan_leg_skips.py (same rationale/mechanism as
+# scripts/localdecl_only_walkers.grandfather and scripts/imported_symbol_reads.grandfather, #3590).
+#
+# Two per-file sections, same shape as the mutable baseline.
+
+[swallowing_guards]
+6    tests/codegen/builtin_owned_transfer_leak_1388_test.cpp
+2    tests/codegen/cts_register_timer_1413_test.cpp
+2    tests/codegen/field_drop_on_overwrite_1328_test.cpp
+4    tests/codegen/generic_owned_drain_990_test.cpp
+3    tests/codegen/linked_cts_810_test.cpp
+4    tests/codegen/local_drop_on_overwrite_1625_test.cpp
+2    tests/codegen/move_only_inline_array_reassign_drop_on_overwrite_1385_test.cpp
+1    tests/codegen/mutex_field_disposal_4290_test.cpp
+9    tests/codegen/owned_drain_639_test.cpp
+6    tests/codegen/owned_drain_bound_2167_test.cpp
+1    tests/codegen/ownedarray_forin_using_var_1287_test.cpp
+3    tests/codegen/owning_enumerator_1349_test.cpp
+3    tests/codegen/owning_inline_array_whole_value_reassign_3263_test.cpp
+3    tests/ownership/compound_assignment_read_after_consume_3969_test.cpp
+
+[conflating_helpers]

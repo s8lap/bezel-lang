@@ -40,6 +40,7 @@
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 
@@ -98,7 +99,8 @@ static int compileImportAndRun783(const std::string& bSrc,
     d.metadataPath = aObj;
     d.objectPath = aObj;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc, bExe, deps).success) return -1;
+    if (!driver.compileFile(bSrc, bExe, deps).success)
+        return bezel::test::asanBuildFailure("compileFile");
     int status = std::system(bExe.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
@@ -116,9 +118,28 @@ static bool compileImportFails783(const std::string& bSrc,
     return !driver.compileFile(bSrc, bExe, deps).success;
 }
 
-// Cross-module ASan/LSan probe: compile B to object via the Driver (object-only),
-// link A.o + B.o + ASan runtime, run under detect_leaks. Returns 0 = clean+correct,
-// 1 = leak/double-free (exit 99), -1 = toolchain unavailable → SKIP.
+// Cross-module ASan/LSan probe: compile B importing A to an EXECUTABLE via
+// compileFileForTest (so the Bezel compiler emits a native `int main()` for us
+// — see LlvmBackend_Setup.cpp:89, `if (isMain(ms)) return "main";`), link
+// A.o + the Bezel-emitted B exe + ASan runtime, run under detect_leaks.
+// Returns 0 = clean+correct, 1 = leak/double-free (exit 99), -1 = toolchain
+// unavailable → SKIP, -3 = compile/link failure.
+//
+// EARLIER DESIGN (revoked — see #783 regression log 2026-09-18): an earlier
+// revision used Driver::compileObject for B (library mode, §33.6 / #1563) and
+// supplied a hand-written C++ main shim of the form
+//   extern int bz$App.C$Main(void);
+//   int main(void) { return bz$App.C$Main(); }
+// to fill the missing native `main`. The shim FAILS TO COMPILE because
+// `bz$App.C$Main` contains a `.`, which is not a valid C or C++ identifier
+// character (POSIX §6.4.2 / C++ §5.10 [lex.name]); clang rejects it with
+//   error: expected ';' after top level declarator
+// and the probe's link step then returns -3, masking whatever the Bezel
+// program itself does (the Bezel symbol exists in b.o but the link fails on
+// the unresolved shim — which is the opposite of the truth: the Bezel code
+// compiles fine, the shim is malformed). The simpler fix is to NOT use
+// library mode for B: `compileFile` is executable mode, the Bezel compiler
+// emits the `main` symbol itself, and no shim is needed.
 static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
                        int expectedCode) {
     const std::string& rt = laneLocalAsanRt783();
@@ -129,17 +150,19 @@ static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
     static int ctr = 0;
     std::string stem = "bz783_asan_" + std::to_string(ctr++);
     std::string bSrcPath = (tmpDir / (stem + "_b.bzl")).string();
-    std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
     std::string exePath = (tmpDir / (stem + "_exe")).string();
     writeSource783(bSrcPath, bSrc);
 
     auto cleanup = [&] {
         std::remove(bSrcPath.c_str());
-        std::remove(bObjPath.c_str());
         std::remove(exePath.c_str());
     };
 
-    // Compile B to an object that imports A.
+    // Compile B importing A to an EXECUTABLE — Bezel emits a native `int main()`
+    // for us. We must use compileFile (executable mode), not compileObject
+    // (library mode), because the latter omits `main` and the resulting b.o has
+    // only `bz$App.C$Main`, a symbol that cannot be referenced from a portable
+    // C/C++ main shim (`.` is not an identifier character).
     {
         bezel::Driver driver;
         std::vector<bezel::Dependency> deps;
@@ -147,27 +170,24 @@ static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
         d.metadataPath = aObj;
         d.objectPath = aObj;
         deps.push_back(d);
-        if (!driver.compileObject(bSrcPath, bObjPath, deps).success) {
+        if (!bezel::test::compileFileForTest(
+                driver, bSrcPath, exePath, deps,
+                bezel::codegen::CodegenOptions{}).success) {
             cleanup();
-            return -1;
+            return -3;
         }
     }
-
-    std::string linkCmd =
-        "clang++ -fsanitize=address -g " + bObjPath + " " + aObj + " " + rt +
-        " -lm -lpthread -lstdc++ -o " + exePath + " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " + exePath +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 99) return 1;
     if (code == expectedCode) return 0;
-    return -1;
+    return -3;
 }
 
 }  // namespace

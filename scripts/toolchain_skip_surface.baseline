@@ -1,0 +1,30 @@
+# toolchain_skip_surface.baseline - ratchet for issue #3733:
+# the runAotChecked toolchain-SKIP surface (2,046 call sites in 634
+# files at 2026-09-17). Freezes the surface so it cannot grow while
+# the burn-down runs.
+#
+# Regenerate with scripts/check_toolchain_skip_surface.py --update
+# after a burn-down step. --update REFUSES to raise absorbing_sites
+# (it may only fall) and REFUSES to raise checked_calls without a
+# contemporaneous drop in absorbing_sites (a real rise means a new
+# absorbing call site, which is the defect the ratchet exists to
+# catch).
+#
+# EXACT, not a ceiling: a count below its baseline fails as STALE
+# HEADROOM (same rule as every sibling ratchet in this family).
+#
+# absorbing_sites : the violation count. Sites where a runAotChecked
+#                   result reaches a "return on SKIP" guard with no
+#                   positive rejection-text check (#3733).
+# checked_calls   : the denominator. runAotChecked{,,Lenient,
+#                   Disposal} calls in tests/**/*.cpp outside
+#                   tests/support/. May rise legitimately when a
+#                   new checked test is added (the test_main.cpp
+#                   additive-field / run_parallel.sh floor wires
+#                   the loud half).
+# support_calls   : the control — same tokens, no filters. Differs
+#                   from checked_calls only when a file moves into
+#                   or out of tests/support/.
+absorbing_sites = 1209
+checked_calls   = 2529
+support_calls   = 2544

@@ -210,7 +210,15 @@ BEZEL_TEST(choice_classification_35_4,
     auto r = resolveAll(
         "module M; class R end R; "
         "choice Color Red, Green, Blue; "
-        "  public method Make(): R => new R(); "
+        // `owned` is REQUIRED here, not decoration (#4759). Per §28.3
+        // announcement table row 4 (v0.307), a plain concrete class-typed
+        // instance return admits only a receiver-sourced borrow, and `new R()`
+        // is a fresh owned value. This row runs on `resolveAll` (resolve only —
+        // the ownership pass never runs), so the unmarked spelling would
+        // surface only against the full driver (#3439). The marker sits on a
+        // METHOD return, not a case payload, so §35.4 still computes ValueLike
+        // — which is precisely what this row asserts.
+        "  public method Make(): owned R => new R(); "
         "end Color;");
     auto c = classify(r, "Color");
     BEZEL_EXPECT_TRUE(c.has_value());

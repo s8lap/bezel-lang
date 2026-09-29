@@ -8,6 +8,7 @@
 //! cites: 30.5, 15.3
 //! expect: reject
 //! diagnostic: move-only
+//! issue: 2255
 module Conf;
 
 public class Widget

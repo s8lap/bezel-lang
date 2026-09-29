@@ -19,5 +19,5 @@
 
 module M; record Ev(N: int); class Bus public static Total: int := 0; public static event Signal: Ev; public static method Hook() Signal += lambda(e) => do Bus.Total := Bus.Total + e.N; end; end Hook; end Bus;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `Total` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `Total` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

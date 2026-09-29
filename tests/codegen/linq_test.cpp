@@ -241,10 +241,19 @@ BEZEL_TEST(linq, min_max_selector_double_result_type_1901) {
 // (the caller takes no disposal obligation; the OwningArray disposes each Box
 // exactly once). Before the fix the result typed as `int`, so `.v` below could
 // not resolve / the value was mis-dispatched.
+// Per spec §22.10 (v0.307, line 1861) post-#4868 5458a4e1: the class's
+// primary-ctor parameter `v` is NOT auto-promoted to a public property. The
+// canonical §22.10 idiom (docs/Bezel_Language_Spec.md:2042-2057) requires an
+// explicit `public readonly property V: int := v;` so `top.v` reads out-of-class
+// are legal (now as `top.V`). The migration preserves the #1901 `Max()` selector
+// intent — selector returns the class element (`U = Box`), member access on
+// the result resolves, and the observable value 9 (the max element's `V`) is
+// unchanged.
 BEZEL_TEST(linq, min_max_selector_class_result_type_1901) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System; "
         "class Box(v: int): IComparable<Box> "
+        "  public readonly property V: int := v; "
         "  public method CompareTo(other: Box): int => "
         "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
         "end Box; "
@@ -252,7 +261,7 @@ BEZEL_TEST(linq, min_max_selector_class_result_type_1901) {
         "  using var a := new OwningArray<Box>(); "
         "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
         "  var top := a.Max(lambda(o) => o); "   // U = Box (borrow of receiver element)
-        "  return top.v; "                 // resolves only if result types as Box
+        "  return top.V; "                 // resolves only if result types as Box
         "end Main; end C;"), 9);
 }
 

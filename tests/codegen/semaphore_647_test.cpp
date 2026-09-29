@@ -49,6 +49,7 @@
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/emit_object_support.hpp"  // #4569: emitObjectFileForTest
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -92,19 +93,28 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        // #4569: repointed onto the ASan-sweep wrapper, the same rename the
+        // other 35 files in the #3917 burn-down took. #4569 listed this file
+        // among the "concurrency tail" that needed a per-call sanitizer
+        // decision because the *_647 family "carries sibling TSan rows in the
+        // same file" -- measured, it does not: this file has exactly ONE
+        // emitObjectFile call, no buildRuntimeSanitizerObject, and its link
+        // line below is a hardcoded `-fsanitize=address`, so there is no
+        // -fsanitize=thread path an instrumented object could reach.
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -114,14 +124,17 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
     std::string runCmd =
         std::string("ASAN_OPTIONS=detect_leaks=") +
         (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer fired
     return 0;  // clean
 }
@@ -273,6 +286,81 @@ BEZEL_TEST(codegen_semaphore_6_3, two_arg_constructor_works) {
         "end; "
         "return 0; "
     )), 55);
+}
+
+// ---------------------------------------------------------------------------
+// fix #4445 / stdlib §6.3 v0.302: the two-arg constructor must raise
+// `ArgumentException` when `max < 1` or `initial > max`. The one-arg form
+// has no ceiling and is unaffected.
+//
+// The codegen emits the ArgumentException guard (max < 1 OR initial > max)
+// BEFORE calling bz_semaphore_new, so the constructor's runtime path never
+// sees a value that would have tripped the guard — only the throw, never a
+// silent coercion. The runtime clamps in bz_semaphore_new stay as defensive
+// defaults for any direct FFI / misuse path.
+//
+// Regression tests:
+//   * Row (1) initial > max  → ArgumentException
+//   * Row (2) max < 1        → ArgumentException
+//   * Row (3) initial ≤ max AND max ≥ 1 → no exception (control)
+//   * Row (4) one-arg form   → no exception (control: ceiling inert, max=INT_MAX)
+// ---------------------------------------------------------------------------
+
+// fix #4445 / stdlib §6.3 v0.302: `new Semaphore(5, 3)` (initial > max) raises
+// a catchable ArgumentException. Without the guard, the runtime silently clamps
+// max up to 5 and returns a working N=5 semaphore — exactly the v0.302 defect.
+BEZEL_TEST(codegen_semaphore_6_3_4445, initial_gt_max_raises_argument_exception_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var caught := 0; "
+        "try "
+        "  var sem := new Semaphore(5, 3); "
+        "  sem.Dispose(); "
+        "catch ArgumentException => do caught := 1; end "
+        "end; "
+        "return caught; "                 // 1
+    )), 1);
+}
+
+// fix #4445 / stdlib §6.3 v0.302: `new Semaphore(0, 0)` (max < 1) raises a
+// catchable ArgumentException. Without the guard, max gets clamped up to
+// initial=0 — a silent zero-permit semaphore that no acquire can ever fulfil.
+BEZEL_TEST(codegen_semaphore_6_3_4445, max_lt_one_raises_argument_exception_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var caught := 0; "
+        "try "
+        "  var sem := new Semaphore(0, 0); "
+        "  sem.Dispose(); "
+        "catch ArgumentException => do caught := 1; end "
+        "end; "
+        "return caught; "                 // 1
+    )), 1);
+}
+
+// fix #4445 / stdlib §6.3 v0.302 CONTROL: `new Semaphore(3, 5)` (initial ≤ max,
+// max ≥ 1) constructs successfully and the semaphore works.
+BEZEL_TEST(codegen_semaphore_6_3_4445, valid_two_arg_succeeds_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var sem := new Semaphore(3, 5); "
+        "using var t1 := sem.Acquire(); "
+        "using var t2 := sem.Acquire(); "
+        "using var t3 := sem.Acquire(); "
+        "return 33; "
+    )), 33);
+}
+
+// fix #4445 / stdlib §6.3 v0.302 CONTROL: `new Semaphore(5)` (one-arg form)
+// constructs successfully. The one-arg form has no ceiling; the codegen passes
+// max=INT_MAX, so both guard conditions (max < 1, initial > max) are inert.
+BEZEL_TEST(codegen_semaphore_6_3_4445, one_arg_form_unaffected_4445) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var sem := new Semaphore(5); "
+        "using var t1 := sem.Acquire(); "
+        "using var t2 := sem.Acquire(); "
+        "using var t3 := sem.Acquire(); "
+        "using var t4 := sem.Acquire(); "
+        "using var t5 := sem.Acquire(); "
+        "return 44; "
+    )), 44);
 }
 
 // ---------------------------------------------------------------------------

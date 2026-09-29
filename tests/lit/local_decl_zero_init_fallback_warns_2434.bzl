@@ -32,4 +32,4 @@
 
 module M; class C public method M(o: Object): int var s := o.Anything(); return 0; end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: internal: lowerLocalDecl's initializer expression failed to lower to a value for this local's slot (degraded to a zero-initialized value) — #2434
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: lowerLocalDecl's initializer expression failed to lower to a value for this local's slot (degraded to a zero-initialized value) — #2434

@@ -10,7 +10,7 @@
 module Conf;
 
 public class Boom: Exception
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);
   end constructor;
 end Boom;
 

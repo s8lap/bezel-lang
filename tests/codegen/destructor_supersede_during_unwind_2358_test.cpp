@@ -48,15 +48,17 @@
 // SEPARATE, already-tracked gap — see below) takes an unchanged path.
 //
 // SCOPE NOTE — control case NOT pinned here: a destructor that throws on a
-// NORMAL-path scope exit (no unwind already in progress) currently has its
-// exception silently swallowed rather than reaching the enclosing catch —
-// this is a distinct, already-filed, already-tracked defect (issues #1878,
-// #1882) that #2358 does not touch. Verified via scratch-copy revert/restore
-// that this control case's behavior (exit code, absence of a leak — the
-// object stays reachable via the global in-flight-exception slot, so
-// LeakSanitizer does not flag it either way) is IDENTICAL before and after
-// this fix; not pinned as a permanent test here to avoid enshrining #1878/
-// #1882's known-incorrect swallowing as if it were this fix's contract.
+// NORMAL-path scope exit (no unwind already in progress) was, when #2358
+// landed, silently swallowed rather than reaching the enclosing catch — a
+// distinct defect (issues #1878, #1882) that #2358 did not touch. Verified via
+// scratch-copy revert/restore that this control case's behavior was IDENTICAL
+// before and after this fix; deliberately not pinned here, to avoid enshrining
+// that swallowing as if it were #2358's contract. It has since been FIXED (the
+// missing §28.4 propagate-from-the-disposal-point check, #1878/#1882) and is
+// pinned in its own files —
+// throwing_destructor_propagates_from_{explicit_dispose_1878,scope_end_1882}_test.cpp.
+// The rows below are unaffected: every one of them faults on the UNWIND edge,
+// which #1878/#1882 deliberately left untouched.
 //
 // FAILS WITHOUT / PASSES WITH: every runAotChecked test below whose comment
 // says "48-byte leak without the fix" flips r.ran from false to true

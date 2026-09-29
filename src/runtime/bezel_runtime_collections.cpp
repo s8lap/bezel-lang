@@ -337,8 +337,10 @@ int8_t bz_array_is_disposed(void* arrp) {
 void bz_array_sort(void* arrp, int64_t elem_size,
                    int (*cmp)(const void*, const void*)) {
     auto* arr = (bz_array_t*)arrp;
-    if (arr && arr->count > 1)
+    if (arr && arr->count > 1) {
         qsort(arr->data, (size_t)arr->count, (size_t)elem_size, cmp);
+        arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort repositions)
+    }
 }
 
 // stdlib §3 / #472: Sort with a closure-bearing comparator.
@@ -363,6 +365,26 @@ void bz_array_sort_closure(void* arrp, int64_t elem_size,
     qsort(arr->data, (size_t)arr->count, (size_t)elem_size, bz_sort_cl_shim);
     bz_sort_cl_closure = nullptr;
     bz_sort_cl_fn      = nullptr;
+    arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort(comparer) repositions)
+}
+
+// §29.12, v0.307: record an in-place repositioning that the CALLER performed.
+//
+// The in-place `Array<T>`/`OwningArray<T>` `Reverse()` (stdlib §4.4) is lowered
+// as an inlined element-swap loop in codegen (`Emitter::tryLowerArrayCall`'s
+// `Reverse` arm) rather than as a call into this file, so unlike every other
+// structural mutator here it had no site at which to bump the modification
+// epoch. §29.12 names it in the same breath as `Sort()` — "together with the
+// in-place `Sort()`/`Reverse()` (they reposition)" — so a `for` over the array
+// that reverses it in the loop body must raise `InvalidOperationException` at
+// the next advance, exactly as `Sort()` already does via `bz_array_sort`.
+//
+// The `count > 1` guard mirrors `bz_array_sort`'s: an array of 0 or 1 elements
+// repositions nothing, so no enumerator is invalidated.
+void bz_array_note_repositioned(void* arrp) {
+    auto* arr = (bz_array_t*)arrp;
+    if (arr && arr->count > 1)
+        arr->mod_count++;  // §29.12 / #4631: structural mutation (Reverse repositions)
 }
 
 // stdlib §3 / #472: Shallow-copy `arr` — allocate a new bz_array_t with the
@@ -432,10 +454,18 @@ void bz_array_reserve(void* arrp, int64_t elem_size, int64_t cap) {
 
 struct bz_entry_t {
     char*   key;        // malloc'd copy, null = empty slot
-    int64_t key_len;
+    int64_t key_len;    // string mode: CODE POINTS (§4.6); generic mode: key_size bytes
     void*   val;
     uint32_t hash;
     bool    deleted;
+    // fix #4499 (spec §4.6 / §8.3, v0.306): the storage WIDTH (1/2/4 bytes per
+    // code point) of `key` in string-key mode. The pre-fix table stored only
+    // (bytes, code-point count) and used the code-point count as a BYTE count,
+    // so a width>1 key was truncated to its first `len/width` code points and
+    // distinct keys collided. Width is not recoverable from the bytes — the
+    // width-2 key `"日"` and the width-1 key `"\u00E5e"` have the SAME two
+    // bytes — so identity needs it. Zero in generic-key mode (unused there).
+    int8_t  key_w;
 };
 
 struct bz_dict_t {
@@ -474,11 +504,75 @@ struct bz_dict_t {
     int64_t     kind;
 };
 
-static uint32_t fnv1a(const char* s, int64_t len) {
+// fix #4499 (spec §4.6 / §8.3, v0.306): read one code point out of a stored
+// string key's raw buffer at code-point index `i`, honouring the key's storage
+// width. Mirrors bezel_runtime_strings.cpp's `bz_str_cp`, which reads the same
+// layout off a full bz_string; this one takes the (data, width) pair because a
+// table entry is raw bytes, not a string object.
+static inline uint32_t bz_key_cp(const char* d, int8_t w, int64_t i) {
+    if (w == 2) return ((const uint16_t*)d)[i];
+    if (w == 4) return ((const uint32_t*)d)[i];
+    return ((const uint8_t*)d)[i];
+}
+
+// fix #4499: hash the key's CODE-POINT SEQUENCE, not its storage bytes.
+// §8.3 requires `a.Equals(b)` ⇒ equal hashes, and §4.6 makes equality the
+// code-point sequence with the storage width "invisible at the language
+// level" — so the hash may not depend on the width either. Mixing each code
+// point as four bytes makes the value width-independent by construction.
+// (The pre-fix `fnv1a` mixed the first `len` BYTES — for a width>1 key that is
+// the first `len/width` code points only, which is the collision this fixes.)
+static uint32_t fnv1a_cp(const char* s, int64_t cp_len, int8_t w) {
     uint32_t h = 2166136261u;
-    for (int64_t i = 0; i < len; i++)
-        h = (h ^ (uint8_t)s[i]) * 16777619u;
+    for (int64_t i = 0; i < cp_len; i++) {
+        uint32_t c = bz_key_cp(s, w, i);
+        h = (h ^ (uint8_t)( c        & 0xFFu)) * 16777619u;
+        h = (h ^ (uint8_t)((c >>  8) & 0xFFu)) * 16777619u;
+        h = (h ^ (uint8_t)((c >> 16) & 0xFFu)) * 16777619u;
+        h = (h ^ (uint8_t)((c >> 24) & 0xFFu)) * 16777619u;
+    }
     return h;
+}
+
+// fix #4499: string-key equality is §4.6's code-point-sequence equality. Equal
+// widths take the memcmp fast path (same encoding, so byte equality IS code
+// point equality); mixed widths decode both sides, so a width-2 and a width-1
+// spelling of the same code points still compare equal — §4.6's width
+// invisibility, and the same policy bz_str_compare_cp (#4487) applies to
+// ordering.
+static bool bz_key_eq(const char* a, int64_t alen, int8_t aw,
+                      const char* b, int64_t blen, int8_t bw) {
+    if (alen != blen) return false;
+    if (!a || !b) return a == b;
+    if (aw == bw) {
+        size_t wb = (size_t)(aw > 0 ? aw : 1);
+        return memcmp(a, b, (size_t)alen * wb) == 0;
+    }
+    for (int64_t i = 0; i < alen; i++)
+        if (bz_key_cp(a, aw, i) != bz_key_cp(b, bw, i)) return false;
+    return true;
+}
+
+// fix #4499 (Defect B): copy a string key's raw bytes with malloc+memcpy.
+// The pre-fix `strndup(k, k_len)` was wrong twice over: `k` is a bz_string
+// data buffer, which is NOT a C string, and `k_len` is a code-point count, not
+// a byte count. For a key holding a genuine U+0000 code point (a legal `char`,
+// §4.5) strndup's internal strnlen stopped at the embedded NUL and returned a
+// SHORTER allocation while the caller still recorded the full `key_len` —
+// every later length-bounded read of that entry (dict_find's memcmp) then read
+// past the allocation. Measured pre-fix: AddressSanitizer heap-buffer-overflow,
+// "0 bytes after 2-byte region", on `d["a\u0000b"] := 1;` twice over.
+// One extra width-sized zero slot terminates the copy the way bz_string's own
+// buffers are terminated, keeping the strcmp-based ordering scans below (#4493)
+// memory-safe.
+static char* bz_key_dup(const char* k, int64_t cp_len, int8_t w) {
+    size_t wb = (size_t)(w > 0 ? w : 1);
+    size_t n  = (size_t)cp_len * wb;
+    char* p = (char*)malloc(n + wb);
+    if (!p) bz_alloc_fail("Dictionary<K,V> string key copy");
+    if (n && k) memcpy(p, k, n);
+    memset(p + n, 0, wb);
+    return p;
 }
 
 // issue #622 / stdlib §4.8: append a bucket index to the insertion-order array.
@@ -507,7 +601,12 @@ static void dict_order_remove(bz_dict_t* d, int64_t slot) {
     }
 }
 
-static int64_t dict_find(bz_dict_t* d, const char* k, int64_t klen, uint32_t h) {
+// fix #4499: `klen` is a CODE-POINT count and `kw` the operand's storage width
+// (§4.6); the pre-fix signature carried only `klen` and used it as a byte count
+// in the memcmp, which is the truncation/collision defect. Equality is
+// delegated to bz_key_eq (code-point equality, width-independent).
+static int64_t dict_find(bz_dict_t* d, const char* k, int64_t klen, int8_t kw,
+                         uint32_t h) {
     int64_t mask = d->capacity - 1;
     int64_t idx = h & mask;
     for (int64_t probe = 0; probe < d->capacity; probe++) {
@@ -515,7 +614,7 @@ static int64_t dict_find(bz_dict_t* d, const char* k, int64_t klen, uint32_t h) 
         bz_entry_t& e = d->buckets[i];
         if (!e.key && !e.deleted) return -(i + 1); // empty: not found, insert here
         if (e.deleted) continue;
-        if (e.hash == h && e.key_len == klen && memcmp(e.key, k, (size_t)klen) == 0)
+        if (e.hash == h && bz_key_eq(e.key, e.key_len, e.key_w, k, klen, kw))
             return i; // found
     }
     return -1; // table full (shouldn't happen with load factor management)
@@ -647,32 +746,37 @@ int8_t bz_dict_is_disposed(void* dp) {
     return ((bz_dict_t*)dp)->disposed;
 }
 
-bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, void** out) {
+bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
+                         void** out) {
     auto* d = (bz_dict_t*)dp;
     if (!d || !k) return false;
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx < 0) return false;
     if (out) *out = d->buckets[idx].val;
     return true;
 }
 
-void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
+void bz_dict_set_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
+                     void* val) {
     auto* d = (bz_dict_t*)dp;
     // Rehash at 75% load
     if (d->count * 4 >= d->capacity * 3) dict_rehash(d);
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
+        // fix #4606 / §29.12, v0.307: an element-level write to a present key
+        // is NOT structural ("dict[existingKey] := v updating a present key
+        // ... leaves the enumerator valid") — do not bump mod_count here.
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
     int64_t ins = -(idx + 1);
-    d->buckets[ins].key = strndup(k, (size_t)k_len);
+    d->buckets[ins].key = bz_key_dup(k, k_len, k_w);   // fix #4499 (was strndup)
     d->buckets[ins].key_len = k_len;
+    d->buckets[ins].key_w = k_w;                       // fix #4499
     d->buckets[ins].val = val;
     d->buckets[ins].hash = h;
     d->buckets[ins].deleted = false;
@@ -685,24 +789,26 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
 // If `k` is already present, dispose the value stored under it before replacing
 // it (exactly-once disposal of the displaced owner); a fresh key just inserts.
 void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
-                               void* val, void (*dispose_val)(void*)) {
+                               int8_t k_w, void* val,
+                               void (*dispose_val)(void*)) {
     auto* d = (bz_dict_t*)dp;
     if (!d) return;
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx >= 0) {
+        // fix #4606 / §29.12, v0.307: value update of a present key is not
+        // structural — no mod_count bump (see bz_dict_set_str above).
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
-    bz_dict_set_str(dp, k, k_len, val);   // fresh key: bz_dict_set_str bumps mod_count
+    bz_dict_set_str(dp, k, k_len, k_w, val);  // fresh key: bz_dict_set_str bumps mod_count
 }
 
-bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
+bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len, int8_t k_w) {
     auto* d = (bz_dict_t*)dp;
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx < 0) return false;
     dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     free(d->buckets[idx].key);
@@ -718,10 +824,10 @@ bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
 // Mirrors bz_dict_clear's per-entry dispose pattern. The non-owning
 // Dictionary.Remove still calls bz_dict_remove_str (no disposer).
 bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
-                                  void (*dispose_val)(void*)) {
+                                  int8_t k_w, void (*dispose_val)(void*)) {
     auto* d = (bz_dict_t*)dp;
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx < 0) return false;
     dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
@@ -734,19 +840,28 @@ bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
     return true;
 }
 
-bool bz_dict_contains_str(void* dp, const char* k, int64_t k_len) {
-    return bz_dict_try_get_str(dp, k, k_len, nullptr);
+bool bz_dict_contains_str(void* dp, const char* k, int64_t k_len, int8_t k_w) {
+    return bz_dict_try_get_str(dp, k, k_len, k_w, nullptr);
 }
 
 int64_t bz_dict_count(void* dp) {
     return dp ? ((bz_dict_t*)dp)->count : 0;
 }
 
-void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out, int64_t* n_out) {
+// fix #4499: the snapshot hands back THREE parallel arrays — the raw key
+// bytes, the code-point count, and the storage WIDTH — because a key's byte
+// size is `len * width` and the width is not recoverable from the bytes
+// (§4.6). Pre-fix the caller rebuilt every key as a width-1 string of `len`
+// bytes, which is the same code-point-count-as-byte-count confusion the
+// storage layer had; now `decodeDictStringKeyAt` reads the width back.
+void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out,
+                      int8_t** widths_out, int64_t* n_out) {
     auto* d = (bz_dict_t*)dp;
     int64_t n = d ? d->count : 0;
     auto** keys = (char**)malloc((size_t)(n > 0 ? n : 1) * sizeof(char*));
     auto*  lens = (int64_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    auto*  wids = (int8_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int8_t));
+    if (!keys || !lens || !wids) bz_alloc_fail("Dictionary<K,V> key snapshot");
     int64_t j = 0;
     if (d) {
         // issue #622 / stdlib §4.8: iterate in insertion order via order[].
@@ -755,15 +870,17 @@ void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out, int64_t* n
             if (slot < 0) continue;  // tombstone from a remove
             bz_entry_t& e = d->buckets[slot];
             if (e.key && !e.deleted) {
-                keys[j] = strndup(e.key, (size_t)e.key_len);
+                keys[j] = bz_key_dup(e.key, e.key_len, e.key_w);  // fix #4499
                 lens[j] = e.key_len;
+                wids[j] = e.key_w ? e.key_w : 1;
                 j++;
             }
         }
     }
-    if (keys_out) *keys_out = keys; else free(keys);
-    if (lens_out) *lens_out = lens; else free(lens);
-    if (n_out)    *n_out    = j;
+    if (keys_out)   *keys_out   = keys; else free(keys);
+    if (lens_out)   *lens_out   = lens; else free(lens);
+    if (widths_out) *widths_out = wids; else free(wids);
+    if (n_out)      *n_out      = j;
 }
 
 // Generic-key variants (issue #343, §4.8). Keys are raw byte blobs of
@@ -831,8 +948,9 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     int64_t idx = dict_find_gen(d, key, h);
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
+        // fix #4606 / §29.12, v0.307: element-level write to a present key is
+        // not structural — do not bump mod_count here.
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
@@ -859,9 +977,10 @@ void bz_dict_set_gen_disposing(void* dp, const void* key, void* val,
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx >= 0) {
+        // fix #4606 / §29.12, v0.307: value update of a present key is not
+        // structural — no mod_count bump (see bz_dict_set_gen above).
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
-        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     bz_dict_set_gen(dp, key, val);        // fresh key: bz_dict_set_gen bumps mod_count
@@ -912,12 +1031,12 @@ bool bz_dict_contains_gen(void* dp, const void* key) {
 // unlink the entry WITHOUT disposing the value (ownership transfers to caller),
 // and return true.  Returns false when the key is absent (callee raises).
 // String-key variant.
-bool bz_dict_pop_value_str(void* dp, const char* k, int64_t k_len,
+bool bz_dict_pop_value_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
                             void** out) {
     auto* d = (bz_dict_t*)dp;
     if (!d || !k) return false;
-    uint32_t h = fnv1a(k, k_len);
-    int64_t idx = dict_find(d, k, k_len, h);
+    uint32_t h = fnv1a_cp(k, k_len, k_w);
+    int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx < 0) return false;
     if (out) *out = d->buckets[idx].val;
     dict_order_remove(d, idx);
@@ -1099,43 +1218,54 @@ void* bz_dict_max_key_gen(void* dp,
 
 // bz_dict_min_key_str / bz_dict_max_key_str — O(n) scan of a string-key dict
 // (key_size == 0) for the least or greatest key.
-// Fills *out_data (strndup'd copy) and *out_len.  Returns false if empty.
+// Fills *out_data (a malloc'd copy of len*width bytes), *out_len (code points)
+// and *out_w (storage width, fix #4499).  Returns false if empty.
 // Caller must free(*out_data) after use.
 // Ordinal (strcmp) comparison per §9.6.
 
-bool bz_dict_min_key_str(void* dp, char** out_data, int64_t* out_len) {
+bool bz_dict_min_key_str(void* dp, char** out_data, int64_t* out_len,
+                         int8_t* out_w) {
     auto* d = (bz_dict_t*)dp;
     if (!d || d->count == 0) return false;
     const char* best = nullptr;
     int64_t best_len = 0;
+    int8_t  best_w = 1;
     for (int64_t oi = 0; oi < d->order_count; oi++) {
         int64_t slot = d->order[oi];
         if (slot < 0) continue;
         bz_entry_t& e = d->buckets[slot];
         if (!e.key || e.deleted) continue;
-        if (!best || strcmp(e.key, best) < 0) { best = e.key; best_len = e.key_len; }
+        if (!best || strcmp(e.key, best) < 0) {
+            best = e.key; best_len = e.key_len; best_w = e.key_w ? e.key_w : 1;
+        }
     }
     if (!best) return false;
-    if (out_data) *out_data = strndup(best, (size_t)best_len);
+    if (out_data) *out_data = bz_key_dup(best, best_len, best_w);  // fix #4499
     if (out_len)  *out_len  = best_len;
+    if (out_w)    *out_w    = best_w;
     return true;
 }
 
-bool bz_dict_max_key_str(void* dp, char** out_data, int64_t* out_len) {
+bool bz_dict_max_key_str(void* dp, char** out_data, int64_t* out_len,
+                         int8_t* out_w) {
     auto* d = (bz_dict_t*)dp;
     if (!d || d->count == 0) return false;
     const char* best = nullptr;
     int64_t best_len = 0;
+    int8_t  best_w = 1;
     for (int64_t oi = 0; oi < d->order_count; oi++) {
         int64_t slot = d->order[oi];
         if (slot < 0) continue;
         bz_entry_t& e = d->buckets[slot];
         if (!e.key || e.deleted) continue;
-        if (!best || strcmp(e.key, best) > 0) { best = e.key; best_len = e.key_len; }
+        if (!best || strcmp(e.key, best) > 0) {
+            best = e.key; best_len = e.key_len; best_w = e.key_w ? e.key_w : 1;
+        }
     }
     if (!best) return false;
-    if (out_data) *out_data = strndup(best, (size_t)best_len);
+    if (out_data) *out_data = bz_key_dup(best, best_len, best_w);  // fix #4499
     if (out_len)  *out_len  = best_len;
+    if (out_w)    *out_w    = best_w;
     return true;
 }
 
@@ -1156,6 +1286,14 @@ static int bz_kv_idx_cmp_gen(const void* ia, const void* ib, void* c) {
     return ctx->cmp(ctx->keys[i], ctx->keys[j]);
 }
 struct BzKVSortCtxStr { char** keys; };
+// NOTE (#4493, not fixed here): this comparison is byte-wise `strcmp` over the
+// snapshot's raw key buffers, so it orders by storage BYTE rather than by code
+// point and stops at the first zero byte a width>1 key contains. It is
+// memory-safe (bz_key_dup terminates every copy with a width-sized zero slot)
+// but it is not §4.6's ordering; the width spine bz_sort_kv_str now carries is
+// what a code-point-aware comparator (bz_str_compare_cp's relation, #4487)
+// needs in order to be written. Fixing the relation is #4493's scope, not
+// #4499's — #4499 is identity/hashing.
 static int bz_kv_idx_cmp_str(const void* ia, const void* ib, void* c) {
     auto* ctx = (BzKVSortCtxStr*)c;
     int64_t i = *(const int64_t*)ia, j = *(const int64_t*)ib;
@@ -1187,7 +1325,8 @@ void bz_sort_kv_gen(void** keys, void** values, int64_t n,
 
 // bz_sort_kv_str: reorder char** keys + int64_t* lens + void** values together
 // in ascending lexicographic string order (§9.6).
-void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n) {
+void bz_sort_kv_str(char** keys, int64_t* lens, int8_t* widths, void** values,
+                    int64_t n) {
     if (n <= 1 || !keys) return;
     // fix #1762 finding R1 + spec §31.4: every scratch allocation here
     // terminates on failure. Returning early (the pre-fix and first-fix
@@ -1202,15 +1341,22 @@ void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n) {
     if (!ks) bz_alloc_fail("sort scratch (key array)");
     int64_t* ls = lens   ? (int64_t*)malloc((size_t)n * sizeof(int64_t)) : nullptr;
     if (lens && !ls) bz_alloc_fail("sort scratch (length array)");
+    // fix #4499: the WIDTH array is a third parallel spine and must be
+    // permuted with the other two, or a key's bytes and its width come from
+    // different entries after the sort.
+    int8_t*  ws = widths ? (int8_t*)malloc((size_t)n * sizeof(int8_t)) : nullptr;
+    if (widths && !ws) bz_alloc_fail("sort scratch (width array)");
     void**   vs = values ? (void**)malloc((size_t)n * sizeof(void*)) : nullptr;
     if (values && !vs) bz_alloc_fail("sort scratch (value array)");
     for (int64_t i = 0; i < n; i++) {
         ks[i] = keys[idx[i]];
         if (ls) ls[i] = lens[idx[i]];
+        if (ws) ws[i] = widths[idx[i]];
         if (vs) vs[i] = values[idx[i]];
     }
     memcpy(keys, ks, (size_t)n * sizeof(char*));
     if (ls) { memcpy(lens, ls, (size_t)n * sizeof(int64_t)); free(ls); }
+    if (ws) { memcpy(widths, ws, (size_t)n * sizeof(int8_t)); free(ws); }
     if (vs) { memcpy(values, vs, (size_t)n * sizeof(void*)); free(vs); }
     free(ks); free(idx);
 }
@@ -1226,8 +1372,8 @@ void bz_sort_keys_gen(void** keys, int64_t n,
 // bz_sort_keys_str: sort char** key-data + int64_t* lens in ascending order.
 // Thin wrapper over bz_sort_kv_str (values=null).
 // Used for SortedDictionary<string,V>.Keys sorted iteration (§4.17).
-void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n) {
-    bz_sort_kv_str(keys, lens, nullptr, n);
+void bz_sort_keys_str(char** keys, int64_t* lens, int8_t* widths, int64_t n) {
+    bz_sort_kv_str(keys, lens, widths, nullptr, n);
 }
 
 // issue #628 / stdlib §4.9 v0.135: OwningDictionary<K,V>.Drain() per-entry pop.
@@ -1247,7 +1393,7 @@ void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n) {
 // that starts at 0 and is updated here.
 bool bz_dict_drain_next_str(void* dp, int64_t* cursor,
                              char** key_out, int64_t* key_len_out,
-                             void** val_out) {
+                             int8_t* key_w_out, void** val_out) {
     auto* d = (bz_dict_t*)dp;
     if (!d || d->count == 0) return false;
     // Advance cursor to the first live slot in the order array.
@@ -1258,8 +1404,11 @@ bool bz_dict_drain_next_str(void* dp, int64_t* cursor,
         bz_entry_t& e = d->buckets[slot];
         if (!e.key || e.deleted) continue;  // already gone
         // Found a live entry: hand ownership of key+val to caller.
-        if (key_out)     *key_out     = strndup(e.key, (size_t)e.key_len);
+        // fix #4499: malloc+memcpy of `key_len * key_w` bytes; the width
+        // rides along so the caller can rebuild the key at its true width.
+        if (key_out)     *key_out     = bz_key_dup(e.key, e.key_len, e.key_w);
         if (key_len_out) *key_len_out = e.key_len;
+        if (key_w_out)   *key_w_out   = e.key_w ? e.key_w : 1;
         if (val_out)     *val_out     = e.val;
         // Remove from the bucket (mark deleted, free key storage, nil val).
         free(e.key);
@@ -1488,6 +1637,13 @@ void bz_dict_clear_set_strings(void* dp) {
     memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
     d->count = 0;
     d->order_count = 0;  // issue #622: reset insertion-order tracking on Clear
+    // fix #4623 / §29.12, v0.307: Clear() is a listed structural operation
+    // ("Add, ..., Clear, ...") — this string-releasing twin of bz_dict_clear
+    // must bump mod_count exactly as bz_dict_clear does, else a `for` over a
+    // Set<string> that Clear()s the same set mid-iteration never raises
+    // InvalidOperationException (a false negative — the enumerator keeps
+    // walking a table that was just emptied underneath it).
+    d->mod_count++;  // §29.12 / #4623: structural mutation
 }
 
 // issue #429 / §28.9 / §4.10: like bz_dict_remove_gen but releases the
@@ -1512,6 +1668,13 @@ bool bz_dict_remove_set_string(void* dp, const void* key) {
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    // fix #4623 / §29.12, v0.307: Remove() is a listed structural operation
+    // ("Add, ..., Remove, ..."), same as bz_dict_remove_gen (the non-string
+    // twin this function otherwise mirrors) and bz_dict_remove_str — this
+    // string-releasing Set<string> path was the one sibling that skipped the
+    // bump, so a `for` over a Set<string> that Remove()s the same set
+    // mid-iteration never raised InvalidOperationException (false negative).
+    d->mod_count++;  // §29.12 / #4623: structural mutation
     return true;
 }
 
@@ -3139,7 +3302,8 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
             auto* s = (bz_string_struct*)(intptr_t)k;
             const char* kd = s ? (const char*)s->data : "";
             int64_t kl = s ? s->len : 0;
-            bz_dict_set_str(dict, kd, kl, val);
+            int8_t  kw = s ? s->width : (int8_t)1;   // fix #4499
+            bz_dict_set_str(dict, kd, kl, kw, val);
         } else {
             memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
             bz_dict_set_gen(dict, key_buf, val);

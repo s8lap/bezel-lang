@@ -45,6 +45,7 @@
 #include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
+#include "support/emit_object_support.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
@@ -99,19 +100,20 @@ int runUnderLeakSanitizer(const std::string& source) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -121,13 +123,16 @@ int runUnderLeakSanitizer(const std::string& source) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
 
     std::string runCmd =
         "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
     return 0;
 }
@@ -166,7 +171,7 @@ void expectValueAndNoCorruption(const std::string& source, int expectedExitCode)
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
         if (!module) return;
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return;
+        if (!bezel::test::emitObjectFileForTest(*module, objPath, err)) return;
     }
     auto cleanup = [&] {
         std::remove(objPath.c_str());
@@ -214,6 +219,44 @@ const char* k841CapturingHandlerRepro =
     "  end; "
     "  b.Fire(5); "   // sub disposed → no handler → box unchanged
     "  return box.V; "  // 2
+    "end Main; end C;";
+
+// fix #4509 (§27.5 / §28.9, v0.306): the LOOP-AMPLIFIED spelling of the repro
+// above, for the leak leg only. The one-shot form is a VACUOUS leak oracle: the
+// capture cell it allocates is the last one, so its pointer is routinely still
+// discoverable by LeakSanitizer's conservative stack scan and the row passes
+// whether or not the cell was ever freed. That is not a hypothesis — on the
+// pre-#4509 compiler the one-shot form reported clean while
+// `LSAN_OPTIONS=use_stacks=0` on the SAME binary reported 8 B / 1 allocation,
+// and 200 iterations reported 1592 B / 199 allocations. CLAUDE.md's oracle rule
+// ("ship the loop, 50-500 iterations") is exactly this case.
+//
+// `total == 400` proves all 200 handlers ran, so the amplification is of the
+// live shape. Returns 7.
+const char* k841CapturingHandlerReproLoop =
+    "module M; "
+    "record Ev(N: int); "
+    "class Box "
+    "  public V: int := 0; "
+    "  public method Add(x: int) V := V + x; end Add; "
+    "end Box; "
+    "class Button "
+    "  public event Clicked: Ev; "
+    "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+    "end Button; "
+    "class C public static method Main(): int "
+    "  var total := 0; "
+    "  for var i in 0..<200 do "
+    "    using var box := new Box(); "
+    "    using var b := new Button(); "
+    "    do "
+    "      using var sub := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+    "      b.Fire(2); "
+    "    end; "
+    "    total := total + box.V; "
+    "  end; "
+    "  if total = 400 then return 7; end; "
+    "  return 1; "
     "end Main; end C;";
 
 // §24 / §27.5 / #841 NON-CAPTURING: a non-capturing handler has no env
@@ -343,6 +386,14 @@ const char* k841BoundLocalCapturing =
 BEZEL_TEST(codegen_event_subscription_closure_841,
            capturing_handler_env_released_on_sub_dispose_24_27_5) {
     expectValueAndLeakFree(k841CapturingHandlerRepro, 2);
+    // fix #4509 (§27.5 / §28.9, v0.306): the same claim, amplified, because the
+    // one-shot leg above can pass by stack-scan REACHABILITY rather than by
+    // reclamation (see k841CapturingHandlerReproLoop's note). Strictly stronger
+    // than what this row asserted before; the one-shot legs are kept as-is.
+    BEZEL_EXPECT_EQ(run(k841CapturingHandlerReproLoop), 7);
+    int lsanLoop = runUnderLeakSanitizer(k841CapturingHandlerReproLoop);
+    if (lsanLoop != -1)  // toolchain unavailable: skip, as the helper does
+        BEZEL_EXPECT_EQ(lsanLoop, 0);
 }
 
 // 841-b: a non-capturing handler (null env) — bz_closure_release must be

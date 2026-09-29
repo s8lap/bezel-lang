@@ -78,19 +78,20 @@ int lowerToObject(const std::string& source, const std::string& objPath) {
     bezel::Lexer lexer(source, diags);
     bezel::Parser parser(lexer, diags);
     auto unit = parser.parseCompilationUnit();
-    if (!unit) return -1;
+    if (!unit) return bezel::test::asanBuildFailure("parse");
     bezel::sema::SemaContext ctx(diags);
     bezel::sema::collectSymbols(*unit, ctx);
     bezel::sema::resolveTypes(*unit, ctx);
     bezel::sema::typecheckExpressions(*unit, ctx);
     bezel::sema::checkDefiniteAssignment(*unit, ctx);
     bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -1;
+    if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
     llvm::LLVMContext llvmCtx;
     auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-    if (!module) return -1;
+    if (!module) return bezel::test::asanBuildFailure("emitModule");
     std::string err;
-    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     return 0;
 }
 

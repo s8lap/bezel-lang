@@ -38,6 +38,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -58,6 +59,40 @@ std::string mod(const std::string& member) {
         "    return new Inner(); "
         "  end MakeOwned; "
         ) + member + " end Wrap;";
+}
+
+// v0.303 / #4450 (the #3975 option-1 ruling): under a DOMINATING
+// `Dispose()`, every use of the source local — read, borrow, AND consume —
+// is §28.2's use-after-dispose WARNING, NOT §28.3's consume-table ERROR.
+// The consume-side ruling is the new contract; the OLD §28.3 ERROR text
+// ("cannot move from disposed local `x`") is GONE.  These two helpers are
+// the inclusive matcher (matches BOTH wording variants — the read-side
+// `checkRead` produces and the consume-side `markMovedByName` produces
+// post-ruling) and the negative guard that the OLD §28.3 ERROR must NOT
+// have reappeared (catches any over-relaxation of the conditional-kill
+// arms, which the demotion did NOT touch).
+//
+// per §28.2, §28.3 K1.3/K7, v0.303, #3975 (option 1), #4450
+inline bool hasUseAfterDisposeWarning(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("use of `") != std::string::npos &&
+            d.message.find("after a dominating explicit Dispose() call") !=
+                std::string::npos)
+            return true;
+        if (d.message.find("move from a local `") != std::string::npos &&
+            d.message.find("already disposed at this point") !=
+                std::string::npos)
+            return true;
+    }
+    return false;
+}
+inline bool hasCannotMoveFromDisposedError(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("cannot move from disposed local") !=
+                std::string::npos) return true;
+    return false;
 }
 
 } // namespace
@@ -173,26 +208,29 @@ BEZEL_TEST(owned_field_assign, ctor_owned_param_into_owned_field_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.8 / §28.8.1: `move c` of an `owned` parameter is also an owned value;
-// storing it into the owned field is a legal transfer. ACCEPTED.
+// §28.8 / §28.8.1: an `owned` parameter is an owned value; storing it into the
+// owned field is a legal transfer. ACCEPTED. Spelled marker-free per §28.3
+// K3.13 (v0.307): the declared field slot announces the consume, so the bare
+// `resource` IS the transfer and a `move` marker here is redundant (K3.1).
 BEZEL_TEST(owned_field_assign, move_owned_param_into_owned_field_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public method TakeOwnership(owned resource: Inner) "
         "  this._c.Dispose(); "
-        "  this._c := move resource; "
+        "  this._c := resource; "
         "end TakeOwnership;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3: `move ownedLocal` is an Owned producer (the local moves out and is
-// left moved-from). Storing it into the owned field is a legal transfer.
-// ACCEPTED.
+// §28.3: an owned local read in an owned-field store is an Owned producer (the
+// local moves out and is left moved-from). Storing it into the owned field is a
+// legal transfer. ACCEPTED. Spelled marker-free per §28.3 K3.13 (v0.307) — the
+// declared field slot announces the consume, so `move` here is redundant (K3.1).
 BEZEL_TEST(owned_field_assign, move_owned_local_into_owned_field_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public method Replace() "
         "  var fresh := new Inner(); "
         "  this._c.Dispose(); "
-        "  this._c := move fresh; "
+        "  this._c := fresh; "
         "end Replace;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -310,17 +348,26 @@ BEZEL_TEST(owned_field_assign, owned_local_moved_from_after_field_store_rejected
 // §28.8 / §28.3: after a bare owned-PARAMETER read is consumed into the owned
 // field (the §28.8 `_resource := resource;` pattern), the parameter is
 // discharged and may not be used again — a later `move resource` is reading a
-// disposed/consumed value. REJECTED. This proves the parameter discharge was
-// recorded (and, conversely, that the single legal consume does NOT leave the
-// owned parameter undischarged — the accepted positive above).
-BEZEL_TEST(owned_field_assign, owned_param_consumed_then_reused_rejected) {
+// disposed/consumed value. v0.303 / #4450 demoted the dominating-kill arm
+// from §28.3 ERROR to §28.2 WARNING (the ruling is option 1 of #3975), so
+// the verdict MOVED: pre-fix this was a hard REJECT, post-fix it is a
+// WARNING admitted by §28.2's checked-disposal backstop.  The OLD §28.3
+// "cannot move from disposed local" ERROR text is GONE — the negative
+// guard below pins it as absent.
+BEZEL_TEST(owned_field_assign, owned_param_consumed_then_reused_warns_28_2_4450) {
     auto r = parseAndCheckOwnership(mod(
         "public method Bad(owned resource: Inner) "
         "  this._c.Dispose(); "
         "  this._c := resource; "
         "  using var again := move resource; "
         "end Bad;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.2 (v0.303) WARNING — the dominating-kill verdict, not the
+    // §28.3 consume-table error.  The consume-side wording, distinct from
+    // `checkRead`'s read-side text.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
+    // Negative guard: the OLD §28.3 ERROR text must NOT have re-appeared.
+    BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
 }
 
 // ---- §28.6 / #1484: fresh owned value in a FIELD INITIALIZER ---------------

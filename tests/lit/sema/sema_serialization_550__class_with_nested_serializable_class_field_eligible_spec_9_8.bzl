@@ -12,7 +12,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Inner: ISerializable public property V: int; public constructor(v: int) V := v; end constructor; end Inner; class Outer: ISerializable public owned Obj: Inner; public constructor(owned obj: Inner) Obj := move obj; end constructor; end Outer;
+module M; class Inner: ISerializable public property V: int; public constructor(v: int) V := v; end constructor; end Inner; class Outer: ISerializable public owned Obj: Inner; public constructor(owned obj: Inner) Obj := obj; end constructor; end Outer;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

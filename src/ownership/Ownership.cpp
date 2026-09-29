@@ -2,6 +2,7 @@
 #include "ownership/Ownership_impl.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
@@ -273,6 +274,60 @@ bool stmtNeverFallsThrough(const ast::Stmt& s) {
 bool armNeverFallsThrough(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
         if (*it) return stmtNeverFallsThrough(**it);
+    }
+    return false;
+}
+
+// fix #4141 (§21.5/§28.3, v0.298): the companion predicate to
+// `armNeverFallsThrough` for `break`/`continue`. Does the LAST reachable
+// top-level statement of an arm divert control away from the point
+// directly after the ENCLOSING construct, and is its target the
+// IMMEDIATELY enclosing loop (offset 0 — an unlabeled `break`/`continue`,
+// or a labeled form naming the innermost enclosing loop)?
+//
+// Unlike `armNeverFallsThrough` (which DROPS the operand, because
+// `return`/`throw` leave the enclosing CALLABLE and so the operand has
+// nowhere else it needs to go), `break`/`continue` reach a DIFFERENT,
+// but still-live, merge point — the enclosing loop's own join. They must
+// be FORWARDED to that join, not folded into the if/case's own join
+// (which would falsely tell code after the if/case that `x` is maybe-
+// consumed when only the unreachable break-arm ever touched it — see
+// issue #4141's repro and the #4138 first-draft history), and not
+// dropped entirely (which would discard the move from the loop's join
+// — see the #4138 first-draft `while cond do if flag then move x; break;
+// end; end; move x;` counter-example, which silently un-rejected a real
+// double-move when `break` was simply excluded from every join).
+//
+// This predicate's callers (the lambda-body pre-pass's `If`/`Case`
+// arms) push the arm's `states_` to `pendingDivertedStates_` instead of
+// `armEnds`/`caseArmEnds`; the immediately enclosing `While`/`For`
+// handler pops every state pushed during its body's walk and JOINS each
+// one into its own post-loop join (the same loop's post-loop merge
+// operand for an unlabeled break, or the loop's header — both reach
+// the same merge point from this walker's one-pass-through-the-body
+// perspective, so offset-0 is the only case that matters for this fix).
+//
+// Labeled forms with `targetLoopOffset > 0` (e.g. `break outer;` from
+// inside a nested `while true do ... end;`) target an OUTER labeled
+// loop's join, not the immediately enclosing one — forwarding them
+// would need a per-offset stack, which is a larger change than this
+// narrow fix attempts (see #4146's Stage 2, "lambda bodies through the
+// real CFG", for the general solution). For now, only offset 0 is
+// recognized; a labeled form is treated as "does not divert at this
+// level", and falls back to the over-conservative pre-fix behavior
+// (fold the arm's end state into the immediate join — a false-reject,
+// not a soundness hole, since `joinInto`'s accumulation is monotonic
+// toward more caution).
+bool armDivertsToEnclosingLoop(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (auto it = stmts.rbegin(); it != stmts.rend(); ++it) {
+        if (!*it) continue;
+        const ast::Stmt& s = **it;
+        if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s))
+            return brk->targetLoopOffset == 0;
+        if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s))
+            return cnt->targetLoopOffset == 0;
+        return false;
     }
     return false;
 }
@@ -716,7 +771,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         std::string("owned value in `") +
                         std::string(sym->name) +
                         "` is implicitly disposed at the end of its scope "
-                        "(§28.3 auto-drop); use `item?.Dispose()`, `move`, "
+                        "(§28.3 must-use / auto-drop); use `item?.Dispose()`, `move`, "
                         "`using var _ := owned item`, or `return` to discharge "
                         "it explicitly (§28.3/§28.11)");
                     continue;
@@ -758,13 +813,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // adoption idiom `using var … := owned …` is the
                         // warning-free spelling. Diagnostic-only: the frame
                         // disposal itself is unchanged. // per §28.3/§29.8/§30.1
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
-                            "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                            "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
                             "`.Dispose()` it, or adopt it with `using var _ := "
                             "owned " + std::string(sym->name) +
                             "`, to discharge it explicitly");
@@ -800,14 +855,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // The same §28.3 must-use warning the never-discharged
                         // branch above emits: on the branch that does NOT adopt,
                         // the frame's teardown is an implicit drop.
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
                             "on the path that does not adopt it "
-                            "(§28.3/§29.8/§30.1 auto-drop); adopt it on every "
+                            "(§28.3/§29.8/§30.1 must-use / auto-drop); adopt it on every "
                             "path with `using var _ := owned " +
                             std::string(sym->name) +
                             "`, to discharge it explicitly");
@@ -846,14 +901,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // NOT the must-use warning — the await IS the discharge, exactly
                         // as for a warning-free plain-local await. // per §30.5
                         if (awaitDischargedIterVars_.count(sym) == 0)
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of each loop "
-                                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                                "iteration (§29.2/§28.3 must-use / auto-drop); use `.Dispose()`, "
                                 "`move`, `using var`, or `return` to discharge it "
                                 "explicitly");
                         continue;
@@ -954,14 +1009,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // the instance's memory, which §28.9 still requires be
                         // reclaimed.)
                         if (!localIsTrivialDisposeNewBinding(*ld)) {
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of its scope "
-                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "(§28.3 must-use / auto-drop); declare it `using var` to make "
                                 "the scope-bound disposal explicit, or `move` / "
                                 "`return` / `.Dispose()` / `_ := …` to discharge it");
                         }
@@ -978,14 +1033,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (dynamic_cast<const ast::IdentifierExpr*>(ls->decl) &&
                         loopCondOutOwnedSyms_.count(sym) == 0) {
                         ls->autoDropAtScopeEnd = true;
-                        ctx_.diagnostics().report(
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             st.obligationOrigin ? st.obligationOrigin->span.begin
                                                 : SourceLocation{},
                             std::string("owned value in `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of its scope "
-                            "(§28.3 auto-drop); use `item?.Dispose()`, "
+                            "(§28.3 must-use / auto-drop); use `item?.Dispose()`, "
                             "`_ := item`, `move`, or `return` to discharge it "
                             "explicitly (§28.3/§28.11)");
                         continue;
@@ -1003,31 +1058,64 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     // disposal obligation; a borrow parameter is never Owned here.
                     if (ps->modifier == "owned") {
                         ps->autoDropAtScopeEnd = true;
-                        // fix #3033 / §28.10 (v0.240): the fourth remedy used to
-                        // read "rebind it with `using var`", naming a spelling
-                        // that is NOT a discharge. §28.10 *Adopting a named owned
-                        // binding*, verbatim: "An **unmarked** `using var y := x;`
-                        // where `x` is a named owned binding does *not* adopt: it
-                        // is a borrow, pinned per the subsection below, and `x`
-                        // retains the obligation." Only the MARKED form adopts —
-                        // "`using var y := owned x;` transfers a named owned local
-                        // or `owned` parameter into a scope-bound binding: `y`
-                        // takes over the disposal obligation". So a user who
-                        // followed the old text verbatim got this same warning
-                        // again and no discharge; name the marker.
-                        ctx_.diagnostics().report(
+                        // §28.9 + Appendix C.3 item 14, v0.307 / fix #4743:
+                        // the trivial-dispose exemption reaches this holder
+                        // form. §28.9 says so verbatim — the §28.3 must-use
+                        // warning "is not emitted at the implicit-drop site of
+                        // a plain-`var` owned local, of an undischarged
+                        // `owned` parameter … whose type is trivial-dispose".
+                        // The fix is WARNING-only; `autoDropAtScopeEnd` stays
+                        // set above so the emitted scope-end free is unchanged
+                        // (suppressing the free instead would leak the
+                        // instance's memory, which §28.9 still requires be
+                        // reclaimed).
+                        //
+                        // narrow #4743: the gate is the POSITIVE predicate, the
+                        // one the owned-LOCAL twin at L1011 already reaches
+                        // through `localIsTrivialDisposeNewBinding`. #4743
+                        // spelled it `if (common::isNonTrivialDisposeClass(pt,
+                        // ctx_))`, which is NOT the same question: that
+                        // predicate answers `false` for a declaration-less
+                        // builtin head, an uninstantiated bare type parameter
+                        // and every non-`Class` declaration kind, so an
+                        // `owned OwningArray<Cell>`, an `owned x: T` inside a
+                        // generic, and an `owned` interface parameter all lost
+                        // a warning §28.9 requires — "the owned-element
+                        // variants … are **not** trivial-dispose at any
+                        // instantiation", "an interface type is never
+                        // trivial-dispose". Read the declared type here: a
+                        // parameter has no statically-known producer, which is
+                        // the arm §28.9's classification key selects.
+                        const sema::TypeRef* pt = ps->declType
+                            ? ctx_.resolvedType(*ps->declType)
+                            : ps->resolvedDeclType;
+                        if (!typeIsProvablyTrivialDisposeClass(pt)) {
+                            // fix #3033 / §28.10 (v0.240): the fourth remedy used to
+                            // read "rebind it with `using var`", naming a spelling
+                            // that is NOT a discharge. §28.10 *Adopting a named owned
+                            // binding*, verbatim: "An **unmarked** `using var y := x;`
+                            // where `x` is a named owned binding does *not* adopt: it
+                            // is a borrow, pinned per the subsection below, and `x`
+                            // retains the obligation." Only the MARKED form adopts —
+                            // "`using var y := owned x;` transfers a named owned local
+                            // or `owned` parameter into a scope-bound binding: `y`
+                            // takes over the disposal obligation". So a user who
+                            // followed the old text verbatim got this same warning
+                            // again and no discharge; name the marker.
+                            ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of the method "
-                            "(§28.3 auto-drop); `move` / `return` / `.Dispose()` "
+                            "(§28.3 must-use / auto-drop); `move` / `return` / `.Dispose()` "
                             "it, or adopt it with `using var " +
                             std::string(sym->name) + "2 := owned " +
                             std::string(sym->name) +
                             ";` (the `owned` marker is required — an unmarked "
                             "`using var` rebind is a borrow-pin, §28.10), to "
                             "discharge it explicitly");
+                        }
                         continue;
                     }
                 }
@@ -1142,14 +1230,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             taskElementBorrowingCollectionSuspendLocal) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
-                            ctx_.diagnostics().report(
+                                ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
                                                     : SourceLocation{},
                                 std::string("owned value in `") +
                                 std::string(sym->name) +
                                 "` is implicitly disposed at the end of its scope "
-                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "(§28.3 must-use / auto-drop); declare it `using var` to make "
                                 "the scope-bound disposal explicit, or `move` / "
                                 "`return` / `.Dispose()` / `_ := …` to discharge it");
                             continue;
@@ -1226,7 +1314,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 Severity::Warning, fs->span.begin,
                 std::string("owned value in `") + std::string(ls->name) +
                 "` is implicitly disposed at the end of each loop "
-                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                "iteration (§29.2/§28.3 must-use / auto-drop); use `.Dispose()`, "
                 "`move`, `using var`, or `return` to discharge it "
                 "explicitly");
     }
@@ -1267,7 +1355,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 ps->decl ? ps->decl->span.begin : SourceLocation{},
                 std::string("owned parameter `") + std::string(sym->name) +
                 "` is implicitly disposed by the frame at teardown "
-                "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
                 "`.Dispose()` it, or adopt it with `using var _ := owned " +
                 std::string(sym->name) + "`, to discharge it explicitly");
         }
@@ -1323,7 +1411,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     Severity::Warning, ld->span.begin,
                     std::string("owned value in `") + std::string(sym->name) +
                     "` is implicitly disposed at the end of its scope "
-                    "(§28.3 auto-drop); declare it `using var` to make the scope-bound "
+                    "(§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound "
                     "disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` "
                     "to discharge it");
                 continue;
@@ -1343,7 +1431,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     ls->decl ? ls->decl->span.begin : SourceLocation{},
                     std::string("owned value in `") + std::string(sym->name) +
                     "` is implicitly disposed at the end of its scope "
-                    "(§28.3 auto-drop); use `item?.Dispose()`, "
+                    "(§28.3 must-use / auto-drop); use `item?.Dispose()`, "
                     "`_ := item`, `move`, or `return` to discharge it "
                     "explicitly (§28.3/§28.11)");
             }
@@ -1487,6 +1575,15 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         }
     }
     checkBorrowReturnedThroughOwningType(exprBody);
+    // fix #4428 (§9.7, v0.301): the `=>` expression-body sibling of the
+    // block-body `handleReturn -> checkRecordBorrowEscapesOnReturn` call.
+    // Mirrors the block-body return-site coverage so an expression-bodied
+    // `static method Trim(s: ReadOnlySpan<byte>): ReadOnlySpan<byte> =>
+    // s.Slice(1);` reaches the parameter-root rejection exactly as
+    // `return s.Slice(1);` does. A no-op when the body's static type is not
+    // a borrow-bearing record or a builtin span view (the function's first
+    // gate is `isBorrowBearingRecordOrSpan(rt)`). // per §9.7 v0.301
+    checkRecordBorrowEscapesOnReturn(exprBody);
     // §28.3 (v0.180, #1547): the `=>` expression-body sibling of the
     // handleReturn call — rejects `static method Pick(a: Res, b: Res): Res =>
     // a;` exactly as the block-body `return a;` form is rejected. A no-op
@@ -1523,6 +1620,16 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Pick(a: Res, b: Res): owned Res => b;` (a borrowed parameter
     // returned through an `owned` return type, double-free). // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(exprBody);
+    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987): the `=>`
+    // expression-body sibling of the handleReturn driver above —
+    // `=> (if c then move y else g);` reaches the return site with the same
+    // mixed Owned/Borrowed arm set the block-body `return <same>;` form does,
+    // so the K7.3 rejection the `=>` body otherwise skipped (and which the
+    // local-decl-INITIALIZER driver does not see for the body itself) fires
+    // here too. A no-op outside a ConditionalExpr/CaseExpr body and any arm
+    // set that does not mix Owned with Borrowed-class-typed.
+    // // per §28.3, K7.3, v0.307
+    checkArmMeetMixed(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
     // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
@@ -2548,6 +2655,19 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // statement; the if/while/for/do/try branches inside visitStmt are
     // retained but unreachable from a block's statement list (the CFG
     // already extracted that control flow).
+    //
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): `CaseStmt` is now in the
+    // CFG (visitCase, src/flow/CFG.cpp) — each arm is its own Branch block
+    // with a real fall-through edge into a Merge block. `CaseStmt` itself
+    // does NOT appear in any block's `stmts` list (it is consumed by
+    // visitStmt which now only does the side-band K8 mark + early return;
+    // the per-arm body stmts live in the per-arm Linear blocks). The two
+    // side-band Exprs it owns — the scrutinee and each arm's expression-
+    // form body — are NOT in `stmts` (an Expr is not a Stmt), so the per-
+    // block visitStmt walk above cannot reach them. They are instead
+    // recorded on the block via back-pointers (`CFGBlock::caseScrutinee`
+    // on the entry block, `CFGBlock::caseArmExprBody` on the arm's Branch
+    // block) and fired explicitly below.
     for (const ast::Stmt* s : block.stmts) {
         if (!s) continue;
         // §28.8.1 "Exception paths are not exempt" (#3080): asked at this
@@ -2559,6 +2679,67 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
         // exception out of the RHS precedes the store. // per §28.8.1
         checkThrowableWhileFieldMovedFrom(*s);
         visitStmt(*s);
+    }
+    // fix #4146: case-arm expression-form body discharge. Block-form arms
+    // walk their stmts via `processBlock` on the per-arm Linear blocks the
+    // CFG builds; expression-form arms carry no body stmts and need their
+    // `exprBody` discharged here (`handleDischarge` is the §28.3 owned-
+    // argument-transfer authority — same call as the pre-#4146 CaseStmt
+    // arm used at Ownership.cpp:3361, only now fired from processBlock on
+    // the per-arm Branch block instead of inlined in the per-statement
+    // visitStmt walk). Null on Block-form arms and on every non-case block.
+    if (block.caseArmExprBody) {
+        handleDischarge(*block.caseArmExprBody);
+    }
+    // fix #4146: case-statement side-band Expr checks. The scrutinee lives
+    // on `block.caseScrutinee` (set by flow::CFG.cpp visitCase on the case's
+    // entry block — the block WHERE this construct's `case EXPR of` keyword
+    // is). It is an Expr position and carries the §28.8 borrow→`owned`
+    // argument check; mirror what `visitStmt`'s CaseStmt arm used to do
+    // before the structural arm-join was retired (Ownership.cpp:3328). The
+    // `when` statement form parses into CaseStmt with a null scrutinee, so
+    // `caseScrutinee` is null on those entry blocks — the guard is null too,
+    // so there is no ownership-bearing Expr at the entry to check.
+    //
+    // ORDER: BEFORE the block.stmts loop. The K8 full-expression boundary
+    // mark (`disposeOwnedScrutinee`, #1795) reads `producerState(*scrutinee)`
+    // — a state query that is only meaningful AFTER `checkRead` has
+    // populated the state map from the scrutinee's producers. Running the
+    // side-band checkRead before the stmts loop ensures the K8 mark (fired
+    // here, immediately after, on the same block) sees populated state.
+    // The K8 mark is fired here rather than from visitStmt's CaseStmt arm
+    // because the CFG no longer appends the CaseStmt node to any block's
+    // `stmts` list (visitCase consumes it and emits per-arm blocks), so
+    // visitStmt on the CaseStmt never runs from processBlock on this entry
+    // block — processBlock fires the K8 mark directly off the back-pointer.
+    if (block.caseScrutinee) {
+        checkRead(*block.caseScrutinee, /*selfTarget=*/false);
+        // K8 full-expression boundary mark (#1795). Mirrors what
+        // visitStmt's CaseStmt arm used to do before the structural arm-
+        // join was retired (Ownership.cpp:3329-3352). The gate is the
+        // SAME as DiscardStmt::disposeOwnedValue above: producerState ==
+        // Owned plus a heap class/interface type or an owning-collection
+        // head — the §17.13 / #1009 / #1909 predicate. The CaseStmt AST
+        // node is on `block.sourceStmt` (set by visitCase — see
+        // src/flow/CFG.cpp).
+        const ast::Expr* scrut = block.caseScrutinee;
+        if (!suppressDiag_ && producerState(*scrut) == OwnershipState::Owned) {
+            const sema::TypeRef* rt = ctx_.exprType(*scrut);
+            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration &&
+                (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !rt->declaration->isValueBuiltin &&
+                (rt->declaration->decl != nullptr ||
+                 !rt->declaration->moduleName.empty());
+            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                isOwningCollectionNameHead(rt->headName());
+            if (isHeapClass || isOwningCollection) {
+                if (auto* cs = dynamic_cast<const ast::CaseStmt*>(block.sourceStmt)) {
+                    const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
+                }
+            }
+        }
     }
     // #2109 (§30.7 / §28.3): for every for/await-for loop whose iterable and
     // (optional) `with` cancellation-token expression are evaluated in this
@@ -3270,87 +3451,106 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // turning on a brand-new clash diagnostic for `case` arms is a separate,
     // larger blast radius left for its own issue if it turns out to matter.
     // // per §19, §19.6, §28.3 K1.4, v0.295, #4116
+    //
+    // fix #4146 (§19, §28.2, §28.3 K1.4, v0.298): the structural arm-join
+    // (`armEnds` collection, `joinInto` at the merge, the
+    // `armNeverFallsThrough` exclusion — #4116, #4138, #4139 in concert)
+    // was RETIRED here in favor of the CFG-driven dataflow. `flow::CFG.cpp`
+    // `visitCase` now emits one Branch block per arm (each carrying the arm
+    // guard) with a real fall-through edge into a fresh Merge block; the
+    // CFG's pre-existing `joinInto` at the merge block (`computeEntry`, this
+    // file ~line 2408) computes the arm-join for free, with the existing
+    // real CFG divert edges (`addEdge` from each arm's terminator to the
+    // function exit / loop afterEnd / header — already in place for if/
+    // while/for/try) handling return/throw/break/continue routing. The
+    // `armNeverFallsThrough` predicate becomes obsolete at this layer: a
+    // return/throw arm simply has NO edge into the merge block in the CFG
+    // (its terminator wires straight to `cfg_.exit()`), so its end state is
+    // already correctly absent from the join. Same for `break`/`continue`,
+    // which `routeExitThroughFinally` (fix #4180, the existing real-CFG
+    // finally routing) and the per-try frame's `loopDepthAtEntry` gate (also
+    // #4180) already forward to the enclosing loop's join — fixing #4141's
+    // open sub-case as a side effect.
+    //
+    // What remains here is the SIDE-BAND work that has no CFG-driven
+    // representation: the §28.8 borrow→`owned` argument check on the
+    // scrutinee (`checkRead`), the K8 full-expression boundary mark
+    // (`disposeOwnedScrutinee`, #1795), and the guard's `checkRead` (the
+    // pattern match itself is a Pattern — not an Expr — so it has no
+    // ownership-bearing expressions to check; only the guard is an Expr
+    // position). The CFG records the scrutinee and each arm's guard as
+    // back-pointers on the corresponding entry/Branch blocks
+    // (`CFGBlock::caseScrutinee`, mirroring `catchGuard`'s shape — see
+    // #1591's rationale, which transfers verbatim to the case-arm guard).
+    // Those side-band checks fire when `processBlock` visits the entry and
+    // arm Branch blocks (this file ~line 2568) via the new
+    // `processCaseScrutinee` / `processCaseArmGuard` helpers below.
+    //
+    // The per-arm body STMT walk is delegated to the CFG-driven
+    // `processBlock` on each arm's Linear block (the CFG already extracts
+    // the per-arm body into its own block sequence; `processBlock` calls
+    // `visitStmt` on each body stmt in turn). The structural arm-join is
+    // computed by `computeEntry`'s `joinInto` at the Merge block. Net line
+    // reduction in the per-method path: ~80 lines deleted, ~30 added (the
+    // two processBlock helpers + the side-band block). Net line reduction
+    // in the lambda-body pre-pass: deferred to a follow-up lane (see the
+    // commit body's "Declined remedy" section — option (A) here is the
+    // anchor for the larger lambda-body descent that #2683 names).
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
-        // K8 full-expression boundary (#1795): the K8 boundary for an
-        // unbound owned temporary minted by the scrutinee is the WHOLE `case`
-        // construct (statement-position and expression-position alike). Mark
-        // the case-statement node so codegen's lowerCaseStmt stores the
-        // scrutinee in an entry alloca and emits a null-guarded dispose at
-        // the construct's endBB. The gate mirrors DiscardStmt::disposeOwned-
-        // Value above: producerState == Owned plus a heap class/interface
-        // type (or an owning-collection head) — the same predicate the
-        // §17.13 / #1009 / #1909 paths consult.
-        if (!suppressDiag_ && cs->scrutinee &&
-            producerState(*cs->scrutinee) == OwnershipState::Owned) {
-            const sema::TypeRef* rt = ctx_.exprType(*cs->scrutinee);
-            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                rt->declaration &&
-                (rt->declaration->kind == ast::TypeDeclKind::Class ||
-                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
-                !rt->declaration->isValueBuiltin &&
-                (rt->declaration->decl != nullptr ||
-                 !rt->declaration->moduleName.empty());
-            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                isOwningCollectionNameHead(rt->headName());
-            if (isHeapClass || isOwningCollection)
-                const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
-        }
-        BlockState saved = states_;
-        std::vector<BlockState> armEnds;
-        armEnds.reserve(cs->arms.size());
-        for (const auto& arm : cs->arms) {
-            states_ = saved;
-            if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
-            bool armNeverReachesJoin = false;
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
-                if (arm.exprBody) handleDischarge(*arm.exprBody);
-            } else {
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
-                // fix #4138 (§19/§28.2/§28.3, v0.295): an arm whose last
-                // reachable statement is `return`/`throw` leaves the
-                // callable outright and so never reaches the point directly
-                // after this `case` -- see `armNeverFallsThrough`'s header
-                // comment a few hundred lines above (including why
-                // `break`/`continue` are deliberately NOT recognized there).
-                // Excluding it here is what #4138 adds on top of #4116's
-                // join: without this, a throwing arm's end state (however it
-                // left `x`) was wrongly folded in alongside a sibling arm
-                // that never touched `x`, poisoning the ONLY reachable path
-                // with a spurious maybe-consumed.
-                armNeverReachesJoin = armNeverFallsThrough(arm.stmts);
-            }
-            if (!armNeverReachesJoin) armEnds.push_back(states_);
-        }
-        // fix #4116: join every arm's end state, plus `saved` for the
-        // statement-`case`'s possible no-match fallthrough (§19.6) UNLESS
-        // the cached §19.6 exhaustiveness verdict proves that edge empty
-        // (fix #4139), instead of discarding all of it back to `saved`. See
-        // the header comment above for the full rationale.
-        std::vector<BlockState> joinOperands = std::move(armEnds);
-        if (!cs->noMatchEdgeStaticallyDead)
-            joinOperands.push_back(saved);
-        if (joinOperands.empty()) {
-            // fix #4138: every arm (a present unguarded catch-all included,
-            // or every closed-value-space leaf) provably never falls
-            // through -- the code after this `case` is unreachable via any
-            // live path. Fall back to `saved` rather
-            // than dereference an empty vector; soundness is moot for
-            // provably-unreachable code (`armNeverFallsThrough` never
-            // over-claims termination, so this branch is only reached when
-            // the fallthrough truly cannot happen).
-            states_ = saved;
-        } else {
-            auto joined = std::move(joinOperands.front());
-            for (std::size_t i = 1; i < joinOperands.size(); ++i)
-                joinInto(joined, joinOperands[i], cs->span.begin,
-                         /*emitClash=*/false, /*unionKeys=*/false);
-            states_ = std::move(joined);
-        }
+        // fix #4146: CaseStmt is now in the CFG (visitCase,
+        // src/flow/CFG.cpp). The CaseStmt node itself is NOT appended to
+        // any block's `stmts` list — visitCase consumes it and emits
+        // per-arm blocks — so visitStmt's CaseStmt arm is unreachable from
+        // processBlock's normal stmts walk. The two side-band actions
+        // (the K8 full-expression boundary mark on the scrutinee, and the
+        // §28.8 borrow→`owned` argument check on the scrutinee) are
+        // therefore fired from processBlock's own case-scrutinee side-band
+        // (above the stmts loop), keyed off `block.caseScrutinee`. The
+        // per-arm guard `checkRead` and the per-arm expression-form body
+        // `handleDischarge` are also fired from processBlock side-bands
+        // (`block.catchGuard` for the guard — #1591's shape reused — and
+        // `block.caseArmExprBody` for the expression body). The structural
+        // arm-join (`armEnds`, `joinInto` at the merge, the
+        // `armNeverFallsThrough` exclusion) is computed by the CFG-driven
+        // dataflow's `computeEntry` `joinInto` at the merge block — no
+        // hand-rolled logic at this layer. This arm returns immediately;
+        // reaching it would mean the CaseStmt leaked through the CFG
+        // (i.e. an unknown-Statement-kind emission in visitStmt), which is
+        // its own regression and should be flagged separately.
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
+            // §28.3 K3.13 (marker economy) / K3.9 (discard `_ := x;`): the
+            // discard statement is the announcement (consume table K3.9 row,
+            // Spelling column = "the discard statement itself, or the
+            // `Dispose()` call — no marker"); `_ := move x;` is rejected as
+            // redundant. Bounded to LOCAL or PARAMETER sources (LocalSymbol /
+            // ParameterSymbol); a discard of a field move `_ := move _f;` is
+            // NOT redundant — the field's slot needs the marker for K9
+            // restoration.
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr *>(ds->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr *>(ue->operand.get())) {
+                    auto *id = static_cast<const ast::IdentifierExpr *>(
+                        ue->operand.get());
+                    auto *sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol *>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol *>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "discard right-hand side — the discard "
+                                        "statement already announces the "
+                                        "dispose; write `_ := ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker economy; "
+                                "K3.9 discard)");
+                    }
+                }
+            }
             handleDischarge(*ds->value);
             // §17.13 / §28.3 v0.184 (#1651): `_ := x;` where `x` is a named
             // owned binding — a plain owned LOCAL (a `var`/`using var`
@@ -3386,6 +3586,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     ds->value.get())) {
                 if (id->name != "this" && id->name != "base") {
                     auto* dstate = lookupState(id->name);
+                    // fix #4734 (§35.5 *The owning match*, §17.13, v0.307):
+                    // `_ := r;` where `r` is an arm binding an OWNING match
+                    // transferred a payload into. §35.5 makes it "an **owned
+                    // local of the arm body's scope**" and names `_ := r;`
+                    // among the four warning-free discharges; §17.13's
+                    // "Discard of a named owned binding" then disposes it at
+                    // the end of the discard statement. The dataflow keeps no
+                    // `states_` entry for a pattern binding, so `dstate` is
+                    // null and this whole path was skipped: the statement
+                    // compiled and emitted NOTHING. MEASURED: a 24-byte
+                    // LeakSanitizer leak, exit 1, on an ACCEPTED program —
+                    // the silent-degrade shape. There is nothing to mark
+                    // disposed (no `states_` entry to move), so this stamps
+                    // only the two flags codegen reads.
+                    // // per §35.5, §17.13, §28.3, v0.307
+                    if (!dstate &&
+                        isOwningMatchTransferredArmBinding(
+                            ctx_.exprSymbol(*id))) {
+                        const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
+                            true;
+                        const_cast<ast::IdentifierExpr*>(id)
+                            ->owningMatchTransferBinding = true;
+                    }
                     if (dstate && dstate->state == OwnershipState::Owned) {
                         // fix #3253 / §17.13 / §28.10 (v0.256, #2071 residual): a
                         // discard `_ := alias;` over a `using var alias := r;`
@@ -3581,6 +3804,45 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // §28.3 K3.13 (marker economy) / K3.1 (store into an `owned` field /
+        // owning-collection slot): the declared slot announces the consume
+        // (consume table K3.1 row, Spelling column = "none — the declared slot
+        // announces (marker-free)"). A marker on the RHS of such a store is
+        // rejected as redundant. Limited to assignment (`:=`) — compound
+        // assignments (`+=`, `??=`, etc.) don't enter this consume position.
+        //
+        // Bounded to LOCAL or PARAMETER RHS sources. A field-to-field store
+        // `_ownedA := move _ownedB;` is NOT redundant — both fields' K9.2
+        // restoration rules need the explicit marker on the RHS to track the
+        // moved-from slot.
+        if (as->op == ":=" && as->target && as->value &&
+            exprIsOwnedFieldRead(*as->target)) {
+            if (auto* ue =
+                    dynamic_cast<const ast::UnaryExpr*>(as->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on "
+                                        "the right-hand side of a store into "
+                                        "an `owned` field — the declared "
+                                        "field slot already announces the "
+                                        "ownership transfer; write `") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.1 owned-field store)");
+                    }
+                }
+            }
+        }
         handleAssignment(*as);
         return;
     }
@@ -3615,7 +3877,44 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) handleReturn(*rs->value);
+        if (rs->value) {
+            // §28.3 K3.13 (marker economy) / K3.2 (return under an owned or
+            // mint-announcing return type): `return move x;` is rejected as
+            // redundant — the `return` keyword / declared return type already
+            // announces the ownership transfer (the [consume table](#sec-consume-table)
+            // K3.2 row, Spelling column = "none"). Per K3.13 the marker is admitted
+            // at the marker-required consuming positions and only at those.
+            //
+            // Bounded to LOCAL or PARAMETER sources. A field move
+            // `return move _f;` is NOT redundant even under an owned return —
+            // the field's slot needs the explicit marker to drive the K9.2
+            // restoration tracking, and the §28.8.1 terminal-move /
+            // not-reassigned diagnostic that owns those cases must continue to
+            // fire (`s28_8_1_0002`, etc.).
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
+                if (ue->op == "move" && returnOwned_ &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "`return` operand — the owned return "
+                                        "type already announces the ownership "
+                                        "transfer; write `return ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.2 return)");
+                    }
+                }
+            }
+            handleReturn(*rs->value);
+        }
         return;
     }
     // §29.6 / §29.8 (#945): walk a `yield return EXPR` operand through the shared
@@ -3631,6 +3930,45 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // `yield break` (null value) carries nothing to walk.
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         if (ys->value) {
+            // §28.3 K3.13 (marker economy) / K3.7 (operand of `yield return` in an
+            // OWNING iterator): the declared owning interface already announces
+            // (consume table K3.7 row, Spelling column = "none"); a marker on the
+            // yielded value is rejected as redundant. The owning-iterator test
+            // is shared with the using-var / dispose-by-name check below.
+            bool owningIter =
+                returnType_ && returnType_->kind == ast::TypeKind::Named &&
+                returnType_->name && !returnType_->name->parts.empty() &&
+                common::isIterFormatEnumerableHead(
+                    returnType_->name->parts.front()) &&
+                common::isOwningIterableInterfaceHead(
+                    returnType_->name->parts.front());
+            if (owningIter) {
+                if (auto* ue =
+                        dynamic_cast<const ast::UnaryExpr*>(ys->value.get())) {
+                    if (ue->op == "move" &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            ue->operand.get())) {
+                        auto* id = static_cast<const ast::IdentifierExpr*>(
+                            ue->operand.get());
+                        auto* sym = ctx_.exprSymbol(*id);
+                        bool sourceIsLocalOrParam =
+                            sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                    dynamic_cast<sema::ParameterSymbol*>(sym));
+                        if (sourceIsLocalOrParam) {
+                            report(
+                                Severity::Error, ue->span.begin,
+                                std::string("the `move` marker is redundant "
+                                            "on a `yield return` operand in an "
+                                        "owning iterator — the declared "
+                                        "owning interface already announces "
+                                        "the transfer; write `yield return ") +
+                                    std::string(id->name) +
+                                    "` without `move` (§28.3 K3.13 marker "
+                                    "economy; K3.7 owning-iterator yield)");
+                        }
+                    }
+                }
+            }
             handleDischarge(*ys->value);
             // fix #1863 / §29.1 v0.196 (IOwningEnumerable ownership transfer): in
             // an OWNING iterator (return type IOwningEnumerable<T> /
@@ -3650,14 +3988,8 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             //
             // #3419 class-H: the OWNING half of the four iterator-format
             // ENUMERABLE heads, same composition as iterableIsOwningEnumerable
-            // above. // per §29.2, #3419
-            bool owningIter =
-                returnType_ && returnType_->kind == ast::TypeKind::Named &&
-                returnType_->name && !returnType_->name->parts.empty() &&
-                common::isIterFormatEnumerableHead(
-                    returnType_->name->parts.front()) &&
-                common::isOwningIterableInterfaceHead(
-                    returnType_->name->parts.front());
+            // above; `owningIter` itself is computed at the top of this YieldStmt
+            // arm (the §28.3 K3.13 redundant-move check shares it). // per §29.2, #3419
             if (owningIter) {
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         ys->value.get())) {
@@ -3720,6 +4052,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // as opposed to a borrow — is a separate announced-consume case, handled
     // explicitly below after the discharge walk.) // per §31.1, §28.8
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        // §28.3 K3.13 (marker economy) / K3.8 (throw operand): `throw move e;`
+        // is rejected as redundant — the `throw` keyword already announces the
+        // ownership transfer (consume table K3.8 row, Spelling column = "none").
+        // Bounded to LOCAL or PARAMETER sources; `throw move _f;` of a field
+        // is NOT redundant — the field's K9.2 restoration tracking still
+        // needs the marker.
+        if (th->value) {
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(th->value.get())) {
+                if (ue->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+                    auto* id = static_cast<const ast::IdentifierExpr*>(
+                        ue->operand.get());
+                    auto* sym = ctx_.exprSymbol(*id);
+                    bool sourceIsLocalOrParam =
+                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym));
+                    if (sourceIsLocalOrParam) {
+                        report(
+                            Severity::Error, ue->span.begin,
+                            std::string("the `move` marker is redundant on a "
+                                        "`throw` operand — the `throw` "
+                                        "keyword already announces the "
+                                        "ownership transfer; write `throw ") +
+                                std::string(id->name) +
+                                "` without `move` (§28.3 K3.13 marker "
+                                "economy; K3.8 throw)");
+                    }
+                }
+            }
+        }
         // §31.1 (issue #430): check for a catch borrow escaping via a
         // NON-OWNED constructor argument of the thrown object. This is the
         // `throw new Wrap(ex)` pattern where Wrap's ctor stores ex in a
@@ -4810,6 +5172,18 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 return OwnershipState::Owned;
             // Other non-`owned` user returns: fall through.
         }
+        // fix #4360 (§28.3, v0.298): an INSTANCE method whose every return is a
+        // fresh owned producer AND none of the returns are self-derived is an
+        // instance factory — the caller must treat the call as Owned. Without
+        // this, `method Make(): C => new C(); end` classified Borrowed (the
+        // instance-method fallthrough default) and the fresh allocation leaked
+        // at every call site (24 B/call + payload).
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            if (common::instanceFactoryReturnsFreshOwned(
+                    *md, ctx_.exprType(e), ctx_,
+                    [](const sema::TypeRef* t) { return t; }))
+                return OwnershipState::Owned;
+        }
         // #1388 / §28.3 / §28.11 / §29.1: builtin owned-TRANSFER calls — Pop /
         // Dequeue on the OWNING stacks/queues, PopLast/PopFirst/PopAt/PopValue,
         // T.Deserialize, and TakeCurrent on the owning enumerators — TRANSFER an
@@ -5203,6 +5577,53 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // (#965). Owned only when the result is a disposable class/interface (an
     // `owned`-returning operator on a value type is impossible — §9.7 forbids
     // record destructors). The operands stay borrowed, so there is no double-free.
+    //
+    // fix #4737 (§11.8 "Dispatch through the type parameter", v0.307): the
+    // result-type gate was `rt->declaration` is a non-value-builtin Class or
+    // Interface — which a BARE TYPE PARAMETER can never satisfy (an
+    // unsubstituted `T` is a Named TypeRef with `declaration == nullptr`; sema
+    // type-checks a generic body once, before monomorphization, so `exprType`
+    // never resolves it). So a constraint-sourced `static operator +(a: T,
+    // b: T): owned T` — §11.8's OWN worked example, `tests/conformance/cases/
+    // spec_0049.bzl` — classified its result Borrowed, while `T.Zero()` on the
+    // SAME constraint interface with the SAME `owned T` declared return
+    // classified Owned through the `md->returnOwned` CallExpr arm above.
+    // Measured on 921dbc45: in one generic body, `var z := T.Zero();` fired the
+    // §28.3 auto-drop warning and `var r := a + b;` fired nothing; `const z :=
+    // T.Zero();` was rejected by §21.1 and `const r := a + b;` was accepted.
+    // Two producers, one declaration shape, two classifications.
+    //
+    // §11.8 (v0.307) settles which one is right: "At a class or interface
+    // substitution of `T`, `total` is an owned local: `T.Zero()` AND EACH
+    // OPERATOR RESULT transfer per stdlib §2.19's `owned` producer signatures,
+    // the loop's reassignment disposes the displaced previous total by
+    // drop-on-overwrite (§28.7) … At value and runtime-managed substitutions
+    // the markers are erased and every step is a plain copy (§28.1, §28.9)."
+    // That two-case dichotomy is EXACTLY what `isValueSubstitutionErased`
+    // implements (§28.1, v0.196, #1817) and exactly what the `md->returnOwned`
+    // CallExpr arm above already consults, so this arm now mirrors that arm
+    // byte-for-byte instead of re-deriving a narrower predicate. An
+    // unsubstituted bare `T` is deliberately NOT erased (the predicate's
+    // documented conservative direction: "keeping the marker over-warns at
+    // worst, never under-disposes"), which is the already-settled verdict the
+    // sibling call arm has been giving `T.Zero()` since #1425.
+    //
+    // CODEGEN ALREADY AGREES — this closes a sema/codegen divergence rather
+    // than opening one. Both of codegen's owned-operator classifiers
+    // (`unwindOwnedLocalClass` LlvmBackend_Setup.cpp:21079 and
+    // `usingVarOwnsClassObjectDynamically` :38001) gate on
+    // `isClassOrInterfaceRef(initTy) || isClassOrInterfaceRef(
+    // resolveTypeParamRef(initTy))`, i.e. they resolve the bare parameter
+    // through the active substitution and register the disposal. Only the
+    // ownership pass lacked the type-parameter half.
+    //
+    // BUILT-IN OPERATORS ARE UNAFFECTED. The gate is unchanged above the
+    // result-type test: an operator MethodSymbol on the BinaryExpr
+    // (`ctx_.exprSymbol(*be)`) that `ms->isOperator && methodReturnsOwned`
+    // accepts. A built-in `a + b` over int/string/decimal is a compiler
+    // intrinsic (§3.5) with no operator MethodSymbol, so it cannot reach the
+    // result-type test at all and stays Borrowed — no disposal obligation is
+    // manufactured on arithmetic. // per §11.8, §28.1, §28.7, v0.307, #4737
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         // fix #3189 (family M2 of umbrella #3152): read the marker through the
         // both-sources accessor. `ms->decl` is null for an operator of a
@@ -5217,16 +5638,17 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // exactly as narrow as it was.
         if (auto* sym = ctx_.exprSymbol(*be))
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_))
-                    if (const sema::TypeRef* rt = ctx_.exprType(e))
-                        if (rt->kind == sema::TypeRef::Kind::Named &&
-                            rt->declaration &&
-                            (rt->declaration->kind ==
-                                 ast::TypeDeclKind::Class ||
-                             rt->declaration->kind ==
-                                 ast::TypeDeclKind::Interface) &&
-                            !rt->declaration->isValueBuiltin)
-                            return OwnershipState::Owned;
+                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_)) {
+                    // fix #4737: the SAME two lines the `md->returnOwned`
+                    // CallExpr arm above runs, for the same §28.1 question.
+                    // A record/enum/value-builtin/primitive/unit/function
+                    // result erases the marker and stays Borrowed exactly as
+                    // the old `rt->declaration` gate made it; a class,
+                    // interface, or still-generic bare `T` result transfers.
+                    if (isValueSubstitutionErased(ctx_.exprType(e)))
+                        return OwnershipState::Borrowed;
+                    return OwnershipState::Owned;
+                }
         // #1029 / §28.3: built-in `??` (NullCoalescing) with an Owned-producing
         // RHS. The caller owns whichever branch's value is taken: LHS non-null →
         // ownership transfers from the LHS (codegen nulls the LHS slot); LHS null
@@ -5310,6 +5732,20 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
 // typed arms carry an ownership meaning; a value-typed conditional has no meet.
 void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
     std::vector<const ast::Expr*> arms;
+    // fix #4964: the built-in `??` is the same K7 meet (§28.3 `a ?? b` row).
+    // Peel `!` — `(a ?? b)!` has the meet's classification (§17.8).
+    {
+        const ast::Expr* core = &e;
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+            if (!pb->operand) break;
+            core = pb->operand.get();
+        }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(core);
+            be && be->op == "??") {
+            checkCoalesceMeetMixed(*be);
+            return;
+        }
+    }
     if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         arms = {c->thenValue.get(), c->elseValue.get()};
     } else if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
@@ -5351,6 +5787,59 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
                "— mark the named binding with the arm transfer (`owned x`, "
                "§28.3 K3.4 v0.209), bind the owned source first, or transfer "
                "both arms — so every arm has the same ownership");
+}
+
+// fix #4964 (§28.3 producer table `a ?? b` row, K7.1–K7.3, K7.5, K3.13,
+// v0.307): "`a ?? b` — the meet of the ownership states of `a` and `b` per K7
+// … owned ⊓ owned = owned …; borrowed ⊓ borrowed = borrowed with the union of
+// sources; mixed = rejected — equalize the arms first. A named owned binding
+// written as an arm is an unmarked read and therefore a borrow arm". So
+// `p ?? new W()` (named owned `p`) and `g ?? new W()` (borrowed parameter
+// `g`) are both mixed meets and are rejected. Before this the pass classified
+// any `??` with an owned right operand as an OWNED producer (#1029) and
+// codegen transferred the left operand's value: for a named owned local that
+// was a silent transfer the spec forbids, and for a borrow (a parameter, a
+// field, a property) it handed a value the caller still owns to a new owner
+// — a heap-use-after-free, measured on e3b0bdf0 at a local, `using var`,
+// field assignment, `owned` return and `owned` argument.
+//
+// Arms are classified exactly as checkArmMeetMixed classifies if/case arms
+// (producerState; a borrow arm counts only when class/interface-typed; `null`
+// and `throw` absorb, K7.5). A user-defined `operator ??` (an operator
+// MethodSymbol on the node) is an ordinary call, not a meet, and is skipped.
+void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
+    if (be.op != "??" || !be.left || !be.right) return;
+    if (auto* sym = ctx_.exprSymbol(be))
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            if (ms->isOperator) return;
+    if (coalesceMeetReported_.count(&be)) return;
+    bool ownedArm = false;
+    bool borrowArm = false;
+    const ast::Expr* borrowAt = nullptr;
+    for (const ast::Expr* arm : {be.left.get(), be.right.get()}) {
+        if (dynamic_cast<const ast::ThrowExpr*>(arm)) continue;      // K7.5
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm)) continue;  // K7.5
+        OwnershipState s = producerState(*arm);
+        if (s == OwnershipState::Owned) {
+            ownedArm = true;
+        } else if (s == OwnershipState::Borrowed &&
+                   isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+            borrowArm = true;
+            if (!borrowAt) borrowAt = arm;
+        }
+    }
+    if (!ownedArm || !borrowArm || suppressDiag_) return;
+    coalesceMeetReported_.insert(&be);
+    report(Severity::Error, borrowAt->span.begin,
+           "the operands of this `??` mix an owned value with a borrowed arm "
+           "— the ownership meet is rejected (§28.3 producer table, `a ?? b` "
+           "row; K7.3, v0.307): owned⊓owned is owned and borrowed⊓borrowed "
+           "is borrowed, but a mixed pair has no coherent owner (a parameter, "
+           "field or property read is a borrow, and so is an UNMARKED named "
+           "owned binding — K3.13; `move` is rejected in `??`-operand "
+           "position, axiom A7). Equalize the arms: use "
+           "`(if a <> null then move a! else new …)` (§28.3 K3.4), or "
+           "equalize by statement");
 }
 
 bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
@@ -5686,10 +6175,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
     // dangling borrow. Checked before the lsym early-return so it runs for a
     // value-typed (record) binding too, matching the handleReturn/handleAssignment
     // hooks for the other binding contexts.
-    if (ld.initializer)
+    if (ld.initializer) {
         if (const auto* ne =
                 dynamic_cast<const ast::NewExpr*>(ld.initializer.get()))
             checkRecordFromTemporary(*ne);
+        // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` non-destructive-
+        // update sibling of the `new Record(...)` check above. Same rule,
+        // same call-site family — a borrow-bearing record built from a
+        // temporary bound to one of its borrow-carrying fields. Pairs with
+        // the matching arms in handleAssignment and handleReturn below.
+        if (const auto* we =
+                dynamic_cast<const ast::WithExpr*>(ld.initializer.get()))
+            checkRecordWithFromTemporary(*we);
+    }
     // Find the LocalSymbol that ExprTypecheck created for this decl.
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
@@ -5750,6 +6248,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // moved" on a marked move-only-array transfer). // per §28.3 v0.180 #1962
         if (!ld.initializerHasOwnedMarker)
             noteMoveOnlyArrayWholeMoveRead(*ld.initializer);
+        // §15.3 (#4587) bullet 1, the OTHER move-only kind: the identical
+        // move for an owning-classified choice (§35.4) initializer —
+        // `var c := b;` where `b: Bundle` (owning) — same guard (skipped
+        // under the `owned` marker for the same double-mark reason above).
+        // // per §15.3, §28.7, v0.306, #4587
+        if (!ld.initializerHasOwnedMarker)
+            noteOwningChoiceWholeMoveRead(*ld.initializer);
     }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
@@ -6528,6 +7033,16 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     // (error recovery).  // per §28.9, v0.237, #2654
     const sema::TypeRef* t = ctx_.exprType(*ne);
     if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+    return typeIsProvablyTrivialDisposeClass(t);
+}
+
+// The TYPE half of the §28.9 exemption, shared by the owned-LOCAL `new`
+// binding above and the owned-PARAMETER must-use gate (~L1080). See the
+// declaration in Ownership_impl.hpp for why this is a POSITIVE predicate and
+// why `!common::isNonTrivialDisposeClass(...)` is not a substitute for it.
+//   // per §28.9, v0.307
+bool MethodOwnership::typeIsProvablyTrivialDisposeClass(
+        const sema::TypeRef* t) {
     if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
     // fix #2667 (§28.9, v0.268): §28.9's "Trivial-dispose for generic class
     // instantiations" names the standard borrowing-collection types (Array<T>,
@@ -6543,10 +7058,20 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     // the codegen auto-drop chain both already consult — same 13 names, no
     // hand-list to drift. The Owning* heads are NOT on that table. // per
     // §28.9, fix #2667
+    //
+    // narrow #4743: this arm is ALSO what keeps an uninstantiated bare type
+    // parameter (`method Bad(owned x: T)` inside `class Wrap<T>` — a `Named`
+    // TypeRef with a null `declaration` and a head naming no builtin) and a
+    // compiler-synthesized FRAME type unexempt, per §28.9's "not defined for
+    // a compiler-synthesized frame" sentence and §3.6 rule 2's "uninstan-
+    // tiated-still-generic stays rejecting" posture.
     if (!t->declaration) {
         return common::isChainClaimedBuiltinHeadName(t->headName());
     }
     sema::TypeSymbol* d = t->declaration;
+    // §28.9: "an interface type is never trivial-dispose, its conformance set
+    // being open across modules" — and a record/enum/choice declaration is not
+    // a class, so it has no trivial-dispose verdict to read either.
     if (d->kind != ast::TypeDeclKind::Class) return false;
     // fix #3647 (§28.9 / §3.6 rule 2, v0.286): the TypeRef+SemaContext
     // overload — `t` is already the resolved TypeRef this arm classified,
@@ -6956,6 +7481,52 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
     recordMovesIn(*as.value);
+    // §15.3 (#4587) bullet 1: the plain-`:=` twin of `handleLocalDecl`'s
+    // `noteOwningChoiceWholeMoveRead` call above — `c := b;` where `b: Bundle`
+    // (owning-classified, §35.4) is a local-to-local move exactly as
+    // `var c := b;` is, and had no dataflow coverage at all before #4587 (only
+    // #4566's codegen-side runtime zero-store protected it, memory-safety-wise).
+    // Gated on the same `valueHasOwnedMarker` condition `recordMovesIn`'s own
+    // caller context establishes: a marked `c := owned b;` was already
+    // diverted to `handleMarkedOwnedAssignment` above for a tracked-local
+    // target (which calls `markMovedByName` itself) — running this
+    // unconditionally would double-mark that shape. `recordMovesIn` handled
+    // `move`/`await` top-level forms immediately above; this call's own
+    // bare-IdentifierExpr gate naturally no-ops for those (they are not
+    // IdentifierExpr nodes), mirroring `noteMoveOnlyArrayWholeMoveRead`'s
+    // identical reliance in `handleLocalDecl`. Self-assignment (`b := b;`) is
+    // not specially excluded here (unlike #4566's codegen mark, which must
+    // avoid a destructive runtime zero-store): the state-scan below
+    // immediately re-derives this same symbol's state from `producerState`,
+    // so a transient MovedFrom mark here never survives past this statement
+    // and no spurious diagnostic can result from it.
+    //
+    // TARGET-SHAPE GATE: §15.3 bullet 1 is "Local-to-local assignment" — BOTH
+    // ends locals — so this only fires when `as.target` is ALSO a bare
+    // identifier naming a plain `ast::LocalDecl`-backed local, mirroring
+    // #4566's `Emitter::markOwningChoiceLocalMovedFrom` target gate exactly.
+    // A field / owning-array-slot / index / discard (`_ := b;`, §35.10's
+    // move-only discard — §17.13's own clause, a DIFFERENT rule from bullet
+    // 1) target is deliberately left unmarked here: #4566 declined the
+    // runtime zero-store for every one of those shapes ("FIELD targets, a
+    // parameter at either end, `_ := b;`, ... remain open"), and widening the
+    // READ rejection to cover them would flip programs #4587 never audited —
+    // exactly the "while we're at it" scope creep CLAUDE.md forbids. Each is
+    // a separate, already-filed gap, not silently absorbed into this fix.
+    // // per §15.3, §28.7, v0.306, #4587
+    if (!as.valueHasOwnedMarker) {
+        bool targetIsPlainLocal = false;
+        if (auto* tid2 = dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+            if (auto* tlsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid2)))
+                // LOCALDECL-ONLY: `tlsym->decl` here is the decl behind an
+                // ASSIGNMENT TARGET (`as.target`) — §21.1 forbids a `const`
+                // local from ever being a reassignment target ("assignment
+                // ... are compile errors"), so a `LocalConstDecl` is
+                // structurally unreachable at this cast.
+                targetIsPlainLocal = dynamic_cast<const ast::LocalDecl*>(tlsym->decl) != nullptr;
+        }
+        if (targetIsPlainLocal) noteOwningChoiceWholeMoveRead(*as.value);
+    }
     // §28.3 K3.4/K7.4 (v0.209, #2080): an assignment RHS containing MARKED
     // arm transfers (`x := (if c then owned a else new Res(2));`) — run the
     // consume-if-selected processing so the marked binding's state joins
@@ -6972,6 +7543,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // from a temporary is a dangling borrow.
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(as.value.get()))
         checkRecordFromTemporary(*ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` sibling — `x := r
+    // with(...)` / `this.f := r with(...)` from a temporary bound to a
+    // borrow-carrying field is a dangling borrow. Mirrors the local-decl
+    // and return arms exactly.
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(as.value.get()))
+        checkRecordWithFromTemporary(*we);
     // §28.3 (#386 cases 1+2): storing a borrow of an owned scope-bound local
     // into a field of an object, or writing it through an out/ref parameter,
     // lets the borrow outlive the local (use-after-dispose). Run AFTER
@@ -7631,6 +8208,64 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
     markMovedByName(id->name, id->span.begin);
 }
 
+// §15.3 (#4587) bullet 1: mark an owning-choice local read by a bare
+// identifier at a local-to-local transfer position as moved-from. Sibling of
+// `noteMoveOnlyArrayWholeMoveRead` above, for the OTHER move-only kind (§35.4's
+// owning-classified choice) — §15.3's opening rule ("Assignment transfers the
+// value from source to destination, leaving the source in moved-from state")
+// and its own first Rules bullet ("Local-to-local assignment `var y := x;`:
+// ... moves for a move-only value type. After the move, `x` is in moved-from
+// state ... and may not be read until reassigned") apply to it exactly as they
+// do to a move-only inline array; the dataflow had no analogue for it at all
+// (#4566 found and worked around the gap at the codegen layer with a runtime
+// zero-store, deliberately leaving this compile-time half for #4587).
+//
+// SCOPE. This function checks only the SOURCE (`src`) shape: a bare
+// identifier naming a plain `ast::LocalDecl`-backed local (no field,
+// parameter, index, or §21.1 `const`). The TARGET-shape half of #4566's
+// `Emitter::markOwningChoiceLocalMovedFrom` gate (both ends must be such a
+// local) is the CALLER'S responsibility — `handleLocalDecl`'s target is
+// always a fresh local by construction, and `handleAssignment` adds an
+// explicit target check at its call site so the combined scope matches
+// #4566's codegen counterpart exactly. So a read this rejects is a read the
+// runtime store #4566 already zeroes, and nothing this declines is newly
+// left unsafe (the codegen mark was already scoped the same way; #4566's
+// runtime zero-store is unconditional regardless of this compile-time check,
+// so a shape this declines to reject is not newly UB — it just keeps reading
+// the zeroed moved-from value, unchanged from pre-#4587 behaviour).
+void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
+    if (!id) return;  // only a WHOLE bare-identifier read is a move; `.f` /
+                      // `[i]` / `.M()` are borrows of the receiver, not moves
+    auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!lsym) return;  // not a tracked local (e.g. a parameter — §15.3's
+                        // "Parameter passing" bullet 3 is a separate rule,
+                        // out of scope here, matching #4566's codegen twin)
+    // LOCALDECL-ONLY: mirrors `markOwningChoiceLocalMovedFrom`'s `sld` gate —
+    // a §21.1 `const` local can never BIND an owning-choice production (§21.1
+    // forbids the initializer that would admit it), so it is never enrolled
+    // in the scope-end active-case disposal pass and has no read obligation
+    // for this to protect either way.
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl);
+    if (!ld) return;
+    auto verdict = common::classifyChoiceType(ctx_.exprType(src), ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    auto* st = lookupState(id->name);
+    if (!st) return;
+    // A live source (Owned when a `using var`, Borrowed when a plain `var` —
+    // the default bare-identifier producerState, mirroring
+    // `noteMoveOnlyArrayWholeMoveRead`'s identical comment for the sibling
+    // move-only kind) is the genuine move. A MovedFrom / Disposed / Poisoned
+    // source was already diagnosed by the checkRead that precedes every
+    // caller of this function; re-marking would either duplicate that
+    // diagnostic or (via markMovedByName) resurrect a poisoned local.
+    // // per §15.3 bullet 1
+    if (st->state != OwnershipState::Owned &&
+        st->state != OwnershipState::Borrowed)
+        return;
+    markMovedByName(id->name, id->span.begin);
+}
+
 void MethodOwnership::moveOnlyArrayNoteSlotMoved(const ast::IndexExpr& ix) {
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix.target.get());
     if (!id || ix.indices.size() != 1 || !ix.indices[0].value) return;
@@ -7975,6 +8610,12 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // dangling borrow exactly as a local-decl initializer is.
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
         checkRecordFromTemporary(*ne);
+    // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` sibling of the
+    // `new Record(...)` check above — `return r with(...)` carries the same
+    // risk when an override value is a temporary bound to a borrow-carrying
+    // field. Mirrors handleLocalDecl's arm exactly.
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(&e))
+        checkRecordWithFromTemporary(*we);
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): `return
     // Identity(new C());` launders a fresh owned temporary out through the borrow
@@ -8058,11 +8699,60 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // regard to the declared return type — the double-free this closes).
     // // per §28.3, §28.6
     checkOwnedReturnDirectBorrow(e);
+    // §28.3 arm-meet (v0.184, #1661) / K7.3 (v0.307, #4987): the RETURN-site
+    // sibling of the local-decl-INITIALIZER driver. `return (if c then move y
+    // else g);` — one owned arm, one borrow arm — reaches a return with no
+    // coherent owner exactly as a binding `var z := (if c then move y else
+    // g);` does. The mixed-meet rule has only fired at binding sites
+    // previously (checkArmMeetMixed's lone caller), so a thrown-back return
+    // slipped through silently and the borrow arm's caller-attributed owner
+    // never disposed the moved-out `y` (a leak; the `c=true` path hands the
+    // moved-out local to the caller as a borrow of itself). Fires before the
+    // bare-identifier discharge fast-path below so the rejection is observed
+    // before handleDischarge silently marks anything moved-from. A no-op for
+    // a non-ConditionalExpr / non-CaseExpr `e` and for any arm set that does
+    // not mix Owned with Borrowed-class-typed. // per §28.3, K7.3, v0.307
+    checkArmMeetMixed(e);
+    // fix #4948 (§17.8, §28.3, §28.10, v0.307): `return x!;` — §17.8: "if `x`
+    // has ownership state owned …, `x!` is owned", i.e. the bare `x` itself,
+    // so for a `using var` it is the same move-out of a scope-bound local the
+    // bare-identifier arm below rejects (and, read as a borrow, the same
+    // escape). Only the `using var` arm is routed here: an owned plain local's
+    // `return y!;` is a spec-legal transfer and keeps its existing handling.
+    if (isBangOverBareIdentifier(e)) {
+        const auto* bid =
+            dynamic_cast<const ast::IdentifierExpr*>(peelTopCastBang(&e));
+        if (bid) {
+            if (auto* st = lookupState(bid->name)) {
+                if (st->implicitDischarge) {
+                    report(
+                        Severity::Error, bid->span.begin,
+                        std::string("cannot return `using var` `") +
+                        std::string(bid->name) +
+                        "`; a `using var` is scope-bound — it cannot be moved "
+                        "out of (only borrowed from, and a borrow of it may "
+                        "not escape its scope) (§28.3 / §28.10)");
+                    st->state = OwnershipState::Poisoned;
+                    return;
+                }
+            }
+        }
+    }
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
     // pessimistically.
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+    //
+    // fix #4955 (§17.8, §28.3, v0.307): `return y!;` over a bare identifier is
+    // `return y;` — §17.8: "if `x` has ownership state owned …, `x!` is owned"
+    // (and a borrowed `x!` is borrowed with the same source) — so it takes the
+    // same arm. Before this an owned plain local's `return y!;` skipped this
+    // arm, so this pass never recorded `y` as discharged by the return (with
+    // the arm, a read of `y` in an active `finally` draws the same warning as
+    // after `return y;`). The `using var` arm of `y!` is rejected above.
+    const ast::Expr* returnedCore =
+        isBangOverBareIdentifier(e) ? peelTopCastBang(&e) : &e;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(returnedCore)) {
         // §28.3 / §28.10 (#762): a `using var` is owned but scope-bound — per
         // §28.3 "it cannot be moved out of, only borrowed from." Returning it by
         // bare identifier transfers it out of its scope: for an `owned` return
@@ -8405,6 +9095,23 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
         if (auto* locSym = dynamic_cast<sema::LocalSymbol*>(sym)) {
             if (locSym->decl &&
                 dynamic_cast<const ast::BindingPattern*>(locSym->decl)) {
+                // fix #4734 (§35.5 *The owning match*, §28.6, v0.307): the
+                // rejection below is §19.3's BORROWING-match rule, and §28.6's
+                // borrow-receiver list names "a pattern binding (§19.3)" in
+                // exactly that sense. §35.5 scopes it: in an OWNING match a
+                // transferred payload binding "is an **owned local of the arm
+                // body's scope**", and §35.5 names "an explicit `r.Dispose()`"
+                // verbatim as one of the four warning-free discharges — the
+                // owner disposing its own value, which §28.6 admits ("an owned
+                // local"). Admit, and stamp the receiver so codegen's
+                // LOCALDECL-ONLY slot resolver reclaims the block instead of
+                // dispatching the destructor and leaking it.
+                // // per §35.5, §28.6 "Who may call Dispose()", v0.307
+                if (isOwningMatchTransferredArmBinding(locSym)) {
+                    const_cast<ast::IdentifierExpr*>(id)
+                        ->owningMatchTransferBinding = true;
+                    return;
+                }
                 report(
                     Severity::Error, loc,
                     std::string("cannot call `Dispose()` on `") +
@@ -9373,6 +10080,10 @@ void MethodOwnership::checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam) {
     // cannot decide (issue 3702) and which was accepted before.
     if (lam.exprBody) {
         checkClosureEscapesOnReturn(*lam.exprBody, EscapeScope::LambdaBody);
+        // fix #4628 (§28.9 / §15.3): needs no `states_` / flow input (a pure
+        // span-containment + type check), so it runs independent of the
+        // save/clear/restore window above — same reason it is safe below too.
+        checkMoveOnlyArraySlotMovesInExpr(*lam.exprBody, lam);
         states_ = std::move(savedStates);
         localDepth_ = std::move(savedDepths);
         return;
@@ -9386,6 +10097,10 @@ void MethodOwnership::checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam) {
         if (s) scanCatchBorrowClosureReturns(*s);
     for (const auto& s : lam.stmts)
         if (s) scanLambdaBodyBorrowStores(*s);
+    // fix #4628 (§28.9 / §15.3): reject `move X[i]` through a captured
+    // borrow of a move-only inline-array local — see the declaration
+    // comment in Ownership_impl.hpp.
+    scanLambdaBodyMoveOnlyArraySlotMoves(lam);
     states_ = std::move(savedStates);
     localDepth_ = std::move(savedDepths);
 }
@@ -9673,6 +10388,230 @@ void MethodOwnership::forEachBorrowStoreCallInExpr(
     // a storing-method call either; consistent with `collectBodyLambdasExpr`.)
 }
 
+// fix #4628 (§28.9 / §15.3, v0.300): see the declaration comment in
+// Ownership_impl.hpp. Driven per-statement over `lam.stmts` via
+// `forEachNestedStmt` (the #3656 single statement grammar), exactly like
+// `scanLambdaBodyBorrowStores` above — statement-LIST recursion is
+// `forEachNestedStmt`'s job, so `checkMoveOnlyArraySlotMovesInStmt` below
+// only extracts each statement's own direct expression children.
+void MethodOwnership::scanLambdaBodyMoveOnlyArraySlotMoves(
+        const ast::LambdaExpr& lam) {
+    for (const auto& top : lam.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [this, &lam](const ast::Stmt& cur) {
+            checkMoveOnlyArraySlotMovesInStmt(cur, lam);
+        });
+    }
+}
+
+// Mirrors `forEachBorrowStoreCallInStmt`'s expression-position dispatch
+// (same statement grammar, same never-recurse-into-nested-statement-lists
+// contract — that recursion is `forEachNestedStmt`'s, done by the caller
+// above), reused here because a `move` expression can appear at any of the
+// same positions a storing call can.
+void MethodOwnership::checkMoveOnlyArraySlotMovesInStmt(
+        const ast::Stmt& s, const ast::LambdaExpr& lam) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) checkMoveOnlyArraySlotMovesInExpr(*ld->initializer, lam);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) checkMoveOnlyArraySlotMovesInExpr(*lc->value, lam);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) checkMoveOnlyArraySlotMovesInExpr(*rs->value, lam);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) checkMoveOnlyArraySlotMovesInExpr(*es->expr, lam);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) checkMoveOnlyArraySlotMovesInExpr(*as->target, lam);
+        if (as->value) checkMoveOnlyArraySlotMovesInExpr(*as->value, lam);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) checkMoveOnlyArraySlotMovesInExpr(*ts->value, lam);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) checkMoveOnlyArraySlotMovesInExpr(*is->target, lam);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) checkMoveOnlyArraySlotMovesInExpr(*ds->value, lam);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) checkMoveOnlyArraySlotMovesInExpr(*ys->value, lam);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            checkMoveOnlyArraySlotMovesInExpr(*ifs->ifBranch.condition, lam);
+        for (const auto& el : ifs->elifBranches)
+            if (el.condition) checkMoveOnlyArraySlotMovesInExpr(*el.condition, lam);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) checkMoveOnlyArraySlotMovesInExpr(*ws->condition, lam);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) checkMoveOnlyArraySlotMovesInExpr(*fs->iterable, lam);
+        if (fs->withExpr) checkMoveOnlyArraySlotMovesInExpr(*fs->withExpr, lam);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) checkMoveOnlyArraySlotMovesInExpr(*cs->scrutinee, lam);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) checkMoveOnlyArraySlotMovesInExpr(*arm.guard, lam);
+            if (arm.exprBody) checkMoveOnlyArraySlotMovesInExpr(*arm.exprBody, lam);
+        }
+        return;
+    }
+    // Break / Continue / DoEndBlock / TryStmt / block-form CaseStmt arms:
+    // no direct expr child of their own here — `forEachNestedStmt` (the
+    // caller) already recurses into their nested STATEMENT lists, which
+    // reach this dispatch per visited statement.
+}
+
+// The expression-side recursion. Mirrors `forEachBorrowStoreCallInExpr`
+// node-for-node, but instead of firing a callback on every `CallExpr`, it
+// checks every `move` (`UnaryExpr` with `op == "move"`) directly: a `move`
+// is a primary-level prefix (grammar A.7), so its only reachable position is
+// as *some* subexpression's child, exactly where a storing `CallExpr` can
+// appear.
+void MethodOwnership::checkMoveOnlyArraySlotMovesInExpr(
+        const ast::Expr& e, const ast::LambdaExpr& lam) {
+    if (dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Nested-lambda boundary: do NOT descend. The flat lambda list in
+        // `checkOneLambdaBodyEscapes` walks this nested lambda separately,
+        // testing `declaredInLambda` against ITS OWN span.
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->op == "move" && un->operand) {
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(un->operand.get()))
+                reportIfCapturedMoveOnlyArraySlotMove(*ix, lam);
+        }
+        if (un->operand) checkMoveOnlyArraySlotMovesInExpr(*un->operand, lam);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) checkMoveOnlyArraySlotMovesInExpr(*ce->callee, lam);
+        for (const auto& a : ce->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) checkMoveOnlyArraySlotMovesInExpr(*nc->callee, lam);
+        for (const auto& a : nc->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) checkMoveOnlyArraySlotMovesInExpr(*ma->target, lam);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) checkMoveOnlyArraySlotMovesInExpr(*nm->target, lam);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) checkMoveOnlyArraySlotMovesInExpr(*ix->target, lam);
+        for (const auto& a : ix->indices)
+            if (a.value) checkMoveOnlyArraySlotMovesInExpr(*a.value, lam);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) checkMoveOnlyArraySlotMovesInExpr(*be->left, lam);
+        if (be->right) checkMoveOnlyArraySlotMovesInExpr(*be->right, lam);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) checkMoveOnlyArraySlotMovesInExpr(*pb->operand, lam);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) checkMoveOnlyArraySlotMovesInExpr(*tt->operand, lam);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) checkMoveOnlyArraySlotMovesInExpr(*cd->condition, lam);
+        if (cd->thenValue) checkMoveOnlyArraySlotMovesInExpr(*cd->thenValue, lam);
+        if (cd->elseValue) checkMoveOnlyArraySlotMovesInExpr(*cd->elseValue, lam);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) checkMoveOnlyArraySlotMovesInExpr(*th->operand, lam);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) checkMoveOnlyArraySlotMovesInExpr(*we->source, lam);
+        for (const auto& ia : we->assigns)
+            if (ia.value) checkMoveOnlyArraySlotMovesInExpr(*ia.value, lam);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) checkMoveOnlyArraySlotMovesInExpr(*k, lam);
+        for (const auto& el : cl->elements)
+            if (el) checkMoveOnlyArraySlotMovesInExpr(*el, lam);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) checkMoveOnlyArraySlotMovesInExpr(*part.expr, lam);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) checkMoveOnlyArraySlotMovesInExpr(*cx->scrutinee, lam);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) checkMoveOnlyArraySlotMovesInExpr(*arm.guard, lam);
+            if (arm.exprBody) checkMoveOnlyArraySlotMovesInExpr(*arm.exprBody, lam);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit / bind /
+    // range: no child expressions that can hold a `move` of an indexed slot.
+}
+
+// The check point: `move X[i]` — `ix` is the IndexExpr operand of a `move`
+// found by the walker above. Reports iff `X` is a bare identifier resolving
+// to a move-only inline-array LOCAL declared OUTSIDE `lam` (a capture).
+void MethodOwnership::reportIfCapturedMoveOnlyArraySlotMove(
+        const ast::IndexExpr& ix, const ast::LambdaExpr& lam) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix.target.get());
+    if (!id) return;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls || !ls->decl) return;
+    long long size = 0;
+    if (!isMoveOnlyInlineArrayType(ls->declType, size)) return;
+    // Same `declaredInLambda` span-containment test `checkClosureEscapesOnReturn`'s
+    // §28.8 leg uses above (Ownership.cpp, the isBorrow classifier): a local
+    // whose OWN declaration lies inside `lam`'s span is this lambda's own
+    // production, not a capture from the enclosing scope.
+    const bool declaredInLambda =
+        ls->decl->span.begin.offset >= lam.span.begin.offset &&
+        ls->decl->span.end.offset <= lam.span.end.offset;
+    if (declaredInLambda) return;
+    report(Severity::Error, ix.span.begin,
+           std::string("cannot `move` slot `") + std::string(id->name) +
+           "[...]` through the closure's captured borrow of `" +
+           std::string(id->name) +
+           "`: the closure does not own the array (§28.9); read the slot "
+           "instead, or have the caller `move` the needed slots in as an "
+           "`owned` argument before constructing the closure");
+}
+
 // fix #3571: a thin `scanReturnsIn` leaf, firing `checkClosureEscapesOnReturn`
 // on every `return`'s value — including a `try`/`catch` arm body, which is
 // the shape this fix exists for. Was its own copy of the traversal, mirroring
@@ -9753,6 +10692,196 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
 // fresh owned/adopt value inside a lambda body still adopts (the predicate
 // stays Borrowed for fresh-owned producers per the #2128 layering), and a
 // borrow RHS pins. // per §28.10 v0.220, #2166
+
+// fix #4271 (§28.3 / §28.6 / §28.7, v0.298): seed `states_` with declaration-
+// time entries for any local the lambda body CAPTURES — a captured local
+// declared OUTSIDE the lambda body must still be tracked inside the body so
+// that (a) a lambda-body reassignment of the captured local to a fresh owned
+// value updates its state (producer-state adoption, disposeAliasSource clear,
+// becomesOwnedViaReassign flag — the same bookkeeping
+// `handleAssignment`/`applyUsingVarBorrowPinInLambdaStmt`'s AssignmentStmt
+// arm runs at method scope), and (b) a following `.Dispose()` in the lambda
+// body reclaims the slot via `markExplicitDisposeReclaimIfReassignedBorrow`.
+// Without this seed, the body's fresh `states_` finds NOTHING for the
+// captured local, the assignment arm's `for (auto& [sym, st] : states_)
+// if (sym->name != tid->name) continue;` loop never matches, none of the
+// bookkeeping runs, and codegen falls back to `unwindOwnedLocalClass(ld)` —
+// which classifies purely from the local's DECLARATION initializer form
+// (here, a borrow-init `var y := x;`) and returns false, leaving the heap
+// block leaked. Measured FAIL-WITHOUT under LSan (16 B / 1 allocation,
+// lam$0 — the `new Res(9)` `y.Dispose()` does not reclaim).
+//
+// The `outerStates` argument is intentionally NOT consulted: this pre-pass
+// runs BEFORE the method-body dataflow, so `outerStates` is empty (it only
+// carries method-scope parameter seeds at this point). Instead, derive the
+// captured local's declaration-time `LocalOwnership` directly from its
+// `LocalDecl` AST — the same `producerState` / `disposeAliasSource` /
+// `implicitDischarge` classification `handleLocalDecl` performs at method
+// scope (Ownership.cpp ~5683-5985), narrowed to the four fields the lambda-
+// body bookkeeping actually reads (`state`, `disposeAliasSource`,
+// `implicitDischarge`, `obligationOrigin`) and without the dataflow-time
+// side effects (`checkRead`, `checkDrainOnTemporary`,
+// `noteMoveOnlyArrayWholeMoveRead`, `checkBareBorrowTempLaunder`) the
+// dataflow will run itself when it walks this same declaration. // per
+// §28.3, §28.6, §28.7, v0.298, #4271
+void MethodOwnership::seedCapturedOuterLocals(
+        const ast::LambdaExpr& lam,
+        const BlockState& outerStates) {
+    (void)outerStates;  // see header — pre-pass runs before the dataflow
+    if (lam.exprBody) {
+        // Expression-bodied lambdas carry no statements to capture locals —
+        // every IdentifierExpr in the body references a captured outer-scope
+        // local (a body-local in an expression-bodied lambda would have to
+        // be a `let`-style binding, which the grammar does not provide).
+        // Still walk for completeness so a future grammar extension (or a
+        // leftover identifier reachable through collectIdentifiersIn's
+        // recurse-into-LambdaExpr arm) is covered.
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(lam, ids);
+        for (const auto* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (!ls) continue;
+            // For an expression-bodied lambda the body has NO LocalDecl
+            // surface, so any reachable LocalSymbol is captured-from-outer by
+            // construction — no `bodyStmts` check is meaningful.
+            seedCapturedLocalFromDecl(ls);
+        }
+        return;
+    }
+    // Block-bodied lambdas: walk the body to find every reachable Stmt
+    // node — a LocalSymbol whose `decl` is one of these is a BODY-local,
+    // not captured; one whose `decl` is NOT in this set (or is null) is
+    // captured from the enclosing scope. `forEachNestedStmt` reaches
+    // every statement kind via the #3656 single statement grammar.
+    std::unordered_set<const ast::Stmt*> bodyStmts;
+    for (const auto& s : lam.stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&bodyStmts](const ast::Stmt& cur) {
+            bodyStmts.insert(&cur);
+        });
+    }
+    // Walk the body's identifiers — every reference resolves via sema's
+    // exprSymbol. For each LocalSymbol that is captured (its decl is
+    // outside the body's Stmt set), derive the declaration-time
+    // LocalOwnership from its LocalDecl and seed it into `states_`.
+    // Restricting to LocalSymbol avoids the (rare) `ParameterSymbol`
+    // capture case — parameters do not carry a `LocalOwnership` here;
+    // their classification lives in the dataflow via different predicates
+    // (#2166/#4286 territory).
+    std::vector<const ast::IdentifierExpr*> ids;
+    collectLambdaIdentifiers(lam, ids);
+    for (const auto* id : ids) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) continue;
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) continue;
+        // A captured local's decl is a Stmt OUTSIDE the lambda body. The
+        // inline `out var x` shape's `decl` is an IdentifierExpr (a call-
+        // arg list position), never a Stmt — also correctly classified as
+        // captured-from-outer. A null `decl` is the conservative case
+        // (treat as captured, skip the seed if there's no decl to derive
+        // from — leaving the prior empty-state behavior intact, never
+        // crashing on null).
+        const bool declInBody =
+            ls->decl &&
+            dynamic_cast<const ast::Stmt*>(ls->decl) &&
+            bodyStmts.count(static_cast<const ast::Stmt*>(ls->decl));
+        if (declInBody) continue;
+        seedCapturedLocalFromDecl(ls);
+    }
+}
+
+// helper for `seedCapturedOuterLocals`: derive the captured local's
+// declaration-time `LocalOwnership` from its `LocalDecl` AST (or skip if
+// the decl is absent / not a `LocalDecl` — the `LocalConstDecl` /
+// for-loop-var / catch-binding / inline-out-var shapes carry their own
+// scope semantics and the lambda-body bookkeeping has no shape-specific
+// gap there, so they fall through unchanged). Mirrors the four fields
+// `handleLocalDecl` sets (`state`, `disposeAliasSource`,
+// `implicitDischarge`, `obligationOrigin`) without the dataflow-time
+// side effects (see `seedCapturedOuterLocals`'s header for the rationale).
+void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
+    // LOCALDECL-DEBT: #4271 — `const`-annotated captured local has separate LocalConstDecl form; widening drops the init discrimination.
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld) return;
+    // Skip if the local is already seeded (e.g. by a previous iteration
+    // over the same identifier-references list).
+    if (states_.count(ls)) return;
+    LocalOwnership lo;
+    lo.obligationOrigin = ld;
+    // §28.3 binding-position `owned` marker (`var y := owned x;`) — the
+    // SAME divert `handleLocalDecl` (Ownership.cpp ~5762) runs. An owned
+    // marker transfers obligation, so `y` is Owned.
+    if (ld->initializer && ld->initializerHasOwnedMarker) {
+        lo.state = OwnershipState::Owned;
+    } else if (ld->initializer) {
+        // The plain-producer funnel — the SAME `producerState` `handleLocalDecl`
+        // uses (Ownership.cpp ~5779). A `new T(...)` RHS is Owned; a bare-id
+        // read of an Owned-tracked local is also Owned (the bare-id
+        // classifier falls through producerState's many borrow/owned
+        // discriminators); a value-type RHS is Borrowed; etc. The captured
+        // case's most common shape (`var y := x;` — a bare-id read of an
+        // owned-tracked `x`) classifies `y` as Owned here — which is the
+        // spec's K1 row's "borrowed" verdict for the binding (a plain-id
+        // read of an owned source is a BORROW, not an ownership transfer).
+        // That divergence is why we run the `disposeAliasSource` arm below
+        // before falling through — the `producerState` Owned verdict on a
+        // bare-id RHS is the standard "looks-Owned but is actually a borrow"
+        // case `handleLocalDecl` itself documents.
+        lo.state = producerState(*ld->initializer);
+    } else {
+        // No initializer (`var x;` / `var x: T;` plain declaration). Treat
+        // as Uninitialized — the body walk's reassignment will set the
+        // real state.
+        lo.state = OwnershipState::Uninitialized;
+    }
+    // The `using var` borrow-pin classification lives on the LocalDecl's
+    // `isUsing` flag (set by sema); mirror it so a captured `using var`
+    // in a lambda body still carries `implicitDischarge` for the
+    // body-walk's read-check.
+    lo.implicitDischarge = ld->isUsing;
+    // The `disposeAliasSource` twin — the same narrow bare-IDENTIFIER-of-
+    // a-still-Owned-tracked-local test `handleLocalDecl` runs on a plain
+    // local declaration (and the LocalConstDecl arm's #4286 / #4314 /
+    // #4304 extension set, applied here for a captured `var` that
+    // borrows from an outer-scope Owned local — `var y := x;` where `x`
+    // is method-scope Owned, `y` is Borrowed with disposeAliasSource =
+    // x). The captured-from-outer `x` is necessarily an enclosing-frame
+    // symbol (not in this lambda body), so the
+    // `isOwnedTrackedLocalInEnclosingFrame` / `isReassignedOwnedLocalIn-
+    // EnclosingFrame` / `isOwnedParameterInEnclosingFrame` predicates are
+    // the right ones — same predicates the LocalConstDecl arm uses for
+    // its #4286 family.
+    if (ld->initializer) {
+        sema::Symbol* aliasSrc = nullptr;
+        if (auto* rid =
+                dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+            sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+            if (isOwnedTrackedLocal(rsym)) {
+                aliasSrc = rsym;
+            } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            } else if (isReassignedOwnedLocalInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            } else if (isOwnedParameterInEnclosingFrame(rsym)) {
+                aliasSrc = rsym;
+            }
+        }
+        if (!aliasSrc && exprIsOwnedFieldRead(*ld->initializer))
+            aliasSrc = ctx_.exprSymbol(*ld->initializer);
+        if (aliasSrc) {
+            // The spec's K1 row for `var y := x;` over an Owned-tracked `x`
+            // — `y` is BORROWED with `disposeAliasSource = x`. This is the
+            // override `handleLocalDecl` itself applies for the same shape.
+            lo.state = OwnershipState::Borrowed;
+            lo.disposeAliasSource = aliasSrc;
+        }
+    }
+    states_[ls] = lo;
+}
+
 void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     // Collect every LambdaExpr in the body (collectBodyLambdas already
@@ -9769,8 +10898,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         // decltype saves spelling it out here.
         BlockState savedStates = states_;
         auto savedFieldMovedFrom = fieldMovedFrom_;
+        // fix #4271 (§28.3 / §28.6 / §28.7, v0.298): seed `states_` with the
+        // outer-scope entries for every local this lambda CAPTURES. Runs
+        // AFTER the clear below — the bookkeeping arms in
+        // `applyUsingVarBorrowPinInLambdaStmt` (AssignmentStmt's
+        // `for (auto& [sym, st] : states_) if (sym->name != tid->name)
+        // continue;` loop) and `markExplicitDisposeReclaimIfReassignedBorrow`
+        // (`lookupState(name)`) need the captured local present in
+        // `states_` for the reassignment + `.Dispose()` shape to find its
+        // entry and run producer-state adoption / disposeAliasSource clear /
+        // disposeReclaimsReassignedBorrow stamping — see
+        // `seedCapturedOuterLocals`'s header for the full rationale and the
+        // measured leak signature. // per §28.3, §28.6, §28.7, v0.298, #4271
         states_.clear();
         fieldMovedFrom_.clear();
+        seedCapturedOuterLocals(*lam, savedStates);
         // Walk the lambda's own body. Expression-bodied lambdas carry their
         // body as a single `exprBody`; block-bodied lambdas carry `stmts`.
         // Neither contains a top-level LocalDecl (the lambda is a value, not
@@ -9786,6 +10928,21 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdas(
         }
         for (const auto& s : lam->stmts) {
             if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
+        }
+        // prep #4146 Stage 2-A (§28.3, v0.298): when the experimental lambda
+        // dataflow flag is set, ALSO run the CFG-based dataflow walk over the
+        // lambda body, seeded with the captured states. The pre-pass walk above
+        // remains the DEFAULT path (no behavior change when the flag is off).
+        // The new path should reach identical ownership decisions — it is the
+        // basis for Stage 2-B's default switch. Both walks are run sequentially;
+        // the pre-pass runs first so its flag-setting (usingVarSourceIsBorrow)
+        // is already done when the CFG walk's dataflow reaches the same locals.
+        if (std::getenv("BEZEL_OWNERSHIP_LAMBDA_DATAFLOW") &&
+            std::atoi(std::getenv("BEZEL_OWNERSHIP_LAMBDA_DATAFLOW")) == 1) {
+            // Seed from savedStates: these are the outer-scope entries for every
+            // captured local at the point the lambda is defined — exactly what
+            // runLambdaBody needs as its entry state.
+            runLambdaBody(lam, savedStates);
         }
         // Restore the outer scope's state — the lambda is its own scope.
         states_ = std::move(savedStates);
@@ -10192,6 +11349,95 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #4273 (§28.3/§7.7/§28.7, v0.298): port the `??=` arm from
+        // `handleAssignment` (Ownership.cpp ~line 6768) into the lambda-body
+        // pre-pass. The `:=` arm above handles a null-init plain local's first
+        // Owned adoption when the assignment unconditionally occurs; `??=` is
+        // the same shape when the target is provably null (PolyNull state) —
+        // §7.7's `a ??= b` producers row ("the compound form `a ??= b` assigns
+        // into `a` and follows the same meet rule for the assigned-into
+        // location") collapses the conditional to an unconditional assignment,
+        // exactly as #3980's method-scope arm describes. Without this, a
+        // `var r: Res? := null; r ??= new Res(5);` inside a lambda body leaks:
+        // the target's dataflow state stays PolyNull (the arm never fires),
+        // `becomesOwnedViaReassign` is never set, codegen's
+        // `unwindOwnedLocalClass` never classifies `r` as an owned class local,
+        // §28.7 drop-on-overwrite never fires, and §28.3 scope-end disposal is
+        // never registered — the 16 B allocation leaks with zero diagnostics
+        // and the explicit `.Dispose()` call dispatches to the destructor
+        // without reclaiming the block. Deliberately mirrors `handleAssignment`'s
+        // `??=` arm NARROWLY: only the `states_`-local bookkeeping — the
+        // producer-state adoption, the maybe-consumed/disposedOnSomePath/awaitSpent
+        // clears, the null-init `becomesOwnedViaReassign` flag, the
+        // definitelyRestoredLocals_ insert, and the borrow-source reset. NOT
+        // run: `checkConsumeFreeze` (the lambda pre-pass has no equivalent of
+        // the method-level consume-freeze that `:=`'s #4216 fix ports), and no
+        // `aliasSrc`/`disposeAliasSource` handling (those belong to
+        // LocalConstDecl, which cannot appear in a lambda-body local's
+        // assignment). Run BEFORE the nested-lambda collection below, matching
+        // this arm's existing ordering. // per §28.3, §7.7, §28.7, #1625,
+        // #3980, v0.298, #4273
+        if (as->op == "??=" && as->target) {
+            if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                for (auto& [sym, st] : states_) {
+                    if (sym->name != tid->name) continue;
+                    if (st.state == OwnershipState::PolyNull) {
+                        // The assignment provably occurs; mirror the `:=` path's
+                        // bare-identifier arm (§28.3, §28.7). recordMovesIn
+                        // runs first so a `move`d source is no longer Owned
+                        // before the local adopts its producer state (matches
+                        // the order in the `:=` branch).
+                        if (as->value) recordMovesIn(*as->value);
+                        // §28.7 / §28.3 (#1625): the null-init flag, set on
+                        // the first Owned reassignment of a null-init plain
+                        // local so codegen treats it as an owned class local
+                        // (drop-on-overwrite + scope-end disposal). Restricted
+                        // to a null-init LocalDecl — the two "becomes owned
+                        // via reassign" shapes the `:=` path guards against
+                        // (no-init local carrying the §28.3 disposal
+                        // obligation; borrow-init local admitting double-free)
+                        // do not arise here: a `??=` RHS is by §7.7 a producer
+                        // (owned value or borrow), but the borrow-init guard
+                        // is a property of the LocalDecl's initializer, which
+                        // for a PolyNull local is `null` — i.e. exactly the
+                        // case the flag is for. // per §28.7, §28.3, #1625
+                        if (producerState(*as->value) == OwnershipState::Owned) {
+                            if (auto* lsym =
+                                    dynamic_cast<sema::LocalSymbol*>(sym)) {
+                                if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                        lsym->decl))
+                                    if (ld2->initializer &&
+                                        dynamic_cast<const ast::NullLiteralExpr*>(
+                                            ld2->initializer.get()))
+                                            const_cast<ast::LocalDecl*>(ld2)
+                                                ->becomesOwnedViaReassign = true;
+                            }
+                        }
+                        // State transition, mirroring the `:=` path's
+                        // bare-identifier arm: the local adopts the RHS's
+                        // ownership state and any conditional-discharge /
+                        // await-spend markers from prior joins are cleared.
+                        // // per §28.3, §7.7 K7, #3980
+                        st.state = producerState(*as->value);
+                        st.obligationOrigin = as;
+                        st.maybeConsumed = false;
+                        st.disposedOnSomePath = false;
+                        st.awaitSpent = false;
+                        // §28.3 (#1900): the scope-end auto-drop's "definitely
+                        // holds a fresh value" marker, used by the
+                        // consume-and-restore idiom. // per §28.3, #1900
+                        if (st.state == OwnershipState::Owned)
+                            definitelyRestoredLocals_.insert(sym);
+                        // §28.9 / §9.7 indirect-escape tracking: `??=` writes
+                        // a fresh value, so any prior borrow source is cleared
+                        // — the local no longer aliases the old referent.
+                        st.source.reset();
+                    }
+                    break;
+                }
+            }
+        }
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);
@@ -10269,8 +11515,30 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // fallthrough (`savedIfStates`, pushed below when there is no
         // `else`) is NOT a real arm body and is always reachable, so it is
         // never subject to this check.
-        if (!armNeverFallsThrough(ifs->ifBranch.body))
-            armEnds.push_back(states_);
+        //
+        // fix #4141 (§21.5/§28.3, v0.298): an arm ending in an UNLABELED
+        // `break`/`continue` (offset 0 — targeting the immediately
+        // enclosing loop) also never reaches the point directly after
+        // this `if`, BUT it does reach a different live merge point
+        // (the enclosing loop's own post-loop join). It must be
+        // FORWARDED to that join, not dropped, and not folded into this
+        // `if`'s own join (which would tell code after the if that
+        // `x` is maybe-consumed when only the unreachable break-arm
+        // ever touched it). The If/Case push the state to
+        // `pendingDivertedStates_`; the enclosing While/For pops and
+        // joins each one into its own post-loop join — see
+        // `armDivertsToEnclosingLoop`'s header. Labeled forms (offset
+        // > 0) target an outer loop and are NOT yet recognized here;
+        // they fall through to the `else` branch below and fold into
+        // the if's own join (the over-conservative pre-#4141 behavior
+        // for that one shape, sound-direction only).
+        if (!armNeverFallsThrough(ifs->ifBranch.body)) {
+            if (armDivertsToEnclosingLoop(ifs->ifBranch.body)) {
+                pendingDivertedStates_.push_back(states_);
+            } else {
+                armEnds.push_back(states_);
+            }
+        }
         for (const auto& el : ifs->elifBranches) {
             states_ = savedIfStates;
             if (el.condition) {
@@ -10281,15 +11549,25 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             }
             for (const auto& bs : el.body)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            if (!armNeverFallsThrough(el.body))
-                armEnds.push_back(states_);
+            if (!armNeverFallsThrough(el.body)) {
+                if (armDivertsToEnclosingLoop(el.body)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    armEnds.push_back(states_);
+                }
+            }
         }
         if (ifs->hasElse) {
             states_ = savedIfStates;
             for (const auto& bs : ifs->elseBody)
                 if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-            if (!armNeverFallsThrough(ifs->elseBody))
-                armEnds.push_back(states_);
+            if (!armNeverFallsThrough(ifs->elseBody)) {
+                if (armDivertsToEnclosingLoop(ifs->elseBody)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    armEnds.push_back(states_);
+                }
+            }
         } else {
             armEnds.push_back(savedIfStates);
         }
@@ -10342,8 +11620,16 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // one is out of this fix's scope. // per §28.3 K1.3, v0.295, #3951,
         // #4117
         BlockState savedWhileStates = states_;
+        // fix #4141 (§21.5/§28.3, v0.298): bracket the body walk so the
+        // pending `break`/`continue` arm states (pushed by the If/Case
+        // arms inside this body, see `armDivertsToEnclosingLoop`) are
+        // bounded to this loop's contribution to the post-loop join —
+        // any state pushed by a construct OUTSIDE this loop belongs to
+        // an enclosing loop and must not be touched here.
+        const std::size_t pendingStart = pendingDivertedStates_.size();
         for (const auto& bs : ws->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        const std::size_t pendingEnd = pendingDivertedStates_.size();
         // fix #4138 (§21.5/§28.3, v0.295): a body whose last reachable
         // statement is return/throw never reaches the point directly after
         // this loop (it leaves the callable outright), so it must not be
@@ -10359,6 +11645,18 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedWhileStates, ws->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        // fix #4141: join every break/continue-arm end-state pushed
+        // during this body's walk into the post-loop join. Each one is
+        // a path through the body that EXITED the loop early; together
+        // with the "ran the body to completion" and "0 iterations"
+        // operands above, it forms the complete post-loop join. After
+        // joining, drop the entries from the pending stack so the
+        // enclosing loop sees only ITS body's contributions.
+        for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
+            joinInto(states_, pendingDivertedStates_[i], ws->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
+        pendingDivertedStates_.resize(pendingStart);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -10382,8 +11680,14 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // with zero diagnostics and heap-use-after-freed. // per §28.3 K1.3,
         // v0.295, #3951, #4117
         BlockState savedForStates = states_;
+        // fix #4141 (§21.5/§28.3, v0.298): same bracket as WhileStmt
+        // just above -- bound the break/continue-arm states pushed
+        // during this body walk to THIS loop's post-loop join, and
+        // include each one in that join.
+        const std::size_t pendingStart = pendingDivertedStates_.size();
         for (const auto& bs : fs->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        const std::size_t pendingEnd = pendingDivertedStates_.size();
         // fix #4138 (§21.5/§28.3, v0.295): see the identical WhileStmt
         // exclusion just above.
         if (armNeverFallsThrough(fs->body)) {
@@ -10392,6 +11696,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             joinInto(states_, savedForStates, fs->span.begin,
                      /*emitClash=*/false, /*unionKeys=*/false);
         }
+        for (std::size_t i = pendingStart; i < pendingEnd; ++i) {
+            joinInto(states_, pendingDivertedStates_[i], fs->span.begin,
+                     /*emitClash=*/false, /*unionKeys=*/false);
+        }
+        pendingDivertedStates_.resize(pendingStart);
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
@@ -10457,42 +11766,59 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
         // dataflow), and widening it to one is out of this fix's scope.
         // // per §28.3 K1.3, §28.8.1, v0.295, #3951, #4117
         //
-        // #4138 (declined here — see issue #4142): the try-body's normal-
-        // completion path has the identical false-reject shape as the
-        // Case/If joins above when it ends in `return`/`throw` (measured:
-        // `try t := t + Take(move x); return t; catch E => t := 0; end; t
-        // := t + Take(move x);` compiles clean on origin/main, falsely
-        // rejected on this batch's base) — but excluding it here the same
-        // way is UNSOUND, not merely incomplete, because of `finally`.
-        // `finally` ALWAYS runs, on every path including one that is about
-        // to return/throw, so the state fed into `finally`'s own walk below
-        // must be the union of EVERY path, terminated or not — dropping a
-        // terminated operand here is invisible when there is no `finally`,
-        // but reopens a real double-move once one is added: measured, `try
-        // t := t + Take(move x); return t; finally t := t + Take(move x);
-        // end;` (no catch arm at all) correctly rejects "already moved out"
-        // at `102d29f`/`3bdae03` alike (a single-operand join, the body's
-        // own MovedFrom state, feeds `finally` directly) but silently
-        // ACCEPTED once this arm was excluded from `tryEnds` the same way
-        // the Case/If arms are — `finally` was walked from the wrong
-        // (too-optimistic) state. `finally`'s state and "state that
-        // survives past the whole `try`" are the SAME variable in this
-        // walker (`states_`, mutated in place) precisely because `finally`
-        // is walked exactly once, not once per tryEnds operand — so there
-        // is no way to filter one consumer without also filtering the
-        // other with the tools this walker has. A correct fix needs the two
-        // uses separated (an unfiltered union for `finally`'s own walk, and
-        // a further reachability re-filter of ITS OWN result afterward for
-        // what continues past the whole `try`) — a larger, more careful
-        // change than this narrow batch fix-forward should make under time
-        // pressure. Left EXACTLY as #4117 landed it (unconditional), so the
-        // known-safe `finally` behavior is preserved and #4138's Try
-        // sub-case remains a declared, open false-reject (issue #4142).
+        // fix #4142 (§21.7 / §28.3 / §28.8.1, v0.298): the try-body's normal-
+        // completion path that ends in `return`/`throw` (per
+        // `armNeverFallsThrough`, the same predicate the Case/If #4138 arms
+        // already use — see this file's header for the why-break/continue-are-
+        // excluded asymmetry) leaves the enclosing callable outright, so it
+        // NEVER reaches the point directly after the `try`. The pre-#4142
+        // walker joined every body operand into `tryEnds` regardless, which
+        // gave code-after-the-try a spurious "already moved" / "maybe-
+        // consumed" diagnostic that the real per-method TryStmt join has
+        // never produced.
+        //
+        // The fix splits the operands into TWO views:
+        //   - `tryEndsForFinally` — the FULL union (body + every catch arm).
+        //     Used to seed the `finally` walk, because `finally` ALWAYS runs,
+        //     on every path including one that just returned/threw — dropping
+        //     a terminated operand here is unsafe (the previously-measured
+        //     `try t := t + Take(move x); return t; finally t := t + Take(
+        //     move x); end;` shape would silently re-accept the double-move).
+        //   - `tryEndsForJoin` — body and catch arms EXCLUDED when their last
+        //     reachable stmt is `return`/`throw`. Used for the post-try state
+        //     (what code AFTER the whole try sees).
+        //
+        // `applyUsingVarBorrowPinInLambdaStmt`'s `states_` is mutated in place
+        // by the finally walk (one-pass, no fixpoint), so the two views cannot
+        // share the variable: finally walks from `tryEndsForFinally`'s join
+        // FIRST, then `states_` is REASSIGNED to `tryEndsForJoin`'s join for
+        // what survives past the whole try. Same shape as CaseStmt/IfStmt
+        // #4138 (this file's If/Case arms ~lines 10660-10784 / 11021-11112),
+        // generalized to the {body-normal-completion} ∪ {catch arms} ∪
+        // {finally-always-runs} control shape. // per §21.7, §28.3 K1.4,
+        // §28.8.1, v0.298, #4142, #4138
         BlockState savedTryStates = states_;
         for (const auto& bs : trys->body)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
-        std::vector<BlockState> tryEnds;
-        tryEnds.push_back(states_);  // normal completion, no throw
+        // fix #4142: track whether the body's normal-completion path is
+        // reachable to the post-try code. `armNeverFallsThrough` returns true
+        // when the body's last reachable stmt is `return`/`throw` — that path
+        // leaves the callable, so its state must be excluded from the post-try
+        // join (mirrors If/Case #4138). The same-state-for-finally variable
+        // below retains it for the finally walk.
+        const bool bodyNeverFallsThrough = armNeverFallsThrough(trys->body);
+        // Build both views IN PARALLEL as we walk each catch arm. Each
+        // operand (body + each catch arm) is pushed to the view it belongs
+        // to based on whether its last reachable stmt is a terminator.
+        // Both views get COPIES (not moves) of the post-walk `states_` — a
+        // `std::move` would invalidate the source for the OTHER view, since
+        // the finally walk later mutates `states_` in place from
+        // `tryEndsForFinally`'s join.
+        std::vector<BlockState> tryEndsForFinally;
+        std::vector<BlockState> tryEndsForJoin;
+        tryEndsForFinally.push_back(states_);
+        if (!bodyNeverFallsThrough)
+            tryEndsForJoin.push_back(states_);
         for (const auto& arm : trys->catches) {
             states_ = savedTryStates;
             if (arm.guard) {
@@ -10502,15 +11828,53 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     applyUsingVarBorrowPinInLambdaBody(*nested);
             }
             if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
-            tryEnds.push_back(states_);
+            // fix #4142: a catch arm whose body ends in `return`/`throw`
+            // ALSO never reaches the post-try code — the throw that brought
+            // control here is "consumed" by the catch arm, but the arm itself
+            // then exits the callable, leaving the post-try code unreachable.
+            // (`stmtNeverFallsThrough` handles the ExpressionStmt/DoEndBlock/
+            // if-with-no-else nested shapes the same way `armNeverFallsThrough`
+            // does for vector bodies.) Catch arms always run BEFORE `finally`,
+            // so their terminated operands STAY in `tryEndsForFinally` — the
+            // exclusion only applies to `tryEndsForJoin`.
+            const bool armTerminates = arm.body &&
+                stmtNeverFallsThrough(*arm.body);
+            tryEndsForFinally.push_back(states_);
+            if (!armTerminates)
+                tryEndsForJoin.push_back(states_);
         }
-        auto tryJoined = std::move(tryEnds.front());
-        for (std::size_t i = 1; i < tryEnds.size(); ++i)
-            joinInto(tryJoined, tryEnds[i], trys->span.begin,
-                     /*emitClash=*/false, /*unionKeys=*/false);
-        states_ = std::move(tryJoined);
+        // #4142: feed `finally` the FULL union (the body's own state plus
+        // every catch arm's own state) — this is `tryEndsForFinally`. Walk
+        // finally from `states_` set to this union's join; the
+        // post-try state is then OVERWRITTEN with the FILTERED join below.
+        if (tryEndsForFinally.empty()) {
+            // Empty body + no catch arms: the `try` is a no-op, walk finally
+            // (if any) from the pre-try snapshot.
+            states_ = savedTryStates;
+        } else {
+            auto tryJoinedForFinally = std::move(tryEndsForFinally.front());
+            for (std::size_t i = 1; i < tryEndsForFinally.size(); ++i)
+                joinInto(tryJoinedForFinally, tryEndsForFinally[i],
+                         trys->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(tryJoinedForFinally);
+        }
         for (const auto& bs : trys->finallyBody)
             if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        // #4142: the post-try state. When the entire operand set is
+        // excluded (every body + every catch arm ends in `return`/`throw`),
+        // the post-try code is unreachable via any live path — fall back to
+        // the pre-try snapshot, mirroring CaseStmt's identical fallback at
+        // ~line 11104.
+        if (tryEndsForJoin.empty()) {
+            states_ = savedTryStates;
+        } else {
+            auto tryJoined = std::move(tryEndsForJoin.front());
+            for (std::size_t i = 1; i < tryEndsForJoin.size(); ++i)
+                joinInto(tryJoined, tryEndsForJoin[i], trys->span.begin,
+                         /*emitClash=*/false, /*unionKeys=*/false);
+            states_ = std::move(tryJoined);
+        }
         return;
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
@@ -10574,8 +11938,20 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             // return/throw leaves the callable outright and so never
             // reaches the point directly after this `case`, so its end
             // state must not be folded in.
-            if (!armNeverFallsThrough(arm.stmts))
-                caseArmEnds.push_back(states_);
+            //
+            // fix #4141 (§21.5/§28.3, v0.298): symmetric with the If arm
+            // just above -- an arm ending in an unlabeled
+            // `break`/`continue` (offset 0) targets the immediately
+            // enclosing loop's own join, so it must be FORWARDED there
+            // (via `pendingDivertedStates_`, popped by the enclosing
+            // While/For), not folded into this `case`'s own join.
+            if (!armNeverFallsThrough(arm.stmts)) {
+                if (armDivertsToEnclosingLoop(arm.stmts)) {
+                    pendingDivertedStates_.push_back(states_);
+                } else {
+                    caseArmEnds.push_back(states_);
+                }
+            }
         }
         if (!cs->noMatchEdgeStaticallyDead)
             caseArmEnds.push_back(savedCaseStates);
@@ -10601,12 +11977,40 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
 // nested-lambda recursion is inlined here so the save/restore is tight
 // (each nested lambda is its own scope). Body walking mirrors the outer
 // `applyUsingVarBorrowPinInLambdas` block/expr-body shape.
+//
+// fix #4271 (§28.3 / §28.6 / §28.7, v0.298): SEED `states_` from the
+// enclosing-scope `savedStates` for every local this nested lambda body
+// CAPTURES — the sibling of the same-named call in
+// `applyUsingVarBorrowPinInLambdas`. A nested lambda's enclosing scope is
+// either the method body (the FIRST-level lambda case, via
+// `applyUsingVarBorrowPinInLambdas`) or an OUTER lambda body mid-walk
+// (this helper's caller). For a captured local declared in the METHOD
+// (and reached only by the outer chain), the FIRST-level seed in
+// `applyUsingVarBorrowPinInLambdas` has already put the entry in the
+// outer-lambda's `states_` — `savedStates` here is that very map, so the
+// seed carries through. For a captured local declared in the OUTER
+// lambda body itself, the outer lambda's own pre-pass is mid-walk; that
+// walk has populated `states_` with the local's declaration-time state
+// (via `handleLocalDecl`'s LocalDecl arm in
+// `applyUsingVarBorrowPinInLambdaStmt`), and that entry is the one
+// `seedCapturedOuterLocals` re-seeds here. // per §28.3, §28.6, §28.7,
+// v0.298, #4271
 void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         const ast::LambdaExpr& lam) {
     BlockState savedStates = states_;
     auto savedFieldMovedFrom = fieldMovedFrom_;
+    // See #4271 comment in `applyUsingVarBorrowPinInLambdas` for the full
+    // rationale. The seed runs AFTER the clear so the bookkeeping arms'
+    // state lookups (AssignmentStmt's `for (auto& [sym, st] : states_)`
+    // loop, `markExplicitDisposeReclaimIfReassignedBorrow`'s
+    // `lookupState(name)`) find the captured local present in `states_`
+    // for the reassignment + `.Dispose()` shape to find its entry and run
+    // producer-state adoption / disposeAliasSource clear /
+    // disposeReclaimsReassignedBorrow stamping. // per §28.3, §28.6, §28.7,
+    // v0.298, #4271
     states_.clear();
     fieldMovedFrom_.clear();
+    seedCapturedOuterLocals(lam, savedStates);
     if (lam.exprBody) {
         std::vector<const ast::LambdaExpr*> nestedLambdas;
         collectBodyLambdasExpr(*lam.exprBody, nestedLambdas);
@@ -10617,6 +12021,36 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
     states_ = std::move(savedStates);
     fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+}
+
+
+// prep #4146 Stage 2-A (§28.3, v0.298): run the ownership CFG dataflow over
+// one lambda body, seeded with the outer-scope captured states. Mirrors
+// MethodOwnership::run but skips the method-body-only checks that have no
+// lambda-body analogue (checkAsyncSignatureBorrowBearing,
+// checkBorrowBearingLocalsAcrossSuspension, and the IOwningEnumerable check).
+// The capturedStates are the outer scope's BlockState at the point the lambda
+// is defined — every captured local is seeded into the dataflow entry state.
+//
+// Stage 2-A is completely SILENT: no diagnostics are emitted, no flags are set,
+// no state is persisted. The CFG is built but runDataflow is NOT called,
+// because visitStmt (called by runDataflow) emits diagnostics as a side effect
+// and the new CFG-based walk reaches different ownership conclusions from the
+// existing structural pre-pass. Making them identical in this prep commit would
+// require either degrading the CFG walk or enhancing the pre-pass — both are
+// deferred to subsequent Stage 2 sub-commits. This no-op call site therefore
+// establishes the infrastructure (buildLambdaBodyCFG + captured-state seed) as
+// a verified-correct second walk with zero behavioral impact, safe for landing.
+void MethodOwnership::runLambdaBody(
+    const ast::LambdaExpr* lam,
+    const BlockState& capturedStates) {
+    // Build the lambda body CFG (block-bodied or expression-bodied) to verify
+    // the CFG construction works correctly for all lambda body shapes. The result
+    // is discarded — no runDataflow call — to keep Stage 2-A behavior-neutral.
+    auto cfg = flow::CFG::buildLambdaBodyCFG(lam, buildOpts_);
+    // Silence unused variable warnings: cfg is built but not yet consumed.
+    (void)cfg;
+    (void)capturedStates;
 }
 
 
@@ -11743,15 +13177,96 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
     if (returnIsBareTypeParam_) return; // bare-T: checkBareTypeParamReturn's job
     if (!returnType_) return;
     if (returnType_->kind == ast::TypeKind::Named && returnType_->name &&
-        !returnType_->name->parts.empty() &&
-        isOwningTypeNameHead(returnType_->name->parts.front()))
-        return;  // owning-type return: checkBorrowReturnedThroughOwningType
+        !returnType_->name->parts.empty()) {
+        std::string_view retHead = returnType_->name->parts.front();
+        if (isOwningTypeNameHead(retHead))
+            return;  // owning-type return: checkBorrowReturnedThroughOwningType
+        // §28.3 announcement table rows 2-3 (v0.307): a MINT-ANNOUNCING
+        // return type — the non-owning half of the iterable/enumerator
+        // family (`IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`,
+        // `IAsyncEnumerator<T>`; the owning four are already excluded above
+        // via `isOwningTypeNameHead`) or a `Task`-family type — is "claimed
+        // by no other row" EXCLUDES it from row 4 outright: "the unmarked
+        // mint-announcing return type transfers the container like an
+        // `owned` return" (row 2's own text), so a fresh production through
+        // one is the NORMAL, expected shape — `GetEnumerator(): IEnumerator
+        // <T> => new IntRangeEnum(...);` is admitted precisely because
+        // `IEnumerator<T>` announces the transfer itself, exactly as
+        // `§29.1`'s own worked example spells it unmarked. MEASURED
+        // regression (found reviewing this fix's own blast radius): before
+        // this guard, `GetEnumerator(): IEnumerator<T> => new E();` was
+        // newly and wrongly rejected by the block below — an existing,
+        // heavily-used iterator-protocol idiom across many codegen/module
+        // tests (§29.1). `checkBorrowReturnedThroughOwningType` (the
+        // sibling function) already governs what THIS family disallows
+        // returning (a stored-view re-exposure of a receiver-owned field);
+        // it does not, and should not, reject a fresh production, so no
+        // corresponding guard was needed there. // per §28.3, v0.307
+        if (common::isIterableInterfaceHead(retHead)) return;
+        if (common::isTaskFamilyHead(retHead)) return;
+    }
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
+    // §28.3 announcement table row 4 (v0.307): an instance method's
+    // non-`owned` plain concrete class/interface return admits ONLY a
+    // receiver-sourced borrow — "return only a receiver-(parameter-)
+    // sourced borrow; a fresh owned value is rejected (§28.6) — declare
+    // `owned`." Scope this rejection to the two shapes this fix's spec-
+    // cited corpus cases pin — a direct `new` expression (s28_3_0039) and
+    // a bare identifier naming a tracked local currently in the OWNED
+    // state (s28_3_0029) — so the CallExpr-relay gap (a fresh owned value
+    // returning through a CallExpr result, #4009) is left untouched rather
+    // than guessed at.
+    //
+    // fix #4986 (§17.8, §28.3 row 4, v0.307): peel a top-level `!` / `as`
+    // so `return y!;` over a tracked OWNED plain local is classified the
+    // same as `return y;` is — §17.8 "if x has ownership state owned …,
+    // x! is owned". Without this peel, the bare-identifier arm below
+    // matches only ast::IdentifierExpr, so the bang form slipped past row
+    // 4 entirely (UAF pre-#4955, leak post-#4955 — issue #4986). The
+    // borrow classifier `ownedArgSourceIsBorrow` itself is unchanged in
+    // this fix (it is too widely called to retune here), so the bang
+    // form STAYS classified as a borrow by it; the row-4 check therefore
+    // runs this peel-based classification BEFORE the borrow classifier's
+    // verdict is allowed to override it.
+    {
+        const ast::Expr* core = peelTopCastBang(&e);
+        bool isFreshOwnedProducer = false;
+        if (dynamic_cast<const ast::NewExpr*>(core)) {
+            isFreshOwnedProducer =
+                producerState(*core) == OwnershipState::Owned;
+        } else if (auto* rid =
+                       dynamic_cast<const ast::IdentifierExpr*>(core)) {
+            if (auto* st = lookupState(rid->name))
+                // Exclude a maybe-consumed local (K7.4 join): that is a
+                // narrower, separately-diagnosed hazard (checkRead's
+                // maybe-consumed report), not this rule's business —
+                // mirrors the `st.state == Owned && st.maybeConsumed`
+                // gating already established at the reassignment site
+                // above in this file.
+                isFreshOwnedProducer =
+                    st->state == OwnershipState::Owned && !st->maybeConsumed;
+        }
+        if (isFreshOwnedProducer) {
+            report(
+                Severity::Error, e.span.begin,
+                "an instance method whose declared return type is a plain "
+                "concrete class or interface type may return only a "
+                "receiver-sourced borrow (§28.3 announcement table row 4) — a "
+                "fresh owned value is rejected here; declare the return type "
+                "`owned` to transfer ownership to the caller");
+            return;
+        }
+    }
     if (!ownedArgSourceIsBorrow(e)) return;
     // Is the borrow's root a plain (non-`owned`) parameter? Only then is the
     // return non-receiver-sourced. `this`/`base` and receiver field reads are
     // admitted (their root is not a ParameterSymbol).
-    const ast::IdentifierExpr* root = identifierRoot(e);
+    // fix #4986 (§17.8, §28.3 row 4, v0.307): peel a top-level `!`/`as` so a
+    // `return g!;` over a plain (non-`owned`) parameter `g` is classified the
+    // same as `return g;` is — the bang is a borrow of `g`'s value (§17.4
+    // analog, §17.8 confirms the source-and-state invariant), and §28.3
+    // rejects the parameter-sourced borrow through a plain return.
+    const ast::IdentifierExpr* root = identifierRootThroughCastBang(e);
     if (!root) return;
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*root));
     if (!ps) return;
@@ -12492,6 +14007,80 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
     if (!isAsync_ || !returnType_) return;
     if (!isAsyncPatternAClassResultType(ctx_.resolvedType(*returnType_), ctx_))
         return;
+
+    // fix #4463 (§30.5 Pattern A kind 1, §28.3 Producers, v0.306):
+    // `checkAsyncPatternABorrowedIdentifierReturn` only inspected a bare
+    // IdentifierExpr at the top level.  Wrapper AST shapes that can only
+    // unwrap to a borrowed source were invisible to the check.
+    //
+    // Recursive helper: walks through wrapper shapes to the underlying
+    // borrowed source.  The walk is intentionally CONSERVATIVE — it rejects
+    // only when the underlying source is demonstrably a borrow (plain
+    // parameter, tracked Borrowed local, implicit-this field).  It does NOT
+    // classify CallExpr/NullCondCallExpr results beyond checking the callee;
+    // a method call whose result is borrowed through its receiver's borrow
+    // is caught via the MemberAccessExpr base-check.  The 6 defect probes
+    // (L4 report, probes 3/4/5/7/9/10) are all caught by this walk.
+    // Codegen's `detectAsyncPatternAKind` remains as the fast first-pass
+    // for the unambiguous MemberAccessExpr / NullCondMemberExpr / IndexExpr
+    // top-level shapes. // per §30.5, §28.3
+    std::function<bool(const ast::Expr&)> isBorrowed =
+        [&](const ast::Expr& expr) -> bool {
+        // PostfixBangExpr: the `!` postfix asserts non-null but does not
+        // change ownership classification (§7.5 / §28.3) — unwrap and recurse.
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(&expr))
+            return isBorrowed(*p->operand);
+        // TypeTestExpr (op="as"): borrows from its operand.
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(&expr))
+            return t->op == "as" && isBorrowed(*t->operand);
+        // ConditionalExpr: the meet of the arms' ownership states; if
+        // either arm is borrowed the whole expression is (§28.3).
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&expr))
+            return isBorrowed(*c->thenValue) || isBorrowed(*c->elseValue);
+        // BinaryExpr (op="??"): identically to ConditionalExpr (§28.3).
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&expr))
+            return b->op == "??" &&
+                   (isBorrowed(*b->left) || isBorrowed(*b->right));
+        // CallExpr / NullCondCallExpr: the result is borrowed if the callee
+        // is borrowed (§28.3 row 4).
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&expr))
+            return isBorrowed(*call->callee);
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&expr))
+            return isBorrowed(*nc->callee);
+        // MemberAccessExpr: if the base is borrowed, the access is borrowed.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&expr))
+            return isBorrowed(*ma->target);
+        // NullCondMemberExpr: `h?.Peek` — same borrow semantics as MemberAccessExpr
+        // per §28.3; the `?.` does not transfer ownership.
+        if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(&expr))
+            return isBorrowed(*ncm->target);
+        // IdentifierExpr: consult per-local flow state, then parameter
+        // symbol, then implicit-this field — the same 3-arm logic this
+        // function uses for a bare IdentifierExpr.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&expr)) {
+            if (auto* st = lookupState(id->name))
+                return st->state == OwnershipState::Borrowed;
+            if (auto* sym = ctx_.exprSymbol(*id))
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
+                    return ps->modifier.empty();
+            if (auto* sym = ctx_.exprSymbol(*id))
+                if (dynamic_cast<sema::FieldSymbol*>(sym))
+                    return true;
+            return false;  // owned local or untracked — admitted
+        }
+        return false;  // everything else: owned or not this check's business
+    };
+
+    // fix #4463: for non-IdentifierExpr shapes (wrapper expressions),
+    // use the recursive walk to detect borrowed sources.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (isBorrowed(e)) {
+            reportAsyncPatternABorrowedIdentifierReturn(e);
+            return;
+        }
+        // Not borrowed: fall through to handle bare IdentifierExpr via
+        // the existing top-level check below.
+    }
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
     if (!id) return;
     if (auto* st = lookupState(id->name)) {

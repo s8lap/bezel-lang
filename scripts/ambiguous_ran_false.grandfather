@@ -1,0 +1,39 @@
+# ambiguous_ran_false.grandfather - per-file ceiling for #3892/#3895.
+#
+# Each row is one file maximum number of bare-!ran/hasErrors()
+# rows allowed without per-site `// AMBIGUOUS-RAN-FALSE-DEBT:
+# #NNNN <reason>` markers. The ceiling only ever falls - every
+# successful `--update` tightens each file to min(existing,
+# measured), so a drain becomes the new ceiling on the very
+# next --update. A file whose tightened ceiling reaches 0 is
+# dropped entirely. Raising a ceiling stays a deliberate,
+# reviewed hand-edit to this file.
+#
+# See check_debt_floor() in scripts/check_ambiguous_ran_false.py
+# (mirrors scripts/localdecl_only_walkers.grandfather, ported
+# from #3590 as the family-wide mechanism).
+
+1    tests/codegen/async_auto_drop_sync_dispose_1663_test.cpp
+1    tests/codegen/async_iter_early_abandonment_dispose_1525_test.cpp
+1    tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp
+1    tests/codegen/box_value_type_generic_record_2203_test.cpp
+1    tests/codegen/builtin_member_chain_2976_test.cpp
+1    tests/codegen/captured_owned_primary_param_shared_predicate_3634_test.cpp
+1    tests/codegen/collection_task_add_appends_2999_test.cpp
+1    tests/codegen/compound_operator_base_class_2932_test.cpp
+1    tests/codegen/conditional_test.cpp
+1    tests/codegen/const_qualified_ref_1095_test.cpp
+1    tests/codegen/decimal_parse_fraction_scale_2273_test.cpp
+1    tests/codegen/expr_getter_object_boxing_2761_test.cpp
+1    tests/codegen/ffi_test.cpp
+1    tests/codegen/owned_dict_field_value_dispose_893_894_test.cpp
+1    tests/codegen/scoped_await_bind_proto_3048_test.cpp
+2    tests/codegen/shift_count_domain_3045_test.cpp
+1    tests/codegen/sorted_set_record_element_3740_test.cpp
+2    tests/codegen/unused_owned_primary_param_leak_3205_test.cpp
+1    tests/codegen/virtual_overload_inherited_1090_test.cpp
+1    tests/codegen/virtual_property_generic_base_type_param_concrete_override_2944_test.cpp
+2    tests/ownership/captured_moved_from_binding_3755_test.cpp
+1    tests/sema/index_arg_ownership_modifier_3097_test.cpp
+2    tests/sema/lambda_param_no_target_type_reject_3756_test.cpp
+2    tests/sema/primitive_boxes_into_builtin_iface_2765_test.cpp

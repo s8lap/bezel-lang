@@ -505,6 +505,35 @@ struct MetaChoicePayloadField {
     bool serializedOptional = false;
     std::string serializedName;
 
+    // §35.7 "Equality, hashing, ToString" / §9.2 "The `equality skip` clause"
+    // (v0.307; issue #4652, follow-up to fix #4643/#3152 family F9): this
+    // payload field's `equality skip` clause (A.3 `CaseField`'s trailing
+    // `EqualityClause?`).
+    //
+    // §35.7 states the clause reads per §9.2's skip-model table — "excluded
+    // from its case's payload comparison and hash, exempt from admissibility"
+    // — and §9.2 states the artifact interface carries the clause "exactly as
+    // it carries `serialized` clauses": adding or removing it on a public
+    // choice's payload is a breaking change (§3.6 rule 3), because it flips
+    // `=`/`GetHashCode` results for clients and can flip the choice's §35.7
+    // auto-hashable / §3.6 hashable derived properties (the ELIGIBILITY GATE
+    // direction — a class-typed payload marked `equality skip` rescues an
+    // otherwise-inadmissible case from disqualifying the whole choice).
+    // #4643 landed the record-side sibling field but explicitly declared the
+    // choice site out of scope (tests/parser/equality_skip_clause_test.cpp);
+    // this is the wire-carriage half of closing that gap, following the
+    // `MetaMember::equalitySkip` (fix #3152/0892d092) template: a symbol/AST
+    // field, one record code, hash+operator==+emit+read.
+    //
+    // Emitted under its own record code (REC_CHOICE_EQ_CLAUSE) and only when
+    // TRUE, so a module using no `equality skip` on a choice payload is
+    // byte-identical to a pre-#4652 build. Absent (a pre-#4652 blob) reads as
+    // `false`, i.e. "participates in equality" — the reading every
+    // dependency's own compiler already produced, since no compiler before
+    // this fix read the clause for a choice payload at all (in-module or
+    // across an import).
+    bool equalitySkip = false;
+
     bool operator==(const MetaChoicePayloadField&) const;
 };
 
@@ -1078,6 +1107,31 @@ struct MetaMember {
     bool serializedOptional = false;
     std::string serializedWireName;   // empty => the DECLARED name
 
+    // §9.2 "The `equality skip` clause" (v0.307; additive within v7,
+    // follow-up to fix #4643): this storage member's `equality skip` clause.
+    //
+    // §9.2 states the obligation directly: "the artifact interface ([§2.8.2])
+    // carries the clause exactly as it carries `serialized` clauses", and
+    // "Adding or removing `equality skip` on a public type's member is a
+    // breaking change ([§3.6] rule 3)" — so it is interface content the
+    // semantic hash must track, not a local decoration. #4643 landed the
+    // clause with no wire carriage at all; MEASURED consequence, on a record
+    // exported by one module and used by another: `new Pt(1,10) = new
+    // Pt(1,20)` (where `Cache` is `equality skip`) answered `True` in the
+    // declaring module and `False` at the import, with the same split on
+    // `GetHashCode`, and the body-record shape turned a locally-accepted `=`
+    // into a compile error at the import.
+    //
+    // Emitted under its OWN record code (REC_EQ_CLAUSE) and only when TRUE, so
+    // a module using no `equality skip` is byte-identical to a pre-#4643 build
+    // — the REC_SER_CLAUSE / REC_POSPARAM_DEFAULT discipline, with `hashMember`
+    // guarded by the SAME predicate as the emission (the half c97a49f had to
+    // correct on the F4 slice). Absent (a pre-#4643 blob) reads as `false`,
+    // i.e. "participates in equality": the pre-fix reading, so a stale
+    // dependency degrades to exactly what it did before and no new silent
+    // answer appears in the dependency direction.
+    bool equalitySkip = false;
+
     // NestedType (§11.3, issue #502): when kind == NestedType, this holds
     // the complete MetaTypeDecl for the nested type. Heap-allocated via
     // unique_ptr to break the cyclic MetaMember → MetaTypeDecl → MetaMember
@@ -1156,6 +1210,45 @@ struct MetaTypeDecl {
     // #3144's `choiceCases` (CHOICE_CASE_BLOCK), #3191's `nonTrivialDispose`
     // (REC_DISPOSE_VERDICT), #3179's `serializedShape` (REC_SER_TYPE_SHAPE).
     std::string baseCtorArgsText;
+
+    // §22.16 / §2.8.2 (#4592, additive within v7): this class's OWN
+    // `invariant(E);` members, re-rendered as source text — one
+    // `invariant(<expr source>);` per non-`static` invariant member, in
+    // declaration order, newline-separated. Empty for every class declaring
+    // none and for every non-class kind.
+    //
+    // WHY A SECOND TEXT CHANNEL BESIDE `invariants`. `MetaContractRecord::
+    // canonicalText` (the `invariants` list above) is an IDENTITY artifact,
+    // not an executable one: §2.8.2 defines it as the clause's token sequence
+    // with "each reference to a parameter of the member … replaced by its
+    // zero-based parameter position" and "all other names … recorded as
+    // resolved at the declaration (module-qualified)". MEASURED on an
+    // exported `invariant(v > 0);` over a field `v`, the record's canonical
+    // text is `InvLibA.BaseA.v > 0` — a module-qualified member PATH that
+    // does not re-parse into an expression evaluable against `this` in the
+    // importer. §2.8.2 anticipates exactly this split: "An implementation may
+    // additionally carry each clause's display text (original names) for
+    // diagnostics; display text never participates in identity." This field
+    // is that second channel, put to the use §22.16's runtime instrumentation
+    // needs, and it is deliberately NOT read by any identity/agreement check.
+    //
+    // WHY OWN-ONLY (not the flattened chain `invariants` carries). The
+    // importer re-parses this text in a synthetic re-declaration of THIS
+    // class, whose member stubs are `members` — this class's own fields and
+    // methods. An inherited clause names the BASE's storage, which that
+    // synthetic class does not declare; each class carrying only its own text
+    // lets `Emitter::emitInvariantCheck`'s existing base-first chain walk
+    // compose the conjunction exactly as it does for a local hierarchy.
+    //
+    // Carried as REC_INVARIANT_TEXT under its own record code so a pre-#4592
+    // reader `skipRecord()`s it and the field defaults to empty (the pre-fix
+    // reading — an imported base's invariants silently unchecked). The
+    // exporter emits the record only when non-empty, so a module whose
+    // classes declare no invariant is BYTE-IDENTICAL to a pre-#4592 build,
+    // and `hashTypeDecl`'s fold is conditional on the same predicate. Same
+    // additive-within-v7 precedent as `baseCtorArgsText` (#3916),
+    // `builtinExceptionBase` (#2950) and `serializedShape` (#3179).
+    std::string ownInvariantText;
 
     // §12 / §31.4 / §2.8.2 (#2950, additive within v7): the name of the
     // BUILT-IN exception type this class names directly as its base

@@ -16,5 +16,5 @@
 
 module M; class Held end Held; static class Globals public static owned readonly Cache: Held := new Held(); end Globals;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: static readonly field `Cache` has class type `Held` which is reachable from every domain; confine its use to one domain or ensure its own internal synchronization
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} static readonly field `Cache` has class type `Held` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal synchronization
 // CHECK-SAME: (§22.12 rule 4, #1363)

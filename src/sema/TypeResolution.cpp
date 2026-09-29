@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
@@ -15,6 +16,95 @@ namespace bezel::sema {
 // units (TypeResolution_Names.cpp for type/name resolution,
 // TypeResolution_Checks.cpp for the well-formedness checks). This file holds
 // the public entry function plus the resolver's top-level driver.
+
+// fix #5003 (§2.2 / §2.3, v0.307): is `n` the simple name of an §2.3
+// always-available bare name — a name visible in every source file WITHOUT
+// an explicit `import`? Per spec §2.3 (table), the always-available set is:
+//   - Row 3: `Object`, `Type`
+//   - Row 4: `IDisposable`, `IAsyncDisposable`
+//   - Row 5: `Task`, `OwningTask` (Task family)
+//   - Row 6: `Subscription`, `CancellationToken`, `IEvent`, `IAsyncEvent`,
+//     `EventSource`, `AsyncEventSource`, `ISharedEvent`, `SharedEventSource`
+//   - Row 7: every §31.4 standard exception type
+//   - Row 8: System auto-imports — `Console`, `Math`, `Convert`,
+//     `Environment`, `DateTime`, `TimeSpan`, `Guid`, `Random`,
+//     `IComparable`, `IEquatable`, `ISerializer`, `IDeserializer`,
+//     `ISerializable`, `IDeserializable`, `IntPtr`, `UIntPtr`, `CString`,
+//     `WString`, `RawBytes`, plus stdlib §2's System-resident types
+//     (`Boolean`, `BitConverter`, `Shared`, `Weak`, `Encoding`,
+//     `ReadOnlyStringSpan`, `IFormattable`, `INumber`, `ISteppable`,
+//     `IParsable`, the stdlib §2.19 static abstractions)
+//   - Row 9: System.Text — `StringBuilder`, `Encoding`, `ReadOnlyStringSpan`
+//   - Row 10: System.Collections.Generic — the whole of stdlib §4
+//   - Row 11: System.Collections.Linq — `IGrouping`, `IOrderedEnumerable`
+//
+// `builtinTypeArity`'s table is BROADER than this (it also admits
+// `Mutex`, `Lock`, `Semaphore`, `SemaphoreToken`, `Atomic`,
+// `AtomicInteger`, `TaskCompletionSource`, `OwningTaskCompletionSource`,
+// `TaskScope`, `CancellationTokenSource`, `Channel`, `ChannelSender`,
+// `Domain`, `File`, `Directory`, `Path`, `FileStream`, `Stopwatch`,
+// `Debug`, `BinarySerializer`, `BinaryDeserializer`, `JsonSerializer`,
+// `JsonDeserializer`, `JsonOptions`, `Linq` — every name in stdlib §6
+// through §9 that requires `import System.Threading` / `System.IO` /
+// `System.Diagnostics` / `System.Serialization` per spec §2.3 L160). Use
+// the explicit `kAlwaysAvailableNames` table below to enforce the right
+// boundary; consult it BEFORE `builtinTypeArity`'s broader union.
+//
+// The spec §2.3 wording "every file sees these names" is what makes them
+// "imported" for the purpose of §2.2's "unambiguously imported public
+// bare name" rule — §2.7 rule 1 resolves imported bare names before
+// aliases with no backtracking, so a same-named alias is unreachable in
+// every chain-head position.
+//
+// Note: the §2.3 keyword-aliased primitives (`bool`, `int`, `string`, …)
+// are NOT included here — they are unshadowable per §3.4, but the lexer
+// rejects any `import Foo as bool;` at parse time (an alias would be a
+// parse error long before reaching this check), so they need not be
+// enumerated.
+constexpr bool isAlwaysAvailableBareName(std::string_view n) {
+    return
+        // Row 3 / 4 / 5 (core types, disposal interfaces, Task family).
+        n == "Object" || n == "Type" ||
+        n == "IDisposable" || n == "IAsyncDisposable" ||
+        n == "Task" || n == "OwningTask" ||
+        // Row 6 (events / subscription / cancellation).
+        n == "Subscription" || n == "CancellationToken" ||
+        n == "IEvent" || n == "IAsyncEvent" ||
+        n == "EventSource" || n == "AsyncEventSource" ||
+        n == "ISharedEvent" || n == "SharedEventSource" ||
+        // Row 7 (§31.4 standard exceptions — also in builtinTypeArity).
+        n == "Exception" || n == "ArgumentException" ||
+        n == "ArgumentNullException" || n == "ArgumentOutOfRangeException" ||
+        n == "ArithmeticException" || n == "OverflowException" ||
+        n == "DivideByZeroException" || n == "InvalidOperationException" ||
+        n == "DisposedAccessException" || n == "NotImplementedException" ||
+        n == "NullReferenceException" || n == "IndexOutOfRangeException" ||
+        n == "KeyNotFoundException" || n == "MatchFailureException" ||
+        n == "OperationCanceledException" || n == "TypeInitializationException" ||
+        n == "FormatException" || n == "StackOverflowException" ||
+        n == "SerializationException" || n == "ContractViolationException" ||
+        n == "ExceptionInfo" ||
+        // Row 8 (System auto-imports).
+        n == "Console" || n == "Math" || n == "Convert" || n == "Environment" ||
+        n == "DateTime" || n == "TimeSpan" || n == "DateOnly" || n == "TimeOnly" ||
+        n == "Guid" || n == "Random" ||
+        n == "IComparable" || n == "IEquatable" ||
+        n == "ISerializer" || n == "IDeserializer" ||
+        n == "ISerializable" || n == "IDeserializable" ||
+        n == "IFormattable" ||
+        n == "IntPtr" || n == "UIntPtr" ||
+        n == "CString" || n == "WString" || n == "RawBytes" ||
+        n == "Boolean" || n == "BitConverter" ||
+        n == "Shared" || n == "Weak" ||
+        // Row 9 (System.Text).
+        n == "StringBuilder" || n == "Encoding" || n == "ReadOnlyStringSpan" ||
+        // Row 10 (System.Collections.Generic — the whole of stdlib §4).
+        // Derived from kAlwaysAvailableBareNameCollections (BuiltinRegistry.cpp,
+        // fix #5044) — the single authority for §2.3 Row 10 names.
+        common::isAlwaysAvailableBareNameCollection(n) ||
+        // Row 11 (System.Collections.Linq).
+        n == "IGrouping" || n == "IOrderedEnumerable";
+}
 
 PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "bool")    return PrimitiveType::Bool;
@@ -163,9 +253,30 @@ void Resolver::run(const ast::SourceFile& src) {
     // compile error. Track each name's origin module; on collision, remove it
     // from scope and record it in ambiguousImportNames_ so resolveNamed can
     // diagnose a clear "ambiguous" error rather than "unresolved identifier".
-    // Only engaged when imports were actually loaded — the no-import path is
-    // byte-for-byte unchanged.
-    if (ctx_.hasImports()) {
+    // Only engaged when the file has at least one `import` declaration — the
+    // no-import path is byte-for-byte unchanged.
+    //
+    // fix #4690 (§2.2, v0.307): this used to read `ctx_.hasImports()`
+    // (`!importedByModule_.empty()`), which is true only once some import
+    // resolved to a LOADED dependency ARTIFACT (ModuleLoader's
+    // registerImportedType). A file whose only imports are stdlib pseudo-
+    // modules (`System.Threading`, `System.IO`, ...) never registers one —
+    // those names resolve through the separate builtin-name tables in
+    // TypeResolution_Names.cpp / ExprTypecheck_Calls.cpp, not through a
+    // loaded artifact — so `hasImports()` was FALSE for such a file and this
+    // entire block, including the alias/alias and alias/local-declaration
+    // collision checks below (which need only `src.imports` and the local
+    // scope, not a loaded artifact), silently never ran. Measured:
+    // `import System.Threading as Th; public class Th ...` compiled clean
+    // despite §2.2's "[an alias] may not collide with ... a type declared in
+    // the file's module" (s2_2_0006 in the rule corpus). The
+    // `importedNameOrigin` loop just below already no-ops per-import when
+    // `ctx_.importedTypesOf(dotted)` is null (line ~196's `if (!exported)
+    // continue;`), so widening the gate to "the file wrote an import" rather
+    // than "an import loaded an artifact" changes behavior ONLY for the
+    // alias-collision checks — which is exactly the gap to close — and stays
+    // byte-for-byte unchanged for a file with no `import` at all.
+    if (ctx_.hasImports() || !src.imports.empty()) {
         // Snapshot local module declarations already in scope: these shadow
         // imports and are never marked ambiguous (§2.2: local wins silently).
         std::unordered_set<std::string_view> localNames;
@@ -261,20 +372,63 @@ void Resolver::run(const ast::SourceFile& src) {
                 continue;
             }
             auto originIt = importedNameOrigin.find(imp->alias);
-            if (originIt == importedNameOrigin.end()) continue;
-            if (ambiguousImportNames_.count(imp->alias)) continue;
-            ctx_.diagnostics().report(
-                Severity::Error, imp->span.begin,
-                std::string("import alias `") + imp->alias +
-                "` collides with the unambiguously imported public bare name `" +
-                imp->alias + "` (from module `" + originIt->second +
-                "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
-                "aliases with no backtracking, so the alias would be "
-                "unreachable — choose a different alias (\xC2\xA7""2.2)");
+            if (originIt != importedNameOrigin.end() &&
+                !ambiguousImportNames_.count(imp->alias)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the unambiguously imported public bare name `" +
+                    imp->alias + "` (from module `" + originIt->second +
+                    "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                    "aliases with no backtracking, so the alias would be "
+                    "unreachable — choose a different alias (\xC2\xA7""2.2)");
+                continue;
+            }
+            // fix #5003 (§2.2 / §2.3, v0.307): always-available bare name
+            if (isAlwaysAvailableBareName(imp->alias)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the always-available bare name `" +
+                    imp->alias +
+                    "` (spec \xC2\xA7""2.3); \xC2\xA7""2.7 rule 1 resolves "
+                    "imported bare names before aliases with no backtracking, "
+                    "so the alias would be unreachable — choose a different "
+                    "alias (\xC2\xA7""2.2)");
+                continue;
+            }
+            // fix #5003 (§2.2 / §2.3, v0.307): public of imported stdlib pseudo-module
+            if (common::builtinClassModulePathOf(imp->alias) == dotted) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` collides with the public `" + imp->alias +
+                    "` of the imported stdlib module `" + dotted +
+                    "`; \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                    "aliases with no backtracking, so the alias would be "
+                    "unreachable — choose a different alias (\xC2\xA7""2.2)");
+            }
         }
+    }
+    // per §32.13 clause 1 / §32.5 (v0.306): an `extern` signature's
+    // admissibility depends on DERIVED properties of the types it names — is
+    // this record C-compatible? is this `Ptr<T>`'s pointee in the FFI-pointee
+    // set? — and those are computed from the record's own resolved field
+    // types. This loop walks `topDecls` in DECLARATION ORDER, so an extern
+    // block written above the record it names would see unresolved fields and
+    // reject a declaration the spec admits. §32.1 puts extern declarations at
+    // module level with no ordering rule, so resolve every other top-level
+    // declaration first and the extern blocks afterwards. (Only signatures are
+    // involved — no body is resolved here — so nothing else observes the
+    // deferral.)
+    for (const auto& decl : src.topDecls) {
+        if (!decl) continue;
+        if (dynamic_cast<const ast::ExternBlock*>(decl.get())) continue;
+        resolveTopDecl(*decl, &moduleScope);
     }
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
+        if (!dynamic_cast<const ast::ExternBlock*>(decl.get())) continue;
         resolveTopDecl(*decl, &moduleScope);
     }
     // fix #4047 (§27.8, v0.294): the forward pass above walks
@@ -325,6 +479,9 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticIndexers();
     // §23.5 (v0.241, #2758): indexer parameters may not declare defaults.
     checkIndexerParamDefaults();
+    // §22.5 (v0.306, #4494): every parameter after the first defaulted
+    // parameter must itself have a default.
+    checkParamDefaultOrdering();
     // §25.2 (#746): comparison/equality operators must form a complete group.
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
@@ -340,6 +497,13 @@ void Resolver::run(const ast::SourceFile& src) {
     // each instantiation of the enclosing generic binds (runs after all member
     // types are resolved, so every instantiation has been recorded).
     checkOwningElementInstantiations();
+    // §15.1.1 / §3.6 rule 2 (#4678): the `[N owned]T` inline-array sibling of
+    // checkOwningElementInstantiations above — an owning inline array whose
+    // element slot is a bare generic parameter is re-checked against the
+    // type each instantiation of the enclosing generic binds (e.g.
+    // `Pool<string>` at a field-type mention, per #4367's ruling that a
+    // field-type mention is itself an instantiation site).
+    checkOwningInlineArrayElementInstantiations();
     // §28.11 / §15.3 (#3775): every recorded element-category slot must not
     // be a move-only value type (an owning inline array or an owning-
     // classified choice) — runs after checkOwningElementInstantiations for
@@ -362,6 +526,11 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAsTargetInstantiations();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
+    // §11.7 (static class inheritance and interface implementation).
+    // Walks the resolved base type list (`t->baseTypes`), so it must run
+    // after type resolution populates it (it does — every preceding
+    // type-resolution pass has finished by here).
+    checkStaticClassInheritance();
     // fix #3100 (§19.6 / §11.7, v0.254): a `closed` class whose hierarchy
     // has a non-public concrete subclass makes the cross-module
     // exhaustiveness guarantee unsound (the leaf is invisible to importers
@@ -376,6 +545,10 @@ void Resolver::run(const ast::SourceFile& src) {
     checkTopLevelVisibility();
     // Slice S23: record restrictions (§9.7).
     checkRecordRestrictions();
+    // fix #4702 (§9.3/§9.9, v0.307): a combined-form body constructor
+    // carrying a contract clause (see the declaration's comment for the
+    // rule this does NOT yet implement, and why).
+    checkRecordCombinedFormContractClauseConstructors();
     // #2208 (§35.1, v0.226): choice self-containment through value-typed
     // payload components (record↔choice by-value cycles, mutable mutual pairs
     // of choices, etc.). Walks the same value-containment graph as the
@@ -433,6 +606,25 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAbstractPropertyBodies();
     // Slice S34: static members may not be virtual (§12.1).
     checkStaticNotVirtual();
+    // §11.5 (v0.307, #4719): out-of-order modifiers are rejected. Runs
+    // after the dispatch-modifier checks so an out-of-order modifier
+    // surfaces a single diagnostic rather than cascading false positives.
+    checkMemberModifierOrder();
+    // §9.2 (v0.297): a record member may not declare `virtual`, `abstract`,
+    // or `sealed override`; `override` is rejected on any record member other
+    // than `Equals` / `GetHashCode` / `ToString`. Records are implicitly
+    // sealed and have no virtual-dispatch surface (§9.6), so the modifiers
+    // would be inert; admitting them would mislead every reader of the
+    // declaration. The three-name admission is the Object-slot fill §10.5
+    // grants enums and §35.2 grants choices.
+    checkRecordMemberModifiers();
+    // §9.2 / fix #4643 (v0.298): `equality skip` on a static member is
+    // an inert annotation (§9.2 line 1419, mirroring §9.8). The
+    // grammar admits the clause on FieldDecl/PropertyDecl; sema rejects
+    // it on the `static` modifier of either. Other reject positions
+    // (computed property, method, enum constant, choice case) are caught
+    // at parse time.
+    checkEqualitySkipInert();
     // Slice S35: `async abstract` is a compile error (§12.6).
     checkAsyncModifiers();
     // §22.15 (v0.202, #2052): `pure` placement + signature restrictions.
@@ -498,6 +690,140 @@ void Resolver::run(const ast::SourceFile& src) {
     checkExpandingGenericMemberEdges();
 }
 
+// fix #4702 (§9.3 "Combined form" / §9.9 "Constructor-only records",
+// v0.307): see the declaration comment (TypeResolution_impl.hpp).
+//
+// §9.3 states TWO body-constructor disqualifiers for a positional-or-
+// combined-form record. Only the SECOND is implemented here:
+//
+//   (a) "The body may not declare a constructor with the same parameter
+//       list as the auto-generated primary constructor." NOT IMPLEMENTED —
+//       see issue #4702 for why: the rule-corpus's own hand-authored case
+//       (s9_3_0002) and a pre-existing, apparently deliberate lit test
+//       (sema/sema_serialization_550__record_combined_form_explicit_ctor_
+//       match_accepted_spec_9_8_v0182.bzl, exercising §9.8's "Constructor
+//       selection ... matched by name ... compared case-insensitively")
+//       disagree on the SAME shape — a body constructor whose parameter
+//       TYPES match the primary's but whose NAMES differ only in case
+//       (`constructor(x: int, y: int)` against positional fields `X, Y`).
+//       Reading "parameter list" as types-only (matching every other
+//       signature-shape rule in this codebase — overload conflicts,
+//       override matching) rejects the §9.8 test's Vec2, which the lit
+//       suite has accepted since before this fix. Reading it as an exact
+//       name match makes the rule nearly vacuous (records name positional
+//       fields PascalCase by convention; body constructor parameters
+//       essentially never collide case-for-case) and does not match the
+//       corpus case's OWN lowercase-name repro. Both readings have real
+//       evidence behind them; this is a genuine spec-vs-existing-test
+//       conflict, not a case to silently edit either side of (CLAUDE.md
+//       rule 1) — filed as #4702 rather than guessed at.
+//   (b) "The body may not declare a constructor carrying a contract
+//       clause" (§9.9's constructor-only trigger: "A record declaring
+//       positional fields may not declare such a constructor: a compile
+//       error at the record declaration"). IMPLEMENTED below — independent
+//       of (a)'s shape question, and no existing test (corpus or lit)
+//       conflicts with it (confirmed: no accepted test anywhere in the
+//       tree pairs a positional-or-combined-form record with a body
+//       constructor carrying `requires`/`ensures`).
+//
+// Reads the constructor's own `ast::ConstructorDecl` (via
+// `ConstructorSymbol::decl`), which is null only for an IMPORTED symbol —
+// an imported record's body constructors were already checked in the
+// declaring module, so skipping them here is not a gap, it is the same
+// once-per-declaration posture every other TypeResolution_Checks.cpp
+// per-member walk in this file takes.
+void Resolver::checkRecordCombinedFormContractClauseConstructors() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+        if (!recordIsPositional(t)) continue;
+
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs) continue;
+            // SEAM-DEBT: #4714 the caller walks `ctx_.module()->children`, so
+            // no imported TypeSymbol reaches this loop; and this is a
+            // DECLARATION-site rule, so the null branch is the right answer
+            // even if one did (an imported record's ctors were checked in its
+            // own module). Re-derive from the sema::Symbol
+            // (imported-symbol-audit-2026-08-13.md §4) if either premise moves.
+            const auto* rawCtorDecl = cs->decl;
+            const auto* cd =
+                dynamic_cast<const ast::ConstructorDecl*>(rawCtorDecl);
+            if (!cd) continue;  // imported — nothing local to check
+
+            // §9.9 "on any constructor of the record, of any visibility, in
+            // any recorded tier".
+            if (!cd->contractClauses.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "`'s body may not declare a constructor carrying a "
+                    "contract clause (\xC2\xA7""22.16) — the auto-generated "
+                    "primary constructor can carry none, so no record "
+                    "declaring positional fields is constructor-only "
+                    "(\xC2\xA7""9.9, \xC2\xA7""9.3)");
+            }
+            // fix #5100 (§9.3, v0.307): "The body may not declare a
+            // constructor with the same parameter list as the auto-generated
+            // primary constructor." Every candidate reading of #4775 Q1 rejects
+            // the exact-duplicate shape — same arity, and at each position
+            // the same case-sensitive name, resolved type, §22.6 overload
+            // modifier and default presence. Apply bb2040db's narrow predicate
+            // (which already does this for classes) to records as well.
+            // The primary's parameters are the record's positional fields.
+            // imported-symbol seam (#3152, audit §4): the primary's
+            // parameters come off the positional FieldSymbols (`posParam`),
+            // not a TypeDecl downcast.
+            const std::vector<const Symbol*> primary =
+                recordPositionalFieldSymbols(t);
+            if (primary.empty()) continue;
+            if (cs->params.size() != primary.size() ||
+                cd->params.size() != primary.size())
+                continue;
+            bool listsMatch = true;
+            for (std::size_t i = 0; i < cs->params.size(); ++i) {
+                auto* ps = dynamic_cast<ParameterSymbol*>(cs->params[i]);
+                auto* pfs = dynamic_cast<const FieldSymbol*>(primary[i]);
+                if (!ps || !pfs || !pfs->posParam) {
+                    listsMatch = false;
+                    break;
+                }
+                const ast::Param& pf = *pfs->posParam;
+                const ast::Param& bp = cd->params[i];
+                if (bp.name != pf.name ||
+                    (bp.defaultValue != nullptr) !=
+                        (pf.defaultValue != nullptr)) {
+                    listsMatch = false;
+                    break;
+                }
+                TypeRef* paramType =
+                    ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
+                TypeRef* primaryType =
+                    pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+                if (!typeRefEqual(paramType, primaryType)) {
+                    listsMatch = false;
+                    break;
+                }
+                if (overloadModifier(ps->modifier) !=
+                    overloadModifier(pf.modifier)) {
+                    listsMatch = false;
+                    break;
+                }
+            }
+            if (listsMatch) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cd->span.begin,
+                    std::string("body constructor redeclares the primary ")
+                        .append("constructor: it has the same parameter list ")
+                        .append("as the auto-generated primary constructor ")
+                        .append("(\xC2\xA7""9.3, v0.307)"));
+            }
+        }
+    }
+}
+
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {
     Resolver r(ctx);
     r.run(src);
@@ -539,6 +865,12 @@ bool checkSendableConstraintsLate(const ast::SourceFile& src,
 // common-shape case (concrete typeArgs) is handled. See the comment on
 // `Resolver::checkGenericConstraintsAtUseSite` for the full rationale
 // and the deferred-nested edge case.
+//
+// fix #4465: the deferred type-bound failures pushed by
+// checkGenericConstraintsAtUseSite were NEVER reported — the temporary
+// Resolver `r` is discarded without flushing. At ExprTC time all types
+// are fully resolved, so flushing now correctly reports the constraint
+// violation at the static-call site.
 bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    SourceLocation useSite,
                                    const std::vector<const ast::Type*>& argAsts,
@@ -546,6 +878,7 @@ bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    TypeSymbol* tsym) {
     Resolver r(ctx);
     r.checkGenericConstraintsAtUseSite(useSite, argAsts, argRefs, tsym);
+    r.flushDeferredTypeBoundFailures();
     return !ctx.diagnostics().hasErrors();
 }
 

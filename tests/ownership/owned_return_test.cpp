@@ -46,11 +46,22 @@ BEZEL_TEST(own_return, owned_return_into_using_var_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// §28.3 announcement table row 4 (v0.307): `Get()`'s own declaration must
+// itself be legal — a plain (non-`owned`) instance return admits ONLY a
+// receiver-sourced borrow, so `Get(): T => new T();` (a fresh production) is
+// rejected at its OWN site since that rule was added. This test's subject is
+// the CALLER-side classification (a call through a plain instance return is
+// a borrow, no discharge obligation) — give `Get()` a genuine receiver-
+// sourced borrow (a bare owned-field read) so it stays legally
+// Borrowed-classified at the call site without tripping the declaration-site
+// rule. // per §28.3, v0.307
 BEZEL_TEST(own_return, borrowed_return_into_plain_var_clean) {
     auto r = parseAndCheckOwnership(mod(
         "class T end T; "
         "class C "
-        "  public method Get(): T => new T(); "
+        "  public owned _t: T; "
+        "  public constructor() _t := new T(); end constructor; "
+        "  public method Get(): T => _t; "
         "  public method M() "
         "    var x := this.Get(); "
         "  end M; "

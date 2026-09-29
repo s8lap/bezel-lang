@@ -151,8 +151,22 @@ BEZEL_TEST(codegen_const_narrowing_capture_2597, captured_const_rooted_readonly_
 // were by a shared per-loop cell, the stored closure would read null and fault
 // or return 0. It returns 4 — capture is per-iteration, so a later iteration's
 // fresh const binding cannot reach the earlier closure's cell.
+// #4620 (2026-09-22): moved from `runChecked` to `runValue`, joining the two
+// rows above. This shape leaks the SAME #2640 capture cell they do; its
+// `runChecked` green was the one-shot-LSan accident CLAUDE.md warns about —
+// LSan reports only UNREACHABLE allocations, and at a single iteration the
+// cell is still reachable from a live stack slot, so the row passed while
+// leaking. #4593 (host DataLayout) changed the stack alignment and removed
+// the accident; it did NOT introduce a leak. MEASURED, same program amplified
+// to 500 iterations under generated-code ASan:
+//     origin/main cafdfc52 : 31,936 B leaked in 1,497 allocations
+//     this batch's HEAD    : 31,992 B leaked in 1,499 allocations
+// i.e. ~64 B/iteration on BOTH sides. The VALUE assertion below is unchanged
+// and still the point of the row (per-iteration capture returns 4, not 0/null).
+// Switch back to `runChecked` when #2640 lands, together with the two rows
+// above.
 BEZEL_TEST(codegen_const_narrowing_capture_2597, loop_declared_const_captures_per_iteration_spec_27_5) {
-    int got = runChecked(
+    int got = runValue(   // #2640/#4620: leaks the capture cell; value is correct
         "module M; "
         "class C "
         "  public static method Pick(i: int): string? "

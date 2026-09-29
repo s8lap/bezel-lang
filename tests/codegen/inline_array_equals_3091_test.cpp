@@ -116,21 +116,27 @@ BEZEL_TEST(codegen_inline_array_eq, equals_false_record_elements_spec_15_1_2) {
 // §15.1.2 + §4.6: string elements compare by CONTENT, not pointer identity.
 // The strings are built at runtime (concatenation) so the pointers differ,
 // ensuring the comparison is by content.
+// `[2]string` carries an explicit initializer: `string` is not defaultable
+// (§17.11, v0.307), so the uninitialised form is rejected (§15.1 / §7.9,
+// v0.307; #4419 — pinned in definite_assignment_default_init_4419_test.cpp).
 BEZEL_TEST(codegen_inline_array_eq, equals_true_string_content_spec_15_1_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: [2]string; a[0] := \"foo\"; a[1] := \"ba\" + \"r\"; "
-        "  var b: [2]string; b[0] := \"f\" + \"oo\"; b[1] := \"bar\"; "
+        "  var a: [2]string := [\"\", \"\"]; a[0] := \"foo\"; a[1] := \"ba\" + \"r\"; "
+        "  var b: [2]string := [\"\", \"\"]; b[0] := \"f\" + \"oo\"; b[1] := \"bar\"; "
         "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 // §15.1.2 + §4.6: string elements differing in content → not equal.
+// `[2]string` carries an explicit initializer: `string` is not defaultable
+// (§17.11, v0.307), so the uninitialised form is rejected (§15.1 / §7.9,
+// v0.307; #4419 — pinned in definite_assignment_default_init_4419_test.cpp).
 BEZEL_TEST(codegen_inline_array_eq, equals_false_string_content_spec_15_1_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: [2]string; a[0] := \"foo\"; a[1] := \"bar\"; "
-        "  var b: [2]string; b[0] := \"foo\"; b[1] := \"baz\"; "
+        "  var a: [2]string := [\"\", \"\"]; a[0] := \"foo\"; a[1] := \"bar\"; "
+        "  var b: [2]string := [\"\", \"\"]; b[0] := \"foo\"; b[1] := \"baz\"; "
         "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 0);
 }

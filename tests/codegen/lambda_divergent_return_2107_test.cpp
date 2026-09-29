@@ -90,10 +90,25 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_ascription) {
 // prior #2107 fix, which threaded the target only from a typed-local
 // initializer and a call argument and so wrongly rejected this shape. The body
 // returns Dog and Cat (sibling types — divergent without a target, §5.1-
-// compatible with the Animal target); the resulting `() -> Dog` converts to
-// `() -> Animal` under §27.1.1 (reference covariance), and g() dispatches to
-// Dog.Kind (= 1). Fails without the ReturnStmt target-threading (divergent
-// error); passes with it.
+// compatible with the Animal target), and g(…) dispatches to Dog.Kind (= 1).
+// Fails without the ReturnStmt target-threading (divergent error); passes with
+// it.
+//
+// ⚠ The Dog/Cat/bool bindings are the LAMBDA's OWN parameters, not the
+// enclosing method's. They used to be `Make(d: Dog, c: Cat, b: bool)` with the
+// lambda capturing all three; §28.3's closure bullet (v0.298, restated v0.307,
+// implemented by `ac2c7c6e` / fix #4709) rejects a returned closure whose
+// source set is non-empty, and a captured plain borrow parameter makes it
+// non-empty — so that spelling is now a REJECT on a rule this file does not
+// test. Moving the bindings INTO the lambda keeps this row's axis exactly (the
+// method's `(…) -> Animal` return type is still the block-bodied lambda's
+// target, and its two `return`s are still the divergent Dog/Cat pair) while
+// the closure captures nothing. Measured: with the bindings inside, the
+// identical body with NO target still reports "a block-bodied lambda with no
+// target type has divergent `return` types … (§27.3)", so the suppression this
+// row pins is still the thing under test. The capture rule itself is pinned in
+// tests/ownership/plain_borrow_param_closure_escape_4709_test.cpp.
+// // per §27.3 v0.226, §28.3 v0.307
 BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_method_return_target) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -101,8 +116,8 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_method_return_target
         "class Dog : Animal public override method Kind(): int return 1; end Kind; end Dog; "
         "class Cat : Animal public override method Kind(): int return 2; end Kind; end Cat; "
         "class C "
-        "  public static method Make(d: Dog, c: Cat, b: bool): () -> Animal "
-        "    return lambda() => do "
+        "  public static method Make(): (Dog, Cat, bool) -> Animal "
+        "    return lambda(d, c, b) => do "
         "      if b then return d; end; "
         "      return c; "
         "    end; "
@@ -110,8 +125,8 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_method_return_target
         "  public static method Main(): int "
         "    using var d := new Dog(); "
         "    using var c := new Cat(); "
-        "    var g := Make(d, c, true); "
-        "    return g().Kind(); "
+        "    var g := Make(); "
+        "    return g(d, c, true).Kind(); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -154,7 +169,18 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_reassign_target) {
 // it for the lambda body (a lambda's `return` is an internal transfer to the
 // trampoline, not a method-contract return that mints +1 against a declared
 // return-type node).  Fails (sanitizer double-free → r.ran == false) without
-// the fix; passes (ASan/LSan-clean AND g().Kind() == 1) with it.
+// the fix; passes (ASan/LSan-clean AND the invocation's Kind() == 1) with it.
+//
+// ⚠ Same re-spelling as the cell above (#4709/#4757, §28.3 v0.307): the
+// Dog/Cat/bool bindings moved from the enclosing method's parameter list into
+// the LAMBDA's, so the returned closure captures nothing. The #2515 mechanism
+// is untouched by that move — it is `currentReturnTypeNode_` (the enclosing
+// method's `(…) -> Animal` Function-kind node) leaking into the block-bodied
+// lambda's ReturnStmt lowering, so emitReturn's closure-return-retain branch
+// fires emitClosureRetain on the returned CLASS instance. The body still
+// returns a class instance (Dog / Cat) from a block-bodied lambda that is
+// itself returned through a Function-kind declared return type, which is
+// exactly the input that branch mis-classifies.
 BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_owned_capture_asan_2515) {
     auto r = runAotChecked(
         "module M; "
@@ -162,8 +188,8 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_owned_capture_asan_2515) {
         "class Dog : Animal public override method Kind(): int return 1; end Kind; end Dog; "
         "class Cat : Animal public override method Kind(): int return 2; end Kind; end Cat; "
         "class C "
-        "  public static method Make(d: Dog, c: Cat, b: bool): () -> Animal "
-        "    return lambda() => do "
+        "  public static method Make(): (Dog, Cat, bool) -> Animal "
+        "    return lambda(d, c, b) => do "
         "      if b then return d; end; "
         "      return c; "
         "    end; "
@@ -171,11 +197,11 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_owned_capture_asan_2515) {
         "  public static method Main(): int "
         "    using var d := new Dog(); "
         "    using var c := new Cat(); "
-        "    var g := Make(d, c, true); "
-        "    return g().Kind(); "
+        "    var g := Make(); "
+        "    return g(d, c, true).Kind(); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);        // ASan/LSan-clean (no double-free, no leak)
-    BEZEL_EXPECT_EQ(r.exitCode, 1);  // g().Kind() == Dog.Kind == 1
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // g(d, c, true).Kind() == Dog.Kind == 1
 }
 

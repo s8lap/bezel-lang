@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 namespace bezel::codegen {
@@ -265,9 +266,126 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // builtinClassSym-declaration form). Passing resTy (FrozenArray<T>) yields
     // the same bz_array_t* shape an Array<T> target would — and bz_array_copy
     // doesn't care about the source TypeRef's nominal identity.
+    //
+    // Ownership tracking: per §4.19, `From(items: Array<T>)` COPIES — the
+    // caller still owns `items`. The pre-#4850 path unconditionally freed
+    // `src` at the end, which double-freed a borrowed-lvalue source at
+    // scope exit (the calling `using var xs: Array<string>` still owns its
+    // buffer; the SEGV at `bz_array_free:294` is `xs`'s scope-end dispose
+    // dereferencing already-freed storage).
+    //
+    // The v1 fix (#4850 6dcfb9d7) gated on `literal || owned || move` and
+    // mis-classified every other fresh rvalue (call results, instance-method
+    // results like `xs.ToArray()`, conditional/match yielding a fresh array)
+    // as a borrowed lvalue — leaking the source across 200 iterations of
+    // `FrozenArray<int>.From(Make(i))` per #4850 v2 (cycle-25 main measured
+    // 24120 bytes / 402 allocations). The rework inverts the predicate: a
+    // source is BORROWED only when it is a place expression (IdentifierExpr,
+    // MemberAccessExpr, IndexExpr — `this.field` is a MemberAccessExpr);
+    // anything else is an rvalue and the call owns the storage. The `owned`
+    // modifier and the `move` UnaryExpr (§28.3 move form) still override —
+    // caller-stated transfer, independently of the place/rvalue distinction.
+    const ast::Expr* argValue = call.args[0].value.get();
+    bool sourceIsMoved = (call.args[0].modifier == "owned");
+    if (!sourceIsMoved) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(argValue)) {
+            if (un->op == "move") sourceIsMoved = true;
+        }
+    }
+    // sourceHasFreshStorage — recursive helper that returns true iff the
+    // expression's storage is freshly allocated here (i.e. the call, not
+    // some outer local, owns it). The rework's predicate is the inverse:
+    //   sourceOwnedHere = sourceHasFreshStorage(argValue)
+    //                       OR explicit `owned` / `move` mark.
+    // Built locally (not lifted to the header) because #4850 v2 is the only
+    // call site that needs the recursive conditional/match walk; pulling it
+    // up would have wider review surface for no current benefit.
+    //
+    // The walk:
+    //   * `move e` — the §28.3 transfer mark. The modifier says the caller
+    //     has yielded storage; the call owns the source. Return TRUE
+    //     regardless of what `e` is (an IdentifierExpr operand is the common
+    //     case, and the move already null'd the local at parse time).
+    //   * literal / NewExpr of a class / interface / builtin collection,
+    //     CallExpr (treated as a fresh rvalue — the called method either
+    //     returns `owned T` or returns a fresh local whose +1 transfers):
+    //     owned here.
+    //   * ConditionalExpr / MatchExpr: owned iff every branch arm is owned.
+    //   * IdentifierExpr / MemberAccessExpr / IndexExpr / anything else:
+    //     BORROWED. The local-or-field's scope-end dispose is the source's
+    //     owner — unconditionally freeing here would double-free that
+    //     storage at scope end, the very defect #4850 fixed.
+    //
+    // ⚠ #4850 v3 (cycle-25 main 2026-09-25): an earlier draft walked
+    // IdentifierExpr → LocalDecl → initializer, recursing into a fresh
+    // ConditionalExpr through the local binding. That mis-classified
+    // `var src := if c then Make(i) else [i+1000]; FrozenArray.From(src)`
+    // as OWNED — the call freed the ConditionalExpr's storage AND the
+    // local's scope-end dispose freed it again (double-free). Fix: an
+    // IdentifierExpr (or any other place expression) is ALWAYS borrowed;
+    // the caller's local owns the storage. The conditional/match fresh
+    // shape is reached only when the conditional/match IS the direct
+    // argument (no binding local).
+    std::function<bool(const ast::Expr*)> hasFreshStorage =
+        [&](const ast::Expr* e) -> bool {
+        if (!e) return false;
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            // `move e` — the §28.3 transfer mark; always owns.
+            if (un->op == "move") return true;
+            return false;
+        }
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(e)) return true;
+        if (dynamic_cast<const ast::NewExpr*>(e)) {
+            const sema::TypeRef* rt = ctx_.exprType(*e);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+                if (rt->declaration) {
+                    if (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                        rt->declaration->kind == ast::TypeDeclKind::Interface)
+                        return true;
+                } else if (rt->astNode && rt->astNode->name &&
+                           !rt->astNode->name->parts.empty()) {
+                    std::string_view n = rt->headName();
+                    // GRID-DEBT: #4912 fresh-storage head list, not a wrap claim; should read a BuiltinRegistry classifier
+                    if (n == "Array" || n == "OwningArray" ||
+                        n == "OwningBuffer" || n == "Stack" || n == "OwningStack" ||
+                        n == "Queue" || n == "OwningQueue" ||
+                        n == "LinkedList" || n == "OwningLinkedList" ||
+                        n == "Set" || n == "OwningSet" || n == "SortedSet" ||
+                        n == "Dictionary" || n == "OwningDictionary" ||
+                        n == "SortedDictionary")
+                        return true;
+                }
+            }
+            return false;
+        }
+        if (dynamic_cast<const ast::CallExpr*>(e)) return true;
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            return hasFreshStorage(c->thenValue.get()) &&
+                   hasFreshStorage(c->elseValue.get());
+        }
+        if (auto* m = dynamic_cast<const ast::CaseExpr*>(e)) {
+            if (m->arms.empty()) return false;
+            for (const auto& arm : m->arms) {
+                // Expression-body arms expose their value via exprBody;
+                // block-body arms are unsupported by this walk (the
+                // borrow-pin extends across the whole block, so a free here
+                // would double-free the local at scope end) — be
+                // conservative and reject.
+                if (arm.bodyKind != ast::CaseArmBodyKind::Expression) return false;
+                if (!hasFreshStorage(arm.exprBody.get())) return false;
+            }
+            return true;
+        }
+        // Place expressions (IdentifierExpr, MemberAccessExpr, IndexExpr) and
+        // anything else: BORROWED. The unconditional free here would double-
+        // free an outer owner's storage at scope end — the very defect #4850
+        // fixed.
+        return false;
+    };
+    const bool sourceOwnedHere = sourceIsMoved || hasFreshStorage(argValue);
+
     llvm::Value* src = nullptr;
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
-            call.args[0].value.get())) {
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(argValue)) {
         if (!cl->isDict) {
             src = materializeHeapCollectionLiteral(cl, resTy);
         } else {
@@ -275,8 +393,12 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
         }
     }
     if (!src) {
-        // Not a collection literal (e.g. a named Array<T> variable) — fall
-        // through to lowerExpr for the ordinary expression path.
+        // Not a collection literal (e.g. a named Array<T> variable, a call
+        // result, an instance-method result, a conditional) — fall through
+        // to lowerExpr for the ordinary expression path. Per the rework
+        // predicate above, all non-place expressions are owned here, so the
+        // source-disposal below frees a fresh storage whose owner is the
+        // call, not a borrowed lvalue whose owner is the caller.
         src = lowerExpr(*call.args[0].value);
     }
     if (!src) return nullptr;
@@ -295,12 +417,17 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // type is a no-op.
     emitArrayRetainStringsIfStringArray(resTy, copy);
 
-    // §28.3: free the source Array<T> temporary now that the FrozenArray owns
-    // its own copy. The source's element policy is the borrowing form (no
-    // disposer), matching the bz_array_free call's null 2nd arg.
-    auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy()});
-    builder_.CreateCall(freeFn, {src, llvm::ConstantPointerNull::get(ptrTy())});
+    // §28.3: free the source storage ONLY when ownership transferred into the
+    // call (literal / `move` / explicit `owned` modifier). The source's
+    // element policy is the borrowing form (no disposer), matching the
+    // bz_array_free call's null 2nd arg. For a borrowed-lvalue source
+    // (the `FrozenArray<string>.From(xs)` idiom in #4850), the caller's
+    // `using var xs` remains the owner and would double-free here.
+    if (sourceOwnedHere) {
+        auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+        builder_.CreateCall(freeFn, {src, llvm::ConstantPointerNull::get(ptrTy())});
+    }
     return copy;
 }
 
@@ -593,43 +720,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        // Widen to i32 for libc functions if needed.
+        // Widen to i32 for the runtime helper if needed.
         if (!arg->getType()->isIntegerTy(32))
             arg = builder_.CreateSExt(arg, i32());
-        // Map Bezel method names to libc functions.
+        // fix #4420 (stdlib §9.5, v0.306): these used to lower directly onto
+        // <ctype.h> (isdigit/isalpha/.../toupper/tolower), which is
+        // undefined for any argument not representable as `unsigned char`
+        // (0-255) or `EOF` (C11 §7.4p1). A Bezel char is a 32-bit Unicode
+        // scalar up to U+10FFFF (§4.5), so any code point above U+00FF was
+        // an out-of-bounds libc table read, not merely a wrong answer. The
+        // bz_char_* runtime helpers (bezel_runtime_strings.cpp) are the ONE
+        // shared, UB-free lowering — also used by string.IsNullOrWhiteSpace
+        // below — see their definitions for exactly which categories are
+        // Unicode-exact across the full range (IsControl/Cc, IsWhiteSpace/
+        // White_Space — each a closed, stable code-point list) versus
+        // ASCII-only pending full Unicode category data (IsDigit/IsLetter/
+        // IsLetterOrDigit/IsUpper/IsLower/IsPunctuation/ToUpper/ToLower).
         const char* fnName = nullptr;
-        if (m == "IsDigit") fnName = "isdigit";
-        else if (m == "IsLetter") fnName = "isalpha";
-        else if (m == "IsLetterOrDigit") fnName = "isalnum";
-        else if (m == "IsWhiteSpace") fnName = "isspace";
-        else if (m == "IsUpper") fnName = "isupper";
-        else if (m == "IsLower") fnName = "islower";
-        else if (m == "IsPunctuation") fnName = "ispunct";
-        else if (m == "IsControl") fnName = "iscntrl";   // stdlib §9.5 (sweep #7)
+        bool boolResult = true;
+        if (m == "IsDigit") fnName = "bz_char_is_digit";
+        else if (m == "IsLetter") fnName = "bz_char_is_letter";
+        else if (m == "IsLetterOrDigit") fnName = "bz_char_is_letter_or_digit";
+        else if (m == "IsWhiteSpace") fnName = "bz_char_is_white_space";
+        else if (m == "IsUpper") fnName = "bz_char_is_upper";
+        else if (m == "IsLower") fnName = "bz_char_is_lower";
+        else if (m == "IsPunctuation") fnName = "bz_char_is_punctuation";
+        else if (m == "IsControl") fnName = "bz_char_is_control";   // stdlib §9.5 (sweep #7)
+        else if (m == "ToUpper") { fnName = "bz_char_to_upper"; boolResult = false; }
+        else if (m == "ToLower") { fnName = "bz_char_to_lower"; boolResult = false; }
         if (fnName) {
-            auto* fn = module_->getFunction(fnName);
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
-            }
+            auto* fn = declareC(fnName, i32(), {i32()});
             llvm::Value* res = builder_.CreateCall(fn, {arg}, std::string(fnName) + ".res");
-            return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
-        }
-        if (m == "ToUpper") {
-            auto* fn = module_->getFunction("toupper");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "toupper", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "toupper.result");
-        }
-        if (m == "ToLower") {
-            auto* fn = module_->getFunction("tolower");
-            if (!fn) {
-                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
-            }
-            return builder_.CreateCall(fn, {arg}, "tolower.result");
+            if (boolResult)
+                return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
+            return res;
         }
         // char.ToString(c): string — convert char code point to string.
         // Uses the same path as c.ToString() for a char value.
@@ -764,11 +888,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
-        auto* isspaceFn = module_->getFunction("isspace");
-        if (!isspaceFn) {
-            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-            isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
-        }
+        // fix #4420 (stdlib §9.6/§9.5, v0.306): this used to call raw
+        // isspace(cp) on the loaded code point, which — like the char.Is*
+        // dispatch above — is undefined above U+00FF (C11 §7.4p1); a
+        // width≥2 string's code points reach this loop unmasked via
+        // loadCodePoint (which is already width-aware, not "width=1 chars
+        // only" as the stale comment here used to claim). Routed through the
+        // same bz_char_is_white_space helper as char.IsWhiteSpace so the
+        // fix is one shared lowering, not two — see that helper's comment
+        // for why it is Unicode-exact (the White_Space property) across the
+        // full char domain, unlike libc's ASCII-only "C"-locale isspace.
+        auto* isspaceFn = declareC("bz_char_is_white_space", i32(), {i32()});
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* isNull = builder_.CreateICmpEQ(
             arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
@@ -789,7 +919,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
         builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
-        // For now: only check width=1 chars (ASCII whitespace check).
+        // loadCodePoint decodes the code point at the string's actual
+        // per-string storage width (1/2/4 bytes, §4.6) — every code point
+        // is checked, not just width-1 (ASCII) strings.
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
         llvm::Value* cp = loadCodePoint(arg, idxB);
         llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});
@@ -820,7 +952,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // with `pt == String && m == "Compare"` any more. The replacement
     // instance member `CompareTo(other[, ignoreCase])` lowers in
     // tryLowerStringMethod (LlvmBackend_String.cpp), reusing the same
-    // `bz_string_compare` runtime helper the 3-arg form used here.
+    // ordinal string comparison the 3-arg form used here (`bz_str_compare_cp`
+    // since fix #4487; `bz_string_compare` before it).
     // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
     // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
     if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&
@@ -2670,11 +2803,38 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     bool isEquals      = member == "Equals"       && call.args.size() == 1;
     if (!isToString && !isGetHashCode && !isEquals) return nullptr;
 
-    // A user-declared method of this name wins (the callee resolves to it).
-    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee)))
-        return nullptr;
-
     auto* recvTy = ctx_.exprType(*ma->target);
+
+    // A user-declared method of this name wins (the callee resolves to it).
+    //
+    // fix #5068 (§9.1 / §9.2 / stdlib §2.9, v0.307): EXCEPT the abstract
+    // `IEquatable<T>.Equals` a record listing `IEquatable<Self>` resolves to.
+    // The record's synthesized `Equals(T)` is not a sema member, so member
+    // lookup finds the interface's declaration instead, and bailing here sent
+    // a record-VALUE receiver down the interface dispatch path, which cannot
+    // take one and degraded to a constant `false` (measured: `p1.Equals(p2)`
+    // on two equal `record Point(X: int, Y: int): IEquatable<Point>` values
+    // answered False, while the same record without the listing answered
+    // True). §9.1: the synthesized `Equals(T)` IS the witness, so route to it
+    // exactly as the unlisted record does. The receiver is the record itself
+    // or a bare `T` this instantiation binds to one (`where T: IEquatable<T>`).
+    if (auto* callee =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        const sema::TypeSymbol* recRecv = nullptr;
+        if (isEquals && recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Named) {
+            if (recvTy->declaration) {
+                recRecv = recvTy->declaration;
+            } else if (!genericSubstSemaTy_.empty()) {
+                auto sit = genericSubstSemaTy_.find(recvTy->headName());
+                if (sit != genericSubstSemaTy_.end() && sit->second &&
+                    sit->second->kind == sema::TypeRef::Kind::Named)
+                    recRecv = sit->second->declaration;
+            }
+        }
+        if (!isSynthesizedIEquatableEquals(callee, recRecv)) return nullptr;
+    }
+
     if (!recvTy) return nullptr;
     // #1091 (§8.1/§14.2): GetHashCode/Equals on a bare unconstrained generic
     // type parameter `T` (Named, no declaration). The value-semantics gate below
@@ -2727,10 +2887,13 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                         // — needs the same §8.6 argument boxing, or
                         // `t.Equals(5)` inside a generic body drops exactly as
                         // the concrete `Object` receiver's did.
-                        if (llvm::Value* other =
-                                lowerUniversalEqualsArg(*call.args[0].value))
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        // fix #3480: same one-step dispatch as the concrete
+                        // `Object`-receiver spelling, so the three §8.1
+                        // `Equals` faces share one box-lifetime rule.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     }
                 }
             }
@@ -2917,7 +3080,17 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     // §22.5 order: the receiver was evaluated by the caller; the argument is
     // evaluated (and boxed) next. Minting the receiver's box afterwards copies
     // an SSA value the argument's evaluation cannot have changed.
-    llvm::Value* other = lowerUniversalEqualsArg(*call.args[0].value);
+    // fix #3480 (§8.6 / §28.9, v0.306): capture the argument's fresh mint.
+    // The RECEIVER here is a box THIS function is about to mint from a
+    // statically-known value type, so its vtable is `boxVtableFor(recvTy)` and
+    // the dispatch below necessarily lands on a compiler-generated box-equals
+    // thunk — the receiver-is-a-box premise holds by construction, without any
+    // analysis. The argument box is therefore dead after the comparison, on
+    // exactly the reasoning this function's own header already gives for the
+    // RECEIVER's box ("minted here, only READ by bz$boxeq").
+    llvm::Value* argMint = nullptr;
+    llvm::Value* other =
+        lowerUniversalEqualsArg(*call.args[0].value, &argMint);
     if (!other || !other->getType()->isPointerTy()) return nullptr;
     // `boxValue` publishes its mint in `lastBoxMint_` for #2865's reader; this
     // box is claimed HERE, so the caller's view of that field is restored.
@@ -2932,6 +3105,7 @@ llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
     auto* relFn = declareC("bz_box_release", llvm::Type::getVoidTy(llvm_),
                            {ptrTy()});
     builder_.CreateCall(relFn, {boxedRecv});   // null-safe (§28.9)
+    if (argMint) builder_.CreateCall(relFn, {argMint});   // fix #3480
     return r;
 }
 
@@ -3002,6 +3176,18 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         recvTy->primitive != sema::PrimitiveType::Object &&
         (isEquals || isGetHashCode)) {
         if (isGetHashCode) {
+            // fix #4562 (§4.4/§8.3, v0.306): a `decimal` receiver lowers to a
+            // 16-byte STRUCT (decimalStructType()), not an LLVM int/float, so
+            // it matched neither shape check below and this arm answered
+            // `nullptr` for every decimal `GetHashCode()` call. Reuse
+            // `emitValueHashCode`'s own decimal arm (LlvmBackend_String.cpp)
+            // — the SAME `bz_decimal_hash` call the box-Equals thunk
+            // (`primBoxHashThunk`) and every decimal record/dictionary-key
+            // hash site already use — rather than re-deriving the runtime
+            // call here, so a decimal's boxed and unboxed `GetHashCode()`
+            // can never disagree.
+            if (recv->getType() == decimalStructType())
+                return emitValueHashCode(recv, recvTy);
             // §8.3-style: the value itself as an i32 hash (bit-pattern for FP).
             if (recv->getType()->isDoubleTy())
                 recv = builder_.CreateBitCast(recv, i64());
@@ -3013,6 +3199,44 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         // isEquals: value equality, returning i1 (Bool).
         if (!call.args[0].value) return nullptr;
+        // fix #4562 (§4.4/§8.3, v0.306): the DECIMAL twin of the FP/int shape
+        // checks below. A `decimal` receiver lowers to a struct, so it
+        // matched neither `isFloatingPointTy()` nor `isIntegerTy()` and this
+        // whole arm fell through to the unconditional `return nullptr;` at
+        // its end — for EVERY argument, including another decimal of the
+        // identical value — after already having (uselessly) lowered the
+        // argument. A caller further out then silently answered a bare
+        // `false`, with no diagnostic. Classify the ARGUMENT's static type
+        // BEFORE lowering it (§22.5: a reroute below must not lower it a
+        // second time) — the same settle-vs-dispatch split the record/enum/
+        // choice arms below use for their own `Equals`: an argument whose
+        // static type is decimal itself (§9.1's `IEquatable<decimal>` fast
+        // path) is compared directly via `emitValueEquality` — the same
+        // canonical per-value helper `=`, record-field equality, and the
+        // box-Equals thunk (`primBoxEqualsThunk`, #2793) all call, which
+        // routes a decimal payload through `bz_decimal_cmp` so `1.5m` and
+        // `1.50m` compare equal despite differing scale bits. Any other
+        // static shape (`Object`, an interface, a class, `string`, a
+        // nullable form, or an unresolved generic) can dynamically BE a
+        // boxed decimal and is routed through `lowerValueSemUniversalEquals`
+        // — the SAME box+dispatch+release helper #4559's sibling fix wired
+        // the int/FP family's mismatched-shape argument to, and every
+        // record/enum/choice receiver below already uses — so this stays
+        // the fourth face of one rule (§8.1's universal `Equals`) rather
+        // than a new dispatch site.
+        if (recv->getType() == decimalStructType()) {
+            const ast::Expr& argE = *call.args[0].value;
+            const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+            bool argIsDecimal = at && !at->nullable &&
+                at->kind == sema::TypeRef::Kind::Primitive &&
+                at->primitive == sema::PrimitiveType::Decimal;
+            if (!argIsDecimal)
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            llvm::Value* other = lowerExpr(argE);
+            if (!other || other->getType() != decimalStructType())
+                return nullptr;
+            return emitValueEquality(recv, other, recvTy);
+        }
         llvm::Value* other = lowerExpr(*call.args[0].value);
         if (!other) return nullptr;
         if (recv->getType()->isFloatingPointTy()) {
@@ -3508,12 +3732,46 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // unchanged (its `genericSubstSemaTy_` is empty, so
         // `resolveTypeParamRef` returns the bare-unresolved ref unchanged).
         // Replaces what was previously `ctx_.exprType(argE)`.
-        const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+        // fix #4799 (§14.1 / §9.1 / §8.3, v0.307): the ARGUMENT belongs to
+        // the CALLER, so its type and its value are resolved under the
+        // caller's substitution, not the receiver record's. `valSubst` above
+        // replaced the whole substitution with the record's own
+        // (`Pair<T>`'s T -> int). Inside `AreEqual<T>(a: T, b: T)` called
+        // with T = Pair<int>, the argument `b: T` was then read as the
+        // RECORD's T, so `at` became `int` and (a) answered a static False
+        // for two equal pairs. Measured: `record Pair<T>(A: T, B: T)` +
+        // `AreEqual(new Pair<int>(1, 2), new Pair<int>(1, 2))` printed
+        // `False`, and renaming the record parameter to `U` printed `True`.
+        // `withCallerSubst` swaps the outer substitution back in for every
+        // argument-side step: resolving `at`, lowering the argument, and the
+        // run-time route (which also boxes `recv` through `recvTy`, itself a
+        // caller-side type). A non-generic record installs nothing
+        // (`valSubst.active` is false), so this is a no-op for it. It is
+        // also a no-op in the dead generic-template pass
+        // (`emittingGenericTemplateBody_`): that body never runs and has no
+        // caller binding to restore, so it keeps its pre-#4799 lowering
+        // unchanged.
+        const bool swapToCaller =
+            valSubst.active && !emittingGenericTemplateBody_;
+        auto withCallerSubst = [&](auto&& fn) {
+            if (swapToCaller) {
+                std::swap(genericSubst_, valSubst.savedSubst);
+                std::swap(genericSubstSemaTy_, valSubst.savedSemaTy);
+            }
+            auto r = fn();
+            if (swapToCaller) {
+                std::swap(genericSubst_, valSubst.savedSubst);
+                std::swap(genericSubstSemaTy_, valSubst.savedSemaTy);
+            }
+            return r;
+        };
+        const sema::TypeRef* at = withCallerSubst(
+            [&] { return resolveTypeParamRef(ctx_.exprType(argE)); });
         // (a) The argument's static type settles the answer at False on its own.
         //     The argument is still lowered — §22.5 makes its effects part of
         //     the call whatever the answer is.
         if (equalsArgSettlesFalse(at, ts)) {
-            lowerExpr(argE);
+            withCallerSubst([&] { return lowerExpr(argE); });
             return builder_.getFalse();
         }
         // (b) This record itself, or a type parameter this instantiation has
@@ -3525,9 +3783,12 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // (c) Anything else — `Object`, an interface, a class, `Pt?` — can
         //     dynamically BE a box of this record, so only the run time can say.
         if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
-            return lowerValueSemUniversalEquals(recvTy, recv, call);
+            return withCallerSubst([&] {
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            });
         // §9.1 / §9.2: structural equality, same as the `=` operator (§8.3).
-        llvm::Value* other = lowerExpr(argE);
+        llvm::Value* other =
+            withCallerSubst([&] { return lowerExpr(argE); });
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
@@ -4056,6 +4317,223 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
     return closure;
 }
 
+// fix #4901 (stdlib §6.5 "Capture-freedom at every subscribe position",
+// spec §28.14, v0.307): the admission gate for the shared pair
+// (`ISharedEvent<T>` / `SharedEventSource<T>`). Sema has NO member surface for
+// this pair: #4920 rejects a capturing handler at Subscribe / Add / `+=`, but
+// nothing checks the handler / payload against the declared `(T) -> ()` /
+// `Raise(payload: T)` signatures, and Remove is unchecked entirely — so every
+// call codegen claims here would otherwise be lowered unchecked. Before #4901 the gap was papered over by the #2457
+// "no dispatch arm emitted any code" backstop, which rejected every call on
+// the pair. These helpers claim a call ONLY when codegen can prove it both
+// capture-free and exactly well-typed; everything else keeps the #2457 reject
+// (a spurious reject is recoverable, a mis-typed handler is a SEGV / UAF).
+namespace {
+
+// Structural type identity, stricter than sema::typeRefEqual: that helper
+// compares a Named ref by `declaration` alone, and every builtin head AND every
+// generic type parameter has a null declaration — so it answers `true` for
+// `T` vs `U`, or `T` vs `Subscription`. Compare the alias-transparent head too.
+bool sharedEventTypeEq(const sema::TypeRef* a, const sema::TypeRef* b) {
+    if (!sema::typeRefEqual(a, b)) return false;
+    switch (a->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (!a->declaration && a->headName() != b->headName()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!sharedEventTypeEq(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            return true;
+        case sema::TypeRef::Kind::InlineArray:
+            return sharedEventTypeEq(a->arrayElement, b->arrayElement);
+        case sema::TypeRef::Kind::Function:
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i)
+                if (!sharedEventTypeEq(a->funcParams[i].type,
+                                       b->funcParams[i].type))
+                    return false;
+            if (!a->funcReturn || !b->funcReturn)
+                return a->funcReturn == b->funcReturn;
+            return sharedEventTypeEq(a->funcReturn, b->funcReturn);
+        default:
+            return true;
+    }
+}
+
+// True when `t` mentions a generic TYPE PARAMETER anywhere (a Named ref with no
+// declaration whose head is not a registered builtin). Such a name is only
+// meaningful relative to the scope that binds it, so the head comparison in
+// sharedEventTypeEq alone cannot prove two of them the same binding.
+bool sharedEventMentionsTypeParam(
+        const sema::TypeRef* t,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!t) return false;
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (!t->declaration && !isBuiltinName(t->headName())) return true;
+            for (const sema::TypeRef* g : t->genericArgs)
+                if (sharedEventMentionsTypeParam(g, isBuiltinName)) return true;
+            return false;
+        case sema::TypeRef::Kind::InlineArray:
+            return sharedEventMentionsTypeParam(t->arrayElement, isBuiltinName);
+        case sema::TypeRef::Kind::Function:
+            for (const auto& fp : t->funcParams)
+                if (sharedEventMentionsTypeParam(fp.type, isBuiltinName))
+                    return true;
+            return sharedEventMentionsTypeParam(t->funcReturn, isBuiltinName);
+        default:
+            return false;
+    }
+}
+
+// True when another method named `ms->name` is visible on `ts` or a base —
+// i.e. the handler spelling names an overload GROUP. Sema resolves a bare
+// method reference to one member of the group without consulting the
+// `(T) -> ()` target (measured: `H.On` with On(string)/On(int) on an int feed
+// bound the string overload — SEGV), so a group is never admitted.
+bool sharedEventMethodIsOverloaded(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* ts,
+        std::unordered_set<const sema::TypeSymbol*>& seen) {
+    if (!ts || !seen.insert(ts).second) return false;
+    for (const sema::Symbol* m : ts->members) {
+        if (m != ms && m && m->name == ms->name &&
+            dynamic_cast<const sema::MethodSymbol*>(m))
+            return true;
+    }
+    for (const sema::TypeSymbol* b : ts->baseTypes)
+        if (sharedEventMethodIsOverloaded(ms, b, seen)) return true;
+    return false;
+}
+
+// True when `e` is a bare identifier naming a member of `owner` — the one
+// receiver/handler shape in which a type parameter named in the member's type
+// is provably the SAME binding as one named by another member of `owner`.
+bool sharedEventIsBareMemberOf(sema::SemaContext& ctx, const ast::Expr* e,
+                               const sema::TypeSymbol* owner) {
+    if (!e || !owner || !dynamic_cast<const ast::IdentifierExpr*>(e))
+        return false;
+    auto* m = dynamic_cast<const sema::MemberSymbol*>(ctx.exprSymbol(*e));
+    return m && m->parent == owner;
+}
+
+}  // namespace
+
+// fix #4901: may a `Subscribe`/`Add` (or `+=`) on the shared pair, whose
+// receiver expression is `receiver` and payload type is `payload`, claim
+// `handler`? Only when ALL of the following hold; otherwise the caller leaves
+// the call on the #2457 backstop (or, for `+=`, reports its own error).
+//   1. Capture-free — a STATIC method reference, decided on the RESOLVED
+//      symbol, never the AST spelling: a bare `OnX`, or `Bus.OnX` /
+//      `Alias.OnX` qualified by a type or type alias. §6.5 admits "a
+//      non-capturing lambda or a static method reference"; an INSTANCE method
+//      reference (`box.OnI`, bare `OnI` / `this.OnI` inside an instance method)
+//      is NOT capture-free — §28.14: a method reference's "capture is the
+//      receiver" — and a local / field / call result / conditional may hold a
+//      capturing closure codegen cannot see. Kept even though #4920 now
+//      rejects capturing handlers in sema: it is the only check at Remove,
+//      and lambda literals — even the capture-free ones §6.5 and #4920
+//      admit — are not lowered on this pair yet (#4972, a spurious reject).
+//      Mirrors sema's `ExprTC::isCaptureFreeEntry` arm (a) (§30.14).
+//   2. Exactly the handler type `(T) -> ()` (stdlib §6.5), because nothing
+//      else checks it: not an overload group, not generic, not an operator or
+//      extension method, not async; exactly one formal, with NO modifier
+//      (an `owned` formal would free the payload each handler borrows —
+//      measured heap-use-after-free; `ref`/`out`/`scoped` change the ABI),
+//      whose type is identical to T; a unit, non-`owned` return.
+//   3. If T or the formal mentions a generic type parameter, the receiver and
+//      the handler are both bare members of the same type, so the two names
+//      are one binding.
+bool sharedEventHandlerAdmissible(
+        sema::SemaContext& ctx, const ast::Expr* handler,
+        const ast::Expr* receiver, const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!handler || !payload) return false;
+    // (1) capture-free: a static method reference.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(handler);
+    if (!ma && !dynamic_cast<const ast::IdentifierExpr*>(handler)) return false;
+    if (ma) {
+        // The qualifier must name a TYPE (or a type alias), never a value: a
+        // value qualifier would be evaluated and is a receiver by construction.
+        if (!ma->target) return false;
+        sema::Symbol* tgt = ctx.exprSymbol(*ma->target);
+        if (!dynamic_cast<sema::TypeSymbol*>(tgt) &&
+            !dynamic_cast<sema::TypeAliasSymbol*>(tgt))
+            return false;
+    }
+    auto* ms = dynamic_cast<const sema::MethodSymbol*>(ctx.exprSymbol(*handler));
+    if (!ms || ms->extensionDecl || ms->isOperator || !ms->parent ||
+        !ms->genericParams.empty())
+        return false;
+    auto hasMod = [&](std::string_view m) {
+        return std::find(ms->modifiers.begin(), ms->modifiers.end(), m) !=
+               ms->modifiers.end();
+    };
+    if (!hasMod("static") || hasMod("async")) return false;
+    // (2) exactly `(T) -> ()`.
+    {
+        std::unordered_set<const sema::TypeSymbol*> seen;
+        if (sharedEventMethodIsOverloaded(ms, ms->parent, seen)) return false;
+    }
+    if (sema::formalParamCount(*ms) != 1) return false;
+    if (!sema::formalParamModifier(*ms, 0).empty()) return false;
+    const sema::TypeRef* paramTy = nullptr;
+    if (const ast::Type* dt = sema::formalParamDeclType(*ms, 0))
+        paramTy = ctx.resolvedType(*dt);
+    else
+        paramTy = sema::formalParamResolvedType(*ms, 0);
+    if (!paramTy || !sharedEventTypeEq(paramTy, payload)) return false;
+    if (sema::methodReturnsOwned(*ms, ctx)) return false;
+    // SEAM-DEBT: #4988 no both-sources declared-return-type accessor exists yet; AST arm then importedReturnType below
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (md->returnType) {
+            const sema::TypeRef* rt = ctx.resolvedType(*md->returnType);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Unit) return false;
+        }
+    } else if (ms->decl) {
+        return false;  // not a plain method declaration
+    } else if (const sema::TypeRef* rt = ctx.importedReturnType(ms)) {
+        if (rt->kind != sema::TypeRef::Kind::Unit) return false;
+    }
+    // (3) type parameters: one binding only.
+    if (sharedEventMentionsTypeParam(payload, isBuiltinName) ||
+        sharedEventMentionsTypeParam(paramTy, isBuiltinName)) {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(handler) ||
+            !sharedEventIsBareMemberOf(ctx, receiver, ms->parent))
+            return false;
+    }
+    return true;
+}
+
+// fix #4901: may `SharedEventSource<T>.Raise(...)` claim this argument list?
+// Same reason as above — nothing else checks it (measured: `Raise("hello")` on
+// an int feed printed garbage, `Raise()` on a class-typed feed SEGV'd in the
+// handler, `Raise(1, 2)` was accepted). Admitted: exactly one positional
+// argument whose static type is identical to T, or — for a unit payload —
+// `Raise()` / `Raise(())` (stdlib §6.5's no-argument overload).
+static bool sharedEventRaiseAdmissible(
+        sema::SemaContext& ctx, const ast::CallExpr& call,
+        const sema::TypeRef* payload,
+        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+    if (!payload) return false;
+    for (const auto& a : call.args)
+        if (!a.value || !a.name.empty()) return false;
+    if (payload->kind == sema::TypeRef::Kind::Unit) {
+        if (call.args.empty()) return true;
+        if (call.args.size() != 1) return false;
+        const sema::TypeRef* at = ctx.exprType(*call.args[0].value);
+        return at && at->kind == sema::TypeRef::Kind::Unit;
+    }
+    if (call.args.size() != 1) return false;
+    const sema::TypeRef* at = ctx.exprType(*call.args[0].value);
+    if (!at || !sharedEventTypeEq(at, payload)) return false;
+    // A payload that mentions a type parameter is never admitted: whether the
+    // argument's `T` and the source's `T` are one binding depends on the
+    // enclosing method, and codegen's current-method state is not reliable
+    // for that while it emits a generic instantiation (measured: a Raise in
+    // `G<T>.Arm` is lowered with `Main` as the current method). A spurious
+    // reject (#4971).
+    if (sharedEventMentionsTypeParam(payload, isBuiltinName)) return false;
+    return true;
+}
+
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     // fix #3225 (§24 / §2.5, v0.254): the §24 raise-syntax BARE-CALL
@@ -4279,6 +4757,57 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         return std::optional<llvm::Value*>(
             builder_.CreateCall(subFn, {src, closure}, "subscription"));
     }
+    // fix #4901 / stdlib §6.5 (v0.307): `.Subscribe` on a STORED
+    // ISharedEvent<T> value — the cross-domain publication point's public,
+    // subscribe-only interface face. Mirrors the IEvent<T> arm immediately
+    // above: ISharedEvent<T> has no itable, but its runtime value IS the
+    // same bz_event_source_t* a SharedEventSource<T> field gives up (via the
+    // event-as-value read), so dispatch directly to bz_event_subscribe. The
+    // payload is the receiver type's genericArgs[0]. Stdlib §6.5 declares
+    // ISharedEvent<T> with ONLY `Subscribe` ("ISharedEvent deliberately has
+    // no Add/Remove/Raise") and states the interface deliberately does NOT
+    // extend IEvent<T> (so it is never reached via isIEventTypeName above) —
+    // so no other member name is admitted here.
+    //
+    // §6.5 / §28.14: every subscribe position on the shared pair admits ONLY
+    // a capture-free handler — a non-capturing lambda or a static method
+    // reference. Sema enforces the capture half (#4920); it does NOT check
+    // the handler against `(T) -> ()`, because the pair has no sema member
+    // surface. So this arm claims the call ONLY when the handler is a STATIC
+    // method reference of exactly the handler type `(T) -> ()`
+    // (sharedEventHandlerAdmissible, keyed on the resolved MethodSymbol).
+    // An instance method reference captures its receiver (§28.14: a method
+    // reference's "capture is the receiver") and a local/field/conditional/
+    // call-result handler may hold a capturing closure (both now also
+    // rejected by #4920, so this is defence in depth). An ill-typed static
+    // (overload group, wrong arity, `owned` formal, wrong type) would be
+    // lowered unchecked — measured SEGV / garbage / heap-use-after-free — and
+    // a lambda literal is not lowered on this pair yet (#4972). All of those
+    // fall through to the SAME #2457 backstop as before.
+    const sema::TypeRef* sharedPayload =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                 : nullptr;
+    auto builtinName = [this](std::string_view n) {
+        return isBuiltinTypeRefName(n);
+    };
+    if (ma->member == "Subscribe" && call.args.size() == 1 &&
+        call.args[0].value && isISharedEventTypeName(recvTy) &&
+        sharedEventHandlerAdmissible(ctx_, call.args[0].value.get(),
+                                     ma->target.get(), sharedPayload,
+                                     builtinName)) {
+        llvm::Value* src = lowerExpr(*ma->target);
+        if (!src) return std::optional<llvm::Value*>(nullptr);
+        const sema::TypeRef* payload = sharedPayload;
+        llvm::Value* closure =
+            lowerEventHandlerClosure(call.args[0].value.get(), payload);
+        if (!closure) return std::optional<llvm::Value*>(nullptr);
+        // No lastLambdaCapturedCells_ consume (cf. the IEvent<T> arm above):
+        // the handler is never a lambda literal here.
+        auto* subFn =
+            declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
+        return std::optional<llvm::Value*>(
+            builder_.CreateCall(subFn, {src, closure}, "subscription"));
+    }
     // §6.5 / §24 (#1610): a value held in a local/param/field of static type
     // EventSource<T>/AsyncEventSource<T>. Its runtime value is the same
     // bz_event_source_t* a direct event access yields (via the event-as-value
@@ -4291,6 +4820,67 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         const sema::TypeRef* payload =
             (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
         return dispatchEventMethods(src, payload);
+    }
+    // fix #4901 / stdlib §6.5 (v0.307): a value held in a local/param/field of
+    // static type SharedEventSource<T> — the cross-domain publication
+    // point's producer-side sealed class. Its runtime value is the same
+    // bz_event_source_t* an EventSource<T> field gives up (both are
+    // registered heap-pointer-reference builtins with the identical
+    // representation, common::BuiltinRegistry.cpp), so Subscribe/Add/Remove/
+    // Raise dispatch through the SAME dispatchEventMethods used for
+    // EventSource<T> just above. RaiseAsync is deliberately EXCLUDED even
+    // though dispatchEventMethods itself would recognize that name: stdlib
+    // §6.5 does not declare RaiseAsync on SharedEventSource<T> ("the shared
+    // async twin is deferred" — ISharedAsyncEvent<T>/SharedAsyncEventSource<T>
+    // do not exist), and — unlike EventSource<T>/AsyncEventSource<T>, which
+    // are gated by sema's `rcn == "EventSource"` block
+    // (ExprTypecheck_Calls.cpp) rejecting any undocumented member name before
+    // codegen ever runs — there is no equivalent sema gate for
+    // SharedEventSource<T> today, so a bogus `.RaiseAsync()` call reaches
+    // here unrejected. This arm therefore names the four real methods
+    // explicitly, rather than forwarding every method name the way the
+    // EventSource<T> arm does, so an out-of-surface call falls through to
+    // ordinary (itable) dispatch instead of being mis-lowered as an async
+    // raise.
+    //
+    // §6.5 / §28.14: `Subscribe` and `Add` on the shared pair admit ONLY a
+    // capture-free handler (a non-capturing lambda or a static method
+    // reference). Sema enforces the capture half (#4920) but not the
+    // `(T) -> ()` / `Raise(payload: T)` typing for this type (see the
+    // ISharedEvent<T> arm's comment above), so every member is claimed only
+    // when codegen can prove the call
+    // well-formed; anything else falls through to the pre-existing #2457
+    // "not implemented" backstop rather than silently accepting it:
+    //   * Subscribe / Add — sharedEventHandlerAdmissible (static, exactly
+    //     `(T) -> ()`).
+    //   * Remove — the SAME gate. §6.5 exempts Remove from capture-freedom
+    //     ("call-bounded: compares only"), but a lambda-literal argument is a
+    //     fresh closure that can never compare equal to a subscribed handler,
+    //     and a capturing one leaks its environment; until lambda handlers
+    //     are lowered on this pair (#4972), Remove takes what Subscribe/Add
+    //     take. (Even a static Remove leaks its closure record, #4970.)
+    //   * Raise — sharedEventRaiseAdmissible (one argument of type exactly T,
+    //     or none for a unit payload). Unchecked, `Raise("s")` on an int
+    //     feed, `Raise()` on a class feed and `Raise(1, 2)` all compiled.
+    if (isSharedEventSourceTypeName(recvTy)) {
+        const bool handlerMember = ma->member == "Subscribe" ||
+                                   ma->member == "Add" ||
+                                   ma->member == "Remove";
+        const bool ok =
+            handlerMember
+                ? (call.args.size() == 1 && call.args[0].value &&
+                   call.args[0].name.empty() &&
+                   sharedEventHandlerAdmissible(
+                       ctx_, call.args[0].value.get(), ma->target.get(),
+                       sharedPayload, builtinName))
+                : (ma->member == "Raise" &&
+                   sharedEventRaiseAdmissible(ctx_, call, sharedPayload,
+                                              builtinName));
+        if (ok) {
+            llvm::Value* src = lowerExpr(*ma->target);
+            if (!src) return std::optional<llvm::Value*>(nullptr);
+            return dispatchEventMethods(src, sharedPayload);
+        }
     }
     return std::nullopt;
 }
@@ -4344,8 +4934,25 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
             return false;
         // A direct event access OR a stored IEvent<T>/IAsyncEvent<T> value
         // (#747): both produce an owned Subscription that must be disposed.
+        // fix #4901 / stdlib §6.5 (v0.307): a stored ISharedEvent<T> value
+        // (interface face) or a stored SharedEventSource<T> value (producer
+        // class) ALSO produce an owned Subscription via `.Subscribe`, and —
+        // unlike EventSource<T>/AsyncEventSource<T> — sema has no
+        // `rcn == "SharedEventSource"` block that types the call result as
+        // `Subscription` (no equivalent block exists for the shared pair), so
+        // this structural fallback is the ONLY recognition path for them,
+        // exactly the #747/#3591 gap this lambda already exists to close for
+        // IEvent<T>. Without this, `var sub := face.Subscribe(h); sub.Dispose();`
+        // through an ISharedEvent<T>/SharedEventSource<T> receiver dispatched
+        // the explicit `.Dispose()` through the generic vtable path against
+        // Subscription's vtable-less handle — SIGSEGV (measured with this
+        // fix's own probe: `App.Feed.Subscribe(OnTick); sub.Dispose();` through
+        // a SharedEventSource<T>-backed ISharedEvent<T> property crashes
+        // without this arm and disposes cleanly with it).
         return eventSymbolOf(*ma->target) != nullptr ||
-               isIEventTypeName(ctx_.exprType(*ma->target));
+               isIEventTypeName(ctx_.exprType(*ma->target)) ||
+               isISharedEventTypeName(ctx_.exprType(*ma->target)) ||
+               isSharedEventSourceTypeName(ctx_.exprType(*ma->target));
     };
     if (isSubscribeCall(e)) return true;
     if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -4572,6 +5179,27 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                     if (outOwnedRecipients_.count(static_cast<const void*>(ie)))
                         return lvalueAddr(receiver, slotTy);
                 }
+                // fix #4734 (§35.5 *The owning match*, §28.6, §17.13, v0.307):
+                // an arm binding an OWNING match transferred a payload into.
+                // Its `decl` is a `BindingPattern` (or #1271's synthesized
+                // naked-binding anchor), so it reaches neither the `ld` branch
+                // below nor any arm above and fell to the trailing `return
+                // nullptr` — dispatch-only, the heap block LEAKED. §35.5 makes
+                // the binding "an owned local of the arm body's scope", and
+                // the case lowering keys its slot on exactly that anchor node
+                // (`locals_[bp]` / `locals_[nakedAnchor]`), which `localSlot`
+                // resolves — so this scope's slot IS the sole reclaim path.
+                // Exactly-once: #4617's `dischargeOwningMatchTransfers` zeroes
+                // the transferred slot in the scrutinee temp at the top of the
+                // selected arm, so the construct-completion reclaim declines
+                // it. Gated on the PER-OCCURRENCE flag the ownership pass
+                // stamps only where it proved the owning-match transfer, so a
+                // BORROWING match's arm binding — whose payload the
+                // scrutinee's owner still disposes — can never reach here.
+                // // per §35.5, §28.6, §17.13, v0.307
+                if (id->owningMatchTransferBinding &&
+                    dynamic_cast<const ast::BindingPattern*>(loc->decl))
+                    return lvalueAddr(receiver, slotTy);
                 // #963 / §28.11 / §29.2: a for-loop variable of an
                 // `IOwningEnumerable<T>` loop (`for var x in Gen()`) is a
                 // LocalSymbol whose decl is the ForStmt (sema sets `lsym->decl =
@@ -5102,6 +5730,27 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // arm's inline copy of them was the one the
             // collection arms next door were missing.
         }
+    } else if (recvTy && recvTy->kind == sema::TypeRef::Kind::Function) {
+        // fix #4475 (§28.2 v0.30x): explicit `c.Dispose()` on a closure-typed
+        // value. The closure cell is NOT a vtable-backed class — its word 0
+        // is the `fn` pointer, not a class vtable, so the user-class arm
+        // below (emitDynamicDispose → slot 2 dispatch) would read fn+0x10 as
+        // a function pointer and WILD-JUMP. Without this arm the existing
+        // codegen silently produced a SEGV on the Dispose call itself.
+        //
+        // Emit the SAME `bz_closure_release(c)` that the auto-dispose path
+        // uses, but preceded by `bz_closure_mark_disposed(c)` so the
+        // release's last-drop path QUARANTINES instead of freeing — the
+        // closure-invoke guard then reads the disposed flag and throws
+        // DisposedAccessException (§31.4). The mark is gated on
+        // --checked-disposal: outside that mode the byte stays 0 and the
+        // release frees as before (unchecked mode's UB allowance per §28.2).
+        auto* mkFn = declareC("bz_closure_mark_disposed",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        if (checkedDisposal_) builder_.CreateCall(mkFn, {recv});
+        auto* relFn = declareC("bz_closure_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(relFn, {recv});
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
@@ -5204,6 +5853,12 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // owned TEMPORARY explicitly disposed (no second reclaim
         // path, but no slot to null either) is the deferred sub-
         // case noted in #415.
+        // fix #1878 (§28.4, v0.306): bracket the dispatch below so the check at
+        // the end of this chain can tell a fault THIS disposal raised from one
+        // that was already propagating when the statement was reached (an
+        // `x.Dispose()` inside an iterator `finally` run during §29.7
+        // abandonment is such a place). See emitDisposalFaultCheck.
+        llvm::Value* excBeforeDispose = snapshotInFlightExc();
         llvm::Type* slotTy = nullptr;
         llvm::Value* slot =
             explicitDisposeOwnedReceiverSlot(target,
@@ -5297,6 +5952,38 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             builder_.CreateBr(dcont);
             builder_.SetInsertPoint(dcont);
         }
+        // fix #1878 (§28.4, v0.306): "The exception propagates from the
+        // **disposal point** — the explicit `Dispose()` call, ...". Every arm
+        // above dispatches the object's vtable Dispose, which runs the USER
+        // destructor body; when that body throws, `Dispose` returns with the
+        // exception parked in the bz_exc slot (emitDisposerCore's `dtor.threw`
+        // /`dtor.restore` tail leaves it there after completing the remaining
+        // owned-field and base-chain steps, #1546). Every OTHER user-code call
+        // in this backend is followed by a pending check — this one was not, so
+        // the in-flight exception simply stayed in the slot and control fell
+        // through to the next statement. Two contradictory manifestations
+        // followed from that single omission: with no later pending check in
+        // the function the exception was SILENTLY SWALLOWED (the reported
+        // `r.Dispose(); Console.WriteLine("no-throw")` printing "no-throw" and
+        // exiting 0), and with one — any later call, including the §22.13
+        // static-init guard — it surfaced at that unrelated site instead, which
+        // is typically OUTSIDE the `try` whose body held the disposal point, so
+        // it escaped the enclosing `catch` as unhandled (#1882's face of the
+        // same gap at the scope-end site).
+        //
+        // The check is bracketed (`excBeforeDispose` above) rather than a plain
+        // "is anything in flight": a `Dispose()` reached while an exception is
+        // already propagating — an `x.Dispose()` inside an iterator `finally`
+        // running under §29.7 abandonment, a destructor body on an unwind edge
+        // (#1468) — must route ONLY a genuinely new fault and leave the
+        // propagating one alone. It is a no-op on every non-throwing disposal
+        // (the slot is unchanged), which is why it can sit here unconditionally.
+        //
+        // Placed after the whole arm chain rather than inside each arm so the
+        // reclaim tail (identity-hash reap, CauseChain reclaim, `free`) and the
+        // slot-null still run before the exception leaves — §28.4's "physical
+        // reclamation still occurs — a cleanup fault never leaks the object".
+        emitDisposalFaultCheck(excBeforeDispose);
     }
     // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
     // exit. Every built-in branch above released the receiver
@@ -5306,6 +5993,44 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     if (builtinReleasedHere)
         nullExplicitlyDisposedBuiltinSlot(target);
     return true;
+}
+
+// fix #2590 (§2.8.2 / §9.2 / §22.8 / §28.9, v0.306): the ONE predicate that
+// says whether an imported member's declared type may be recovered from the
+// `importedMemberType` side table for a direct closure dispatch
+// (`recv.F(args)` where `F` is a function-typed field or auto-property).
+//
+// An imported member carries no `ast::FieldDecl`/`ast::PropertyDecl` — the
+// importer (ModuleLoader) reconstructs the Symbol from dependency metadata —
+// so its resolved type rides `ctx_.importedMemberType()`. #2300 (fields) and
+// #2589 (auto-properties) each added that fallback behind its OWN copy of a
+// receiver-kind allowlist, and both copies excluded `Record` for the same
+// stated reason: at the time, an imported record's function-typed field was
+// never INITIALIZED across the module boundary, so the read yielded a null
+// closure pointer and routing the direct invoke through `emitClosureCall`
+// would only convert #2477's silent zero-init into a SIGSEGV (#2590's own
+// repro). That premise no longer holds: the imported-record field-initializer
+// replay (#2874's parsed-AST carriage, #3671's `buildRecordValue` consumer,
+// #3723's writer-side `(isGenericType || Record)` widening) now runs the
+// exporter's initializer at the consumer's `new` site, so the record read
+// lands a real closure pointer — measured: the local-bind spelling
+// `var g := b.F; g(5)` returns the correct value on an imported record, while
+// the direct spelling `b.F(5)` still degrades to 0. §2.8.2 clause 1 requires a
+// consumer to type-check and run "every well-formed use of the module's public
+// surface"; §9.2 makes a function-typed record field such a use, and §28.9
+// makes its value runtime-managed with unbounded lifetime (so no ownership
+// rule distinguishes the record receiver from the class one).
+//
+// Interface is admitted for both member kinds: an interface declares no
+// fields (§11.2 — its members are methods, properties, indexers and events,
+// all bodiless), so the FieldSymbol arm simply never observes that
+// alternative. One predicate, no per-arm drift — the drift between the two
+// copies is what left the record case half-open in the first place.
+static bool importedMemberTypeAdmitsClosureDispatch(
+    const sema::TypeSymbol* parent) {
+    return parent && (parent->kind == ast::TypeDeclKind::Class ||
+                      parent->kind == ast::TypeDeclKind::Interface ||
+                      parent->kind == ast::TypeDeclKind::Record);
 }
 
 // fix #2963 (codegen, v0.240): the one place that classifies a null return.
@@ -5318,6 +6043,15 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
 // Dispose chain), and a nineteenth arm added tomorrow participates for free.
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     const IrFootprint before = irFootprint();
+    // fix #5009: scoped call-site location for emitInlineGenericMethod's
+    // constraint-route backstop (see `callSiteLoc_`).
+    struct CallSiteLocScope {
+        SourceLocation& slot;
+        SourceLocation saved;
+        CallSiteLocScope(SourceLocation& s, SourceLocation v)
+            : slot(s), saved(s) { slot = v; }
+        ~CallSiteLocScope() { slot = saved; }
+    } callSiteLocScope(callSiteLoc_, call.span.begin);
     llvm::Value* v = lowerCallDispatch(call);
     // fix #3421 (§4.7, v0.283): a void-typed result IS "no value" — LLVM `void`
     // has no size and no alignment, so nothing can be done with the `CallInst`
@@ -5343,6 +6077,51 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // ⇒ an arm lowered it and the result is unit.
     lastCallHandledWithoutValue_ = !v && emittedSideEffectSince(before);
     return v;
+}
+
+// fix #4813 (§14.1 / §14.5 / §26.4, v0.307): the generic-parameter NAMES the
+// callee's own declaring type binds -- the class/record/interface parameters
+// for a member method, or the extension block's type variables (its `where`
+// parameters plus every bare null-declaration name in its target type, the
+// same scan sema's extension matcher performs) for an extension method.
+// Codegen's substitution maps are keyed by NAME, so when a method type
+// parameter SHADOWS one of these (`class Box<T> … method Pick<T>(x: T)`), one
+// map cannot bind both: erasing the name to bind the method's `T` loses the
+// class `T` that the body still reads (a `_v: T` field, a non-generic `Show()`
+// that reads it), which is silent wrong code. The erase sites below therefore
+// keep such a name and leave the shadowing shape at its pre-#4813 behaviour;
+// the owner-qualified identity it actually needs is tracked by #4862 / #4847.
+static std::unordered_set<std::string_view> calleeOwnerTypeParamNames(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    std::unordered_set<std::string_view> names;
+    if (!ms) return names;
+    if (ms->parent) {
+        for (std::string_view n : sema::genericParamNames(ms->parent))
+            if (!n.empty()) names.insert(n);
+    }
+    if (const ast::ExtensionDecl* ext = ms->extensionDecl) {
+        for (const auto& gc : ext->genericConstraints)
+            names.insert(gc.typeParam);
+        const sema::TypeRef* target =
+            ext->targetType ? ctx.resolvedType(*ext->targetType) : nullptr;
+        std::function<void(const sema::TypeRef*)> scan =
+            [&](const sema::TypeRef* tr) {
+            if (!tr) return;
+            if (tr->kind == sema::TypeRef::Kind::Named && !tr->declaration &&
+                tr->genericArgs.empty()) {
+                std::string_view vname;
+                if (tr->astNode && tr->astNode->name &&
+                    !tr->astNode->name->parts.empty())
+                    vname = tr->astNode->name->parts.back();
+                else if (!tr->importedName.empty())
+                    vname = tr->importedName;
+                if (!vname.empty()) names.insert(vname);
+            }
+            for (const sema::TypeRef* ga : tr->genericArgs) scan(ga);
+        };
+        scan(target);
+    }
+    return names;
 }
 
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
@@ -5815,11 +6594,39 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             // Build the case's payload struct value.
             auto* payloadTy = st->getElementType(1 + tag);
+            // fix #4610 / §35.3 + §7.5 (v0.306): a payload field declared with
+            // a NULLABLE VALUE type (`S(v: int?)`) occupies the §15.1 tagged
+            // struct `{ i8 hasValue, T value }` in the case's payload slot —
+            // `choiceStruct` lays it out that way — but the ARGUMENT lowers to
+            // the bare inner value (`i32 7`). The InsertValue below was handed
+            // that bare value against a `{ i8, i32 }` element, which LLVM's
+            // constant folder accepts and turns into a malformed constant
+            // aggregate: `{ { i8, i32 } } { i32 7 }`. Nothing on the codegen
+            // path rejects it (`verifyModule` is opt-in here), so it survived
+            // to the backend, where the DAG builder measured the mistyped
+            // element and aborted the whole compiler with
+            // `LLVM ERROR: Invalid size request on a scalable vector.` (six
+            // lines of Bezel, no generics, no `owned` — §35.4 rule 3 makes
+            // `Opt` value-like, an ordinary copyable value).
+            //
+            // `coerceToNullableSlot` is the same #813/§15.1 wrap every other
+            // store into a nullable-value slot goes through (assignment,
+            // inline-array element stores, `out` recipients); it tags the value
+            // `hasValue = 1`, maps a `null` literal to the all-zero struct, and
+            // is a NO-OP when the element is not a nullable-value struct or the
+            // argument already IS one — so every other payload shape (a plain
+            // value, an `owned` class pointer, a `string?`, a nested choice)
+            // lowers byte-for-byte as before. // per §35.3, §7.5, §15.1
+            auto* payloadStructTy = llvm::dyn_cast<llvm::StructType>(payloadTy);
             llvm::Value* payload = llvm::UndefValue::get(payloadTy);
             for (std::size_t i = 0; i < payloadFields.size(); ++i) {
-                if (payloadFields[i])
-                    payload = builder_.CreateInsertValue(
-                        payload, payloadFields[i], {(unsigned)i});
+                if (!payloadFields[i]) continue;
+                llvm::Value* fv = payloadFields[i];
+                if (payloadStructTy && i < payloadStructTy->getNumElements())
+                    fv = coerceToNullableSlot(
+                        payloadStructTy->getElementType((unsigned)i), fv);
+                payload = builder_.CreateInsertValue(payload, fv,
+                                                     {(unsigned)i});
             }
             // Build the full choice struct value: tag + payload slots.
             llvm::Value* whole = llvm::UndefValue::get(st);
@@ -5952,10 +6759,56 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // and it is unreachable from the unwind edge, so a later argument that
         // throws leaks the buffer. Both reclaims are now established here, at
         // production, and discharged at the full-expression boundary.
+        // per §32.5 *Boundary `out` and `ref`* (v0.306): an accessor-mediated
+        // `ref`/`out` target goes through §22.3's copy-in/copy-out bracket;
+        // the records collected here are flushed after the call returns ("the
+        // setter is called once with the slot's final value"). An extern
+        // call's only non-normal exit is §32.8's callback abort, which
+        // terminates the process, so there is no exception edge to suppress
+        // the write-back on.
+        std::vector<AccessorRefArg> externRefArgs;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
+            // per §32.5 *Boundary `out` and `ref`* (v0.306): "`ref p: T` — C
+            // sees `T*`, receiving the **address of the caller's storage** …
+            // Direct passing is the *normative* semantics, not an as-if
+            // shortcut"; `out p: T` is "same address passing". Before this
+            // branch the extern arm lowered EVERY argument with `lowerExpr` —
+            // i.e. by VALUE — so a `ref`/`out` extern parameter silently
+            // dropped the native callee's write (`strtol(s, out e, 10)` left
+            // `e` at its pre-call value with no diagnostic anywhere). Mirrors
+            // the imported-method path's identical `lvalueAddr` + §22.3
+            // accessor-bracket shape; kept in lockstep with declareExterns'
+            // matching `ptrTy()` slot.
+            std::string_view refMod =
+                (ed && idx < ed->params.size() && !ed->params[idx].modifier.empty())
+                    ? ed->params[idx].modifier
+                    : a.modifier;
+            if (isByRefMod(refMod)) {
+                llvm::Type* slotTy = nullptr;
+                llvm::Value* addr = lvalueAddr(*a.value, slotTy);
+                if (!addr) {
+                    // §22.3's copy-in/copy-out bracketing, applied unchanged
+                    // (§32.5): a property/indexer target has no true-alias
+                    // location, so the hidden slot's address is what crosses.
+                    addr = emitAccessorRefArgCopyIn(
+                        *a.value, /*paramTy=*/nullptr,
+                        /*isOut=*/refMod != "ref", externRefArgs);
+                }
+                if (!addr) {
+                    emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+                    return nullptr;
+                }
+                args.push_back(addr);
+                ++llvmIdx;
+                ++idx;
+                continue;
+            }
             llvm::Value* v = lowerExpr(*a.value);
-            if (!v) return nullptr;
+            if (!v) {
+                emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+                return nullptr;
+            }
             // fix #3296 / §17.12 (v0.266): a `throw` expression used as an
             // argument diverges (CG40 — `lowerExpr` set `diverged_ = true` and
             // branched the current BB to `unwindBB`). The loop body below
@@ -6090,7 +6943,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             ++llvmIdx;
             ++idx;
         }
-        if (args.size() != it->second->arg_size()) return nullptr;
+        if (args.size() != it->second->arg_size()) {
+            emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+            return nullptr;
+        }
         // fix #3296 / §17.12 (v0.266): an argument `throw` expression broke
         // the loop above (the BB is already terminated by the unwind branch
         // from `emitThrowValue`). The CreateCall below would emit into that
@@ -6100,11 +6956,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // throw edge already branched to `unwindBB`, no join can reach a
         // join that consumes this). Mirrors the combinator-path fix in
         // `tryLowerResultCombinatorCall`.
-        if (diverged_) return llvm::PoisonValue::get(it->second->getReturnType());
+        if (diverged_) {
+            emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
+            return llvm::PoisonValue::get(it->second->getReturnType());
+        }
         // per §32 / issue #496: coerce the return value if the canonical
         // function returns a different type than the user's extern declared.
         // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
         llvm::Value* result = builder_.CreateCall(it->second, args);
+        // per §32.5 *Boundary `out` and `ref`* (v0.306): "write-back on return
+        // — an extern call's only non-normal exit is the callback abort of
+        // §32.8, which terminates the process, so no write-back question
+        // arises on it". Flush the §22.3 bracket in argument textual order.
+        emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/true);
         // fix #2733 (§28.3, v0.240): NO post-call reclaim is emitted here for
         // either FFI-buffer family. Both are now established on the
         // establishment-ordered cleanup stack at production and discharged at
@@ -6148,6 +7012,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (!closurePtr || !rt ||
             rt->kind != sema::TypeRef::Kind::Function)
             return nullptr;
+        // fix #4475 (§28.2 v0.30x): under --checked-disposal, an explicit
+        // `c.Dispose()` BEFORE the invoke must raise DisposedAccessException
+        // (§31.4) instead of UAF-reading the freed cell. The explicit
+        // Dispose arm emits `bz_closure_mark_disposed(c)` which sets the
+        // closure's disposed flag (offset 40); the release that follows
+        // quarantines the cell at last-drop instead of freeing it (the
+        // same shape bz_array_mark_disposed / bz_dict_mark_disposed use).
+        // We read the flag here and throw on non-zero. Sibling to the
+        // channel/semaphore/stream disposed-flag guards (#4354, #4357,
+        // #4336). Outside --checked-disposal the flag is never written,
+        // so the guard's read sees the calloc zero-fill and the throw is
+        // unreachable.
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_closure_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag = builder_.CreateCall(
+                isFn, {closurePtr}, "cd.cdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
         // Load fn_ptr from closure[0].
         llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
         // Load env_ptr from closure[1].
@@ -6392,6 +7277,79 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                        expectedSt->getElementType(1)) {
                                 args[ai] = wrapNullableValue(formalTy,
                                                              args[ai]);
+                            } else if (auto* vSt =
+                                           llvm::dyn_cast<llvm::StructType>(
+                                               args[ai]->getType())) {
+                                // fix #4979 (§5.1 "Nullable conversions",
+                                // v0.307): the closure-call arm's `S? → T?`
+                                // lift-widen, mirroring buildOrderedArgs's
+                                // #4967 fix. An `int?` argument bound to a
+                                // `long?` formal arrives here already tagged
+                                // (`{i8, i32}` against `{i8, i64}`), so neither
+                                // the null wrap nor the bare-T wrap fires, and
+                                // `verifyModule` aborts. Extract the payload,
+                                // widen per §5.1 (sign/zero-extend), re-wrap
+                                // with the hasValue tag kept. Gated on numeric
+                                // payloads so a `record?`→`record?` pass is
+                                // still a no-op. Same shape as the imported-
+                                // callee `.` arm at ~L12017.
+                                auto numeric = [](llvm::Type* t) {
+                                    return (t->isIntegerTy() &&
+                                            !t->isIntegerTy(1)) ||
+                                           t->isFloatingPointTy();
+                                };
+                                if (vSt != expectedSt &&
+                                    vSt->getNumElements() == 2 &&
+                                    vSt->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    expectedSt->getNumElements() == 2 &&
+                                    expectedSt->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    numeric(vSt->getElementType(1)) &&
+                                    numeric(expectedSt->getElementType(1))) {
+                                    llvm::Type* dstPay =
+                                        expectedSt->getElementType(1);
+                                    llvm::Value* conv = coerceNumericToType(
+                                        builder_.CreateExtractValue(
+                                            args[ai], {1u},
+                                            "cl.arg.lift.in"),
+                                        dstPay,
+                                        pi < call.args.size() &&
+                                            isUnsignedTargetExpr(
+                                                *call.args[pi].value));
+                                    if (conv && conv->getType() == dstPay) {
+                                        llvm::Value* res =
+                                            builder_.CreateInsertValue(
+                                                llvm::UndefValue::get(
+                                                    expectedSt),
+                                                builder_.CreateExtractValue(
+                                                    args[ai], {0u},
+                                                    "cl.arg.lift.has"),
+                                                {0u});
+                                        args[ai] = builder_.CreateInsertValue(
+                                            res, conv, {1u}, "cl.arg.lift");
+                                    }
+                                }
+                            } else if (args[ai]->getType()->isIntegerTy() ||
+                                       args[ai]->getType()
+                                           ->isFloatingPointTy()) {
+                                // fix #4963 (§5.1 `S → T → T?`, v0.307): a
+                                // NARROWER numeric argument at a closure's
+                                // nullable-value formal (`f(7)` against
+                                // `(long?) -> long`) widens to the payload,
+                                // then wraps — the closure-call twin of
+                                // #4922's buildOrderedArgs fix, through the
+                                // same helper. Before this the bare i32
+                                // reached the `{i8, i64}` parameter: IR
+                                // verification failure.
+                                const ast::Expr* srcE =
+                                    pi < call.args.size()
+                                        ? call.args[pi].value.get()
+                                        : nullptr;
+                                args[ai] = coerceReturnToNullableValue(
+                                    args[ai], formalTy,
+                                    srcE && isUnsignedTargetExpr(*srcE),
+                                    /*sourceIsNullableRef=*/false, srcE);
                             }
                         }
                         continue;  // type is now correct; skip numeric coercions
@@ -6512,7 +7470,82 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     closurePtr = builder_.CreateLoad(ptrTy(), addr);
                 }
             }
-            return emitClosureCall(closurePtr, rt);
+            llvm::Value* r = emitClosureCall(closurePtr, rt);
+            // fix #4422 (§27.5, v0.298): a reassigned closure-typed local's
+            // final value is excluded from scope-end release (ClosureEscapeWalker
+            // marks any reassigned local as escaped), so without an explicit
+            // release here the closure leaks — 40 B per call. Only emit the
+            // release when the local was actually reassigned (tracked in
+            // closureLocalReassigned_) AND its scope-end release is NOT armed
+            // (the slot's +1 isn't consumed elsewhere): a non-reassigned local's
+            // scope-end release already balances the slot's reference, and
+            // emitting a second release here would double-free it.
+            //
+            // fix #2107-follow-up (§27.5 / §28.9, v0.298): the multi-call
+            // discipline. When a reassigned local is CALLED, the call-site
+            // release here would free the cell after the FIRST call, leaving
+            // the SECOND (and later) call to read a freed closure pointer —
+            // exit 139 SIGSEGV (issue #2107's
+            // `spec_27_3_divergent_under_reassign_target`, the same UAF
+            // #64a9c41f's always-retain was originally added to fix). The
+            // walker (collectClosureReleaseEligible, see that function's
+            // #2107-follow-up override) re-includes CALLED reassigned locals
+            // in scope-end release and excludes TRANSEFRRED ones — so when
+            // scope-end release is armed here, SKIP the call-site release
+            // (the cell stays alive across calls, scope-end fires once at
+            // function exit). When scope-end release is NOT armed (e.g. the
+            // reassigned local is transferred via `return f` and the caller
+            // owns its +1), emit the call-site release as before.
+            //
+            // fix #4434 (§27.5 / §28.9, v0.298): the THREE-PATH release
+            // discipline. Track a per-slot call counter here (reset per scope
+            // — see closureLocalCallCounts_'s own declaration for the reset
+            // sites), and gate the call-site release on it:
+            //   (a) NOT reassigned: skip (existing pre-fix behavior — scope-end
+            //       release handles it; emitting here would double-free).
+            //   (b) reassigned AND captured-cell: SKIP, envdtor is sole owner.
+            //       The cell lives in `cellVars_` and the envdtor's release
+            //       decrements its rc, freeing it once when the capturing env
+            //       is destroyed. Adding a call-site release would over-release
+            //       (the env's release fires at call-time, the envdtor's
+            //       release fires when the env is destroyed — both target the
+            //       same +1). Pinned by the canonical regression
+            //       `codegen_closure_captured_cell_returned_uaf_4198.
+            //       single_capture_mutated_not_returned_stays_crash_free_
+            //       spec_28_9`.
+            //   (c) reassigned AND plain (not captured-cell):
+            //       — first call (counter == 0): emit release (the +1 is
+            //         consumed by this call).
+            //       — subsequent calls (counter > 0): skip (multi-call was
+            //         detected by the walker, scope-end release armed, that
+            //         release is the single source of truth for the slot's
+            //         lifetime across calls).
+            // The call counter is local to this arm's gate logic — the
+            // MULTI-CALL VERDICT itself is computed by the walker
+            // (`calleeCallCount > 1 || uncountableCalleeSeen`), which fires
+            // the scope-end override. The counter here is just an
+            // "emit-at-most-once" guard against a redundant first-call
+            // release when the call is inside a loop or repeated control
+            // structure the walker conservatively cannot attribute to a
+            // single point.
+            if (loc->decl) {
+                const void* key = static_cast<const void*>(loc->decl);
+                bool isCapturedCell =
+                    closureLocalCapturedCell_.count(key) != 0;
+                bool isReassigned = closureLocalReassigned_.count(key) != 0;
+                bool scopeEndArmed = closureReleaseEligible_.count(key) != 0;
+                bool isFirstCall =
+                    closureLocalCallCounts_[key]++ == 0;
+                // (b) captured-cell: SKIP — envdtor handles it.
+                // (c) plain reassigned: emit ONLY on first call AND when
+                // scope-end is NOT armed (single-call discipline — lane-35's
+                // override leaves escaped=true for calleeCallCount==1).
+                if (!isCapturedCell && isReassigned && !scopeEndArmed &&
+                    isFirstCall) {
+                    emitClosureRelease(closurePtr);
+                }
+            }
+            return r;
         }
     }
     // CG60: call through a function-typed field or auto-property —
@@ -6557,18 +7590,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // through the LocalSymbol path with the field read supplying the
         // closure pointer; only the FieldSymbol callee path missed the type.
         //
-        // Gated on a CLASS receiver: an imported RECORD function-typed field
-        // has a SEPARATE, deeper pre-existing defect — the cross-module field
-        // READ itself yields a bad closure pointer (the local-bind workaround
-        // `g := r.F; g(n)` segfaults on an imported record on origin/main,
-        // independent of this fix). Routing the record direct-invoke through
-        // emitClosureCall here would only turn that case's silent zero-init
-        // into a segfault without fixing the underlying read. The record
-        // field-read ABI is filed separately and out of scope for #2300
-        // (which is class-specific); leave the record direct-invoke on its
-        // pre-fix #2477 zero-init path until that lands.
-        if (!rt && fs->parent &&
-            fs->parent->kind == ast::TypeDeclKind::Class) {
+        // #2300 gated this on a CLASS receiver, because an imported RECORD's
+        // function-typed field was then never initialized across the module
+        // boundary — the read yielded null and dispatching here would have
+        // turned #2477's silent zero-init into a SIGSEGV (#2590). fix #2590
+        // (§2.8.2 / §9.2 / §28.9, v0.306) retires that carve-out: the
+        // field-initializer replay (#2874/#3671/#3723) now lands a real
+        // closure pointer at the consumer's `new` site, so a record receiver
+        // is as sound here as a class one. The allowlist itself moved to the
+        // single `importedMemberTypeAdmitsClosureDispatch` predicate above —
+        // see it for why one copy, shared with the PropertySymbol arm below,
+        // replaces the two that had drifted apart.
+        if (!rt && importedMemberTypeAdmitsClosureDispatch(fs->parent)) {
             if (sema::TypeRef* it = ctx_.importedMemberType(fs))
                 rt = it;
         }
@@ -6616,17 +7649,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the backing-field closure value; for a computed/block property the
     // getter yields it directly), and emitClosureCall on that pointer.
     //
-    // Gated on a CLASS or INTERFACE receiver for the imported-type fallback.
-    // An imported RECORD function-typed property read shares the separate
-    // deeper defect filed as #2590 (the cross-module field/closure READ
-    // yields a bad pointer): verified empirically, opening this gate to
-    // Record segfaults the imported-record direct-invoke (exit 139) — the
-    // same ABI defect #2300's record gate guards against for fields. The
-    // LOCAL record case (which has an AST decl and a sound read path) is
-    // covered by the `pd->type` branch above. Interface is included because
-    // the imported interface property read dispatches through the itable
-    // (lowerVirtualPropertyGet), which yields a sound closure pointer —
-    // verified: `i.F(10)` on an imported `IFunc` returns 11, no segfault.
+    // #2589 gated the imported-type fallback on a CLASS or INTERFACE
+    // receiver: an imported RECORD's function-typed auto-property shared the
+    // #2590 defect (its backing field was never initialized across the module
+    // boundary, so opening this gate produced a SIGSEGV rather than the #2477
+    // zero-init). fix #2590 (§2.8.2 / §9.2 / §23.1 / §28.9, v0.306) retires
+    // that carve-out for the same reason the FieldSymbol arm's above is
+    // retired — the #2874/#3671/#3723 replay initializes the backing field at
+    // the consumer's `new` site — and both arms now ask the SINGLE
+    // `importedMemberTypeAdmitsClosureDispatch` predicate instead of keeping
+    // one receiver-kind allowlist each. The LOCAL record case (which has an
+    // AST decl and a sound read path) is covered by the `pd->type` branch
+    // below and is untouched. Interface stays admitted because the imported
+    // interface property read dispatches through the itable
+    // (lowerVirtualPropertyGet), which yields a sound closure pointer.
     // The `rt->kind == Function` guard still gates dispatch, so a non-
     // function-typed property read (`obj.N`, an int) is wholly unaffected —
     // it never enters this arm's dispatch.
@@ -6635,12 +7671,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             sema::TypeRef* rt = nullptr;
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                 if (pd->type) rt = ctx_.resolvedType(*pd->type);
-            } else if (ps->parent &&
-                       (ps->parent->kind == ast::TypeDeclKind::Class ||
-                        ps->parent->kind == ast::TypeDeclKind::Interface)) {
-                // Imported class/interface property: no ast::PropertyDecl
-                // (the importer reconstructs the PropertySymbol from
-                // dependency metadata), so the resolved type rides the
+            } else if (importedMemberTypeAdmitsClosureDispatch(ps->parent)) {
+                // Imported class/interface/record property: no
+                // ast::PropertyDecl (the importer reconstructs the
+                // PropertySymbol from dependency
+                // metadata), so the resolved type rides the
                 // importedMemberType side table — mirroring #2300's
                 // imported-field fallback and every other imported-property
                 // read site (LlvmBackend_Exprs.cpp ~L4844
@@ -6830,6 +7865,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
             llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy);
+            // fix #4239 (§27.5 / §28.9, v0.300): when the chain-call result is
+            // a class/record type, store through the local's OWN slot and register
+            // scope-end disposal.  lowerLocalDecl wires the slot to us via
+            // pendingChainCallLocalSlot_ so we use the same slot the disposal
+            // will fire on.
+            if (calleeTy->funcReturn &&
+                calleeTy->funcReturn->kind == sema::TypeRef::Kind::Named &&
+                calleeTy->funcReturn->declaration &&
+                !calleeTy->funcReturn->nullable) {
+                llvm::AllocaInst* ccResSlot = pendingChainCallLocalSlot_;
+                if (!ccResSlot) {
+                    ccResSlot = builder_.CreateAlloca(
+                        ccRes->getType(), nullptr, "ccres.slot");
+                } else {
+                    pendingChainCallLocalSlot_ = nullptr;
+                }
+                builder_.CreateStore(ccRes, ccResSlot);
+                Disposal d{ccResSlot, calleeTy->funcReturn->declaration};
+                disposeStack_.back().push_back(d);
+            }
             // #422 / §28.9: release the transient closure after the call.
             // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287):
             // mirror the Stmts.cpp:2626 mint gate at the chain-call
@@ -6874,9 +7929,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (ret) retVal = ret->value.get();
                         }
                         if (retVal) {
+                            // fix #4239 (§28.3 / §30.5, v0.298): the
+                            // returnedClosureLocalOwnsPlusOne() predicate
+                            // returns false when called from the chain-call
+                            // site (currentFn_ = C.Main, not MakeClosure),
+                            // so this test was always false for the named-
+                            // local return case. Directly check whether retVal
+                            // is a local-identifier whose initializer is a +1
+                            // closure producer (lambda literal or method ref).
+                            // For `return f;` where `f := lambda() => …`:
+                            //   - f's initializer IS a +1 producer → local
+                            //     owns the +1 → innerMints = false → ONE
+                            //     release (correct, no double-free).
+                            // For `return g();` where g is a closure local:
+                            //   - g's initializer is a lambda (a +1 producer)
+                            //     but the call CONSUMES g (rc(g) goes to 0),
+                            //     and the return mints a new +1 → innerMints
+                            //     = true → TWO releases (correct).
+                            bool localOwnsPlusOne = false;
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(retVal)) {
+                                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                                    LocalDeclInitView dv = localDeclInitView(loc->decl);
+                                    if (dv.init && isPlusOneClosureProducer(dv.init))
+                                        localOwnsPlusOne = true;
+                                }
+                            }
                             innerMints = !isPlusOneClosureProducer(retVal) &&
                                          !isUserMethodClosureReturnCall(retVal) &&
-                                         !returnedClosureLocalOwnsPlusOne(retVal);
+                                         !localOwnsPlusOne;
                         }
                     }
                 }
@@ -8111,11 +9191,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // was missing. This is fix #3422's sibling on the other
                         // operand: that one is the `()` RECEIVER, this the
                         // value-typed ARGUMENT.
-                        llvm::Value* other =
-                            lowerUniversalEqualsArg(*call.args[0].value);
-                        if (recv && other)
-                            if (llvm::Value* r = lowerObjectEquals(recv, other))
-                                return r;
+                        //
+                        // fix #3480 (§8.6 / §28.9, v0.306): the argument box's
+                        // §28.9 discharge now rides the SAME helper as its
+                        // mint, so the lifetime rule cannot be applied here and
+                        // forgotten at the `?.`, generic-T or value-receiver
+                        // spelling. `isKnownBoxReceiverExpr` is what makes it
+                        // admissible — see `lowerUniversalEqualsDispatch`.
+                        if (llvm::Value* r = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(ma->target.get())))
+                            return r;
                     } else {
                         if (recv)
                             if (llvm::Value* r = lowerObjectGetHashCode(recv))
@@ -10100,9 +11186,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     bool memberAlreadyDispatched =
                         receiverIsPlainLocalRead &&
                         emittedSideEffectSince(effectiveDispatchEntry);
+                    // fix #4200 (spec §10/§11, v0.298): `new
+                    // Stopwatch().TotallyBogusMember()` is silently accepted
+                    // without warning because `isConcreteType` is false
+                    // (declaration == nullptr for nullary stdlib class
+                    // `Stopwatch`), so the Shape 1/2 condition below never
+                    // fires. Add a third shape: call-shaped receiver
+                    // (CallExpr/NewExpr) whose resolved type has no declaration
+                    // — the same `new Stopwatch()` / `Stopwatch.StartNew()`
+                    // ambiguity the #4171 comment above already analyses.
+                    bool receiverIsCallShapedBuiltin =
+                        (dynamic_cast<const ast::CallExpr*>(
+                             ma->target.get()) ||
+                         dynamic_cast<const ast::NewExpr*>(
+                             ma->target.get())) &&
+                        recvTy && recvTy->kind == K::Named &&
+                        !recvTy->declaration;
                     if (!memberAlreadyDispatched &&
                         (isConcreteType ? !isUniversalObjMember
-                                        : isBareTypeParamInDeadTemplate)) {
+                                        : isBareTypeParamInDeadTemplate ||
+                                            receiverIsCallShapedBuiltin)) {
                         // Same derivation the §8.1 reject above uses — one
                         // `receiverName` lambda, not two copies (#2924's
                         // four-way-mirror finding).
@@ -10201,6 +11304,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // of this function. Null when the receiver is not such a temporary.
     llvm::AllocaInst* recvUnwindSlot = nullptr;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
+    // fix #4597 (§22.16, v0.306): "A call whose receiver is `this` — explicit
+    // or implicit — from inside any instance member of the class or a
+    // subclass enters the member's unchecked face". Decided HERE, from the
+    // callee's own SYNTAX, because that is what the spec makes the rule turn
+    // on and what makes it "statically decidable": a bare callee is the
+    // implicit `this`; `this.M()` and `base.M()` are the explicit spellings.
+    // Deliberately NOT `recv == currentThis_` — a value test would also
+    // capture `var a := this; a.M();`, which §22.16 leaves checked, and would
+    // miss nothing it gains. Guarded on `currentThis_` so a call lowered
+    // outside any instance member (a static body, a module function) is never
+    // mistaken for one.
+    bool thisReceiver = false;
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
         llvm::Value* recv = nullptr;
@@ -10209,10 +11324,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     ma->target.get())) {
                 if (tid->name == "base") baseQualified = true;
+                if (tid->name == "this" || tid->name == "base")
+                    thisReceiver = currentThis_ != nullptr;
             }
             recv = ma->target ? lowerExpr(*ma->target) : nullptr;
         } else {
             recv = currentThis_;
+            thisReceiver = currentThis_ != nullptr;
         }
         if (!recv) return nullptr;
         // #2106 / §7.4: a flow-narrowed nullable VALUE-type receiver (`p: Point?`
@@ -10489,6 +11607,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (!recvUnwindSlot) {
                 disposeFreshNewReceiverTempDeferred(
                     recvTempExpr, recv, ctx_.exprType(call), &call);
+                // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): the
+                // non-nullable-`string`-result arm that
+                // `freshNewReceiverTempEligible` declines (so `recvUnwindSlot`
+                // is null here) and `disposeFreshNewReceiverTempDeferred`
+                // declines too (its result must be a deferred-activation head,
+                // which a primitive never is — the two predicates are
+                // disjoint). §28.3 puts this reclaim at the K8 full-expression
+                // boundary rather than inline after the call; the queue entry
+                // carries it there, and the disposeStack_ entry the helper also
+                // pushes covers the exception edge.
+                registerFreshNewReceiverTempK8(recvTempExpr, recv,
+                                               ctx_.exprType(call));
             }
         }
     }
@@ -10513,11 +11643,86 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // (emitFunctionBody for the unspecialized generic would then use T=ptr for
     // its closure call type, producing a i32(ptr,ptr) fnTy with an i32 arg →
     // IR verification failure).
+    //
+    // fix #4899: entries buildOrderedArgs records for THIS call start here; a
+    // nested call inside an argument truncates back to its own base.
+    const std::size_t bareTParamUnwrapBase = bareTParamNarrowUnwraps_.size();
+    // fix #4899: the formals buildOrderedArgs bound against — captured in the
+    // local-MethodDecl arm below so the restore need not re-read ms->decl
+    // (the imported else-branch records no entries).
+    const std::vector<ast::Param>* bareTParamUnwrapParams = nullptr;
     {
+        // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): a collection-literal
+        // argument is built at the callee's FORMAL type (see buildOrderedArgs),
+        // so give that arm the callee's own type-parameter bindings. They are
+        // exactly what applyMethodGenericSubst installs for the callee body
+        // below; it is run here on a scratch copy of the (caller's) maps and
+        // only the callee's own, non-owner names are kept. Saved and restored
+        // around this call so a nested call's arguments see their own callee.
+        const std::vector<ast::Param>* savedFormalParams =
+            calleeFormalSubstParams_;
+        auto savedFormalSema = std::move(calleeFormalSemaSubst_);
+        calleeFormalSubstParams_ = nullptr;
+        calleeFormalSemaSubst_.clear();
+        struct FormalSubstRestore {
+            Emitter& e;
+            const std::vector<ast::Param>* params;
+            std::unordered_map<std::string_view, const sema::TypeRef*>& sema;
+            ~FormalSubstRestore() {
+                e.calleeFormalSubstParams_ = params;
+                e.calleeFormalSemaSubst_ = std::move(sema);
+            }
+        } formalSubstRestore{*this, savedFormalParams, savedFormalSema};
+        // fix #5041 (§14.1, v0.307): likewise scope the lambda pre-pass's
+        // callee-own type-parameter set to THIS call (see the member's comment).
+        const std::vector<ast::Param>* savedLambdaOwnParams =
+            lambdaCalleeOwnParams_;
+        auto savedLambdaOwnTParams = std::move(lambdaCalleeOwnTParams_);
+        lambdaCalleeOwnParams_ = nullptr;
+        lambdaCalleeOwnTParams_.clear();
+        struct LambdaOwnTParamsRestore {
+            Emitter& e;
+            const std::vector<ast::Param>* params;
+            std::unordered_set<std::string_view>& names;
+            ~LambdaOwnTParamsRestore() {
+                e.lambdaCalleeOwnParams_ = params;
+                e.lambdaCalleeOwnTParams_ = std::move(names);
+            }
+        } lambdaOwnTParamsRestore{*this, savedLambdaOwnParams,
+                                  savedLambdaOwnTParams};
+        // One read of the callee's declaration serves both pre-passes in this
+        // block (the literal-formal bindings here and the lambda pre-pass
+        // below); fix #4813 adds no new MemberSymbol::decl classification.
+        const auto* prePassMd = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (auto* md = prePassMd) {
+            bool hasLiteralArg = false;
+            for (const auto& a : call.args)
+                if (a.value && dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                   a.value.get())) {
+                    hasLiteralArg = true;
+                    break;
+                }
+            if (hasLiteralArg && !md->genericParams.empty()) {
+                auto scratchSubst = genericSubst_;
+                auto scratchSema = genericSubstSemaTy_;
+                applyMethodGenericSubst(call, ms);
+                const auto ownerNames = calleeOwnerTypeParamNames(ctx_, ms);
+                for (const auto& gp : md->genericParams) {
+                    if (ownerNames.count(gp.name)) continue;
+                    auto it = genericSubstSemaTy_.find(gp.name);
+                    if (it != genericSubstSemaTy_.end() && it->second)
+                        calleeFormalSemaSubst_[gp.name] = it->second;
+                }
+                genericSubst_ = std::move(scratchSubst);
+                genericSubstSemaTy_ = std::move(scratchSema);
+                if (!calleeFormalSemaSubst_.empty())
+                    calleeFormalSubstParams_ = &md->params;
+            }
+        }
         bool didPrePass = false;
         std::unordered_map<std::string_view, llvm::Type*> preSavedSubst;
         std::unordered_map<std::string_view, const sema::TypeRef*> preSavedSema;
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (auto* md = prePassMd) {
             if (!md->genericParams.empty()) {
                 // Check whether any argument is a lambda (function-type formal).
                 bool hasLambdaArg = false;
@@ -10534,37 +11739,42 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     std::unordered_map<std::string_view,
                                        const sema::TypeRef*> preSema =
                         genericSubstSemaTy_;
-                    for (const auto& gp : md->genericParams) {
-                        if (preSubst.count(gp.name)) continue;
-                        for (std::size_t pi = 0;
-                             pi < md->params.size() && pi < call.args.size();
-                             ++pi) {
-                            const ast::Type* pt = md->params[pi].type.get();
-                            if (!pt || pt->kind != ast::TypeKind::Named ||
-                                !pt->name ||
-                                pt->name->parts.size() != 1 ||
-                                pt->name->parts[0] != gp.name)
-                                continue;
-                            if (!call.args[pi].value) continue;
-                            // Skip lambda args — only infer from concrete vals.
-                            if (dynamic_cast<const ast::LambdaExpr*>(
-                                    call.args[pi].value.get()))
-                                continue;
-                            sema::TypeRef* at =
-                                ctx_.exprType(*call.args[pi].value);
-                            if (!at) continue;
-                            llvm::Type* lt = lowerTypeRef(at);
-                            if (lt != i32()) {
-                                preSubst[gp.name] = lt;
-                                preSema[gp.name] = at;
-                            }
-                            break;
+                    // fix #4813 (§14.1 / §14.5, v0.307): the callee's type
+                    // parameters are its own — drop a same-NAMED caller
+                    // binding so the `count` guards below cannot mistake it
+                    // for the callee's (see applyMethodGenericSubst). The
+                    // bindings made here are resolved in the caller's
+                    // substitution, which is the active one at this point.
+                    // A name the callee's declaring type also binds is kept
+                    // (calleeOwnerTypeParamNames; #4862).
+                    {
+                        const auto ownerNames =
+                            calleeOwnerTypeParamNames(ctx_, ms);
+                        for (const auto& gp : md->genericParams) {
+                            if (ownerNames.count(gp.name)) continue;
+                            preSubst.erase(gp.name);
+                            preSema.erase(gp.name);
+                            lambdaCalleeOwnTParams_.insert(gp.name);
                         }
+                        if (!lambdaCalleeOwnTParams_.empty())
+                            lambdaCalleeOwnParams_ = &md->params;
                     }
+                    // fix #5041 (§14.5 phase 1, v0.307): explicit type
+                    // arguments are seeded FIRST and are authoritative — the
+                    // argument-inference loop below skips every name they
+                    // bind, mirroring sema's #4935 gate (inference runs only
+                    // when the call site gave no type arguments). Seeded
+                    // after inference, as before, `Map<int?>(null, lambda(y)
+                    // => …)` bound T from `null`'s own type (a reference,
+                    // `ptr`) and `Map<long?>(7L, …)` from `long` (`i64`), so
+                    // the lambda was emitted with a `ptr` / `i64` parameter
+                    // while the specialization passed the `{i8, T}` nullable
+                    // carrier — an ASan SEGV in bz_obj_is_string.
+                    std::unordered_set<std::string_view> explicitTypeArgNames;
                     // per §14.1 (issue #516/#561): a generic method with U
                     // appearing ONLY in the lambda's return type (e.g.
-                    // `Apply<U>(x:int, fn:(int)->U):U`) may leave U unbound
-                    // after the non-lambda arg loop above — no concrete arg has
+                    // `Apply<U>(x:int, fn:(int)->U):U`) is left U unbound by
+                    // the non-lambda arg loop below — no concrete arg has
                     // declared type exactly `U`. If the call site supplies
                     // explicit type arguments (`Apply<string>(...)`), those
                     // explicit args settle the substitution. Seed from the
@@ -10592,15 +11802,119 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             sema::TypeRef* concreteArg =
                                 ctx_.resolvedType(*(*callTAs)[gi]);
                             if (!concreteArg) continue;
+                            explicitTypeArgNames.insert(pname);
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             if (lt != i32()) {
+                                // Unchanged pre-#4896 behavior (see the
+                                // non-lambda arg loop below for the
+                                // rationale).
                                 preSubst[pname] = lt;
-                                preSema[pname] = concreteArg;
+                                preSema[pname] = substituteTypeRefLocal(
+                                    concreteArg, genericSubstSemaTy_);
+                            } else {
+                                // fix #4896: same substitute-then-gate as
+                                // the non-lambda arg loop below — an
+                                // explicit type argument can itself be a
+                                // bare outer-method type-parameter
+                                // reference (e.g. `Map<T>(v, lambda(y) =>
+                                // …)` inside `Go<T>`'s body).
+                                const sema::TypeRef* concreteArgSub =
+                                    substituteTypeRefLocal(
+                                        concreteArg, genericSubstSemaTy_);
+                                if (!isBareTypeParamRef(concreteArgSub)) {
+                                    preSema[pname] = concreteArgSub;
+                                }
                             }
                         }
                     }
                     }
-                    if (preSubst != genericSubst_) {
+                    for (const auto& gp : md->genericParams) {
+                        if (preSubst.count(gp.name) ||
+                            explicitTypeArgNames.count(gp.name))
+                            continue;
+                        for (std::size_t pi = 0;
+                             pi < md->params.size() && pi < call.args.size();
+                             ++pi) {
+                            const ast::Type* pt = md->params[pi].type.get();
+                            if (!pt || pt->kind != ast::TypeKind::Named ||
+                                !pt->name ||
+                                pt->name->parts.size() != 1 ||
+                                pt->name->parts[0] != gp.name)
+                                continue;
+                            if (!call.args[pi].value) continue;
+                            // Skip lambda args — only infer from concrete vals.
+                            if (dynamic_cast<const ast::LambdaExpr*>(
+                                    call.args[pi].value.get()))
+                                continue;
+                            sema::TypeRef* at =
+                                ctx_.exprType(*call.args[pi].value);
+                            // fix #4813 (§14.5 phase 1, §27.4, v0.307): an
+                            // enclosing lambda's inferred parameter (`y` in
+                            // `Map(v, lambda(y) => Map(y, lambda(z) => …))`)
+                            // has no sema expression type until lowerExpr
+                            // injects its hint, which runs AFTER this
+                            // pre-pass. Read the hint directly; without it
+                            // the callee's own `W` (just erased above) stayed
+                            // unbound and the inner lambda's `z` was lowered
+                            // at the i32 placeholder (a string printed as an
+                            // address).
+                            if (!at) {
+                                if (auto* aid =
+                                        dynamic_cast<const ast::IdentifierExpr*>(
+                                            call.args[pi].value.get())) {
+                                    auto hit = lambdaParamTypeHint_.find(
+                                        ctx_.exprSymbol(*aid));
+                                    if (hit != lambdaParamTypeHint_.end())
+                                        at = hit->second;
+                                }
+                            }
+                            if (!at) continue;
+                            llvm::Type* lt = lowerTypeRef(at);
+                            if (lt != i32()) {
+                                // Unchanged pre-#4896 behavior: `at` may
+                                // itself still be a bare outer-method type
+                                // parameter (e.g. `v`'s sema type is Go's
+                                // bare `T` when this call is nested inside
+                                // Go<T>'s body), but lowerTypeRef already
+                                // resolved it to a concrete non-i32 LLVM
+                                // type (e.g. `ptr` for `string`). Since
+                                // #4813 the sema entry is substituted
+                                // through the active context; it must not
+                                // be gated on bareness.
+                                preSubst[gp.name] = lt;
+                                preSema[gp.name] = substituteTypeRefLocal(
+                                    at, genericSubstSemaTy_);
+                            } else {
+                                // fix #4896 (§14.5 phase 2, §18.5
+                                // interpolated strings, v0.307): `lt ==
+                                // i32()` is ambiguous — it
+                                // covers a genuinely still-unresolved
+                                // placeholder AND a type parameter resolved
+                                // to `char`/an `enum` (both of which lower
+                                // to i32). Substitute `at` against the
+                                // ACTIVE genericSubstSemaTy_ (this call's
+                                // enclosing generic method's own
+                                // monomorphization, e.g. Go<T>'s T → char)
+                                // to tell the two apart: if the result is
+                                // still bare, `at` really is unresolved and
+                                // we skip, matching the original behavior;
+                                // if it resolved to something concrete,
+                                // record ONLY the sema substitution — the
+                                // LLVM type is still i32, so recording
+                                // preSubst would be indistinguishable from
+                                // no entry.
+                                const sema::TypeRef* atSub =
+                                    substituteTypeRefLocal(
+                                        at, genericSubstSemaTy_);
+                                if (!isBareTypeParamRef(atSub)) {
+                                    preSema[gp.name] = atSub;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (preSubst != genericSubst_ ||
+                        preSema != genericSubstSemaTy_) {
                         preSavedSubst = genericSubst_;
                         preSavedSema  = genericSubstSemaTy_;
                         genericSubst_ = std::move(preSubst);
@@ -10667,6 +11981,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         std::unordered_map<std::string_view,
                                            const sema::TypeRef*>
                             preSema = genericSubstSemaTy_;
+                        // fix #4813: as in the lambda pre-pass above,
+                        // keeping a name the declaring type binds (#4862).
+                        {
+                            const auto ownerNames =
+                                calleeOwnerTypeParamNames(ctx_, ms);
+                            for (const auto& gp : md->genericParams) {
+                                if (ownerNames.count(gp.name)) continue;
+                                preSubst.erase(gp.name);
+                                preSema.erase(gp.name);
+                            }
+                        }
                         for (std::size_t gi = 0;
                              gi < md->genericParams.size() &&
                              gi < callTAs->size(); ++gi) {
@@ -10679,7 +12004,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (!concreteArg) continue;
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             preSubst[pname] = lt;
-                            preSema[pname] = concreteArg;
+                            preSema[pname] = substituteTypeRefLocal(
+                                concreteArg, genericSubstSemaTy_);
                         }
                         if (preSubst != genericSubst_) {
                             if (!didPrePass) {
@@ -10689,6 +12015,138 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             }
                             genericSubst_ = std::move(preSubst);
                             genericSubstSemaTy_ = std::move(preSema);
+                        }
+                    }
+                }
+            }
+        }
+        // fix #5024 (§14.1 / §14.5, v0.307): a call through a RECEIVER whose
+        // static type instantiates a generic CLASS (`Box<T>`) with a lambda
+        // argument (`b.Apply(lambda(y) => …)`, `b: Box<U>` inside `Go<U>`'s
+        // own body) never reaches the pre-pass above at all when the callee
+        // method (`Apply`) declares no generic parameters of its OWN — the
+        // class's `T` is not in `md->genericParams` (that list is the
+        // method's own `<...>` clause only), so the whole
+        // `if (!md->genericParams.empty())` gate above is skipped.
+        // `genericSubstSemaTy_["T"]` is populated only by the "CG-generic"
+        // receiver substitution further below (the `!isStaticMethod(ms) &&
+        // ms->parent && !args.empty()` block), which runs AFTER
+        // `buildOrderedArgs` — too late for `lowerLambda`'s #4896 hint
+        // injection, which consults `genericSubstSemaTy_` while lowering the
+        // lambda argument HERE. The formal parameter `y: T` therefore kept
+        // the bare placeholder type, and when `T` resolved to `char`/an enum
+        // (both LLVM `i32`, indistinguishable at the LLVM level from
+        // "unresolved") interpolating `y` fell through to the raw-integer
+        // fallback (`Util.Go<char>('m')` printed `<109>` instead of `<m>`).
+        //
+        // Bind the callee's OWNER (declaring class) type-parameter names
+        // from the receiver's own class instantiation before
+        // `buildOrderedArgs` runs, mirroring the "CG-generic" computation
+        // below but early enough for the lambda pre-pass to see it.
+        // Additive only: a name already bound — by the method-generic-param
+        // pre-pass above or by an outer scope — is left untouched, and a
+        // still-bare resolution (the receiver's own type argument is itself
+        // an unresolved outer parameter) is skipped rather than recorded.
+        //
+        // fix #5094 (§14.1 / §14.5, v0.307): #5024's own binding below gates
+        // on an EXACT match (`recvTy->declaration == ms->parent`), so an
+        // INHERITED (not overridden) lambda-taking method called through a
+        // SUBCLASS receiver (`SubBox<U>: Box<U>` calling inherited `Apply`)
+        // missed this pre-pass entirely — same bug, same `<109>` instead of
+        // `<m>` output, just one level of inheritance away from #5024's own
+        // repro. The block below now branches: an exact-match receiver keeps
+        // #5024's binding unchanged; a subclass receiver instead asks the
+        // shared #585/#2840 `computeAncestorGenericSubst` walk to compose the
+        // base-chain substitution up to `ms->parent`.
+        if (!isStaticMethod(ms) && ms->parent &&
+            !ms->parent->genericParams.empty()) {
+            bool hasLambdaArgForRecv = false;
+            for (const auto& a : call.args) {
+                if (a.value &&
+                    dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    hasLambdaArgForRecv = true;
+                    break;
+                }
+            }
+            if (hasLambdaArgForRecv) {
+                const ast::Expr* recvExpr = nullptr;
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call.callee.get()))
+                    recvExpr = ma->target.get();
+                if (recvExpr) {
+                    sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration) {
+                        std::unordered_map<std::string_view, llvm::Type*>
+                            recvSubst = genericSubst_;
+                        std::unordered_map<std::string_view,
+                                           const sema::TypeRef*>
+                            recvSema = genericSubstSemaTy_;
+                        bool changed = false;
+                        if (recvTy->declaration == ms->parent &&
+                            !recvTy->genericArgs.empty()) {
+                            // Direct-class receiver: #5024's original binding.
+                            const std::vector<std::string_view> ownerGpNames =
+                                sema::genericParamNames(ms->parent);
+                            if (ownerGpNames.size() ==
+                                recvTy->genericArgs.size()) {
+                                for (std::size_t gi = 0;
+                                     gi < ownerGpNames.size(); ++gi) {
+                                    std::string_view pname = ownerGpNames[gi];
+                                    if (recvSubst.count(pname)) continue;
+                                    const sema::TypeRef* argSema =
+                                        substituteTypeRefLocal(
+                                            recvTy->genericArgs[gi],
+                                            genericSubstSemaTy_);
+                                    if (!argSema || isBareTypeParamRef(argSema))
+                                        continue;
+                                    recvSubst[pname] = lowerTypeRef(argSema);
+                                    recvSema[pname] = argSema;
+                                    changed = true;
+                                }
+                            }
+                        } else if (recvTy->declaration != ms->parent) {
+                            // fix #5094 (§14.1 / §14.5, v0.307): the receiver's
+                            // static type is a SUBCLASS of the class that
+                            // DECLARES the callee (an INHERITED, not
+                            // overridden, method) — the exact-match gate above
+                            // (`recvTy->declaration == ms->parent`) misses this
+                            // shape entirely; #5024 only covers the direct-
+                            // class receiver (its own repro never subclasses
+                            // `Box<T>`). Walk the base chain with the shared
+                            // #585/#2840 `computeAncestorGenericSubst`
+                            // authority instead of re-deriving the walk here:
+                            // it already composes each level's
+                            // `baseTypeRefs[i]->genericArgs` against the level
+                            // below, so a pass-through subclass (`SubBox<U>:
+                            // Box<U>`), a fixed base argument (`IntBox:
+                            // Box<char>`), a reordered base-clause param
+                            // (`Pair2<A,B>: Base<B>`), and a two-level chain
+                            // all resolve `ms->parent`'s own param names the
+                            // same way its other call sites already rely on.
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                ancSubst;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*>
+                                ancSema;
+                            if (computeAncestorGenericSubst(
+                                    recvTy, ms->parent, ancSubst, ancSema)) {
+                                for (auto& [pname, argSema] : ancSema) {
+                                    if (recvSubst.count(pname)) continue;
+                                    recvSubst[pname] = ancSubst[pname];
+                                    recvSema[pname] = argSema;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if (changed) {
+                            if (!didPrePass) {
+                                preSavedSubst = genericSubst_;
+                                preSavedSema  = genericSubstSemaTy_;
+                                didPrePass = true;
+                            }
+                            genericSubst_ = std::move(recvSubst);
+                            genericSubstSemaTy_ = std::move(recvSema);
                         }
                     }
                 }
@@ -10707,6 +12165,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // walk `md`'s body. Cleared on every exit below (success, early
             // bail-out, post-CreateCall release emission).
             currentCallee_ = md;
+            bareTParamUnwrapParams = &md->params;
             if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                                   /*nullTransferredOwned=*/true,
                                   &accessorRefArgs)) {
@@ -10867,9 +12326,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // buildOrderedArgs exactly: a `null` literal becomes the
                 // all-zero `{i8 0, T 0}` (nullableValueNull); a bare T
                 // becomes `{i8 1, T}` (wrapNullableValue); a value already
-                // shaped is left alone. No-op for ref/out (the `byRef` arm
-                // passes an address, which the callee receives as a pointer
-                // and never a tagged struct).
+                // shaped is left alone.
+                //
+                // fix #4940 / §5.1 (v0.307): add the S? → T? lift-widen
+                // buildOrderedArgs's #4967 fix added. The earlier three-line
+                // mirror matched the SHAPE only — an `int?` argument at a
+                // `long?` formal left the i32 carrier untouched, and
+                // `verifyModule` rejected the call (`{i8, i32}` supplied
+                // against `{i8, i64}` declared). Without the lift the local
+                // ctor / method path was right but every cross-module call
+                // crashed the IR verifier (a 4294967295 read on the non-null
+                // arm if the bad IR made it to the linker — exactly the
+                // symptom #4940 reports on a single-module probe). Extract
+                // the payload, sign/zero-extend per §5.1, re-wrap into the
+                // expected struct. Same widening shape as the local twin,
+                // gated on numeric payloads so a `record?` to `record?`
+                // pass is still a no-op.
                 if (!byRef && formalTy && isNullableValueTy(formalTy)) {
                     auto* expectedSt = nullableValueStructTy(formalTy);
                     if (v->getType() != expectedSt) {
@@ -10879,6 +12351,49 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         } else if (v->getType() ==
                                    expectedSt->getElementType(1)) {
                             v = wrapNullableValue(formalTy, v);
+                        } else if (auto* vSt =
+                                       llvm::dyn_cast<llvm::StructType>(
+                                           v->getType())) {
+                            // S? → T? widening (mirrors buildOrderedArgs
+                            // widenNullableArgPayload #4967).
+                            auto numeric = [](llvm::Type* t) {
+                                return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                                       t->isFloatingPointTy();
+                            };
+                            if (vSt != expectedSt &&
+                                vSt->getNumElements() == 2 &&
+                                vSt->getElementType(0) == nullablePrimHasValTy() &&
+                                expectedSt->getNumElements() == 2 &&
+                                expectedSt->getElementType(0) ==
+                                    nullablePrimHasValTy() &&
+                                numeric(vSt->getElementType(1)) &&
+                                numeric(expectedSt->getElementType(1))) {
+                                llvm::Type* dstPay =
+                                    expectedSt->getElementType(1);
+                                llvm::Value* conv = coerceNumericToType(
+                                    builder_.CreateExtractValue(
+                                        v, {1u}, "imp.arg.lift.in"),
+                                    dstPay,
+                                    a.value &&
+                                        isUnsignedTargetExpr(*a.value));
+                                if (conv && conv->getType() == dstPay) {
+                                    llvm::Value* res = builder_.CreateInsertValue(
+                                        llvm::UndefValue::get(expectedSt),
+                                        builder_.CreateExtractValue(
+                                            v, {0u}, "imp.arg.lift.has"),
+                                        {0u});
+                                    v = builder_.CreateInsertValue(
+                                        res, conv, {1u}, "imp.arg.lift");
+                                }
+                            }
+                        } else if (v->getType()->isIntegerTy() ||
+                                   v->getType()->isFloatingPointTy()) {
+                            // fix #4963 (§5.1 `S → T → T?`, v0.307): the
+                            // imported-callee twin of #4922's widen-then-
+                            // wrap (an `int` argument at a `long?` formal).
+                            v = coerceReturnToNullableValue(
+                                v, formalTy, isUnsignedTargetExpr(*a.value),
+                                /*sourceIsNullableRef=*/false, a.value.get());
                         }
                     }
                 }
@@ -11204,14 +12719,50 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             std::unordered_map<std::string_view,
                                                const sema::TypeRef*>
                                 newSema;
+                            // fix #2755 (§14.1 *Instantiation and its site*,
+                            // §2.8.3 rule 4, v0.306): compose the SEMA
+                            // argument through the still-active OUTER
+                            // substitution before storing it, exactly as the
+                            // INSTANCE arm of this same function does
+                            // (`newSema[pname] = argSema;` above). The two
+                            // halves used to disagree: `lowerTypeRef` reads
+                            // `genericSubst_`, which is still the outer map
+                            // at this point, so the LLVM half COMPOSED
+                            // (`T → i64` for `Inner<U>.Head()` inside a live
+                            // `OuterU<long>`), while the sema half stored the
+                            // still-open `U` RAW. Every consumer of the sema
+                            // half then saw an unbound type parameter: the
+                            // specialization NAME loop skips a `declaration`-
+                            // less ref, so the callee was emitted as
+                            // `Inner$Head$spec` with no `$Long` suffix —
+                            // indistinguishable from the dead-template
+                            // pseudo-specialization; the specialization CACHE
+                            // KEY keyed on `typeRefIdentityKey(U)` so distinct
+                            // instantiations collided; and `lowerTypeRef`'s
+                            // nullable bare-parameter branch fell back to the
+                            // `{i8, i32}` placeholder. A live, concrete caller
+                            // (`OuterU$Head$spec$long`, returning `{i8,i64}`)
+                            // therefore called a body built under a
+                            // NON-concrete substitution, returning `{i8,i32}`
+                            // — malformed IR, caught by `verifyModule` as
+                            // "Function return type does not match operand
+                            // type of return inst!" on a legal program.
+                            // `substituteTypeRefLocal` is the RECURSIVE
+                            // superset of `resolveTypeParamRef`, needed here
+                            // because a nested `Inner<Wrap<U>>` argument is
+                            // not a top-level bare parameter. An empty outer
+                            // map makes it the identity, so the direct
+                            // `Inner<long>.Head()` path is unchanged.
                             for (std::size_t gi = 0; gi < nGP; ++gi) {
-                                llvm::Type* concrTy =
-                                    lowerTypeRef(recvTy->genericArgs[gi]);
+                                const sema::TypeRef* argSema =
+                                    substituteTypeRefLocal(
+                                        recvTy->genericArgs[gi],
+                                        genericSubstSemaTy_);
                                 // Local generic: name comes from ast::TypeDecl;
                                 // imported: name comes from sema::Symbol.
                                 std::string_view pname = gpNames[gi];
-                                newSubst[pname] = concrTy;
-                                newSema[pname] = recvTy->genericArgs[gi];
+                                newSubst[pname] = lowerTypeRef(argSema);
+                                newSema[pname] = argSema;
                             }
                             genericSubst_ = std::move(newSubst);
                             genericSubstSemaTy_ = std::move(newSema);
@@ -11227,7 +12778,25 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the actual argument types, explicit call-site type args, or the call's
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
-    applyMethodGenericSubst(call, ms);
+    // fix #4813 (§14.1, v0.307): `savedSubst`/`savedSemaTy` are the CALLER's
+    // maps; the receiver-class block above may have replaced the active ones
+    // wholesale, and the call site's type arguments are written in the caller.
+    applyMethodGenericSubst(call, ms, &savedSubst, &savedSemaTy);
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): with the class- and method-level
+    // substitution now installed, a bare `v: T` formal at `T := int?` is known
+    // to be a nullable value type — restore the {i8,T} carrier the argument
+    // binding stripped before `T` was known.
+    if (bareTParamUnwrapParams &&
+        bareTParamNarrowUnwraps_.size() > bareTParamUnwrapBase) {
+        std::vector<BareTParamNarrowUnwrap> mine(
+            bareTParamNarrowUnwraps_.begin() +
+                static_cast<std::ptrdiff_t>(bareTParamUnwrapBase),
+            bareTParamNarrowUnwraps_.end());
+        bareTParamNarrowUnwraps_.resize(bareTParamUnwrapBase);
+        restoreBareTParamNullableCarriers(*bareTParamUnwrapParams, mine, args);
+    }
+    if (bareTParamNarrowUnwraps_.size() > bareTParamUnwrapBase)
+        bareTParamNarrowUnwraps_.resize(bareTParamUnwrapBase);
     // fix #2901 (§8.6 / §14.1, v0.240): §8.6 states, verbatim: "When a value
     // type is used where `Object` (or an interface implemented by the value
     // type) is expected, the value is **boxed**: a heap-allocated wrapper holds
@@ -11638,7 +13207,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
-                                         call.span.begin);
+                                         call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
@@ -11886,14 +13455,67 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
 // trigger as lowerCall (`.`) — previously only `.` installed this, so an
 // explicit-type-arg `?.` generic call reached emitMethodCall with an empty
 // genericSubst_ and called the unspecialized i32-placeholder body.
-void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
-                                      sema::MethodSymbol* ms) {
+void Emitter::applyMethodGenericSubst(
+        const ast::CallExpr& call, sema::MethodSymbol* ms,
+        const std::unordered_map<std::string_view, llvm::Type*>* callerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            callerSema) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || md->genericParams.empty()) return;
     std::unordered_map<std::string_view, llvm::Type*> newSubst =
         genericSubst_;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
         genericSubstSemaTy_;
+    // fix #4813 (§14.1 / §14.5, v0.307): a method's type parameters are
+    // scoped to that method. `newSubst` starts as a copy of the active maps
+    // (it must keep, e.g., the receiver class's bindings the callee body
+    // reads), so a caller binding that merely shares a NAME with one of the
+    // callee's own parameters used to survive into the callee: every
+    // `if (newSubst.count(pname)) continue;` / `!subst.count(nm)` guard below
+    // then treated the callee's `T` as already bound, and the callee body was
+    // monomorphized at the CALLER's `T`. Measured: `Id<int>(4)` and `Id(5)`
+    // inside `Go<T>` at T = string built `Id$spec(i32): ptr` — IR verifier
+    // abort; renaming Id's parameter to `V` printed 9. Drop the callee's own
+    // names so each is bound only from what THIS call site supplies.
+    //
+    // EXCEPT a name the callee's own declaring type (or extension block) also
+    // binds: there the method `T` SHADOWS the class `T`, the map is keyed by
+    // name and cannot hold both, and the callee body may read the class `T`
+    // (a `_v: T` field, or a non-generic method that reads one). Erasing it
+    // turned `Box<string>.Pick<T>(x: T) => $"{x}+{_v}"` from `5+z` into
+    // `5+0` — silent wrong code — so such a name keeps its receiver-class
+    // binding, which is the pre-#4813 behaviour. The shadowing shape needs
+    // owner-qualified type-parameter identity (#4862; sema side #4847).
+    {
+        const auto ownerNames = calleeOwnerTypeParamNames(ctx_, ms);
+        for (const auto& gp : md->genericParams) {
+            if (ownerNames.count(gp.name)) continue;
+            newSubst.erase(gp.name);
+            newSema.erase(gp.name);
+        }
+    }
+    // Everything the call site supplies is written in the CALLER's scope, so
+    // it is resolved in the caller's substitution — an explicit `Id<T>(v)` /
+    // `Count<T>(xs)` inside `Go<T>` names the caller's `T`, and an argument
+    // or result type may mention it too. Resolving it to a concrete type
+    // before binding is what lets the callee's `T` be erased above without
+    // losing it: the old map reached the caller's `T` only by a chained NAME
+    // lookup, which the shadowing broke. Lowering runs with the caller's
+    // maps active, so the LLVM and sema sides of each binding agree.
+    std::unordered_map<std::string_view, llvm::Type*> cSubst =
+        callerSubst ? *callerSubst : genericSubst_;
+    std::unordered_map<std::string_view, const sema::TypeRef*> cSema =
+        callerSema ? *callerSema : genericSubstSemaTy_;
+    auto inCallerScope = [&](const sema::TypeRef* t) {
+        return substituteTypeRefLocal(t, cSema);
+    };
+    auto underCallerSubst = [&](auto&& fn) {
+        std::swap(genericSubst_, cSubst);
+        std::swap(genericSubstSemaTy_, cSema);
+        fn();
+        std::swap(genericSubst_, cSubst);
+        std::swap(genericSubstSemaTy_, cSema);
+    };
     // fix #1894 #1895 / §14.1: EXPLICIT call-site type arguments
     // (`Make<long, long>(...)`) are AUTHORITATIVE and must be bound FIRST,
     // before any argument-driven inference. An argument's own expression type
@@ -11934,8 +13556,11 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
             sema::TypeRef* concreteArg =
                 ctx_.resolvedType(*(*callTAs)[gi]);
             if (!concreteArg) continue;
-            newSubst[pname] = lowerTypeRef(concreteArg);
-            newSema[pname] = concreteArg;
+            // fix #4813: the written argument is resolved in the caller.
+            const sema::TypeRef* boundArg = inCallerScope(concreteArg);
+            underCallerSubst(
+                [&] { newSubst[pname] = lowerTypeRef(concreteArg); });
+            newSema[pname] = boundArg;
         }
     }
     }
@@ -11965,12 +13590,58 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
             ctx_.resolvedType(*md->params[pi].type);
         sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
         if (!declPt || !at) continue;
+        // fix #4813: the argument's type is a caller-side type.
+        const sema::TypeRef* atCaller = inCallerScope(at);
         bool added = false;
-        unifyMethodReturnTypeArg(declPt, at, md->genericParams,
-                                 newSubst, newSema, added);
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declPt, atCaller, md->genericParams,
+                                     newSubst, newSema, added);
+        });
     }
-    genericSubst_ = std::move(newSubst);
-    genericSubstSemaTy_ = std::move(newSema);
+    // fix #4813 (§14.1 / §15.4, v0.307): a sequence collection literal
+    // (`C([11, 22])` against `xs: Array<T>`) has no expression type of its
+    // own, so the loop above cannot bind `T` from it — the callee body was
+    // then specialized at the unbound i32 placeholder whatever the elements
+    // were. Bind a STILL-unbound parameter from the literal's elements when
+    // they all agree on one type; run after every typed argument so a typed
+    // argument keeps priority. A dictionary literal is left alone.
+    for (std::size_t pi = 0; pi < md->params.size() &&
+         pi < call.args.size(); ++pi) {
+        if (!md->params[pi].type || !call.args[pi].value) continue;
+        auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+            call.args[pi].value.get());
+        if (!cl || cl->isDict || cl->elements.empty()) continue;
+        if (ctx_.exprType(*cl)) continue;
+        const sema::TypeRef* declPt =
+            ctx_.resolvedType(*md->params[pi].type);
+        if (!declPt || declPt->kind != sema::TypeRef::Kind::Named ||
+            declPt->genericArgs.size() != 1 || !declPt->genericArgs[0])
+            continue;
+        const sema::TypeRef* elemCaller = nullptr;
+        bool agree = true;
+        for (const auto& el : cl->elements) {
+            sema::TypeRef* et = el ? ctx_.exprType(*el) : nullptr;
+            if (!et) { agree = false; break; }
+            const sema::TypeRef* etc = inCallerScope(et);
+            if (!elemCaller) { elemCaller = etc; continue; }
+            // Agreement is SEMA type identity (§14.5 *Agreement*: "the same
+            // type"), never the lowered LLVM type: `string` and a class `A`
+            // both lower to `ptr`, so `Show(["s", new A()])` bound `T` to
+            // `string` and the body read the `A` element as a string (ASan
+            // heap-buffer-overflow in `Util$Show$spec`).
+            if (!sema::typeRefEqual(etc, elemCaller)) {
+                agree = false;
+                break;
+            }
+        }
+        if (!agree || !elemCaller) continue;
+        bool added = false;
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declPt->genericArgs[0], elemCaller,
+                                     md->genericParams, newSubst, newSema,
+                                     added);
+        });
+    }
     // per §14.1/§14.2 + §26.5 (issue #391): a method type parameter
     // that appears *only* in the return type — `Create<T>(): T` — is
     // bound by no argument, so the loop above leaves it unset and
@@ -11982,33 +13653,73 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
     // parameter here by unifying the method's *declared* return type
     // against that concrete result type, then prime the substitution
     // before the body is emitted.
+    //
+    // fix #4813: the call's result type is a caller-side type too, so it is
+    // resolved in the caller and unified BEFORE the callee's substitution is
+    // installed (formerly after, with the result lowered under the callee's
+    // maps — where a caller `T` read the callee's same-named `T`).
     sema::TypeRef* resultTy = ctx_.exprType(call);
     sema::TypeRef* declRet = md->returnType
                                  ? ctx_.resolvedType(*md->returnType)
                                  : nullptr;
     if (resultTy && declRet) {
-        std::unordered_map<std::string_view, llvm::Type*> retSubst =
-            genericSubst_;
-        std::unordered_map<std::string_view, const sema::TypeRef*>
-            retSema = genericSubstSemaTy_;
+        const sema::TypeRef* resultCaller = inCallerScope(resultTy);
         bool added = false;
         // Unify the declared return TypeRef against the concrete result
         // TypeRef, binding any still-unbound method type parameter to
         // the matching concrete component. Handles a bare `T` return as
         // well as a constructed `Box<T>` whose nested parameter is
         // solved from the result's generic argument (§26.5).
-        unifyMethodReturnTypeArg(declRet, resultTy, md->genericParams,
-                                 retSubst, retSema, added);
-        if (added) {
-            genericSubst_ = std::move(retSubst);
-            genericSubstSemaTy_ = std::move(retSema);
-        }
+        underCallerSubst([&] {
+            unifyMethodReturnTypeArg(declRet, resultCaller, md->genericParams,
+                                     newSubst, newSema, added);
+        });
     }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
 }
 
 // fix #3143 (§14.1 / §2.5, v0.254): `genericParamNamesOf` used to live here as
 // a file-static. It is now `sema::genericParamNames` (sema/GenericParams.hpp) —
 // the ONE both-sources walk the whole family calls, sema included.
+
+void Emitter::restoreBareTParamNullableCarriers(
+        const std::vector<ast::Param>& params,
+        const std::vector<BareTParamNarrowUnwrap>& entries,
+        std::vector<llvm::Value*>& args) {
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): see the declaration comment.
+    if (genericSubstSemaTy_.empty() || args.size() < params.size()) return;
+    const std::size_t off = args.size() - params.size();
+    for (const auto& u : entries) {
+        if (u.paramIdx >= params.size() || !params[u.paramIdx].type) continue;
+        const std::size_t ai = u.paramIdx + off;
+        if (args[ai] != u.unwrapped) continue;  // later step replaced it
+        const sema::TypeRef* formal =
+            ctx_.resolvedType(*params[u.paramIdx].type);
+        const sema::TypeRef* resolved = resolveTypeParamRef(formal);
+        if (!resolved || resolved == formal || !isNullableValueTy(resolved))
+            continue;  // T bound non-nullable: the §7.4 unwrap was right
+        if (u.carrier->getType() != nullableValueStructTy(resolved)) continue;
+        args[ai] = u.carrier;
+    }
+}
+
+void Emitter::restoreCtorBareTParamCarriers(
+        const std::vector<ast::Param>& params, std::size_t base,
+        std::vector<llvm::Value*>& args,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            calleeSemaTy) {
+    // fix #4945 (§14.1 / §7 / §7.10, v0.307): see the declaration comment.
+    if (bareTParamNarrowUnwraps_.size() <= base) return;
+    std::vector<BareTParamNarrowUnwrap> mine(
+        bareTParamNarrowUnwraps_.begin() + static_cast<std::ptrdiff_t>(base),
+        bareTParamNarrowUnwraps_.end());
+    bareTParamNarrowUnwraps_.resize(base);
+    auto savedSemaTy = std::move(genericSubstSemaTy_);
+    genericSubstSemaTy_ = calleeSemaTy;
+    restoreBareTParamNullableCarriers(params, mine, args);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+}
 
 // §14.1 / §2.5 (fix #711): is `arg` a BARE generic-parameter reference (as
 // opposed to a concrete or constructed type)? Locally that is a single-part
@@ -12425,11 +14136,76 @@ void Emitter::collectClosureArgBodyIdentifiers(
 }
 
 
+// fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): an IMPORTED generic
+// method whose body did not cross the module boundary (no attached
+// `ast::MethodDecl`) although one of its own type parameters carries a bound
+// the i32-placeholder template cannot honour — a `new()` bound, or a bound
+// that is a USER type. The call can then only run the defining module's
+// template compiled against the placeholder. MEASURED on 8575510a,
+// `virtual Mk<T>() where T: IShape, new()` and `virtual Cnt<T>(n: int) where
+// T: IShape` returned 0 across the boundary (single-module twins 95 / 47 /
+// 48) with no diagnostic, because no argument had type `T` for the #1943
+// width gate to catch.
+//
+// fix-forward 5: a user-type bound counts WHEREVER it is declared, not only
+// in the method's own module. The exporter's `isConstraintUsingGenericMethod`
+// ships a body only for a bound its own module declares, so a bound from a
+// THIRD module (`RD2.G.VB3<T>(b: RBox<T>) where T: RD1.IShape`) left no body
+// and, with `T` crossing inside a pointer-width `RBox<T>`, no width
+// mismatch: MEASURED on f7554738, 0 for the virtual VB3 AND the non-virtual
+// NB3 (single-module twin 127). A user type is one some loaded module
+// registered (`importedByModule`); a bound declared by the importing module
+// itself cannot reach an imported method. Builtin bounds (`class`, `value`,
+// `notnull`, a synthesized builtin interface) are sound at i32 and are not
+// counted.
+static bool importedGenericLacksConstraintBody5009(
+        const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
+    if (!ms || !ctx.isImported(ms) || ms->genericParams.empty()) return false;
+    // SEAM-DEBT: #5042 imported-only probe (isImported guard above): asks whether the exporter shipped a body AST; no sema body-crossed flag yet
+    if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) return false;
+    auto isUserType = [&](const sema::TypeSymbol* d) {
+        if (!d || d->isSynthesizedBuiltinInterface) return false;
+        for (const auto& [modName, types] : ctx.importedByModule())
+            for (const sema::TypeSymbol* t : types)
+                if (t == d) return true;
+        return false;
+    };
+    for (const sema::Symbol* s : ms->genericParams) {
+        auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s);
+        if (!gp) continue;
+        for (const sema::GenericParamConstraint& c : gp->constraints) {
+            if (c.kind == "new") return true;
+            if (c.kind == "type" && c.importedBound &&
+                isUserType(c.importedBound->declaration))
+                return true;
+        }
+    }
+    return false;
+}
+
+// The located reject for importedGenericLacksConstraintBody5009. It shares
+// the codegen backstop's opening ("its body could not be monomorphized across
+// the module boundary"), so one needle names the whole family.
+static std::string boundBodyReject5009(std::string_view name,
+                                       bool virtualCall) {
+    return "calling imported generic method `" + std::string(name) +
+           "`: its body could not be monomorphized across the module "
+           "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+           "\xE2\x80\x94 a type parameter carries a `new()` bound or a "
+           "user-type bound, and the " +
+           std::string(virtualCall ? "virtual " : "") +
+           "call runs the defining module's template compiled against the "
+           "`int` (i32) placeholder, so it would silently compute a wrong "
+           "value. Call it within the module that defines it" +
+           std::string(virtualCall ? ", or make it non-virtual" : "");
+}
+
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
                             const std::vector<const ast::Expr*>* argExprs,
-                            SourceLocation callLoc) {
+                            SourceLocation callLoc,
+                            bool thisReceiver) {
     // issue #421 / #410: is the argument at index `ai` an unsigned source?
     // Defaults to false (signed) when no source expression is known for the
     // slot (e.g. the receiver) or no argExprs vector was supplied.
@@ -12438,6 +14214,49 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return false;
         return isUnsignedTargetExpr(*(*argExprs)[ai]);
     };
+    // fix #4963 (§5.1 `S → T → T?` / §14.1, v0.307): under an active generic
+    // substitution a formal declared `T?` (or a bare `T` bound to a nullable
+    // value type, #4830 case C) is not a nullable value type until it is
+    // resolved, so buildOrderedArgs's CG-nullable block — which reads the
+    // unresolved declaration — leaves a narrower numeric argument bare:
+    // `Id<long>(5)` against `Id<T>(x: T?)` arrives as `i32 5`.
+    // wrapArgForNullableValueFormal (emitGenericSpecialization and the
+    // expression-body binding) wraps only an EXACT-payload argument, so the
+    // specialization was built with an `i32` parameter the body then read as
+    // `{i8, i64}` (bezelc SIGSEGV in lowerCoalesce). Widen, then wrap, HERE,
+    // where the argument's source expression — and so its signedness — is
+    // still known; the downstream wrap then sees the finished carrier. Every
+    // emitInlineGenericMethod/emitGenericSpecialization entry is in this
+    // function, below this point, under the same substitution.
+    // `coerceReturnToNullableValue` resolves the formal exactly as
+    // wrapArgForNullableValueFormal does (cases A/B/C) and returns the value
+    // unchanged for any formal that is not a nullable value type.
+    // A caller type parameter that merely shares a NAME with one of the
+    // callee's own (`Go<T>` at T := int? calling `Id<long>(3)`) needs no
+    // special case here: applyMethodGenericSubst (#4813, §14.1/§14.5) erases
+    // the callee's own names and binds them from THIS call site, so
+    // genericSubst_ already resolves the callee's `T` to `long`.
+    if (!genericSubst_.empty() && ms) {
+        const std::size_t liftOff = isStaticMethod(ms) ? 0u : 1u;
+        if (args.size() == liftOff + ms->params.size()) {
+            for (std::size_t ai = liftOff; ai < args.size(); ++ai) {
+                llvm::Value* a = args[ai];
+                if (!a || !(a->getType()->isIntegerTy() ||
+                            a->getType()->isFloatingPointTy()))
+                    continue;
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    ms->params[ai - liftOff]);
+                if (!ps) continue;
+                const sema::TypeRef* formal =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                args[ai] = coerceReturnToNullableValue(
+                    a, formal, argUnsigned(ai), /*sourceIsNullableRef=*/false,
+                    (argExprs && ai < argExprs->size()) ? (*argExprs)[ai]
+                                                        : nullptr);
+            }
+        }
+    }
     // fix #2821 (§14.1 / §2.5 / §2.8.3, v0.240) — the §14.1/#783 SOUNDNESS GATE,
     // stated as the property it actually needs.
     //
@@ -12779,7 +14598,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     // implies `inlined`, so every previously-returning case still
                     // returns, and a genuine decline still falls through untouched.
                     bool inlined = false;
-                    llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+                    llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
                     if (inlined || diverged_) {
                         emitPendingCheck();
                         return r;
@@ -13074,6 +14893,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             llvm::Value* slotPtr = builder_.CreateGEP(
                 ptrTy(), vptr, {builder_.getInt32(vtSlot)});
             fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+            // fix #4613 (§22.16, v0.306): the VIRTUAL half of #4597's
+            // unchecked-face binding — "a `this`-receiver dispatching call
+            // reaches the dynamic target's unchecked face". The non-virtual
+            // arm below binds by rewriting `callee`; here the callee is a
+            // loaded slot value, so the rewrite is on that value. Returns
+            // null (leaving `fnPtr` untouched) for every call §22.16 does not
+            // instrument.
+            if (thisReceiver)
+                if (llvm::Value* uf =
+                        uncheckedFacePtrForThisVirtualCall(ms, fnPtr))
+                    fnPtr = uf;
         }
         // #1183 / §11.2 / §12.1: builtin generic interfaces
         // (IComparable<T>/IEquatable<T>/IEqualityComparer<T>) compile
@@ -13087,6 +14917,30 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // Only applied to interface dispatch (isIfaceMethod) where the
         // generic-T erasure mismatch can arise.
         if (isIfaceMethod) {
+            // fix #4900 (§13 / §14.1 / §7 / §7.10, v0.307): the itable slot
+            // of an implementor instantiated at a nullable value type
+            // (`Holder<int?>` implementing `IId<int?>`) is the specialization
+            // that takes the tagged `{i8, T}` carrier for a bare `v: T`
+            // formal — the same carrier emitGenericSpecialization builds for
+            // the direct call (#4830). This arm passed the argument as the
+            // bare payload (`i32 5`) and then, below, retyped the call from
+            // the argument types, so the callee read an `{i8, i32}` from an
+            // `i32` register: layout-dependent garbage. Shape each argument
+            // for its interface formal under the active substitution (the
+            // receiver's `IId<int?>` binds the interface's `T`) first.
+            std::size_t ifThisOff = isStaticMethod(ms) ? 0u : 1u;
+            for (std::size_t ai = ifThisOff; ai < args.size(); ++ai) {
+                std::size_t pi = ai - ifThisOff;
+                if (pi >= ms->params.size()) break;
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        ms->params[pi])) {
+                    const sema::TypeRef* formal =
+                        ps->declType ? ctx_.resolvedType(*ps->declType)
+                                     : ps->resolvedDeclType;
+                    args[ai] = wrapArgForNullableValueFormal(
+                        args[ai], formal, argUnsigned(ai));
+                }
+            }
             bool needsConcrete = false;
             for (std::size_t ai = 0; ai < args.size(); ++ai)
                 if (args[ai]->getType() != fnTy->getParamType(ai))
@@ -13099,6 +14953,58 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 fnTy = llvm::FunctionType::get(
                     fnTy->getReturnType(), concParamTys, /*isVarArg=*/false);
             }
+        }
+        // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): the #1943
+        // argument-width gate (below, on the direct-call path), applied to a
+        // CLASS-VIRTUAL slot call of an imported generic method. Such a call
+        // never reaches that gate: with no reconstructed body,
+        // emitVirtualGenericDispatch declines and the call loads the
+        // defining module's i32-placeholder template from the vtable. A
+        // pointer-width type argument then made LLVM's verifier abort the
+        // compile with an unlocated "Call parameter type does not match
+        // function signature" (MEASURED on b30c6f12, `GV.VBox<T>(v: T): int
+        // where T: IShape` called with a class). Report #1943's located
+        // diagnostic instead, as the direct call does. Only a call the
+        // verifier would reject reaches this, so no accepted program changes.
+        if (!isIfaceMethod && ctx_.isImported(ms) &&
+            !ms->genericParams.empty()) {
+            for (std::size_t ai = 0;
+                 ai < args.size() && ai < fnTy->getNumParams(); ++ai) {
+                if (args[ai]->getType() == fnTy->getParamType(ai)) continue;
+                SourceLocation loc = callLoc;
+                if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
+                    loc = (*argExprs)[ai]->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "calling imported generic method `" +
+                    std::string(ms->name) +
+                    "` with a type argument whose representation is not the "
+                    "compiled `int` (i32) placeholder \xE2\x80\x94 e.g. a "
+                    "class, `long`, `double`, `bool`, or a record \xE2\x80\x94 "
+                    "is not yet monomorphized across the module boundary for "
+                    "a virtual call (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, "
+                    "#5009): the method's body was compiled in its defining "
+                    "module against the placeholder layout, so the argument "
+                    "would cross the boundary at the wrong width. Call it "
+                    "within the module that defines it, or have it take a "
+                    "non-generic parameter");
+                if (fnTy->getReturnType()->isVoidTy()) return nullptr;
+                return llvm::PoisonValue::get(fnTy->getReturnType());
+            }
+        }
+        // fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): the width
+        // gate above only sees a type argument that crosses as an ARGUMENT. A
+        // method whose `T` appears in no parameter (`virtual Mk<T>() where T:
+        // IShape, new()`, `virtual Cnt<T>(n: int) where T: IShape`) passes it
+        // with identical widths and silently returned 0 (MEASURED on
+        // 8575510a; twins 95 / 47 / 48). Fail closed on the BOUND instead —
+        // see importedGenericLacksConstraintBody5009.
+        if (!isIfaceMethod &&
+            importedGenericLacksConstraintBody5009(ctx_, ms)) {
+            ctx_.diagnostics().report(Severity::Error, callLoc,
+                                      boundBodyReject5009(ms->name, true));
+            if (fnTy->getReturnType()->isVoidTy()) return nullptr;
+            return llvm::PoisonValue::get(fnTy->getReturnType());
         }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         // fix #2752: merge the string-receiver arm back in. Only reached when
@@ -13170,7 +15076,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
          // LlvmBackend_impl.hpp:2602-2614), so widening this guard to also
          // include OperatorDecl is the whole codegen-side change for the fix.
          dynamic_cast<const ast::OperatorDecl*>(ms->decl))) {
-        llvm::Value* r = emitInlineGenericMethod(ms, args);
+        llvm::Value* r = emitInlineGenericMethod(ms, args, nullptr, argExprs);
         emitPendingCheck();
         // HARD route: never fall through to methodFns_ for an imported generic
         // method. The only entry there is the EXTERNAL declaration of the
@@ -13217,6 +15123,24 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             calleeTy->getParamType(0)->isPointerTy())
             return nullptr;
     }
+    // fix #4597 (§22.16, v0.306): "call sites with syntactic receiver `this`
+    // bind to the unchecked face — statically decidable". This is that
+    // binding, and this arm is where "statically decidable" is true: the
+    // callee is already resolved to one function. Placed AFTER the two
+    // bail-out guards above so a call that declines to lower mints no
+    // face; the face has the checked face's exact signature, so neither
+    // guard could answer differently for it. `uncheckedFaceFor` returns
+    // null for everything §22.16 does not instrument, so the overwhelmingly
+    // common call keeps `callee` exactly as it was.
+    //
+    // Without it, an `invariant(E)` whose E calls a public method of the same
+    // instance emitted a call to that method's ONE face, whose prologue
+    // re-ran the invariant: unbounded recursion, SIGSEGV. The same binding is
+    // what makes §22.16's other promise hold — a public method may call
+    // `this.Other()` while its own state is legitimately mid-update, "where an
+    // algorithm may pass through broken intermediate states".
+    if (thisReceiver)
+        if (llvm::Function* face = uncheckedFaceFor(ms)) callee = face;
     // CG-generic: if the generic substitution is active and the method
     // is on a class that has generic parameters, we must specialize the
     // call — even for methods with non-generic param/return types (like
@@ -13248,7 +15172,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // implies `inlined`, so every previously-returning case still
             // returns, and a genuine decline still falls through untouched.
             bool inlined = false;
-            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
             if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
@@ -13316,7 +15240,7 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // implies `inlined`, so every previously-returning case still
             // returns, and a genuine decline still falls through untouched.
             bool inlined = false;
-            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined, argExprs);
             if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
@@ -13394,6 +15318,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return llvm::PoisonValue::get(callee->getReturnType());
         }
     }
+    // fix #5009 fix-forward 5 (§14.1 / §2.8.3 rule 4, v0.307): the direct-call
+    // sibling of the slot-call gate in the virtual arm above. The width gate
+    // just above cannot see a `T` that crosses inside a pointer (`RBox<T>`)
+    // or not at all; MEASURED on f7554738 the non-virtual NB3 returned 0
+    // (twin 127). Refuse on the bound — see
+    // importedGenericLacksConstraintBody5009, which never counts a method
+    // whose body is attached.
+    if (importedGenericLacksConstraintBody5009(ctx_, ms)) {
+        ctx_.diagnostics().report(Severity::Error, callLoc,
+                                  boundBodyReject5009(ms->name, false));
+        return llvm::PoisonValue::get(callee->getReturnType());
+    }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown
     // fix #2952 (§8.6 / §28.9 / §28.3, v0.240): §28.3 discharges an unbound
@@ -13412,9 +15348,106 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 }
 
 
-llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
-                                       std::vector<llvm::Value*>& args,
-                                       const CallableInfo& ci) {
+// fix #4830 (§14.1 / §7 / §8.6, v0.307): see the declaration comment in
+// LlvmBackend_impl.hpp. Detects cases (A)/(B)/(C) and wraps `arg` into the
+// tagged `{i8, T}` struct when one applies; returns `arg` unchanged otherwise.
+llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
+                                                     const sema::TypeRef* formal,
+                                                     bool srcUnsigned) {
+    if (!formal || !arg) return arg;
+    sema::TypeRef concBuf;
+    const sema::TypeRef* nvTy = nullptr;
+    if (isNullableValueTy(formal)) {
+        nvTy = formal;
+    } else if (formal->nullable &&
+               formal->kind == sema::TypeRef::Kind::Named &&
+               !formal->declaration &&
+               nullableTypeParamConcrete(formal, concBuf) &&
+               isNullableValueTy(&concBuf)) {
+        nvTy = &concBuf;
+    } else if (!formal->nullable &&
+               formal->kind == sema::TypeRef::Kind::Named &&
+               !formal->declaration) {
+        // Case C (#4830): the formal is a BARE, non-`?`-declared type
+        // parameter (`v: T`), but the enclosing class was instantiated at a
+        // nullable value type (e.g. `Holder<int?>`), so under the active
+        // substitution `T` itself resolves to `int?`. The other two cases
+        // only fire when `T?` appears explicitly in source; this one catches
+        // the "class instantiated at a nullable value type" case. Per
+        // §14.1/§7 (v0.307), a nullable value type is represented as
+        // `{i8, T}` regardless of whether the nullability came from the
+        // parameter's own declaration or from its type parameter's
+        // substitution.
+        if (const sema::TypeRef* resolved = resolveTypeParamRef(formal);
+            resolved && resolved != formal && isNullableValueTy(resolved)) {
+            nvTy = resolved;
+        }
+    }
+    if (!nvTy) return arg;
+    auto* expectedSt = nullableValueStructTy(nvTy);
+    if (arg->getType() == expectedSt) return arg;
+    if (arg->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(arg))
+        return nullableValueNull(nvTy);
+    if (arg->getType() == expectedSt->getElementType(1))
+        return wrapNullableValue(nvTy, arg);
+    // fix #5046 (§5.1 "Nullable conversions", v0.307): `S?` -> `T?` LIFT at a
+    // generic `T?` FORMAL. §5.1: "S? implicitly converts to T? whenever S
+    // implicitly converts to T ... a present value converts by the underlying
+    // conversion, null converts to null" — so `Id<double>(a)` with
+    // `a: int?` and `Id<T>(x: T?): T? => x;` must compile: T is bound to
+    // `double` at this call, so the formal here (`nvTy`) is `double?`, but
+    // `arg` arrives as the CALLER's own `int?` — already the tagged
+    // `{i8, i32}` struct, not the bare `i32` payload the case above handles
+    // and not a null pointer. Neither prior case matches (the struct is
+    // neither `expectedSt` nor a bare payload), so `arg` fell through
+    // unwrapped: the specialized body's parameter (and its `T?` return) then
+    // disagreed with the call site's expected `{i8, double}`, and
+    // `verifyModule` rejected the PHI merging the two (measured: "PHI node
+    // operands are not the same type as the result!" over `Id<double>(a) ??
+    // -1.0`). Unwrap the payload, widen it per §5.1 (the same
+    // `coerceNumericToType` widening `coerceReturnToNullableValue` and the
+    // `buildOrderedArgs` / `fillOmittedParamDefaults` `S? -> T?` lift
+    // (#4967, LlvmBackend_Assign.cpp) use), and re-wrap with the hasValue tag
+    // carried through untouched — `null` stays `null`.
+    //
+    // `srcUnsigned` is the CALLER-supplied answer (see the parameter's own
+    // comment, LlvmBackend_impl.hpp): treating every source as signed here
+    // was a soundness bug, not merely a documented gap — `uint?` holding
+    // 3000000000 lifted to a `long?` formal would sign-extend the payload
+    // into a negative `long`, silent wrong code (caught in review before
+    // landing). Only a numeric pair is matched at all (a `record?`/`enum?`
+    // payload is left unchanged).
+    if (auto* vSt = llvm::dyn_cast<llvm::StructType>(arg->getType())) {
+        auto numeric = [](llvm::Type* t) {
+            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                   t->isFloatingPointTy();
+        };
+        if (vSt != expectedSt && vSt->getNumElements() == 2 &&
+            vSt->getElementType(0) == nullablePrimHasValTy() &&
+            expectedSt->getNumElements() == 2 &&
+            expectedSt->getElementType(0) == nullablePrimHasValTy() &&
+            numeric(vSt->getElementType(1)) &&
+            numeric(expectedSt->getElementType(1))) {
+            llvm::Type* dstPay = expectedSt->getElementType(1);
+            llvm::Value* conv = coerceNumericToType(
+                builder_.CreateExtractValue(arg, {1u}, "arg.lift.in"),
+                dstPay, srcUnsigned);
+            if (conv->getType() == dstPay) {
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(expectedSt),
+                    builder_.CreateExtractValue(arg, {0u}, "arg.lift.has"),
+                    {0u});
+                return builder_.CreateInsertValue(res, conv, {1u});
+            }
+        }
+    }
+    return arg;
+}
+
+llvm::Value* Emitter::emitGenericSpecialization(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const CallableInfo& ci,
+        const std::vector<const ast::Expr*>* argExprs) {
     // Build the function type with concrete arg/ret types. Each param type
     // defaults to its argument's LLVM type, BUT when the declared parameter is a
     // nullable VALUE type `T?` (a bare value-type generic param under the active
@@ -13435,29 +15468,14 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                 const sema::TypeRef* formal =
                     ps->declType ? ctx_.resolvedType(*ps->declType)
                                  : ps->resolvedDeclType;
-                sema::TypeRef concBuf;
-                const sema::TypeRef* nvTy = nullptr;
-                if (formal && isNullableValueTy(formal)) {
-                    nvTy = formal;
-                } else if (formal && formal->nullable &&
-                           formal->kind == sema::TypeRef::Kind::Named &&
-                           !formal->declaration &&
-                           nullableTypeParamConcrete(formal, concBuf) &&
-                           isNullableValueTy(&concBuf)) {
-                    nvTy = &concBuf;
-                }
-                if (nvTy) {
-                    auto* expectedSt = nullableValueStructTy(nvTy);
-                    if (args[i]->getType() != expectedSt) {
-                        if (args[i]->getType()->isPointerTy() &&
-                            llvm::isa<llvm::ConstantPointerNull>(args[i])) {
-                            args[i] = nullableValueNull(nvTy);
-                        } else if (args[i]->getType() ==
-                                   expectedSt->getElementType(1)) {
-                            args[i] = wrapNullableValue(nvTy, args[i]);
-                        }
-                    }
-                }
+                // fix #5046 follow-up (§5.1, v0.307): real signedness when the
+                // caller (emitInlineGenericMethod, threading emitMethodCall's
+                // own argExprs) has this argument's source expression.
+                bool argUns = argExprs && i < argExprs->size() &&
+                              (*argExprs)[i] &&
+                              isUnsignedTargetExpr(*(*argExprs)[i]);
+                args[i] = wrapArgForNullableValueFormal(args[i], formal,
+                                                         argUns);
             }
         }
         paramTys.push_back(args[i]->getType());
@@ -14220,6 +16238,44 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     }
     if (!defaultImpl) return nullptr;  // no implementation found — bail safely
 
+    // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): SIBLING GUARD of
+    // emitInlineGenericMethod's constraint-route backstop. A constraint-route
+    // body (ModuleLoader, `markConstraintRouteBody`) is proven only for the
+    // statically dispatched inline path, and neither the exporter nor the
+    // importer puts a virtual, override, abstract or interface method on that
+    // route. If one reaches the per-class dispatch anyway, report a located
+    // error rather than lowering it: MEASURED on bd0405e6, such bodies
+    // returned 0 here (twins 107 / 207), and override selection across the
+    // module boundary picked the base body (#5031). Checked before any
+    // instruction is emitted.
+    {
+        // Fix-forward 4: an imported implementation whose bound-carrying body
+        // did not cross the boundary (importedGenericLacksConstraintBody5009)
+        // is refused on the same terms as the slot call in emitMethodCall.
+        auto refused = [&](const sema::MethodSymbol* m) {
+            return ctx_.isConstraintRouteBody(m) ||
+                   importedGenericLacksConstraintBody5009(ctx_, m);
+        };
+        bool constraintRouteImpl = refused(ms) || refused(defaultImpl);
+        for (const Branch& b : branches)
+            if (refused(b.impl)) constraintRouteImpl = true;
+        if (constraintRouteImpl) {
+            ctx_.diagnostics().report(
+                Severity::Error, callSiteLoc_,
+                "calling imported generic method `" + std::string(ms->name) +
+                "`: its body could not be monomorphized across the module "
+                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+                "\xE2\x80\x94 a virtual call to it cannot be dispatched to a "
+                "specialized body, so the call would silently compute a wrong "
+                "value. Call it within the module that defines it, or give it "
+                "a non-generic parameter");
+            if (llvm::FunctionType* ft = methodFnType(ms))
+                if (!ft->getReturnType()->isVoidTy())
+                    return llvm::PoisonValue::get(ft->getReturnType());
+            return nullptr;
+        }
+    }
+
     // Re-key the active substitution by the override's own generic-param names.
     // Base::Show<T> and Derived::Show<U> may name the parameter differently; the
     // substitution we built keys on the static method's names, so positionally
@@ -14259,6 +16315,26 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             genericSubst_ = std::move(rk);
             genericSubstSemaTy_ = std::move(rks);
         }
+        // fix #5090 (§5.1/§14.1/§12, v0.307): when a formal is a nullable value
+        // type `T?` (explicit or resolved from a bare `T` in a class instantiated
+        // at a nullable value type) and the argument arrived as bare `T`, the
+        // specialized body reads the param as `{i8, T}` — so the argument must be
+        // wrapped HERE before building the function type, matching what
+        // emitGenericSpecialization does at its call to wrapArgForNullableValueFormal.
+        std::size_t ifThisOff = isStaticMethod(impl) ? 0u : 1u;
+        for (std::size_t ai = ifThisOff; ai < args.size(); ++ai) {
+            std::size_t pi = ai - ifThisOff;
+            if (pi >= impl->params.size()) break;
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    impl->params[pi])) {
+                const sema::TypeRef* formal =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                args[ai] = wrapArgForNullableValueFormal(args[ai], formal);
+            }
+        }
+        paramTys.clear();
+        for (auto* a : args) paramTys.push_back(a->getType());
         llvm::Function* fn = buildSpecializedMethodFn(impl, ci, paramTys);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSema);
@@ -14355,9 +16431,9 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
 }
 
 
-llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                      std::vector<llvm::Value*>& args,
-                                      bool* emitted) {
+llvm::Value* Emitter::emitInlineGenericMethod(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        bool* emitted, const std::vector<const ast::Expr*>* argExprs) {
     // fix #3497: "did I lower the call here?" starts out NO and is answered at
     // each emission arm below; see the declaration for why the answer cannot be
     // read off the returned value. Assigned before every `return` so a caller
@@ -14365,6 +16441,19 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     if (emitted) *emitted = false;
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return nullptr;
+    // fix #5009 (§14.1 / §14.2 / §2.8.3 rule 4, v0.307): the constraint-route
+    // BACKSTOP. ModuleLoader attaches such a body only once every reference in
+    // it binds, and refuses lambdas and nested generic calls outright, but
+    // binding does not prove the monomorphized body LOWERS. MEASURED on
+    // 43854953: bound bodies lowered a sub-expression to nothing and the call
+    // returned 0 with only an INTERNAL #2491 warning, where dcb17d57 rejected
+    // cleanly with #1943. So any INTERNAL degrade reported while this body is
+    // emitted is escalated to a located error at the call site: the compile
+    // fails, never a silent zero. Checked after the body is emitted (below).
+    const bool constraintRoute = ctx_.isConstraintRouteBody(ms);
+    const SourceLocation constraintRouteSite = callSiteLoc_;
+    const std::size_t constraintRouteDiagMark =
+        ctx_.diagnostics().diagnostics().size();
     // #1059: do NOT bail when `ms->decl` is an OperatorDecl rather than a
     // MethodDecl — an operator overload on a GENERIC record/class must
     // specialize per-instantiation just like a regular method. callableInfo
@@ -14445,8 +16534,38 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
                 ps->declType ? lowerType(ps->declType) : i32();
             refParams_[ms->params[pi]] = {args[pi + paramStart], elemTy};
         } else {
-            auto* slot = entryAlloca(args[pi + paramStart]->getType());
-            builder_.CreateStore(args[pi + paramStart], slot);
+            // fix #4830 (§14.1 / §7 / §8.6, v0.307): the SAME nullable-value
+            // wrap emitGenericSpecialization applies to a block-bodied
+            // method's specialized-function parameters is needed here too —
+            // this arm binds an EXPRESSION-bodied generic method's params
+            // directly into the caller's own stack slots (no specialized
+            // function, no buildSpecializedMethodFn), so without this an
+            // argument arriving as bare `T` (or a null ptr) under a `v: T`
+            // formal that resolves to a nullable value type (e.g.
+            // `Holder<int?>`) left the slot typed as the argument's OWN
+            // (unwrapped) type. A later `store ptr <null>` into a slot the
+            // callee body's other uses expect as `{i8, T}` is a type-size
+            // mismatch the emitted IR does not catch (opaque pointers): a
+            // narrower alloca overrun UB that ASan reports as a
+            // stack-buffer-overflow (measured: `Holder<bool?>.Id(null)`,
+            // "WRITE of size 8" into a 2-byte `{i8,i1}` slot).
+            const sema::TypeRef* formal =
+                ps ? (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : ps->resolvedDeclType)
+                   : nullptr;
+            // fix #5046 follow-up (§5.1, v0.307): real signedness when
+            // `argExprs` (threaded from emitMethodCall) has this argument's
+            // source expression — see wrapArgForNullableValueFormal's own
+            // comment for why signed-by-default here would be silent wrong
+            // code for an unsigned source.
+            const std::size_t argIdx = pi + paramStart;
+            bool argUns = argExprs && argIdx < argExprs->size() &&
+                          (*argExprs)[argIdx] &&
+                          isUnsignedTargetExpr(*(*argExprs)[argIdx]);
+            llvm::Value* argVal = wrapArgForNullableValueFormal(
+                args[argIdx], formal, argUns);
+            auto* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
             paramSlots_[ms->params[pi]] = slot;
         }
     }
@@ -14486,8 +16605,26 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         // active genericSubst_ substitutes T so the enumerator's element type
         // matches the instantiation.
         if (result && ci.returnType && !diverged_) {
-            result = boxForTarget(result,
-                ctx_.resolvedType(*ci.returnType), ci.exprBody);
+            const sema::TypeRef* declRet = ctx_.resolvedType(*ci.returnType);
+            // fix #4830 (§14.1 / §7 / §8.6, v0.307): the mirror of the
+            // STATEMENT `return v;` path's coerceReturnToNullableValue call
+            // (LlvmBackend_Stmts.cpp) for an EXPRESSION-bodied generic
+            // method's inlined result. Without this, `Id(v: T): T => v;`
+            // instantiated at `Holder<int?>` returned the bare unwrapped
+            // value (or, pre-parameter-fix, a mismatched IR-verify failure)
+            // instead of the tagged `{i8, T}` struct the declared `T`
+            // (resolved to a nullable value type) requires. Mutually
+            // exclusive with boxForTarget/wrapAsIEnumerableForTarget below —
+            // a declared return is either a nullable value type or an
+            // Object/interface/IEnumerable target, never both — so this is a
+            // no-op (returns `result` unchanged) whenever those apply.
+            const sema::TypeRef* srcTy = ctx_.exprType(*ci.exprBody);
+            bool srcNullableRef = srcTy && srcTy->nullable &&
+                                  !isNullableValueTy(srcTy);
+            result = coerceReturnToNullableValue(
+                result, declRet, isUnsignedTargetExpr(*ci.exprBody),
+                srcNullableRef, ci.exprBody);
+            result = boxForTarget(result, declRet, ci.exprBody);
             // #1916: ownLazyPipeline=true — this is a RETURN position (the caller
             // owns the inlined result), so a lazy pipeline returned as
             // IEnumerable<T> is drained into an OWNING enumerator (leak-free).
@@ -14496,7 +16633,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
             // collection the wrap only borrows (registers a scope-end
             // bz_array_free / bz_dict_free / bz_llist_free for the source).
             result = wrapAsIEnumerableForTarget(
-                result, ctx_.resolvedType(*ci.returnType), ci.exprBody,
+                result, declRet, ci.exprBody,
                 /*ownLazyPipeline=*/true,
                 /*outWrapMade=*/nullptr,
                 /*srcOwnedByCallee=*/
@@ -14507,7 +16644,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         // Inlining block bodies is problematic because `return` generates
         // `ret` in the outer function. Instead, monomorphize: compile a
         // concrete version of the function with the active substitution.
-        result = emitGenericSpecialization(ms, args, ci);
+        result = emitGenericSpecialization(ms, args, ci, argExprs);
         // fix #3497: exact for this arm without the footprint — emitGeneric
         // Specialization returns the `CallInst` (void-typed for a unit method,
         // hence non-null) on every path that emits a call, and nullptr only
@@ -14527,6 +16664,25 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628 (phase a)
+
+    // fix #5009: the constraint-route backstop (see the top of this function).
+    if (constraintRoute) {
+        const std::vector<Diagnostic>& ds = ctx_.diagnostics().diagnostics();
+        for (std::size_t di = constraintRouteDiagMark; di < ds.size(); ++di) {
+            if (ds[di].severity != Severity::Warning ||
+                ds[di].message.rfind("internal:", 0) != 0)
+                continue;
+            ctx_.diagnostics().report(
+                Severity::Error, constraintRouteSite,
+                "calling imported generic method `" + std::string(ms->name) +
+                "`: its body could not be monomorphized across the module "
+                "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+                "\xE2\x80\x94 a part of it did not lower, so the call would "
+                "silently compute a wrong value. Call it within the module "
+                "that defines it, or give it a non-generic parameter");
+            break;
+        }
+    }
 
     if (emitted) *emitted = bodyEmitted;
     return result;
@@ -14867,10 +17023,11 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             // receiver arm, so §7.5's "nothing to its right in
                             // the chain is evaluated" still holds: a null
                             // receiver evaluates no argument and mints no box.
-                            llvm::Value* ncoOther =
-                                lowerUniversalEqualsArg(*call.args[0].value);
-                            if (ncoOther)
-                                ncoRes = lowerObjectEquals(recv, ncoOther);
+                            // fix #3480: the `?.` mirror discharges the
+                            // argument box on the SAME terms as the `.` form.
+                            ncoRes = lowerUniversalEqualsDispatch(
+                                recv, *call.args[0].value,
+                                isKnownBoxReceiverExpr(nm.target.get()));
                         }
                         if (!ncoRes) return nullptr;
                         bool ncoRef = ncoRes->getType()->isPointerTy();
@@ -15130,6 +17287,15 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             // cross-module receiver is provably non-null by the time we
             // reach this loop (the `callBB` entry branch null-tests it),
             // so the argument list itself always evaluates.
+            //
+            // fix #4979 (§5.1 "Nullable conversions", v0.307): the `S? → T?`
+            // lift-widen that buildOrderedArgs's #4967 fix and the `.` arm's
+            // #4940 mirror both added — the `?.` arm was left out and crashes
+            // the IR verifier on a closure-typed `?.` call whose argument is
+            // a narrower nullable value (e.g. `int?` → `long?`). Mirror the
+            // `.` arm's widening block exactly: extract the payload, widen
+            // per §5.1, re-wrap with the hasValue tag kept. Gated on numeric
+            // payloads so a `record?`→`record?` pass is still a no-op.
             if (!byRef && formalTy && isNullableValueTy(formalTy)) {
                 auto* expectedSt = nullableValueStructTy(formalTy);
                 if (v->getType() != expectedSt) {
@@ -15139,6 +17305,47 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                     } else if (v->getType() ==
                                expectedSt->getElementType(1)) {
                         v = wrapNullableValue(formalTy, v);
+                    } else if (auto* vSt =
+                                   llvm::dyn_cast<llvm::StructType>(
+                                       v->getType())) {
+                        // S? → T? widening (mirror #4967 buildOrderedArgs).
+                        auto numeric = [](llvm::Type* t) {
+                            return (t->isIntegerTy() && !t->isIntegerTy(1)) ||
+                                   t->isFloatingPointTy();
+                        };
+                        if (vSt != expectedSt &&
+                            vSt->getNumElements() == 2 &&
+                            vSt->getElementType(0) ==
+                                nullablePrimHasValTy() &&
+                            expectedSt->getNumElements() == 2 &&
+                            expectedSt->getElementType(0) ==
+                                nullablePrimHasValTy() &&
+                            numeric(vSt->getElementType(1)) &&
+                            numeric(expectedSt->getElementType(1))) {
+                            llvm::Type* dstPay =
+                                expectedSt->getElementType(1);
+                            llvm::Value* conv = coerceNumericToType(
+                                builder_.CreateExtractValue(
+                                    v, {1u}, "nc.arg.lift.in"),
+                                dstPay,
+                                a.value && isUnsignedTargetExpr(*a.value));
+                            if (conv && conv->getType() == dstPay) {
+                                llvm::Value* res = builder_.CreateInsertValue(
+                                    llvm::UndefValue::get(expectedSt),
+                                    builder_.CreateExtractValue(
+                                        v, {0u}, "nc.arg.lift.has"),
+                                    {0u});
+                                v = builder_.CreateInsertValue(
+                                    res, conv, {1u}, "nc.arg.lift");
+                            }
+                        }
+                    } else if (v->getType()->isIntegerTy() ||
+                               v->getType()->isFloatingPointTy()) {
+                        // fix #4963 (§5.1 `S → T → T?`, v0.307): the `?.`
+                        // twin of the widen-then-wrap above.
+                        v = coerceReturnToNullableValue(
+                            v, formalTy, isUnsignedTargetExpr(*a.value),
+                            /*sourceIsNullableRef=*/false, a.value.get());
                     }
                 }
             }
@@ -15607,12 +17814,11 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     // comparator — bz_dict_keys_str would treat those 8-byte pointer buffers
     // as char data and produce garbage bytes for the bz_string_t readback.
     // buildValueHashTrampoline's elementHashFn / elementEqFn already route
-    // string elements through bz_str_hash / bz_string_compare; we mirror that
-    // here for the runtime-allocated `int (*)(const void*, const void*)` that
-    // bz_sort_kv_gen requires. The string comparator below dereferences both
-    // keys[i] into their bz_string_struct* and forwards data/len to
-    // bz_string_compare — same content ordering SortedDictionary<string,V>
-    // gets from its strcmp-driven bz_sort_kv_str path.
+    // string elements through bz_str_hash / the ordinal string comparison; we
+    // mirror that here for the runtime-allocated
+    // `int (*)(const void*, const void*)` that bz_sort_kv_gen requires. The
+    // string comparator below dereferences both keys[i] into their
+    // bz_string_struct* and forwards them to bz_str_compare_cp.
     using K = sema::TypeRef::Kind;
     bool isStringElem = elemTy->kind == K::Primitive &&
                         elemTy->primitive == sema::PrimitiveType::String;
@@ -15643,10 +17849,22 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
     } else {
         // #2550 string comparator: two `void*` args (each pointing to a
         // malloc(8) buffer holding a bz_string_struct* pointer value).
-        // Single-load each to recover the bz_string_struct*, then load
-        // data/len and forward to bz_string_compare — yielding the same
-        // ordinal ordering SortedDictionary<string,V> gets from its
-        // strcmp-driven bz_sort_kv_str path.
+        // Single-load each to recover the bz_string_struct*, then forward
+        // both to bz_str_compare_cp.
+        //
+        // fix #4487 (stdlib §4.18 + §9.6, v0.306): this used to load data/len
+        // off each operand and call `bz_string_compare`, which walked
+        // `min(len)` BYTES over a CODE-POINT length (the #535 defect class),
+        // so every non-ASCII element whose first `len` storage BYTES matched
+        // another's compared EQUAL and the "ascending order" §4.18 promises
+        // silently degraded to insertion order. Measured on HEAD (4d9d186a):
+        // a SortedSet<string> given "日本", "日x", "日a" enumerated
+        // 日本,日x,日a — the insertion order — because all three share the
+        // storage bytes `E5 65`. §4.18 defines this order as the element
+        // type's own `CompareTo`, and §9.6 gives `string.CompareTo` the
+        // ordinal code-point relation, so this comparator MUST be the same
+        // relation the `CompareTo` member is: it is now literally the same
+        // runtime call.
         llvm::Function* strCmp = nullptr;
         if (auto* existing = module_->getFunction("bz$sscmp$string"))
             strCmp = existing;
@@ -15669,15 +17887,10 @@ llvm::Value* Emitter::sortedSetSnapshotToSortedArray(
                 ptrTy(), strCmp->getArg(0), "sa");
             llvm::Value* bStr = builder_.CreateLoad(
                 ptrTy(), strCmp->getArg(1), "sb");
-            llvm::Value* aData = loadStringData(aStr);
-            llvm::Value* aLen  = loadStringLen(aStr);
-            llvm::Value* bData = loadStringData(bStr);
-            llvm::Value* bLen  = loadStringLen(bStr);
-            auto* cmpFnRt = declareC("bz_string_compare",
-                i32(), {ptrTy(), i64(), ptrTy(), i64(), i32()});
+            auto* cmpFnRt = declareC("bz_str_compare_cp",
+                i32(), {ptrTy(), ptrTy(), i32()});
             llvm::Value* res = builder_.CreateCall(cmpFnRt,
-                {aData, aLen, bData, bLen,
-                 llvm::ConstantInt::get(i32(), 0)},
+                {aStr, bStr, llvm::ConstantInt::get(i32(), 0)},
                 "scmp");
             builder_.CreateRet(res);
             builder_.restoreIP(savedIP);
@@ -15825,6 +18038,7 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
 
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* widsOutSlot = entryAlloca(ptrTy());   // fix #4499: per-key §4.6 width
     auto* cntSlot     = entryAlloca(i64());
     auto* valsOutSlot = entryAlloca(ptrTy());
 
@@ -15838,8 +18052,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     } else {
         auto* kfn = declareC("bz_dict_keys_str",
             llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, widsOutSlot,
+                                  cntSlot});
         auto* vfn = declareC("bz_dict_values_str",
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
@@ -15847,6 +18062,9 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
     llvm::Value* lensArr = isStringKey
                                ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* widsArr = isStringKey            // fix #4499
+                               ? builder_.CreateLoad(ptrTy(), widsOutSlot)
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
@@ -15861,8 +18079,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         }
     } else {
         auto* sortFn = declareC("bz_sort_kv_str",
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(), i64()});
-        builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+        // fix #4499: the width spine permutes with keys/lens/values.
+        builder_.CreateCall(sortFn, {keysArr, lensArr, widsArr, valsArr, cnt});
     }
 
     // Allocate a fresh bz_array_t of {K, V} entries.
@@ -15904,7 +18124,8 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
         // lowerToLazyEnumerator's dict arm.) ---
         llvm::Value* keyDecoded;
         if (isStringKey) {
-            auto strPr = decodeDictStringKeyAt(keysArr, lensArr, idxB);
+            auto strPr =
+                decodeDictStringKeyAt(keysArr, lensArr, widsArr, idxB);
             keyDecoded = strPr.first;
             builder_.CreateCall(freeFn, {strPr.second});
         } else {
@@ -15934,7 +18155,10 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     }
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    if (isStringKey) {
+        builder_.CreateCall(freeFn, {lensArr});
+        builder_.CreateCall(freeFn, {widsArr});   // fix #4499
+    }
     builder_.CreateCall(freeFn, {valsArr});
 
     // String keys: use the #2522 string-key Dispose-walker so the rebuilt

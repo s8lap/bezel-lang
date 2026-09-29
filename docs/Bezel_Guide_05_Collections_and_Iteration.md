@@ -133,7 +133,7 @@ end;
 
 If the elements are the pool's to dispose, say so through the pool: `pool.Clear()` disposes every element, `pool.RemoveAt(i)` disposes one, and disposing the pool cascades. To dispose elements *yourself*, take them out first — that is §3.
 
-Two smaller rules complete the picture. Structurally modifying a collection while iterating it raises `InvalidOperationException` at the next advance (spec §29.12). The standard shape is collect-then-remove, two passes:
+Two smaller rules complete the picture. Structurally modifying a collection while iterating it raises `InvalidOperationException` at the next advance (spec §29.12) — and the compiler warns at the in-loop call when the loop would advance after it, naming this remedy. The standard shape is collect-then-remove, two passes:
 
 ```bezel
 using var expired := new Array<Transaction>();
@@ -397,6 +397,7 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 |---|---|
 | Hold references owned elsewhere | the borrowing family (`Array<T>`, `Dictionary<K, V>`, …) |
 | Hold resources this holder disposes | the owning family — `Dispose()` cascades, no destructor |
+| Refer to one object from many places — graph edges, a cache's index, a registry — without a stored borrow | `OwningSlotMap<T>` (stdlib §4.21): the map owns, you store the `SlotHandle` value and look it up at use; a removed entry's handle reads absent |
 | Read elements, either family | an `IEnumerable<T>` / `IReadOnlyList<T>` parameter |
 | Look at an element | indexer, `Peek`, `GetOrNull` — borrows, no obligation |
 | Take one element out | `Pop*` / `Dequeue` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |

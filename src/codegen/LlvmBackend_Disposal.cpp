@@ -90,6 +90,34 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
 
 
 void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
+    // fix #3936 / #2702 item 2 (§28.3 / §28.4 / §28.9, v0.290+): the
+    // per-body emitter fields a NESTED body emission must not INHERIT —
+    // the destructor-body pair (emittingDisposerBody_ / disposerEntryExc_),
+    // the catch-arm pair, the accessor-representation pair
+    // (accessorReturnTypeNode_ / accessorReturnTypeFn_), the choice
+    // receiver-identity recovery field, the suspend/resume frame, the
+    // narrow per-call channels, and the root-scope registration channels
+    // (see NestedBodyScope's definition in LlvmBackend_Assign.cpp ~5114
+    // for the full list and the members deliberately inherited) — are
+    // saved, neutralised and restored by ONE guard. This is the same
+    // #2702 shape the other six lazy emitters already adopt
+    // (ensurePropertyBlockGetter / ensureIndexerGetterFn /
+    // ensureIndexerSetterFn / ensurePropertyAccessorFn /
+    // emitIteratorMethod / emitAsyncMethod). Without it, the two
+    // mid-emission call paths this function is reached from
+    // (`emitSpecializedDisposer` from `specializedVtableFor` ->
+    // `emitInstanceInit` for a generic instantiation with an `owned T`
+    // field, #816 / §28.5; and `specializedDisposerCoreFor` from
+    // `emitBaseDisposeChain`) leave the disposer body of a TYPED-`Owner`
+    // reached MID-emission of a HOLDER destructor carrying the HOLDER's
+    // `emittingDisposerBody_ = true` — and on the way out, the cached
+    // `Owner.dispose` IR is frozen module-wide by `disposerCoreFns_[ts]`
+    // with that flag's *wrong* value. The disposer's own `Sink.Seen := _n`
+    // (a block-body property getter lowered from this disposer body)
+    // therefore reads the HOLDER caller's stored `Sink.Seen` instead of
+    // the property's own `_n` (#3936's measured divergence, two callers
+    // in two orders). The RAII guard's dtor restores everything on exit.
+    NestedBodyScope nestedScope(*this);
     // fix #3921 (§27.5 / §28.4 / §28.9, v0.294): the SAVE/RESTORE half of the
     // capture-cell clear+re-pin block ~150 lines below (fix #2887's). A
     // `clear()` on per-lowering emitter state and a save/restore around nested
@@ -1026,6 +1054,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // libc free(). Mirrors the `rawBytes` flag on the `ffiBuffer` Disposal
         // entry used by the local-scope / parameter paths.
         bool rawBytes = false;
+        // fix #4290: the type name for an `owned` field of a vtableless builtin
+        // type (Mutex, Lock, Semaphore, SemaphoreToken, CancellationTokenSource,
+        // Channel, ChannelSender, Stopwatch, FileStream, TaskCompletionSource,
+        // Atomic, AtomicInteger, etc.).  These have no user TypeDecl and no vtable,
+        // so isOwnedReferenceField returns false and the field would otherwise be
+        // silently skipped.  The name is stored here so emitVtablelessBuiltinRelease
+        // can dispatch to the correct runtime free function.  Empty = not a
+        // vtableless builtin field.
+        std::string vtablelessBuiltin = {};
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -1162,6 +1199,36 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 of.rawBytes = isRaw;
                 owned.push_back(of);
             } else {
+            // fix #4290: an `owned` field of a vtableless builtin type (Mutex,
+            // Lock, Semaphore, SemaphoreToken, CancellationTokenSource, Channel,
+            // ChannelSender, Stopwatch, FileStream, TaskCompletionSource, Atomic,
+            // AtomicInteger, etc.).  These have no user TypeDecl
+            // (declaration == nullptr in their TypeRef) and no vtable, so
+            // isOwnedReferenceField returns false and the field would otherwise be
+            // silently skipped.  Classify by name via builtinTypeName +
+            // classifyVtablelessBuiltinRelease.
+            const sema::TypeRef* rt = nullptr;
+            if (fs->decl) {
+                // SEAM-DEBT: #4290 vtableless-builtin release walker — same
+                // imported-symbol seam as the rest of #3149/#3149; fix #4290
+                // demands this read; canonical accessor (sema::fieldDeclTypeOf)
+                // would still need the FieldDecl decl guard for the
+                // `no user TypeDecl` builtin class case.
+                auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (fd && fd->type) rt = ctx_.resolvedType(*fd->type);
+            } else {
+                rt = ctx_.importedMemberType(fs);
+            }
+            if (rt) {
+                if (auto n = builtinTypeName(rt); !n.empty()) {
+                    if (classifyVtablelessBuiltinRelease(n) !=
+                        VtablelessBuiltinReleaseArm::None) {
+                        OwnedField of{fs, nullptr};
+                        of.vtablelessBuiltin = std::string(n);
+                        owned.push_back(of);
+                    }
+                }
+            }
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
             // Weak<T> type.  These are compiler-known ref-counted heap objects
             // with no user TypeDecl / no vtable; release via the appropriate
@@ -1446,6 +1513,28 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.SetInsertPoint(taskContBB);
             continue;
         }
+        // fix #4290: an `owned` field of a vtableless builtin type (Mutex, Lock,
+        // Semaphore, SemaphoreToken, CancellationTokenSource, Channel, ChannelSender,
+        // Stopwatch, FileStream, TaskCompletionSource, Atomic, AtomicInteger, etc.).
+        // These have no vtable; dispose via the appropriate runtime free function
+        // (bz_mutex_dispose, bz_lock_release, bz_semaphore_release, etc.) using
+        // the same emitVtablelessBuiltinRelease helper the using-var path uses.
+        // Null the slot after so a re-entrant / second pass is a no-op.
+        if (!it->vtablelessBuiltin.empty()) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* vbDispBB = llvm::BasicBlock::Create(
+                llvm_, "owned.vb.dispose", currentFn_);
+            auto* vbContBB = llvm::BasicBlock::Create(
+                llvm_, "owned.vb.cont", currentFn_);
+            builder_.CreateCondBr(isNull, vbContBB, vbDispBB);
+            builder_.SetInsertPoint(vbDispBB);
+            emitVtablelessBuiltinRelease(it->vtablelessBuiltin, val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(vbContBB);
+            builder_.SetInsertPoint(vbContBB);
+            continue;
+        }
         llvm::Value* isNull = builder_.CreateICmpEQ(
             val, llvm::ConstantPointerNull::get(ptrTy()));
         auto* dispBB = llvm::BasicBlock::Create(llvm_, "owned.dispose",
@@ -1476,6 +1565,16 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // nulled at the move (lowerMoveFromCollectionSlot), so the null-guard skips
     // it — no double-free. Unlike the owned-reference fields above there is no
     // single object to dispatch on; the field is a [N x ptr] sub-aggregate.
+    //
+    // fix #4552 (§15.1.1 / §28.4 v0.307, ruling #4388): "the array's auto-
+    // dispose pass disposes each non-null slot, in reverse slot order — the
+    // same order ... as the whole-value-reassignment pass of §15.3 ... one
+    // pass definition governs all four of this paragraph's endings [scope
+    // end, instance-field Dispose(), whole-value reassignment, static
+    // program exit]." This loop iterated 0..n-1 (establishment order); the
+    // reassignment pass (lowerOwningInlineArrayReassign,
+    // LlvmBackend_Stmts.cpp) already iterates N..1 for exactly this reason.
+    // Iterate in reverse to match.
     {
         llvm::StructType* st = classStruct(ts);
         for (const sema::Symbol* m : ts->members) {
@@ -1496,7 +1595,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             llvm::Value* fieldAddr =
                 builder_.CreateStructGEP(st, currentThis_, idx, "ioaf.addr");
             auto* arrTy = llvm::ArrayType::get(ptrTy(), n);
-            for (unsigned i = 0; i < n; ++i) {
+            for (unsigned fwd = 0; fwd < n; ++fwd) {
+                // fix #4552 (§15.1.1 v0.307): reverse slot order.
+                unsigned i = n - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, fieldAddr,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioaf.slot");
@@ -1573,8 +1674,21 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            if (!isStringStorageMember(m)) continue;
+            // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): also a bare-`T`
+            // member at `T = string` — this walk runs inside the
+            // per-instantiation disposer (needsSpecDispose's layoutDiffers
+            // clause forces one at every pointer-sized instantiation) with the
+            // substitution active, and every store into such a member now
+            // retains (see isTypeParamBoundToString). The slot-type check keeps
+            // the release off anything that is not a pointer slot in the
+            // struct actually being walked.
+            if (!isStringStorageMember(m) &&
+                !isTypeParamStringStorageMember(m))
+                continue;
             unsigned idx = fieldIndex_[m];
+            if (!isStringStorageMember(m) &&
+                !sst->getElementType(idx)->isPointerTy())
+                continue;
             llvm::Value* addr = builder_.CreateStructGEP(sst, currentThis_, idx,
                                                          "strf.addr");
             llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "strf.val");
@@ -1676,69 +1790,57 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // existed (a safe-direction leak becomes balanced). It can turn that
     // leak into a double-free / UAF only if the field's value at Dispose
     // time could differ from what the admitted initializer constructed,
-    // or could alias another live binding. Three conditions below close
-    // every reassignment vector found while investigating this issue —
-    // each verified against the REAL compiler, not assumed:
-    //   1. `readonly` — MEASURED: an ordinary (non-constructor) method
-    //      assigning `this.P := ...` to a readonly property is REJECTED
-    //      ("cannot assign to readonly property `P` outside a field
-    //      initializer or constructor (\xC2\xA7 23.1)"). Closes the
-    //      arbitrary-method-reassignment vector.
-    //   2. `!hasAnyConstructor(ts)` — no EXPLICIT constructor exists on
-    //      THIS type, so there is no user-written constructor BODY that
-    //      could reassign the field after its own declaration initializer
-    //      runs. Worth recording because it is NOT redundant with (1):
-    //      MEASURED that a readonly property WITH a declaration
-    //      initializer can currently ALSO be reassigned a second time
-    //      inside an explicit constructor body with NO diagnostic at
-    //      all — sema does not yet enforce §22.8's "at most once,
-    //      counting the field initializer and every constructor body in
-    //      the this(...) chain together" rule when an initializer is
-    //      already present (filed as issue #4275 — a sema gap, out of
-    //      scope for this codegen fix). This condition is the guard
-    //      against it: no constructor body exists to exploit the gap.
-    //   3. `sealed` on `ts` — MEASURED: a DERIVED class's constructor can
-    //      currently reassign a readonly property INHERITED from its
-    //      base with NO diagnostic (a second, broader sema gap than #2 —
-    //      filed as issue #4276). `hasAnyConstructor` only inspects
-    //      `ts`'s OWN members, so it cannot see a subclass's
-    //      constructor; requiring `ts` to be `sealed` closes the vector
-    //      structurally — no subclass can exist to hold such a
-    //      constructor, in this module or any importer.
-    // Together: the field is assigned EXACTLY ONCE, by its own
-    // declaration initializer, for the entire lifetime of every
-    // instance — no other write site exists (own methods barred by (1),
-    // an own constructor body doesn't exist by (2), a derived-class
-    // constructor cannot exist by (3)). The initializer's own
-    // eligibility proof (isFreshRecordConstructionOfExactType) is what
-    // makes that ONE assignment's value provably alias-free.
+    // or could alias another live binding — i.e. only if some OTHER store
+    // to the slot can run.
     //
-    // A field lacking any of these three properties, or whose
-    // initializer is not a provably-fresh NewExpr of the declared type,
-    // is UNCHANGED — still safe-leaks exactly as before this fix
-    // (deliberately narrow, matching #2866/#4237's own local-binding
-    // admission). The residual — constructor-body-assigned fields,
-    // non-sealed classes — is filed as issue #4277.
+    // fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306): that is now asked
+    // DIRECTLY, by `declarationInitializerIsSoleStore` (LlvmBackend_Setup.cpp).
+    // #4253 asked it through three structural PROXIES instead — `readonly`
+    // on the member, `sealed` on `ts`, and `!hasAnyConstructor(ts)` — and
+    // each over-rejected on its own axis, so three whole shapes with exactly
+    // ONE store went on leaking: a non-sealed class with no subclass, a class
+    // whose only constructor never mentions the field, and a non-readonly
+    // property nothing ever assigns (7490 B / 400 allocations, 8600 B / 400,
+    // and 7490 B / 400 respectively at 200 loop iterations, measured on
+    // origin/main cafdfc52). The predicate proves the same safety property
+    // the three proxies were reaching for — the declaration initializer is
+    // the SOLE store the slot ever receives — out of a module-wide write-site
+    // scan plus §13.2/§23.1 cross-module reachability, and is fail-closed on
+    // any AST node kind it does not recognize.
+    //
+    // The two sema facts the proxies were standing in for are unchanged and
+    // still load-bearing, just consulted at their source rather than
+    // approximated: §23.1 (+ fix #4276's declaring-type narrowing) is what
+    // makes a `readonly` member's write sites all local, and §13.2's
+    // default-`internal` top-level visibility is what makes a non-readonly
+    // member of an undecorated type unreachable from an importer.
+    //
+    // A field whose initializer is not a provably-fresh NewExpr of the
+    // declared type, or which any other store site can reach, is UNCHANGED —
+    // still safe-leaks exactly as before. The residual #4277 records and this
+    // fix does NOT close: a field assigned by a CONSTRUCTOR-BODY statement
+    // (`this.P := new Box(...);`) rather than its own declaration
+    // initializer. That shape needs the store site itself to transfer a +1
+    // (drop-on-overwrite for record-typed fields, §28.7's reference-field
+    // mechanism generalized), not merely a proof about how many stores there
+    // are, and stays filed.
     {
         llvm::StructType* rst = classStruct(ts);
-        bool tsSealed = false;
-        for (auto tmod : ts->modifiers)
-            if (tmod == "sealed") { tsSealed = true; break; }
-        bool tsHasCtor = hasAnyConstructor(ts);
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;  // fix #3152 — see the string walk above
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            if (!tsSealed || tsHasCtor) continue;
             const sema::TypeRef* fieldTr = recordMemberType(m);
             if (!isRecordWithStringFieldsTypeRef(fieldTr)) continue;
-            bool isReadonly = false;
-            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
-                for (auto fmod : ms->modifiers)
-                    if (fmod == "readonly") { isReadonly = true; break; }
-            if (!isReadonly) continue;
+            // fix #4277 (§9.7 / §28.9 / §13.2 / §23.1, v0.306): ONE predicate
+            // in place of #4253's three structural proxies (`sealed`,
+            // `!hasAnyConstructor`, `readonly`). See its definition in
+            // LlvmBackend_Setup.cpp — it asks the question those three were
+            // each a coarse stand-in for, and so admits the three shapes they
+            // each over-rejected without widening what is being claimed.
+            if (!declarationInitializerIsSoleStore(ts, m)) continue;
             const ast::Expr* init = nullptr;
             // SEAM-ACCESSOR: `m->decl` is nullptr for an IMPORTED field (no
             // ast::FieldDecl crosses the module boundary, the #3671 seam) --
@@ -2247,7 +2349,60 @@ void Emitter::emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi) {
 }
 
 
-void Emitter::emitPendingCheck() {
+llvm::Value* Emitter::snapshotInFlightExc() {
+    return builder_.CreateLoad(ptrTy(), emitExcSlot(), "disp.preexc");
+}
+
+
+void Emitter::emitDisposalFaultCheck(llvm::Value* excBefore,
+                                     std::size_t unwindDisposeHi) {
+    // fix #1878 + #1882 (§28.4, v0.306): route a fault RAISED BY THE DISPOSAL
+    // that `excBefore` brackets, and only that.
+    //
+    // The obvious condition — `emitPendingCheck`'s plain `bz_exc != null` — is
+    // WRONG here, and measurably so. A disposal site is one of the few places
+    // reached with an exception ALREADY in the slot, and not only inside a user
+    // destructor body (#1468's case, which `emitPendingCheck` does gate on): the
+    // §29.7 abandonment disposal of an `await for` iterator runs the iterator's
+    // compiler-generated teardown — sync-fallback destructor included — while
+    // the exception that abandoned the loop is in flight. A plain non-null test
+    // fires there on somebody else's exception, branches out of the teardown and
+    // LEAKS the iterator frame (measured: 80 bytes, `async_iter_early_-
+    // abandonment_dispose_1525.exception_from_loop_body_disposes_and_preserves_-
+    // the_exception`). That is the #1468 defect class exactly, one context wider.
+    //
+    // So compare against the value in the slot before the disposal ran: fire iff
+    // an exception is in flight AND it is not the one that was already there.
+    // This is the same "did this operation RAISE" shape `emitEnsureStaticInit`
+    // passes to `emitPendingCheckIf`, and it subsumes #1468's disposer-entry
+    // gate — inside a destructor body the bracketed value IS the entry
+    // exception. Supersession still works: `DisposeCore` frees the superseded
+    // instance and leaves the NEW one in the slot (#2358), so the pointer
+    // differs and the check fires on the survivor.
+    //
+    // ⚠ WHAT THE COMPARISON GUARANTEES, EXACTLY. It is an ADDRESS test over a
+    // recycling allocator, so it is ABA-exposed: with `excBefore` = E1@A, a
+    // first disposal that throws E2 makes #2358's supersede tail free E1 —
+    // releasing A — and a second disposal that throws E3 can have `malloc`
+    // hand back A. Then `after == excBefore` and this check does NOT fire. So
+    // the guarantee is one-directional: firing implies a NEW fault (no false
+    // positive, which is the property that matters — a false positive is the
+    // measured iterator-frame leak above), while not firing does NOT imply no
+    // fault. The miss degrades to base behaviour: E3 stays in the bz_exc slot
+    // and the enclosing unwind's next pending check routes it, one site later
+    // than §28.4 would like. Not reproduced, and not worth an identity counter
+    // unless it is; recorded so the next reader does not mistake this for a
+    // total test.
+    llvm::Value* after =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "disp.postexc");
+    llvm::Value* inFlight = builder_.CreateICmpNE(
+        after, llvm::ConstantPointerNull::get(ptrTy()));
+    llvm::Value* isNew = builder_.CreateICmpNE(after, excBefore);
+    emitPendingCheckIf(builder_.CreateAnd(inFlight, isNew), unwindDisposeHi);
+}
+
+
+void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     llvm::Value* pending = builder_.CreateICmpNE(
         exc, llvm::ConstantPointerNull::get(ptrTy()));
@@ -2280,7 +2435,7 @@ void Emitter::emitPendingCheck() {
         llvm::Value* isNew = builder_.CreateICmpNE(exc, entryExc);
         pending = builder_.CreateAnd(pending, isNew);
     }
-    emitPendingCheckIf(pending);
+    emitPendingCheckIf(pending, unwindDisposeHi);
 }
 
 // #792 / §22.13: the shared route block for a conditional pending check. Branch
@@ -2290,7 +2445,8 @@ void Emitter::emitPendingCheck() {
 // the #1468 disposer "is-new" gate) and delegates here; emitEnsureStaticInit
 // passes a "the static-init guard RAISED a new exception" condition so a
 // pre-existing in-flight exception is not misrouted at the static-access site.
-void Emitter::emitPendingCheckIf(llvm::Value* cond) {
+void Emitter::emitPendingCheckIf(llvm::Value* cond,
+                                 std::size_t unwindDisposeHi) {
     auto* unwind =
         llvm::BasicBlock::Create(llvm_, "call.unwind", currentFn_);
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
@@ -2324,7 +2480,17 @@ void Emitter::emitPendingCheckIf(llvm::Value* cond) {
             {currentCaughtExc_});
         emitDisposeAndReclaim(currentCaughtExc_);
     }
-    emitUnwindDisposals();
+    // fix #1882 (§28.4, v0.306): kAllLiveScopes is every pre-existing caller's
+    // meaning and keeps emitUnwindDisposals' behaviour bit-for-bit. A SCOPE-END
+    // disposal pass passes its own scope's index instead: that scope's entries
+    // were just discharged by the pass that raised this exception, and it is
+    // still on disposeStack_ (its owner pops it after the pass returns), so
+    // re-disposing it here would double-release every entry that does not null
+    // its own slot (a plain `stringRelease` is exactly such an entry).
+    if (unwindDisposeHi == kAllLiveScopes)
+        emitUnwindDisposals();
+    else
+        emitUnwindDisposalsInRange(unwindScopeDepth_, unwindDisposeHi);
     builder_.CreateBr(unwindBB());
     builder_.SetInsertPoint(cont);
 }
@@ -2455,6 +2621,15 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     builder_.CreateCall(fnTy, disposeFn, {obj});
+    // fix #1882 (§28.4, v0.306): this call can run a USER destructor body, so
+    // it can leave an exception in the bz_exc slot. Record that fact for
+    // emitDisposals' post-pass propagate check — this function is the single
+    // funnel every disposal site's dispatch goes through, so counting here
+    // makes the gate exact for present and future arms alike. Counting rather
+    // than setting a flag keeps nesting honest: a pass reads the DIFFERENCE
+    // across itself, so a lazily-emitted inner function built mid-pass cannot
+    // clear a bit the pass still needs.
+    ++userCodeDisposalCount_;
 }
 
 
@@ -2467,6 +2642,42 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // Dispose (a no-op if already run) and THEN reclaim the block exactly once.
     // The caller is responsible for null-ing its slot afterward where a second
     // dispatch through the same slot is reachable. free(null) is a no-op.
+    //
+    // fix #4540 (§28.3, §30.1, v0.306) — the #3460 residual. The cross-task
+    // borrow wait MUST run here, at the FRONT of the owner's teardown, not
+    // only in front of the physical `free` in emitReclaimBlock.
+    //
+    // #3460 placed it immediately before `free(obj)`, which closes exactly one
+    // race: the worker reading the object's BYTES after the owner unmapped
+    // them. But `emitDynamicDispose` below dispatches the vtable Dispose, and
+    // that runs the object's LOGICAL teardown — the destructor body and the
+    // owned/refcounted FIELD releases (bz$<C>$DisposeCore) — while the async
+    // frame that registered the borrow is still live and still writing those
+    // same fields. §28.3's "the borrow of the captured state must outlive any
+    // pending resumption" is a claim about the whole of the owner's teardown,
+    // not just about the heap block.
+    //
+    // Measured (issue #4540): `using var c := new C(); var t := c.Fill(7);`
+    // where the async `Fill` assigns `this._h := lambda() => k;` after an
+    // `await`. The owner's Dispose released `_h` (closure A) and only THEN
+    // waited; the worker's `this._h := B` read the same A and released it too
+    // — two releases against one reference. The loser's `__atomic_sub_fetch`
+    // returns -1, which is not `> 0`, so both callers fall into
+    // bz_closure_release's last-drop path and both `free(env)`:
+    // "AddressSanitizer: attempting double-free ... bz_closure_release <-
+    // bz$async$M.C$Fill$Resume <- domain_drain". Waiting first makes the
+    // worker's store happen-before the owner's field release, so each closure
+    // is released exactly once (and B is no longer stranded).
+    //
+    // Null-safe, and a no-op for the objects nobody borrowed (a mutex lock and
+    // a failed side-table lookup, no syscall). emitReclaimBlock keeps its own
+    // call: that function is also entered directly from the `await using` path
+    // (#3470), which never passes through here, and a second wait on an
+    // already-drained object costs the same failed lookup.
+    builder_.CreateCall(
+        declareC("bz_wait_for_borrows", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}),
+        {obj});
     emitDynamicDispose(obj);
     emitReclaimBlock(obj);
 }
@@ -2553,8 +2764,25 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // branch, matching checked disposal's own deliberate-leak posture for
     // everything else the block owns — only the block header itself is kept
     // readable for the disposed-flag guard.)
-    if (!checkedDisposal_)
+    if (!checkedDisposal_) {
+        // fix #3460 (§28.3 / §30.1): before freeing the heap block, wait for
+        // any cross-task BORROWS on this object to be released. A borrow is
+        // registered by an async frame whose `this = c` capture points at c
+        // (the heap-use-after-free of #3460 was main's `using var c` exit
+        // firing `free(c)` while the worker's resume continuation still read
+        // `this._h`). The wait blocks until the worker's emitAsyncComplete
+        // has run and released its borrow — closing the race. Null-safe and
+        // cheap for objects nobody borrowed (the runtime side-table find is a
+        // mutex lock + failed lookup, no syscall). Runs BEFORE the free,
+        // AFTER the CauseChain reclaim — the CauseChain read races only with
+        // a still-borrowed object, but the borrow's release synchronizes
+        // with the wait's acquire-load so the reclaim is safe.
+        builder_.CreateCall(
+            declareC("bz_wait_for_borrows",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+            {obj});
         builder_.CreateCall(freeFn(), {obj});
+    }
 }
 
 
@@ -3067,7 +3295,7 @@ void Emitter::disposeNewDiscardOwnedOutSlots(std::size_t base) {
 
 
 void Emitter::emitOwningChoiceActiveCaseDisposal(
-        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
+        llvm::Value* slot, const sema::TypeSymbol* choiceTy,
         const sema::TypeRef* choiceRef) {
     // §35.4 (v0.200, #2045 stage 3) "Disposal is defined by the active
     // case." Reads the runtime TAG (field 0 of the choice struct), switches
@@ -3132,61 +3360,144 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
     auto* sw = builder_.CreateSwitch(
         tag, joinBB, static_cast<unsigned>(cases.size()));
     // Walk every case in declaration order, building one switch arm per
-    // case that has at least one owned payload field.
+    // case that has at least one owning payload field (an `owned`-marked
+    // payload whose instantiated type is a class/interface, or a payload
+    // whose type is itself an owning choice / move-only value type —
+    // §35.4 "and, recursively, any move-only payloads").
     for (std::size_t i = 0; i < cases.size(); ++i) {
         const sema::ChoiceCaseSymbol* cc = cases[i];
         if (!cc || !cc->caseDecl) continue;
-        // §28.1 + §35.4: only `owned`-marked payload fields are owning slots;
-        // plain (unmarked) class payloads are borrows (the borrow-bearing
-        // classification), value payloads are value-typed (no dispose), and
-        // strings are runtime-managed. Walk the AST payload list, collect
-        // indices of owned fields, and emit one dispose site per owned
-        // field, in payload declaration order (§35.4 "in payload
-        // declaration order").
-        std::vector<unsigned> ownedFieldIdxs;
+        // fix #4132 / §35.4 (v0.300, "and, recursively, any move-only
+        // payloads"): collect indices of every OWNING payload — either an
+        // explicit `owned` payload whose instantiated type is a class/interface
+        // (the vtable Dispose path below) OR a payload whose declared type is
+        // itself an owning choice (the recursive per-tag disposal path). The
+        // pre-#4132 walk only saw the `owned` marker, so a non-`owned` field
+        // whose type was itself an owning choice (the rule-1b classification
+        // trigger, `y: D<Widget>` in `Outer.B(y: D<Widget>)`) was silently
+        // skipped — the case emitted zero owning fields, the switch arm was
+        // omitted entirely, and the nested owning choice's own `owned` payload
+        // was never disposed. The kind discriminator drives the disposal arm
+        // below.
+        std::vector<unsigned> owningFieldIdxs;
+        std::vector<bool> fieldIsOwningChoice;
         for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
             const ast::Param& pf = cc->caseDecl->payload[j];
-            if (pf.modifier != "owned") continue;
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            // §35.4 rule 1a: `owned` + class/interface → vtable disposal.
             // §28.1 per-instantiation erasure (#2047): an `owned` field whose
             // instantiated type is value-like or runtime-managed (e.g.
             // `Error(owned error: string)` at `Result<C, string>`) does NOT
             // participate in vtable disposal — disposing it would dispatch a
-            // Dispose through a non-object payload. Only fields whose
-            // instantiated type is an owning heap reference are disposed.
-            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
-                pf, choiceDecl, choiceRef, ctx_);
-            if (!common::ownedMarkerActiveOnInstantiatedType(ftInst, ctx_))
+            // Dispose through a non-object payload.
+            if (pf.modifier == "owned") {
+                if (common::ownedMarkerActiveOnInstantiatedType(ftInst, ctx_)) {
+                    owningFieldIdxs.push_back(static_cast<unsigned>(j));
+                    // `owned f: D<Widget>` — `owned` is admitted-but-redundant
+                    // (§28.1) on an owning choice; route to the recursive path
+                    // since the field IS the owning choice (not a class ref).
+                    bool isChoice = ftInst && ftInst->kind ==
+                        sema::TypeRef::Kind::Named && ftInst->declaration &&
+                        ftInst->declaration->kind == ast::TypeDeclKind::Choice;
+                    fieldIsOwningChoice.push_back(isChoice);
+                }
                 continue;
-            ownedFieldIdxs.push_back(static_cast<unsigned>(j));
+            }
+            // §35.4 rule 1b: a non-`owned` payload whose TYPE is itself a
+            // move-only value type (an owning inline array or — the issue's
+            // shape — an owning choice) owns heap objects transitively and
+            // must be disposed. Same kind test isMoveOnlyValueType uses
+            // (OwnershipFacts.cpp:1840, #3775): owning choice or owning inline
+            // array. Inline-array payload disposal is not yet wired (filed
+            // separately); the recursive disposal is identical to a class
+            // payload's — a temp alloca holding the choice struct, then the
+            // recursive per-tag switch.
+            const char* mvKind = nullptr;
+            if (ftInst && common::isMoveOnlyValueType(ftInst, ctx_, mvKind)) {
+                bool isChoice = ftInst->kind == sema::TypeRef::Kind::Named &&
+                    ftInst->declaration &&
+                    ftInst->declaration->kind == ast::TypeDeclKind::Choice;
+                if (isChoice) {
+                    owningFieldIdxs.push_back(static_cast<unsigned>(j));
+                    fieldIsOwningChoice.push_back(true);
+                }
+                // Owning inline array in choice payload: deferred (#4132
+                // covers the choice-in-choice case; a future issue tracks the
+                // inline-array variant).
+            }
         }
-        if (ownedFieldIdxs.empty()) continue;  // nothing to dispose — switch
-                                               // arm collapses to join.
+        if (owningFieldIdxs.empty()) continue;  // nothing to dispose — switch
+                                                // arm collapses to join.
         auto* armBB =
             llvm::BasicBlock::Create(llvm_, "ocd.arm", currentFn_);
         sw->addCase(
             llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i), armBB);
         builder_.SetInsertPoint(armBB);
         // GEP into the case's payload slot (field 1+i) and load the
-        // payload struct value, then extract each owned field and dispose.
+        // payload struct value, then extract each owning field and dispose.
         llvm::Value* casePayload = builder_.CreateExtractValue(
             choiceVal, {1 + (unsigned)i}, "ocd.case.payload");
-        for (unsigned j : ownedFieldIdxs) {
-            llvm::Value* ownedPtr = builder_.CreateExtractValue(
+        for (std::size_t k = 0; k < owningFieldIdxs.size(); ++k) {
+            unsigned j = owningFieldIdxs[k];
+            bool isChoice = fieldIsOwningChoice[k];
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            llvm::Value* fieldVal = builder_.CreateExtractValue(
                 casePayload, {j}, "ocd.owned.field");
+            if (isChoice) {
+                // fix #4132 / §35.4 rule 1b: the nested choice's per-tag
+                // disposal needs an AllocaInst slot to read the value from;
+                // the field is a struct value embedded in casePayload, so
+                // alloca a fresh slot of the choice struct's specialized
+                // type, store the value, and recurse. The temp slot is dead
+                // the moment the recursive disposal completes (no live
+                // alias — the recursive switch reads the tag fresh each
+                // pass), so no NULLing is needed across re-entry.
+                //
+                // §14.1 / §28.1 (#2047): under an OUTER substitution (this
+                // emit's own RecordSubstGuard installed the OUTER choice's
+                // mapping), choiceStruct(ftInst->declaration) would lay out
+                // the bare choice with the OUTER's instantiation context —
+                // e.g. `Outer`'s subst doesn't name `T`, so `D`'s `T`
+                // falls back to the i32 placeholder (a too-small slot for
+                // the 24-byte `D<Widget>` value we already extracted).
+                // `store %D$spec0 into %D` then overruns the alloca's right
+                // redzone by exactly 4 bytes — the measured ASan report.
+                // Install ftInst's own subst for the alloca + the recursive
+                // call (which would otherwise inherit the outer map).
+                llvm::StructType* nestedSt = nullptr;
+                {
+                    RecordSubstGuard nestedSubst(this, ftInst);
+                    nestedSt = choiceStruct(ftInst->declaration);
+                    if (!nestedSt) continue;  // defensive — never fires
+                                              // (substitutedChoicePayloadType
+                                              // already proved it's a choice)
+                    llvm::AllocaInst* nestedSlot =
+                        builder_.CreateAlloca(
+                            nestedSt, nullptr, "ocd.nested.slot");
+                    builder_.CreateStore(fieldVal, nestedSlot);
+                    emitOwningChoiceActiveCaseDisposal(
+                        nestedSlot, ftInst->declaration, ftInst);
+                }
+                continue;
+            }
+            // Class/interface `owned` payload — the pre-#4132 path.
             // Null-guard: a never-bound arm of the active-case match could
             // leave an `owned`-payload slot null (the binding took it out);
             // or a payload-defaulted construction. `emitDisposeAndReclaim`
             // is null-safe (free(null) no-op) but the dispatch on a null
             // vtable would crash — guard explicitly.
             llvm::Value* isNull = builder_.CreateICmpEQ(
-                ownedPtr, llvm::ConstantPointerNull::get(ptrTy()));
+                fieldVal, llvm::ConstantPointerNull::get(ptrTy()));
             auto* dispBB = llvm::BasicBlock::Create(
                 llvm_, "ocd.dispose", currentFn_);
             auto* contBB = llvm::BasicBlock::Create(
                 llvm_, "ocd.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            emitDisposeAndReclaim(ownedPtr);
+            emitDisposeAndReclaim(fieldVal);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
         }
@@ -5040,12 +5351,33 @@ bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // Widening to Class|Interface fixes the Class-only check that caused
     // OwningDictionary<K,IFoo> indexer-set and move-out to skip disposal for
     // interface-valued slots.
+    //
+    // fix #4642 (§8.6 / §8.3 / §28.11, v0.307): further widened to admit
+    // `Object`. A §8.6 box IS reference-shaped at the slot — a heap pointer
+    // carrying the §8.3 object header (vtable at word 0), exactly like a class
+    // or interface element — but it is `Kind::Primitive` with no `TypeSymbol`
+    // declaration, so it fell past the `Kind::Named && declaration` guard. The
+    // authority used is `hasObjectHeaderEquality`, the SAME named predicate
+    // `genericBackingType`'s dictionary row and `lowerNew`'s SortedSet
+    // rejection already use for "carries the §8.3 object header: a class, an
+    // interface, or `Object`", rather than a fourth hand-rolled spelling of it
+    // — and it is exactly this function's old test plus the `Object` row.
+    //
+    // WHY IT MATTERS (issue #4642): `materializeArrayBackedSetLiteral`'s opening
+    // `if (!collectionElemIsClass(setTy, 0)) return nullptr;` is the reason
+    // `var s: Set<Object> := [];` never materialised AT ALL — `genericBackingType`
+    // declines `Object` for a set (deliberately: a class/interface/Object set is
+    // array-backed, #1070), both materialisers returned null, and
+    // `lowerLocalDecl`'s #559 "materialisation failed; sema already diagnosed
+    // it" guard then dropped the local's storage with NO diagnostic, so every
+    // later read of `s` missed `locals_` and degraded to the #2434 zero-init
+    // fallback. `new Set<Object>()` already allocated a `bz_array_t` (lowerNew's
+    // array arm lists `Set`/`OwningSet`) and `registerCollectionDisposal`
+    // already classified such a set array-backed via the same
+    // `genericBackingType` test, so this closes the literal half of a split the
+    // rest of the backend had already made.
     if (!collTy || collTy->genericArgs.size() <= idx) return false;
-    const sema::TypeRef* el = collTy->genericArgs[idx];
-    if (!el || el->kind != sema::TypeRef::Kind::Named || !el->declaration)
-        return false;
-    return el->declaration->kind == ast::TypeDeclKind::Class ||
-           el->declaration->kind == ast::TypeDeclKind::Interface;
+    return hasObjectHeaderEquality(collTy->genericArgs[idx]);
 }
 
 
@@ -6075,6 +6407,658 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
 }
 
 
+// fix #4552 / §35.9 *Nullable `C?`* (v0.306): dispose the owning-choice value
+// held AT AN ADDRESS, unwrapping §35.9's `C?` representation first.
+//
+// §35.9 makes `C?` "the ordinary nullable value type (§7.2)", and §7.2's
+// representation for a nullable value type is the tagged wrapper
+// `{ i8 hasValue, <payload> }` (`nullableValueStructTy`, whose own
+// `isNullableChoiceTy` arm builds it with `choiceStruct` as the payload). So a
+// `C?` LOCATION does not hold a choice struct at offset 0 — it holds the
+// wrapper, with the choice struct at field 1.
+//
+// ⚠ EVERY pre-#4552 caller read it as though it did. `registerOwningChoiceDisposal`
+// registers a nullable owning-choice local exactly as it registers a
+// non-nullable one (its gate reads `rt->declaration->kind == Choice`, which a
+// `C?` TypeRef satisfies), and the scope-end pass then loaded `%choice.C` from
+// the wrapper's address — reading `hasValue` (plus padding) AS THE TAG.
+// MEASURED on `var o: Outcome? := Outcome.Fetched(new Widget());`: `hasValue`
+// is 1, `Fetched` is case 0 and `Failed` is case 1, so the tag read 1, the
+// switch took the payload-free `Failed` arm, and the widget was silently
+// leaked. The same misread is a CRASH rather than a leak whenever the
+// mis-decoded tag lands on a case that DOES carry an owned payload: the
+// extracted "payload pointer" is then another field's bytes.
+void Emitter::emitOwningChoiceLocationDisposal(llvm::Value* addr,
+                                               const sema::TypeRef* choiceRef) {
+    if (!addr || !choiceRef || !choiceRef->declaration) return;
+    if (!choiceRef->nullable) {
+        emitOwningChoiceActiveCaseDisposal(addr, choiceRef->declaration,
+                                           choiceRef);
+        return;
+    }
+    llvm::StructType* wrap = nullableValueStructTy(choiceRef);
+    if (!wrap || wrap->getNumElements() < 2) return;
+    // §35.9: "`null` assignment into an owned-state `C?` location is
+    // drop-on-overwrite — the displaced value's payloads are disposed". The
+    // converse is equally normative: a `C?` location that IS null holds no
+    // payloads, so the walk must be guarded rather than run on zeroed bytes.
+    llvm::Value* hvAddr =
+        builder_.CreateStructGEP(wrap, addr, 0, "ocd.opt.hv.addr");
+    llvm::Value* hv =
+        builder_.CreateLoad(nullablePrimHasValTy(), hvAddr, "ocd.opt.hv");
+    llvm::Value* live = builder_.CreateICmpNE(
+        hv, llvm::ConstantInt::get(nullablePrimHasValTy(), 0), "ocd.opt.live");
+    auto* dispBB =
+        llvm::BasicBlock::Create(llvm_, "ocd.opt.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ocd.opt.cont", currentFn_);
+    builder_.CreateCondBr(live, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    llvm::Value* inner =
+        builder_.CreateStructGEP(wrap, addr, 1, "ocd.opt.val.addr");
+    emitOwningChoiceActiveCaseDisposal(inner, choiceRef->declaration,
+                                       choiceRef);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
+// fix #4552 / §35.4 *Drop-on-overwrite is defined and automatic* + §35.9
+// (v0.306). §35.4: "Whole-value reassignment of an owning-choice local or field
+// *disposes the displaced value* per §28.7, like an owned class binding. A
+// choice has no partial states, so the single-value form of that rule applies
+// as written"; and "`x := null;` on an owned `C?` location likewise disposes
+// the displaced value's payloads (§35.9)".
+//
+// Codegen had NO drop-on-overwrite path for a choice before this: the class
+// sibling (`disposeDisplacedOwnedClassLocal`, above) returns at its
+// `unwindOwnedLocalClass` gate for a choice-typed local (a choice is a
+// value type, not a class reference), and the scope-end active-case pass
+// (`registerOwningChoiceDisposal` → `emitDisposals`' `owningChoice` arm) only
+// ever sees the FINAL value in the slot. So every displaced value leaked:
+// MEASURED on `var b := Bundle.Ready(new Resource("old")); b := Bundle.Ready(
+// new Resource("new"));` — spec output `dispose old / reassigned / dispose
+// new`, observed `reassigned / dispose new`.
+//
+// ORDER. Called from the `:=` lowering AFTER the RHS has been lowered and
+// BEFORE the store — §35.4's own sequencing ("the RHS is evaluated first, then
+// the displaced value is disposed, then the new value is stored").
+//
+// THE TWO SUPPRESSIONS, both §28.7's: the pass runs only "if the previous value
+// is live (**non-null and not moved-from**)".
+//   1. moved-from — supplied by the caller via `as->lhsMovedFromAtStore`, the
+//      ownership dataflow's converged state at this store (#3950). Without it
+//      `b := Pass(move b);` would dispose the value the callee just handed
+//      back through the same slot.
+//   2. self-assignment — `b := b;` is admitted today and lowers to a
+//      load-then-store of the same bytes, so disposing the displaced value
+//      would free the payload the store is about to write back. The class
+//      sibling catches this with a pointer IDENTITY guard on the loaded old
+//      value; a choice is a struct in an SSA register with no pointer to
+//      compare, so the equivalent test is syntactic: the RHS is a bare
+//      identifier naming the same local.
+// The NULL half of §28.7's conjunction needs no separate gate here: an owning
+// choice always holds a live case, and the `C?` spelling's `hasValue` guard is
+// inside `emitOwningChoiceLocationDisposal`.
+void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
+                                                llvm::Value* addr,
+                                                const ast::Expr* rhsExpr) {
+    if (!addr || !target) return;
+    if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return;  // field / index / static target — not a plain local
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc) return;  // a parameter (borrow or owned) — excluded
+    // LOCALDECL-ONLY: `target` is an ASSIGNMENT target — this helper is reached
+    // only from the `:=` lowering — and §21.1 makes a `const` local a
+    // single-assignment binding, so sema rejects the store before codegen ever
+    // runs ("cannot assign to const local `b` — a const local is a
+    // single-assignment binding (§21.1)", verified by probe). A LocalConstDecl
+    // therefore cannot reach here, and there is no `const` binding form for the
+    // #3591 family to silently skip. // per §21.1
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld) return;
+    // Suppression 2 (see the header): `b := b;`.
+    if (auto* rhsId = dynamic_cast<const ast::IdentifierExpr*>(rhsExpr))
+        if (ctx_.exprSymbol(*rhsId) == static_cast<sema::Symbol*>(loc)) return;
+    // The declared type decides — the same resolution order
+    // `registerOwningChoiceDisposal` uses, so the store-site drop and the
+    // scope-end active-case pass can never disagree about which locals are
+    // owning choices.
+    const sema::TypeRef* rt =
+        ld->type ? ctx_.resolvedType(*ld->type)
+                 : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return;
+    // §3.6 rule 2 + §35.4: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    emitOwningChoiceLocationDisposal(addr, rt);
+}
+
+
+// fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from and null*
+// (v0.306). §15.3 makes an owning-classified choice a MOVE-ONLY value type:
+// "Assignment transfers the value from source to destination, leaving the
+// source in moved-from state", spelled out at the first *Rules* bullet as
+// "**Local-to-local assignment** `var y := x;`: copies for an ordinary value
+// type; moves for a move-only value type. After the move, `x` is in moved-from
+// state" — unmarked, because "a move-only value binding has no borrow reading
+// to disambiguate". §15.3's *Local lifetime* bullet then states the
+// consequence for the SOURCE: a whole-value move "leaves the local holding no
+// value rather than a hole, so no pass walks it (K1's moved-from state:
+// 'discharge machinery skips it')", which is §28.7's *Moved-from and null*
+// clause — "A moved-from or null location therefore stores without disposal".
+//
+// Codegen implemented only the STORE half. `c := b;` and `var c := b;`
+// plain-copied the choice struct, so both slots held the same owned payload
+// pointer and BOTH scope-end active-case passes dispatched `Dispose` through
+// it. MEASURED on §35.4's own shape (`var b := Bundle.Ready(new
+// Resource("b")); var c := Bundle.Ready(new Resource("c")); c := b;`):
+// `dispose c` / `moved` / `dispose b` / SIGSEGV, the second dispatch reading
+// a freed vtable, and `AddressSanitizer: heap-use-after-free` under
+// `--sanitize=address`.
+//
+// THE MARK IS A RUNTIME ZERO-STORE over the source slot — the choice analogue
+// of `nullTransferredOwnedLocalSlot`, which nulls an owned class local's slot
+// at a transfer so the null-guarded disposal downstream is a no-op. Zeroing
+// works for a choice for the same reason, one level in: the scope-end pass
+// reads tag 0, enters case 0's arm, and finds payload pointers its EXISTING
+// null-guard skips ("Null-guard: a never-bound arm ... could leave an `owned`-
+// payload slot null"); a case-0 payload that is itself an owning choice
+// recurses into the same all-zero state and terminates there. So no consumer
+// of the slot needs a new predicate:
+//   * the scope-end active-case pass disposes nothing;
+//   * `disposeDisplacedOwningChoiceLocal` at a later re-acquiring store
+//     (`c := b; b := Bundle.Ready(new Resource("b2"));` — measured as its own
+//     double free, `dispose c` / `dispose b` / SIGSEGV) reads the same zeros
+//     and disposes nothing, which is exactly §28.7's moved-from clause;
+//   * the next store into the source re-arms it with a live value, so a move
+//     inside a loop body is correct every iteration.
+// Being a runtime store it is EXACT on every control-flow path: a move under
+// an `if` suppresses the source's disposal on the taken path and leaves it on
+// the other. A static "transferred somewhere in this body" set — the move-only
+// inline array's `moveOnlyArrayTransferred_`, the other move-only kind's
+// answer to the same question — cannot make that distinction and pays for it
+// with a leak on the untaken path.
+//
+// WHY NOT A SENTINEL TAG instead of a zero-store: an out-of-range tag would
+// also make the disposal switch fall to its no-op default, but it puts the
+// slot in a state the CASE lowering's exhaustive switch has no arm for. Zero
+// is an in-range, constructible state, so a read of the moved-from source —
+// which §15.3 makes a compile error but which this compiler still ACCEPTS
+// (filed separately; not fixed here) — stays a defined read rather than
+// becoming undefined behaviour.
+//
+// SCOPE. #4566 is local-to-local, so both ends must be plain locals with an
+// `ast::LocalDecl`: that is exactly the set `registerOwningChoiceDisposal`
+// enrolls in the scope-end pass, which is what makes "the target has taken
+// over the disposal obligation" a fact rather than an assumption. A
+// field/index/static target, a parameter at either end, `_ := b;` (§35.10's
+// move-only discard) and §35.5 arm-selection payload transfer are declined
+// here and remain open.
+void Emitter::markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
+                                             const ast::Expr* srcExpr) {
+    // THE TARGET must be a plain local — the recipient has to be a location
+    // this backend actually enrolls in the scope-end active-case pass, or the
+    // suppression below would turn the double free into a leak. Same gate, in
+    // the same order, as `disposeDisplacedOwningChoiceLocal` above.
+    if (!targetExpr) return;
+    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(targetExpr);
+    if (!tid) return;
+    auto* tloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+    if (!tloc) return;
+    // This overload is reached only from the `:=` lowering, so `targetExpr` is
+    // an ASSIGNMENT target; the same marker, for the same reason, as
+    // `disposeDisplacedOwningChoiceLocal` above. // per §21.1
+    // LOCALDECL-ONLY: §21.1 makes a runtime `const` a single-assignment
+    // binding, so sema rejects a store into one before codegen runs and an
+    // `ast::LocalConstDecl` can never be an assignment target here.
+    auto* tld = dynamic_cast<const ast::LocalDecl*>(tloc->decl);
+    markOwningChoiceLocalMovedFrom(tld, srcExpr);
+}
+
+// The shared core, reached from the `:=` overload above and directly from the
+// `var c := b;` declaration site (a LocalDecl has no target EXPRESSION — the
+// binding itself is the target).
+void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
+                                             const ast::Expr* srcExpr) {
+    if (!targetLd || !srcExpr) return;
+    if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
+    // THE SOURCE must be a bare identifier naming a DIFFERENT local. A bare
+    // identifier is the only shape §15.3 bullet 1 moves; `b.f`, `b[i]` and
+    // `b.M()` are borrows of `b` (the same reading `MoveOnlyArrayTransfer
+    // Walker` gives those positions for the other move-only kind).
+    auto* sid = dynamic_cast<const ast::IdentifierExpr*>(srcExpr);
+    if (!sid) return;
+    auto* sloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*sid));
+    if (!sloc) return;
+    // `lowerStmt`'s own `LocalConstDecl` arm records why its sibling does not
+    // mirror the `registerOwningChoiceDisposal` chain: "A `const` cannot bind
+    // an OWNED production (an owning choice, a move-only inline array, a task
+    // frame — §21.1)". // per §21.1
+    // LOCALDECL-ONLY: a §21.1 runtime `const` cannot BIND an owning choice, so
+    // it is never enrolled in the scope-end active-case pass and has no
+    // disposal for a moved-from mark to suppress.
+    auto* sld = dynamic_cast<const ast::LocalDecl*>(sloc->decl);
+    if (!sld) return;  // a parameter / §21.1 `const` — neither is enrolled in
+                       // the scope-end pass, so neither has a disposal to
+                       // suppress (§21.1 does not admit an owned production
+                       // at a `const` binding at all).
+    if (sld == targetLd) return;  // `b := b;` — §15.3's *Whole-value
+                                  // reassignment* bullet makes self-assignment
+                                  // "a no-op"; zeroing here would destroy the
+                                  // value the store just wrote back.
+    // The declared type decides, resolved in the SAME order
+    // `registerOwningChoiceDisposal` uses — the store below and the scope-end
+    // pass must never disagree about which locals are owning choices.
+    const sema::TypeRef* rt =
+        sld->type ? ctx_.resolvedType(*sld->type)
+                  : (sld->initializer ? ctx_.exprType(*sld->initializer)
+                                      : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return;
+    // §3.6 rule 2 + §35.4: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    auto it = locals_.find(sld);
+    if (it == locals_.end() || !it->second) return;
+    llvm::AllocaInst* slot = it->second;
+    // The expected storage type, derived the way the DISPOSAL derives it:
+    // §35.9's `C?` is the ordinary nullable value type `{ i8 hasValue,
+    // <choice struct> }` (zeroing it clears `hasValue`, so
+    // `emitOwningChoiceLocationDisposal`'s guard skips the walk outright),
+    // and a bare `C` is the choice struct, laid out under its own
+    // instantiation's substitution (#2047).
+    llvm::Type* want = nullptr;
+    if (rt->nullable) {
+        want = nullableValueStructTy(rt);
+    } else {
+        RecordSubstGuard choiceSubst(this, rt);
+        want = choiceStruct(rt->declaration);
+    }
+    if (!want) return;
+    // Refuse anything whose alloca is not that exact storage. The one shape
+    // this excludes in practice is a §27.5 capture-boxed local, whose alloca
+    // has been rewritten to a pointer-sized cell holder — a zero-store there
+    // would null the cell pointer rather than the value. §15.3's consume-site
+    // freeze makes moving a move-only local while a closure capture of it is
+    // live a compile error, so the shape should not reach here; declining is
+    // the conservative answer if it ever does (the pre-fix double free, never
+    // a fresh corruption).
+    if (slot->getAllocatedType() != want) return;
+    builder_.CreateStore(llvm::Constant::getNullValue(want), slot);
+}
+
+
+// fix #4552 / §35.5 *The owning match* + §35.4 *Disposal is defined by the
+// active case* (v0.306): is `e` an UNBOUND owned temporary of owning-choice
+// type — the scrutinee shape §35.5 calls an "announcing scrutinee form"?
+//
+// §35.5: "The scrutinee temporary's full expression is the **whole `case`
+// construct** — K8.3, applied unchanged — so payloads not transferred into
+// bindings (discarded slots like `Fetched(_)`, and the payloads of the value
+// when a `_` or non-destructuring arm is selected) are disposed when the
+// construct completes, by the same unbound-temporary pass that disposes the
+// container."
+//
+// THE ADMITTED SHAPE IS A CALL, and only a call. §15.3 makes an owning choice
+// a move-only value type whose "return transfers", and §35.3's case
+// construction (`Outcome.Fetched(new Widget())`) is itself a CallExpr whose
+// callee resolves to a ChoiceCaseSymbol — so both mint. EXCLUDED, each because
+// something else already owns the value and a second disposal here would be a
+// double free:
+//   • a bare identifier (`case o of …`) — a named local, disposed by
+//     `registerOwningChoiceDisposal`'s scope-end active-case pass;
+//   • a field / property / indexer read — a borrow of its storage (K1.5).
+//
+// `case move o of …` — §35.5's OTHER announcing scrutinee form — is NOT in
+// either list: it was excluded here as "#4552's follow-up" until fix #4609
+// implemented the marked scrutinee transfer, and it now reaches the same
+// construct-completion reclaim through the sibling gate
+// `markedOwningChoiceScrutineeSlot`, which additionally marks the source
+// binding moved-from. The old exclusion's stated consequence — "the source
+// local's slot is left populated and its scope-end pass still disposes it" —
+// was not the leak it reads as but a DOUBLE FREE, since the arm had already
+// adopted the payload; see that helper for the measurement.
+//
+// This gate is deliberately NOT the ownership pass's `disposeOwnedScrutinee`
+// flag: that flag's own predicate is `producerState == Owned` restricted to a
+// heap class/interface or an owning-collection head, and widening it would
+// change a pass whose verdicts feed diagnostics. The owning-choice family is
+// already classified codegen-side by `registerOwningChoiceDisposal` (which
+// likewise consults no ownership flag), so keeping this gate beside it keeps
+// the two owning-choice disposal sites reading one authority.
+bool Emitter::patternBindsAnySlot(const ast::Pattern* p) {
+    if (!p) return false;
+    if (dynamic_cast<const ast::BindingPattern*>(p)) return true;
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+        for (const auto& sp : dp->subPatterns) {
+            if (!sp.nakedBinding.empty()) return true;
+            if (patternBindsAnySlot(sp.pattern.get())) return true;
+        }
+        return false;
+    }
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+        for (const auto& m : ap->members)
+            if (patternBindsAnySlot(m.get())) return true;
+        return false;
+    }
+    return false;  // discard / null / constant / named / range / relop / type
+}
+
+
+// fix #4617 / §35.5 *The owning match* (v0.307): the PER-SLOT discharge of an
+// owning-choice scrutinee temporary's construct-completion reclaim.
+//
+// §35.5 states both halves of arm selection at SLOT granularity: the selected
+// arm "transfers the case's `owned` and move-only value payloads into its
+// bindings", and "the un-transferred remainder — unlisted fields, unmarked
+// named slots, discarded siblings — is disposed at construct completion".
+// #4609's discharge was per ARM — `patternBindsAnySlot` gating one zero-store
+// over the whole temp — so an arm binding SOME slots of a multi-payload case
+// discharged the reclaim for ALL of them and the un-bound siblings were
+// reclaimed by nobody. MEASURED on §35.5's own shape, over
+// `W(owned a: Widget, owned b: Widget)`:
+//
+//   case move o of
+//     W(var w, _) => do using var live := move w; end,   // `b` reclaimed by nobody
+//     X           => ()
+//   end case;
+//
+// printed `dispose a` and never `dispose b` (a leak, amplified to 16 B and one
+// allocation per iteration under LSan).
+//
+// THE MARK IS #4566's moved-from encoding, applied at slot granularity rather
+// than to the whole value: `emitOwningChoiceActiveCaseDisposal` null-guards
+// every class/interface payload pointer explicitly, and a zeroed nested choice
+// struct reads tag 0 with null payload pointers, which its recursive walk
+// likewise skips. So nulling exactly the transferred slots leaves the
+// completion reclaim (and the dispose-stack entry covering a `return`/`throw`
+// out of the arm) disposing exactly the remainder — §35.5's four disposal
+// traces unchanged, now at the granularity the section states them at.
+//
+// THE TWO ERROR DIRECTIONS ARE NOT SYMMETRIC, and that asymmetry is the whole
+// design: failing to mark a slot the arm adopted is a DOUBLE FREE, while
+// marking one it did not is a leak. Every shape whose transfer set cannot be
+// computed per slot therefore falls back to the pre-#4617 whole-value mark —
+// the sound direction, and exactly the previous behaviour, so no shape that
+// works today can regress.
+void Emitter::dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
+                                            const sema::TypeRef* choiceRef,
+                                            const ast::Pattern* armPattern) {
+    if (!slot) return;
+    if (markOwningMatchTransferredSlots(slot, choiceRef, armPattern)) return;
+    // Fallback: #4609's whole-value mark.
+    builder_.CreateStore(
+        llvm::Constant::getNullValue(slot->getAllocatedType()), slot);
+}
+
+
+// The recursive core of the above. `choiceAddr` is the address of a choice
+// struct (the scrutinee temp's alloca at the top level, a nested payload
+// field's address one level in); returns false — "I could not decide this
+// shape, mark the whole value" — for every case listed in the caller's
+// asymmetry note.
+bool Emitter::markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
+                                              const sema::TypeRef* choiceRef,
+                                              const ast::Pattern* p) {
+    if (!choiceAddr || !choiceRef || !choiceRef->declaration || !p) return false;
+    if (choiceRef->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    // §35.9's `C?` storage is the §7.2 wrapper `{ i8 hasValue, <choice> }`, not
+    // a choice struct; decline rather than GEP a case payload out of the wrong
+    // layout. The caller's whole-value mark keeps the pre-fix behaviour.
+    if (choiceRef->nullable) return false;
+    // Only a case destructuring carries a per-slot transfer set. A whole-value
+    // `BindingPattern` arm (`case move o of var whole => …`) transfers the
+    // entire value, and an alternative list is binding-free by §35.5 — both
+    // take the whole-value mark.
+    auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p);
+    if (!dp || !dp->typeName || dp->typeName->parts.empty()) return false;
+    const sema::TypeSymbol* choiceTy = choiceRef->declaration;
+    std::size_t tag = 0;
+    const sema::ChoiceCaseSymbol* cc =
+        choiceCaseByName(choiceTy, dp->typeName->parts.back(), &tag);
+    if (!cc || !cc->caseDecl) return false;   // head names no case of this
+                                              // choice (a record destructure)
+    // §14.1 / §28.1 (#2047): the layout is per-instantiation, exactly as
+    // `emitOwningChoiceActiveCaseDisposal` and the match-side binding path
+    // derive it — the two must never disagree about where a payload lives.
+    RecordSubstGuard choiceSubst(this, choiceRef);
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return false;
+    // The storage gate, the same one `markedOwningChoiceScrutineeSlot` applies:
+    // the alloca must hold exactly the layout this instantiation implies.
+    if (auto* ai = llvm::dyn_cast<llvm::AllocaInst>(choiceAddr))
+        if (ai->getAllocatedType() != st) return false;
+    if (1 + tag >= st->getNumElements()) return false;
+    auto* payloadTy = llvm::dyn_cast<llvm::StructType>(
+        st->getElementType(static_cast<unsigned>(1 + tag)));
+    if (!payloadTy) return false;
+    llvm::Value* payloadAddr = builder_.CreateStructGEP(
+        st, choiceAddr, static_cast<unsigned>(1 + tag), "omt.payload");
+    for (std::size_t j = 0;
+         j < dp->subPatterns.size() && j < cc->caseDecl->payload.size(); ++j) {
+        if (j >= payloadTy->getNumElements()) break;
+        const auto& sp = dp->subPatterns[j];
+        // §35.5: a slot that binds nothing — `_`, a constant, a range — is
+        // "the un-transferred remainder"; leave it for the completion reclaim.
+        // THIS IS THE FIX: before #4617 the loop did not exist and every slot
+        // of a binding arm was marked.
+        bool slotBinds = !sp.nakedBinding.empty() ||
+                         patternBindsAnySlot(sp.pattern.get());
+        if (!slotBinds) continue;
+        llvm::Type* fieldTy =
+            payloadTy->getElementType(static_cast<unsigned>(j));
+        llvm::Value* fieldAddr = builder_.CreateStructGEP(
+            payloadTy, payloadAddr, static_cast<unsigned>(j), "omt.slot");
+        // A whole-slot binding — `W(var w, _)`'s `w`, or the naked `W(w, _)`
+        // spelling — transfers the payload into an owned local of the arm
+        // body's scope (§35.5). Mark just that slot.
+        bool wholeSlot =
+            !sp.nakedBinding.empty() ||
+            dynamic_cast<const ast::BindingPattern*>(sp.pattern.get()) !=
+                nullptr;
+        if (!wholeSlot) {
+            // A nested pattern that binds. §35.5 routes the recursion "exactly
+            // through the slots that transfer", and the one nested move-only
+            // shape with a pattern surface is a choice payload — recurse into
+            // it so ITS un-bound remainder survives to the completion reclaim
+            // too. Every other nested shape (a class-typed payload, whose
+            // nested slots are property-getter borrows) takes the conservative
+            // whole-slot mark: a leak, never a double free.
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                cc->caseDecl->payload[j], choiceTy, choiceRef, ctx_);
+            bool recursed = false;
+            if (ftInst && !ftInst->nullable &&
+                ftInst->kind == sema::TypeRef::Kind::Named &&
+                ftInst->declaration &&
+                ftInst->declaration->kind == ast::TypeDeclKind::Choice) {
+                // fix #4132's lesson: compute the nested layout under the
+                // NESTED instantiation's substitution and require it to be the
+                // field's actual storage before GEPing through it.
+                llvm::StructType* nestedSt = nullptr;
+                {
+                    RecordSubstGuard nestedSubst(this, ftInst);
+                    nestedSt = choiceStruct(ftInst->declaration);
+                }
+                if (nestedSt && nestedSt == fieldTy)
+                    recursed = markOwningMatchTransferredSlots(
+                        fieldAddr, ftInst, sp.pattern.get());
+            }
+            if (recursed) continue;
+        }
+        builder_.CreateStore(llvm::Constant::getNullValue(fieldTy), fieldAddr);
+    }
+    return true;
+}
+
+
+bool Emitter::unboundOwningChoiceTemp(const ast::Expr* e,
+                                      const sema::TypeRef* rt) {
+    if (!e || !rt) return false;
+    if (!dynamic_cast<const ast::CallExpr*>(e)) return false;
+    if (rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) return false;
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    return verdict && *verdict == common::ChoiceClassification::Owning;
+}
+
+
+// fix #4609 / §35.5 *The owning match* (v0.306): the SECOND announcing
+// scrutinee form — "a named owned binding under an explicit scrutinee
+// transfer marker — `case move outcome of …`, the scrutinee an
+// identifier-operand `move` expression (§28.8.1)".
+//
+// §35.5 makes this form a consume with a stated end state: "the consumed
+// binding is left **moved-from** when the construct completes". Codegen never
+// recorded that. `unboundOwningChoiceTemp`'s own exclusion list said so — "`case
+// move o of …` — the §35.5 marked scrutinee transfer, which codegen does not
+// yet implement (the source local's slot is left populated and its scope-end
+// pass still disposes it; #4552's follow-up)" — and the consequence was not a
+// leak but a DOUBLE FREE: the arm's `using var u := move w;` adoption disposes
+// the transferred payload, and the source local's scope-end active-case pass
+// then disposes the same block again. MEASURED on the rule corpus' own
+// s35_5_0003 (which is written from §35.5 and was passing): `adopted` /
+// `widget disposed` / `after` then SIGSEGV, and `AddressSanitizer:
+// heap-use-after-free ... READ of size 8` under `--sanitize=address`. The
+// nested spelling in #4609 (an owning choice inside an owning choice) is the
+// same defect one level in.
+//
+// THE MARK IS #4566's, at the third site its SCOPE note left open: a runtime
+// zero-store over the source slot. See `markOwningChoiceLocalMovedFrom` for
+// why zero is the right moved-from encoding for a choice (tag 0, null payload
+// pointers, every downstream walk already null-guarded) and why a runtime
+// store rather than a static set (exact on every control-flow path).
+//
+// The gate here is the STORAGE TYPE, not the declaration kind, and it is
+// deliberately wider than #4566's `ast::LocalDecl` gate in one direction and
+// narrower in another. Wider: an arm binding of nested owning-choice type
+// (`case move o of W(var i) => … case move i of …`, #4609's own repro) and a
+// by-value-move parameter (§15.3: "parameter passing is by value-move") both
+// reach here and both must be marked, because the caller registers a
+// replacement disposal for the value it took. Narrower: the slot must hold
+// EXACTLY the storage `rt` implies, so a §27.5 capture-boxed local — whose
+// alloca is a pointer-sized cell holder — is declined, and a decline is safe
+// because the caller then registers nothing and the pre-fix path stands.
+llvm::AllocaInst* Emitter::markedOwningChoiceScrutineeSlot(
+        const ast::Expr* e, const sema::TypeRef* rt) {
+    if (!e || !rt) return nullptr;
+    auto* un = dynamic_cast<const ast::UnaryExpr*>(e);
+    if (!un || un->op != "move" || !un->operand) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
+    if (!id) return nullptr;   // `move this._f` / `move a[i]` — §35.5 rejects a
+                               // borrowed scrutinee, and neither has a slot
+                               // this backend owns.
+    if (rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return nullptr;
+    const sema::TypeRef* res = resolveTypeParamRef(rt);
+    if (!res || res->kind != sema::TypeRef::Kind::Named || !res->declaration)
+        return nullptr;
+    if (res->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    // §3.6 rule 2 + §35.4 / §35.11: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(res, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning)
+        return nullptr;
+    llvm::AllocaInst* slot = localSlot(*id);
+    if (!slot) return nullptr;
+    // The expected storage, derived exactly as the DISPOSAL derives it —
+    // §35.9's `C?` is `{ i8 hasValue, <choice struct> }`, a bare `C` is the
+    // choice struct under its own instantiation's substitution (#2047).
+    llvm::Type* want = nullptr;
+    if (res->nullable) {
+        want = nullableValueStructTy(res);
+    } else {
+        RecordSubstGuard choiceSubst(this, res);
+        want = choiceStruct(res->declaration);
+    }
+    if (!want || slot->getAllocatedType() != want) return nullptr;
+    return slot;
+}
+
+
+// fix #4552 / §28.3 *Unbound owned temporaries* (v0.306). See the declarations
+// in LlvmBackend_impl.hpp for the rule, the measured repro and the
+// non-nullable-`string`-only soundness argument.
+bool Emitter::freshNewReceiverTempStringResult(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy) const {
+    if (!recvExpr || !recvPtr || !resultTy) return false;
+    if (!isFreshOwnedClassProducer(recvExpr)) return false;
+    if (resultTy->kind != sema::TypeRef::Kind::Primitive) return false;
+    if (resultTy->primitive != sema::PrimitiveType::String) return false;
+    if (resultTy->nullable) return false;   // `string?` returns are NOT minted
+    if (!recvPtr->getType()->isPointerTy()) return false;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return false;
+    return true;
+}
+
+
+void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
+                                             llvm::Value* recvPtr,
+                                             const sema::TypeRef* resultTy) {
+    if (!freshNewReceiverTempStringResult(recvExpr, recvPtr, resultTy)) return;
+    if (disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;
+    if (!currentFn_) return;
+    // `entryAllocaNullPtr` (not a bare `entryAlloca`) for the #2733 reason the
+    // unwind registration documents: a disposal pass can be reached on a path
+    // that never executed the production store.
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;      // the normal edge is the K8 flush below
+    d.dynamicDispose = false;
+    disposeStack_.back().push_back(d);
+    k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_});
+}
+
+
+void Emitter::flushK8RecvTemps() {
+    // Mirrors flushFfiExprTemps / flushAwaitedTaskTemps exactly, including the
+    // two retains those document: an entry belonging to ANOTHER function is
+    // kept (a nested function body's boundary fires while the enclosing
+    // expression is still open), and a diverged (terminated) block drops the
+    // entry without emitting — the unwind edge's disposeStack_ walk has
+    // already reclaimed it and emitting after a terminator is invalid IR.
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    bool live = currentFn_ && bb && !bb->getTerminator();
+    std::vector<K8RecvTemp> keep;
+    for (const auto& t : k8RecvTemps_) {
+        if (t.fn != currentFn_) { keep.push_back(t); continue; }
+        if (!live) continue;
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), t.slot, "k8recv.load");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* dispBB =
+            llvm::BasicBlock::Create(llvm_, "k8recv.dispose", currentFn_);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "k8recv.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(obj);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Discharge at RUNTIME (not by erasing the registration): the
+        // disposeStack_ entry stays but now loads null, so scope end / return /
+        // unwind are all no-ops, and a LOOP re-arms the same entry-block alloca
+        // each iteration. Same discipline as the two sibling queues.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), t.slot);
+    }
+    k8RecvTemps_.swap(keep);
+}
+
+
 void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // fix #2892 / §28.10 (v0.241): the UNWIND-EXCLUSIVE entries (`unwindOnly`,
     // `releaseOnUnwindOnly`) fire when the scope's owned locals never reached
@@ -6084,6 +7068,32 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // (#2869 needed a separate `undischargedOwned` question for the one edge where
     // they diverged; see the declaration in LlvmBackend_impl.hpp.)
     const bool dropUndischarged = isUnwind;
+    // fix #1882 (§28.4, v0.306): snapshot the user-code counter so the
+    // post-pass propagate check below fires only for a pass that could actually
+    // have raised, and bracket the slot so it fires only on a fault THIS pass
+    // raised. See the tail of this function for the rule. The bracket is a
+    // load at the pass's own entry point, which dominates every block the pass
+    // goes on to create.
+    //
+    // ⚠ EMISSION COST, stated plainly because it is easy to overclaim here:
+    // `emitPendingCheck`/`emitPendingCheckIf` ARE byte-identical for every
+    // pre-existing caller (they take the `kAllLiveScopes` default), but THIS
+    // snapshot is not free — it is emitted at the top of every non-unwind,
+    // non-empty pass whether or not the gate goes on to trip, and
+    // `bz_exc_addr` carries no attributes, so LLVM cannot DCE the dead ones.
+    // A program with no disposal semantics therefore gains one call + load per
+    // scope exit. It is the same shape every call site already emits for its
+    // own pending check, so it is in line with existing cost rather than a new
+    // class of it. The cheap remedy, if this ever shows up in a profile, is to
+    // save the insert point here and materialise the snapshot lazily at the
+    // tail only when the gate trips — deliberately not done now, because the
+    // saved-insert-point dance is the kind of complexity this project trades
+    // away for simplicity until the compiler is functionally complete.
+    const unsigned dispatchesAtPassEntry = userCodeDisposalCount_;
+    llvm::Value* excAtPassEntry = nullptr;
+    if (!isUnwind && !scope.empty() && builder_.GetInsertBlock() &&
+        !builder_.GetInsertBlock()->getTerminator())
+        excAtPassEntry = snapshotInFlightExc();
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an
         // awaited Pattern A `Task<T:class>` temporary produced by an anonymous
@@ -6274,6 +7284,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::Value* lensArrD = builder_.CreateLoad(
                     ptrTy(), it->dictEntryForLensOutSlot, "def.lens");
                 builder_.CreateCall(freeFnD, {lensArrD});
+                if (it->dictEntryForWidsOutSlot) {   // fix #4499
+                    llvm::Value* widsArrD = builder_.CreateLoad(
+                        ptrTy(), it->dictEntryForWidsOutSlot, "def.wids");
+                    builder_.CreateCall(freeFnD, {widsArrD});
+                }
             }
             builder_.CreateCall(freeFnD, {valsArrD});
             continue;
@@ -6471,6 +7486,57 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // an entry — the cell leaks there instead of a use-after-free.
         if (it->boxedCellFree) {
             if (isUnwind && it->skipCellFreeOnUnwind) continue;
+            // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this
+            // boxedCellFree entry also carries dictEntryKeyReleaseDeferred
+            // (set in consumeLastLambdaCapturedCells when the captured local
+            // is a string-keyed DictionaryEntry<string,V>), emit the Key
+            // release BEFORE freeing the cell. singleCaptureLocals_ is
+            // required for boxedCellFree registration, so exactly one holder
+            // and exactly one +1 to balance.
+            //
+            // Narrow (fix-forward of c1237c9f): the original fix's
+            // `dictEntryForVarSlot` lookup via `locals_[ce.key]` returned the
+            // REBOUND cell-holder ptr* alloca (lowerLambda's `locals_[decl]
+            // = newSlot` at Exprs2.cpp:1664 rebinds to the boxed cell holder
+            // before consumeLastLambdaCapturedCells reads it), not the
+            // original DictionaryEntry struct alloca — so the GEP type cast
+            // `dyn_cast<StructType>(...->getAllocatedType())` returned null
+            // and the key release was a no-op (17500 B / 1000 allocs leak
+            // unchanged from the pre-fix HEAD). The original struct alloca
+            // is no longer recoverable from locals_[key]. `fix #4612` since
+            // populates cellVarSyncSlot_ on the FRESH boxing path too (it was
+            // GUARDED-only when this was written), so that map is no longer a
+            // reason to avoid — but cellVars_ (keyed by the cell holder, i.e.
+            // it->slot itself) is populated by BOTH paths and records the
+            // cell's TYPE, which is what the GEP below actually needs — look
+            // up the struct type there for the field 0 load.
+            if (it->dictEntryKeyReleaseDeferred) {
+                if (auto cvIt = cellVars_.find(it->slot);
+                    cvIt != cellVars_.end()) {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(cvIt->second)) {
+                        llvm::Value* structPtr;
+                        if (it->slot->getAllocatedType()->isPointerTy()) {
+                            // Guarded: it->slot is cell holder (ptr*). Load
+                            // cell and cast.
+                            llvm::Value* cellTyped = builder_.CreatePointerCast(
+                                builder_.CreateLoad(ptrTy(), it->slot,
+                                                    "dictek.cell.ptr"),
+                                st->getPointerTo(), "dictek.cell.cast");
+                            structPtr = cellTyped;
+                        } else {
+                            // Non-guarded: it->slot IS the struct alloca
+                            // (the cell is the struct itself; no
+                            // indirection).
+                            structPtr = it->slot;
+                        }
+                        llvm::Value* keyAddr = builder_.CreateStructGEP(
+                            st, structPtr, 0, "dictek.addr");
+                        llvm::Value* keyVal = builder_.CreateLoad(
+                            ptrTy(), keyAddr, "dictek.val");
+                        emitStringRelease(keyVal);
+                    }
+                }
+            }
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
@@ -6485,6 +7551,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // (after every main-loop disposal in this scope), not here — the owner
         // disposal reads the object through the cell and must run first.
         if (it->boxedCellFreeDeferred) continue;
+        // fix #4509 (§27.5 / §28.9, v0.306): a refcounted capture cell's FRAME
+        // reference is dropped in the same SECOND PASS, for the same ordering
+        // reason — the owner's disposal reads the object through the cell, so
+        // the frame may not let go until every main-loop entry has run.
+        if (it->cellRelease) continue;
         // #383 / §31.1: the caught exception object. On a normal handled exit
         // it is freed (destructor + base chain + block, via its vtable); on the
         // unwind path it is SKIPPED — a re-raise/throw leaving the arm keeps it
@@ -6556,9 +7627,18 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // "a move-only local's owned slots are auto-disposed at scope end").
         // Only registered for locals proven never transferred out, so this is the
         // single disposal of each slot's object (no double-free).
+        //
+        // fix #4552 (§15.1.1 v0.307, ruling #4388): "the array's auto-dispose
+        // pass disposes each non-null slot, in reverse slot order ... one
+        // pass definition governs all four of this paragraph's endings"
+        // (scope end included). This loop iterated 0..N-1 (establishment
+        // order); the reassignment pass (lowerOwningInlineArrayReassign,
+        // LlvmBackend_Stmts.cpp) already iterates N..1 for exactly this
+        // reason. Iterate in reverse to match.
         if (it->inlineOwnedArray) {
             auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
-            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+            for (unsigned fwd = 0; fwd < it->inlineSlotCount; ++fwd) {
+                unsigned i = it->inlineSlotCount - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, it->slot,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioa.slot");
@@ -6586,6 +7666,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // null the slot. The cell itself is freed separately by the boxedCellFree
         // that fires AFTER this. Non-escaping-gated at registration so the cell is
         // alive here and no escaping closure still references the elements.
+        //
+        // fix #4552 (§15.1.1 v0.307, ruling #4388): same reverse-slot-order
+        // fix as the plain `inlineOwnedArray` arm above — a boxed/captured
+        // local is disposed at the same "scope end" ending, just through
+        // heap-cell storage instead of a plain alloca.
         if (it->inlineOwnedArrayCell) {
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "ioac.cell");
@@ -6596,7 +7681,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCondBr(cellNull, afterBB, liveBB);
             builder_.SetInsertPoint(liveBB);
             auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
-            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+            for (unsigned fwd = 0; fwd < it->inlineSlotCount; ++fwd) {
+                unsigned i = it->inlineSlotCount - 1 - fwd;
                 llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
                     arrTy, cell,
                     {builder_.getInt32(0), builder_.getInt32(i)}, "ioac.slot");
@@ -6641,7 +7727,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // the same slot reads null on its own (later, in reverse-declaration-
         // order iteration) unwind path and skips. The unbox is load → null-
         // check → release → store null, identical shape to the class path.
-        if (it->unwindOnly) {
+        // fix #4552 / §35.5 (v0.306): `!it->owningChoice` — a case-scrutinee
+        // owning-CHOICE temporary registers an `unwindOnly` entry whose slot
+        // holds a choice STRUCT, not a pointer. This arm loads a `ptr` from
+        // the slot and dispatches a vtable Dispose on it, which for a choice
+        // struct would read the tag word as an object pointer. Let such an
+        // entry fall through to the `owningChoice` arm below, which carries
+        // its own `unwindOnly` gate.
+        if (it->unwindOnly && !it->owningChoice) {
             if (!dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -6735,6 +7828,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 auto* dynFn = declareC("bz_array_free_dynamic",
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(dynFn, {arr});
+                // fix #1878 (§28.4, v0.306): the backing is statically erased
+                // here (§28.11: a borrowing list interface may be backed by an
+                // owning array), so the disposer consulted at runtime MAY be
+                // the class-element cascade. Count it — an over-count costs a
+                // dead pending check, an under-count swallows a fault.
+                ++userCodeDisposalCount_;
             } else {
                 llvm::Value* disp = it->collectionElemDisposer
                     ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
@@ -6743,6 +7842,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {arr, disp});
+                // fix #1878 (§28.4, v0.306): "the owning container's cascade"
+                // is a disposal point too. bz_array_free walks the live slots
+                // calling this thunk, which for a class element dispatches the
+                // element's own vtable Dispose — user code, reached WITHOUT
+                // emitDynamicDispose, so the pass gate has to be told here.
+                if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                    ++userCodeDisposalCount_;
             }
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
@@ -6812,6 +7918,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
+            // fix #1878 (§28.4, v0.306): the OwningDictionary value cascade —
+            // same reasoning as the collection arm above. dictKeyDisposer is
+            // deliberately NOT counted: it is the #4091 borrowing-builtin
+            // thunk, which frees inner collection headers and never reaches a
+            // user destructor.
+            if (elementDisposerRunsUserCode(it->dictValueDisposer))
+                ++userCodeDisposalCount_;
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
@@ -6846,6 +7959,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {list, disp});
+            // fix #1878 (§28.4, v0.306): the OwningLinkedList element cascade —
+            // same reasoning as the collection arm above, on the node value
+            // pointer rather than an array slot.
+            if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                ++userCodeDisposalCount_;
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
@@ -7807,8 +8925,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // slot value is whatever the active case holds at scope end, and
         // disposing it is the SOLE path for those payloads.
         if (it->owningChoice) {
-            emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
-                                               it->owningChoiceRef);
+            // fix #4552 / §35.5 (v0.306): an `unwindOnly` owning-choice entry
+            // is a case-scrutinee temporary whose NORMAL-edge disposal is
+            // emitted at the construct's completion (lowerCaseStmt); this
+            // entry covers only the arm-body throw edge.
+            if (it->unwindOnly && !dropUndischarged) continue;
+            // fix #4552 / §35.9 (v0.306): route through the LOCATION helper,
+            // which unwraps a `C?` slot's `{ i8 hasValue, <choice> }` before
+            // walking the active case. `owningChoiceRef` is the local's own
+            // (instantiated) TypeRef, so it carries the `nullable` bit;
+            // `registerOwningChoiceDisposal` admits a `C?` local exactly as it
+            // admits a `C` one, and reading the wrapper's leading bytes as the
+            // tag is what made the nullable spelling leak (or, for a different
+            // case order, dispatch through the wrong payload slot).
+            if (it->owningChoiceRef)
+                emitOwningChoiceLocationDisposal(it->slot, it->owningChoiceRef);
+            else
+                emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
+                                                   it->owningChoiceRef);
             continue;
         }
         // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose
@@ -7897,9 +9031,238 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (isUnwind && d.skipCellFreeOnUnwind) continue;
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): if this deferred
+        // entry also carries dictEntryKeyReleaseDeferred, emit the DictionaryEntry
+        // Key release BEFORE freeing the cell — the same GEP field 0 +
+        // bz_string_release as dictEntryKeyRelease (LlvmBackend_Setup.cpp's
+        // emitDisposals arm), firing at the identical point with the identical
+        // safety case: singleCaptureLocals_ is required for boxedCellFreeDeferred
+        // registration, so exactly one holder and exactly one +1 to balance.
+        //
+        // d.dictEntryForVarSlot stores the ORIGINAL local's struct alloca
+        // (NOT the rebound cell holder; set at registration time in Exprs2.cpp).
+        // Use it to get the struct type for the GEP — the slot may be the
+        // struct itself (non-guarded: newSlot == slot) OR a cell holder
+        // (guarded: newSlot != slot). In the guarded case the local's struct
+        // was copied INTO the cell at boxing time and is still readable through
+        // the cell; the SECOND PASS runs after all reads-through-cell disposals,
+        // so the value is provably dead (no UAF). Mutually exclusive with
+        // dictEntryForSnapshot's own use of this field (the for-var snapshot
+        // path is a completely different disposal kind; the two flags never
+        // coincide).
+        if (d.dictEntryKeyReleaseDeferred) {
+            // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295) — narrow
+            // (fix-forward of c1237c9f): see FIRST PASS note. Look up the
+            // cell's struct type via cellVars_ (keyed by the cell holder
+            // d.slot, set on both boxing paths in boxLocalSlot). The original
+            // struct alloca is no longer recoverable from locals_[key] (it is
+            // rebound to the cell holder by lowerLambda before this consumer
+            // runs). (cellVarSyncSlot_ was GUARDED-only when this was written;
+            // `fix #4612` populates it on the non-for-var FRESH path too. It
+            // still is not what this needs: the cell itself holds the
+            // DictionaryEntry struct by value, and cellVars_ records its type.)
+            if (auto cvIt = cellVars_.find(d.slot);
+                cvIt != cellVars_.end()) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(cvIt->second)) {
+                    // The slot is either the struct itself or a cell holder.
+                    // Check the slot's allocated type: struct = direct
+                    // access, ptr* = load cell and cast.
+                    llvm::Value* structPtr;
+                    if (d.slot->getAllocatedType()->isPointerTy()) {
+                        // Guarded: d.slot is cell holder (ptr*). The cell
+                        // pointer is already loaded into `cell` above
+                        // (before this block, line ~7956). Cast and use.
+                        llvm::Value* cellTyped = builder_.CreatePointerCast(
+                            cell, st->getPointerTo(),
+                            "dictek.deferred.cellcast");
+                        structPtr = cellTyped;
+                    } else {
+                        // Non-guarded: d.slot IS the struct alloca.
+                        structPtr = d.slot;
+                    }
+                    llvm::Value* keyAddr = builder_.CreateStructGEP(
+                        st, structPtr, 0, "dictek.deferred.addr");
+                    llvm::Value* keyVal = builder_.CreateLoad(
+                        ptrTy(), keyAddr, "dictek.deferred.val");
+                    emitStringRelease(keyVal);
+                }
+            }
+        }
         builder_.CreateCall(freeFn(), {cell});
         // Null the guarded holder so a later re-entry allocates a fresh cell.
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
+    }
+
+    // fix #4509 (§27.5 / §28.9, v0.306) SECOND PASS, second half: drop the
+    // DECLARING FRAME's reference to each refcounted capture cell this scope
+    // owns. Placed beside #1017's deferred free and after it for the identical
+    // ordering reason — every reads-through-cell disposal in this scope has
+    // run, so the frame has no further access path through the cell.
+    //
+    // WHAT IS DIFFERENT from the loop above, and it is the point of the fix:
+    // that one FREES, under a static proof that no env outlives the frame.
+    // This one RELEASES, under no such proof — the cell is freed here only if
+    // the runtime count says the frame was the last holder, and stays alive for
+    // an env that outlived it. That is why this arm can be armed for the cells
+    // #1017's cannot: the cells an escaping capturer reaches
+    // (`declsCapturedByEscaping_`), which before this had no reclaim site at
+    // all and simply leaked, 8 B per capture (#4509: 1592 B over 200
+    // iterations, measured identical with and without #1882's check).
+    //
+    // BOTH EDGES, exactly once: a given exit goes one way only, so the normal
+    // and unwind emissions of this pass are alternatives, not a pair. There is
+    // no `skipCellFreeOnUnwind` analogue here — that flag exists because a
+    // FREE on the unwind edge could outrun a #1422 zombie drain still reading
+    // the cell; a release cannot, since a reader that still holds a counted
+    // reference keeps the cell alive by construction.
+    //
+    // THE HOLDER IS NULLED afterwards, exactly as `boxedCellFree` nulls its
+    // own, and for a reason that is easy to get wrong the other way (this code
+    // did, and the regression is worth recording). A scope can be RE-ENTERED:
+    // a captured local declared inside a `while` body has its declaring scope
+    // exited once per iteration, so this release runs once per iteration — but
+    // the cell HOLDER is a function-entry alloca that keeps the previous
+    // iteration's cell pointer whenever the next iteration does not reach the
+    // capture site again (a capture behind an `if`, say). Without the null,
+    // iteration 1 releases iteration 0's cell a SECOND time; with an env still
+    // holding it, that is a use-after-free, measured on
+    // `codegen_const_narrowing_capture_2597.loop_declared_const_captures_per_iteration_spec_27_5`
+    // (`const t` bound behind an `if` inside a `while`, captured by a closure
+    // that outlives the loop). Nulling makes the re-entry release a null, which
+    // `bz_cell_release` treats as a no-op, and leaves `boxLocalSlot`'s guard to
+    // allocate a fresh cell on the next capture — the same contract the free
+    // above relies on. The frame's reference is gone either way once this has
+    // run, so the holder is genuinely dead at this point.
+    for (const auto& d : scope) {
+        if (!d.cellRelease) continue;
+        llvm::Value* cell =
+            builder_.CreateLoad(ptrTy(), d.slot, "cell.rc.ptr");
+        builder_.CreateCall(
+            declareC("bz_cell_release", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {cell});
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
+    }
+
+    // fix #1882 (§28.4, v0.306): "The exception propagates from the **disposal
+    // point** — ... the `using var`/auto-drop scope-end site ...". A destructor
+    // that throws during THIS pass leaves its exception parked in the bz_exc
+    // slot (the generated `DisposeCore`'s `dtor.threw`/`dtor.restore` tail,
+    // #1546) and returns normally; nothing here ever looked. The exception then
+    // sat in the slot until some LATER, unrelated pending check picked it up —
+    // typically the §22.13 static-init guard of the next static access, which
+    // is usually OUTSIDE the `try` whose body held the disposal point, so it
+    // escaped the enclosing `catch` as UNHANDLED (the reported repro: a
+    // `using var` disposed inside a `try`/`catch Exception`, exit 70 instead of
+    // the catch arm running). With no later check in the function at all the
+    // same omission SWALLOWED it silently instead (#1878's face). Both
+    // manifestations, and their maddening dependence on unrelated surrounding
+    // code, are this one missing check.
+    //
+    // WHY AT THE END OF THE PASS, not after each disposal. §28.4: "In a
+    // multi-value cleanup pass ... a throwing disposer does not skip the
+    // remaining values: every remaining disposal still runs. If a later
+    // disposal in the same pass also throws, the later exception supersedes the
+    // earlier one". Checking per entry would branch out on the first fault and
+    // skip the rest; checking once at the end lets the whole pass run and lets
+    // each `DisposeCore`'s own entry-exception supersede tail (#2358) do the
+    // §31.2 record-before-drop accounting between them. Whatever survives the
+    // pass is what propagates — exactly the spec's "N−1 chronological entries"
+    // shape.
+    //
+    // WHY isUnwind IS EXCLUDED: an unwind pass's caller branches to the unwind
+    // target itself the moment the pass returns, and a fault raised *during* it
+    // has already superseded the in-flight exception inside `DisposeCore`. A
+    // check here would only re-route to the same place.
+    //
+    // WHY THE COUNTER GATE: `emitPendingCheckIf` materialises the enclosing
+    // scopes' unwind disposals at its branch target, so emitting it at EVERY
+    // scope end — including the overwhelming majority that dispose only strings,
+    // closures and capture cells — would duplicate that code for passes that
+    // provably cannot raise. `userCodeDisposalCount_` counts the constructs this
+    // change is about: a vtable `Dispose` dispatch through `emitDynamicDispose`,
+    // and an owning container's element cascade through the `bz$elemDispose`
+    // thunk (§28.4's "the owning container's cascade", which reaches the element
+    // destructor via `bz_array_free`/`bz_dict_free`/`bz_llist_free` rather than
+    // via `emitDynamicDispose`, and so announces itself at those three arms).
+    //
+    // The gate is SOUND-BY-UNDERCOUNT, NOT EXACT — see the counter's own
+    // declaration for the enumeration of routes that reach a user destructor
+    // without being counted (nested-collection and `Shared`/`Weak` element
+    // thunks, the TCS element thunk, the task-owned result disposer, and the
+    // enumerator-frame arm below, which dispatches vtable slot 1 by hand).
+    // An uncounted route means the fault keeps BASE behaviour — it stays in the
+    // slot for a later check, exactly as before this change — never a
+    // double-dispose or a lost object. Those disposal points are pre-existing
+    // gaps neither #1878 nor #1882 names, and are tracked separately.
+    //
+    // WHY THE CHECK IS BRACKETED rather than a plain "is anything in flight":
+    // a scope-end pass is routinely reached with somebody else's exception
+    // already in the slot — a destructor body on an unwind edge (#1468), and,
+    // one context wider, the §29.7 abandonment teardown of an `await for`
+    // iterator, which runs the iterator's compiler-generated cleanup (its
+    // sync-fallback destructor included) while the exception that abandoned the
+    // loop propagates. A plain non-null test fires there on that exception,
+    // branches out of the teardown, and leaks the iterator frame — measured at
+    // 80 bytes before this was bracketed. `emitDisposalFaultCheck` compares
+    // against `excAtPassEntry` instead, so only a fault THIS pass raised routes.
+    if (!isUnwind && excAtPassEntry &&
+        userCodeDisposalCount_ != dispatchesAtPassEntry) {
+        // The scope being torn down is still on disposeStack_ (its owner pops
+        // it after this returns), so exclude it — and everything nested inside
+        // it, which is already gone — from the unwind edge's disposals. A
+        // free-standing vector (a mid-expression atom scope that was never
+        // pushed) is not found and keeps the all-live-scopes meaning.
+        std::size_t hi = kAllLiveScopes;
+        for (std::size_t i = 0; i < disposeStack_.size(); ++i)
+            if (&disposeStack_[i] == &scope) { hi = i; break; }
+        // A pass over a FREE-STANDING vector — one that is not on
+        // disposeStack_ at all — is NOT a scope end, and must not take this
+        // check. The only such callers that can trip the gate are the §29.7
+        // iterator / async-iterator ABANDONMENT teardowns
+        // (`emitDisposals(one)`, LlvmBackend_Iterators.cpp and
+        // LlvmBackend_Async.cpp), which run inside the generated enumerator
+        // `Dispose` and still have work to finish after this pass: the
+        // remaining `IterCleanup` entries, the yielded value, the owned
+        // parameters and locals, and the FRAME FREE itself. Branching to
+        // `unwindBB()` from there abandons all of it and leaks the frame —
+        // measured 88 B (async `await for`) and 48 B (sync `for`) when the
+        // abandoned iterator's own `using var` destructor throws. Base
+        // behaviour there is to fall through and let a later check find the
+        // fault; that disposal point keeps base behaviour and is tracked
+        // separately (§29.7 is not one of the disposal points §28.4 or these
+        // two issues name). The other free-standing callers,
+        // `emitDisposals(stringReleases)`, dispose only strings and never trip
+        // the gate, so this guard costs them nothing.
+        //
+        // ⚠ WHAT THIS CHECK DOES *NOT* CAUSE, recorded because it looks exactly
+        // like a regression and was investigated as one (#4509). Emitting the
+        // check adds two blocks and a `bz_exc_addr` load to the tail of a
+        // scope-end pass, which perturbs `main`'s register/stack layout — and
+        // that is enough to move a §27.5 capture cell OUT of LeakSanitizer's
+        // conservative stack scan. `codegen_event_subscription_closure_841.
+        // capturing_handler_env_released_on_sub_dispose_24_27_5` is a ONE-SHOT
+        // LSan row over a `using var` class local captured by a lambda passed
+        // to `Event<T>.Subscribe`; its 8-byte cell has no owner (§27.5 / §28.9:
+        // the scope-end route declines on `declsCapturedByEscaping_`, and both
+        // envdtor routes decline because a lambda "merely passed as an
+        // argument" proves nothing about when its env dies — see
+        // `sharedCellEnvdtorFreeOwner_`'s declaration, condition (b)). The row
+        // passes on base only because the cell pointer stays REACHABLE, not
+        // because the cell is freed.
+        //
+        // Measured (generated code uninstrumented over an ASan-instrumented
+        // runtime — the row's own recipe): with this check disabled, one-shot
+        // clean but `LSAN_OPTIONS=use_stacks=0` reports the same 8 B / 1 alloc;
+        // loop-amplified to 200 iterations, 1592 B / 199 allocs, BYTE-IDENTICAL
+        // with and without this check. So the leak is wholly pre-existing and
+        // this check neither creates nor widens it. Do NOT narrow the gate to
+        // silence that row: narrowing would re-mask a real leak and would drop
+        // a §28.4 disposal point the issue this change closes is about. #4509
+        // tracks the cell's missing owner; the durable test-side remedy is the
+        // loop amplification this project's own oracle rules already require.
+        if (hi != kAllLiveScopes)
+            emitDisposalFaultCheck(excAtPassEntry, hi);
     }
 }
 

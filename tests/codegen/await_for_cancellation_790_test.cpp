@@ -20,7 +20,7 @@ int runFull(const std::string& program) {
 const char* gen =
     "module M; import System.Threading; "
     "class C "
-    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "  public static async method Gen(): IAsyncEnumerable<int> "
     "    yield return 1; yield return 2; yield return 3; "
     "  end Gen; ";
 }  // namespace

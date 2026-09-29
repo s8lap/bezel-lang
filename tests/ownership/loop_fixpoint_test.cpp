@@ -118,10 +118,12 @@ BEZEL_TEST(own_loopfix, using_var_in_loop_body_clean_28_10) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3: moving the owned value out each iteration discharges it; clean.
+// §28.3: discharging the owned value each iteration is clean. Spelled
+// marker-free per §28.3 K3.13 / K3.9 (v0.307): the discard statement itself
+// announces the consume, so `_ := move x;` is now a redundant marker.
 BEZEL_TEST(own_loopfix, owned_moved_out_each_iter_clean_28_3) {
     auto r = parseAndCheckOwnership(wrap(
-        "while cond do var x := new Stream(); _ := move x; end;"));
+        "while cond do var x := new Stream(); _ := x; end;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

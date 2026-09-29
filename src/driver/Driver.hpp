@@ -124,11 +124,19 @@ public:
     // Dependency to an importer's compileFile. Unlike the executable path, no
     // `Main` is required (§33.6: a library has no entry point) and no link runs.
     // `deps` lets a dependency itself import further dependencies (acyclic).
-    // `opts` is consulted for exactly one bit on this path — the proposal 0082
-    // stage-1 prototype's `scopedAwaitBind` (#3048, off by default). The
-    // library build's codegen options remain the ones this path builds for
-    // itself (`isMainModule=false`, §33.6); no other flag's meaning changes
-    // here, so every existing caller is unaffected by the added parameter.
+    //
+    // `opts` is the build's codegen options and this path DERIVES the library
+    // build's from it (fix #4488), overriding exactly two fields:
+    //   * `isMainModule` is forced false — §33.6, a library has no entry point;
+    //   * `sanitizeAddress` is forced false — it is an executable-build option
+    //     that needs the final link to add the ASan runtime, and this path does
+    //     not link (main.cpp rejects `-c --sanitize=address`). Leak/double-free
+    //     coverage of the dependency survives via the executable's runtime.
+    // Everything else is carried through, because both checked modes are
+    // per-build choices (§28.2, §22.16) whose instrumentation is *emitted*:
+    // a dependency built without it has no checks and no link step can add
+    // them. Deriving rather than default-constructing is deliberate — a field
+    // added to CodegenOptions later is forwarded here by default.
     CompileResult compileObject(const std::string& path,
                                 const std::string& objectPath,
                                 const std::vector<Dependency>& deps = {},

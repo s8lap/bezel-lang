@@ -191,6 +191,10 @@ case "$MODE" in
     exit 64 ;;
 esac
 DH=scripts/dev_heavy.sh
+# The gate builds with its own -j16 and never joins the shared build jobserver
+# (scripts/build_jobserver.py): it runs with zero other builders, and a gate
+# build must not depend on a daemon's health.
+export BEZEL_JOBSERVER=off
 
 # Zero-builders preflight (cold-cache flake defense): a --full gate run
 # concurrently with even one producer build can stall a shard and trigger the
@@ -201,7 +205,21 @@ DH=scripts/dev_heavy.sh
 # per-area binaries the suite is now built as (bezel_tests_codegen, …) — pgrep's
 # pattern is a regex and -x anchors it to the WHOLE comm, so this still cannot
 # match this bash script.
-BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
+# NB `ninja-build`: Fedora's ninja binary is `/usr/bin/ninja-build` (a symlink
+# target invoked directly, not via the `ninja` name), and the kernel sets a
+# process's comm from the invoked pathname's basename — so a real ninja build
+# has comm `ninja-build`, which the bare `ninja` alternative does NOT match
+# under `-x`'s whole-string anchoring (same class of gap as #5080/#5083; #5087).
+# NB `clang(\+\+)?`: the mandated toolchain (CLAUDE.md's Build toolchain
+# section) is clang++, whose comm is `clang` or `clang++` — clang does not
+# fork a separate backend process the way GCC forks `cc1plus`. A bare
+# `clang++` alternative would repeat the exact metacharacter bug this project
+# already paid for once (`pgrep -x 'clang++'` treats `+` as an ERE repetition
+# operator, not a literal, so it does NOT mean "the literal string clang++");
+# escaping the `+`s makes `clang(\+\+)?` match exactly `clang` or `clang++`,
+# and -x's whole-string anchoring means it still cannot match `clangd` or a
+# versioned `clang-19` (#5093).
+BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|ninja-build|make|clang(\+\+)?|bezel_tests(_[a-z]+)?'
 # Sibling detection for the preflight (gate-infra preflight-lockfile lane):
 # when the ONLY matched builders are processes descended from another gate, do
 # NOT report them as "builders active" — they are this gate's own workers, not
@@ -586,6 +604,22 @@ gate_shard_logdir() { # $1 = sharded-run log, $2 = stamp file → echoes the kep
   return 0
 }
 
+# fix #4533: the gate's side of the sanitizer-evidence channel. ONE reader for
+# BOTH sharded consumers (the authoritative pass and the canary tier), because
+# both launch tests/run_parallel.sh and both used to grep its stdout for a
+# headline that stream structurally cannot carry.
+#
+# The decision itself lives in scripts/gate/sanitizer.py — it is a real
+# decision (corruption in a FAILING test is deterministic evidence; corruption
+# in a PASSING test is a defect unless the row declares that its program's
+# crash is the specified outcome; an unattributable report is never excused;
+# a leak is counted, not fatal) and it belongs where it can be unit-tested,
+# not in a bash conditional. Exit codes: 0 clean, 1 FATAL, 2 the channel is not
+# wired — which must never read like a clean suite.
+gate_sanitizer_verdict() { # $1 = sharded-run log → prints findings; rc 0/1/2
+  PYTHONPATH=scripts python3 -m gate.sanitizer verdict --shard-log "$1" 2>&1
+}
+
 echo "== gate[1/5]: reconfigure (glob any new test files) =="
 # Snapshot the compiler-archive mtime BEFORE any build work: comparing after
 # the build phase tells us whether the k2 cache identity changed this gate
@@ -863,14 +897,41 @@ else
       grep -E 'TOTAL:|WARNING: only' "$S/gate_canary.log" || true
       # A fired generated-code sanitizer report in the canary is DETERMINISTIC
       # evidence, exactly as in the full pass — fail hard, no arbitration.
+      # fix #4533: THE CANARY LAUNCHES tests/run_parallel.sh TOO (just above), so
+      # this grep had the SAME defect as the authoritative pass — it read
+      # run_parallel's stdout, which a shard's program output never reaches.
+      # (#4533 records the canary as unaffected "because it reads a direct
+      # binary run"; that is not what the line above does.) It now reads the
+      # same lifted channel, through the same reader, and the same judgement:
+      # corruption in a passing row is evidence unless the row declares itself
+      # in sanitizer_exempt.txt; a LEAK in a passing row is evidence unless the
+      # row declares itself in sanitizer_leak_exempt.txt (fix #4537 — the 11
+      # `leaksAtLeast` rows do, so a diff that touches only those does not
+      # hard-fail a healthy canary).
+      #
+      # gate.canary.decide's contract is `asan_hits > 0 -> FAIL_HARD`; WHICH
+      # reports count as evidence is the bash side's job (canary.py: "what stays
+      # bash — the ASan check"), so handing it the FATAL verdict as a 1 keeps
+      # the dual-run consistent without changing the module.
       if [ "$ASAN" -eq 1 ]; then
-        c_asan=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_canary.log" 2>/dev/null)
-        _c_asan="${c_asan:-0}"
-        if [ "${c_asan:-0}" -gt 0 ]; then
-          echo "   -- generated-code ASan fired in the canary ($c_asan report marker(s)) --"
-          grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_canary.log" | head -60
+        _c_find=$(gate_sanitizer_verdict "$S/gate_canary.log"); _c_rc=$?
+        if [ "$_c_rc" -eq 1 ]; then
+          _c_asan=1
+          echo "   -- generated-code ASan fired in the canary --"
+          printf '%s\n' "$_c_find" | sed 's/^/   /'
+          sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_canary.log" | head -60
           _canary_dual hard
           fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
+        elif [ "$_c_rc" -ne 0 ]; then
+          # The canary is FAIL-OPEN by design and is never the acceptance
+          # authority. Degrade to "not evaluated here" and say so — the
+          # authoritative pass below REFUSES an unwired channel, which is where
+          # that refusal belongs.
+          echo "   canary: sanitizer-evidence channel not readable — the ASan leg is not evaluated here; the authoritative pass refuses an unwired channel (#4533)"
+          _c_asan=0
+        else
+          _c_asan=0
+          [ -n "$_c_find" ] && printf '%s\n' "$_c_find" | sed 's/^/   canary: /'
         fi
       fi
       if [ "$crc" -ne 0 ]; then
@@ -979,18 +1040,72 @@ grep -E 'TOTAL:|## GATE FAILURE|died on|actual FAIL|--- failing' "$S/gate_shard.
 # an ASan-only failure). The harness re-emits any report with the '[aot-asan
 # #1822]' banner; also catch the raw sanitizer headline. Skipped entirely in the
 # plain default (a clean suite never matches anyway).
+#
+# fix #4533: THIS PHASE READ THE WRONG FILE AND SO COULD NEVER FIRE.
+# `$S/gate_shard.log` is tests/run_parallel.sh's OWN STDOUT; a shard's PROGRAM
+# output goes to a per-shard file under run_parallel's mktemp logdir, and only
+# `^[ FAIL ]` lines were lifted back into the parent stream. The grep below was
+# therefore over a file that STRUCTURALLY CANNOT hold the pattern, and a grep
+# that returns 0 for that reason is indistinguishable from a clean suite.
+# Measured on the failed 2026-09-21 --full cycle at e89577e4: seven programs
+# printed `ERROR: LeakSanitizer` and
+# `grep -cE 'ERROR: (Address|Leak)Sanitizer' e89577e4_full.log` → 0, while this
+# phase recorded `rc=0 (no ASan report)`.
+#
+# run_parallel.sh now LIFTS the evidence out of the per-shard logs while they
+# still exist (it reaps them on a clean run) and prints one unconditional
+# accounting line. Two things changed here:
+#   * LIVENESS IS ASSERTED. A missing accounting line fails the phase instead of
+#     reading as "clean" — a guard that cannot fire is the defect being fixed,
+#     so the gate must refuse a zero it did not actually measure.
+#   * THE HARD-FAIL KEYS ON CORRUPTION AND ON UNDECLARED LEAKS. `ERROR:
+#     AddressSanitizer` (UAF / OOB / double-free) is never deliberate in this
+#     tree and fails the cycle on the spot, independent of rc and of
+#     arbitration, UNLESS the test declares itself in
+#     scripts/gate/sanitizer_exempt.txt (its crash is the spec's SPECIFIED
+#     outcome). A LEAK headline (`ERROR: LeakSanitizer`) is fatal by the
+#     identical rule against a SEPARATE list, sanitizer_leak_exempt.txt
+#     (fix #4537): 37 rows across 5 distinct deliberate-leak-assertion shapes
+#     (not just `leaksAtLeast` — the naive grep for that alone finds only 11;
+#     see the file's own header for the other four) re-emit a real LSan report
+#     while PASSING, and declare themselves there — every other leak now reds
+#     the cycle by name, same as undeclared corruption. Both lists are read by
+#     scripts/gate/sanitizer.py's verdict(); gate_sanitizer_verdict() below
+#     never passes --exempt/--leak-exempt, so the DEFAULT paths (computed next
+#     to sanitizer.py) are what the gate actually consults.
 if [ "$ASAN" -eq 1 ]; then
-  PHASE_T0=$(now)  # shard_asan is only the grep; the ASan compile+run time is
+  PHASE_T0=$(now)  # shard_asan is only the harvest; the ASan compile+run time is
                    # already attributed to the 'shard' phase above (no double-count).
-  asan_hits=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_shard.log" 2>/dev/null)
+  # The evidence line is echoed INSIDE this block on purpose: it carries the
+  # substring `SANITIZER`, and gate_full_cycle.sh's silent-degradation detector
+  # is `grep -qi 'asan\|sanitize'` over gate.sh's STDOUT for the --full pass.
+  # Printing it unconditionally (in both oracles) would satisfy that grep from a
+  # PLAIN run and turn the detector into a tautology — the same trap the
+  # repo-identity banner near the top of this file documents (it is deliberately
+  # not echoed for exactly that reason).
+  asan_ev=$(grep -m1 '^SANITIZER EVIDENCE (all shards):' "$S/gate_shard.log" 2>/dev/null || true)
+  [ -n "$asan_ev" ] && echo "   $asan_ev"
+  asan_hits=$(printf '%s\n' "$asan_ev" | sed -n 's/^SANITIZER EVIDENCE (all shards): \([0-9][0-9]*\) report marker.*/\1/p')
   ASAN_ERRS=${asan_hits:-0}; ASAN_SHARDS=$SHARD_COUNT
-  if [ "${asan_hits:-0}" -gt 0 ]; then
-    echo "   -- generated-code ASan fired in the sharded pass ($asan_hits report marker(s)) --"
-    grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_shard.log" | head -60
-    rec_ran shard_asan "1" "$asan_hits ASan report(s)"
-    fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)"
-  fi
-  rec_ran shard_asan "0" "no ASan report"
+  asan_scanned=$(printf '%s\n' "$asan_ev" | sed -n 's/^.* of \([0-9][0-9]*\) shard log(s) scanned.*/\1/p')
+  asan_find=$(gate_sanitizer_verdict "$S/gate_shard.log"); asan_rc=$?
+  [ -n "$asan_find" ] && printf '%s\n' "$asan_find" | sed 's/^/   /'
+  case "$asan_rc" in
+    0) rec_ran shard_asan "0" "no fatal finding (${asan_hits:-0} marker(s), ${asan_scanned:-0} shard log(s) scanned)" ;;
+    1) # The verdict above NAMED the offending tests. Show the reports too: the
+       # excerpt is the lifted section, which the scan ordered corruption-first.
+       sed -n '/^--- sanitizer reports ---/,$p' "$S/gate_shard.log" | head -60
+       rec_ran shard_asan "1" "corruption in the sharded pass"
+       fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)" ;;
+    2) rec_ran shard_asan "1" "evidence channel unwired"
+       fail "sharded ASan — the sanitizer-evidence channel is not wired; a zero from it is not a clean suite (#4533)" ;;
+    # ANY other status is the reader itself failing (no python3, an import
+    # error, a traceback). That must never fall through as "clean" — the whole
+    # defect being fixed is a verification leg that reads green while switched
+    # off.
+    *) rec_ran shard_asan "1" "evidence reader exited $asan_rc"
+       fail "sharded ASan — the sanitizer-evidence reader exited $asan_rc; its silence is not a clean suite (#4533)" ;;
+  esac
 fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase

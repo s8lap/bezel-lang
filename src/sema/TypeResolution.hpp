@@ -121,6 +121,34 @@ bool checkStaticReadonlyNullSource(SemaContext& ctx);
 // other passes (e.g. §22.6 overload resolution).
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
+// §5.1 "Implicit conversions" numeric/char widening table (fix #4853, v0.307):
+// true iff `from` implicitly widens to `to` (distinct primitives; identity is
+// the caller's). Exposes sema's one copy of the table (`ExprTC::
+// primitiveWidens`) so codegen's `ctorForArgs` can prefer a §5.1-admitted
+// conversion over a narrowing without a second, drifting copy. Covers the
+// TYPE-based rows only — constant narrowing is value-based and not modelled.
+bool primitiveImplicitlyWidens(PrimitiveType from, PrimitiveType to);
+
+// §14.2 (fix #4863, v0.307): does the candidate `arg` satisfy the type-bound
+// `bound` as an INTERFACE INSTANTIATION — not merely as a declaration match.
+// `arg` and `bound` are full TypeRefs with genericArgs preserved; the
+// function walks `arg`'s transitive baseTypeRefs (`baseTypeRefs` is the
+// parallel-instantiation vector to `baseTypes`, populated by
+// SymbolCollection/ModuleLoader and used by override-signature checking) and
+// accepts only when a base's TypeRef equals the bound under `typeRefEqual`.
+// Non-generic bounds (e.g. `where T: IDisposable`) admit any instantiation
+// of the bound's declaration — the no-generic-args specialization of the
+// §14.2 constraint table. Bare-parameter markers in the bound's args
+// (Named with declaration=nullptr, the §14.2 type-parameter marker) name
+// the GENERIC OWNER's type parameter; the single-entry substitution
+// {constraint's param → candidate} applies (see the body comment for the
+// multi-param gap). Exposed as a free function so ExprTypecheck_Calls.cpp's
+// call-site constraint check (the OTHER half of #4863 — the wrapping-form
+// `Resolver::checkGenericConstraints` only fires at instantiation sites,
+// not at method-call sites like `H.F<C>(c, …)`) can call it without
+// depending on Resolver directly.
+bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
+
 // #2787 / spec §14.2 rule 3 + §12.9 / stdlib §2.2 §4.4 §5.1: does the INTERFACE
 // type `t` satisfy the self-recurrent bound `where T: IComparable<T>` — i.e.
 // does it name `IComparable<t>` (ITSELF) in its extension clause?
@@ -261,6 +289,23 @@ std::string degenerateAsTargetReason(const TypeRef* target);
 // #4047 tracks it, not this function.
 TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym);
 
+// fix #4554 (§2.7, v0.306): the chain-head warning row — a chain head
+// resolves to a type while a same-named accessible member exists on the
+// enclosing type (§2.7 rule 1's "type outranks member" precedence for chain
+// heads), AND/OR a local type shadows an imported module-name prefix. The
+// declaration-site warning fires only when the member's declared type is
+// NOT the resolved type (the `property Color: Color` carve-out); the
+// module-shadow warning fires when the head name is in `sourceImports_`.
+// Called from ExprTypecheck_Exprs.cpp's IdentifierExpr handler right after
+// the chain-head lookup resolves to a type.
+void warnChainHeadTypeShadows(
+    SemaContext& ctx,
+    std::string_view headName,
+    const TypeSymbol* resolvedType,
+    const std::unordered_set<std::string>& sourceImports,
+    const Symbol* shadowedEnclosingMember,
+    SourceLocation loc);
+
 // fix #4166 review follow-up (§14.2/§17.11/§35.10, v0.298): THE shared
 // authority for "does `default(T)` (equivalently, at a value-type
 // substitution, `new T()`) have NO well-defined value?" — the §17.11
@@ -326,5 +371,31 @@ TypeSymbol* resolveAliasToTypeSymbol(SemaContext& ctx, TypeAliasSymbol* aliasSym
 // it already did).
 bool typeHasNoDefault(const TypeRef* t, SemaContext& ctx,
                       const common::RecordSubstEnv* incoming = nullptr);
+
+// fix #4472 (§14.2, v0.302; follow-up to fix #4446): does ground CLASS
+// declaration `d` fail `where T: new()` because it is `abstract` or
+// `closed`? §14.2 v0.302: "Nor does an `abstract` or `closed` class
+// [satisfy `new()`], whether it declares a `public` parameterless
+// constructor or takes §22.7's implicit one: §12.5 makes `new` on such a
+// class a compile error, so admitting the substitution would satisfy a
+// constraint whose sole purpose — `new T()` in the generic body — the
+// language forbids on the substituted type." (`d` is assumed to already be
+// `ast::TypeDeclKind::Class`; the caller's own kind switch establishes
+// that — this function only reads `d->modifiers`.)
+//
+// THREE call sites ask this exact question as part of their own "does this
+// class satisfy new()" arm: `ExprTC::groundSatisfiesNew` (ExprTypecheck.cpp,
+// fixed by #4446), `Resolver::argSatisfiesNew` (TypeResolution_Checks.cpp),
+// and the inline Class arm of `checkMethodGenericConstraints`'s "new" item
+// (ExprTypecheck_Calls.cpp) — #4446's own SCOPE NOTE named the latter two
+// as separate, un-fixed duplicates and filed the gap as #4472. Rather than
+// growing a third independently-maintained copy of the modifier test, all
+// three now call this ONE function; the surrounding ctor-enumeration logic
+// (primary-constructor parameter check, accessible-parameterless-ctor scan)
+// stays separate per call site — each has a differently-shaped result
+// protocol (bool return + decided out-param vs. satisfied/decided pair vs.
+// early continue), so unifying that too is a larger, separately-scoped
+// refactor outside what #4472 asks for.
+bool isAbstractOrClosedClass(const TypeSymbol* d);
 
 } // namespace bezel::sema

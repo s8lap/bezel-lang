@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.306 — September 2026**
+**Companion to the Bezel Language Specification, v0.307 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1581,7 +1581,7 @@ Every collection's element semantics — what `Add`, `Remove`, `Clear`, the inde
 
 **Empty-collection egress.** On an empty collection, `Pop`, `PopFirst`, `PopLast`, `Dequeue`, and `Peek` raise **`InvalidOperationException`** — that is what *raises if empty* means wherever the per-type sections below write it ([§4.5](#sec-ownedarrayt), [§4.7](#sec-ownedlinkedlistt), [§4.11](#sec-stackt-ownedstackt-queuet-and-ownedqueuet)), and it is the type [§4.17](#sec-sorted-dictionary)'s `FirstKey`/`LastKey`, [§4.18](#sec-sorted-set)'s `First`/`Last`, and [§5](#sec-system-collections-linq)'s `First`/`Last`/`Single` already name for the same condition. Taking from an empty collection is a state violation, [§1](#sec-failure-signal-rule)'s band 1; the `Try` twins (`TryPop`, `TryPopFirst`, `TryPopLast`, `TryDequeue`, `TryPeek`) are the branch-shaped tier and return `false` instead. **`PopAt(index)` is governed by its index rather than by emptiness**: an `index` outside `0..<Count` raises `IndexOutOfRangeException`, the document-wide bounds fault, which on an empty receiver is every index — so the `= PopAt(0)` and `= PopAt(Count - 1)` glosses on `PopFirst`/`PopLast` name the position each selects, not the fault it raises.
 
-**`Clear()`'s disposal order.** An owning collection's `Clear()` disposes the elements it holds in the order its own `Dispose()` does — reverse storage order for the ordered families (`OwningArray`, `OwningLinkedList`, `OwningStack`, `OwningQueue`; spec [§28.11](Bezel_Language_Spec.md#sec-collection-element-ownership) states it per family), implementation-defined for the unordered (`OwningDictionary`, `OwningSet`) — and keeps the emptied collection (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). `Remove`, `RemoveAt`, and an indexer-set dispose one element and raise no ordering question. A borrowing collection's `Clear()` disposes nothing ([§4.1](#sec-borrowing-collection-interfaces)).
+**`Clear()`'s disposal order.** An owning collection's `Clear()` disposes the elements it holds in the order its own `Dispose()` does — reverse storage order for the ordered families (`OwningArray`, `OwningLinkedList`, `OwningStack`, `OwningQueue`, and — slot order being its storage order — `OwningSlotMap`, [§4.21](#sec-owning-slot-map); spec [§28.11](Bezel_Language_Spec.md#sec-collection-element-ownership) states it per family), implementation-defined for the unordered (`OwningDictionary`, `OwningSet`) — and keeps the emptied collection (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). `Remove`, `RemoveAt`, and an indexer-set dispose one element and raise no ordering question. A borrowing collection's `Clear()` disposes nothing ([§4.1](#sec-borrowing-collection-interfaces)).
 
 <a id="sec-arrayt"></a>
 ### 4.4 `Array<T>`
@@ -1728,7 +1728,7 @@ end OwningArray;
 
 `OwningArray<T>` owns each element. `Add`, `Insert`, and the indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's own `Dispose()` dispose the affected elements. `Sort`'s comparer parameter takes borrows of T (the comparer doesn't consume; it inspects).
 
-The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i]` (returns owned T and leaves the slot in moved-from state; the caller must reassign before the next exit point — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
+The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). A use of that borrow after a dominating `Clear()`, `Remove` of the borrow, or `RemoveAt` at the same index with no structural operation in between draws the language spec's element-borrow use-after-removal warning ([§28.11](Bezel_Language_Spec.md#sec-owning-collections)); re-take the borrow after the mutation, or take the element out first with `PopAt(i)`. To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i]` (returns owned T and leaves the slot in moved-from state; the caller must reassign before the next exit point — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
 
 **The `TryPopAt` gap, recorded.** The `Pop*` surface is asymmetric against [§1](#sec-conventions)'s access tiers: the positional egress has a throwing form (`PopAt`) and no `Try` form, while its two convenience specializations (`PopFirst`/`PopLast`) have both. A coherent reading exists — an out-of-range index is the assert-shaped tier, a bug like the throwing indexer's — but the same argument applies to `PopFirst`/`PopLast` on an empty collection, and those *did* get `Try` forms. The surface currently asserts neither resolution; closing the gap means either declaring `TryPopAt(index: int, out owned item: T?): bool` (shape (a), the `when true` postcondition riding it per §1) or writing the band sentence that says positional egress is deliberately assert-only. Recorded as a gap with the reasoning on both sides, not closed.
 
@@ -3518,6 +3518,76 @@ for var word in words do
   tally.Increment(word);
 end;
 ```
+
+<a id="sec-owning-slot-map"></a>
+### 4.21 `OwningSlotMap<T>` and `SlotHandle`
+
+An owning collection **keyed by handles it mints itself**: `Insert` takes ownership of a value and returns a `SlotHandle`; every read, take and removal is keyed by that handle; a removed slot's handle reads as absent for the rest of the map's life. It is the library form of the handle-and-table pattern (rationale [§5.4](Bezel_Design_Rationale.md#sec-no-shared-ownership)): a program that must refer to an object from many places — a graph's edges, a cache's index, a registry's entries — stores the object's `SlotHandle`, a value, where it would otherwise store a borrow, and so carries no [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) trust clause and no domain clause for the reference.
+
+```bezel
+/// Compiler-intrinsic value record. Sendable (spec §30.14); hashable (spec §3.6) — usable as a
+/// Dictionary<K, V> key or Set<T> element. Declares neither ISerializable nor IDeserializable: no
+/// serialization is synthesized for it, and it is not an admissible serialized component of any
+/// other type (spec §9.8).
+public record SlotHandle
+  public readonly property Index: int;         // the slot's position in its map; stable for the handle's life
+  public readonly property Generation: int;    // the slot's generation when the handle was minted
+  // =, <>, Equals, GetHashCode and ToString are compiler-provided. Two handles are equal iff
+  // they were minted by the same map for the same slot at the same generation; a third,
+  // non-public component identifies the minting map and participates in equality and hashing.
+  // No public constructor: handles are minted by OwningSlotMap<T>.Insert alone. default(SlotHandle)
+  // (spec §17.11) is the one handle no map minted: it denotes a slot of no map (below).
+  // ToString renders `SlotHandle(Index: i, Generation: g)` — the auto-hashable body-record rendering
+  // of spec §8.5/§9.2 over the two public auto-properties; the hidden component is not rendered, so
+  // two handles may print alike and compare unequal.
+end SlotHandle;
+
+public class OwningSlotMap<T>: IEnumerable<T>, IOwningEnumerable<T> where T: class
+  public constructor();
+  public constructor(capacity: int);                      // ArgumentOutOfRangeException if negative (§1)
+
+  public pure readonly property Count: int;               // live slots
+
+  public method Insert(owned value: T): SlotHandle;       // takes ownership; mints the handle
+  public method Contains(handle: SlotHandle): bool;       // live under this handle; enables `h in map` (spec §17.5)
+  public method Get(handle: SlotHandle): T;               // borrow of the stored value; KeyNotFoundException if absent
+  public method GetOrNull(handle: SlotHandle): T?;        // §1 *OrNull tier: absent -> null; present -> a borrow
+  public method TryGetValue(handle: SlotHandle, out value: T?): bool;   // §1 shape (a); the out is a borrow
+  public method Remove(handle: SlotHandle): bool;         // disposes the value; false if absent
+  public method PopValue(handle: SlotHandle): owned T;    // vacates the slot; KeyNotFoundException if absent
+  public method TryPopValue(handle: SlotHandle, out owned value: T?): bool;   // §1 shape (a)
+  public method Handles(): owned Array<SlotHandle>;       // a snapshot of every live handle, ascending Index
+  public method Drain(): IOwningEnumerable<T>;            // iteration drains the map, ascending Index
+  public method Clear();                                  // disposes every value, descending Index
+end OwningSlotMap;
+```
+
+**Slots and generations.** The map is a table of slots addressed by index. Every slot carries a **generation**, `0` when the slot is first used and advanced by one each time the slot is **vacated** — by `Remove`, `PopValue`, `TryPopValue`, a `Drain()` yield, or `Clear()`. `Insert` places the value in a vacant slot and mints a handle carrying that slot's index and current generation. A handle is **live** iff its slot holds a value and the slot's generation equals the handle's `Generation`; otherwise the handle reads as **absent** — `Contains` is `false`, `GetOrNull` is `null`, `TryGetValue` and `TryPopValue` return `false`, `Remove` returns `false`, and `Get` and `PopValue` raise `KeyNotFoundException`. A handle therefore never reads a later occupant of its slot.
+
+**Reuse and retirement.** `Insert` reuses the **most recently vacated** slot that is not retired, and otherwise takes the next never-used index; `Index` values are consequently dense, which is what makes them usable as indices into a side table kept beside the map. A slot whose generation would exceed `int.MaxValue` is **retired** — never reused — so generations never wrap and a stale handle can never become live again.
+
+**A handle from another map is a fault.** Every handle-taking member raises `ArgumentException` when the handle was minted by a different `OwningSlotMap<T>` instance ([§1](#sec-failure-signal-rule)'s band 1: a caller bug, not an expected absence). A `default(SlotHandle)` (spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator) — the record is defaultable, so `var h: SlotHandle;`, a default-initialized field and a default-initialized `Array<SlotHandle>` slot all hold it) denotes a slot of no map and takes the same fault: no map ever mints it.
+
+**Ownership faces** (spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)'s owned column). `Insert` takes `owned`: a fresh producer or a `move`d binding, never an unmarked read of an owned binding (spec §28.3 K3.3). `Get`, `GetOrNull`, `TryGetValue`'s out, and default iteration produce **borrows sourced from the map**, valid until the slot is mutated — a `Remove`, `PopValue` or `Clear` on the slot is a mid-scope kill under the checked-disposal backstop (spec [§28.2](Bezel_Language_Spec.md#sec-checked-disposal)). Spec [§28.11](Bezel_Language_Spec.md#sec-owning-collections)'s element-borrow use-after-removal warning reaches the map's default-iteration variable (in that warning's producer set) after a dominating `Clear()` (in its kill set); a `Get`, `GetOrNull` or `TryGetValue` result is a method-call borrow outside that producer set, and a handle-keyed `Remove`/`PopValue` is outside that kill set, so a use of such a borrow after either is the backstop's, not the warning's (a chosen silence, liftable). `Remove` and `Clear` **dispose**; `PopValue`, `TryPopValue` and `Drain()` **transfer**. Disposing through a borrow obtained from `Get` or `GetOrNull` is spec [§28.6](Bezel_Language_Spec.md#sec-who-may-dispose)'s compile error.
+
+**Order.** Default iteration (`IEnumerable<T>`), `Handles()` and `Drain()` visit live slots in **ascending `Index`**. `Clear()` and the map's own `Dispose()` dispose the values in **descending `Index`** — the ordered families' reverse-storage-order rule of spec [§28.11](Bezel_Language_Spec.md#sec-owning-collections), storage order here being slot order. `Clear()` keeps the emptied map; `Dispose()` then releases the storage.
+
+**`Handles()` is a snapshot, not a view.** It returns a fresh `owned Array<SlotHandle>` — trivial-dispose at this element type, so `for var h in map.Handles() do … end;` carries no ceremony — because the dominant loop over a registry removes as it goes, and a mutation through a live view is spec [§29.12](Bezel_Language_Spec.md#sec-mutation-during-iteration)'s `InvalidOperationException`. `Insert`, `Remove`, `PopValue`, `Drain` and `Clear` are structural modifications under that section and invalidate an active enumerator.
+
+```bezel
+using var m := new OwningSlotMap<Session>();
+var h := m.Insert(new Session("alice"));       // a value; store it anywhere
+_edges.Add(new Edge(h, other));                 // record Edge(From: SlotHandle, To: SlotHandle): no borrow, no trust clause
+var s := m.GetOrNull(h);                        // a borrow sourced from m, or null if the slot was vacated
+if s <> null then s.Touch(); end if;
+for var stale in m.Handles() do                 // remove while walking: the snapshot is not a view
+  if m.Get(stale).Expired then _ := m.Remove(stale); end if;   // Remove disposes; the handle reads absent afterwards
+end for;
+```
+
+**Interface conformance.** `IEnumerable<T>` (borrowing default iteration) and `IOwningEnumerable<T>` (the `Drain()` path) — the both-implemented shape of [§4.5](#sec-ownedarrayt), with [§4.13](#sec-owning-enumeration-interfaces)'s static-type rule selecting the path. Not `IOwningCollection<T>`: that interface's `Add(owned item: T)` returns `()` where this type's ingress returns the handle, and its `Contains(item: T)`/`Remove(item: T)` are keyed by element where this type's are keyed by handle. Not a collection-literal target (spec [§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol)): a literal could not hand back the handles it would mint. **There is no borrowing twin**: handles exist to replace stored borrows, and a borrow-storing slot map would carry spec [§28.11](Bezel_Language_Spec.md#sec-borrowing-collections)'s store residual at every slot. A program that must refer to an object owned elsewhere stores that object's handle from the map that owns it; where the *holder* must keep the object alive, `Shared<T>`/`Weak<T>` ([§2.16](#sec-shared-and-weak)) remains the form.
+
+**Derived properties.** Not trivial-dispose at any instantiation (spec [§28.9](Bezel_Language_Spec.md#sec-trivial-dispose-for-generic-class-instantiations)). Sendable iff `T` is a sendable class type (spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)'s owning-collection rule: the map's state is wholly owned; handles left behind in the origin domain denote a map that domain can no longer reach). `SlotHandle` is sendable, hashable and defaultable (spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator); its default is the no-map handle above), and declares no serialization conformance. `OwningSlotMap<T>` declares no statics-and-sharing facts ([§1](#sec-statics-and-sharing-facts)); a `static owned readonly` map draws spec §22.12 rule 4's warning like every other owning collection, and the `Locked<T>` registry idiom ([§6.11](#sec-locked-and-rwlocked)) is the process-global spelling. `T` is restricted to class and interface types at the instantiation site (spec [§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)).
 
 <a id="sec-system-collections-linq"></a>
 ## 5. `System.Collections.Linq` (auto-imported)

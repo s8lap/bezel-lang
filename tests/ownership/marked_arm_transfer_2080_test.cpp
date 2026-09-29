@@ -78,7 +78,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_coalesce_both_paths) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    // wasSkipped(r) guard DELETED (narrow #3733 burn-down — the silent-skip
+    // pattern lets a box without clang report clean PASS having run no
+    // ASan tier; BEZEL_EXPECT_TRUE(r.ran) below catches SKIP as a test
+    // failure, making the burn-down finish loud).
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // Pick(true): D1 (explicit) + D9 (per-path scope end). Pick(false): D9

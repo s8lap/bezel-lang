@@ -282,25 +282,33 @@ BEZEL_TEST(inherited_generic_base_field_bare_id_2909,
 // ===========================================================================
 // T5 — OWN-CLASS BARE READ (non-inherited) STILL WORKS.
 // `class Coll<U> { dv: U }` reads `dv` bare. `dv` is declared on `Coll`
-// itself, not inherited; the substitution is empty in the template body
-// but `dv: U` lowers to the i32 placeholder without issue (the template
-// body is dead code, `return i32` against an i32-returning function
-// verifies). At runtime the SPEC body (per U = int instantiation) reads
-// `dv` as i32. Pins the non-inherited path; the relaxation must not
-// disturb the own-field shape. Expected: 99.
+// itself, not inherited; the substitution is empty in the template body.
+// At runtime the SPEC body (per U = int instantiation) reads `dv` as i32.
+// Pins the non-inherited path; the relaxation must not disturb the
+// own-field shape. Expected: 99.
+//
+// #4768 (§5.1 / §3.6 rule 2, v0.307): this row originally declared
+// `ReadDV(): int` and returned the `U`-typed field from it. A generic body
+// type-checks under the weakest assumption its constraints establish, and
+// §5.1 converts a type-parameter value only to `Object` and to its
+// constraint bounds, so `U -> int` has no conversion: that return is now
+// rejected at the declaration. The row keeps its subject (the bare read
+// of an own generic field) in the spec-valid spelling: `ReadDV(): U`,
+// with the value stored from `Main` at the concrete `U = int`.
 // ===========================================================================
 BEZEL_TEST(inherited_generic_base_field_bare_id_2909,
            own_class_bare_read_unchanged_spec_23_1) {
     auto r = runAotChecked(
         "module H; "
         "class Coll<U> "
-        "  public dv: U := 99; "
-        "  public method ReadDV(): int "
+        "  public dv: U; "
+        "  public method ReadDV(): U "
         "    return dv; "
         "  end ReadDV; "
         "end Coll; "
         "class C public static method Main(): int "
         "  using var c := new Coll<int>(); "
+        "  c.dv := 99; "
         "  return c.ReadDV(); "
         "end Main; end C;");
     if (wasSkipped(r)) return;

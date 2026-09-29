@@ -24,7 +24,7 @@ class C
   public method Run(): int
     var r := new R();
     var b := new Box();
-    b.a := move r;     // textbook §28.8 transfer at method scope
+    b.a := r;     // textbook §28.8 transfer at method scope
     return b.a!.V();
   end Run;
   public static method Main(): int

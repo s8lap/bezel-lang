@@ -17,5 +17,5 @@
 
 module M; class A public static V: int := 1; end A; class B public static V: int := 2; end B; record C(X: int); enum E Red, Green; end E; interface I method M(): int; end I; class P public static method Main(): int return A.V + B.V; end Main; end P;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `V` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `V` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

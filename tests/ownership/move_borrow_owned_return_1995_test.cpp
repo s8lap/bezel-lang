@@ -168,15 +168,18 @@ BEZEL_TEST(move_borrow_owned_return_1995,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.8: `return move b;` where `b` is an OWNED parameter — the legal transfer
+// §28.8: `return b;` where `b` is an OWNED parameter — the legal transfer
 // of a transferred-in owned value. Guards against the fix over-rejecting an
-// `owned` (as opposed to borrow) parameter.
+// `owned` (as opposed to borrow) parameter. Spelled marker-free per §28.3
+// K3.13 / K3.2 (v0.307): `return` under an `owned` return type is a
+// marker-free consuming position, so `return move b;` is now rejected as a
+// redundant marker; the classification this row pins is unchanged.
 BEZEL_TEST(move_borrow_owned_return_1995,
            return_move_owned_param_disposes_once_spec_28_8) {
     std::string src =
         std::string(kCell) +
         "class C "
-        "  public static method Pass(owned b: Cell): owned Cell return move b; end Pass; "
+        "  public static method Pass(owned b: Cell): owned Cell return b; end Pass; "
         "  public static method Main(): int "
         "    do using var got := C.Pass(new Cell()); end; return Cell.live; "
         "  end Main; "
@@ -212,6 +215,9 @@ BEZEL_TEST(move_borrow_owned_return_1995,
 // of an owned field — moved into a local, the field reassigned, then the local
 // returned. Guards against the fix mis-classifying an owned-field read as a
 // borrow. The value is disposed exactly once (Cell.live == 0). // per §28.8.1
+// The trailing `return r;` is marker-free per §28.3 K3.13 / K3.2 (v0.307); the
+// `move f!` owned-field read it pins keeps its marker (K3.13 leaves field moves
+// marked, for §28.8.1 K9.2 restoration tracking).
 BEZEL_TEST(move_borrow_owned_return_1995,
            owned_field_move_via_local_disposes_once_spec_28_8_1) {
     std::string src =
@@ -220,7 +226,7 @@ BEZEL_TEST(move_borrow_owned_return_1995,
         "  public owned f: Cell? := null; "
         "  public constructor() this.f := new Cell(); end constructor; "
         "  public method Give(): owned Cell "
-        "    var r := move f!; this.f := null; return move r; "
+        "    var r := move f!; this.f := null; return r; "
         "  end Give; "
         "  destructor end destructor; "
         "end Box; "

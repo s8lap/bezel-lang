@@ -137,6 +137,18 @@ BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
 // invokes `bz_array_free` on the `OwningTask<Cell>` — the crash this test
 // pins. Post-fix: the outer frame's disposal is a correct no-op for its
 // borrowed `OwningTask` result (the #1889/#776/#777 contract, extended).
+//
+// fix #4670 / §30.5 (v0.307): `C.Wrap(): Task<OwningTask<Cell>>` is a
+// Pattern A producer (OwningTask<Cell> is class-like), so `await
+// C.Wrap()` produces a BORROW, not an owned value; §30.5's consumer-side
+// rules admit that borrow only to a plain `var` (here, the scoped
+// await-bind desugaring of `var inner := await C.Wrap();`, since
+// `C.Wrap()` is a bare producer call), never to `using var`. This row
+// used `using var inner := await C.Wrap();` before #4670 landed; #4670
+// correctly rejects that shape now, so it is converted to `var inner`
+// here. `inner`'s own await (`using var c := await inner;`) is unaffected
+// — `inner: OwningTask<Cell>` is Pattern B, whose canonical discharge IS
+// `using var`.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
            nested_owning_task_result_use_after_free_3657) {
@@ -154,7 +166,7 @@ BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
         "    return C.Produce(); "
         "  end Wrap; "
         "  public static async method Run(): Task<int> "
-        "    using var inner := await C.Wrap(); "
+        "    var inner := await C.Wrap(); "
         "    using var c := await inner; "
         "    return c.value; "
         "  end Run; "
@@ -178,6 +190,13 @@ BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
 // __asan::Allocator::Deallocate`, stack `bz_array_free <-
 // bz$patAResultCollFree$OwningTask <- bz_task_free <-
 // bz$async$M.C$Run$Resume`); post-fix LSan-clean, correct sum, 5/5 runs.
+//
+// fix #4670 / §30.5 (v0.307): same conversion as the single-shot row
+// above — `using var outer := await C.Wrap(k);` (outer: a Pattern A
+// borrow, C.Wrap(k) class-like OwningTask<Cell> result) is rejected
+// post-#4670; converted to `var outer`, the scoped await-bind (per-
+// iteration hidden slot, disposed at the end of each loop iteration —
+// identical disposal timing to the original `using var`).
 BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
            nested_owning_task_result_amplified_200x_3657) {
     const std::string src =
@@ -196,7 +215,7 @@ BEZEL_TEST(PatternATaskResultCollectionMembership3657_3658,
         "  public static async method Run(): Task<int> "
         "    var total := 0; "
         "    for var k in 0..<200 do "
-        "      using var outer := await C.Wrap(k); "
+        "      var outer := await C.Wrap(k); "
         "      using var c := await outer; "
         "      total := total + c.value; "
         "    end for; "

@@ -13,9 +13,23 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
+// `Resource` declares a DESTRUCTOR deliberately (narrow #4743). §28.9 v0.307:
+// "No must-use / auto-drop diagnostic attaches to a trivial-dispose value.
+// The §28.3 must-use warning is not emitted at the implicit-drop site of …
+// an undischarged `owned` parameter … whose type is trivial-dispose." A bare
+// `class Resource end Resource;` has no destructor, no `owned` field and no
+// owning-inline-array field, so §28.9 classifies it TRIVIAL-DISPOSE and the
+// §28.3 parameter must-use rows below would be asserting a warning the spec
+// says must not be emitted. The destructor is §28.9's first disqualifier;
+// adding it restores the rows' subject — `Resource` is a resource with real
+// disposal work, which is what every row in this file means by the name.
+//
+// `T` stays destructor-less on purpose: `owned_trivial_dispose_param_silent_
+// spec_28_9` below pins the exemption's other side with it, so both
+// directions of the §28.9 gate are covered from this file.
 std::string wrap(const std::string& method) {
     return std::string("module M; "
-        "class T end T; class Resource end Resource; "
+        "class T end T; class Resource destructor end destructor; end Resource; "
         "class C ") + method + " end C;";
 }
 
@@ -32,15 +46,67 @@ BEZEL_TEST(own_param, owned_param_undischarged_diagnosed) {
     BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "r"));
 }
 
+// §28.9 v0.307, the exemption's POSITIVE side (narrow #4743 — the reason the
+// `Resource` fixture above now declares a destructor). `T` is a bare
+// `class T end T;`: no destructor, no `owned` field, no owning-inline-array
+// field, so it is trivial-dispose and §28.9's "the §28.3 must-use warning is
+// not emitted at the implicit-drop site of … an undischarged `owned`
+// parameter … whose type is trivial-dispose" applies verbatim. The auto-drop
+// itself is unaffected (§28.9: the compiler still frees the instance at the
+// holder's release point) — only the diagnostic is suppressed.
+BEZEL_TEST(own_param, owned_trivial_dispose_param_silent_spec_28_9) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Take(owned t: T) end Take;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(r, "t"));
+}
+
+// §28.9 v0.307, the exemption's NEGATIVE side at its sharpest edge (fix
+// #4743). §28.9 states it in so many words: "an **interface** type is never
+// trivial-dispose, its conformance set being open across modules … so a drop
+// site is unexempt wherever the key selects an interface type — every site
+// with no statically-known producer whose declared type is an interface". An
+// `owned` PARAMETER has no statically-known producer, so the key selects its
+// declared type; an interface-typed one therefore keeps the §28.3 warning
+// however trivial-dispose its eventual implementors happen to be.
+//
+// This is the row that catches the #4743 defect shape directly: driving the
+// exemption off `!common::isNonTrivialDisposeClass(pt, ctx_)` answers "exempt"
+// here, because that predicate returns false for every non-`Class`
+// declaration kind — silently dropping an obligation over an open conformance
+// set. Asserting the specific auto-drop diagnostic for `t`, not `hasErrors()`.
+BEZEL_TEST(own_param, owned_interface_param_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "interface IThing method Go(); end IThing; "
+        "class C public static method Take(owned t: IThing): int "
+        "  return 0; "
+        "end Take; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "t"));
+}
+
 BEZEL_TEST(own_param, owned_param_explicitly_disposed_clean) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(owned r: Resource) r.Dispose(); end Take;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// The return type is `owned Resource`, not `Resource` — REQUIRED as of v0.307
+// and load-bearing for this row. §28.3's announcement table row 4 admits only
+// a RECEIVER-SOURCED BORROW through a plain concrete class return, and an
+// `owned` parameter is neither receiver-sourced nor a borrow: returning it is
+// a transfer, which is spelled `owned`. The diagnostic says so itself
+// ("declare the return type `owned` to transfer ownership to the caller").
+//
+// The row originally spelled the plain return and was admitted pre-v0.307.
+// `fe95b173` implemented row 4 and it became a compile error. The row's axis
+// — that an owned parameter may be discharged by returning it — is unchanged
+// and still pinned; only the spelling of the transfer moved.
+// per §28.3 announcement table row 4, §28.8, v0.307
 BEZEL_TEST(own_param, owned_param_returned_clean) {
     auto r = parseAndCheckOwnership(wrap(
-        "public method Pass(owned r: Resource): Resource "
+        "public method Pass(owned r: Resource): owned Resource "
         "  return r; "
         "end Pass;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -157,7 +223,12 @@ OwnedParamDiagLoc findOwnedParamDiag(const bezel::test::OwnershipResult& r,
 BEZEL_TEST(own_param_3037, sync_param_auto_drop_warning_at_decl_not_zero) {
     const std::string src =
         "module M;\n"
-        "class Resource end Resource;\n"
+        // Destructor per narrow #4743: a destructor-less class is
+        // trivial-dispose (§28.9 v0.307) and the §28.3 parameter
+        // must-use warning whose LOCATION this row pins is then
+        // correctly not emitted at all. Kept on line 2 so the line/
+        // column pins below still address the same tokens.
+        "class Resource destructor end destructor; end Resource;\n"
         "class C\n"
         "  public method Take(owned r: Resource)\n"
         "  end Take;\n"
@@ -184,7 +255,12 @@ BEZEL_TEST(own_param_3037, sync_param_auto_drop_warning_at_decl_not_zero) {
 BEZEL_TEST(own_param_3037, second_owned_param_auto_drop_at_its_own_decl) {
     const std::string src =
         "module M;\n"
-        "class Resource end Resource;\n"
+        // Destructor per narrow #4743: a destructor-less class is
+        // trivial-dispose (§28.9 v0.307) and the §28.3 parameter
+        // must-use warning whose LOCATION this row pins is then
+        // correctly not emitted at all. Kept on line 2 so the line/
+        // column pins below still address the same tokens.
+        "class Resource destructor end destructor; end Resource;\n"
         "class C\n"
         "  public method Take(owned r1: Resource, owned r2: Resource)\n"
         "    r1.Dispose();\n"

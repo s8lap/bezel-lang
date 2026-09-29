@@ -14,5 +14,5 @@
 
 module M; class App public static readonly _ch: Channel<int> := new Channel<int>(1); public static method Main(): int => 0; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: static readonly field `_ch` has class type `Channel` which is reachable from every domain; confine its use to one domain or ensure its own internal synchronization
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} static readonly field `_ch` has class type `Channel` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal synchronization
 // CHECK-SAME: (§22.12 rule 4, #1363)

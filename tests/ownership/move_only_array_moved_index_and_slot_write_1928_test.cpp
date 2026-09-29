@@ -184,7 +184,7 @@ BEZEL_TEST(move_only_array_moved_index_and_slot_write_1928,
         "var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
         "var s: Cell := new Cell(0); "
         "var x: int := a[s.V()]!.V(); "
-        "_ := move s; "
+        "_ := s; "
         "return x;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -237,7 +237,7 @@ BEZEL_TEST(move_only_array_moved_index_and_slot_write_1928,
         "var arr: [3]int := [10, 20, 30]; "
         "var s: Cell := new Cell(1); "
         "var x: int := arr[s.V()]; "
-        "_ := move s; "
+        "_ := s; "
         "return x;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

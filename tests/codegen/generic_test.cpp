@@ -135,7 +135,14 @@ BEZEL_TEST(codegen_generic, generic_swap_int) {
         "class Pair<T> "
         "  public _first: T; public _second: T; "
         "  public constructor(a: T, b: T) _first := a; _second := b; end constructor; "
-        "  public method Swap(): Pair<T> return new Pair<T>(_second, _first); end Swap; "
+        // `owned` is REQUIRED here, not decoration (#4758). Per §28.3
+        // announcement table row 4 (v0.307), an instance method whose declared
+        // return type is a plain concrete class type may return only a
+        // receiver-sourced borrow; `new Pair<T>(...)` is a fresh owned value,
+        // so the unmarked spelling is rejected by the real compiler. This row
+        // runs on `runJit`, which never blocks on the ownership pass, so the
+        // violation would surface only on a port to `runAot` (#3439).
+        "  public method Swap(): owned Pair<T> return new Pair<T>(_second, _first); end Swap; "
         "  destructor end destructor; "
         "end Pair; "
         "class C public static method Main(): int "

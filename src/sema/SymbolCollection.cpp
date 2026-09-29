@@ -186,6 +186,15 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
         // FieldSymbol::declLoc reported 0:0.
         sym->declLoc = fd->span.begin;
         sym->scope = parent.memberScope;  // field lives in type's member scope
+        // §9.2 "The `equality skip` clause" (v0.307): an explicit field's
+        // clause, onto the SYMBOL. A.4 places it BEFORE the identifier on a
+        // FieldDecl; this is the third of the three storage-bearing AST hosts
+        // (the other two are the positional field in collectTypeDecl and the
+        // auto-property below). Copied unconditionally — including onto a
+        // `static` field, which §9.2's inert-annotation rule then REJECTS in
+        // `Resolver::checkTypeEqualitySkipInert`; that check reads the symbol
+        // bit, so dropping it here for statics would silently disarm the rule.
+        if (fd->equality) sym->equalitySkip = fd->equality->isSkip;
         return sym;
     }
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
@@ -292,6 +301,11 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
             sym->serializedOptional = pd->serialized->isOptional;
             sym->serializedWireName = pd->serialized->name;
         }
+        // §9.2 "The `equality skip` clause" (v0.307): an auto-property's
+        // clause, onto the SYMBOL, for the same reason the `serialized` copy
+        // directly above gives — §9.2 states the artifact interface carries
+        // it "exactly as it carries `serialized` clauses".
+        if (pd->equality) sym->equalitySkip = pd->equality->isSkip;
         return sym;
     }
     if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
@@ -498,6 +512,13 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
                 fs->serializedOptional = pf.serialized->isOptional;
                 fs->serializedWireName = pf.serialized->name;
             }
+            // §9.2 "The `equality skip` clause" (v0.307): the positional
+            // field's clause, onto the SYMBOL. A positional FieldSymbol's
+            // `decl` is the owning TypeDecl (not a FieldDecl), so before this
+            // even the LOCAL consumers had to recover the clause by index
+            // arithmetic back into `td.positionalFields`; the symbol bit
+            // retires that walk as well as the imported-side blind spot.
+            if (pf.equality) fs->equalitySkip = pf.equality->isSkip;
             sym->members.push_back(fs);
         }
     }
@@ -649,10 +670,72 @@ std::string_view formalParamName(const ConstructorSymbol& cs,
     return {};
 }
 
+// fix #4924 (§22.3 / §22.4 / §22.6, v0.307): see Symbol.hpp.
+bool callSiteRefOutMatches(std::string_view argModifier,
+                           std::string_view paramModifier) {
+    const bool argRef = argModifier == "ref";
+    const bool argOut = argModifier == "out" || argModifier == "out var" ||
+                        argModifier == "out using var" ||
+                        argModifier == "out owned var";  // per §22.4
+    if (paramModifier == "ref") return argRef;
+    if (paramModifier == "out" || paramModifier == "out owned") return argOut;
+    return !argRef && !argOut;
+}
+
 std::size_t formalParamCount(const ConstructorSymbol& cs) {
     if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl))
         return d->params.size();
     return cs.params.size();
+}
+
+// narrow #4791 (§12.8 / §22.5 / §22.10, v0.307): see Symbol.hpp. Each
+// conjunct below mirrors one gate of the #3793 self-chain check in
+// `Resolver::checkTypeConstructorChains`, in the same order, plus the one
+// new conjunct at the end.
+const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
+                                            const ConstructorSymbol& cs,
+                                            const ast::ConstructorDecl& cd) {
+    // #3793 applies only to a type WITHOUT a primary constructor — a
+    // §22.10 class primary or, fix #4999 (§9.1 / §9.3, v0.307), a record's
+    // §9.1 auto-generated primary; the same predicate as
+    // `Resolver::checkTypeConstructorChains`'s `typeHasPrimaryCtor`.
+    if (t.hasPositionalFields && (t.kind == ast::TypeDeclKind::Class ||
+                                  t.kind == ast::TypeDeclKind::Record))
+        return nullptr;
+    if (cs.isStatic || cd.body.empty() || !cd.body[0]) return nullptr;
+    // A misplaced or duplicated chain call is already a §12.8 error.
+    int chainCount = 0;
+    for (std::size_t i = 0; i < cd.body.size(); ++i) {
+        bool isThisI = false;
+        if (!cd.body[i] || !ast::chainCallOfStmt(*cd.body[i], isThisI))
+            continue;
+        if (i != 0) return nullptr;
+        ++chainCount;
+    }
+    if (chainCount > 1) return nullptr;
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
+    if (!chain || !isThis) return nullptr;
+    const std::size_t n = chain->args.size();
+    if (n != cs.params.size()) return nullptr;
+    for (Symbol* m : t.members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic || other == &cs) continue;
+        if (other->params.size() == n) return nullptr;
+    }
+    // The new conjunct: a named argument naming no parameter of `cs`.
+    const std::size_t csArity = formalParamCount(cs);
+    for (const auto& a : chain->args) {
+        if (a.name.empty()) continue;
+        bool namesCsParam = false;
+        for (std::size_t j = 0; j < csArity; ++j)
+            if (formalParamName(cs, j) == a.name) {
+                namesCsParam = true;
+                break;
+            }
+        if (!namesCsParam) return chain;
+    }
+    return nullptr;
 }
 
 // fix #3176 (§22.3 / §2.5, v0.254 — family M1 of umbrella #3152): the METHOD
@@ -1023,8 +1106,16 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
 // `isNonNullableReferenceAutoProp`, TypeResolution_Checks.cpp's per-type BFS)
 // that walk `klass.members` directly and have not (yet, or ever) resolved a
 // PropertySymbol for the member they are looking at.
+// NOTE (#4037, #4100): the prior `p.isIndexer` guard excluded ALL indexers.
+// That is correct for the storage-classification call sites (indexers never
+// get a backing field regardless of abstract-ness), but WRONG for the setter-
+// axis question: an abstract auto-indexer (`abstract property [i: int]: T;`)
+// IS a §12.5 shorthand (get-only, no setter) and must return true here so
+// that callers on the setter axis (e.g. `propertyDeclHasSetter`) do not
+// incorrectly report a setter as present. The guard is removed so that
+// abstract auto-indexers are treated identically to abstract auto-properties.
 bool isAbstractPropertyShorthand(const ast::PropertyDecl& p) {
-    if (p.isIndexer || p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
     for (auto mod : p.modifiers)
         if (mod == "abstract") return true;
     return false;
@@ -1208,7 +1299,7 @@ static bool isHomogeneousEqualityOperatorOverload(const MethodSymbol* meth,
 // to check whether a nested positional record is itself hashable.
 // Definition follows isAutoEqualityBearingBodyRecord below.
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx);
+                                        SemaContext& ctx);
 
 // §35.7 (v0.210, #2083): declared in Symbol.hpp (with the #2047 `inst`
 // instantiation parameter). Body is below — after the admissibility predicate
@@ -1403,6 +1494,16 @@ SerializedComponentClause serializedComponentClause(const Symbol* m) {
     return info;
 }
 
+// §9.2 "The `equality skip` clause" (v0.307; follow-up to fix #4643): see the
+// declaration comment in Symbol.hpp for the measured cross-module divergence
+// this closes — a positional record comparing `True` in its own module and
+// `False` across the import, and a body record whose `=` is accepted locally
+// and rejected at the import.
+bool memberEqualitySkip(const Symbol* m) {
+    const auto* ms = dynamic_cast<const MemberSymbol*>(m);
+    return ms && ms->equalitySkip;
+}
+
 // fix #3140 (§9.8, family F2): see the declaration comment in Symbol.hpp for
 // why an imported class answers "" and what was measured when it did not.
 std::string_view serializedClassShape(const TypeSymbol* t) {
@@ -1571,7 +1672,7 @@ std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts) {
 //
 // (v0.158 removed the former "sealed reference type with content equality"
 // clause; its only instance, `string`, is admitted explicitly above.)
-static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
+static bool isAdmissibleComponentType(const TypeRef* ty, SemaContext& ctx,
                                       int depth) {
     using K = TypeRef::Kind;
     if (!ty || depth > 32) return true;  // unresolved / recursion guard: conservative
@@ -1680,6 +1781,47 @@ bool recordIsPositional(const TypeSymbol* rec) {
     return false;
 }
 
+// §9.9 (v0.307, proposal 0107, fix #4699): see Symbol.hpp for the full
+// reading. Local-only check: walk the AST `TypeDecl::members` for any
+// `ConstructorDecl` whose `contractClauses` is non-empty. The local AST is
+// always available for a record actually declared in the current module
+// (`rec->decl` is the `ast::TypeDecl*`); the null-decl fallback is the
+// cross-module (imported) case, for which this returns false conservatively
+// (the wire-channel carriage is not yet built — see Symbol.hpp's
+// IMPORTED READING).
+//
+// fix #4699 (cycle 23): landed as the predicate behind the three
+// downstream checks the corpus targets — `default(R)` at §17.11,
+// `where T: new()` substitution at §14.2, and default-initialized `R`-typed
+// storage at §7.9.
+bool recordIsConstructorOnly(const TypeSymbol* rec) {
+    if (!rec) return false;
+    if (rec->kind != ast::TypeDeclKind::Record) return false;
+    // A positional record may not declare a clause-bearing constructor at
+    // all (the declaration-site rule from fix #4702 in TypeResolution.cpp's
+    // `checkRecordCombinedFormContractClauseConstructors`), so it cannot
+    // be constructor-only. Both sources are consulted for symmetry with
+    // `recordIsPositional` above.
+    if (recordIsPositional(rec)) return false;
+    // SEAM-DEBT: #3301 this is NOT a benign null branch. `recordIsConstructorOnly`
+    // feeds USE-site consumers (§17.11 `default(T)`, §14.2 `new` constraints,
+    // §7.9), so answering `false` for an IMPORTED record wrongly ADMITS
+    // `default(ImportedCtorOnlyRecord)`. The §2.8.2 wire channel that would
+    // carry the property is unbuilt — #3301 tracks it, and this file's own
+    // IMPORTED READING in Symbol.hpp states the conservative fallback. Closing
+    // #3301 must revisit this read; do not treat the early `false` as correct.
+    auto* rawRecDecl = rec->decl;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(rawRecDecl);
+    if (!td) return false;  // imported — see IMPORTED READING in Symbol.hpp
+    for (const auto& m : td->members) {
+        if (!m) continue;
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
+            if (!cd->contractClauses.empty()) return true;
+        }
+    }
+    return false;
+}
+
 // §9.2: auto-equality eligibility for a body record. The spec's membership
 // rule ("A body-only record receives auto-generated `=`, `<>`, `GetHashCode`,
 // and `ToString` over its auto-properties … when every member of the record
@@ -1712,7 +1854,7 @@ bool recordIsPositional(const TypeSymbol* rec) {
 // and was wrongly disqualifying a record for exactly the "Origin-style
 // constant" pattern §9.2 gives as the motivating example — fixed here.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
-                                     const SemaContext& ctx) {
+                                     SemaContext& ctx) {
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
     // §9.3: a record with positional fields is positional / combined form; it
     // gets the §9.1 positional synthesis, not this body-record path.
@@ -1730,7 +1872,14 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         // components and returned `true`. A body record whose auto-property is
         // class-typed then got `=` across a module boundary that §9.2 rejects
         // in a single module.
+        //
+        // §9.2 (v0.307) / fix #4643: an auto-property marked `equality skip`
+        // is removed from the auto-equality membership computation before the
+        // admissibility check — that is the clause's rescue purpose for
+        // otherwise-inadmissible auto-property storage (e.g. a class-typed
+        // cache field whose address identity must not enter auto-`=`).
         if (isAutoPropertyStorageSymbol(m, ctx)) {
+            if (memberEqualitySkip(m)) continue;
             if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
                 return false;
             continue;
@@ -1742,10 +1891,19 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
             // §9.2 v0.182: a `static` field (e.g. `static readonly`) carries no
             // instance storage and is ignored. A non-static explicit field IS
             // storage that is not an auto-property → still disqualifies.
+            //
+            // §9.2 (v0.307) / fix #4643: a non-static field marked
+            // `equality skip` is also removed from the auto-equality
+            // membership computation — that is precisely the clause's purpose
+            // (it rescues otherwise-ineligible auto-properties / fields by
+            // declaring they are not part of the equality synthesis). The
+            // static-field check above still rejects such a field as an
+            // inert annotation; the (mutable) skip arm is the rescue path.
             bool isStatic = false;
             for (auto mod : fs->modifiers)
                 if (mod == "static") { isStatic = true; break; }
             if (isStatic) continue;
+            if (memberEqualitySkip(m)) continue;
             return false;
         }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
@@ -1805,11 +1963,20 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // false-accepted `=`/`<>` on imported combined-form records whose exporter
 // already rejects them).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
-                                        const SemaContext& ctx) {
+                                        SemaContext& ctx) {
     if (!rec) return false;
     for (const Symbol* m : rec->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
             if (fs->posParam) {
+                // §9.2 (v0.307) / fix #4643: a positional field marked
+                // `equality skip` is removed from the auto-equality
+                // membership computation. The clause is the rescue path for
+                // an otherwise-inadmissible positional field — caching /
+                // auxiliary storage that the auto-`=`/`<>` synthesis would
+                // otherwise reject as a class-typed / move-only / reference
+                // component. Checked BEFORE the admissibility test below so
+                // the field's declared type is not consulted.
+                if (memberEqualitySkip(m)) continue;
                 // Positional field: type must be admissible (§9.3 → §9.2 rule).
                 if (!isAdmissibleComponentType(
                         storageComponentType(m, ctx), ctx, 0))
@@ -1939,7 +2106,7 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
 // "non-issue in practice" note from the previous revision. v0.276 widens the
 // ruling to choices; this is that widening.
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx,
+                                 SemaContext& ctx,
                                  const TypeRef* inst) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §35.4: compute the classification. classifyChoiceType returns nullopt
@@ -2044,7 +2211,7 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 // defect class (#3144/#3152 family F9's cousin — empty-source predicate
 // silently mis-answers).
 bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
-                                   const SemaContext& ctx,
+                                   SemaContext& ctx,
                                    const TypeRef* inst) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §3.6 hashable row: gate on ValueLike. Same type-ref setup as
@@ -2096,7 +2263,7 @@ bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
 // §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is hashable unless
 // it is a record that neither synthesizes equality nor declares user equality,
 // or a choice that is not value-like auto-hashable (§35.7, v0.214).
-bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
+bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
     if (!ty) return true;                              // unresolved: conservative
     // The underlying type carries the equality contract; a nullable key `K?`
     // is hashable iff `K` is (the null-safe `=` of §8.4 handles null).
@@ -2162,7 +2329,7 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
 // detail level §3.6 supports for this property. Returns empty (the caller keeps
 // the flat message) when the type is not the record/choice failure shape.
 std::string hashableFailureComponentPath(const TypeRef* ty,
-                                         const SemaContext& ctx) {
+                                         SemaContext& ctx) {
     if (!ty || ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
     const TypeSymbol* ts = ty->declaration;
     // Fragment prefix — reads naturally after the parent §14.2 citation:

@@ -232,15 +232,166 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                (t->declaration->kind == ast::TypeDeclKind::Record ||
                 t->declaration->kind == ast::TypeDeclKind::Choice);
     };
+    // fix #4301 (§9.7/§28.9, v0.298): `isRecordOrChoiceDeclared` is content-blind —
+    // it fires whenever the callee return type (or InlineArray element) is
+    // Record/Choice-declared, suppressing the caller-side release of a string
+    // argument on the basis that the record/choice's own fast-path constructor
+    // store embeds the string unretained.  That reasoning is only sound when the
+    // record/choice actually HAS a directly string-typed field.  A
+    // Record/Choice whose fields are all Class-typed (or Record/Choice-typed
+    // with no string of their own) does NOT embed the string argument via the
+    // raw fast path — the Class (or inner Record/Choice) retains it separately —
+    // and the caller-side suppression is a pure leak.
+    //
+    // This helper answers "does this Record/Choice have a field whose declared
+    // type is `string`?" by walking the declaration's positional parameters and
+    // body fields.  Record/Choice field types are always locally inspectable
+    // (the declaration is never imported separately from the method), so no
+    // `isImported` guard is needed here — unlike the Class-field walk below.
+    //
+    // fix #4254 generic-substitution (§9.7 / §28.9, v0.298): the original
+    // check looked ONLY at the declaration's bare field types, so a generic
+    // record `Box<T>(Value: T)` instantiated as `Box<string>` saw `Value: T`
+    // (an unresolved Named ref with no declaration) and answered false —
+    // `calleeReturnMayAliasStringArgUnretained` then declined the relaxation,
+    // `s` stayed armed for its own scope-end release, and
+    // `Helper.MakeInner(s: string): Box<string> return new Box<string>(s)`
+    // called as `var inner := Helper.MakeInner(s)` in a scope narrower than a
+    // later read of `inner.Value` produced a heap-use-after-free
+    // (issue 4254 PIN 2/3 — the issue's own `Box<Box<string>>` shape, measured
+    // by `narrow_scope_helper_returned_nested_generic_record_no_longer_uaf`).
+    //
+    // The substitution map is built from `t->genericArgs` (the caller-side
+    // instantiation) and the declaration's generic-param names
+    // (`sema::genericParamNames`). For each bare type-parameter field type
+    // that resolves through the map, the substituted TypeRef is consulted
+    // instead — exactly the way `isFreshRecordConstructionOfExactType`'s
+    // own `isBareTypeParamRef` arm resolves a bare component through
+    // `nty->genericArgs` (#3964, same shape).
+    //
+    // Deliberately does NOT recurse into a substituted type that is itself a
+    // Record/Choice with a string field (e.g. `Pair<Box<string>>` over a
+    // declaration `record Pair<A>(First: A)`): the `Box<string>` substitution
+    // does not enter the `Pair` walk as a nested field — its own fast-path
+    // constructor is one level DEEPER than the `Pair` constructor's raw
+    // positional store, so the raw-store UAF shape is the same there too,
+    // but admitting it here would extend this predicate beyond what is
+    // measurable for the filed repro. Filed separately, not widened here
+    // (CLAUDE.md "no while we're at it").
+    auto recordOrChoiceHasStringField =
+        [&](const sema::TypeRef* t) -> bool {
+            if (!t || t->kind != sema::TypeRef::Kind::Named ||
+                !t->declaration ||
+                (t->declaration->kind != ast::TypeDeclKind::Record &&
+                 t->declaration->kind != ast::TypeDeclKind::Choice)) {
+                return false;
+            }
+            const auto* ts = static_cast<const sema::TypeSymbol*>(t->declaration);
+            // fix #4422 / §9.7 / §28.9 (v0.300): for a generic choice,
+            // the case payload types are not yet substituted (the substitution
+            // happens at the concrete call site); a bare type parameter in a
+            // payload can never be String, so a generic choice can never have a
+            // direct string field in its payloads.  Guard mirrors
+            // choiceHasStringFields (LlvmBackend_Disposal.cpp) for consistency.
+            if (t->declaration->kind == ast::TypeDeclKind::Choice &&
+                !ts->genericParams.empty()) {
+                return false;
+            }
+            // Build the substitution map (declared param-name -> caller-side
+            // generic argument). Empty for a non-generic record or a generic
+            // record instantiated with no / mismatched genericArgs — both
+            // shape the predicate's existing no-substitution behaviour for
+            // the genericParams-empty / genericArgs-mismatch case.
+            std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+            if (!ts->genericParams.empty() && !t->genericArgs.empty()) {
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(ts);
+                for (std::size_t gi = 0;
+                     gi < gpNames.size() && gi < t->genericArgs.size(); ++gi) {
+                    subst[gpNames[gi]] = t->genericArgs[gi];
+                }
+            }
+            auto substitute = [&](const sema::TypeRef* ft) ->
+                const sema::TypeRef* {
+                if (!ft || subst.empty()) return ft;
+                // A bare type-parameter ref: Named, no declaration, single-part
+                // name. The headName lookup mirrors `recordMemberTypeResolved`'s
+                // own bare-param resolution (LlvmBackend_Layout.cpp:2437-2442).
+                if (ft->kind == sema::TypeRef::Kind::Named && !ft->declaration &&
+                    ft->genericArgs.empty() &&
+                    ft->astNode && ft->astNode->name &&
+                    ft->astNode->name->parts.size() == 1) {
+                    auto it = subst.find(ft->headName());
+                    if (it != subst.end()) return it->second;
+                }
+                return ft;
+            };
+            for (const sema::Symbol* mem : ts->members) {
+                const auto* fs = dynamic_cast<const sema::FieldSymbol*>(mem);
+                if (!fs) {
+                    // fix #4422: Choice case payloads are ChoiceCaseSymbol, not
+                    // FieldSymbol.  Walk the case's payload for string params.
+                    const auto* cc =
+                        dynamic_cast<const sema::ChoiceCaseSymbol*>(mem);
+                    if (cc && cc->caseDecl) {
+                        for (const ast::Param& pf : cc->caseDecl->payload) {
+                            if (!pf.type) continue;
+                            const sema::TypeRef* tr =
+                                substitute(ctx.resolvedType(*pf.type));
+                            if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                                tr->primitive == sema::PrimitiveType::String) {
+                                return true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Positional parameter (record positional field): type is in posParam
+                // (local) or in fieldTypes_ (imported). For imported positional
+                // fields, posParam->type is null but the type is stored in
+                // fieldTypes_ and accessed via ctx.importedMemberType(fs).
+                // Check posParam->type first (local path), then fall back to
+                // importedMemberType for the imported case.
+                if (fs->posParam) {
+                    const sema::TypeRef* tr = nullptr;
+                    if (fs->posParam->type) {
+                        tr = substitute(ctx.resolvedType(*fs->posParam->type));
+                    } else {
+                        // Imported positional field: type is in fieldTypes_
+                        tr = substitute(ctx.importedMemberType(fs));
+                    }
+                    if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                        tr->primitive == sema::PrimitiveType::String) {
+                        return true;
+                    }
+                }
+                // Body field: type is in the FieldDecl
+                // SEAM-DEBT: #4301 — record/choice with only Class-typed
+                // fields' caller-string-release predicate (cannot read the
+                // class via sema::fieldDeclTypeOf because the *whole point*
+                // is to distinguish "class-typed field" from "string-typed
+                // field", so the canonical accessor would return the same
+                // TypeRef either way — this read is the discrimination).
+                const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (!fd || !fd->type) continue;
+                const sema::TypeRef* tr = substitute(ctx.resolvedType(*fd->type));
+                if (tr && tr->kind == sema::TypeRef::Kind::Primitive &&
+                    tr->primitive == sema::PrimitiveType::String) {
+                    return true;
+                }
+            }
+            return false;
+        };
     // fix #4265 / #4280: does an INLINE-ARRAY ELEMENT type embed a plain
     // string argument via a bare per-slot store with no retain? Two proven
     // shapes: the element IS `string` (#4265), or the element is a
-    // Record/Choice whose own fast-path constructor store is the identical
-    // raw shape (#4280). Deliberately NOT "any Named" — a CLASS-typed
-    // element retains via `lowerStringFieldStore` when ITS OWN field is
-    // `string`-typed (see the walkCallArgs call site's CLASS-exclusion
-    // history for the send-back that measured the one case where that is
-    // NOT true: a class whose field is Record/Choice-typed one level in).
+    // Record/Choice with a direct string field whose constructor uses the
+    // identical raw fast path (#4280, narrowed by fix #4301).  Deliberately
+    // NOT "any Named" — a CLASS-typed element retains via
+    // `lowerStringFieldStore` when ITS OWN field is `string`-typed (see the
+    // walkCallArgs call site's CLASS-exclusion history for the send-back that
+    // measured the one case where that is NOT true: a class whose field is
+    // Record/Choice-typed one level in).
     auto elementMayEmbedStringArgUnretained =
         [&](const sema::TypeRef* elem) {
             if (!elem) return false;
@@ -248,9 +399,16 @@ inline bool calleeReturnMayAliasStringArgUnretained(
                 elem->primitive == sema::PrimitiveType::String) {
                 return true;
             }
-            return isRecordOrChoiceDeclared(elem);
+            return isRecordOrChoiceDeclared(elem) &&
+                   recordOrChoiceHasStringField(elem);
         };
-    if (isRecordOrChoiceDeclared(crt)) return true;
+    // fix #4301: only suppress when the Record/Choice actually has a direct
+    // string field — a Record/Choice whose fields are all Class-typed (or
+    // Record/Choice-typed with no string of their own) does NOT embed the
+    // string via the raw fast path.
+    if (isRecordOrChoiceDeclared(crt) && recordOrChoiceHasStringField(crt)) {
+        return true;
+    }
     // fix #4300 (§9.7/§28.3, v0.298): the top-level arm above correctly
     // suppresses the caller-side release when the callee return type IS
     // Record/Choice-declared, and `elementMayEmbedStringArgUnretained` (applied
@@ -453,7 +611,20 @@ public:
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
           builder_(llvmCtx),
           checkedDisposal_(opts.checkedDisposal),
-          isMainModule_(opts.isMainModule) {}
+          checkedContracts_(opts.checkedContracts),
+          isMainModule_(opts.isMainModule) {
+        // fix #4593 (spec §7.2, stdlib §2.6 / §4.4 / §9.8, v0.306): stamp the host
+        // DataLayout BEFORE a single type is lowered. A fresh llvm::Module
+        // carries the EMPTY DataLayout, in which `i64` has a 4-byte ABI
+        // alignment; x86-64 gives it 8. Every `module_->getDataLayout()
+        // .getTypeAllocSize(T)` below — `collectionElemSize`, `lazyElemSize`,
+        // the dictionary entry stride, the async/iterator frame size, the box
+        // payload size — is handed to the runtime as a memcpy byte count for
+        // storage the BACKEND lays out with the host layout, so any aggregate
+        // whose padding depends on an i64 member was measured short. See
+        // setHostTargetLayout's comment in LlvmBackend.hpp for the full story.
+        setHostTargetLayout(*module_);
+    }
 
     std::unique_ptr<llvm::Module> run() {
         // CG8: build every class's instance layout first (so field
@@ -638,6 +809,10 @@ public:
             }
         }
         emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
+        // fix #4933 (§11.2 / §14.1, v0.307): after every method body exists and
+        // with no caller substitution active, re-point the erased itable slots
+        // of a non-generic class over a concrete generic base.
+        patchConcreteDerivedGenericBaseItables();
         {
             std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
                 sorted(ctorFns_.begin(), ctorFns_.end());
@@ -704,6 +879,14 @@ public:
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (ts && initFns_.count(ts)) emitInstanceInitFunction(ts);
         }
+        // fix #4597 (§22.16, v0.306): lower the §22.16 unchecked faces every
+        // loop above minted at its `this`-receiver call sites. Here, and not
+        // inside the methodFns_ loop, because a face is minted DURING a body's
+        // lowering (so the loop's own iteration is already in flight) and
+        // because a ctor, disposer or init body's `this`-receiver call mints
+        // one too. Before finalizeVtableTable() for the reason stated there —
+        // every body must be lowered before allVtables_ is closed.
+        emitPendingUncheckedFaces();
         // #1843 / §8.6 #417: now that every method/ctor/disposer/init body has
         // been lowered, allVtables_ holds every vtable an object can carry —
         // including the per-monomorphization vt$C$specN created lazily above.
@@ -761,6 +944,12 @@ private:
     // disposed-flag test on every instance-member entry; emitDisposeAndReclaim
     // suppresses the heap-free (quarantine) so the flag remains readable.
     bool checkedDisposal_ = false;
+    // §22.16 / issue #4386: in checked-contracts mode the `ensures` epilogue
+    // (armEnsuresEpilogue) and the `invariant` check (emitInvariantCheck) emit
+    // the clause-evaluation call. In unchecked (release) mode — the default —
+    // both are no-ops at codegen, so `ensures`/`invariant` clauses are pure
+    // (never evaluated). `requires` is always-on regardless of this bit.
+    bool checkedContracts_ = false;
     // per §33.1/§2.4/§33.6 (#1563): true when this compilation unit is the
     // executable's main module, so a qualifying `Main` (§33.2) is lowered as
     // the native process entry point. False for a library (`-c`) build — see
@@ -777,6 +966,17 @@ private:
     // (a synthesized Serialize FUNCTION would be required to support it).
     std::unordered_set<const sema::TypeSymbol*> serializeEmitStack_;
     std::unordered_set<const sema::TypeSymbol*> deserializeEmitStack_;
+    // fix #4865 / §17.14 / §22.12 (v0.307): the class-level `const` members
+    // whose initializer is currently being lowered. `constMemberValue` calls
+    // `lowerExpr(*cd->value)`, which for a bare-identifier or qualified const
+    // reference re-resolves to that const's own AST decl and re-enters
+    // `constMemberValue`. A self/mutually-referential cycle recurses
+    // unboundedly and overflows the process stack (SIGSEGV, codegen). Sema's
+    // `checkConstInitCycles` rejects the cycle with a diagnostic; this set is
+    // the defensive backstop — a re-entry on a symbol already in the set
+    // returns null rather than recursing, so a future fold change that reopens
+    // a cycle in sema cannot reintroduce the crash.
+    std::unordered_set<const sema::ConstMemberSymbol*> constMemberLoweringStack_;
     // fix #3140 follow-up (§9.8): the type whose synthesized Serialize /
     // Deserialize is currently being emitted, so `emitSerializeField` /
     // `emitDeserializeField` — which take a bare `TypeRef` and have no
@@ -956,6 +1156,17 @@ private:
     // routed to the class disposal the explicit `.Dispose()` path already takes.
     // Keyed by the decl ast::Node* (module-lifetime — no clearing).
     std::unordered_set<const ast::Node*> iterFormatWrappedDecls_;
+    // fix #4794 (§28.8.1 / §28.3 / §29.1, stdlib §4.13, v0.307): the decl
+    // nodes whose local `registerIterableSourceDisposal` CLAIMED — a plain
+    // `var`/`const` holding a freshly produced iterator-format source that
+    // this scope disposes (null-guarded slot-1 Dispose) at its end. A `move`
+    // of such a local transfers that frame to its new owner, so the `move`
+    // lowering (LlvmBackend_Exprs2.cpp) nulls the slot and the claim reloads
+    // null and skips. Without it `var view := Gen(); Take(move view);` into
+    // an `owned` parameter the callee disposes was a heap-use-after-free in
+    // the caller. Keyed by the decl ast::Node* (module-lifetime — no
+    // clearing, like iterFormatWrappedDecls_).
+    std::unordered_set<const ast::Node*> iterableSourceClaimedDecls_;
     // fix #3419 (§29.2 / §23.2 / §23.4 / §28.6, v0.283): the PROPERTY/INDEXER
     // READ face's half of the same self-report. `iterFormatWrappedDecls_` cannot
     // cover it: `preIterWrap` is captured AFTER `lowerExpr(*init)` has run, so a
@@ -981,13 +1192,17 @@ private:
     // was never minted is a double-free — strictly worse than the leak this
     // closes. CLAIM = MINT by construction, per #3384's shape.
     std::unordered_set<const ast::Node*> propReadIterWrappedExprs_;
-    // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
-    // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
-    // (the variable's original storage slot).  After boxing, the original
-    // slot is kept in sync on every write so that pre-emitted code (e.g.
-    // a while-loop condition lowered before the body) that loads from the
-    // original alloca sees the updated value.  NOT populated for for-var
-    // loop variables (their incBB manages the original slot directly).
+    // §27.5 / #673: for boxed NON-FOR-VAR locals, maps each cell-holder alloca
+    // (newSlot) to the ORIGINAL pre-boxing alloca (the variable's original
+    // storage slot).  After boxing, the original slot is kept in sync on every
+    // write so that pre-emitted code (e.g. a while-loop condition lowered
+    // before the body) that loads from the original alloca sees the updated
+    // value.  NOT populated for for-var loop variables (their incBB manages
+    // the original slot directly — see boxLocalSlot's fresh-path note).
+    // Populated on BOTH of boxLocalSlot's strategies: the guarded one since
+    // #673, the fresh-each-iteration one since `fix #4612`, which needs the
+    // entry so #3484's exposed-read repair covers a local declared inside a
+    // loop body.
     // Part of the saved/restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::AllocaInst*> cellVarSyncSlot_;
 
@@ -1100,6 +1315,25 @@ private:
         // rebound to the cell holder). Measured on the pre-fix compiler as a
         // SIGSEGV at address 0, not a leak. See consumeLastLambdaCapturedCells.
         bool isParam = false;
+        // fix #4261 (§28.3, v0.298): disposeStack_.size() at the time this
+        // entry was pushed. consumeLastLambdaCapturedCells drains only entries
+        // with pushScopeDepth >= the current disposeStack_.size(), so entries
+        // pushed at a SHALLOWER scope (belonging to an outer lambda) are
+        // PRESERVED and remain for that outer lambda's later consume call.
+        std::size_t pushScopeDepth = 0;
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): true when `key` is a
+        // string-keyed `DictionaryEntry<string,V>` local captured by a
+        // NON-ESCAPING closure. Parallel sibling of #4127 (escaping capture,
+        // envdtor path, freeCellInEnvdtor-gated) and #4135 (DrainedEntry
+        // non-escaping capture). At scope-end (this entry's boxedCellFree arm)
+        // emit the same GEP field 0 + bz_string_release before the cell free;
+        // see `dictEntryKeyReleaseDeferred`'s declaration on Disposal for the
+        // full argument and emission site. Set ONLY for a LocalDecl (params
+        // are never a DictionaryEntry type — they would be a captured
+        // DictionaryEntry local, not a parameter). Compute the type once at
+        // the registration site in lowerLambda; consumeLastLambdaCapturedCells
+        // propagates this flag to the Disposal it builds.
+        bool dictEntryKeyReleaseDeferred = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
@@ -1112,6 +1346,90 @@ private:
     // LastCellEntry::isParam (fix #3403) carries the same fact without needing a
     // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
+    // fix #4523 (§27.5 / §28.9, v0.306): the FUNCTION each `declScopeDepth_`
+    // entry is a depth INTO. `declScopeDepth_` is module-wide and never cleared,
+    // while `disposeStack_` is cleared per body (lowerLambda, every async resume
+    // / iterator moveNext / thunk prolog). A depth recorded while lowering one
+    // body is therefore meaningless as an index into another body's
+    // `disposeStack_`, and nothing in the map itself says which body it came
+    // from. Any consumer that INDEXES `disposeStack_` with a depth from here
+    // must first check this map against `currentFn_`; consumers that only
+    // COMPARE depths within the current body (#969's nested-scope guard) do not.
+    // Written only through `recordDeclScopeDepth`, so the two maps cannot drift.
+    std::unordered_map<const void*, llvm::Function*> declScopeDepthFn_;
+    // fix #4523: record a local's declaring scope depth TOGETHER with the body
+    // that depth indexes. Every `declScopeDepth_` write goes through here — the
+    // pairing is the invariant, and a site that set one without the other would
+    // reintroduce exactly the cross-body mis-indexing this fixes.
+    void recordDeclScopeDepth(const void* declNode) {
+        declScopeDepth_[declNode]   = disposeStack_.size();
+        declScopeDepthFn_[declNode] = currentFn_;
+    }
+    // fix #4526 (§27.5 / §28.3 / §28.9, v0.306): the ONE sanctioned way to
+    // turn a recorded declaration depth into a `disposeStack_` INDEX. #4523
+    // proved the hazard is reachable rather than theoretical and closed the
+    // single site it was filed for with an inline conjunct; two siblings
+    // still indexed by a bare depth. Making the check and the index ONE
+    // operation is what stops the next site from forgetting it — the index is
+    // simply not obtainable without the proof.
+    //
+    // Returns false, leaving `idxOut` untouched, when no depth was recorded,
+    // when it was recorded while lowering a DIFFERENT body, or when it is out
+    // of range for the stack being held right now. Every caller's false
+    // branch must be the conservative one (register nothing), which costs a
+    // bounded leak; the alternative reading is a use-after-free.
+    //
+    // NOT for depth COMPARISONS. #969's `declaredShallower` test — "does this
+    // capture's local live in an ENCLOSING scope?" — only compares two
+    // depths, which `declScopeDepthFn_`'s declaration above documents as safe
+    // as it stands; routing it through here would change its meaning rather
+    // than tighten it.
+    bool declScopeDisposeIndex(const void* declNode,
+                               std::size_t& idxOut) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        if (fnIt == declScopeDepthFn_.end() || fnIt->second != currentFn_)
+            return false;
+        auto it = declScopeDepth_.find(declNode);
+        if (it == declScopeDepth_.end()) return false;
+        if (it->second < 1 || it->second > disposeStack_.size()) return false;
+        idxOut = it->second - 1;
+        return true;
+    }
+    // fix #4526: was this local's depth recorded while lowering a DIFFERENT
+    // body? Deliberately distinct from `!declScopeDisposeIndex(...)`, which is
+    // also true for "never recorded" and "out of range": a consumer whose
+    // pre-existing fallback for an UNRECORDED local is sound must keep it and
+    // refuse only when the recorded depth positively belongs to another
+    // frame — because for such a local no scope of THIS body is a correct
+    // place to dispose it, not even the innermost one.
+    bool declScopeDepthFromOtherFn(const void* declNode) const {
+        auto fnIt = declScopeDepthFn_.find(declNode);
+        return fnIt != declScopeDepthFn_.end() && fnIt->second != currentFn_;
+    }
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's per-DECL decision, made once
+    // and obeyed everywhere.
+    //
+    //   * `refcountedCellDecls_` — this local's capture cell is refcounted, so
+    //     EVERY env that stores its cell pointer must announce itself with
+    //     `bz_cell_retain` and drop it in its envdtor, whichever body builds
+    //     that env. The retain/envdtor-release pair is self-balancing and needs
+    //     no `disposeStack_` registration, so a holder in a NON-declaring body
+    //     joins the protocol instead of being declined out of it (the #4509
+    //     regression: a declined nested holder read through a cell the frame
+    //     had already released).
+    //   * `cellRefcountDeclined_` — a capture site in the declaring body looked
+    //     at this local and refused. STICKY: a later sibling lambda must not
+    //     arm a cell an earlier sibling's env is already holding uncounted.
+    //
+    // Both are keyed by the LocalDecl AST node because refcounted-ness is a
+    // property of the CELL, not of any one capturing lambda. The decision is
+    // always taken in the declaring body: a capture of a local can only appear
+    // in a lambda lexically inside that local's scope, and the outermost such
+    // lambda's capture loop runs while that body is being lowered — before any
+    // lambda nested within it. The locals capture loop in `lowerLambda` has no
+    // early `continue`, so every captured local reaches the decision.
+    std::unordered_set<const void*> refcountedCellDecls_;
+    std::unordered_set<const void*> cellRefcountDeclined_;
     // CG6: emitted LLVM function for each static method symbol.
     // fix #3550 (§23.3 / §23.4 / §30.5 / §28.4, v0.286): MapVector, NOT
     // unordered_map. The NestedBodyScope comment (LlvmBackend_Assign.cpp ~4665)
@@ -1219,6 +1537,13 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initStateGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initOwnerGV_;
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initProgressGV_;
+    // fix #4486 (§22.13, v0.306): initEpoch snapshots, at this type's own
+    // CAS-win, the POST-bump value of the thread-local monotonic
+    // `bz_static_init_epoch` (bezel_runtime_concurrency.cpp) — see that
+    // global's own comment for the full same-type-vs-cross-type rationale.
+    // emitStaticPartialReadGuard compares the CURRENT epoch against this
+    // snapshot to classify a same-thread partial-state touch.
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initEpochGV_;
     // Per-type sfinit / cctor functions, indexed for ensureinit emission. Built
     // from staticCtors_ in declareStaticInitializers.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
@@ -1859,6 +2184,45 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #4509 (§27.5 / §28.9, v0.306): drop the DECLARING FRAME's
+        // reference to a REFCOUNTED capture cell (`bz_cell_release`), rather
+        // than free it outright. Registered once per cell holder, in the scope
+        // that declared the captured local, for exactly the cells no static
+        // route can name a free site for — one whose capturers include a
+        // conservatively-escaping lambda (see `CaptureEntry::retainCellInEnv`).
+        // Emitted in the #1017 SECOND PASS beside `boxedCellFreeDeferred`, and
+        // for the same reason: it must run AFTER every reads-through-cell
+        // disposal in the scope. It differs from that flag in what it emits and
+        // in what it proves — `boxedCellFreeDeferred` is a free that a static
+        // proof licensed, this is a release whose safety the RUNTIME count
+        // establishes, so it is correct even when an env outlives the frame.
+        // Mutually exclusive with `boxedCellFree` / `boxedCellFreeDeferred`:
+        // those arm only where no escaping capturer exists, this only where one
+        // does. Reads nothing through the cell, so it is in the
+        // `consumeLastLambdaCapturedCells` / LlvmBackend_Stmts.cpp exclusion
+        // lists beside them.
+        bool cellRelease = false;
+        // fix #4165 (§27.5/§28.9, stdlib §4.8, v0.295): parallel to
+        // `dictEntryKeyRelease` (LlvmBackend_Setup.cpp) but for a
+        // string-keyed `DictionaryEntry<string,V>` local captured by a
+        // NON-ESCAPING closure (one whose sole capturing closure is proven
+        // non-escaping by cellFreeEligible_ and is therefore registered for
+        // deferred cell-free via `boxedCellFreeDeferred`, above). The local
+        // was NOT registered in `dictEntryKeyReleaseEligible_` by the
+        // isFreshDictEntryKeyReleaseTerminalLocal walk (StringEscapeWalker
+        // treats ANY closure capture as an escape, per that predicate's own
+        // documented trade-off), so the normal-scope `dictEntryKeyRelease`
+        // disposal never fires. This flag is set alongside `boxedCellFreeDeferred`
+        // on the SAME Disposal entry (same slot, same owner-scope depth, same
+        // deferred dedup); in the SECOND PASS (LlvmBackend_Disposal.cpp's
+        // boxedCellFreeDeferred block), the key release is emitted before the
+        // cell free — identical GEP field 0 + bz_string_release as
+        // dictEntryKeyRelease, identical safety case: exactly one holder
+        // (singleCaptureLocals_), the value is provably dead by second-pass
+        // time (all env refs released, all owner reads-through-cell disposals
+        // complete), no UAF or double-free. Fires on BOTH normal and unwind
+        // exits, symmetrically with `dictEntryKeyRelease` itself.
+        bool dictEntryKeyReleaseDeferred = false;
         // fix #3752 (§28.2 / §27.5 / §28.9, v0.286): the CONTENT analogue of
         // `boxedCellFreeDeferred`. A runtime-managed (`string` / function-typed)
         // local captured from a STRICTLY DEEPER scope keeps its single +1 in the
@@ -1998,6 +2362,10 @@ private:
         bool dictEntryForSnapshot = false;
         llvm::AllocaInst* dictEntryForKeysOutSlot = nullptr;  // ptr* (char**/void**)
         llvm::AllocaInst* dictEntryForLensOutSlot = nullptr;  // ptr* (i64*); null unless string key
+        // fix #4499: the snapshot's THIRD spine (int8_t* of per-key §4.6
+        // storage widths), malloc'd by bz_dict_keys_str beside keys and lens
+        // and freed on exactly the same paths. Null unless string key.
+        llvm::AllocaInst* dictEntryForWidsOutSlot = nullptr;  // ptr* (i8*)
         llvm::AllocaInst* dictEntryForValsOutSlot = nullptr;  // ptr* (void**)
         llvm::AllocaInst* dictEntryForCntSlot     = nullptr;  // i64* — snapshot count
         llvm::AllocaInst* dictEntryForIdxSlot     = nullptr;  // i64* — current cursor
@@ -2112,6 +2480,12 @@ private:
     // ROOT scope (the first scope it pushes) so they are auto-disposed on an
     // exception unwind out of the whole method. Cleared once registered.
     std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
+    // fix #4239 (§27.5 / §28.9, v0.300): a chained call `var w := C.Make()()`
+    // in lowerLocalDecl — lowerExpr (CG60 arm) needs to store the closure-call
+    // result through the local's OWN slot (not a temp), and register disposal on
+    // that slot. Capture the slot BEFORE lowerExpr runs so the CG60 arm can use
+    // it; cleared after the CG60 arm consumes it.
+    llvm::AllocaInst* pendingChainCallLocalSlot_ = nullptr;
     // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
     // array is built in the function prolog (before any scope opens) and must be
     // disposed at the function-body root scope exit.  This optional Disposal is
@@ -2407,6 +2781,61 @@ private:
     // exception propagates out of them (§28.3). 0 = dispose all (the
     // function propagate path).
     std::size_t unwindScopeDepth_ = 0;
+    // fix #1878 + #1882 (§28.4, v0.306): how many disposal emissions that can
+    // run USER code have been emitted so far in this module. Read only as a
+    // difference across a disposal pass, so its absolute value is meaningless
+    // and it never needs resetting per function. emitDisposals uses it to gate
+    // §28.4's propagate-from-the-disposal-point check, which would otherwise
+    // duplicate the enclosing scopes' unwind disposals at EVERY scope end.
+    //
+    // Counted: a vtable `Dispose` dispatch through `emitDynamicDispose`, and an
+    // owning container's element cascade whose per-element callback is
+    // `elementDisposerThunk()` (see elementDisposerRunsUserCode).
+    //
+    // ⚠ THIS IS A SOUND UNDERCOUNT, NOT AN EXACT CLASSIFICATION. Do not read it
+    // as "every route to a user destructor is counted" — an earlier revision of
+    // this comment said exactly that and it was false. Measured routes that do
+    // reach a user destructor and are NOT counted:
+    //
+    //   * `nestedCollectionDisposerThunk` — an `OwningArray<OwningArray<R>>`
+    //     cascades into the inner collection, and from there into `R`'s
+    //     destructor, without ever being `elementDisposerThunk()`.
+    //   * `sharedReleaseThunk` / `weakReleaseThunk` — `bz_shared_release` calls
+    //     the control block's `dispose_value`, which IS the element's vtable
+    //     `Dispose`. (An earlier revision of this comment listed the
+    //     Shared/Weak handle among the callbacks that "cannot reach user code";
+    //     that was wrong.)
+    //   * `tcsElementDisposerThunk`, and the `taskOwnedResultDisposer` arm.
+    //   * the iterator/enumerator-frame arm in emitDisposals, which dispatches
+    //     vtable slot 1 directly rather than through `emitDynamicDispose` — so
+    //     "the single funnel" is not literally true either.
+    //
+    // An uncounted route is not a regression and not a hazard: the gate simply
+    // does not fire, and the fault keeps BASE behaviour (it stays in the bz_exc
+    // slot for a later pending check) rather than being routed from its own
+    // disposal point. Those are pre-existing §28.4 gaps that neither #1878 nor
+    // #1882 names, tracked separately. Anything ADDED here must keep that
+    // direction: counting too little degrades to base, counting too much only
+    // costs a dead check.
+    unsigned userCodeDisposalCount_ = 0;
+
+    // fix #1878 (§28.4, v0.306): does this per-element / per-value disposer
+    // callback dispatch the element's own vtable `Dispose` DIRECTLY? Exactly
+    // one thunk does — `elementDisposerThunk()`, §28.4's "the owning
+    // container's cascade" in its plain form. The container arms use this to
+    // trip the propagate gate, because such a cascade reaches the element's
+    // destructor through a runtime loop rather than through emitDynamicDispose.
+    //
+    // ⚠ A `false` here does NOT mean "cannot reach user code": the nested-
+    // collection thunk and the `Shared`/`Weak` release thunks reach a user
+    // destructor by a longer path and answer false. See
+    // `userCodeDisposalCount_` for the full enumeration and for why
+    // undercounting is the safe direction.
+    bool elementDisposerRunsUserCode(const llvm::Value* disposer) const {
+        return disposer != nullptr && elementDisposerThunk_ != nullptr &&
+               disposer == static_cast<const llvm::Value*>(
+                               elementDisposerThunk_);
+    }
     // CG22: per-built-in-exception-type descriptor and vtable globals
     // (§31.4 hierarchy), keyed by type name (built-in exception types have
     // no user TypeSymbol). A shared no-op Dispose serves all of them.
@@ -2497,6 +2926,35 @@ private:
     // node).  Used in identifier lookup to supply the missing sema type so that
     // string subscript, member access, etc. work on inferred-type params.
     std::unordered_map<const sema::Symbol*, sema::TypeRef*> lambdaParamTypeHint_;
+    // fix #4813 (§14.1 / §14.5, v0.307): every expression whose sema type
+    // was INJECTED from lambdaParamTypeHint_ (the three `if (!exprType) …
+    // setExprType(hint)` sites). The hint is resolved through the ACTIVE
+    // monomorphization, so the injected type is only valid for the current
+    // specialization; lowerLambda clears the entries it recorded on exit so
+    // the next specialization of the same lambda AST re-derives them instead
+    // of reading the first specialization's type (`Go<long>` then
+    // `Go<string>` over `Map(v, lambda(y) => $"<{y}>")` printed an address).
+    std::vector<const ast::Expr*> lambdaHintInjectedExprs_;
+    // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): the CALLEE's own method
+    // type-parameter bindings for the call whose `buildOrderedArgs` is running
+    // over `calleeFormalSubstParams_`. A collection-literal argument has no
+    // type of its own (§15.4: it is typed by the parameter), so it is built
+    // against the FORMAL `Array<T>` — and that `T` is the callee's, which the
+    // active (caller's) maps do not bind, or bind to the caller's same-named
+    // `T`. Set by lowerCallDispatch; read only when `params` is that callee's.
+    const std::vector<ast::Param>* calleeFormalSubstParams_ = nullptr;
+    std::unordered_map<std::string_view, const sema::TypeRef*>
+        calleeFormalSemaSubst_;
+    // fix #5041 (§14.1 / §14.5, v0.307): the callee whose lambda pre-pass is
+    // active in lowerCallDispatch — its formals and the names of its OWN
+    // method type parameters (owner-type names excluded). lowerLambda resolves
+    // a bare type-parameter return of expectedFunctionType_ through the active
+    // substitution ONLY when that formal is one of these params and the name
+    // is one of these type parameters; otherwise a same-named binding of the
+    // ENCLOSING generic method (`Go<T>` calling `Box<string>.Apply(v, f: (T)
+    // -> T)`) would be taken for the callee's. Saved/restored per call.
+    const std::vector<ast::Param>* lambdaCalleeOwnParams_ = nullptr;
+    std::unordered_set<std::string_view> lambdaCalleeOwnTParams_;
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
@@ -3489,6 +3947,28 @@ private:
         return false;
     }
 
+    // §9.2 "The `equality skip` clause" (v0.307) / fix #4643, cross-module
+    // follow-up: true when the record-storage member is removed from the
+    // auto-equality membership computation. Used by
+    // `collectRecordStorageForEquality` (and by `emitStructEquality` /
+    // `emitRecordHashCode`, which walk the FULL layout and need to know which
+    // physical slots to step over) to drop the member from the synthesized
+    // `=`/`<>`/`GetHashCode` while leaving it laid out — so reads, `with`,
+    // ToString and serialization still see it.
+    //
+    // Delegates to the ONE sema predicate (umbrella #3152). The first spelling
+    // of this helper recovered the clause by casting `Symbol::decl` to a
+    // PropertyDecl / FieldDecl, and for a positional field by index arithmetic
+    // back through `parent->decl`'s `positionalFields` — all three null for an
+    // IMPORTED member, so an imported record's skipped component was compared
+    // and hashed at the import while the exporter's own module excluded it
+    // (measured: `True` in-module, `False` across the boundary, on both `=`
+    // and `GetHashCode`). `sema::memberEqualitySkip` reads the symbol bit both
+    // collectors fill, so the two sides answer from one source.
+    static bool memberHasEqualitySkip(const sema::Symbol* m) {
+        return sema::memberEqualitySkip(m);
+    }
+
     // CG17: a method participates in virtual dispatch if it is `virtual`,
     // `override`, or `abstract` (all imply a vtable slot; §12.1/§12.5).
     static bool isVirtual(const sema::MethodSymbol* ms) {
@@ -3778,12 +4258,27 @@ private:
     // IndexOf, Contains, SequenceEqual, Length/IsEmpty, for-in); the owning
     // class-T behaviour (disposing set, `move`, Clear/MoveFrom/MoveTo) is gated
     // separately on isOwningSpanTypeName.
+    //
+    // fix #4583 (§27.8, v0.306): a type alias (`type Al := ArraySpan<int>`)
+    // resolves TRANSPARENTLY by copying the underlying TypeRef and then
+    // RESTORING astNode to the USE SITE (the alias name), so a raw
+    // `astNode->name->parts[0]` read here answered the ALIAS name ("Al"),
+    // never matched, and every member access on an alias-typed span local
+    // fell through to the generic path and failed to lower (ICE: "internal:
+    // return-value expression failed to lower to a value"). `headName()`
+    // (TypeRef.hpp) is documented as "the ONE read every builtin-collection/
+    // wrapper identity check should use instead of astNode->name->parts[0]"
+    // for exactly this reason — it prefers `aliasResolvedHead` (the
+    // underlying head, set at alias resolution) and falls back to the
+    // existing astNode/importedName reads otherwise, so a non-alias ref is
+    // unaffected. Same class of read fix #4570 applied one layer up, in sema's
+    // namedTypeSimpleName.
     static bool isSpanLikeTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
             return false;
-        auto n = rt->astNode->name->parts[0];
+        auto n = rt->headName();
         return n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
                n == "Span" || n == "ReadOnlySpan";
     }
@@ -3792,6 +4287,22 @@ private:
     // interface — a span boxed into { vtable, rc, bz.arrayspan } (arrayspan at
     // box+16). Recognised by the IReadOnlySpan TypeSymbol declaration or, for a
     // not-yet-resolved ref, the leading name part.
+    //
+    // #4583 investigation: this predicate's astNode-head leg has the SAME
+    // `astNode->name->parts[0]` shape as isSpanLikeTypeName/isOwningSpanTypeName
+    // below, but — unlike ArraySpan/Span, which are pure syntactic builtins
+    // with no TypeSymbol — IReadOnlySpan IS backed by a real TypeSymbol, so
+    // `ref = *underlying` (§27.8 alias resolution, TypeResolution_Names.cpp)
+    // copies `declaration` too and the FIRST branch above already answers
+    // correctly for an alias (`type Al := IReadOnlySpan<int>`); MEASURED via
+    // both a `for`-in loop (LlvmBackend_Stmts.cpp) and the boxed-SequenceEqual-
+    // argument path (LlvmBackend_Calls3.cpp), both alias-typed, both correct
+    // pre-fix. The astNode leg below is therefore reached only when
+    // `declaration` is null (the "not-yet-resolved ref" the comment above
+    // names), a shape no surface alias program was found to produce — left
+    // as `astNode->name->parts[0]` rather than switched to `headName()`,
+    // since a change with no FAIL-WITHOUT repro is not a provable fix (see
+    // #4583's discussion of this exact predicate).
     static bool isIReadOnlySpanType(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         if (rt->declaration && rt->declaration->name == "IReadOnlySpan")
@@ -3806,12 +4317,15 @@ private:
     // §4.14 (#779): test whether a TypeRef is the OWNING `Span<T>` over an
     // OwningBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
     // is a read-only view (no set/move/clear), so it is NOT matched here.
+    //
+    // fix #4583 (§27.8, v0.306): same alias-blind read as isSpanLikeTypeName
+    // above — see that comment.
     static bool isOwningSpanTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
             return false;
-        return rt->astNode->name->parts[0] == "Span";
+        return rt->headName() == "Span";
     }
 
     // §4.15: extract the `Source` array pointer (field 0) from a lowered span struct value.
@@ -3962,19 +4476,25 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
-    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544): the closure-cell heap layout —
+    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544) / #4475 (§28.2): the
+    // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
-    //     i64 kind (off 32) }
-    //   = 40 bytes.
+    //     i64 kind (off 32), i8 disposed (off 40) }
+    //   = 48 bytes (LLVM may pad the tail to 8-byte alignment = 48 bytes).
     // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
     // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
     // unchanged; envdtor (field index 3, off 24) is the #672 typed env-disposer;
-    // kind (field index 4, off 32) is NEW (#1544): a FnValKind tag recording which
-    // §27.7.1 equality rule the value obeys, consulted only by
-    // bz_closure_value_equals / bz_closure_same (never by retain/release). The
-    // values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_* constants.
+    // kind (field index 4, off 32) is the §27.7.1 FnValKind tag, consulted only
+    // by bz_closure_value_equals / bz_closure_same (never by retain/release).
+    // The values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_*
+    // constants. disposed (field index 5, off 40, #4475) is the §28.2
+    // use-after-dispose flag: 0 by default (calloc zero-fill), set to 1 by
+    // bz_closure_mark_disposed on an explicit `c.Dispose()` (codegen only,
+    // under --checked-disposal), read at the closure-invoke guard site.
     // Every closure-cell producer calloc's this size and stores rc := 1,
-    // envdtor := null, and kind := the producer-appropriate FnValKind.
+    // envdtor := null, kind := the producer-appropriate FnValKind, and
+    // disposed := 0 (calloc zero-fill; explicit initClosureDisposed() is
+    // provided as documentation).
     enum FnValKind : int64_t {
         // Lambda or value-shaped-receiver (record/enum/primitive) ref: equals
         // only itself (reference identity on the cell). §27.7.1 first & third.
@@ -3988,7 +4508,10 @@ private:
     llvm::StructType* closureCellType() {
         if (!closureCellTy_)
             closureCellTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy(), i64()}, "bz.closure");
+                llvm_,
+                {ptrTy(), ptrTy(), i64(), ptrTy(), i64(),
+                 llvm::Type::getInt8Ty(llvm_)},
+                "bz.closure");
         return closureCellTy_;
     }
 
@@ -4476,16 +4999,19 @@ private:
     // type is a Choice, so a record can hold a choice component and the
     // synthesized Equals/GetHashCode remains consistent.
     llvm::Value* emitChoiceEquality(llvm::Value* l, llvm::Value* r,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     llvm::Value* emitChoiceHashCode(llvm::Value* val,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     // §35.7 (#2479): "TypeName.CaseName(field1: value1, …)" / "TypeName.
     // CaseName" over the choice struct's active case, mirroring
     // emitChoiceEquality/emitChoiceHashCode's tag-switch shape. Callers must
     // confirm auto-hashable (sema::isAutoEqualityBearingChoice)
     // first — this function does not re-check it.
     llvm::Value* emitChoiceToString(llvm::Value* val,
-                                    const sema::TypeSymbol* choiceTy);
+                                    const sema::TypeSymbol* choiceTy,
+                                    const sema::TypeRef* instTy = nullptr);
     // fix #2661 (spec §8.5, v0.252): the §8.5 POSITIONAL-RECORD default for the
     // standard library's span records — "The defaults above are generated for
     // **every** type of the applicable kind, wherever declared — user modules
@@ -4709,7 +5235,16 @@ private:
     // CG31: the address (and element type) of an assignable target — a
     // local/parameter slot, a static-field global, a `this.f`/`obj.f`
     // field, or a bare implicit-`this` field. Null if not assignable.
-    llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy);
+    //
+    // fix #4646 (§22.16, v0.307): `outRecvPtr`, when non-null, forwards
+    // `fieldAddr`'s existing #1039 out-parameter — the lowered class-instance
+    // receiver pointer for an `obj.f` target. It exists so the §22.16
+    // auto-property store boundary can name the receiver it must evaluate the
+    // invariant over WITHOUT lowering the receiver expression a second time
+    // (which would duplicate its side effects). Defaulted to null, so every
+    // pre-existing caller is unchanged.
+    llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy,
+                            llvm::Value** outRecvPtr = nullptr);
 
     // CG31: apply a compound-assignment/increment arithmetic or bitwise
     // operator (op without the trailing `=`). Integer `+ - *` and `/ mod`
@@ -5000,6 +5535,14 @@ private:
     //   down, at the element, which is why the top-level
     //   `entryAlloca`/`bindParameters` guards never caught `[N]()` on their
     //   own.
+    //   `fillOmittedParamDefaults`' `default(T)` arm (LlvmBackend_Assign.cpp,
+    //   fix #4665) — the OMITTED-argument default for a unit-typed parameter.
+    //   That arm deliberately lowers the PARAMETER's own annotation rather
+    //   than the `DefaultExpr`'s inner type (#1163), so it inherits the same
+    //   `void` and fed it to `Constant::getNullValue`, whose
+    //   `llvm_unreachable` is a `ud2` here. It is a storage-shaped position
+    //   for the usual reason: `lowerParamType` already put the placeholder
+    //   byte in the callee's signature, so the caller owes that byte.
     //
     // The four #3537 sites are ONE decision at four faces, not four decisions:
     // the element type becomes the frame's `current_val` field, `Current`'s
@@ -5127,7 +5670,26 @@ private:
     // inline-array literal initializer — store a properly-tagged value rather
     // than the raw inner bytes (which clobber the hasValue byte). Returns `v`
     // unchanged when the slot is not a nullable-value struct or `v` is already it.
-    llvm::Value* coerceToNullableSlot(llvm::Type* elemTy, llvm::Value* v) {
+    //
+    // fix #5005 (§5.1 "Nullable conversions" — `S` converts to `T?` via
+    // `S → T → T?` — v0.307): a NARROWER numeric `v` (e.g. an `int` at an
+    // inline `[N]long?` element, `a[i] := k;`) used to fail BOTH the
+    // already-struct guard above and the exact-payload-match check below, so
+    // it fell through unwrapped — `v->getType() != elemTy`'s bare `i32` stored
+    // at the struct's address overwrote only the leading `hasValue` byte (plus
+    // padding), leaving the `i64` payload bytes at their prior value. MEASURED:
+    // `a[0] := k;` (`k: int`, `a: [N]long?`) read back `0` instead of the
+    // widened value. Widen `v` against the payload width FIRST — the same
+    // `coerceNumericToType` widen `coerceInitializerToSlot` performs for the
+    // declaration-initializer / return / argument sites that already route
+    // through this helper (e.g. `lowerVirtualPropertySet`, fix #2927) — so the
+    // exact-match check below then succeeds. A no-op for a non-numeric `v`
+    // (record / choice payloads pass through unchanged, as before) and for a
+    // `v` that already matches the payload width. `srcUnsigned` defaults to
+    // `false` (signed widen) for the many call sites with no natural source
+    // expression to derive it from; a caller that has one should pass it.
+    llvm::Value* coerceToNullableSlot(llvm::Type* elemTy, llvm::Value* v,
+                                      bool srcUnsigned = false) {
         auto* st = elemTy ? llvm::dyn_cast<llvm::StructType>(elemTy) : nullptr;
         if (!st || st->getNumElements() != 2 ||
             st->getElementType(0) != nullablePrimHasValTy() || !v ||
@@ -5136,13 +5698,106 @@ private:
         if (v->getType()->isPointerTy() &&
             llvm::isa<llvm::ConstantPointerNull>(v))
             return llvm::ConstantAggregateZero::get(elemTy);
-        if (v->getType() == st->getElementType(1)) {
+        llvm::Value* inner = v;
+        if ((inner->getType()->isIntegerTy() ||
+             inner->getType()->isFloatingPointTy()) &&
+            inner->getType() != st->getElementType(1))
+            inner = coerceNumericToType(inner, st->getElementType(1),
+                                        srcUnsigned);
+        if (inner->getType() == st->getElementType(1)) {
             llvm::Value* res = builder_.CreateInsertValue(
                 llvm::UndefValue::get(elemTy),
                 llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
-            return builder_.CreateInsertValue(res, v, {1u});
+            return builder_.CreateInsertValue(res, inner, {1u});
         }
         return v;
+    }
+
+    // fix #455 / §4.5, extracted for fix #4579 (§4.6 / §7.2, v0.306): lift a
+    // lowered element value `v` into the tagged `{i8 hasValue, T value}` struct
+    // an element of nullable-VALUE type `elemTyRef` occupies, so the alloca the
+    // caller spills it into MATCHES the stride `collectionElemSize` computed and
+    // the runtime memcpy's. Returns `v` unchanged for every other element type.
+    //
+    // This was the body of the `ensureNullableElem` lambda #455 put inside
+    // `tryLowerCollectionInstanceCall` (LlvmBackend_Calls.cpp) — see that call
+    // site's comment for the full rationale, which is unchanged. It is a member
+    // now because the NODE-backed `LinkedList<T>` family lives in a different
+    // function in a different file (`tryLowerLinkedListInstanceCall`,
+    // LlvmBackend_Calls3.cpp) and so never got the rule: its `AddLast(1)` on a
+    // `LinkedList<int?>` spilled a bare `i32` into a 4-byte alloca and handed
+    // `bz_llist_add_last` an 8-byte stride, which memcpy'd 4 bytes PAST the slot
+    // (ASan stack-buffer-overflow) and left the node holding the payload's low
+    // byte as its hasValue tag. One helper, both families — rather than the
+    // second spelling of one rule that narrow #4553 and fix #4571 each declined
+    // to introduce in `emitRemoveElementEquality`.
+    llvm::Value* ensureNullableElementValue(const sema::TypeRef* elemTyRef,
+                                            llvm::Value* v) {
+        if (!elemTyRef || !v) return v;
+        sema::TypeRef nvBuf;
+        const sema::TypeRef* nvTy = nullptr;
+        if (isNullableValueTy(elemTyRef)) {
+            nvTy = elemTyRef;
+        } else if (elemTyRef->nullable &&
+                   elemTyRef->kind == sema::TypeRef::Kind::Named &&
+                   !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
+            // fix #569 / §14.1: a BARE nullable type parameter (`T?`) inside a
+            // monomorphized body — resolve it through the active substitution.
+            if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
+                isNullableValueTy(&nvBuf))
+                nvTy = &nvBuf;
+        }
+        if (!nvTy) return v;
+        llvm::StructType* expected = nullableValueStructTy(nvTy);
+        if (!expected || v->getType() == expected) return v;
+        // (b) null pointer → the null tagged struct.
+        if (v->getType()->isPointerTy()) return nullableValueNull(nvTy);
+        // (a) inner scalar/struct value → {hasValue=1, v}.
+        return wrapNullableValue(nvTy, v);
+    }
+
+    // fix #5017 / #5078 (§5.1 "Nullable conversions", v0.307): lift a
+    // NULLABLE-VALUE-typed value `v` — the tagged `{i8 hasValue; S}` struct a
+    // `Nullable<S>`-typed expression already lowers to — into a DIFFERENT
+    // nullable-value slot type `{i8 hasValue; T}` (S ≠ T, both scalars §5.1
+    // permits widening between). Converts the payload via coerceNumericToType
+    // and carries the source's hasValue through unchanged — §5.1, verbatim:
+    // "a present value converts by the underlying conversion, `null` converts
+    // to `null`". Returns `v` UNCHANGED unless BOTH `v` and `slotTy` are that
+    // exact tagged-struct shape and the types actually differ, so it is safe
+    // to try unconditionally on a bare scalar or a pointer (a `null` literal)
+    // before falling back to whatever scalar-specific wrap the caller already
+    // performs for those shapes.
+    //
+    // Originally a local lambda inside lowerStmt's AssignmentStmt handling
+    // (fix #5017, the `:=` / `??=` reassignment preamble). Hoisted to a member
+    // so `lowerCollectionIndexerSet`'s `Array<T?>` / `Dictionary<K,T?>`
+    // indexer-setter arm (fix #5078, LlvmBackend_Assign.cpp) can reuse the
+    // identical unwrap/convert/rewrap instead of a second copy — indexer
+    // assignment is a SEPARATE `IndexExpr` arm in lowerStmt that returns
+    // before ever reaching the shared preamble where #5017's fix lives, so it
+    // needs its own call site to the same logic.
+    llvm::Value* liftNullableValueToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                        bool srcUnsigned) {
+        auto isTagged = [this](llvm::Type* t) {
+            auto* st = llvm::dyn_cast<llvm::StructType>(t);
+            return st && st->isLiteral() && st->getNumElements() == 2 &&
+                   st->getElementType(0) == nullablePrimHasValTy();
+        };
+        if (!v || !slotTy || v->getType() == slotTy ||
+            !isTagged(v->getType()) || !isTagged(slotTy))
+            return v;
+        llvm::Type* want = slotPayloadTy(slotTy);
+        llvm::Value* srcInner =
+            builder_.CreateExtractValue(v, {1u}, "lift.in");
+        llvm::Value* conv =
+            coerceNumericToType(srcInner, want, srcUnsigned);
+        if (conv->getType() != want) return v;
+        llvm::Value* hasVal =
+            builder_.CreateExtractValue(v, {0u}, "lift.has");
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(slotTy), hasVal, {0u});
+        return builder_.CreateInsertValue(res, conv, {1u}, "lift.wrap");
     }
 
     // v0.171 (#1336) — the Try-convention writeback. Every extraction
@@ -6160,6 +6815,17 @@ private:
     // the substitution, so measuring both sequences has no emission consequences.
     bool instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t);
 
+    // fix #4933 (§11.2 / §14.1 / §12.1, v0.307): re-point the itable slots of a
+    // NON-GENERIC class that inherits its interface implementation from a
+    // generic base instantiated at concrete arguments (`class E: B<string>`,
+    // `B<T>: I<T>`). declareVtables Pass D fills such a slot with the erased
+    // `T -> i32` template body, and `specializedVtableFor` — the per-
+    // instantiation repair for GENERIC classes — never runs for `E` (no
+    // substitution is active at `new E()`), so `I<string>.Get()` read the
+    // 8-byte string handle back as an i32 and printed "". Runs once, after
+    // every method body is emitted; see the definition (LlvmBackend_Layout.cpp).
+    void patchConcreteDerivedGenericBaseItables();
+
     // fix #2889: install what `ancestorGenericSubstAdditions` proves into the
     // ACTIVE substitution, for callers that hold a substitution for `t` across
     // more than a single layout query (the §22.8 construction sequence, the
@@ -6258,7 +6924,12 @@ private:
     // non-static FieldSymbols (positional + explicit body fields) and
     // auto-property PropertySymbols (body-record storage). The same ordering
     // recordStruct lays out, and the order the value-semantics synthesis
-    // (Equals / GetHashCode / ToString) iterates.
+    // (Equals / GetHashCode / ToString) iterates. The struct LAYOUT must
+    // include every storage member — `equality skip` does NOT remove a
+    // member from the record's layout (the spec keeps it accessible for
+    // reads / ToString / serialization; it only opts it OUT of auto-`=`
+    // synthesis). Auto-equality uses the narrower
+    // `collectRecordStorageForEquality` helper below.
     void collectRecordStorage(const sema::TypeSymbol* t,
                               std::vector<const sema::Symbol*>& out) {
         for (const sema::Symbol* m : t->members) {
@@ -6271,6 +6942,28 @@ private:
             // confirmed memory-safety hazard this closes.
             if (sema::isAutoPropertyStorageSymbol(m, ctx_)) out.push_back(m);
         }
+    }
+
+    // §9.2 (v0.307) / fix #4643: the narrower storage order used by the
+    // synthesized Equals / GetHashCode. Like `collectRecordStorage`, but
+    // drops every member marked `equality skip` — those members are
+    // present in the record's layout but excluded from auto-equality.
+    // Iterates alongside the layout order so the index used in
+    // `emitStructEquality` (which `extractvalue`s layout slots by their
+    // physical index) lines up with the layout even after skips: we
+    // advance the storage index alongside the layout index by emitting a
+    // placeholder for skipped slots. The caller (`emitStructEquality` /
+    // `emitRecordHashCode`) does this bookkeeping itself, so this helper
+    // returns the kept members in layout order — same physical index as
+    // recordStruct would assign them.
+    void collectRecordStorageForEquality(const sema::TypeSymbol* t,
+                                         std::vector<const sema::Symbol*>& out) {
+        collectRecordStorage(t, out);
+        out.erase(std::remove_if(out.begin(), out.end(),
+                                 [](const sema::Symbol* m) {
+                                     return memberHasEqualitySkip(m);
+                                 }),
+                  out.end());
     }
 
     // §27.4 (v0.183, #1408): lambda-parameter record destructuring prologue.
@@ -6804,6 +7497,27 @@ private:
         if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
         return recordIsPositional(rec) ||
                sema::isAutoEqualityBearingBodyRecord(rec, ctx_);
+    }
+
+    // fix #5068 (§9.1 / §9.2 / stdlib §2.9, v0.307): is `ms` the builtin
+    // `IEquatable<T>.Equals(other: T)` AND is its implementation on record
+    // `rec` the SYNTHESIZED `Equals(T)`? §9.1: "the synthesized `Equals(T)` is
+    // what satisfies a declared `IEquatable<T>` conformance". That witness is
+    // minted in codegen and is never a `TypeSymbol::members` entry, so when a
+    // record lists `IEquatable<Self>` sema resolves `p.Equals(q)` to the
+    // abstract interface member and every consumer that asks "which member
+    // implements this?" finds nothing. False when the record declares its own
+    // `Equals` of the interface's arity (that user method IS the witness and
+    // keeps its ordinary dispatch) and for a body record that is not
+    // auto-hashable (no synthesized package exists to route to).
+    bool isSynthesizedIEquatableEquals(const sema::MethodSymbol* ms,
+                                       const sema::TypeSymbol* rec) {
+        if (!ms || !rec || ms->name != "Equals" || ms->params.size() != 1)
+            return false;
+        const sema::TypeSymbol* ieq =
+            ctx_.builtinInterfaceSymIfCached("IEquatable");
+        if (!ieq || ms->parent != ieq) return false;
+        return recordIsAutoBearing(rec) && !findInterfaceImpl(rec, ms);
     }
 
     // fix #2934 (spec §8.5, v0.252): does §8.5's *name-only* `ToString` default
@@ -8138,13 +8852,128 @@ private:
                             const sema::TypeSymbol* classType,
                             bool disposeAndFreeOnThrow = false);
 
-    // §22.16 (v0.240, #2941): true while emitting an invariant check, so
-    // nested pure-method calls (a clause may call a `pure` public method
-    // of the same instance without recursion, §22.16 "Invariant evaluation
-    // is a boundary-time read of instance state") suppress the re-entry
-    // check. Pushed/popped by emitInvariantCheck around the predicate
-    // walk — no other site touches it.
+    // §22.16 (v0.240, #2941): true while emitting an invariant check.
+    // Pushed/popped by emitInvariantCheck around the predicate walk — no
+    // other site touches it.
+    //
+    // fix #4597 (§22.16, v0.306): this used to be described as what makes
+    // "a clause may call a `pure` public method of the same instance without
+    // recursion" hold. It is not — it is a COMPILE-TIME flag, so it stops a
+    // check being emitted INSIDE the predicate's own lowering and nothing
+    // more; the emitted call still entered the callee's sole face, whose
+    // prologue re-evaluated the invariant (SIGSEGV, measured). What honours
+    // "without recursion" is the face split below. The flag stays for the
+    // narrower job it really does: a construction-exit check reached from
+    // within a clause's lowering is still suppressed here.
     bool insideInvariantCheck_ = false;
+
+    // fix #4597 (§22.16, v0.306) — the UNCHECKED FACE.
+    //
+    // §22.16: "Every instrumented public member compiles to a checked face
+    // (entry checks -> unchecked face -> exit checks) and an unchecked face
+    // (the body); call sites with syntactic receiver `this` bind to the
+    // unchecked face". `insideInvariantCheck_` above is a COMPILE-TIME flag
+    // held only while a predicate is being lowered, so it never stopped the
+    // RUNTIME cycle the spec's "without recursion" forbids: the clause emits
+    // a call to the callee's ONE face, whose prologue re-evaluates the
+    // invariant, which calls it again. Measured on origin/main @ cafdfc52,
+    // `invariant(Ok());` over `public pure method Ok(): bool`: unbounded
+    // self-recursion in `bz$M.C$Ok` -> SIGSEGV (exit 139) where §22.16
+    // requires ContractViolationException.
+    //
+    // `uncheckedFaceFns_` holds the second face: a private-linkage clone of
+    // the method's body with the §22.16 entry/exit invariant checks (and only
+    // those — `requires` is "evaluated on every invocation" and `ensures` "on
+    // every normal-completion path", in EVERY mode) suppressed. The checked
+    // face keeps the public symbol, the vtable slot and every external call
+    // site, so nothing outside a `this`-receiver call site changes.
+    std::unordered_map<sema::MethodSymbol*, llvm::Function*> uncheckedFaceFns_;
+
+    // Faces whose body is not lowered yet. A face is minted lazily at the
+    // first `this`-receiver call site that needs it, which is mid-body-
+    // emission; the bodies are drained after the ordinary emission loops (and
+    // before `finalizeVtableTable`), re-checking the worklist because one
+    // face's body can mint another's.
+    std::vector<std::pair<sema::MethodSymbol*, llvm::Function*>>
+        pendingUncheckedFaces_;
+
+    // True while `emitFunctionBody` is lowering an unchecked face, so the two
+    // §22.16 invariant-instrumentation sites in `emitMethodBody` (entry) and
+    // `armEnsuresEpilogue` (exit) stand down. Nothing else differs.
+    bool emittingUncheckedFace_ = false;
+
+    // §22.16 "The class invariant of C is the conjunction of every invariant
+    // member of C and of every base class, evaluated base-first, declaration
+    // order within each class". ONE walk, used by both readers —
+    // `emitInvariantCheck` (which lowers each clause) and `hasClassInvariant`
+    // (which only asks whether the conjunction is empty). Stating it twice
+    // would let the gate and the emitter disagree about what an invariant IS.
+    // Appended base-first; each entry names the declaring class (for the
+    // violation message) and the clause expression.
+    void collectInvariantChain(
+        const sema::TypeSymbol* classType,
+        std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>>& out)
+        const;
+
+    // §22.16: true when `classType`'s conjunction has at least one clause, so
+    // `emitInvariantCheck` would emit something. Gates face creation, so a
+    // program with no `invariant` member mints no faces at all.
+    bool hasClassInvariant(const sema::TypeSymbol* classType) const;
+
+    // §22.16: the unchecked face of `ms`, minted on demand, or null when `ms`
+    // is not an instrumented public member (then the sole face already IS the
+    // unchecked one and the call site binds to it unchanged).
+    llvm::Function* uncheckedFaceFor(sema::MethodSymbol* ms);
+
+    // fix #4613 (§22.16, v0.306): the VIRTUAL half of the same binding.
+    // `checkedFnPtr` is the function pointer a class-virtual dispatch just
+    // loaded out of the receiver's vtable slot; the result is that pointer
+    // rewritten, by a chain of `select`s over the implementations this
+    // compilation can name, to the dynamic target's UNCHECKED face. Null when
+    // §22.16 instruments nothing here, in which case the call site keeps the
+    // loaded pointer unchanged. See the definition for why this is not a
+    // parallel vtable slot.
+    llvm::Value* uncheckedFacePtrForThisVirtualCall(
+        sema::MethodSymbol* ms, llvm::Value* checkedFnPtr);
+
+    // Lower every pending unchecked-face body. Called once after the ordinary
+    // body-emission loops; loops until the worklist stays empty.
+    void emitPendingUncheckedFaces();
+
+    // fix #4614(b) (§22.16, v0.306): the class whose invariant a store through
+    // `ps`'s SETTER, written at `target`, must evaluate on entry and normal
+    // exit — or null when §22.16 instruments nothing there (release mode, a
+    // non-public/static setter, a class with no invariant, or the
+    // `this`-receiver reentrancy exemption). See the definition in
+    // LlvmBackend_Assign.cpp for why the exemption is decided here.
+    const sema::TypeSymbol* instrumentedSetterClass(
+        const ast::Expr& target, const sema::PropertySymbol* ps,
+        const ast::PropertyDecl* pd) const;
+
+    // fix #4646 (§22.16, v0.307): the AUTO-PROPERTY half of the same row.
+    // §22.16 instruments "every `public` setter — block-form, auto-property,
+    // indexer, `set(owned)` alike", but a same-module `c.P := v` on a
+    // non-virtual auto-property has no setter body to inline: it lowers to a
+    // direct backing-field store through `lvalueAddr`, so it never reaches
+    // `lowerPropertySetValue` and #4614(b)'s instrumentation could not see it.
+    // Answers "is the assignment target `target` such a store, and if so whose
+    // conjunction does it evaluate?", by resolving the target's own
+    // `PropertySymbol`/`PropertyDecl` and deferring every §22.16 and §13.6
+    // question — including the `this`-reentrancy exemption — to
+    // `instrumentedSetterClass`, so the two shapes cannot drift apart.
+    const sema::TypeSymbol* instrumentedAutoPropertyStoreClass(
+        const ast::Expr& target) const;
+
+    // fix #4651 (§22.16 / §2.8.2, v0.307): the receiver-INDEPENDENT half of
+    // `instrumentedSetterClass` — the class whose invariant `ps`'s setter must
+    // evaluate on entry and normal exit, judged from the declaration alone
+    // (mode, class kind, `static`, §13.6 accessor visibility, and a non-empty
+    // conjunction), or null when §22.16 instruments nothing. The exporter-side
+    // §22.16 CHECKED FACE (`emitExportedPropertySetters`) asks exactly this,
+    // having no receiver expression to apply the `this`-reentrancy exemption
+    // to — and needing none, since every caller of that face is an importer.
+    const sema::TypeSymbol* setterInstrumentationClass(
+        const sema::PropertySymbol* ps, const ast::PropertyDecl* pd) const;
 
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
@@ -8409,6 +9238,17 @@ private:
                                              const std::string& fnName);
     llvm::Function* boxRecordHashThunkCore(const sema::TypeSymbol* ts,
                                            const std::string& fnName);
+    // fix #5068: the `IEquatable<T>.Equals` itable slot of a boxed record
+    // whose witness is the synthesized `Equals(T)` (§9.1). Reads the ACTIVE
+    // genericSubst_ like the two cores above.
+    llvm::Function* boxRecordIEquatableEqualsThunk(const sema::TypeSymbol* ts,
+                                                   const std::string& fnName);
+    // fix #5068: the per-instantiation itmap for a boxed generic record whose
+    // IEquatable slot holds that thunk (specializedBoxVtableFor's caller).
+    llvm::Constant* specializedIEquatableItmap(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args,
+        const std::string& readable, llvm::Constant* sharedItmap);
 
     // per §10.5 (v0.183): an enum may declare plain `ToString(): string`,
     // `Equals(E): bool`, and `GetHashCode(): int` members that REPLACE the
@@ -8588,6 +9428,41 @@ private:
         return false;
     }
 
+    // narrow #4926 (§12.7 / §14, v0.307): generic-ARGUMENT identity for the
+    // builtin-collection static-decision branch in `lowerTypeTest`
+    // (LlvmBackend_Layout.cpp), which decides `x is Array<T>` / `LinkedList<T>`
+    // / `Dictionary<K,V>` / ... purely statically when the OPERAND's static
+    // type is itself a ground instance of a builtin collection (see that
+    // branch's header comment for why the erased-carrier shape the issue's
+    // own repro uses is NOT decided this way). `staticTypeIdentical` above
+    // deliberately answers `false` for a pair of declaration-less Named types
+    // (its own comment: "a generic-template shape that does not reach here")
+    // — but a builtin collection's element type can itself be another builtin
+    // collection (`Array<Array<char>>`), and for that shape `false` would be
+    // the WRONG answer, not just an imprecise one. This recurses through the
+    // declaration-less-Named case by HEAD NAME + arity (Bezel generics are
+    // invariant, §14 — no covariance, so a differing head or arity can never
+    // be the same type), falling back to staticTypeIdentical for every shape
+    // it already decides correctly (Primitive, Unit, InlineArray,
+    // declaration-ful Named — records/enums/value-builtins as element types).
+    static bool builtinCollectionArgIdentical(const sema::TypeRef* a,
+                                               const sema::TypeRef* b) {
+        if (!a || !b) return a == b;
+        if (a->kind != b->kind) return false;
+        if (a->nullable != b->nullable) return false;
+        if (a->kind == sema::TypeRef::Kind::Named && !a->declaration &&
+            !b->declaration) {
+            if (a->headName() != b->headName()) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!builtinCollectionArgIdentical(a->genericArgs[i],
+                                                    b->genericArgs[i]))
+                    return false;
+            return true;
+        }
+        return staticTypeIdentical(a, b);
+    }
+
     // fix #3090 (§12.7 / §8.6, v0.252): the §12.7 flow-narrowed VALUE type of an
     // identifier read, or nullptr when this read is not one.
     //
@@ -8705,6 +9580,24 @@ private:
     // nullptr for imported (no body available — conservatively leak).
     const ast::Member* currentCallee_ = nullptr;
 
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): the {i8,T} nullable-value
+    // carriers buildOrderedArgs's §7.4 narrowed-read unwrap
+    // (unwrapNarrowedNullable) stripped for a formal that is a BARE type
+    // parameter (`v: T`). At argument-lowering time the callee's substitution
+    // is not yet installed, so that formal lowers to the i32 placeholder and a
+    // `x: int?` argument's tag was dropped even when `T := int?` — the callee
+    // then saw a present 0 for a null. Each entry is (parameter index, the
+    // unwrapped value placed in the argument list, the original carrier).
+    // Consumed by restoreBareTParamNullableCarriers once the substitution is
+    // known; saved/restored around each such call so a nested call inside an
+    // argument cannot clobber the outer call's entries.
+    struct BareTParamNarrowUnwrap {
+        std::size_t paramIdx;
+        llvm::Value* unwrapped;
+        llvm::Value* carrier;
+    };
+    std::vector<BareTParamNarrowUnwrap> bareTParamNarrowUnwraps_;
+
     // fix #2952: is the callee's parameter at `paramIdx` provably NON-ESCAPING
     // the callee body? Returns true only when the walker proves the parameter
     // is never assigned to a static/instance field, passed to another call,
@@ -8740,6 +9633,15 @@ private:
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
 
+    // fix #4619 (§8.6 / §25.2 / §8.4, v0.307): §8.6-box a collection
+    // MEMBERSHIP QUERY into the element slot's type. Every caller that feeds
+    // `emitRemoveElementEquality` a caller-supplied query expression must run
+    // it through this, ONCE, outside the per-element loop. Definition and the
+    // full warrant (including why the box is deliberately not discharged) live
+    // beside `boxForTarget` in LlvmBackend_Layout.cpp.
+    llvm::Value* boxMembershipQuery(llvm::Value* v, const sema::TypeRef* elemTy,
+                                    const ast::Expr* queryExpr);
+
     // fix #3443 (§8.1 / §8.6 / §5.1, v0.283): §8.1's universal
     // `public virtual method Equals(other: Object?): bool` FORMAL, as a sema
     // TypeRef. `boxForTarget` decides §8.6 boxing by asking whether the TARGET
@@ -8769,14 +9671,20 @@ private:
     // the `?.` mirror and the generic-T redirect cannot disagree about whether
     // the argument is boxed.
     //
-    // ⚠ THE FRESH BOX IS DELIBERATELY NOT RELEASED, and that is a MEASURED
-    // decision, not an oversight — do not "finish" this by adding a
-    // `bz_box_release` after the dispatch. #2952 discharges an argument-position
-    // box right after the call ONLY when `isCalleeParamNonEscaping` can prove
-    // the callee does not store the parameter; here the callee is a VTABLE
-    // DISPATCH (`lowerObjectEquals` → vtable[kEqualsSlot]) and so is not
-    // statically known at all. The release was implemented first and MEASURED
-    // to produce a heap-use-after-free under ASan on this program:
+    // ⚠ THE FRESH BOX IS RELEASED ONLY WHERE THE RECEIVER IS PROVABLY A BOX
+    // (fix #3480, v0.306) — see `lowerUniversalEqualsDispatch`, which owns
+    // that decision; this helper only REPORTS the mint through `freshMint`.
+    // Everywhere else the box is still deliberately left to leak, and that is
+    // a MEASURED decision rather than an oversight: #2952 discharges an
+    // argument-position box right after the call ONLY when
+    // `isCalleeParamNonEscaping` can prove the callee does not store the
+    // parameter, and here the callee is a VTABLE DISPATCH
+    // (`lowerObjectEquals` → vtable[kEqualsSlot]). It is statically known
+    // exactly when the RECEIVER's vtable is — which for a §8.6 box means a
+    // compiler-generated `bz$box$eq` / `bz$boxeq$<T>` thunk, and for a user
+    // class means the user's own override. The unconditional release was
+    // implemented first and MEASURED to produce a heap-use-after-free under
+    // ASan on this program:
     //
     //     class K
     //       public S: Object?;
@@ -8791,12 +9699,17 @@ private:
     // takes NO `bz_box_retain` and the caller's `+1` is the only reference.
     // §30.12's read-guard clause records the general shape ("a borrowed parameter
     // admits stores in the callee, which no caller-side rule can reject without
-    // rejecting the pass-and-read idiom wholesale"), so this is a program the
-    // compiler admits. Leaking is #2952's own stated conservative direction:
-    // "the compiler's escape analysis conservatively leaks rather than
-    // guessing." The residual leak (24 B per `Equals` call with a value-typed
-    // argument) is filed separately rather than traded for a UAF.
-    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr) {
+    // rejecting the pass-and-read idiom wholesale"), and §28.3's *deliberate
+    // asymmetry* paragraph states it as a rule ("a parameter-sourced object
+    // borrow may be stored into a field under §28.3's borrowed-field rule — a
+    // structural check whose residual is the caller's trust"), so this is a
+    // program the compiler admits. Leaking is #2952's own stated conservative
+    // direction: "the compiler's escape analysis conservatively leaks rather
+    // than guessing." The residual leak on THAT path (24 B per `Equals` call
+    // with a value-typed argument and a class receiver) stands rather than be
+    // traded for a UAF.
+    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr,
+                                         llvm::Value** freshMint = nullptr) {
         llvm::Value* savedBoxMint = lastBoxMint_;
         lastBoxMint_ = nullptr;
         llvm::Value* other = lowerExpr(argExpr);
@@ -8804,8 +9717,58 @@ private:
         // it keeps THIS argument's mint from leaking into a sibling
         // `boxForTarget`, or a previous mint into this one.
         other = boxForTarget(other, universalEqualsFormalTy(), &argExpr);
+        // fix #3480: hand back the box MINTED DURING THIS ARGUMENT'S lowering,
+        // if any — the mint-identity test #2865 established, reused here. It
+        // is the caller's decision whether discharging it is admissible (see
+        // `lowerUniversalEqualsDispatch`); this helper only reports the fact.
+        if (freshMint)
+            *freshMint = (other && lastBoxMint_ && other == lastBoxMint_)
+                             ? other : nullptr;
         lastBoxMint_ = savedBoxMint;
         return other;
+    }
+
+    // fix #3480 (§8.6 / §8.3 / §28.9 / §28.3, v0.306): lower `<recv>.Equals(
+    // <arg>)` for the sites this backend answers itself — argument boxing,
+    // vtable dispatch, and the argument box's §28.9 discharge — as ONE step,
+    // so the lifetime rule cannot be applied at three of the four `Equals`
+    // sites and forgotten at the fourth (this family's characteristic defect).
+    //
+    // `recvIsKnownBox` says the receiver's word 0 is provably a BOX VTABLE.
+    // Every box vtable's `kEqualsSlot` holds a compiler-generated thunk that
+    // reads `other` and returns an `i1` without storing it (see
+    // `pureBoxBindings_` for the enumeration), so the fresh argument box is
+    // dead the instant the dispatch returns and `bz_box_release` here is
+    // exactly-once.
+    //
+    // WHEN IT IS FALSE the box is LEFT TO LEAK, deliberately, and that is
+    // #3480's own measured verdict rather than a missing case: a user class
+    // receiver dispatches to a user `Equals` override, which the spec (v0.306
+    // §28.14's *deliberate asymmetry* paragraph, referring to §28.3's
+    // borrowed-field rule) permits to store its borrowed `Object?` parameter
+    // into a field — taking no `bz_box_retain`,
+    // because `collectBoxStorageFields` cannot classify a field whose only
+    // assignment source is an `Object?` PARAMETER. Releasing there was
+    // implemented and measured to produce a heap-use-after-free. A bounded
+    // leak is the conservative direction; a UAF is not.
+    llvm::Value* lowerUniversalEqualsDispatch(llvm::Value* recv,
+                                              const ast::Expr& argExpr,
+                                              bool recvIsKnownBox) {
+        llvm::Value* mint = nullptr;
+        llvm::Value* other = lowerUniversalEqualsArg(argExpr, &mint);
+        if (!recv || !other) return nullptr;
+        llvm::Value* r = lowerObjectEquals(recv, other);
+        if (!r) return nullptr;
+        if (recvIsKnownBox && mint) emitBoxRelease(mint);  // null-safe (§28.9)
+        return r;
+    }
+
+    bool isKnownBoxReceiverExpr(const ast::Expr* recv) {
+        // Arm (a) reads `pureBoxBindings_`, which describes the body
+        // `collectBoxReleaseEligible` last ran over; the same token check
+        // `lowerLocalDecl` applies to `boxReleaseEligible_`.
+        return knownBoxReceiverShape(recv,
+                                     currentFn_ == boxReleaseEligibleFn_);
     }
 
     // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): does the ARGUMENT's static type
@@ -9295,6 +10258,18 @@ private:
     llvm::Value* wrapArrayAsIOwningEnumerator(llvm::Value* arr,
                                               const sema::TypeRef* iOwnEnumTy,
                                               bool lifo = false);
+    // fix #4750 / #4772 (§29.1, v0.307): the slot-3 `TakeCurrent` body BOTH
+    // builtin draining frames install (`wrapArrayAsIOwningEnumerator` and
+    // `wrapLinkedListAsIOwningEnumerator`, whose layouts share `pending` at
+    // field `pendIdx`). A null `pending` — a take before the first advance,
+    // after exhaustion, or a second take without an intervening advance —
+    // raises `InvalidOperationException` (signalled through `bz_exc_addr`,
+    // exactly as the iterator-method TakeCurrent in LlvmBackend_Iterators.cpp
+    // does per #1349); otherwise the slot is nulled and the value returned.
+    // `tcFn` must be a fresh, body-less `ptr (ptr)` function.
+    void emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
+                                        llvm::StructType* stTy,
+                                        unsigned pendIdx);
 
     // fix #3461 (§29.1 / §29.2 / §29.11; stdlib §4.7 / §4.13, v0.283): the
     // LinkedList sibling of wrapArrayAsIOwningEnumerator — the DRAINING
@@ -9833,10 +10808,38 @@ private:
     // is lowered, so no normal-exit edge can name it and the marking has no
     // subject. Removed with mode 6 and the `undischargedOwned` parameter.)
 
+    // fix #1882 (§28.4, v0.306): the `unwindDisposeHi` sentinel — "every scope
+    // that is still live is still live", i.e. dispose disposeStack_ down to
+    // unwindScopeDepth_ from its current top. Every pre-#1882 caller means
+    // this, because a pending check after a CALL is emitted while no scope is
+    // mid-teardown. A SCOPE-END disposal pass is the one caller that cannot:
+    // the scope it just finished disposing is still ON disposeStack_ (its
+    // owner pops it after the pass returns), so it passes that scope's index
+    // and the unwind edge disposes only the scopes OUTSIDE it — re-running the
+    // pass that just threw would double-release the entries that do not null
+    // their own slot.
+    static constexpr std::size_t kAllLiveScopes =
+        static_cast<std::size_t>(-1);
+
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars
     // first), else continue.
-    void emitPendingCheck();
+    void emitPendingCheck(std::size_t unwindDisposeHi = kAllLiveScopes);
+
+    // fix #1878 + #1882 (§28.4, v0.306): load the in-flight-exception slot so a
+    // disposal site can bracket its dispatch and tell a fault the disposal
+    // RAISED from one that was already propagating when it started. Emitted at
+    // the site's current insert point, which dominates the check below.
+    llvm::Value* snapshotInFlightExc();
+
+    // fix #1878 + #1882 (§28.4, v0.306): §28.4's "the exception propagates from
+    // the disposal point". Fires iff the slot is non-null AND differs from
+    // `excBefore` (a `snapshotInFlightExc()` taken before the disposal) — a
+    // plain non-null test misroutes somebody else's in-flight exception, which
+    // for a §29.7 iterator-abandonment teardown means leaking the frame. See
+    // the definition for the measured case.
+    void emitDisposalFaultCheck(llvm::Value* excBefore,
+                                std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // CG20 + #792 / §22.13: route the pending exception ONLY when `cond` is
     // true. emitPendingCheck computes its own condition (bz_exc != null, ANDed
@@ -9848,7 +10851,8 @@ private:
     // misrouted here — it stays in bz_exc and routes at the next natural
     // pending check. The unwind block (scope disposal + #1216 supersede) is
     // shared verbatim with emitPendingCheck.
-    void emitPendingCheckIf(llvm::Value* cond);
+    void emitPendingCheckIf(llvm::Value* cond,
+                            std::size_t unwindDisposeHi = kAllLiveScopes);
 
     // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
     // When the constructor of an in-flight `new T(...)` throws, the freshly-
@@ -10253,6 +11257,28 @@ private:
     // box (nothing extra to free). The two are mutually exclusive, so the
     // value box is never freed twice.
     llvm::Function* dictValueBoxFreer(const sema::TypeRef* dictTy);
+
+    // fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): promote a
+    // Dictionary/OwningDictionary VALUE to its nullable-value tagged `{i8,T}`
+    // struct BEFORE the caller's own struct-boxing decision
+    // (`dictValueIsBoxedStruct`), so a `null` literal (a bare LLVM `ptr null`)
+    // or an un-tagged scalar/record destined for a `V?` slot is never boxed or
+    // stored as a raw, untagged value. This is the promotion half of
+    // `lowerCollectionIndexerSet`'s `encodeValue` lambda
+    // (LlvmBackend_Assign.cpp) — factored out so `materializeHeapDictLiteral`'s
+    // `encodeVal` (LlvmBackend_Setup.cpp) can call the SAME logic instead of
+    // reimplementing it, which is how the dictionary-LITERAL path missed this
+    // promotion entirely (issue #5084 Bug A: a literal null value passed a raw
+    // `ptr null` straight through to the runtime; Bug B, an overwrite
+    // afterwards aborting on `free()` of a bogus pointer, was traced to the
+    // SAME gap — a plain literal like `99` in `["k": 99]` against
+    // `Dictionary<K, long?>` was never wrapped to `{i8=1,i64=99}` either, so
+    // the table held a raw inttoptr'd `99` that later crashed both a read-back
+    // and the disposing overwrite's `free()` of it). No-op (returns `v`
+    // unchanged) when `valTy` is not a nullable value type.
+    llvm::Value* liftDictValueToNullableStruct(llvm::Value* v,
+                                                const sema::TypeRef* valTy,
+                                                const ast::Expr* valueExpr);
 
     // fix #2791 / §8.6 / §15.4 (v0.240): a standalone `void(void*)` thunk that
     // releases a §8.6 BOX element of a collection literal (a value type boxed
@@ -10962,6 +11988,57 @@ private:
                rt->primitive == sema::PrimitiveType::String;
     }
 
+    // fix #4965 (§4.6 / §28.9 / §14.1, v0.307): closes the class-side gap the
+    // #3964 comment above left open — a CLASS field / auto-property whose
+    // declared type is a bare type parameter (`_v: T`, `property Q: T`,
+    // positional `(v: T)`, or `T?`) instantiated at `string`. Before this fix
+    // the class's retain/release pair was blind to it EXCEPT at one site: a
+    // store whose TARGET is typed `string` at the use site (`e.Q := x` on a
+    // `B<string>` receiver — sema substitutes there, so isStringFieldLvalue
+    // fires) released the old value. The constructor store (`Q := v` inside
+    // B<T>'s body, typed `T`) never retained it, so that release freed the
+    // CALLER's string (heap-use-after-free), and the disposer never released
+    // the final value (leak).
+    //
+    // The balanced policy this predicate drives, and why each half is shaped
+    // as it is:
+    //   * EVERY store whose target is such a member retains the new value
+    //     (the ctor / generic-body `:=` and `??=`, the auto-property setter
+    //     body, the positional primary-ctor store, the field initializer). So
+    //     the member always owns a +1 of its current value.
+    //   * The per-instantiation disposer (emitted with the substitution
+    //     active — `layoutDiffers` forces the specialized disposer at every
+    //     pointer-sized instantiation, Setup.cpp needsSpecDispose) releases it.
+    //   * The existing string-typed external store keeps its release-old.
+    //   * A store that is only string AFTER substitution (inside the generic
+    //     body, or the shared auto setter) does NOT release the old value: a
+    //     `T`-typed local / parameter in a generic body takes no +1 of its own
+    //     at `string` (the string-local refcount arming is sema-typed), so
+    //     `var old := _v; _v := x; return old;` would dangle `old` if this
+    //     store released. The old +1 leaks instead — never a UAF or a double
+    //     free. Making `T` locals refcounted at `string` is a broader
+    //     retain-policy change, filed as #4980.
+    //
+    // Resolution goes through resolveTypeParamRef (the ACTIVE substitution),
+    // so this is only ever true while a body / disposer / accessor of the
+    // member's instantiation is being emitted with its substitution
+    // installed; with none active (the shared, i32-erased template) it is
+    // false and nothing changes. Declared-type read is the same bare
+    // recordMemberType as isStringStorageMember (an IMPORTED member has no
+    // AST-typed declaration and stays blind on BOTH halves — the #3964
+    // "consistently blind" balance is preserved for it). An `int`/class
+    // instantiation resolves to a non-string and is untouched.
+    bool isTypeParamBoundToString(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        const sema::TypeRef* r = resolveTypeParamRef(rt);
+        return r && r != rt && r->kind == sema::TypeRef::Kind::Primitive &&
+               r->primitive == sema::PrimitiveType::String;
+    }
+    bool isTypeParamStringStorageMember(const sema::Symbol* m) {
+        return isTypeParamBoundToString(recordMemberType(m));
+    }
+
     // fix #3945 / #3964 review (§9.7 / §28.9 / §14.1, v0.294): the
     // substitution-aware twin of isStringStorageMember just above, used ONLY
     // by the RECORD string-field walk — recordHasStringFields and
@@ -11362,7 +12439,19 @@ private:
     // a generic statement at all). Populated only by
     // collectRecordCallResultReleaseEligible; empty for every candidate
     // admitted the ordinary way.
-    std::unordered_map<const void*, const ast::AssignmentStmt*>
+    //
+    // fix #4307 (§9.7 / §28.9 / §22.8): the value is now a SET, not a
+    // single AssignmentStmt*. The plain #4266 case has exactly one
+    // member (a single `outer := ...` site); the mutually-exclusive-
+    // branches case has one per branch (if-branch AND else-branch each
+    // contain a valid `outer := ...` site, and BOTH must be recognized
+    // by the escape walker as the non-escaping initializer — anything
+    // else marks one branch's assignment as an escape and taints the
+    // local globally, leaking that branch's record string fields at
+    // scope end). The escape walker's `recordDeclareThenAssignSet`
+    // membership check (a SET lookup, O(1) amortized) replaces the
+    // old pointer-equality check.
+    std::unordered_map<const void*, std::unordered_set<const ast::AssignmentStmt*>>
         recordDeclareThenAssignSite_;
 
     // fix #1747: walk the function body, classifying each plain-`var`
@@ -11613,6 +12702,22 @@ private:
         const sema::TypeRef* kt = rt->genericArgs[0];
         return kt->kind == sema::TypeRef::Kind::Primitive &&
                kt->primitive == sema::PrimitiveType::String && !kt->nullable;
+    }
+
+    // fix #4135 (§27.5 / §28.9, stdlib §4.9, v0.295): is `rt` a
+    // DrainedEntry<K,V> type from lowerDictDrainFor (the for-loop-variable
+    // capture shape)? Mirrors isDictEntryStringKeyTypeRef for the DrainedEntry
+    // sibling issue. DrainedEntry is a class (stdlib §4.9) with owned Value: V
+    // where V: class (guaranteed by OwningDictionary<K,V>'s constraint), and
+    // Key: K by value. The capture cell holds the {K, V*} struct BY VALUE.
+    // Unlike DictionaryEntry (where only the string Key is owned), BOTH fields
+    // of DrainedEntry are owned: Key (if string) and Value (the V*).
+    bool isDrainedEntryTypeRef(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (rt->headName() != "DrainedEntry") return false;
+        return rt->genericArgs.size() >= 2 && rt->genericArgs[0] &&
+               rt->genericArgs[1];
     }
 
     // ====================================================================
@@ -12007,6 +13112,12 @@ private:
     // into compound statements and into expressions (await is an expression).
     static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     static bool exprContainsAwait(const ast::Expr* e);
+
+    // fix #4461 (§30.5 Pattern A kind 1, §30.6, v0.306): narrow predicate for
+    // the Task-factory CallExpr shape (`Task.FromOwnedResult(...)` etc.)
+    // `detectAsyncPatternAKind` rejects on a non-`await` Pattern A return.
+    // // per §30.5 Pattern A, §30.6, v0.306
+    static bool isTaskFactoryCallExpr(const ast::Expr* valueExpr);
 
     // §30.9 / §31.2 (#438): detect an `await` in a try POSITION that is STILL
     // deferred — i.e. inside a catch arm body, a catch guard, or a `finally`
@@ -12635,6 +13746,7 @@ private:
               cellFreeEligible_(e.cellFreeEligible_),
               unwindUnsafeCellFree_(e.unwindUnsafeCellFree_),
               sharedCellEnvdtorFreeOwner_(e.sharedCellEnvdtorFreeOwner_),
+              declsCapturedByEscaping_(e.declsCapturedByEscaping_),  // fix #4210
               cellFreeEligibleFn_(e.cellFreeEligibleFn_) {}
         ~CaptureReclaimSetScope() {
             e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
@@ -12661,6 +13773,8 @@ private:
             e_.unwindUnsafeCellFree_ = std::move(unwindUnsafeCellFree_);
             e_.sharedCellEnvdtorFreeOwner_ =
                 std::move(sharedCellEnvdtorFreeOwner_);
+            e_.declsCapturedByEscaping_ =
+                std::move(declsCapturedByEscaping_);  // fix #4210
             e_.cellFreeEligibleFn_ = cellFreeEligibleFn_;
         }
         CaptureReclaimSetScope(const CaptureReclaimSetScope&) = delete;
@@ -12698,6 +13812,12 @@ private:
         std::unordered_set<const void*> cellFreeEligible_;
         std::unordered_set<const void*> unwindUnsafeCellFree_;
         std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+        // fix #4210 (§27.5 / §28.9, v0.298): the set of all captured entities
+        // (DeclSymbol* / ParameterSymbol*) that ANY escaping lambda captures.
+        // Populated by collectCellFreeEligible; used as the O(1) oracle in the
+        // boxedCellFree arming condition to prevent double-free when an escaping
+        // lambda also captures the same local as a non-escaping lambda.
+        std::unordered_set<const void*> declsCapturedByEscaping_;
         llvm::Function* cellFreeEligibleFn_;
     };
 
@@ -12911,10 +14031,12 @@ private:
             : e_(e),
               boxReleaseEligible_(e.boxReleaseEligible_),
               boxReassignedLocals_(e.boxReassignedLocals_),
+              pureBoxBindings_(e.pureBoxBindings_),   // fix #3447
               boxReleaseEligibleFn_(e.boxReleaseEligibleFn_) {}
         ~BoxReclaimSetScope() {
             e_.boxReleaseEligible_ = std::move(boxReleaseEligible_);
             e_.boxReassignedLocals_ = std::move(boxReassignedLocals_);
+            e_.pureBoxBindings_ = std::move(pureBoxBindings_);
             e_.boxReleaseEligibleFn_ = boxReleaseEligibleFn_;
         }
         BoxReclaimSetScope(const BoxReclaimSetScope&) = delete;
@@ -12924,6 +14046,7 @@ private:
         Emitter& e_;
         std::unordered_set<const void*> boxReleaseEligible_;
         std::unordered_set<const void*> boxReassignedLocals_;
+        std::unordered_set<const void*> pureBoxBindings_;
         llvm::Function* boxReleaseEligibleFn_;
     };
 
@@ -13332,6 +14455,23 @@ private:
     // function that decides "Pattern A borrow". Reset to false after
     // lowerExpr returns in lowerStmt, like its kind-2 twin.
     bool asyncBorrowedReturn_ = false;
+    // fix #4462 (§30.5 Pattern A, §30.6, v0.306): set true by `lowerLocalDecl`
+    // when the init is `await <plain Task<T:class>>` AND the LocalDecl has the
+    // `using` modifier (the consuming binding `using var x := await t;`).
+    // Read by `lowerAwait`, which extends its `takeResultAfter` decision to
+    // fire for plain Task (the OwningTask half already fires unconditionally
+    // via `taskTy->headName() == "OwningTask"`). Without this, the consumer's
+    // `using var x := await t;` cascade-disposes the class value at its
+    // scope end AND the kind-1 disposer attached to the task at producer
+    // completion (the `emitAsyncPatternAResultDecision` kind-2 chained path
+    // that fires when the producer's body is `return await
+    // Task.FromOwnedResult(new X)`) then disposes the same freed value at
+    // `t`'s scope end — a heap-use-after-free, invisible on plain builds
+    // (the freed bucket is exactly the glibc 16-byte tcache width and is
+    // immediately reused) and caught only by ASan (#2633 oracle). Saving/
+    // restoring across `lowerExpr(*init)` so a nested LocalDecl in the same
+    // scope starts from the right value.
+    bool awaitConsumesPlainTaskResult_ = false;
     // §30.1 (#1521): the current plain (non-iterator) async method's frame,
     // published by emitAsyncMethod right after buildStateMachineFrame so
     // emitAsyncOwnedParamAutoDispose can walk frame.captures from EVERY
@@ -13603,6 +14743,11 @@ private:
     // one that reaches an imported generic); every other emitOwnFieldInit caller
     // leaves it `{}` and reports unlocated, exactly as before.
     SourceLocation importedFieldInitDiagLoc_{};
+    // fix #5009 (§14.1 / §2.8.3, v0.307): the location of the call currently
+    // being lowered (scoped in lowerCall). Only consumer: the constraint-route
+    // backstop in emitInlineGenericMethod, whose shipped body's own nodes carry
+    // fresh-AST coordinates that do not locate anything in the importer.
+    SourceLocation callSiteLoc_{};
 
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and
@@ -13650,8 +14795,30 @@ private:
     sema::ConstructorSymbol* ctorForArgs(
         const sema::TypeSymbol* cls,
         const std::vector<ast::CallArgument>& args,
-        const sema::ConstructorSymbol* exclude = nullptr) {
+        const sema::ConstructorSymbol* exclude = nullptr,
+        bool chainCall = false) {
         if (!cls) return nullptr;
+        // fix #4853 (§22.6 "Implicit conversions and tie-breaking" / §22.7,
+        // v0.307): when sema's §22.6 resolution already SELECTED this `new`
+        // site's constructor (`ExprTC::checkNewExprArgs` publishes it, keyed
+        // by the address of `NewExpr::args` — see
+        // `SemaContext::setResolvedNewCtor`), lower that constructor. The
+        // search below is a proxy that cannot express §22.6's exact-match
+        // ranking; re-deriving the choice with it picked the first declared
+        // candidate in the argument's type class — `(a: Animal)` over an
+        // exact `(d: Dog)`, and a `(n: int)` constructor, INAPPLICABLE under
+        // §5.1, for a `long` argument (silent truncation). Adopted only when
+        // it is a non-static constructor of `cls` itself and not `exclude`;
+        // any other shape keeps the proxy. Never consulted for a chain call,
+        // whose argument vector is not a `new` site's.
+        if (!chainCall) {
+            if (sema::ConstructorSymbol* rc = ctx_.resolvedNewCtor(&args)) {
+                if (!rc->isStatic && rc != exclude) {
+                    for (sema::Symbol* m : cls->members)
+                        if (m == rc) return rc;
+                }
+            }
+        }
         // fix #3760 (§22.10 / §12.8 / §22.8, v0.287): a SINGLE explicit
         // constructor whose arity matches the chain call still has to
         // type-match the call's positional args before we can adopt it as
@@ -13705,7 +14872,16 @@ private:
                 case P::UInt:  case P::ULong:  return 1;
                 case P::Float:  return 2;
                 case P::Double: case P::Decimal: return 2;
-                case P::String: return 3; // class 3 regardless of nullable
+                // fix #4822 (§5.1 / §22.6 stage 3, v0.307): `string` is its
+                // OWN class, not the Named class 3. No class, record or
+                // interface value converts to `string` (§5.1), and `string`
+                // converts to no Named type but `IComparable<string>` /
+                // `IEquatable<string>` (the relaxed pass's boxing arm). Filed
+                // under 3, a class-typed argument "matched" a `string`
+                // parameter: `new H(sq)` picked `(s: string)` over the
+                // applicable `(s: IShape, k: int := 2)` and read the `Sq`
+                // object as a string.
+                case P::String: return 4; // regardless of nullable
                 default: return -1;
                 }
             }
@@ -13727,155 +14903,580 @@ private:
             }
             return -1;
         };
+        // fix #4790 (§22.5 "Optional parameters and named arguments" / §22.6
+        // stage 3, v0.307): the parameter TYPE at slot `pi` of `cs`, resolved
+        // the same both-sources way #3760's original `localParamType` always
+        // has — the local AST when `cs` carries an `ast::ConstructorDecl`
+        // (`cd->params[pi].type`, resolved via `ctx_.resolvedType`), falling
+        // back to the imported `ParameterSymbol::resolvedDeclType`/`declType`.
+        // Pulled out of `ctorTypeMatches` (which used to nest an identical
+        // lambda, capturing its OWN `cs` parameter) so the generalized
+        // defaulted-candidate check below — over a constructor whose arity
+        // EXCEEDS the call's argument count, a shape `ctorTypeMatches` itself
+        // refuses outright via its `cs->params.size() != args.size()` guard —
+        // can ask the identical question about a DIFFERENT `cs`.
+        auto paramTypeAt = [&](sema::ConstructorSymbol* cs,
+                               std::size_t pi) -> const sema::TypeRef* {
+            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                if (pi < cd->params.size() && cd->params[pi].type)
+                    return ctx_.resolvedType(*cd->params[pi].type);
+            }
+            if (pi < cs->params.size()) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
+                // Prefer the already-resolved `resolvedDeclType` (filled
+                // by sema for an inferred-typed lambda param) when
+                // available; fall back to resolving `declType` (the AST
+                // type). `ps->declType` is `const ast::Type*` here —
+                // ParameterSymbol's own field shadows the inherited
+                // `Symbol::declType` (a `sema::TypeRef*`).
+                if (ps) {
+                    if (ps->resolvedDeclType) return ps->resolvedDeclType;
+                    if (ps->declType) return ctx_.resolvedType(*ps->declType);
+                }
+            }
+            return nullptr;
+        };
+        // fix #4790 (§22.6 stage 3, v0.307): does call argument `arg`
+        // type-match parameter slot `pi` of `cs`? The exact per-argument rule
+        // `ctorTypeMatches` applied inline before this fix (the #3760
+        // null-vs-nullable follow-up; the #4046 §5.1 int-family→floating
+        // widening) — pulled out so the exact-arity check and the
+        // generalized defaulted-candidate check below apply IDENTICALLY.
+        // #4790's own defect was these two disagreeing: the exact-arity arm
+        // type-checked a bound argument and the defaulted-fill arm
+        // (`argsCanFill`/`argsCanFillSymbolic`, below) never did.
+        //
+        // fix #4790 rework (§5.1 / §14.2 clause 5 / §22.6 stages 3 + 5,
+        // v0.307): the class comparison below is a RANKING proxy, not a model
+        // of §5.1. Used alone as an applicability gate (as the first #4790
+        // commit did) it made `ctorForArgs` return null for calls sema had
+        // accepted through a §5.1 conversion it does not model — a primitive
+        // boxed into the builtin interface it conforms to (`new C(5)` against
+        // `constructor(v: IComparable<int>, k: int := 7)`), or `null` into a
+        // type-parameter slot (`new Box<string?>(null)` against
+        // `constructor(v: T, k: int := 9)`) — and the `new` silently
+        // zero-filled the object. The search therefore runs in two passes
+        // (`relaxedPass`, below): the STRICT pass is the class comparison,
+        // which keeps every same-class candidate ahead of a converting one
+        // (§22.6 stage 5's exact-match preference: `(n: int)` still beats a
+        // sibling `(v: IComparable<int>)` for `new C(5)` whatever their
+        // declaration order); only when it finds nothing does the RELAXED
+        // pass also admit the §5.1 conversions the class proxy cannot see.
+        //
+        // fix #4853 (§22.6 stage 5 "exact beats converting" / §5.1, v0.307):
+        // two tiers now run BEFORE that strict pass, for every call sema did
+        // not resolve for us (a chain call, a class with a §22.10 primary, an
+        // imported class, an undecidable overload set):
+        //   * `Exact` — a candidate is admitted only when every supplied
+        //     argument's static type IS its parameter type. Such a candidate
+        //     is better-or-equal at every position than any other applicable
+        //     one, so it is §22.6's winner (the three arms' order supplies the
+        //     defaulted-arity tie-break among exact candidates);
+        //   * `NoNarrow` — the class proxy minus a numeric pair that is not a
+        //     §5.1 widening (`long` → `int`, `double` → `float`), so a
+        //     converting candidate §5.1 admits outranks one it does not.
+        // The later tiers keep the pre-#4853 verdicts (the `Proxy` tier also
+        // admits an integer CONSTANT narrowed by value, which the proxy cannot
+        // tell from a run-time narrowing), so these tiers only ever change
+        // WHICH admitted candidate is chosen, never whether one is.
+        enum class Tier { Exact, NoNarrow, Proxy, Relaxed };
+        Tier tier = Tier::Proxy;
+        bool relaxedPass = false;
+        // fix #4853: exact static-type identity for the `Exact` tier —
+        // deliberately narrower than `sema::typeRefEqual` (which compares a
+        // Named ref by `declaration` alone, so every generic parameter and
+        // builtin head compares equal): a primitive pair, or a non-generic
+        // Named pair with the same resolved declaration, same nullability.
+        // Anything else is "not provably exact" and waits for a later tier.
+        auto exactType = [](const sema::TypeRef* a,
+                            const sema::TypeRef* b) -> bool {
+            if (!a || !b || a->kind != b->kind || a->nullable != b->nullable)
+                return false;
+            if (a->kind == sema::TypeRef::Kind::Primitive)
+                return a->primitive != sema::PrimitiveType::None &&
+                       a->primitive == b->primitive;
+            if (a->kind == sema::TypeRef::Kind::Named)
+                return a->declaration && a->declaration == b->declaration &&
+                       a->genericArgs.empty() && b->genericArgs.empty();
+            return false;
+        };
+        auto isNumericPrim = [](const sema::TypeRef* t) -> bool {
+            if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
+            using P = sema::PrimitiveType;
+            switch (t->primitive) {
+            case P::SByte: case P::Byte: case P::Short: case P::UShort:
+            case P::Int:   case P::UInt: case P::Long:  case P::ULong:
+            case P::Char:  case P::Float: case P::Double: case P::Decimal:
+                return true;
+            default:
+                return false;
+            }
+        };
+        // §14.2 clause 5 / §5.1 / stdlib §9.1–§9.5 (v0.307): a primitive
+        // value boxes into the builtin `IComparable<P>` / `IEquatable<P>` at
+        // its own type exactly (non-nullable type argument; `bool` has
+        // `IEquatable<bool>` only). The codegen spelling of sema's
+        // `ExprTC::primitiveBoxesIntoBuiltinIface` (ExprTypecheck.cpp), which
+        // is private to sema's typechecker.
+        auto primitiveBoxesInto = [](const sema::TypeRef* from,
+                                     const sema::TypeRef* to) -> bool {
+            if (!from || !to || from->kind != sema::TypeRef::Kind::Primitive ||
+                from->nullable || to->kind != sema::TypeRef::Kind::Named ||
+                !to->declaration ||
+                to->declaration->kind != ast::TypeDeclKind::Interface ||
+                !to->declaration->isSynthesizedBuiltinInterface ||
+                to->genericArgs.size() != 1 || !to->genericArgs[0])
+                return false;
+            const bool isCmp = to->declaration->name == "IComparable";
+            const bool isEq = to->declaration->name == "IEquatable";
+            if (!isCmp && !isEq) return false;
+            if (from->primitive == sema::PrimitiveType::Object) return false;
+            if (isCmp && from->primitive == sema::PrimitiveType::Bool)
+                return false;
+            const sema::TypeRef* targ = to->genericArgs[0];
+            return targ->kind == sema::TypeRef::Kind::Primitive &&
+                   !targ->nullable && targ->primitive == from->primitive;
+        };
+        // Does argument expression `argExpr` type-match a slot of type
+        // `paramTy`? Shared by the explicit-constructor slots
+        // (`slotTypeMatches`) and the §22.10 primary-parameter slots
+        // (`primaryStrictlyApplicable`, below).
+        auto argMatchesParamType = [&](const ast::Expr* argExpr,
+                                       const sema::TypeRef* paramTy) -> bool {
+            if (!argExpr) return true;
+            auto* argTy = ctx_.exprType(*argExpr);
+            bool argIsNull =
+                dynamic_cast<const ast::NullLiteralExpr*>(argExpr) != nullptr;
+            // fix #4853: the `Exact` tier admits identity only (a `null`
+            // literal is never exact — it converts).
+            if (tier == Tier::Exact)
+                return !argIsNull && exactType(argTy, paramTy);
+            int paramCls = typeClassOf(paramTy);
+            // fix #3760 follow-up: a `null` arg against a NULLABLE param is a
+            // valid match — a `null` literal carries no typeClass information
+            // of its own, so a bare class comparison would reject `new
+            // B(null)` against `constructor(n: int?)` even though the
+            // parameter clearly admits null.
+            //
+            // fix #4790 rework (§5.1 / §7, v0.307): `null` also converts to
+            // every REFERENCE slot class (Named/function 3, `string` 4 — the
+            // pre-rework verdict, unchanged) and to a TYPE-PARAMETER slot
+            // (class -1: `T` is instantiated at a nullable type for sema to
+            // have accepted the call — `new Box<string?>(null)`). The
+            // pre-rework `argCls == paramCls` compared null's 3 against the
+            // type parameter's -1 and rejected the only candidate. Only a
+            // non-nullable value-primitive slot (bool/integral/floating)
+            // rejects it.
+            if (argIsNull) {
+                if (paramTy && paramTy->nullable) return true;  // null -> nullable param
+                return paramCls == 3 || paramCls == 4 || paramCls == -1;
+            }
+            int argCls = typeClassOf(argTy);
+            // Relaxed pass only: the §5.1 / §14.2 clause 5 boxing conversion
+            // the class proxy files under a mismatch (primitive 0/1/2/4 vs
+            // interface 3).
+            if (relaxedPass && primitiveBoxesInto(argTy, paramTy)) return true;
+            if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
+                // fix #4046 (§5.1, v0.294): the §5.1 implicit-conversion
+                // table admits `int` → `float`/`double`/`decimal` (and every
+                // other integer-typed source → the same three floating-class
+                // targets), so an integer-typed ARGUMENT against a
+                // floating-typed PARAMETER is a legal source position; every
+                // other class mismatch (including the reverse, decimal arg
+                // against int param) is rejected.
+                if (argCls == 1 && paramCls == 2) return true;
+                return false;
+            }
+            // fix #4853 (§5.1, v0.307): the `NoNarrow` tier rejects a numeric
+            // pair that is neither identity nor a §5.1 widening-table row.
+            if (tier == Tier::NoNarrow && isNumericPrim(argTy) &&
+                isNumericPrim(paramTy) &&
+                argTy->primitive != paramTy->primitive &&
+                !sema::primitiveImplicitlyWidens(argTy->primitive,
+                                                 paramTy->primitive))
+                return false;
+            return true;
+        };
+        // fix #5081 (§22.3 / §22.6, v0.307): scoped opt-in read by
+        // `slotTypeMatches` below — when true, it enforces ref/out
+        // applicability for a NEW-site call too, not only a chain call. Set
+        // (and reset) only around the arity>1 arm further down; see the fix
+        // #4924 comment just below for why the check exists at all, and the
+        // fix #5081 comment at that arm for the scoping rationale.
+        bool enforceRefOutAtNewSite = false;
+        // fix #4924 (§22.3 / §22.6, v0.307): at a `this(...)` / `base(...)`
+        // chain call (`chainCall`) the call-site `ref`/`out` modifier is part
+        // of APPLICABILITY — a `ref` formal is filled only by a `ref`
+        // argument, an `out` formal only by an `out`-family one, any other
+        // formal only by an argument with neither. Without it, `this(n, 5)`
+        // beside `(ref y: int, x: int)` and `(y: long, x: int)` took the FIRST
+        // type-class match, the inapplicable `ref` overload (printed `R5,3`,
+        // not `V5,3`). The predicate is sema's own (`callSiteRefOutMatches`,
+        // the one #4905's chain-call check uses), so the pick is always a
+        // candidate that check admits: it accepts a chain only when some
+        // binding candidate, or the modifier-free primary list, matches.
+        // Every return of `searchOnce` goes through this per-slot check.
+        //
+        // fix #5081 (§22.3 / §22.6, v0.307): a `new`-site call has the SAME
+        // gap when TWO OR MORE explicit constructors share the call's arity
+        // (`enforceRefOutAtNewSite`, applied at that arm below only) — such a
+        // call reaches this proxy tier only when sema declined to resolve it
+        // (a call-site `ref`/`out` modifier on one of its own arguments makes
+        // `ExprTC::checkNewExprArgs` return early), so this ranking is the
+        // ONLY thing that picks among the candidates. It is deliberately NOT
+        // extended to the arity==1 arm just below it, or to the §22.10
+        // primary-vs-explicit-ctor interaction (`primaryStrictlyApplicable`):
+        // a combined-form record's single explicit constructor competing
+        // with its auto-generated primary (#4805) turns on the still-open
+        // §9.3 "same parameter list" ruling (#4775 Q1), and applying the
+        // filter there would flip the pinned row
+        // `rec_ref_ctor_4805.combined_form_literal_arg_rejects_clean_22_3`
+        // from reject to accept — out of scope here; see #5081's issue text.
+        auto slotTypeMatches = [&](sema::ConstructorSymbol* cs, std::size_t pi,
+                                   const ast::CallArgument& arg) -> bool {
+            if ((chainCall || enforceRefOutAtNewSite) &&
+                !sema::callSiteRefOutMatches(
+                    arg.modifier, sema::formalParamModifier(*cs, pi)))
+                return false;
+            return argMatchesParamType(arg.value.get(), paramTypeAt(cs, pi));
+        };
         auto ctorTypeMatches = [&](sema::ConstructorSymbol* cs) -> bool {
             if (cs->params.size() != args.size()) return false;
-            // fix #3760: the type-class check reads the parameter type off the
-            // LOCAL AST when present (`ast::ConstructorDecl::params[i].type`,
-            // resolved to a `sema::TypeRef` via `ctx_.resolvedType`) — and
-            // falls back to the `ParameterSymbol::declType` carried on the
-            // IMPORTED shape (the dep never ships an `ast::ConstructorDecl`,
-            // so the `cd` path is null for an imported ctor and was returning
-            // false unconditionally — which broke every imported convenience
-            // call site, e.g. `WithCounter(6)` from
-            // primary_ctor_direct_new_step2_field_init_3713). Both routes
-            // must agree on the type-class verdict so a single imported
-            // sibling is not rejected on a #3760-motivated check the local
-            // twin would have accepted.
-            auto localParamType = [&](std::size_t pi) -> const sema::TypeRef* {
-                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                    if (pi < cd->params.size() && cd->params[pi].type)
-                        return ctx_.resolvedType(*cd->params[pi].type);
-                }
-                if (pi < cs->params.size()) {
-                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
-                    // Prefer the already-resolved `resolvedDeclType` (filled
-                    // by sema for an inferred-typed lambda param) when
-                    // available; fall back to resolving `declType` (the AST
-                    // type). `ps->declType` is `const ast::Type*` here —
-                    // ParameterSymbol's own field shadows the inherited
-                    // `Symbol::declType` (a `sema::TypeRef*`).
-                    if (ps) {
-                        if (ps->resolvedDeclType) return ps->resolvedDeclType;
-                        if (ps->declType) return ctx_.resolvedType(*ps->declType);
-                    }
-                }
-                return nullptr;
-            };
-            for (std::size_t pi = 0; pi < args.size(); ++pi) {
-                if (!args[pi].value) continue;
-                auto* argTy = ctx_.exprType(*args[pi].value);
-                bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
-                    args[pi].value.get()) != nullptr;
-                int argCls = argIsNull ? 3 : typeClassOf(argTy);
-                auto* paramTy = localParamType(pi);
-                int paramCls = typeClassOf(paramTy);
-                // fix #3760 follow-up: a `null` arg against a NULLABLE param
-                // is a valid match — a `null` literal carries no typeClass
-                // information of its own (sema leaves its exprType either null
-                // or a sentinel), so the previous `argCls=3 vs paramCls=1`
-                // rejection rejected `new B(null)` against `constructor(n:
-                // int?)` even though the parameter clearly admits null. The
-                // param's `nullable` flag is the load-bearing signal: a null
-                // arg → nullable param is fine, null arg → non-nullable param
-                // is rejected (the value-1 nullCls=3 vs the value-1 primitive
-                // mismatch above correctly rejects that). For NAMED class 3
-                // params both nullable and non-nullable are class 3 (the
-                // typeClassOf NAMED branch flattens), so this branch only
-                // narrows the rejection for primitives.
-                if (argIsNull) {
-                    if (paramTy && paramTy->nullable) {
-                        // null → nullable param: accept
-                    } else if (argCls != paramCls) {
-                        return false;
-                    }
-                    continue;
-                }
-                if (argCls != -1 && paramCls != -1 && argCls != paramCls) {
-                    // fix #4046 (§5.1, v0.294): the §5.1 implicit-conversion
-                    // table admits `int` → `float`/`double`/`decimal` (and
-                    // every other integer-typed source → the same three
-                    // floating-class targets — `byte`/`short`/.../ `ulong`/
-                    // `char` all list `float`, `double`, `decimal` as
-                    // implicit destinations), so an integer-typed ARGUMENT
-                    // against a floating-typed PARAMETER is a legal source
-                    // position. The pre-#4046 class-only check rejected it
-                    // (argCls 1 vs paramCls 2), which made `ctorForArgs`
-                    // fall through to `buildRecordValue`'s final
-                    // "no constructor accepts them" arm and let
-                    // `lowerLocalDecl`'s pre-existing #2434 fallback
-                    // silently zero-fill the local — a record's validating
-                    // explicit ctor body never runs, a record whose fields
-                    // would have been initialized with the int literal
-                    // read as zero instead. The fix is a one-directional
-                    // widening: integer → floating is implicit and accepted;
-                    // the reverse (decimal arg against int param) is NOT in
-                    // §5.1's table (would lose information, needs an
-                    // explicit cast) and remains rejected, so the class
-                    // disambiguation #3760 introduced for `this(...)`
-                    // chain-target selection still holds for the float →
-                    // int shape.
-                    if (argCls == 1 && paramCls == 2) {
-                        // int-family arg → float-family param: §5.1 implicit.
+            // fix #4722 (b) (§22.5 "Optional parameters and named arguments"
+            // / §9.3 / §22.6, v0.307): compare each argument against the
+            // parameter it BINDS to, not the parameter at its call-site
+            // index. §22.5 binds a positional argument to the next
+            // positional slot and a named argument to the parameter of that
+            // name, "in any order after positional arguments". The pre-fix
+            // check paired `args[i]` with `params[i]`, so `new P(n := 4,
+            // label := "abc")` against `constructor(label: string, n: int)`
+            // compared the int `4` with `label: string`, rejected the only
+            // candidate sema had accepted, and the `new` failed to lower (or
+            // — through `lowerLocalDecl`'s #2434 fallback — silently
+            // zero-filled the record). A name that matches no parameter, or
+            // a slot bound twice, makes the candidate inapplicable, the same
+            // answer `argsCanFill`/`argsCanFillSymbolic` give.
+            std::vector<std::size_t> boundParam(args.size());
+            {
+                std::vector<bool> filled(args.size(), false);
+                std::size_t pos = 0;
+                for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                    std::size_t idx = args.size();
+                    if (args[ai].name.empty()) {
+                        idx = pos++;
                     } else {
-                        return false;
+                        for (std::size_t j = 0; j < args.size(); ++j)
+                            if (sema::formalParamName(*cs, j) == args[ai].name) {
+                                idx = j;
+                                break;
+                            }
                     }
+                    if (idx >= args.size() || filled[idx]) return false;
+                    filled[idx] = true;
+                    boundParam[ai] = idx;
                 }
+            }
+            // fix #4790: per-slot type check factored into `slotTypeMatches`
+            // above (was inlined here; #3760 / #4046's rules unchanged).
+            for (std::size_t pi = 0; pi < args.size(); ++pi) {
+                if (!slotTypeMatches(cs, boundParam[pi], args[pi])) return false;
             }
             return true;
         };
-        // If exactly one constructor matches by arity, use it directly —
-        // but ONLY after the type check above confirms its params agree
-        // with the call's args (the #3760 fix).
-        if (ctorArityCount(cls, args.size(), exclude) == 1) {
-            if (auto* exact = ctorByArity(cls, args.size(), exclude))
-                return ctorTypeMatches(exact) ? exact : nullptr;
-        }
-        // Multiple constructors with same arity: resolve by LLVM type
-        // matching. Lower each arg, check if the lowered type matches
-        // the constructor's parameter type. Use the sema type of each
-        // arg (ptr for class/string, i32 for int, etc.) to discriminate.
-        if (ctorArityCount(cls, args.size(), exclude) > 1) {
-            // Collect candidate ctors with matching arity.
-            std::vector<sema::ConstructorSymbol*> candidates;
+        // fix #4790 (§22.5 stage 1 + §22.6 stage 3, v0.307): is `cs`
+        // APPLICABLE to `args` when its arity may EXCEED `args.size()` (the
+        // rest defaulted)? Every argument must bind to a distinct slot (the
+        // same rule `argsCanFillSymbolic`/`argsCanFill` check), every unbound
+        // slot must have a default, and every BOUND slot's argument must
+        // type-match (`slotTypeMatches` above) — the rule sema's own
+        // `bindArgsToParams` + `resolveOverload` pipeline applies
+        // (ExprTypecheck_Calls.cpp). Before this fix the defaulted-candidate
+        // search (the trailing loop below) checked binding only, so a
+        // same-named, WRONG-typed candidate at a DIFFERENT arity could shadow
+        // an applicable defaulted sibling (silent zero-fill, #4790 repro A:
+        // `new C(x := 5)` against `constructor(x: string)` beside
+        // `constructor(x: int, y: int := 0)`) or, with three equal-arity
+        // siblings, get selected outright over the correct one (IR-verifier
+        // failure, #4790 repro D).
+        auto ctorApplicableWithDefaults =
+                [&](sema::ConstructorSymbol* cs) -> bool {
+            const std::size_t n = sema::formalParamCount(*cs);
+            std::vector<int> argForSlot(n, -1);
+            std::vector<bool> filled(n, false);
+            std::size_t pos = 0;
+            for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                std::size_t idx;
+                if (args[ai].name.empty()) {
+                    if (pos >= n) return false;
+                    idx = pos++;
+                } else {
+                    idx = n;
+                    for (std::size_t j = 0; j < n; ++j)
+                        if (sema::formalParamName(*cs, j) == args[ai].name) {
+                            idx = j;
+                            break;
+                        }
+                    if (idx >= n) return false;
+                }
+                if (filled[idx]) return false;
+                filled[idx] = true;
+                argForSlot[idx] = static_cast<int>(ai);
+            }
+            for (std::size_t j = 0; j < n; ++j)
+                if (!filled[j] && !sema::formalParamHasDefault(*cs, j))
+                    return false;
+            for (std::size_t j = 0; j < n; ++j) {
+                if (argForSlot[j] < 0) continue;  // defaulted: nothing supplied
+                if (!slotTypeMatches(
+                        cs, j, args[static_cast<std::size_t>(argForSlot[j])]))
+                    return false;
+            }
+            return true;
+        };
+        // fix #4790 rework (§22.10 / §22.5, v0.307): is the §22.10 PRIMARY
+        // constructor applicable to `args` at the strict tier? Bound like
+        // `ctorApplicableWithDefaults` over the positional-field view
+        // (`recordPositionalFieldSymbols`, both sources — a local `posParam`
+        // or #2516's synthetic imported one), each bound slot type-checked
+        // against `storageComponentType` (null → unknown → admitted).
+        auto primaryStrictlyApplicable = [&]() -> bool {
+            // fix #4924 (§22.3, v0.307): a primary parameter is never
+            // `ref`/`out`, so under a chain call a `ref`/`out` argument makes
+            // the primary inapplicable — the modifier-free primary list
+            // #4905's sema check matches against. Checked over EVERY argument
+            // up front: both bind-primary exits (the #4852 short-circuit in
+            // `searchOnce` and the post-strict check below it) go through this
+            // lambda, and with a defaulted tail on the explicit sibling
+            // (`constructor(ref y: int, k: int := 7)` vs `class B(p: int)`) the
+            // `ref` argument is otherwise bound to slot `p` and type-matches.
+            if (chainCall)
+                for (const ast::CallArgument& a : args)
+                    if (!sema::callSiteRefOutMatches(a.modifier, ""))
+                        return false;
+            const std::vector<const sema::Symbol*> pf =
+                sema::recordPositionalFieldSymbols(cls);
+            const std::size_t n = pf.size();
+            auto paramOf = [&](std::size_t j) -> const ast::Param* {
+                auto* fs = dynamic_cast<const sema::FieldSymbol*>(pf[j]);
+                return fs ? fs->posParam : nullptr;
+            };
+            std::vector<int> argForSlot(n, -1);
+            std::size_t pos = 0;
+            for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                std::size_t idx = n;
+                if (args[ai].name.empty()) {
+                    idx = pos++;
+                } else {
+                    for (std::size_t j = 0; j < n; ++j)
+                        if (pf[j] && pf[j]->name == args[ai].name) {
+                            idx = j;
+                            break;
+                        }
+                }
+                if (idx >= n || argForSlot[idx] >= 0) return false;
+                argForSlot[idx] = static_cast<int>(ai);
+            }
+            for (std::size_t j = 0; j < n; ++j) {
+                if (argForSlot[j] >= 0) {
+                    const std::size_t ai = static_cast<std::size_t>(argForSlot[j]);
+                    if (!argMatchesParamType(
+                            args[ai].value.get(),
+                            pf[j] ? sema::storageComponentType(pf[j], ctx_)
+                                  : nullptr))
+                        return false;
+                    continue;
+                }
+                const ast::Param* pp = paramOf(j);
+                if (!pp || (!pp->defaultValue && pp->defaultText.empty()))
+                    return false;
+            }
+            return true;
+        };
+        // fix #4790 rework: ONE search, run up to twice (strict, then
+        // relaxed — see `relaxedPass` above). Its three arms are unchanged.
+        auto searchOnce = [&]() -> sema::ConstructorSymbol* {
+            // If exactly one constructor matches by arity, use it directly —
+            // but ONLY after the type check above confirms its params agree
+            // with the call's args (the #3760 fix).
+            //
+            // fix #4779 (§22.5 "Optional parameters and named arguments" / §22.6
+            // stage 1, v0.307): an equal-arity candidate is not thereby
+            // applicable. A named argument that names none of its parameters
+            // leaves it INAPPLICABLE — §22.5 binding precedes arity-equal type
+            // matching — so resolution continues to the defaulted candidates in
+            // the fill loop below.
+            //
+            // fix #4790 (§22.5 / §22.6 stages 1 + 3, v0.307): #4779 still kept
+            // #3760's null for a candidate whose names DO bind but whose type
+            // classes disagree, returning IMMEDIATELY instead of continuing —
+            // which was wrong whenever a DEFAULTED sibling also binds these
+            // names: `new C(x := 5)` against `constructor(x: string)` beside
+            // `constructor(x: int, y: int := 0)` bound `x` to the arity-1
+            // sibling's own `x` (names agree), failed the type check (int vs
+            // string), and returned null right here — the `new` silently
+            // zero-filled the object, never reaching the applicable defaulted
+            // sibling below. A type mismatch now ALWAYS falls through, whether or
+            // not the names bind, to the search below — which applies the
+            // IDENTICAL type check (`ctorApplicableWithDefaults`) to every other
+            // candidate, so the #3760 self-chain scenario (no OTHER candidate
+            // applies either) still ends in null, exactly as before.
+            if (ctorArityCount(cls, args.size(), exclude) == 1) {
+                if (auto* exact = ctorByArity(cls, args.size(), exclude)) {
+                    if (ctorTypeMatches(exact)) return exact;
+                }
+            }
+            // Multiple constructors with same arity: resolve by LLVM type
+            // matching. Lower each arg, check if the lowered type matches
+            // the constructor's parameter type. Use the sema type of each
+            // arg (ptr for class/string, i32 for int, etc.) to discriminate.
+            if (ctorArityCount(cls, args.size(), exclude) > 1) {
+                // Collect candidate ctors with matching arity.
+                std::vector<sema::ConstructorSymbol*> candidates;
+                for (sema::Symbol* m : cls->members) {
+                    auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic || cs == exclude) continue;
+                    if (cs->params.size() == args.size()) candidates.push_back(cs);
+                }
+                // For each candidate, check if positional arg sema types are
+                // compatible with param sema types. The same `ctorTypeMatches`
+                // helper the ==1 arm uses (#3760) — sharing keeps the two paths
+                // from drifting on what "type match" means.
+                //
+                // fix #5081 (§22.3 / §22.6, v0.307): enforce ref/out
+                // applicability here too (`enforceRefOutAtNewSite`, see the
+                // declaration above) — a `new`-site call with 2+ same-arity
+                // explicit candidates reaches this arm only when sema
+                // declined to resolve it, so this loop is the only ranking
+                // that ever runs for it. Pre-fix it ignored ref/out entirely,
+                // so `new J(ref n, 6)` against `constructor(ref y: int, x:
+                // int)` / `constructor(y: long, x: int)` picked whichever
+                // candidate's TYPES matched first by declaration order
+                // (`V6,3` with the value ctor declared first, `R6,3` with it
+                // declared second) — silent wrong code, since only the `ref`
+                // candidate is ever applicable to a `ref`-modified argument.
+                enforceRefOutAtNewSite = true;
+                sema::ConstructorSymbol* refOutRanked = nullptr;
+                for (auto* cs : candidates) {
+                    if (ctorTypeMatches(cs)) { refOutRanked = cs; break; }
+                }
+                enforceRefOutAtNewSite = false;
+                if (refOutRanked) return refOutRanked;
+                // fix #4790 (§22.5 / §22.6 stage 3, v0.307): #4779's own
+                // fallback here — "first candidate that binds by NAME" — is
+                // REMOVED. It had the identical defect the ==1 arm had above:
+                // binding without a type check. Three equal-arity siblings
+                // `(z: int)`, `(x: string)`, and (at a DIFFERENT arity)
+                // `(x: int, y: int := 0)`: `new C(x := 5)` fell through both
+                // loops above (no perfect type match at arity 1) and this
+                // fallback adopted `(x: string)` — binds `x` by name, but the
+                // caller passed an `int` — which the caller then lowered as if
+                // it were a `string` slot: `bezelc: codegen error: IR
+                // verification failed` (repro D). No fallback belongs here at
+                // all: resolution falls through to the defaulted-fill search
+                // below, which performs the SAME name-binding test this fallback
+                // did (`ctorApplicableWithDefaults`) PLUS the type check it
+                // lacked.
+            }
+            // fix #4852 (§22.6 "defaulted-arity tie-break", v0.307): the loop
+            // just below is the ONLY one of `searchOnce`'s three arms that can
+            // select a candidate which fills one or more §22.5 defaults — the
+            // ==1 and >1 arms above only ever return a candidate whose OWN
+            // arity equals `args.size()` exactly, so they fill none. When the
+            // class also has a §22.10 primary constructor whose own arity
+            // equals `args.size()` exactly (so it fills no default either) and
+            // which is strictly applicable, §22.6's tie-break prefers the
+            // primary over anything this loop could only reach by filling a
+            // default — it is trivially "better-or-equal at every
+            // supplied-argument position" since it needs none of them
+            // defaulted. Consulting `primaryStrictlyApplicable` only after
+            // `searchOnce()` returns null (as the #4790 rework originally had
+            // it, further down in `ctorForArgs`) never reaches this rule once
+            // this loop already has a defaulted hit in hand: `class C(x:
+            // int)` with `constructor(x: int, k: int := 7) this(x + 100);` —
+            // `new C(5)` reached this loop, matched the sibling via
+            // `ctorApplicableWithDefaults` (k defaulted), and returned it,
+            // printing 105 where the primary's 5 is correct (#4852). This also
+            // corrects the identical mis-selection when no OTHER sibling is
+            // present (`ctorArityCount` never even reaches 1, so only this
+            // loop ever runs) — a pre-existing instance of the same gap; see
+            // #4838 (record primary vs. body ctor).
+            if (cls->hasPositionalFields &&
+                sema::recordPositionalFieldSymbols(cls).size() ==
+                    args.size() &&
+                primaryStrictlyApplicable())
+                return nullptr;
             for (sema::Symbol* m : cls->members) {
                 auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-                if (!cs || cs->isStatic || cs == exclude) continue;
-                if (cs->params.size() == args.size()) candidates.push_back(cs);
+                if (!cs || cs->isStatic || cs == exclude) continue;  // fix #3777
+                // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
+                // <ast::ConstructorDecl*>` gate made this fallback unreachable for
+                // every IMPORTED constructor (the #2374 shape — the dep never
+                // ships the AST), so an imported constructor with a default
+                // parameter, called with fewer arguments, returned null here and
+                // the ctor-arg call was never emitted. Lift the gate: a local
+                // ctor still uses the AST-level `argsCanFill` (its `cd->params`
+                // carries the real `ast::Expr` defaults, which a `Param`-list
+                // binder can reference); an imported ctor uses the
+                // `ParameterSymbol`-level predicate `formalParamHasDefault` over
+                // `argsCanFillSymbolic`, the per-slot counterpart that reads
+                // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
+                // off the wire). Both rules admit an omitted trailing default
+                // and reject every other shape the same way the call site does.
+                //
+                // fix #4790 (§22.5 / §22.6 stage 3, v0.307): `argsCanFill`/
+                // `argsCanFillSymbolic` alone answer only §22.5 binding —
+                // whether names/positions fill every slot with the rest
+                // defaulted. Neither ever checked whether a BOUND slot's
+                // argument type-matches, so a same-named, wrong-typed candidate
+                // passed this gate exactly like one that both binds AND
+                // type-matches (#4790's repro A/D — see `ctorApplicableWithDefaults`
+                // above). ANDing it in re-derives the identical §22.5 binding (so
+                // this loop's verdict is unchanged for any candidate the bind
+                // check alone already rejected) and adds the §22.6 stage-3 check
+                // `ctorTypeMatches` already applies at exact arity.
+                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                    if (argsCanFill(cd->params, args) &&
+                        ctorApplicableWithDefaults(cs))
+                        return cs;
+                    continue;
+                }
+                if (argsCanFillSymbolic(*cs, args) &&
+                    ctorApplicableWithDefaults(cs))
+                    return cs;
             }
-            // For each candidate, check if positional arg sema types are
-            // compatible with param sema types. The same `ctorTypeMatches`
-            // helper the ==1 arm uses (#3760) — sharing keeps the two paths
-            // from drifting on what "type match" means.
-            for (auto* cs : candidates) {
-                if (ctorTypeMatches(cs)) return cs;
-            }
-            // No perfect type match — fall back to first by arity.
-            return candidates.empty() ? nullptr : candidates[0];
+            return nullptr;
+        };
+        // fix #4853: the `Exact` and `NoNarrow` tiers are skipped for a `new`
+        // site whose arguments carry a call-site `ref`/`out` (or a discard):
+        // those modifiers are checked per slot only for a chain call
+        // (`slotTypeMatches`, #4924; the `new`-site half awaits #4949), so a
+        // tier that preferred a type-exact candidate could newly prefer one
+        // whose modifiers do not match. Such a call keeps the pre-#4853 pick.
+        bool anyModifier = false;
+        for (const ast::CallArgument& a : args)
+            if (!a.modifier.empty() || a.isDiscard) anyModifier = true;
+        for (Tier t : {Tier::Exact, Tier::NoNarrow, Tier::Proxy}) {
+            if (t != Tier::Proxy && anyModifier && !chainCall) continue;
+            tier = t;
+            if (sema::ConstructorSymbol* hit = searchOnce()) return hit;
+            // fix #4790 rework (§22.10 / §22.6 stage 5, v0.307): for a class
+            // with a §22.10 primary constructor a null result MEANS "the call
+            // binds the primary" (`directPrimaryNew`, `emitChainCall`'s
+            // primary arm) — the primary has no `ConstructorSymbol` of its
+            // own. When the primary is applicable to these arguments at the
+            // STRICT tier, it outranks any explicit constructor the relaxed
+            // pass could only reach through a boxing conversion (§22.6 stage 5
+            // exact-match preference), so the strict null stands. fix #4853:
+            // the same holds tier by tier — a primary exact where every
+            // explicit candidate converts wins at the `Exact` tier.
+            if (cls->hasPositionalFields && primaryStrictlyApplicable())
+                return nullptr;
         }
-        for (sema::Symbol* m : cls->members) {
-            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-            if (!cs || cs->isStatic || cs == exclude) continue;  // fix #3777
-            // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
-            // <ast::ConstructorDecl*>` gate made this fallback unreachable for
-            // every IMPORTED constructor (the #2374 shape — the dep never
-            // ships the AST), so an imported constructor with a default
-            // parameter, called with fewer arguments, returned null here and
-            // the ctor-arg call was never emitted. Lift the gate: a local
-            // ctor still uses the AST-level `argsCanFill` (its `cd->params`
-            // carries the real `ast::Expr` defaults, which a `Param`-list
-            // binder can reference); an imported ctor uses the
-            // `ParameterSymbol`-level predicate `formalParamHasDefault` over
-            // `argsCanFillSymbolic`, the per-slot counterpart that reads
-            // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
-            // off the wire). Both rules admit an omitted trailing default
-            // and reject every other shape the same way the call site does.
-            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                if (argsCanFill(cd->params, args)) return cs;
-                continue;
-            }
-            if (argsCanFillSymbolic(*cs, args)) return cs;
-        }
-        return nullptr;
+        tier = Tier::Proxy;
+        relaxedPass = true;
+        sema::ConstructorSymbol* relaxed = searchOnce();
+        relaxedPass = false;
+        return relaxed;
     }
 
     // fix #3777 (§22.5 / §22.8 step 1 / §12.8 / §22.10, v0.286): fill the
@@ -13893,6 +15494,24 @@ private:
                              bool coerceNumericDefaults,
                              std::vector<llvm::Value*>& args,
                              bool* outIsLocal);
+
+    // fix #4550 (§22.5 / §22.8 step 1 / §22.10, v0.306): the PER-SLOT face of
+    // the fill above, and its body — `fillOmittedCtorArgs` is now a thin
+    // trailing-run wrapper over it, so "what value does an omitted parameter
+    // take" still has exactly one answer in the emitter (CLAUDE.md §6).
+    //
+    // `ordered` is the call's arguments IN PARAMETER ORDER, sized
+    // `target.params.size()`, with a null at every slot §22.5 leaves to its
+    // default; this fills those slots in place. The trailing wrapper cannot
+    // serve a call whose omitted slots are a HOLE rather than a tail, which is
+    // exactly what a NAMED inheritance clause omitting a defaulted parameter
+    // produces (`: B(k := 3)` against `constructor(a: int := 1, k: int)`).
+    // Same contract otherwise: false = an omitted slot declares no default or
+    // its default failed to lower, and the caller abandons the call.
+    bool fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
+                              llvm::FunctionType* fnTy,
+                              bool coerceNumericDefaults,
+                              std::vector<llvm::Value*>& ordered);
 
     // CG16: emit a resolved chain call with `this` + lowered arguments.
     void emitChainCall(const ast::CallExpr* call, bool isThis,
@@ -14796,6 +16415,16 @@ private:
     // record field)? Only such a location owns an independent +1 released on the
     // owner's disposal — see lowerStringFieldStore / emitOwnedFieldDisposals.
     bool isStringFieldLvalue(const ast::Expr& target);
+    // fix #4965 (§4.6 / §28.9 / §14.1): the substitution-only twin of
+    // isStringFieldLvalue — `target` is a CLASS instance field / auto-property
+    // lvalue whose use-site type is a bare type parameter the ACTIVE
+    // substitution binds to `string` (a store inside a generic body lowered at
+    // `string`). Mutually exclusive with isStringFieldLvalue (that one requires
+    // the sema type itself to be `string`). See isTypeParamBoundToString for
+    // the retain-new / keep-old policy such a store follows.
+    bool isTypeParamStringFieldLvalue(const ast::Expr& target);
+    // fix #4965: the class-field-storage half of the two predicates above.
+    bool isClassFieldStorageLvalue(const ast::Expr& target);
     // #429 / §4.6 / §28.9: REASSIGNMENT `x := newVal` where `x` is a string-typed
     // LOCAL/parameter SLOT. Retain-new (transfer a producer) / store / release-
     // old, so the slot keeps owning an independent +1 across the reassignment and
@@ -15043,6 +16672,21 @@ private:
                                    llvm::Type* elemTy, llvm::Value* newVal,
                                    const ast::Expr* valueExpr);
 
+    // fix #4227 (captured-cell twin of lowerClosureLocalReassign): reassign
+    // a closure-typed local that IS ITSELF a captured cell (declared in an
+    // outer scope, written from inside the capturing lambda body). Mirrors
+    // lowerClosureLocalReassign but for the captured-cell path — no
+    // localSlot() gate (the cell slot lives in the outer scope, not the
+    // current function's locals_) and no currentFn_ == closureReleaseEligibleFn_
+    // gate (the analyzed function differs from the lowering function). The
+    // cell itself owns a +1 on its current value; reassignment must release
+    // the displaced value before storing the new one.
+    bool lowerCapturedClosureLocalReassign(const ast::Expr& target,
+                                          llvm::Value* cellAddr,
+                                          llvm::Type* elemTy,
+                                          llvm::Value* newVal,
+                                          const ast::Expr* valueExpr);
+
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
     // once by a codegen-internal +1 producer (a lambda expression or a method
@@ -15072,6 +16716,51 @@ private:
     // — every entry it holds is, by construction, one of THIS scan's own
     // candidates.
     std::unordered_set<const void*> closureLocalCandidates_;
+    // fix #4422 (§27.5, v0.298): closure-typed locals that were reassigned
+    // via lowerClosureLocalReassign. For these locals, the scope-end release
+    // is suppressed (ClosureEscapeWalker marks any reassigned local as escaped),
+    // so the slot's final value is never released unless the call site emits
+    // a release. Tracked so the LocalSymbol arm in emitClosureCall can emit
+    // emitClosureRelease only for reassigned locals, avoiding a double-release
+    // for non-reassigned locals (whose scope-end release is already correct).
+    std::unordered_set<const void*> closureLocalReassigned_;
+    // fix #4434 (§27.5 / §28.9, v0.298): closure-typed locals whose slot is
+    // captured by a downstream lambda (the slot lives in `cellVars_` — a heap
+    // cell, not a bare ptr). The envdtor's release is the sole owner of the
+    // cell's lifetime for these locals. Three-path release discipline:
+    //   (a) NOT reassigned: existing path (cell-free in scope-end disposal
+    //       registers normally; envdtor's release is what fires).
+    //   (b) reassigned AND captured-cell: SKIP call-site release in
+    //       emitClosureCall's LocalSymbol arm (envdtor's release is sole
+    //       owner — a call-site release here would over-release the cell)
+    //       AND SKIP the scope-end `boxedCellFree` registration in
+    //       consumeLastLambdaCapturedCells (the envdtor is the only owner;
+    //       scope-end would double-free alongside it).
+    //   (c) reassigned AND plain (not captured-cell): existing #4422
+    //       call-site discipline — first call emits release, multi-call
+    //       arms scope-end release and skips call-site (the lane-34 gate).
+    // `closureLocalCapturedCellReassigned_` is the subset of this set whose
+    // decl was ALSO observed reassigned by the walker — that pair is the
+    // condition consumeLastLambdaCapturedCells consults to skip its cell-
+    // free registration (a non-reassigned captured-cell local still needs
+    // its scope-end cell-free — the envdtor is the only OTHER owner, but
+    // without an over-count from the reassign's lowerCapturedClosureLocal
+    // Reassign).
+    std::unordered_set<const void*> closureLocalCapturedCell_;
+    std::unordered_set<const void*> closureLocalCapturedCellReassigned_;
+    // fix #4434 (§27.5 / §28.9, v0.298): per-slot call-counter for the
+    // LocalSymbol arm in `emitClosureCall`. Counts how many times this arm
+    // has fired for a given slot in the CURRENT scope; combined with the
+    // walker's three-path classification (`closureLocalCapturedCell_` +
+    // `closureLocalReassigned_` + `closureReleaseEligible_`) the arm
+    // implements the "call-site release fires at most once" discipline. The
+    // counter is reset at every scope boundary — see the lowerScopedBlock /
+    // lowerLambda save/restore sites — so a closure local called in two
+    // distinct inner scopes still gets exactly one call-site release per
+    // scope (matching the existing pre-#4434 single-release contract for
+    // the captured-cell path: each scope that uses the slot is responsible
+    // for its own +1, the envdtor only handles the OUTER scope's).
+    std::unordered_map<const void*, int> closureLocalCallCounts_;
     // fix #2714 (§27.5 / §28.9, v0.286): parallel borrow-side sets — see
     // `collectClosureReleaseEligible` (the .cpp) for the rationale. The
     // `closureBorrowAll_` member holds EVERY borrow-initialized closure-typed
@@ -15106,6 +16795,15 @@ private:
                                  llvm::AllocaInst* slot, llvm::Value* v);
     // Compute closureReleaseEligible_ for a block body (see the .cpp).
     void collectClosureReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #4434 (§27.5 / §28.9, v0.298): see the .cpp definition for the
+    // full rationale — captured-cell classification runs ONCE per function
+    // body at function entry and is NOT re-run from `lowerLambda` (the way
+    // `collectClosureReleaseEligible` is). The function-entry-only contract
+    // is the load-bearing invariant that lets `consumeLastLambdaCapturedCells`
+    // observe the OWNING scope's verdict when a nested lambda's body lowers
+    // its captures into disposeStack_.
+    void collectCapturedCellClosureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // True if `init` is a codegen-internal +1 closure producer: a LambdaExpr, or
     // a bare/qualified method reference (an IdentifierExpr / MemberAccessExpr
@@ -15149,6 +16847,92 @@ private:
     // sidecar bit has no reserved frame field; that shape remains conservatively
     // leaked rather than reading an uninitialized bit after resume.
     std::unordered_set<const void*> boxReassignedLocals_;
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): locals whose slot PROVABLY
+    // holds, for the whole of their scope, exactly the §8.6 box minted at
+    // their own initializer — `isPlusOneBoxProducer` AND SLOT-NEVER-WRITTEN
+    // (no assignment, no increment, no `ref`/`out` alias, including from
+    // inside a lambda body).
+    //
+    // ⚠ SLOT-NEVER-WRITTEN IS NOT "NON-ESCAPING", and the difference is the
+    // whole point of `slotWriteMode`. This set DOES contain locals that
+    // escape — `var o: Object := 7; Store(o); … o.Equals(q);` puts `o` here
+    // even though `boxReleaseEligible_` rejects it — because an escape does
+    // not change what the SLOT holds, and what the slot holds is the entire
+    // receiver-side claim. Non-escaping is the property one would cite to
+    // justify RELEASING `o`; it is emphatically not what this set carries, and
+    // reading it that way would license a release this set does not support.
+    //
+    // WHAT IT LICENSES. Such a local's runtime word 0 is a BOX VTABLE, and
+    // every box vtable's `kEqualsSlot` is filled by LlvmBackend_Setup with a
+    // compiler-generated thunk (`bz$box$eq`, `bz$boxeq$<T>`, and the
+    // inline-array / range / span variants). None of those thunks stores
+    // `other`: they read its word 0 and payload and return an `i1`. So for
+    // `knownBox.Equals(x)` the ARGUMENT is a call-bounded borrow — §8.6's own
+    // reading of a member call on a box ("it borrows the payload for the
+    // call's duration") applied to the other operand — and the argument's box
+    // needs no escape suppression.
+    //
+    // ⚠ THE INVARIANT IS "THE USER METHOD NEVER RECEIVES THE BOX POINTER",
+    // NOT "no user method is reachable". The blunter phrasing is false:
+    // `boxRecordEqualsThunkCore`'s ENUM arm calls `emitEnumEquals`, which
+    // DOES dispatch a user-declared `Equals(E)` from the boxed path. What
+    // makes that safe is a narrower gate in a DIFFERENT function — the
+    // `selfTy->isIntegerTy() && otherTy->isIntegerTy()` test in
+    // `emitEnumEquals` (LlvmBackend_Setup.cpp) — which passes the unboxed
+    // integer payload and DECLINES any `Object?`-signature override, leaving
+    // it to the default. A change that relaxed that gate (the adjacent
+    // "declares user equality" rescue is openly contemplated at the
+    // choice-vtable site) would hand a user body the box pointer and
+    // invalidate this relaxation, and no executable ratchet ties the two
+    // together — so anyone touching `emitEnumEquals`'s parameter test must
+    // re-read this.
+    //
+    // WARNING The receiver's box-ness is LOAD-BEARING, and is exactly what
+    // #3480's measured UAF turns on: when the receiver is a user CLASS
+    // reference the vtable slot holds the user's override, which the spec
+    // (v0.306, §28.14's *deliberate asymmetry* paragraph — which refers to
+    // §28.3's borrowed-field rule: "a parameter-sourced object borrow may be
+    // stored into a field under §28.3's borrowed-field rule — a structural
+    // check whose residual is the caller's trust") lets store its borrowed
+    // `Object?` parameter into a field taking no `bz_box_retain` — an
+    // ADMITTED program in which any caller-side release is a use-after-free.
+    // That case is not in this set and keeps its conservative leak.
+    std::unordered_set<const void*> pureBoxBindings_;
+
+    // fix #3447 (§8.6 / §8.3 / §28.9, v0.306): is `recv` an expression whose
+    // runtime value is provably a §8.6 box — so that §8.1's universal
+    // `Equals` on it necessarily dispatches to a compiler-generated
+    // box-equals thunk, which borrows its argument for the call's duration
+    // and stores nothing? Two shapes answer yes; anything else fails closed,
+    // which costs a bounded leak and never a use-after-free.
+    bool knownBoxReceiverShape(const ast::Expr* recv, bool allowPureBinding) {
+        if (!recv) return false;
+        // (a) a local whose slot provably holds the box its own initializer
+        //     minted (see `pureBoxBindings_`).
+        if (allowPureBinding)
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+                if (auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    if (loc->decl &&
+                        pureBoxBindings_.count(
+                            static_cast<const void*>(loc->decl)))
+                        return true;
+        // (b) a receiver whose STATIC type is a boxable value type. §8.1's
+        //     universal `Equals` on such a receiver is answered by this
+        //     backend boxing the receiver ITSELF
+        //     (`lowerValueSemUniversalEquals`: "Boxing both sides and
+        //     dispatching is not a workaround, it is §8.1's own model"), from
+        //     a statically-known `recvTy` — so the vtable the dispatch reads
+        //     is `boxVtableFor(recvTy)` BY CONSTRUCTION, with no analysis at
+        //     all, and its `kEqualsSlot` is the same family of compiler
+        //     thunks. Arm (b) is inert at `lowerUniversalEqualsDispatch`'s
+        //     three sites (their receivers are Object/interface/class by
+        //     construction); it exists for the escape walker, where it is the
+        //     twin of #3447's own relaxation for the shape
+        //     `record.Equals(<Object local>)`.
+        const sema::TypeRef* rt = ctx_.exprType(*recv);
+        return rt && (isBoxableValueType(rt) || isNullableValueTy(rt));
+    }
 
     // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): every LocalDecl
     // that is REASSIGNED by a statement-level `AssignmentStmt` in the current
@@ -15483,6 +17267,26 @@ private:
     // already uses: without it one syntactic lambda node inside a loop makes N
     // closures over one guarded cell and N envdtors would free it N times.
     std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+    // fix #4210 (§27.5 / §28.9, v0.298): the set of all captured entities
+    // (DeclSymbol* / ParameterSymbol*) that ANY escaping lambda captures.
+    // Populated by collectCellFreeEligible; guards the boxedCellFree arming
+    // condition to prevent double-free when an escaping lambda also captures
+    // the same local as a non-escaping lambda.
+    std::unordered_set<const void*> declsCapturedByEscaping_;
+    // fix #4523 (§27.5 / §28.9, v0.306): #4509's `nestedWidenedCellKeys_` set
+    // is GONE, not moved. It existed to DECLINE a §27.5/#1135 nested-widened
+    // cell on the stated ground that "a capture site inside a NESTED lambda
+    // body runs with `currentFn_` set to the inner function, where the
+    // classification is short-circuited", so such an env would hold the cell
+    // uncounted. That ground was false — `cellFreeEligibleFn_` is set to the
+    // lambda's own function before its body is lowered
+    // (LlvmBackend_Exprs2.cpp), so `currentFn_ == cellFreeEligibleFn_` HOLDS
+    // there and the classification runs. What the set actually masked was the
+    // wrong-body `disposeStack_` index #4523 fixes. With the frame's release
+    // gated on `declScopeDepthFn_`, a nested holder RETAINS like any other and
+    // needs no `disposeStack_` entry, so there is nothing left to decline —
+    // and one question (may this cell be counted?) is answered in one place
+    // instead of two.
     // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
     bool isSharedCellEnvdtorFreeOwner(const void* key,
                                       const ast::LambdaExpr* lam) const {
@@ -15491,8 +17295,29 @@ private:
                it->second == static_cast<const void*>(lam);
     }
     // Compute cellFreeEligible_ for a block body (see the .cpp).
+    //
+    // fix #4524 (§27.5 / §28.9, v0.306): `ownLambda` is non-null exactly when
+    // `body` is a NESTED LAMBDA's own body being re-scanned (lowerLambda /
+    // emitAsyncLambda), and null for a true function frame (method, ctor,
+    // destructor, async resume, iterator moveNext). It gates the #3426
+    // sole-out-of-frame-holder ELECTION, whose soundness argument is an
+    // argument about ONE FRAME: "every non-escaping co-capturer's env is
+    // released at a scope end inside THIS frame; the escaping holder's env
+    // dies strictly after THIS frame is gone; therefore its envdtor is the
+    // cell's last reader." That reasoning only speaks about the cell's
+    // lifetime when THIS frame is the frame that ALLOCATES the cell — i.e.
+    // the frame that declares the local / binds the parameter. A nested
+    // lambda's rescan sees only its own body, so it cannot know how many
+    // times the ANCESTOR frame that owns the cell invokes it: each
+    // invocation mints its own "sole" holder over the SAME cell, and each
+    // holder's envdtor frees it (#4524's measured heap-use-after-free, and
+    // a double-free once the read is removed). A key the walked body does
+    // not itself bind therefore gets NO election here — the declaring
+    // frame's own answer reaches this body through the #3804 ancestor merge,
+    // which is exactly what that merge exists for.
     void collectCellFreeEligible(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LambdaExpr* ownLambda = nullptr);
     // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): the SINGLE authority
     // answering "does calling local L (bound `var/const L := lambda() =>
     // …`) transparently and exclusively produce one specific nested
@@ -15565,6 +17390,19 @@ private:
     // boxForTarget) and methods that sometimes return class references.
     // Parallel to isUserMethodClosureReturnCall for closures.
     bool isUserMethodBoxReturnCall(const ast::Expr* init) const;
+
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): true when `init` is a READ of
+    // a user-defined, locally-compiled, NON-VIRTUAL property whose declared
+    // type is Object or an interface AND whose getter body provably always
+    // produces a boxable value source — so `boxForTarget` at the getter's
+    // return edge always mints a fresh rc=1 box the read hands back. The
+    // property twin of `isUserMethodBoxReturnCall`; see
+    // `boxReturnPropertyMemo_` for the §28.9 warrant. Non-virtual is
+    // LOAD-BEARING: an override could return a class reference through the
+    // same `Object` face, and releasing THAT as a box is a UAF, not a leak.
+    bool isUserPropertyBoxRead(const ast::Expr* init);
+    // Uncached core of isUserPropertyBoxRead (memoized by it).
+    bool computeIsBoxReturnProperty(const sema::PropertySymbol* ps);
 
     // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: true when `target` is
     // an Object- or interface-typed CLASS instance field / auto-property lvalue
@@ -15693,6 +17531,33 @@ private:
     // are lowered. A call to such a method is recognized as a +1 box producer
     // by isUserMethodBoxReturnCall / isPlusOneBoxProducer.
     std::unordered_set<const sema::MethodSymbol*> boxReturnMethods_;
+
+    // fix #2760 (§8.6 / §28.9 / §23.3, v0.306): the PROPERTY analogue of
+    // `boxReturnMethods_`, memoized per PropertySymbol. §28.9's *Accessor
+    // faces are uniform across type kinds* paragraph settles the question
+    // #2760 asked ("ruling needed before implementing"): an `Object`-typed
+    // getter whose body produces a fresh runtime-managed value "remains
+    // admissible ... and the implementation reclaims the production; how is
+    // not specified" — so the shape is legal and the leak is a defect, and
+    // the SAME sentence makes the two body spellings of §23.3 (`get => e`
+    // and `get => do ... end`) "semantically indistinguishable at every read
+    // site", which is why one predicate covers both. The box the getter mints
+    // at its return edge is therefore discharged by the READER'S BINDING at
+    // that binding's release point, exactly as a `boxReturnMethods_` call's
+    // is — no obligation reaches user code, per the same paragraph's
+    // "a getter never transfers a reclamation obligation to its reader".
+    //
+    // ⚠ SCOPE: this predicate is consulted from `boxLocalAssignmentSourceKind`
+    // only, so it closes the BOUND face. At an unbound type-test site
+    // (`if h.O is int then`) `lowerTypeTest`'s `freshBoxTemp` still asks
+    // `lastBoxMint_ || isUserMethodBoxReturnCall`, which the INLINED
+    // expression-body form satisfies by mint identity and the compiled
+    // block-body form cannot — measured 4800 B / 200 for the block form,
+    // clean for the expression form. The two §23.3 spellings therefore still
+    // diverge there; that residual is tracked as issue #4497 rather than
+    // claimed closed here.
+    // Value: true = every getter exit produces a fresh +1 box.
+    std::unordered_map<const sema::PropertySymbol*, bool> boxReturnPropertyMemo_;
     // Scan all MethodDecl bodies to populate boxReturnMethods_. A method is a
     // "box return method" if its declared return type is Object/interface,
     // it is locally compiled (not imported), and every ReturnStmt in its body
@@ -15740,6 +17605,47 @@ private:
     // we know can never hold a class instance. Called once from run() before
     // the method-body emission loop.
     void collectBoxStorageFields();
+
+    // fix #4277 (§9.7 "Records and disposal" / §28.9 "Runtime-managed types" /
+    // §13.2 "Top-level types" / §23.1 "Auto-properties", v0.306): the ONE
+    // question the #4253 class-field record-string release walk has to answer
+    // — "is this field's OWN declaration initializer the SOLE store its slot
+    // ever receives, for every instance, for the whole program?".
+    //
+    // #4253 answered it with THREE structural PROXIES — `sealed` on the
+    // declaring class, `!hasAnyConstructor(ts)`, `readonly` on the member —
+    // each a coarse stand-in for "nothing else can write here", and each
+    // over-rejecting on its own axis (#4277). This pair replaces all three
+    // with the question itself: a module-wide WRITE-SITE scan (the same shape
+    // `collectBoxStorageFields` above already uses to prove "every store to
+    // this field is boxable", reused rather than re-derived) plus the
+    // cross-module reachability argument that makes that scan COMPLETE.
+    //
+    // `recordFieldWritten_` holds, for every write site the scan found, BOTH
+    // the written `sema::Symbol*` and that symbol's `ast::Node* decl` — the
+    // decl key is what makes the answer instantiation-independent, since a
+    // monomorphized generic's member symbol is a different object from the
+    // one a write site resolved against but shares the declaration node.
+    std::unordered_set<const void*> recordFieldWritten_;
+    bool recordFieldWriteScanDone_ = false;
+    // FAIL-CLOSED. Set when the scan meets an `ast::Expr`/`ast::Stmt`/
+    // `ast::Member` kind it does not know, because such a node could hide a
+    // store the scan would then miss. While it is set NO field is admitted —
+    // the pre-#4253 safe leak, never an over-release. A node kind added to the
+    // AST without an arm here therefore disables the optimization loudly (rows
+    // 1-3 of class_field_record_string_release_4253 go red) instead of
+    // silently arming a use-after-free.
+    bool recordFieldWriteScanIncomplete_ = false;
+    // Populate recordFieldWritten_ / recordFieldWriteScanIncomplete_ by
+    // walking every local declaration body in this module. Memoized: the AST
+    // is immutable by the time any disposer is emitted, so the first caller
+    // pays for the walk and the rest read the cache.
+    void collectRecordFieldWriteSites();
+    // The predicate itself — see the definition (LlvmBackend_Setup.cpp) for
+    // the two-part proof (no write site OUTSIDE this module can exist; no
+    // write site INSIDE it does exist).
+    bool declarationInitializerIsSoleStore(const sema::TypeSymbol* ts,
+                                           const sema::Symbol* m);
 
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position
@@ -15989,6 +17895,46 @@ private:
         llvm::Function* fn = nullptr;
     };
     std::vector<AwaitedTaskTemp> awaitedTaskTemps_;
+
+    // fix #4552 / §28.3 *Unbound owned temporaries* (v0.306): a fresh owned
+    // CLASS producer used only as the receiver of a call whose result is a
+    // non-nullable `string`. §28.3 disposes such a temporary "at the **end of
+    // the full expression** in which it is produced, after every use of it
+    // within that expression has completed" — so, unlike the value-result
+    // family, the reclaim may NOT be emitted inline after the call: the
+    // string result is still in flight through the rest of the expression and
+    // the receiver's destructor is user code that the spec sequences after it.
+    // MEASURED on §28.3's own shape, rule-corpus case s28_3_0043 —
+    // `Console.WriteLine(new Widget("temp").Describe());` — whose spec output
+    // is `widget temp` then `dispose temp`; an inline reclaim would print them
+    // the other way round, and `freshNewReceiverTempEligible` (which gates the
+    // inline path) therefore declines a `string` result outright, leaking the
+    // receiver. Same {slot, fn} contract as the two temp queues above.
+    struct K8RecvTemp {
+        llvm::AllocaInst* slot = nullptr;
+        llvm::Function* fn = nullptr;
+    };
+    std::vector<K8RecvTemp> k8RecvTemps_;
+
+    // The eligibility predicate for the queue above. NON-NULLABLE `string`
+    // only: a non-nullable `string` method return is minted `+1` BY THE CALLEE
+    // (the `emitStringRetain` in LlvmBackend_Stmts.cpp's return path and its
+    // expression-body twin, both gated `!nullable`), so the result owns its own
+    // reference and disposing the receiver — which releases the receiver's
+    // string fields — can never dangle it. A `string?` return does NOT mint
+    // (#2196 keeps that path un-refcounted), so it is excluded: there the
+    // result can be a borrow of a receiver field.
+    bool freshNewReceiverTempStringResult(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy) const;
+    // Register such a receiver at its PRODUCTION: an `unwindOnly` disposeStack_
+    // entry (the exception edge, exactly as registerFreshNewReceiverTempUnwind)
+    // plus a queue entry for the next K8 boundary (the normal edge).
+    void registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
+                                        llvm::Value* recvPtr,
+                                        const sema::TypeRef* resultTy);
+    // Emit the queued reclaims at a K8 full-expression boundary.
+    void flushK8RecvTemps();
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for
@@ -16134,9 +18080,145 @@ private:
     // case holds at scope end, and disposing it is the SOLE path for those
     // payloads (no separate `using var` registration fires for choice
     // payloads — the choice value IS the owner).
-    void emitOwningChoiceActiveCaseDisposal(llvm::AllocaInst* slot,
+    // fix #4552 / §35.9 (v0.306): `slot` is a `llvm::Value*`, not an
+    // `AllocaInst*` — `emitOwningChoiceLocationDisposal` below GEPs INTO a
+    // nullable wrapper and hands the inner address here, and the #4132
+    // recursive arm already passes a fresh alloca. Nothing in the body needs
+    // alloca-ness (it only loads the choice struct from the address).
+    void emitOwningChoiceActiveCaseDisposal(llvm::Value* slot,
                                             const sema::TypeSymbol* choiceTy,
                                             const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.9 *Nullable `C?`* + §35.4 *Disposal is defined by the
+    // active case* (v0.306): dispose the owning-choice value held at `addr`,
+    // unwrapping §35.9's `C?` representation first. For a non-nullable
+    // location this is `emitOwningChoiceActiveCaseDisposal` verbatim; for a
+    // `C?` location the storage is `{ i8 hasValue, <choice struct> }`
+    // (nullableValueStructTy), so the active-case walk must run on field 1
+    // under a `hasValue` guard — reading the wrapper's first bytes AS the
+    // choice struct (what every caller did before this fix) reads `hasValue`
+    // as the tag and either silently disposes nothing or dispatches through a
+    // payload slot that holds another case's bytes.
+    void emitOwningChoiceLocationDisposal(llvm::Value* addr,
+                                          const sema::TypeRef* choiceRef);
+
+    // fix #4552 / §35.4 *Drop-on-overwrite is defined and automatic* + §35.9
+    // (v0.306): the owning-CHOICE sibling of `disposeDisplacedOwnedClassLocal`.
+    // "Whole-value reassignment of an owning-choice local or field *disposes
+    // the displaced value* per §28.7" — and "`x := null;` on an owned `C?`
+    // location likewise disposes the displaced value's payloads". Before this,
+    // codegen had no drop-on-overwrite path for a choice at all: the class
+    // helper bails on a non-class local and the scope-end active-case pass only
+    // ever sees the FINAL value, so every displaced owning-choice value leaked.
+    // Emitted between the RHS's evaluation and the store, which is §28.7's
+    // stated order. FIELD targets are NOT covered here (the helper requires a
+    // plain local identifier, exactly as the class sibling does).
+    void disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
+                                           llvm::Value* addr,
+                                           const ast::Expr* rhsExpr);
+
+    // fix #4566 / §15.3 *Local-to-local assignment* + §28.7 *Moved-from and
+    // null* (v0.306): the MOVE half of an owning-choice local-to-local
+    // transfer. §15.3 makes an owning choice a move-only value type — "`var y
+    // := x;`: copies for an ordinary value type; moves for a move-only value
+    // type. After the move, `x` is in moved-from state" — and §15.3's *Local
+    // lifetime* bullet says what that costs the source: a whole-value move
+    // "leaves the local holding no value rather than a hole, so no pass walks
+    // it". Codegen implemented only the store: `c := b;` / `var c := b;`
+    // plain-copied the choice struct, so BOTH slots held the same owned
+    // payload pointer and BOTH scope-end active-case passes dispatched
+    // `Dispose` on it (measured: `dispose b` then a SIGSEGV reading the freed
+    // vtable, and an ASan heap-use-after-free).
+    //
+    // The mark is a RUNTIME one — a zero-store over the source slot, the
+    // choice analogue of `nullTransferredOwnedLocalSlot`'s null-store over an
+    // owned class local's slot. It makes every §28.7 consumer of that slot a
+    // no-op without any of them needing a new predicate: the scope-end
+    // active-case pass reads tag 0, takes case 0's arm, and finds null payload
+    // pointers its existing null-guard already skips (a nested owning-choice
+    // payload recurses into the same all-zero state); `disposeDisplacedOwning
+    // ChoiceLocal` at a later re-acquiring store (`c := b; b := C.Ready(…);`)
+    // reads the same zeros and disposes nothing; and the next store into the
+    // source re-arms it with a live value. Being a runtime store it is exact
+    // on every control-flow path — a move under an `if` suppresses the source
+    // disposal on the taken path only — which a static "this local is
+    // transferred somewhere" set (the move-only inline array's
+    // `moveOnlyArrayTransferred_`) cannot be.
+    //
+    // SCOPE (#4566 is local-to-local; the rest is filed, not silently
+    // widened): both ends must be plain locals with an `ast::LocalDecl` — the
+    // exact set `registerOwningChoiceDisposal` enrolls in the scope-end pass,
+    // so "the target takes over the disposal obligation" is a fact rather than
+    // a hope. A field/index/static target, a parameter at either end, `_ :=
+    // b;` (§35.10's move-only discard) and arm-selection payload transfer are
+    // all declined here.
+    void markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
+                                        const ast::Expr* srcExpr);
+    // The shared core. `var c := b;` has no target EXPRESSION — the binding is
+    // the target — so the declaration site calls this form directly.
+    void markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
+                                        const ast::Expr* srcExpr);
+
+    // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
+    // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's
+    // "announcing scrutinee form"? See the definition for the admitted and
+    // excluded scrutinee shapes and why this gate is codegen-side.
+    bool unboundOwningChoiceTemp(const ast::Expr* e, const sema::TypeRef* rt);
+
+    // fix #4609 / §35.5 *The owning match* form 2 (v0.306): §35.5's OTHER
+    // announcing scrutinee form — "a named owned binding under an explicit
+    // scrutinee transfer marker — `case move outcome of …`". Returns the
+    // source identifier's storage when `e` is `move <identifier>` and `rt`
+    // classifies owning, and null otherwise. §35.5 makes this form a CONSUME:
+    // "the consumed binding is left moved-from when the construct completes".
+    // The returned slot is what the caller zero-stores to record that — the
+    // #4566 mark, at the third site #4566's own SCOPE note left open.
+    //
+    // The storage-type equality check is the safety gate: the slot must hold
+    // exactly the storage `rt` implies (§35.9's `{ i8 hasValue, <choice> }`
+    // for a `C?`, the choice struct otherwise), so a §27.5 capture-boxed local
+    // — whose alloca has been rewritten to a pointer-sized cell holder — is
+    // declined rather than having its cell pointer zeroed. Declining keeps the
+    // pre-fix behaviour, which is the sound direction here: the caller then
+    // registers no replacement disposal either, so nothing can double-free.
+    llvm::AllocaInst* markedOwningChoiceScrutineeSlot(const ast::Expr* e,
+                                                      const sema::TypeRef* rt);
+
+    // fix #4552 / §35.5 (v0.306): does `p` (or any pattern nested in it) bind
+    // a slot? An owning match's selected arm TRANSFERS the case's owned
+    // payloads into its bindings (§35.5), and `using var u := move r;` in a
+    // `do … end` arm is the spec's own adoption spelling — so an arm that
+    // binds anything may not also have the scrutinee disposed wholesale at
+    // construct completion. Deliberately COARSE: a binding on a payload-free
+    // or value-payload case cannot take ownership of anything, but declining
+    // there only leaks (the sound direction), while getting it wrong the other
+    // way is a double free.
+    //
+    // fix #4609 (§35.5, v0.306): read PER ARM, at the top of the selected
+    // arm's body, not once for the whole construct. The whole-construct
+    // reading disabled the reclaim on every arm of a mixed construct
+    // (`A(var x) => …, B(_) => …`), so selecting the discarding arm leaked a
+    // payload §35.5 disposes at completion.
+    static bool patternBindsAnySlot(const ast::Pattern* p);
+
+    // fix #4617 / §35.5 *The owning match* (v0.307): emit the moved-from marks
+    // for exactly the payload slots the selected arm TRANSFERS into its
+    // bindings, leaving §35.5's "un-transferred remainder" in `slot` for the
+    // construct-completion reclaim to dispose. #4609's discharge was per ARM
+    // (one zero-store over the whole value as soon as the arm bound anything),
+    // so a partial binding — `W(var w, _)` over `W(owned a, owned b)` — leaked
+    // every un-bound sibling. Falls back to that whole-value mark for any
+    // pattern shape whose transfer set is not decidable per slot; see the
+    // definition for why that direction is the safe one.
+    void dischargeOwningMatchTransfers(llvm::AllocaInst* slot,
+                                       const sema::TypeRef* choiceRef,
+                                       const ast::Pattern* armPattern);
+    // The recursive core: false means "shape not decidable — mark the whole
+    // value". `choiceAddr` addresses a choice struct (never a §35.9 `C?`
+    // wrapper, which is declined).
+    bool markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
+                                         const sema::TypeRef* choiceRef,
+                                         const ast::Pattern* p);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
@@ -16341,8 +18423,8 @@ private:
                               bool forLoopVar = false,
                               bool* wasGuardedBoxing = nullptr);
 
-    // §27.5 / #673: after writing `val` to the cell of a guarded-boxed
-    // local (whose cell-holder alloca is `newSlot`), also store `val` to
+    // §27.5 / #673: after writing `val` to the cell of a boxed local (whose
+    // cell-holder alloca is `newSlot`), also store `val` to
     // the original pre-boxing alloca if `cellVarSyncSlot_` has an entry.
     // This keeps pre-emitted code that reads the original alloca (e.g. a
     // while-loop condition lowered before the lambda was encountered) in
@@ -16526,6 +18608,20 @@ private:
 
     llvm::Value* implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy);
 
+    // fix #1748 (§22.7 "Observing `this` during construction", recorded
+    // residual, v0.306): the checked-disposal-mode watermark guard for a
+    // just-loaded instance-field READ. `e` is the read expression (a
+    // MemberAccessExpr for a qualified `recv.field`, or an IdentifierExpr
+    // for the implicit-`this` bare form) whose sema type carries the
+    // field's declared nullability; `val`/`elemTy` are the value CG8/CG9
+    // just loaded and its LLVM slot type. No-op outside checkedDisposal_,
+    // for a diverged block, for a non-pointer slot, or for a field whose
+    // sema type is not sema::isNonNullableReferenceType — see the .cpp
+    // definition for the full rationale (why this cannot be caught
+    // statically, and why an unconditional guard here is sound).
+    void emitFieldWatermarkGuard(const ast::Expr& e, llvm::Value* val,
+                                 llvm::Type* elemTy);
+
     // Slice CG2: integer binary operators. NOTE (§6.1): `+ - * / mod`
     // are *overflow-checked* in Bezel (raise OverflowException) and
     // `/`÷0 raises DivideByZeroException — those checks need the
@@ -16612,6 +18708,13 @@ private:
     // #380: declare (once) `void @free(ptr)` from libc — the counterpart to
     // callocFn() that reclaims a disposed class instance's heap block.
     llvm::FunctionCallee freeFn();
+
+    // fix #4210 (§27.5 / §28.9, v0.298): returns the module-level global
+    // that stores the most recently freed cell pointer. The envdtor stores
+    // the freed cell here before free(). boxLocalSlot checks this global;
+    // if the cached cell matches the stored freed pointer, the entry is
+    // stale and fresh allocation runs.
+    llvm::GlobalVariable* getFreedSlotGlobal();
 
     // CG60: lower a lambda expression. Lambdas are represented as a
     // heap-allocated two-pointer closure struct { fn_ptr, env_ptr }.
@@ -16983,6 +19086,22 @@ private:
     // failure) — the safe direction.
     llvm::Value* coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
                                        const ast::Expr* e, bool srcUnsigned);
+
+    // fix #5037 (§5.1 / §9.1, v0.307): wrap a bare payload value into a
+    // NULLABLE VALUE positional-argument slot (`X: T?` bound from a `new`
+    // call's positional/named argument, class or record, direct or through a
+    // primary-ctor `this(...)` chain, #4722a). Routes the payload through
+    // `coerceInitializerToSlot` + `coerceReturnToNullableValue` — the same
+    // §5.1 widen/narrow/int→float rules the field-initializer path uses —
+    // rather than a hand-rolled `CreateSExtOrTrunc`, which sign-extends an
+    // unsigned narrower source and has no int→float arm. A no-op when `fty`
+    // is not a nullable value type or `v` already has the tagged struct's
+    // LLVM type. `srcExpr` may be null (an omitted positional parameter
+    // filled from its default); signedness then defaults to signed. Defined
+    // in LlvmBackend_Layout.cpp beside its two building blocks.
+    llvm::Value* wrapNullablePositionalPayload(llvm::Value* v,
+                                               const sema::TypeRef* fty,
+                                               const ast::Expr* srcExpr);
     // §6.4: decimal arithmetic for compound-assign / increment (sweep #6).
     llvm::Value* emitDecimalArith(const std::string& op, llvm::Value* lhs,
                                   llvm::Value* rhs);
@@ -17636,6 +19755,33 @@ private:
         return true;
     }
 
+    // fix #4830 (§14.1 / §7 / §8.6, v0.307): shared by emitGenericSpecialization
+    // and emitInlineGenericMethod's expression-body parameter binding. Wraps
+    // `arg` into the tagged `{i8, T}` nullable-value carrier when the FORMAL
+    // parameter type is (A) already a nullable value type, (B) an explicitly
+    // `T?`-declared bare type parameter resolving (via nullableTypeParamConcrete)
+    // to a nullable value type, or (C) a BARE, non-`?`-declared type parameter
+    // `v: T` whose ACTIVE class-level substitution resolves `T` itself to a
+    // nullable value type — the "class instantiated at a nullable value type"
+    // shape (`Holder<int?>`'s `v: T`), which the other two cases do not cover
+    // because `T?` never appears in source. Declared here (defined in
+    // LlvmBackend_Calls2.cpp) since both call sites live in that file.
+    //
+    // `srcUnsigned` (fix #5046 follow-up, §5.1, v0.307): governs the ONE case
+    // that widens a numeric payload — an already-tagged `S?` argument lifted
+    // to a differently-typed `T?` formal (#5046 itself). Defaults to `false`
+    // (signed) for a caller with no source expression to ask, exactly the
+    // posture `coerceNumericToType`'s two-argument overload documents; a
+    // caller that DOES have the argument's source expression (currently
+    // `emitGenericSpecialization` / `emitInlineGenericMethod`, both threading
+    // it from `emitMethodCall`'s own `argExprs`) must pass the real value —
+    // `uint? -> long?` at a generic `T?` formal sign-extending a value like
+    // 3000000000 into a negative `long` is silent wrong code, not merely an
+    // uncovered shape.
+    llvm::Value* wrapArgForNullableValueFormal(llvm::Value* arg,
+                                                const sema::TypeRef* formal,
+                                                bool srcUnsigned = false);
+
     // fix #3501 (§4.7 "The unit type" / §7.10 "Generics and nullability" /
     // §14.1, v0.283): make the CALLEE's UNIT bindings visible to the §4.7
     // argument rescue, without disturbing the substitution the argument
@@ -17770,8 +19916,13 @@ private:
     // materializer/GetEnumerator sites do, or deferred to a loop's increment
     // block, as the for-in site does) is the CALLER's job, unchanged from
     // before this fix.
+    // fix #4499: `widthsArr` is `bz_dict_keys_str`'s THIRD out-array (int8_t*
+    // per key, the §4.6 storage width). Without it the rebuilt key is a
+    // width-1 string of `lens[idx]` BYTES, which is a code-point count used as
+    // a byte count — the #4499 defect on the read side.
     std::pair<llvm::Value*, llvm::Value*> decodeDictStringKeyAt(
-        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* idx);
+        llvm::Value* keysArr, llvm::Value* lensArr, llvm::Value* widthsArr,
+        llvm::Value* idx);
 
     // decodeDictGenericKeyAt loads a generic (non-string) key BY VALUE out of
     // the malloc'd raw-bytes copy `bz_dict_keys_gen` wrote at `idx`. Returns
@@ -18459,13 +20610,34 @@ private:
     // An ascription that FAILED to resolve answers "produces a value", so the
     // note still fires on a broken program rather than being suppressed by the
     // absence of a type.
+    //
+    // fix #4665 (§17.11 *The `default` operator* + §4.7, v0.307): the
+    // ASCRIPTION test is asked FIRST, for any body shape. #3434 already made
+    // `: ()` answer "yields nothing" — but only along the CallExpr path, and
+    // the call-shape gate below short-circuits before the question is put, so
+    // the answer was unreachable for every other body. `=> default(())` is
+    // such a body: §17.11's unit row, which with the `DefaultExpr` arm fixed
+    // lowers correctly to nothing and then drew the very #2491 note #2963 and
+    // #3434 exist to keep off a working program (measured on the `DefaultExpr`
+    // fix alone: `public static method Give(): () => default(());` compiled,
+    // ran, and printed the internal note). The call-shape gate remains for the
+    // NO-ascription case, where `lastCallHandledWithoutValue_` is the only
+    // evidence available about whether anything was emitted.
+    //
+    // The widening is exactly "the ascription is the unit type", which §4.7
+    // makes the same contract as writing no ascription at all; `()?` answers
+    // "produces a value" (#3095's `!nullable` conjunct) and a value-typed or
+    // unresolved ascription answers the same as before, so
+    // tests/lit/call_lowered_as_unit_declared_return_still_warns_2963.bzl
+    // (`: int`) and tests/lit/arrow_body_nullable_unit_return_still_warns_3434.bzl
+    // (`: ()?`) keep their notes.
     bool arrowBodyLoweredAsUnit(const ast::Expr* body,
                                 const ast::Type* declRet) const {
+        if (declRet)
+            return !sema::ascribedReturnTypeProducesValue(
+                resolveTypeParamRef(ctx_.resolvedType(*declRet)));
         if (!dynamic_cast<const ast::CallExpr*>(body)) return false;
-        if (!lastCallHandledWithoutValue_) return false;
-        if (!declRet) return true;
-        return !sema::ascribedReturnTypeProducesValue(
-            resolveTypeParamRef(ctx_.resolvedType(*declRet)));
+        return lastCallHandledWithoutValue_;
     }
 
     // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's
@@ -18500,8 +20672,46 @@ private:
     // `.` path installed this substitution, so an explicit-type-arg `?.`
     // generic call reached emitMethodCall with an empty genericSubst_ and
     // called the unspecialized i32-placeholder body (malformed IR).
-    void applyMethodGenericSubst(const ast::CallExpr& call,
-                                 sema::MethodSymbol* ms);
+    //
+    // fix #4813 (§14.1 / §14.5, v0.307): the callee's own type parameters are
+    // scoped to the callee, so any same-NAMED binding in the active maps (the
+    // CALLER's `T` inside `Go<T>` calling `Id<T>`) is dropped before the
+    // callee's are bound, and everything the CALL SITE supplies — explicit
+    // type arguments, argument types, the call's result type — is resolved in
+    // the caller's substitution first. `callerSubst` / `callerSema` name that
+    // substitution when the active maps have already been replaced by a
+    // receiver-class one (lowerCall); null means the active maps are it.
+    void applyMethodGenericSubst(
+        const ast::CallExpr& call, sema::MethodSymbol* ms,
+        const std::unordered_map<std::string_view, llvm::Type*>* callerSubst =
+            nullptr,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            callerSema = nullptr);
+
+    // fix #4899 (§14.1 / §7 / §7.10, v0.307): once the callee's class- and
+    // method-level substitution is installed (after applyMethodGenericSubst),
+    // put back the tagged {i8,T} carrier for every argument whose bare-`T`
+    // formal resolves to a nullable value type and whose tag buildOrderedArgs
+    // stripped (`entries`, taken from bareTParamNarrowUnwraps_). `args` is index-aligned
+    // with `params` after a leading receiver offset (args.size() -
+    // params.size()). A no-op for every argument not recorded, for a formal
+    // that resolves to a non-nullable type (the narrowed unwrap was right), and
+    // for an argument a later step already replaced.
+    void restoreBareTParamNullableCarriers(
+        const std::vector<ast::Param>& params,
+        const std::vector<BareTParamNarrowUnwrap>& entries,
+        std::vector<llvm::Value*>& args);
+    // fix #4945 (§14.1 / §7 / §7.10, v0.307): the constructor sibling. A `new`
+    // site lowers its arguments under the ENCLOSING substitution (#597), so the
+    // constructed type's `T := int?` is not visible to buildOrderedArgs. After
+    // the call, take the entries recorded since `base`, and restore the
+    // carriers under `calleeSemaTy` (the constructed type's substitution).
+    // Always truncates bareTParamNarrowUnwraps_ back to `base`.
+    void restoreCtorBareTParamCarriers(
+        const std::vector<ast::Param>& params, std::size_t base,
+        std::vector<llvm::Value*>& args,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            calleeSemaTy);
 
     // per §24: events. `eventSourcePtr` lowers an event-access expression
     // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /
@@ -18616,12 +20826,22 @@ private:
     // expression to locate a diagnostic on; the §14.1/#783 imported-generic
     // layout gate needs one. Defaulted, so the synthesized callers (ToString /
     // Equals / operator dispatch) are unchanged and simply report unlocated.
+    // `thisReceiver` (fix #4597, §22.16 v0.306) is the SYNTACTIC test the spec
+    // makes the face-binding rule turn on: "A call whose receiver is `this` —
+    // explicit or implicit — from inside any instance member of the class or a
+    // subclass enters the member's unchecked face". Set by `lowerCallDispatch`
+    // from the callee's own syntax (a bare callee = implicit `this`; a
+    // `this.M()`/`base.M()` member access), never from a value comparison, so
+    // `var a := this; a.M();` is a checked call exactly as the spec says.
+    // Defaulted false: every synthesized caller (ToString / Equals / operator
+    // dispatch / iterator protocol) is a non-`this` call by construction.
     llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
                                 std::vector<llvm::Value*>& args,
                                 bool baseQualified,
                                 const std::vector<const ast::Expr*>* argExprs
                                     = nullptr,
-                                SourceLocation callLoc = {});
+                                SourceLocation callLoc = {},
+                                bool thisReceiver = false);
 
     // §12 / §14 (issue #585): compute the concrete generic substitution for an
     // ANCESTOR generic class reached through inheritance from `recvTy`. When a
@@ -18707,9 +20927,17 @@ private:
     // the current genericSubst_ applied to all types.  The specialized
     // function is cached in specializedMethods_ so each (ms, subst) pair is
     // compiled at most once.  The result is a call to the specialized fn.
-    llvm::Value* emitGenericSpecialization(sema::MethodSymbol* ms,
-                                           std::vector<llvm::Value*>& args,
-                                           const CallableInfo& ci);
+    // `argExprs`, when the caller has it (from `emitMethodCall`'s own
+    // parameter of the same name), carries each argument's SOURCE expression
+    // so a narrower-than-formal numeric argument can be widened at its actual
+    // signedness (fix #5046 follow-up, §5.1, v0.307) instead of assuming
+    // signed — see `wrapArgForNullableValueFormal`. Absent (nullptr) at a
+    // caller that has no source expressions to offer (e.g. the itable-slot
+    // rebuild path); such a caller widens as signed, exactly as before.
+    llvm::Value* emitGenericSpecialization(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const CallableInfo& ci,
+        const std::vector<const ast::Expr*>* argExprs = nullptr);
 
     // fix #580 / §14.1 / §14.2: build (or fetch from cache) a STANDALONE
     // monomorphized function for `ms` under the active genericSubst_, with the
@@ -18758,9 +20986,15 @@ private:
     // it is computed from the fact the compiler ALREADY has: `IrFootprint` /
     // `emittedSideEffectSince`, #2963's own discriminator. Pass `nullptr` (the
     // default) at a caller that returns unconditionally.
-    llvm::Value* emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                          std::vector<llvm::Value*>& args,
-                                          bool* emitted = nullptr);
+    // `argExprs`: see the identical parameter on `emitGenericSpecialization`
+    // just above (fix #5046 follow-up, §5.1, v0.307) — threaded through to
+    // the SAME `wrapArgForNullableValueFormal` parameter-binding call this
+    // function makes for an expression-bodied generic method, and passed on
+    // to `emitGenericSpecialization` for a block-bodied one.
+    llvm::Value* emitInlineGenericMethod(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        bool* emitted = nullptr,
+        const std::vector<const ast::Expr*>* argExprs = nullptr);
 
     // CG42: null-conditional call `x?.M(args)` (§7.5) — the callee is a
     // null-conditional member access. If the receiver is null the call is

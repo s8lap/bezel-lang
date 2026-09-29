@@ -3118,10 +3118,18 @@ BEZEL_TEST(cross_module_import,
     writeSource(aSrc.path,
         "module TagLib; "
         "public class Tag<T> "
-        "  public owned Label: string; "
+        // §28.1 (v0.307): `owned` "requires a class type, an interface type,
+        // or a bare type parameter" — a `string` is a runtime-managed
+        // reference type (§28.9) carrying no disposal obligation to transfer,
+        // so `owned Label: string` / `owned label: string` are rejected at the
+        // declaration. The marker was incidental here: this row's subject is
+        // the imported generic STATIC field read from a destructor body
+        // (`Tag.disposed`), which is what crashed in #684. Field and parameter
+        // are plain; nothing else about the fixture moves.
+        "  public Label: string; "
         "  public static disposed: int := 0; "
-        "  public constructor(owned label: string) "
-        "    Label := move label; "
+        "  public constructor(label: string) "
+        "    Label := label; "
         "  end constructor; "
         // The destructor body accesses the generic static field — this is
         // the path that crashed: staticFieldGlobal looked up genericSubst_

@@ -91,19 +91,20 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
         bezel::Lexer lexer(source, diags);
         bezel::Parser parser(lexer, diags);
         auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
+        if (!unit) return bezel::test::asanBuildFailure("parse");
         bezel::sema::SemaContext ctx(diags);
         bezel::sema::collectSymbols(*unit, ctx);
         bezel::sema::resolveTypes(*unit, ctx);
         bezel::sema::typecheckExpressions(*unit, ctx);
         bezel::sema::checkDefiniteAssignment(*unit, ctx);
         bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
+        if (diags.hasErrors()) return bezel::test::asanBuildFailure("sema");
         llvm::LLVMContext llvmCtx;
         auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
+        if (!module) return bezel::test::asanBuildFailure("emitModule");
         std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err))
+            return bezel::test::asanBuildFailure("emitObjectFile");
     }
 
     auto cleanup = [&] {
@@ -113,14 +114,17 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (std::system(linkCmd.c_str()) != 0) {
+        cleanup();
+        return bezel::test::asanLinkFailure("link");
+    }
     std::string runCmd =
         std::string("ASAN_OPTIONS=detect_leaks=") +
         (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
         " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
-    if (status == -1) return -1;
+    if (status == -1) return bezel::test::asanExecFailure("system");
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
     return 0;                                                       // clean
 }
@@ -182,7 +186,7 @@ const char* kHierarchy =
 const char* kContainer =
     "class Container : ISerializable, IDeserializable "
     "  public owned S: Shape; "
-    "  public constructor(owned s: Shape) S := move s; end constructor; "
+    "  public constructor(owned s: Shape) S := s; end constructor; "
     "end Container; ";
 
 // §9.8 tier 4: Circle binary round-trip through polymorphic base field.
@@ -281,7 +285,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  public owned S: Shape; "
         "  public Tag: int; "
         "  public constructor(owned s: Shape, tag: int) "
-        "    S := move s; Tag := tag; "
+        "    S := s; Tag := tag; "
         "  end constructor; "
         "end Container; "
         "class C public static method Main(): int "
@@ -420,11 +424,11 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  public owned Primary: Shape; "
         "  public Alias: Shape?; "  // nullable back-edge
         "  public constructor(owned primary: Shape, alias: Shape?) "
-        "    Primary := move primary; Alias := alias; "
+        "    Primary := primary; Alias := alias; "
         "  end constructor; "
         // Serialize-side convenience ctor: wire the self-alias from the receiver.
         "  public constructor(owned primary: Shape) "
-        "    Primary := move primary; Alias := Primary; "
+        "    Primary := primary; Alias := Primary; "
         "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "

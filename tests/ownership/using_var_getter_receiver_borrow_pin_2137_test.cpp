@@ -147,7 +147,7 @@ BEZEL_TEST(using_var_getter_borrow_pin_2137,
     JitResult r = runAotChecked(
         std::string(kWidget) +
         "class Registry "
-        "  private static readonly owned _shared: Widget := new Widget(); "
+        "  private static owned readonly _shared: Widget := new Widget(); "
         "  public static property Shared: Widget => _shared; "
         "end Registry; "
         "class P "

@@ -36,6 +36,23 @@
 
 namespace bezel {
 
+// Renders a single diagnostic to stderr in the canonical
+// "path:line:col: <severity-prefix?> message" form. Warnings carry the
+// "warning: " prefix so the conformance runner's `\bwarn(?:ing)?\b` regex
+// (tests/conformance/rules/runner.py) matches spec-required warnings — the
+// warn tier under #4626 — without per-site emission edits. Errors and notes
+// remain unprefixed so their text reads as the prose it was authored as.
+// (Fix for #4626; see docs/Bezel_Language_Spec.md §Diagnostic identity,
+// which leaves the byte format implementation-defined.)
+static void renderDiagnostic(const std::string& path,
+                             const Diagnostic& diag) {
+    const char* sevPrefix = (diag.severity == Severity::Warning)
+                                ? "warning: " : "";
+    std::cerr << path << ":" << diag.location.line << ":"
+              << diag.location.column << ": " << sevPrefix << diag.message
+              << "\n";
+}
+
 namespace {
 
 // Reads an entire file into `out`. Returns false if the file cannot be opened.
@@ -297,6 +314,15 @@ std::string Driver::linkCommandLine(const std::string& objectPath,
         // with --sanitize=address; the default link line is unchanged.
         cmd += " -fsanitize=address -g";
     }
+#ifdef BEZEL_LINK_COMPRESS_DEBUG
+    // #5062: keep the runtime archive's (already -gz compressed) debug
+    // sections compressed in the linked program, instead of letting the
+    // linker inflate them. ~60% of every AOT test executable was DWARF, and
+    // each one is written to the bincache. Symbolizers read the compressed
+    // sections, so ASan reports still resolve runtime frames to file:line.
+    // Injected by CMake only when the default linker accepts the flag.
+    cmd += " " BEZEL_LINK_COMPRESS_DEBUG;
+#endif
     if (!runtimeLibPath.empty()) {
         // Static-link the Bezel runtime (path injected at compile time by CMake).
         cmd += " ";
@@ -580,6 +606,12 @@ CompileResult Driver::compileExecutableObject(
         // dependencies — runs after typecheck so static-member references are
         // resolved.
         sema::checkStaticInitCycles(*unit, semaCtx);
+        // fix #4865 / §17.14 / §22.12: reject cyclic class-level const
+        // initializers (e.g. `K1 := K2; K2 := K1`) — without detection
+        // codegen's `constMemberValue` re-lowers the referenced const and
+        // recurses unboundedly into the same pair (SIGSEGV). Runs after
+        // typecheck, alongside the cross-type static-init cycle pass.
+        sema::checkConstInitCycles(*unit, semaCtx);
 
         // Ownership milestone — runs after sema since it needs
         // resolved local symbols + producer info.
@@ -629,9 +661,7 @@ CompileResult Driver::compileExecutableObject(
                 // Print any diagnostics recorded during codegen (e.g. "not yet
                 // implemented") before reporting the codegen failure (#628 pt 1).
                 for (const Diagnostic& diag : diagnostics.diagnostics()) {
-                    std::cerr << path << ":" << diag.location.line << ":"
-                              << diag.location.column << ": " << diag.message
-                              << "\n";
+                    renderDiagnostic(path, diag);
                 }
                 if (!err.empty())
                     std::cerr << "bezelc: codegen error: " << err << "\n";
@@ -641,8 +671,7 @@ CompileResult Driver::compileExecutableObject(
     }
 
     for (const Diagnostic& diag : diagnostics.diagnostics()) {
-        std::cerr << path << ":" << diag.location.line << ":"
-                  << diag.location.column << ": " << diag.message << "\n";
+        renderDiagnostic(path, diag);
     }
 
     CompileResult result;
@@ -671,10 +700,10 @@ CompileResult Driver::compileObject(const std::string& path,
     // gates-the-front-end rule applies to this library/object path.
     if (unit && !diagnostics.hasErrors()) {
         // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), OFF BY DEFAULT — the
-        // library/object path mirrors compileExecutableObject. `opts` is read
-        // for this ONE bit here; the library build's codegen options stay the
-        // locally-built `libOpts` below, so no other flag's meaning changes on
-        // this path.
+        // library/object path mirrors compileExecutableObject. (#4488: `opts`
+        // is no longer read for this ONE bit only — see the `libOpts` block
+        // below, which now DERIVES the library build's codegen options from
+        // the caller's rather than default-constructing them.)
         maybeDesugarScopedAwaitBinds(opts.scopedAwaitBind, source, deps, *unit);
         // stdlib §2.20 (#2047): inject the auto-imported `Result<T, E>` choice
         // (the library/object path mirrors compileFile).
@@ -736,6 +765,10 @@ CompileResult Driver::compileObject(const std::string& path,
         sema::checkPureBodies(*unit, semaCtx);
         sema::checkDefiniteAssignment(*unit, semaCtx);
         sema::checkStaticInitCycles(*unit, semaCtx);  // §2.5 / #797
+        // fix #4865 / §17.14 / §22.12: cyclic class-level const initializer
+        // detection — codegen's constMemberValue recurses unboundedly on a
+        // cycle (SIGSEGV), so the rejection must happen in sema.
+        sema::checkConstInitCycles(*unit, semaCtx);
         ownership::checkOwnership(*unit, semaCtx);
 
         TypeChecker typeChecker(diagnostics);
@@ -756,8 +789,42 @@ CompileResult Driver::compileObject(const std::string& path,
             // a library build, so importing this artifact into an executable
             // that has its own `Main` failed to link with a duplicate
             // definition of `main`.
-            codegen::CodegenOptions libOpts;
+            //
+            // fix #4488, per §28.2 and §22.16 (v0.306): DERIVE the library
+            // build's options from the caller's rather than default-
+            // constructing them. Both checked modes are, in the spec's own
+            // words, "a per-build choice between two conformance modes"
+            // (§28.2 "Use after disposal; checked disposal mode"; §22.16
+            // "`ensures` and `invariant` run under checked-contracts mode")
+            // — a *build*, not a translation unit. Their instrumentation is
+            // EMITTED into the code (the §28.2 disposed-flag entry guard and
+            // the §22.7 watermark guard; the §22.16 clause evaluations), so a
+            // dependency compiled without it simply has no checks and nothing
+            // at link time can add them back. Default-constructing `libOpts`
+            // therefore silently downgraded every `-c` artifact to unchecked,
+            // and a program built `--checked-disposal` ran its imported code
+            // unchecked while appearing to be in checked mode.
+            //
+            // Deriving (rather than copying field-by-field) is the point: a
+            // field added to CodegenOptions later is carried onto this path by
+            // default, so the next emitted flag cannot be forgotten here. Only
+            // the fields whose meaning is specific to the library artifact are
+            // overridden below, each with its reason.
+            codegen::CodegenOptions libOpts = opts;
+            // per §33.1/§2.4/§33.6 (#1563), as above: a library artifact is
+            // never the executable's main module.
             libOpts.isMainModule = false;
+            // NOT forwarded, deliberately (#4488): --sanitize=address is an
+            // *executable-build* option, not an emitted-semantics one. It
+            // requires the final link to pull in the ASan runtime that defines
+            // `__asan_report_*` / `asan.module_ctor`, and this path performs no
+            // link (main.cpp rejects `-c --sanitize=address` outright for that
+            // reason). Dropping it costs only redzone instrumentation inside
+            // the dependency: the executable's ASan runtime interposes malloc
+            // process-wide, so the dependency's allocations are still covered
+            // by leak/double-free detection — the fallback checkedDisposal and
+            // checkedContracts do not have.
+            libOpts.sanitizeAddress = false;
             auto module = codegen::emitModule(*unit, semaCtx, llvmCtx, libOpts);
             // §2.6 step 4: embed the public-interface metadata so an importer's
             // loader can read this object's interface (issue #328 inc 1/2/3).
@@ -770,9 +837,7 @@ CompileResult Driver::compileObject(const std::string& path,
                 // Print codegen diagnostics (e.g. "not yet implemented") before
                 // failing (#628 pt 1).
                 for (const Diagnostic& diag : diagnostics.diagnostics()) {
-                    std::cerr << path << ":" << diag.location.line << ":"
-                              << diag.location.column << ": " << diag.message
-                              << "\n";
+                    renderDiagnostic(path, diag);
                 }
                 if (!err.empty())
                     std::cerr << "bezelc: codegen error: " << err << "\n";
@@ -782,8 +847,7 @@ CompileResult Driver::compileObject(const std::string& path,
     }
 
     for (const Diagnostic& diag : diagnostics.diagnostics()) {
-        std::cerr << path << ":" << diag.location.line << ":"
-                  << diag.location.column << ": " << diag.message << "\n";
+        renderDiagnostic(path, diag);
     }
 
     CompileResult result;

@@ -105,13 +105,16 @@ BEZEL_TEST(throw_owned_operand, throw_owned_local_ok_31_1) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §31.1: `throw move ex;` of an owned local is an explicit owned transfer.
-// ACCEPTED.
+// §31.1: `throw ex;` of an owned local is an owned transfer out of the local.
+// ACCEPTED. Spelled marker-free per §28.3 K3.13 / K3.8 (v0.307): `throw` is a
+// marker-free consuming position (the keyword announces), so `throw move ex;`
+// is now rejected as a redundant marker; the §31.1 property this row pins —
+// that an owned LOCAL is a valid throw operand — is unchanged.
 BEZEL_TEST(throw_owned_operand, throw_move_owned_local_ok_31_1) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle() "
         "  var ex := new AppError(); "
-        "  throw move ex; "
+        "  throw ex; "
         "end Handle;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

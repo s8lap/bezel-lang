@@ -385,6 +385,254 @@ extern "C" void* bz_char_to_string(int32_t cp) {
     return strObj;
 }
 
+// fix #4420 (stdlib §9.5, v0.306): char classification / simple-case-mapping,
+// lowered here ONCE and shared by both call sites that used to hit
+// <ctype.h> directly (LlvmBackend_Calls2.cpp's char.Is*/To* dispatch, and
+// string.IsNullOrWhiteSpace's per-code-point loop). C11 §7.4p1 requires a
+// <ctype.h> argument to be representable as `unsigned char` (0-255) or equal
+// to `EOF`; a Bezel char is a 32-bit Unicode scalar up to U+10FFFF (§4.5), so
+// the old code's raw `isalpha(cp)` etc. was undefined for any code point
+// above U+00FF (typical glibc indexes a 384-entry table off the argument —
+// an out-of-bounds read returning a plausible-looking bool, not merely a
+// wrong one).
+//
+// §9.5 declares every `Is*` predicate TOTAL over the Unicode general
+// category ("each char gets an answer, and none of them raises"). Two of
+// the eight predicates are exactly decidable for the FULL char domain
+// without any Unicode Character Database table, because their category is
+// a small, closed, version-stable list — not a slice of a much larger
+// table:
+//   - IsControl / Cc is *defined* as exactly the C0 and C1 control codes
+//     (U+0000-U+001F, U+007F, U+0080-U+009F) and nothing else.
+//   - IsWhiteSpace / the Unicode White_Space property is the ~25-code-point
+//     PropList.txt list (ASCII whitespace + NEL/NBSP/line & paragraph
+//     separators/the various Zs spaces), long-stable.
+// bz_char_is_control / bz_char_is_white_space implement those closed lists
+// directly and do not consult libc at all.
+//
+// The remaining six (IsDigit/Nd, IsLetter/L*, IsLetterOrDigit, IsUpper/Lu,
+// IsLower/Ll, IsPunctuation/P*) and the two case-mapping members
+// (ToUpper/ToLower) span thousands of code points scattered across nearly
+// every Unicode block (Arabic-Indic digits, CJK punctuation, per-script
+// case pairs, …) — there is no small closed list, so they are only
+// decidable within ASCII (0x00-0x7F), where the "C"-locale libc answer IS
+// definitionally the Unicode general-category answer (verified: glibc's
+// "C"-locale ctype tables return false for isalpha/isdigit/isalnum/isupper/
+// islower/ispunct/isspace for EVERY code point above 0x7F, so restricting
+// the libc call to ASCII changes nothing about the pre-fix answer for
+// 0x80-0xFF and removes the UB for 0x100+ at the same time). Above ASCII
+// these report the domain-safe default — `false` for the predicates,
+// the code point unchanged for ToUpper/ToLower, consistent with §9.5's own
+// "return the argument unchanged where it has [no case mapping]" — rather
+// than guessing from an incomplete slice of a category table (issue #4420:
+// "do not close this by widening a category table"). Full correctness above
+// ASCII needs Unicode Character Database data the runtime does not embed;
+// that is left as a follow-up, not invented here.
+static inline int bz_char_is_ascii_domain(int32_t cp) {
+    return cp >= 0 && cp <= 0x7F;
+}
+
+extern "C" int32_t bz_char_is_control(int32_t cp) {
+    uint32_t u = (uint32_t)cp;
+    return (u <= 0x1F) || (u == 0x7F) || (u >= 0x80 && u <= 0x9F);
+}
+
+extern "C" int32_t bz_char_is_white_space(int32_t cp) {
+    switch ((uint32_t)cp) {
+        case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: // TAB..CR
+        case 0x20:                                             // SPACE
+        case 0x85:                                             // NEL
+        case 0xA0:                                             // NO-BREAK SPACE
+        case 0x1680:                                           // OGHAM SPACE MARK
+        case 0x2000: case 0x2001: case 0x2002: case 0x2003:
+        case 0x2004: case 0x2005: case 0x2006: case 0x2007:
+        case 0x2008: case 0x2009: case 0x200A:  // EN QUAD .. HAIR SPACE
+        case 0x2028:                                           // LINE SEPARATOR
+        case 0x2029:                                           // PARAGRAPH SEPARATOR
+        case 0x202F:                                           // NARROW NO-BREAK SPACE
+        case 0x205F:                                           // MEDIUM MATHEMATICAL SPACE
+        case 0x3000:                                           // IDEOGRAPHIC SPACE
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+extern "C" int32_t bz_char_is_digit(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isdigit(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_letter(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isalpha(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_letter_or_digit(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isalnum(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_upper(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (isupper(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_lower(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (islower(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_is_punctuation(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? (ispunct(cp) != 0) : 0;
+}
+extern "C" int32_t bz_char_to_upper(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? toupper(cp) : cp;
+}
+extern "C" int32_t bz_char_to_lower(int32_t cp) {
+    return bz_char_is_ascii_domain(cp) ? tolower(cp) : cp;
+}
+
+// fix #4483 (stdlib §9.6, v0.306): string.Equals(other, ignoreCase: true) —
+// ordinal, code-point-wise, case-folded equality.
+//
+// This replaces a codegen-inlined "case-fold each side into a fresh buffer,
+// then compare the buffers" loop (LlvmBackend_String.cpp) that carried TWO
+// independent defects at one site:
+//
+//   1. It called <ctype.h>'s tolower() on a code point produced by the
+//      WIDTH-AWARE decoder, so anything above U+00FF was passed outside
+//      tolower's domain — undefined per C11 §7.4p1, the same defect class
+//      #4420 removed from char.* and string.IsNullOrWhiteSpace. ASan cannot
+//      see it (glibc's ctype tables are uninstrumented libc), and on glibc
+//      tolower happens to range-check and hand the argument back, which is
+//      exactly why it survived: benign HERE, on THIS libc, still undefined.
+//
+//   2. It truncated the folded code point to ONE BYTE and stored it at a
+//      hardcoded stride of 1 while the source index advanced one CODE POINT
+//      at a time, then labelled the result width=1 (§4.6). So every code
+//      point above U+00FF was silently replaced by its low byte and distinct
+//      strings compared EQUAL. Measured on HEAD before this fix:
+//      "š".Equals("a", true) → true (U+0161's low byte is 0x61 = 'a'),
+//      "š".Equals("ɡ", true) → true (U+0161 and U+0261 share low byte 0x61),
+//      "á".Equals("ǡ", true) → true (U+00E1 and U+01E1 share low byte 0xE1).
+//      All three must be false.
+//
+// Folding per code point decides the comparison position by position, so no
+// buffer is materialised at all — which also removes the two allocations per
+// operand (data + header) the old lowering never disposed (76 bytes in 4
+// allocations for a single call, measured; the `ignoreCase := false` arm
+// leaked nothing). That is a consequence of deleting the buffer, not a leak
+// fix undertaken here (#4482 owns this area's disposal gaps).
+//
+// The fold is bz_char_to_lower — the SAME shared helper char.ToLower and the
+// rest of the #4420 family use — so the runtime holds exactly one case
+// policy; two copies of a classification rule drifting apart is #2590. Within
+// ASCII that is precisely the simple case fold §9.6's `ignoreCase` overloads
+// specify; above ASCII it is identity, so two code points above ASCII compare
+// equal iff they ARE the same code point. That is #4420's domain-safe answer
+// and deliberately NOT a widened category table: full simple case folding
+// above ASCII needs Unicode Character Database data this runtime does not
+// embed, and #4481 tracks that (no-UB, wrong-value-only) range.
+//
+// The operands' storage widths are irrelevant and may differ (§4.6 adaptive
+// storage): bz_str_cp decodes each side at its own width, exactly as the
+// bz_str_* search family above does. Either pointer may be null (null equals
+// only null), mirroring emitStringEq's null-safety on the `=` path.
+extern "C" int32_t bz_str_equals_ignorecase(const void* self_p, const void* other_p) {
+    if (!self_p || !other_p) return self_p == other_p ? 1 : 0;
+    const auto* a = (const bz_string_struct*)self_p;
+    const auto* b = (const bz_string_struct*)other_p;
+    if (a->len != b->len) return 0;               // §9.6: lengths in code points
+    for (int64_t i = 0; i < a->len; ++i) {
+        if (bz_char_to_lower((int32_t)bz_str_cp(a, i)) !=
+            bz_char_to_lower((int32_t)bz_str_cp(b, i)))
+            return 0;
+    }
+    return 1;
+}
+
+// fix #4487 (stdlib §9.6 + spec §4.6, v0.306): the ONE ordinal string
+// comparison — `CompareTo(other)`, `CompareTo(other, ignoreCase)`, and the
+// `<` / `<=` / `>` / `>=` operators, all of which the two documents define as
+// the SAME relation.
+//
+// Spec §4.6 (v0.306): "`s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal
+// lexicographic comparison of the code-point sequence." Stdlib §9.6 (v0.306):
+// "All comparison and equality methods in this version are ordinal (code-
+// point-based), including the `ignoreCase` overloads". Stdlib §2.8: the result
+// is negative / zero / positive — its MAGNITUDE is not specified, so this
+// returns -1 / 0 / +1.
+//
+// It replaces `bz_string_compare(a_data, a_len, b_data, b_len, ignore_case)`,
+// which this commit deletes. That helper could not be repaired in place: its
+// signature takes a raw data pointer and a length and NOT the storage width,
+// so it was structurally unable to answer the question its callers asked. Its
+// callers handed it `loadStringData` (the raw buffer) and `loadStringLen` (the
+// CODE-POINT count), and it walked `min(a_len, b_len)` BYTES — the #535 defect
+// class. For a width-2 string it therefore read only the first `len` of the
+// `len*width` data bytes, one byte at a time. Measured on HEAD (4d9d186a)
+// before this fix:
+//
+//     "日本".CompareTo("日x", true)  ->   0   two DIFFERENT strings, EQUAL
+//     "š".CompareTo("a", true)       ->   0   U+0161 vs 'a', EQUAL
+//     "š".CompareTo("ɡ", true)       ->   0   U+0161 vs U+0261, EQUAL
+//
+// (For `"日本"` vs `"日x"`, both width 2: data bytes `E5 65 2C 67` against
+// `E5 65 78 00`, compared over n = 2 BYTES, are both `E5 65`, and the lengths
+// are equal.) Unlike #4483 there is no UB here — `bz_string_compare`'s
+// `tolower` calls were on `(unsigned char)` values and in-domain — only wrong
+// values.
+//
+// The 1-arg form did not route through that helper at all: it was an inlined
+// `memcmp(dataL, dataR, minLen*width)` fast path in `emitStringOrdCmp`
+// (LlvmBackend_String.cpp), correct only at width 1. At width 2/4 it ordered
+// by the LITTLE-ENDIAN storage bytes, i.e. by low byte first — which §4.6
+// forbids outright, since the per-string width is invisible to the language
+// and no result may depend on it. Measured on the same HEAD:
+//
+//     "日本".CompareTo("日x")  -> NEGATIVE; U+672C > U+0078, so it must be > 0
+//     "Āa" < "ĀĀ"              -> false  (0x61 < 0x100, so it must be true)
+//
+// MAGNITUDE CAVEAT: only the SIGN of that is a reproducible measurement, and
+// the sign is the whole defect. glibc's `memcmp` is required to return a
+// value whose sign orders the buffers; it is free to return the byte
+// difference or just the sign, and the two measurements taken of this program
+// disagree — -76 on the box this was first reproduced on (the analytic byte
+// difference 0x2C - 0x78) and -1 on a reviewer's rebuild. NEGATIVE-where-
+// §4.6-requires-POSITIVE reproduces on both. Nothing below asserts a
+// magnitude; stdlib §2.8 does not specify one.
+//
+// Decoding per code point via `bz_str_cp` — the same width-aware reader the
+// rest of the `bz_str_*` family uses — decides both forms at each position, so
+// each operand is read at its OWN width and mixed widths need no special case.
+// The `ignoreCase` fold is `bz_char_to_lower`, the SAME shared helper #4420
+// introduced and #4483 reused, so the runtime holds exactly one case policy:
+// the surviving second copy is what the #4483 reviewer flagged here, and two
+// copies of a classification rule drifting apart is what caused #2590. Within
+// ASCII that is the simple case fold §9.6 specifies; above ASCII it is
+// identity, so two code points above ASCII compare equal iff they ARE the same
+// code point (#4481 owns widening that, and this commit does not).
+//
+// Comparison is on `uint32_t` code points, so it is by scalar value (§4.5: a
+// char is a Unicode scalar up to U+10FFFF, always non-negative).
+//
+// NULL OPERANDS are treated as the EMPTY string, deliberately reproducing
+// `bz_string_compare`'s documented behaviour (`if (!a) a_len = 0;`) so that
+// every moved call site keeps the contract it was written against. §4.6 says
+// ordering requires non-nullable operands, so a well-typed program never
+// reaches this; note it is NOT `bz_str_equals_ignorecase`'s "null equals only
+// null" rule, which answers an EQUALITY question where null is a value.
+extern "C" int32_t bz_str_compare_cp(const void* self_p, const void* other_p,
+                                     int32_t ignore_case) {
+    const auto* a = (const bz_string_struct*)self_p;
+    const auto* b = (const bz_string_struct*)other_p;
+    int64_t a_len = a ? a->len : 0;
+    int64_t b_len = b ? b->len : 0;
+    int64_t n = a_len < b_len ? a_len : b_len;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t ca = bz_str_cp(a, i);
+        uint32_t cb = bz_str_cp(b, i);
+        if (ignore_case) {
+            ca = (uint32_t)bz_char_to_lower((int32_t)ca);
+            cb = (uint32_t)bz_char_to_lower((int32_t)cb);
+        }
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    if (a_len == b_len) return 0;                 // §9.6: lengths in code points
+    return a_len < b_len ? -1 : 1;
+}
+
 // per §9.6 / #535: Substring(start, count): owned string — code-point slice.
 // Returns a fresh +1 string of `count` code points starting at code-point
 // index `start`. Clamps `count` to the available tail if needed.

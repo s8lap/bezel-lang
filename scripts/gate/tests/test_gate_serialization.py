@@ -98,11 +98,39 @@ def _spawn_named(name, hold_s=30):
     exec'ing directly into sleep and argv[0] would be lost (the
     resulting process is just `sleep N`, no gate name). The `exec -a
     NAME sleep N` preserves argv[0] across the optimization.
+
+    #4489: the return is gated on cmdline actually reflecting `name`, not
+    just on `_spawn_detached`'s exec-started barrier -- see the call to
+    `_wait_for_cmdline` below for why that barrier alone is insufficient.
     """
     # #3415: detached, so the fixture does not inherit this runner's ancestry.
     # See _spawn_detached for why a plain Popen makes the negative assertions
     # depend on whatever launched the suite.
-    return _spawn_detached(["sleep", str(hold_s)], argv0=name)
+    proc = _spawn_detached(["sleep", str(hold_s)], argv0=name)
+    # #4489: `_spawn_detached`'s fd barrier only proves `execvp` has STARTED
+    # -- it fires at the kernel's `do_close_on_exec()`, which runs inside
+    # `begin_new_exec()` BEFORE `setup_arg_pages()` installs the new argv
+    # that /proc/<pid>/cmdline actually reads from (see `get_mm_cmdline()` /
+    # `mm->arg_start`..`arg_end`). Between those two points the target's
+    # cmdline reads back EMPTY even though the process is alive and mid-exec
+    # into the right program. A caller that samples cmdline immediately
+    # after `_spawn_named` returns can land in that window; under load the
+    # window widens, which is exactly what made `test_orphan_builder_is_not_sibling`
+    # and `test_self_is_not_sibling_when_invoked_as_gate_script` contention-
+    # flaky (#4489) despite each already re-checking cmdline itself -- their
+    # re-check used `_wait_for_cmdline`, which used to give up on that very
+    # first empty read instead of retrying (see its docstring). Making the
+    # postcondition explicit HERE, as part of what "spawned" means, is the
+    # actual fix: a fixture that can return before its own precondition
+    # holds is the defect, not any one caller that forgot to re-poll.
+    settled = _wait_for_cmdline(proc.pid, name, timeout_s=5.0)
+    if settled is None or name not in settled:
+        _kill_proc(proc.pid)
+        raise RuntimeError(
+            "_spawn_named({!r}): cmdline never settled to contain the "
+            "requested argv[0] within 5s; last read: {!r}".format(
+                name, _cmdline_of(proc.pid)))
+    return proc
 
 
 class _DetachedProc(object):
@@ -139,7 +167,7 @@ class _DetachedProc(object):
 
 
 def _spawn_detached(argv, argv0=None):
-    """Spawn `argv` REPARENTED AWAY from this test runner, and return a
+    r"""Spawn `argv` REPARENTED AWAY from this test runner, and return a
     `_DetachedProc`. Raises `RuntimeError` if the fixture cannot be
     established — a broken fixture must report as a broken fixture, not as a
     failure of the predicate under test.
@@ -161,7 +189,8 @@ def _spawn_detached(argv, argv0=None):
     The fix is to give the fixture a genuinely clean ancestry rather than to
     weaken the predicate. `is_gate_sibling` is correct in production, where its
     only call site passes pids from `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|
-    make|bezel_tests*` and so never sees a gate-named process. A detached
+    ninja-build|make|clang(\+\+)?|bezel_tests*` and so never sees a gate-named
+    process. A detached
     fixture is also the *faithful* model of what these tests describe — a
     "foreign builder" that is not part of this gate — which a child of the
     test runner can never be.
@@ -312,8 +341,26 @@ def _cmdline_of(pid):
 
 def _wait_for_cmdline(pid, expected, timeout_s=5.0):
     """Poll /proc/<pid>/cmdline until it contains `expected` (or timeout).
-    Returns the final cmdline (None if the process exited). Substring
-    match — matches the helper's `any(name in cmdline …)` shape.
+    Returns the final cmdline (None if the process genuinely exited).
+    Substring match — matches the helper's `any(name in cmdline …)` shape.
+
+    #4489: a `None` read from `_cmdline_of` is AMBIGUOUS -- it means either
+    (a) the process has exited (/proc/<pid> is gone), or (b) the process is
+    alive but between `do_close_on_exec()` and `setup_arg_pages()` inside
+    its own `exec`, where /proc/<pid>/cmdline reads back empty even though
+    the process is mid-transition into the right program (see
+    `_spawn_detached`'s docstring, and `_spawn_named`'s call to this
+    function, for why that window exists and survives the exec-started fd
+    barrier). An earlier version of this function collapsed that ambiguity
+    the wrong way -- `if last is None: return None` treated (b) as (a) and
+    gave up on the very first transient empty read instead of retrying.
+    Under load that window widens, and giving up on it was the actual
+    mechanism behind the #4489 contention-flakiness (confirmed by
+    replaying that exact sequence — a `None` read followed by a settled
+    one — through this function and observing it return `None` after a
+    single call). So only a genuinely-exited process (no `/proc/<pid>`
+    directory) ends the poll early; a merely-empty cmdline keeps polling
+    until `expected` appears or the timeout elapses.
 
     Used to verify the fixture setup: the `_spawn_named(name)` subprocess
     is reported as ready when cmdline contains `name`."""
@@ -323,7 +370,9 @@ def _wait_for_cmdline(pid, expected, timeout_s=5.0):
         last = _cmdline_of(pid)
         if last is not None and expected in last:
             return last
-        if last is None:
+        if not os.path.isdir("/proc/{}".format(pid)):
+            # Genuine exit -- no point continuing to poll for a pid that
+            # will never produce another /proc/<pid>/cmdline read.
             return None
         time.sleep(0.05)
     return last

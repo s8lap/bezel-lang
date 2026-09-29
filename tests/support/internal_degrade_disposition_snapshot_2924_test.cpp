@@ -99,10 +99,11 @@ struct Entry {
 
 // The WARNING-severity `internal:` degrades (sixteen as of v0.240; #3079 added
 // at v0.249; the two #3157 alarms and #3437's representation guard at v0.283;
-// #4045's AssignmentStmt generic-arm null-address exit at v0.294), each with
-// the judgement #2924 asks for.  Ordered by file, then by the tag.  The live
-// count is `kN`, derived from this array — the prose above is a changelog, not
-// the number the test asserts.
+// #4045's AssignmentStmt generic-arm null-address exit at v0.294; #5032's
+// interpolation-part and case-arm dead-template-body degrades at v0.307),
+// each with the judgement #2924 asks for.  Ordered by file, then by the tag.
+// The live count is `kN`, derived from this array — the prose above is a
+// changelog, not the number the test asserts.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
      Disposition::UnsafePointer,
@@ -135,6 +136,20 @@ const Entry kWarningDegrades[] = {
      "fall-through 'degrades the slot to zero via lowerLocalDecl's "
      "initializer-failed fallback' — the #2434 null-pointer path"},
 
+    {"src/codegen/LlvmBackend_Exprs.cpp", "#1386",
+     Disposition::WrongValue,
+     "the site's own text cites the pre-existing #1386 ICE class (\"lowerExpr "
+     "returned null for interpolated-string expression part\"), but #5032 "
+     "(v0.307) is what newly reaches it as a Warning: a `where T: I`-"
+     "constrained method's DEAD unspecialized generic template body (#490), "
+     "where an interpolated part's receiver is the erased, non-pointer T and "
+     "hits emitMethodCall's #484 non-pointer-receiver guard. Mirrors the "
+     "#2477 entry below: the degraded placeholder is IR generated only "
+     "inside the dead template function, which #490 never invokes — real "
+     "calls dispatch through the monomorphized per-call-site clone, where "
+     "the receiver is a genuine pointer and the interpolation lowers "
+     "normally — so no reader ever observes the substituted value"},
+
     {"src/codegen/LlvmBackend_Exprs2.cpp", "#2805",
      Disposition::WrongValue,
      "`degradedBoolOperand` returns `builder_.getInt1(false)`. The substituted "
@@ -152,6 +167,21 @@ const Entry kWarningDegrades[] = {
      "the imported constructor body never runs, so 'every field it assigns "
      "keeps its default' — a zeroed instance whose class-typed fields are null "
      "references the program will go on to read as objects"},
+
+    {"src/codegen/LlvmBackend_Exprs2.cpp", "#1386",
+     Disposition::WrongValue,
+     "the site's own text cites the pre-existing #1386 ICE class "
+     "(\"case-arm expression body failed to lower to a value\"), but #5032 "
+     "(v0.307) is what newly reaches it as a Warning: a `case v of var q: "
+     "SqN => ... end` arm over a generic T-typed scrutinee, inside the same "
+     "DEAD unspecialized template body as the #2477 entry above — the "
+     "arm's pattern never statically matches there, but its body is still "
+     "lowered to keep the template's IR complete, and `q.Area()` hits the "
+     "identical #484 non-pointer-receiver guard. Same disposition and "
+     "reasoning as #2477: the dead template function is never invoked "
+     "(#490) — the SPECIALIZED clone has a real pointer receiver and lowers "
+     "the arm normally — so the substituted zero/null result is never read "
+     "at runtime"},
 
     {"src/codegen/LlvmBackend_Layout.cpp", "#2775",
      Disposition::WrongValue,
@@ -307,6 +337,39 @@ const Entry kWarningDegrades[] = {
 // ever substituted; the site returns before evaluating the RHS or invoking any
 // store, so the bounded harm is a stale slot, not a manufactured pointer) —
 // so the count stays 9.
+//
+// #4790 (v0.307) is judged here but deliberately has NO entry above: its
+// lowerNew site in src/codegen/LlvmBackend_Exprs2.cpp ("codegen selected no
+// constructor for this `new` that sema accepted … — #4790") landed as a
+// Warning, and this test caught it. Its disposition is UnsafePointer: no
+// constructor body or field initializer runs, so the object is calloc-zero
+// and every string/class/collection field is a null pointer, and a `new`
+// always DEMANDS its value (the program reads those fields as objects, the
+// #2922 shape). Per this file's instructions it was made an Error instead of
+// being recorded as a shipped hazard. It is therefore outside the Warning
+// population this test pins, and the count stays 9.
+//
+// #4791 (v0.307) is the same judgement, reached the same way (#4989): its
+// emitChainCall site in src/codegen/LlvmBackend_Setup.cpp ("a
+// constructor-chain argument slot is still unfilled after default filling,
+// so the chained constructor body does not run — #4791") landed as a
+// Warning and this test caught it at the R20 gate. Disposition
+// UnsafePointer: skipping the chained constructor body leaves every field it
+// assigns at its calloc-zero default — the #2658 shape, a null string / class
+// / collection field the program reads as an object. It was made an Error, so
+// it too is outside the Warning population, and the count stays 9.
+//
+// #5032 (v0.307) adds two more entries — an interpolation-part degrade in
+// LlvmBackend_Exprs.cpp and a case-arm degrade in LlvmBackend_Exprs2.cpp —
+// for the SAME population as the #2477 entry above: a `where T: I`-
+// constrained method's DEAD unspecialized generic-template body (#490),
+// where a T-typed receiver is erased to a non-pointer placeholder and hits
+// emitMethodCall's #484 non-pointer-receiver guard. Both are WrongValue, not
+// UnsafePointer, by the identical #2477 reasoning: the degraded value is IR
+// generated only inside the dead template function, which #490 never
+// invokes — only the SPECIALIZED per-call-site clone runs, where the
+// receiver is a genuine pointer and the expression lowers normally — so
+// neither substituted zero/null is ever read at runtime. The count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 struct Site {

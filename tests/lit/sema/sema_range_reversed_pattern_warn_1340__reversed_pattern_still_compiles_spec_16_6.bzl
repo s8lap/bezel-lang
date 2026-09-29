@@ -12,5 +12,5 @@
 
 module M; class C public static method M(x: int): int return (case x of 50..10 => 99, _ => 0); end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: this pattern never matches — bounds are reversed
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} this pattern never matches — bounds are reversed
 // CHECK-SAME: (§16.6)

@@ -136,7 +136,8 @@ keeping them apart is what makes the divergence count mean something.
 
 ## Gate wiring
 
-The **harness** is gated; the **corpus** is not, and the split is deliberate.
+The **harness** and the **corpus** are both gated now, in two separate
+phases, because they need different things to run.
 
 `scripts/gate_full_cycle.sh` runs a build-free `rule-corpus` phase beside the
 gate self-tests. It runs `test_rules.py` under `unittest discover` against a
@@ -147,8 +148,30 @@ does not lint. The floor is exact, not a ceiling, for the same reason
 `scripts/deprecated_jit_oracle.baseline` is: headroom that is not banked is
 indistinguishable from a drop somebody already spent.
 
-The corpus itself waits on the first classification. Before a baseline exists
-every case is UNCLASSIFIED, and a phase that can only be green is not a check.
+A separate, later `rule-corpus-baseline` phase (`scripts/
+gate_rule_corpus_baseline.py`, #4621) runs the corpus itself against
+`baseline.tsv`, once a `bezelc` exists in the cycle — beside the doc-example
+conformance sweep, for the same reason: `runner.py` needs a real compiler.
+It fails the cycle on any REGRESSION or UNBANKED row, and on a total case
+count below `manifest.tsv`'s row count (a collection failure or an
+over-narrow filter must not print a normal-looking summary over almost
+nothing). Its own `--self-test` runs first and is build-free: it proves
+`runner.py`'s `compare()` still classifies all five (banked, observed)
+combinations per the ratchet table above, and that the phase's summary-line
+parser fails closed on a vacuous or malformed run rather than passing by
+default. It is deliberately named `gate_*.py`, not `check_*.py`:
+`scripts/ratchet_sweep.sh` derives its build-free pre-gate list by grepping
+for `scripts/check_[a-z_]+\.py`, and this phase — needing a real `bezelc`
+and taking well over a minute — must not be swept into that build-free list.
+
+Until #4621, this second phase did not exist: the corpus could carry a
+REGRESSION or an UNCLASSIFIED-turned-stale row indefinitely with no cycle
+ever noticing, which is exactly what v0.307's own graduation did to its
+baseline (see "Record" below). The corpus itself still waits on the first
+classification before this phase means anything: before a baseline exists
+every case is UNCLASSIFIED, and a phase that can only be green is not a
+check. Classification has now happened once (v0.306) and the baseline has
+been kept current since (v0.307, #4621), so the phase has real teeth.
 
 ## Coverage
 
@@ -238,3 +261,77 @@ type-level invariant with no accept/reject surface (§7.10's `?` idempotence), a
 build-request property (§2.8.4's artifact kind, `--main-class`), and anything
 needing two *versions* of one module (§2.8.3's staleness clause, §2.8.6's
 interface delta). Each is recorded where a lane hit it rather than approximated.
+
+### First classification — v0.306 (2026-09-21)
+
+The acceptance pass the founding record was waiting for. Run on a dev box with
+a current toolchain, against `build/bezelc` at commit `c52916d9` (integration
+branch `r18-c7`), documents at spec v0.306.
+
+```bash
+python3 tests/conformance/rules/runner.py build/bezelc --classify --jobs 6
+```
+
+**2149 cases: 1736 pass, 413 divergent (80.8%).** Divergence by tier:
+
+| tier | cases | divergent | pass rate |
+|---|---|---|---|
+| `accept` | 352 | 32 | 91% |
+| `reject` | 788 | 148 | 81% |
+| `run` | 918 | 185 | 80% |
+| `quiet` | 42 | 4 | 90% |
+| `warn` | 49 | **44** | **10%** |
+
+The `warn` row is not 44 separate defects. The compiler implements a handful of
+warnings (the mutable-static forms in §22.12/§22.13, the fresh-producer forms in
+stdlib §4.4/§4.9) and essentially nothing else: must-use and unused-result
+(§17.7, §17.13), case exhaustiveness (§19.6), constant-range direction
+(§16.4–§16.6), chain shadowing (§2.7) and enum-static sharing (§10.4) all
+"compiled silently; the spec requires a warning here". The warning surface is a
+single unimplemented area, and it is the corpus's largest finding.
+
+Of the 185 `run` divergences, 124 do not reach execution at all — the case
+compiles with an error, so they are over-rejections wearing a `run` label. The
+remaining ~61 are wrong behaviour, and they are the severe end: two LLVM IR
+verifier failures (`s2_8_2_0005` "Call parameter type does not match function
+signature", `s17_5_0004` "Invalid operand types for ICmp instruction"), several
+omitted disposals (`s28_3_0043`, `s35_5_0006`, `s35_9_0001`, `s28_12_0005`), one
+cleanup that runs twice (`s28_12_0006`), and disposal-ordering violations
+(`s15_1_1_0005`–`0007`, `s35_4_0005`).
+
+Per the triage rule above these are class (1) — the compiler has not caught up —
+until a case is shown wrong. None were edited to match the compiler.
+
+### v0.307 re-sync — 2026-09-23 (issue #4621)
+
+v0.307 (#4608, `8bfdd889`) changed 3 case files and added 35 more (proposals
+0127, 0128, 0129, 0130 and 0131 graduating) without re-banking
+`baseline.tsv`, leaving 3 REGRESSION + 35 UNCLASSIFIED rows that no gate
+cycle had any way to notice — the `rule-corpus-baseline` phase below did not
+exist yet (#4621's second finding). This entry re-classifies all 38 against
+`build/bezelc` at commit `bf7a7515`, spec v0.307, and closes both gaps: the
+missing phase (added this same batch) and the stale rows.
+
+Each row was checked individually, per the triage rule — **not** bulk-banked
+as `fail`: 13 of the 35 new cases already pass (the compiler's existing,
+more general checks happen to satisfy them, sometimes for the "wrong" narrow
+reason a `diagnostic:` mismatch flags separately, e.g. `l4_21_0010` rejects
+on the not-yet-existing `OwningSlotMap` type rather than the double-dispose
+rule it means to pin — a known limit of the format, not a new one). The
+remaining 25 are class (1), compiler-has-not-caught-up, and are now banked
+`fail` with an `issue:` header naming their proposal's tracker — turning the
+docket into something `coverage.py`/`runner.py` can enumerate:
+
+| proposal | tracker | section(s) | fail rows |
+|---|---|---|---|
+| 0127 (scoped primary-ctor params) | #4601 | 22.10 | `s22_10_0011`, `0018`, `0019` |
+| 0128 (checked-disposal default) | #4602 | 28.2 | `s28_2_0011`, `0012` |
+| 0129 (iteration-mutation lints) | #4603 | 29.12, 28.11 | `s29_12_0001`, `0004`, `0005`; `s28_11_0008`, `0009` |
+| 0130 (`OwningSlotMap<T>`) | #4604 | 4.21 (stdlib) | `l4_21_0001`–`0007`, `0009`, `0011` |
+| 0131 (trust-admission report mode) | #4605 | 28.3 | `s28_3_0090`–`0093`, `0095`, `0096` |
+
+None of the 3 REGRESSION rows turned out to be a real compiler regression —
+each is v0.307 outrunning the implementation, confirmed by re-deriving the
+observed behaviour on this batch's own `bezelc` rather than trusting the
+issue's numbers. Re-run after banking: `2184 cases: 1758 ok, 426
+known-divergent, 0 unclassified, 0 REGRESSION, 0 UNBANKED`.

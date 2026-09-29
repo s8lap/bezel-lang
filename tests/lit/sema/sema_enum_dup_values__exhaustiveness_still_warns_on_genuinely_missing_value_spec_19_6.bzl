@@ -12,5 +12,5 @@
 
 module M; enum Color Red, Green, Blue; end Color; class C public method M(c: Color): int return (case c of Red => 1, Green => 2); end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: non-exhaustive `case`: enum `Color` is missing constant(s): Blue (add a `_` arm or cover the remaining value(s))
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} non-exhaustive `case`: enum `Color` is missing constant(s): Blue (add a `_` arm or cover the remaining value(s))
 // CHECK-SAME: (§19.6)

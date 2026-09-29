@@ -59,25 +59,25 @@ BEZEL_TEST(runtime_dict_alloc_oom_2239, string_key_happy_path_roundtrips) {
 
     uint8_t* va = make_str("one");
     uint8_t* vb = make_str("two");
-    bz_dict_set_str(d, "alpha", 5, va);
-    bz_dict_set_str(d, "beta",  4, vb);
+    bz_dict_set_str(d, "alpha", 5, 1, va);
+    bz_dict_set_str(d, "beta",  4, 1, vb);
 
     BEZEL_EXPECT_EQ(bz_dict_count(d), (int64_t)2);
 
     void* out_a = nullptr;
     void* out_b = nullptr;
-    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "alpha", 5, &out_a));
-    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "beta",  4, &out_b));
+    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "alpha", 5, 1, &out_a));
+    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "beta",  4, 1, &out_b));
     BEZEL_EXPECT_TRUE(out_a == va);
     BEZEL_EXPECT_TRUE(out_b == vb);
 
     // Update-in-place (existing key): bz_dict_set_str overwrites the value
     // without disposing the displaced one (caller owns the values here).
     uint8_t* vb2 = make_str("TWO");
-    bz_dict_set_str(d, "beta", 4, vb2);
+    bz_dict_set_str(d, "beta", 4, 1, vb2);
     BEZEL_EXPECT_EQ(bz_dict_count(d), (int64_t)2);
     void* out_b2 = nullptr;
-    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "beta", 4, &out_b2));
+    BEZEL_EXPECT_TRUE(bz_dict_try_get_str(d, "beta", 4, 1, &out_b2));
     BEZEL_EXPECT_TRUE(out_b2 == vb2);
 
     // Cleanup: free the inserted values (caller-owned) and the dict.
@@ -98,11 +98,11 @@ BEZEL_TEST(runtime_dict_alloc_oom_2239, missing_key_returns_false) {
     void* d = bz_dict_alloc();
     BEZEL_EXPECT_TRUE(d != nullptr);
 
-    BEZEL_EXPECT_FALSE(bz_dict_contains_str(d, "nope", 4));
+    BEZEL_EXPECT_FALSE(bz_dict_contains_str(d, "nope", 4, 1));
     BEZEL_EXPECT_EQ(bz_dict_count(d), (int64_t)0);
 
     void* out = nullptr;
-    BEZEL_EXPECT_FALSE(bz_dict_try_get_str(d, "nope", 4, &out));
+    BEZEL_EXPECT_FALSE(bz_dict_try_get_str(d, "nope", 4, 1, &out));
 
     bz_dict_free(d, nullptr);
 }

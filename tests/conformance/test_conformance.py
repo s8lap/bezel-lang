@@ -172,6 +172,81 @@ class ClassifyWrapTest(unittest.TestCase):
 # The composite ("mixed") wrap — opt-in via the `wrap:mixed` manifest note.
 # -----------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# needs_async_main / main_header — the synthesized `Main` signature.
+#
+# spec §33.2 (v0.306) admits `public static async method Main(): Task` as one of
+# the four accepted entry-point signatures, so promoting the synthesized Main
+# for a body that awaits is enclosing scaffolding, not an edit of the document.
+# -----------------------------------------------------------------------
+
+class NeedsAsyncMainTest(unittest.TestCase):
+    def test_await_statement_needs_async(self):
+        self.assertTrue(cf.needs_async_main("var x := await FetchAsync(u);\n"))
+
+    def test_await_using_needs_async(self):
+        self.assertTrue(cf.needs_async_main("await using var c := await Open();\n"))
+
+    def test_await_for_needs_async(self):
+        self.assertTrue(cf.needs_async_main("await for var l in S() do end;\n"))
+
+    def test_no_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("var x := 1;\nDoWork();\n"))
+
+    def test_await_only_in_a_line_comment_does_not(self):
+        # A prose comment mentioning the keyword must not change the wrap.
+        self.assertFalse(cf.needs_async_main("var x := 1;   // then await it\n"))
+
+    def test_identifier_containing_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("var awaited := 1;\nawaiter.Go();\n"))
+
+    def test_member_named_await_does_not(self):
+        self.assertFalse(cf.needs_async_main("x.await;\n"))
+
+    def test_main_header_promotes_only_when_needed(self):
+        self.assertEqual(cf.main_header("var x := 1;\n"),
+                         "  public static method Main()\n")
+        self.assertEqual(cf.main_header("var x := await F();\n"),
+                         "  public static async method Main(): Task\n")
+
+
+class AsyncMainWrapTest(unittest.TestCase):
+    def test_stmt_wrap_promotes_main(self):
+        mode, src = cf.classify_wrap("var x := await FetchAsync(u);\n")
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertIn("public static async method Main(): Task", src)
+        # The document's own text is untouched: only the enclosing lines differ.
+        self.assertIn("var x := await FetchAsync(u);", src)
+
+    def test_stmt_wrap_leaves_plain_main_alone(self):
+        _, src = cf.classify_wrap("var x := 1;\n")
+        self.assertIn("public static method Main()", src)
+        self.assertNotIn("async", src)
+
+    def test_mixed_wrap_promotes_main(self):
+        _, src = cf.wrap_mixed("record P(X: int);\nvar v := await F();\n")
+        self.assertIn("public static async method Main(): Task", src)
+        self.assertIn("record P(X: int);", src)
+
+    def test_mixed_wrap_ignores_await_inside_a_member(self):
+        # The `await` lives in a class-member item, which classify_top_level_item
+        # sorts into `member` — the Main body has none, so no promotion.
+        _, src = cf.wrap_mixed(
+            "public async method M(): Task\n  await F();\nend M;\n"
+            "var x := 1;\n")
+        self.assertIn("public static method Main()", src)
+
+    def test_env_local_still_anchors_on_a_promoted_main(self):
+        # The `local` splice anchors on the Main declaration line; before the
+        # promotion the anchor regex saw only the plain spelling, so an
+        # async-promoted case would have failed with `env-error`.
+        _, src = cf.classify_wrap("var y := await F(x);\n")
+        entries = cf.parse_env("//@ local x\nvar x: int := 1;\n")
+        out = cf.splice_env(src, ["x"], entries)
+        self.assertIn("var x: int := 1;", out)
+        self.assertIn("public static async method Main(): Task", out)
+
+
 class SplitTopLevelItemsTest(unittest.TestCase):
     def test_split_is_lossless(self):
         # The scaffolding must never drop or rewrite a byte of the doc block.
@@ -393,6 +468,11 @@ class IsCrashTest(unittest.TestCase):
         for rc in (134, 137, 139, 128, 255):
             self.assertTrue(cf.is_crash(rc), rc)
 
+    def test_negative_signal_codes_are_crashes(self):
+        # Python subprocess.run on Unix returns negative signal number, e.g. -11
+        for rc in (-11, -6, -9, -15):
+            self.assertTrue(cf.is_crash(rc), rc)
+
     def test_exit_70_unhandled_exception_is_not_a_crash(self):
         # The runtime's unhandled-exception exit is acceptable for `compiles`.
         self.assertFalse(cf.is_crash(70))
@@ -400,6 +480,39 @@ class IsCrashTest(unittest.TestCase):
     def test_zero_and_normal_are_not_crashes(self):
         for rc in (0, 1, 2, 70, 100, 127):
             self.assertFalse(cf.is_crash(rc), rc)
+
+
+class SnippetTest(unittest.TestCase):
+    """_snippet budgets characters over the WHOLE line, path included — a
+    bezelc diagnostic opens with the absolute path of the file it compiled, so
+    without `strip_dir` the surviving message shrinks as the checkout gets
+    deeper (#4556)."""
+
+    def test_without_strip_dir_a_deep_path_eats_the_whole_budget(self):
+        deep = "/" + "/".join(["lane-worktree-segment"] * 6)
+        log = deep + "/cases/s5_4_0001.bzl:20:23: no member named 'reallyLong'\n"
+        snippet = cf._snippet(log, 120, 120)
+        self.assertNotIn("no member named", snippet)
+
+    def test_strip_dir_removes_the_prefix_before_the_budget_is_spent(self):
+        # cut_chars/head_bytes match the rule-corpus runner's compile-error
+        # tier (runner.py's `evaluate`, expect != reject/quiet branch).
+        deep = "/" + "/".join(["lane-worktree-segment"] * 6) + "/cases"
+        log = (deep + "/s5_4_0001.bzl:20:23: no member named 'reallyLongName' "
+               "in type 'Widget'\n")
+        snippet = cf._snippet(log, 120, 240, strip_dir=deep)
+        self.assertNotIn(deep, snippet)
+        self.assertIn("no member named 'reallyLongName'", snippet)
+
+    def test_strip_dir_is_a_noop_when_the_prefix_is_absent(self):
+        log = "s1_1_0001.bzl:1:1: boom\n"
+        self.assertEqual(cf._snippet(log, 10, 20),
+                         cf._snippet(log, 10, 20, strip_dir="/nonexistent"))
+
+    def test_strip_dir_none_matches_prior_behavior(self):
+        log = "/some/where/f.bzl:1:1: boom text\n"
+        self.assertEqual(cf._snippet(log, 12, 30),
+                         cf._snippet(log, 12, 30, strip_dir=None))
 
 
 class EvaluateRunTest(unittest.TestCase):
@@ -651,6 +764,56 @@ class RunCaseTest(unittest.TestCase):
                                            self.tmp, None, run=self._run_factory())
         self.assertEqual((status, kind, detail),
                          ("FAIL", "compile-error", "source file missing"))
+
+    def test_compile_error_detail_survives_a_deep_tmpdir(self):
+        # #4556: bezelc compiles the case as <tmpdir>/<case_id>_wrapped.bzl and
+        # its diagnostic opens with that absolute path. A lane worktree's
+        # tmpdir prefix routinely runs 100+ characters; without run_case's
+        # strip_dir=tmpdir it alone would consume the whole cut/head budget
+        # and the real message ("no member named ...") never survives.
+        deep_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            deep_root, ignore_errors=True))
+        deep_tmp = os.path.join(deep_root, *(["lane-worktree-segment"] * 5))
+        os.makedirs(deep_tmp)
+        case = self._case("f7", "module Conf;\nclass W\nend W;\n")
+
+        def fake(cmd, cwd=None):
+            if cmd[0] == self.bezelc:
+                wrap_file = cmd[-1]
+                return 1, (wrap_file + ":3:7: no member named "
+                          "'reallyLongName' in type 'W'\n")
+            return 0, ""
+
+        status, kind, detail = cf.run_case(case, self.bezelc, self.cases,
+                                           deep_tmp, None, run=fake)
+        self.assertEqual((status, kind), ("FAIL", "compile-error"))
+        self.assertIn("no member named 'reallyLongName'", detail)
+        self.assertNotIn(deep_tmp, detail)
+
+    def test_missing_diagnostic_detail_survives_a_deep_tmpdir(self):
+        # Same property (#4556), the `cls == "error"` / compile-succeeded
+        # branch: the compiler's own (successful) output can still carry the
+        # wrapped file's absolute path, e.g. in an unrelated warning.
+        deep_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            deep_root, ignore_errors=True))
+        deep_tmp = os.path.join(deep_root, *(["lane-worktree-segment"] * 5))
+        os.makedirs(deep_tmp)
+        case = self._case("f8", "module Conf;\nclass W\nend W;\n", cls="error")
+
+        def fake(cmd, cwd=None):
+            if cmd[0] == self.bezelc:
+                wrap_file = cmd[-1]
+                return 0, (wrap_file + ":1:1: warning: reallyLongDescriptive"
+                          "UnusedImportWarning\n")
+            return 0, ""
+
+        status, kind, detail = cf.run_case(case, self.bezelc, self.cases,
+                                           deep_tmp, None, run=fake)
+        self.assertEqual((status, kind), ("FAIL", "missing-diagnostic"))
+        self.assertIn("reallyLongDescriptiveUnusedImportWarning", detail)
+        self.assertNotIn(deep_tmp, detail)
 
 
 # -----------------------------------------------------------------------

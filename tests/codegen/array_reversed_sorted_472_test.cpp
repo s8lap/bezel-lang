@@ -400,9 +400,18 @@ BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
 namespace {
 // A class implementing IComparable<Box> — mirrors the kBox fixture in
 // math_convert_test.cpp (§14.2 / #1148 / #1195).
+//
+// Per spec §22.10 (v0.307, line 1861) post-#4868 5458a4e1, the class's
+// primary-ctor parameter `v` is NOT auto-promoted to a public property. The
+// canonical idiom (docs/Bezel_Language_Spec.md:2042-2057) requires an
+// explicit `public readonly property V: int := v;` so external readers can
+// observe the value (the in-class body reads — `v` and `other.v` inside
+// `CompareTo` — still resolve to the captured field per §22.10's
+// initializer-vs-body rule).
 const char* kBox1195 =
     "module M; import System; "
     "class Box(v: int): IComparable<Box> "
+    "  public readonly property V: int := v; "
     "  public method CompareTo(other: Box): int => "
     "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
     "end Box; ";
@@ -415,8 +424,13 @@ std::string boxMain1195(const std::string& body) {
 
 // §14.2 / #1195: Array<Box>.Sort() in-place — [Box(30),Box(10),Box(20)]
 // sorted ascending → [Box(10),Box(20),Box(30)].
-// Encode: a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v
+// Encode: a.Get(0).V * 49 + a.Get(1).V * 7 + a.Get(2).V
 //       = 10*49 + 20*7 + 30 = 490+140+30 = 660.
+// Per §22.10 (v0.307, line 1861) post-#4868: external reads of Box's
+// primary-ctor `v` go through the explicit `public readonly property V: int := v;`
+// declared on the kBox1195 fixture (canonical §22.10 idiom, lines 2042-2057).
+// The sort intent (ascending by CompareTo) is preserved; the value-encoding
+// expected exit code (660) is unchanged.
 BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
         "  using var b0 := new Box(30); using var b1 := new Box(10); "
@@ -424,7 +438,7 @@ BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195)
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  a.Sort(); "
-        "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 660);
+        "  return a.Get(0).V * 49 + a.Get(1).V * 7 + a.Get(2).V;")), 660);
 }
 
 // §14.2 / #1195: Sort() orders in ascending order by CompareTo — largest last.
@@ -436,13 +450,13 @@ BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_ascending_119
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  a.Sort(); "
-        "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 75);
+        "  return a.Get(0).V * 49 + a.Get(1).V * 7 + a.Get(2).V;")), 75);
 }
 
 // §14.2 / #1195: Array<Box>.Sorted() copy-form — original unchanged.
 // [Box(30),Box(10),Box(20)] sorted → copy [Box(10),Box(20),Box(30)].
 // Original encode: 30*49 + 10*7 + 20 = 1470+70+20 = 1560. (exit 40 mod 256 = 40)
-// Use simpler encoding: sorted copy Get(0).v = 10.
+// Use simpler encoding: sorted copy Get(0).V = 10.
 BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_copy_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
         "  using var b0 := new Box(30); using var b1 := new Box(10); "
@@ -450,7 +464,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_copy_1195) 
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
-        "  return s.Get(0).v;")), 10);
+        "  return s.Get(0).V;")), 10);
 }
 
 // §14.2 / #1195: Sorted() original array unchanged — first element stays Box(30).
@@ -461,7 +475,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_original_un
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
-        "  return a.Get(0).v;")), 30);
+        "  return a.Get(0).V;")), 30);
 }
 
 // §14.2 / #1195: Sorted() full order check — [Box(30),Box(10),Box(20)]
@@ -473,7 +487,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_order_1195)
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
-        "  return s.Get(0).v * 49 + s.Get(1).v * 7 + s.Get(2).v;")), 660);
+        "  return s.Get(0).V * 49 + s.Get(1).V * 7 + s.Get(2).V;")), 660);
 }
 
 // §14.2 / #1195: Sorted() on non-IComparable class still emits a diagnostic.

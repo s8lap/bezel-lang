@@ -726,6 +726,19 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
                                     const sema::SemaContext& ctx,
                                     const TypeParamResolver& resolveParam);
 
+// fix #4360 (§28.3, v0.298): the instance-method counterpart of
+// staticFactoryReturnsFreshOwned. An INSTANCE method whose every return path
+// produces a fresh owned value AND none of the returns are self-derived
+// (the receiver has no structural stake in the return value) is an instance
+// factory — the caller must treat the call result as Owned. Without this,
+// `method Make(): C => new C(); end` (instance, no `: owned`) is classified
+// Borrowed (the non-static fallthrough default) and the fresh allocation
+// leaks at every call site (24 B/call + payload).
+bool instanceFactoryReturnsFreshOwned(const ast::MethodDecl& md,
+                                      const sema::TypeRef* resultTy,
+                                      const sema::SemaContext& ctx,
+                                      const TypeParamResolver& resolveParam);
+
 // §30.1 / §9.7 (v0.179, #1438; re-applied post-substitution at a generic
 // method's INSTANTIATION site, #1595): true when `rt` is a borrow-bearing
 // record — a user record (§9.7) carrying at least one borrow-carrying field
@@ -751,7 +764,27 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 // result type. Living here (rather than duplicated in each pass) keeps the
 // two checks from drifting apart.
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
-                                 const sema::SemaContext& ctx);
+                                 sema::SemaContext& ctx);
+
+// §4.16 (v0.307, issue #4751): the `IReadOnlySpan<TElement>` INTERFACE — the
+// unifying read-only surface for every concrete span type (stdlib §4.16).
+// `isBorrowBearingRecordOrSpan` is a declaration-based predicate and does not
+// classify an interface type: an `IReadOnlySpan<TElement>` reference carries
+// a borrow of its backing Array/OwningBuffer at runtime (the same canonical
+// shape §9.7 names), but the interface has no fields and is not a record, so
+// the existing record/span/choice legs never reach it. §4.16's textual rule
+// ("a method declaring IReadOnlySpan<TElement> cannot store the parameter in
+// a field that outlives the call … These are the standard borrow-bearing-
+// record constraints; nothing new is added by the interface") IS the §9.7
+// umbrella rule — the interface is borrow-bearing by being the unifying type
+// of borrow-bearing concrete spans, and the field-store rejection applies
+// to it the same way. This predicate closes the gap. Mirrors
+// `isIReadOnlySpanType` in `LlvmBackend_impl.hpp` (#4583 alias-blind read,
+// `headName()` after §27.8 alias resolution copies `declaration`) so a
+// surface alias program (`type Al := IReadOnlySpan<int>`) is classified
+// correctly without depending on whether resolution has populated `declaration`
+// yet. // per §4.16 + §9.7, v0.307
+bool isIReadOnlySpanType(const sema::TypeRef* rt);
 
 // §9.7 / §30.1 (v0.220, #2145): the INSTANTIATION-SITE substitution
 // environment for the borrow-bearing-record field walk. A generic record's
@@ -851,7 +884,7 @@ enum class ChoiceClassification {
 };
 
 std::optional<ChoiceClassification> classifyChoiceType(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env = nullptr);
 
 // per §15.3 (#3775, promoted from a TU-local predicate in ExprTypecheck.cpp
@@ -867,7 +900,7 @@ std::optional<ChoiceClassification> classifyChoiceType(
 // and the §28.11 collection-element-category instantiation check
 // (TypeResolution_Names.cpp) both consult it, so they cannot give different
 // answers for the same type.
-bool isMoveOnlyValueType(const sema::TypeRef* t, const sema::SemaContext& ctx,
+bool isMoveOnlyValueType(const sema::TypeRef* t, sema::SemaContext& ctx,
                          const char*& kindOut);
 
 // §28.1 (v0.196) per-instantiation erasure of the `owned` payload marker, as
@@ -885,24 +918,34 @@ bool isMoveOnlyValueType(const sema::TypeRef* t, const sema::SemaContext& ctx,
 // erased → value-like) and `Result<Connection, string>` (only the class
 // payload disposes) agree.
 bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
-                                         const sema::SemaContext& ctx);
+                                         sema::SemaContext& ctx);
 
 // §28.1 / §35.4: resolve a choice case payload field's DECLARED type through a
 // concrete instantiation `rt` (whose `genericArgs` line up with the choice's
 // generic params). A bare type-parameter field type (`owned value: T`) maps to
-// the matching `rt->genericArgs[i]`; a concrete or nested-generic field type is
-// returned as resolved. Returns null when `pf` has no type. When `rt` carries no
-// generic args (the uninstantiated template), the declared type is returned
-// unchanged, so a template classifies conservatively.
+// the matching `rt->genericArgs[i]`; a payload that MENTIONS the parameter
+// below the top level (`owned inner: Inner<T>`, `owned xs: Array<T>`) is
+// substituted in place through the shared eager walker. Returns null when `pf`
+// has no type. When `rt` carries no generic args (the uninstantiated
+// template), the declared type is returned unchanged, so a template classifies
+// conservatively.
 //
 // `decl` is the choice's `sema::TypeSymbol` (fix #3144, family F9 of #3152). It
 // was the `ast::TypeDecl`, which every caller obtained by
 // `dynamic_cast<const ast::TypeDecl*>(choiceTy->decl)` — null for every
 // IMPORTED choice — so the substitution silently did not happen across a module
 // boundary. The parameter NAMES this reads live on the TypeSymbol on both sides.
+//
+// fix #4568 (#4212's FOURTH eager substitution walker, Family I1): this was a
+// verbatim copy of the pre-#4212 `applyGenericSubst` body — TOP-LEVEL-ONLY, so
+// a payload whose type merely MENTIONED the parameter came back with the
+// parameter still bare. `sema::substituteGenericArgs` now does the walk. `ctx`
+// is non-`const` because the walker allocates the substituted TypeRef through
+// `SemaContext::makeTypeRef`; every caller already holds a non-`const`
+// `SemaContext&`. // per §14.1, §35.4, v0.306
 const sema::TypeRef* substitutedChoicePayloadType(
     const ast::Param& pf, const sema::TypeSymbol* decl, const sema::TypeRef* rt,
-    const sema::SemaContext& ctx);
+    sema::SemaContext& ctx);
 
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801). True when `md`'s
 // DECLARED return type — read *before* generic substitution, nullability

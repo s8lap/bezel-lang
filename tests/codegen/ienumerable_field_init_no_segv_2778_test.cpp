@@ -99,7 +99,7 @@ const char* kArrayIntoIEnumerableField =
     "  public constructor() "
     "    var arr := new Array<int>(); "
     "    arr.Add(1); arr.Add(2); arr.Add(3); "
-    "    seq := move arr; "
+    "    seq := arr; "
     "  end constructor; "
     "  public method Sum(): int "
     "    var total: int := 0; "

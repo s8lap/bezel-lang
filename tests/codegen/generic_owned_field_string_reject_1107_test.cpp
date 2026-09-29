@@ -31,7 +31,7 @@ bool has285Reject(const bezel::test::JitResult& r) {
 const char* kBoxOwned =
     "class Box<T> where T: class "
     "  private owned _item: T; "
-    "  public constructor(owned item: T) _item := move item; end constructor; "
+    "  public constructor(owned item: T) _item := item; end constructor; "
     "end Box; ";
 }  // namespace
 

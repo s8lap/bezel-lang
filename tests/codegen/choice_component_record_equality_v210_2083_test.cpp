@@ -142,3 +142,71 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
         "  return -2; "
         "end Main; end C;"), 100);
 }
+
+// fix #4278 (sibling of #4251, same root cause, different code path):
+// a non-generic record's field of a GENERIC CHOICE type (e.g. `Maybe<string>`)
+// lost its type-parameter substitution in the CHOICE-kind nested-field arms of
+// `emitValueEquality` / `emitValueHashCode` / `emitValueToString` — without passing
+// the concrete instantiation to `emitChoiceEquality/emitChoiceHashCode/emitChoiceToString`,
+// the choice's payload fields were compared/hashed/formatted by pointer identity,
+// not §4.6 content. The record-side sibling (#4251) fixed this at the three
+// record arms; this fix applies the identical pattern at the three choice arms.
+//
+// §4.6 (content equality) / §5.x (CHOICE) / §27.x (generic instantiation).
+
+// §4.6 — a non-generic record holding a generic choice field compares equal
+// by §4.6 content when the choice payloads are content-equal. Without the fix,
+// `emitChoiceEquality` ran without the concrete instantiation, so `Maybe<string>`'s
+// string payload compared by pointer identity — two `Some("hi")` values with distinct
+// heap allocations compared unequal. Uses a distinct-pointer string `s` and a literal
+// `"hi"` so both the "equal" and "not-equal" cases are meaningful.
+BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
+           spec_4_6_generic_choice_in_non_generic_record_equality) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "choice Maybe<T> None, Some(v: T); end Maybe; "
+        "record Box(m: Maybe<string>); "
+        "class C public static method Main(): int "
+        "  var s := \"hi\"; "
+        "  var r1 := new Box(Maybe<string>.Some(s)); "
+        "  var r2 := new Box(Maybe<string>.Some(\"hi\")); "
+        "  var r3 := new Box(Maybe<string>.Some(\"bye\")); "
+        "  if r1 = r2 and not (r1 = r3) then return 1; else return 0; end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.6 / §35.7 — hash invariant: equal records must hash equal. Without the fix,
+// `emitChoiceHashCode` ran without the concrete instantiation, so the string
+// payload in `Some("hi")` hashed by pointer identity — two content-equal
+// `Box(Some("hi"))` values produced different hashes, breaking the §8.3
+// hash-contract for dictionary keys.
+BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
+           spec_4_6_generic_choice_in_non_generic_record_hash_equal) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "choice Maybe<T> None, Some(v: T); end Maybe; "
+        "record Box(m: Maybe<string>); "
+        "class C public static method Main(): int "
+        "  var s := \"hi\"; "
+        "  var r1 := new Box(Maybe<string>.Some(s)); "
+        "  var r2 := new Box(Maybe<string>.Some(\"hi\")); "
+        "  return (if r1.GetHashCode() = r2.GetHashCode() then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §4.6 / §35.7 — hash discrimination: different content must produce different
+// hashes. Without the fix, `emitChoiceHashCode` ran without the concrete
+// instantiation, so distinct strings could hash identically.
+BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
+           spec_4_6_generic_choice_in_non_generic_record_hash_different) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "choice Maybe<T> None, Some(v: T); end Maybe; "
+        "record Box(m: Maybe<string>); "
+        "class C public static method Main(): int "
+        "  var r1 := new Box(Maybe<string>.Some(\"hi\")); "
+        "  var r2 := new Box(Maybe<string>.Some(\"bye\")); "
+        "  return (if r1.GetHashCode() <> r2.GetHashCode() then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
