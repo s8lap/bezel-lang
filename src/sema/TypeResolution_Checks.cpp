@@ -7183,13 +7183,16 @@ void Resolver::checkAbstractImplementations() {
         // `Equals` exactly as before #5048. Codegen's
         // `isSynthesizedIEquatableEquals` (#5068) tests builtin identity and
         // relies on this check for the Self-ness of the listing.
-        TypeSymbol* builtinIEq = nullptr;
-        for (TypeSymbol* b : t->baseTypes) {
-            if (b && b->isSynthesizedBuiltinInterface &&
-                b->name == "IEquatable" && b->genericParams.size() == 1 &&
-                b->genericParams[0]) {
-                builtinIEq = b;
-                break;
+        TypeSymbol* builtinIEq =
+            ctx_.builtinInterfaceSymIfCached("IEquatable");
+        if (!builtinIEq) {
+            for (TypeSymbol* b : t->baseTypes) {
+                if (b && b->isSynthesizedBuiltinInterface &&
+                    b->name == "IEquatable" && b->genericParams.size() == 1 &&
+                    b->genericParams[0]) {
+                    builtinIEq = b;
+                    break;
+                }
             }
         }
         // (b): is `ref` exactly Self — `t` at its own generic parameters?
@@ -7223,6 +7226,17 @@ void Resolver::checkAbstractImplementations() {
                 }
             }
         }
+        // fix #5139 (§14.2 cl 2, v0.309): a record that lists an interface
+        // extending `IEquatable<Self>` (`record Point: IMy` where
+        // `IMy: IEquatable<Point>`) satisfies the constraint via the
+        // synthesized `Equals(T)` witness the same way a direct listing does.
+        // `listsBuiltinIEqAtSelf` above only sees the direct listing; this
+        // companion flag tracks the indirect path through the BFS below. The
+        // injection at the bottom still gates on
+        // `!equalsNeedsRealWitness`, so any non-Self `IEquatable<U>` reached
+        // through an extending interface (the new T4 negative row) keeps the
+        // §12.5 reject.
+        bool seesBuiltinIEqAtSelfViaInterface = false;
         bool equalsNeedsRealWitness = false;
         std::size_t i = 0;
         while (i < frontier.size()) {
@@ -7396,10 +7410,40 @@ void Resolver::checkAbstractImplementations() {
                         }
                     }
                 }
-                // fix #5095: builtin IEquatable reached through ANOTHER
-                // interface is not `t`'s own `IEquatable<Self>` listing.
-                if (cur != t && b == builtinIEq && builtinIEq)
-                    equalsNeedsRealWitness = true;
+                // fix #5139 (§14.2 cl 2, v0.309): when builtin IEquatable is
+                // reached through ANOTHER interface, the synthesized
+                // `Equals(T)` still satisfies the obligation IF and ONLY IF
+                // the type argument at this extension is exactly Self
+                // (`record Point: IMy` where `IMy: IEquatable<Point>` is the
+                // §14.2 cl 2 admit case; `IMy: IEquatable<int>` stays a
+                // §12.5 reject — the synthesized `Equals(Point)` is not a
+                // witness for `IEquatable<int>.Equals(int)`). Pre-#5139 this
+                // was a blanket `equalsNeedsRealWitness = true`, which
+                // rejected the indirect listing unconditionally. The
+                // Self-ness check uses the same `isExactlySelf` predicate
+                // that the direct-listing check above uses, applied to the
+                // type argument in the EXTENDING interface's baseTypeRefs
+                // (e.g. the `Point` in `IMy: IEquatable<Point>`) after
+                // substitution through curSubst — for a non-generic
+                // extending interface (the spec's case) curSubst is empty
+                // and the literal TypeRef's declaration is compared against
+                // `t` directly.
+                if (cur != t && b == builtinIEq && builtinIEq) {
+                    bool selfTyped = false;
+                    if (bi < cur->baseTypeRefs.size()) {
+                        TypeRef* bref = cur->baseTypeRefs[bi];
+                        if (bref && bref->genericArgs.size() == 1) {
+                            const TypeRef* selfArg = substTypeRef(
+                                bref->genericArgs[0], curSubst);
+                            selfTyped = isExactlySelf(selfArg);
+                        }
+                    }
+                    if (selfTyped) {
+                        seesBuiltinIEqAtSelfViaInterface = true;
+                    } else {
+                        equalsNeedsRealWitness = true;
+                    }
+                }
                 std::string key = seenKey(b, bSubst);
                 if (!seen.insert(key).second) continue;
                 frontier.push_back(FrontierNode{b, std::move(bSubst)});
@@ -7409,7 +7453,8 @@ void Resolver::checkAbstractImplementations() {
         // the synthesized `Equals(T)` for the one obligation it witnesses —
         // see the comment above `builtinIEq`. A record with a written
         // `Equals` already has it in `concreteNames` from the BFS.
-        if (listsBuiltinIEqAtSelf && !equalsNeedsRealWitness &&
+        if ((listsBuiltinIEqAtSelf || seesBuiltinIEqAtSelfViaInterface) &&
+            !equalsNeedsRealWitness &&
             (isPositionalRecordEqualityBearing(t, ctx_) ||
              isAutoEqualityBearingBodyRecord(t, ctx_))) {
             concreteNames.insert("Equals");
