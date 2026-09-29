@@ -1200,9 +1200,34 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
         // contexts.
         {
             const sema::TypeRef* targetTR = nullptr;
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-                if (ma->target)
-                    targetTR = ctx_.exprType(*ma->target);
+            const ast::MemberAccessExpr* targetMa =
+                dynamic_cast<const ast::MemberAccessExpr*>(&e);
+            if (targetMa && targetMa->target)
+                targetTR = ctx_.exprType(*targetMa->target);
+            // §22.12 (v0.309, #5152): a BARE, non-generic type name used as
+            // the qualifier (`E._c`, `class E: B<string>`) carries no
+            // exprType at all — exprType is populated for a value
+            // expression, and a plain type-name qualifier with no generic
+            // argument list is never one (unlike `B<string>`, whose
+            // argument list makes sema resolve and record a proper Named
+            // TypeRef so the branch above already works). The established
+            // fallback other inherited-member dispatch sites use for this
+            // exact shape (LlvmBackend_Setup.cpp's
+            // resolveSynthesizedDeserializeCallTarget,
+            // LlvmBackend_Calls.cpp:10559, LlvmBackend_Exprs.cpp:3987) is to
+            // resolve the qualifier's SYMBOL instead and check whether it is
+            // a TypeSymbol; synthesize a bare TypeRef (declaration only, no
+            // generic args) from it, exactly as computeAncestorGenericSubst's
+            // own `this`/`base`-keyword and bare-identifier callers already
+            // do (LlvmBackend_Calls2.cpp's `synth` receivers above).
+            sema::TypeRef bareTargetSynth;
+            if (!targetTR && targetMa && targetMa->target) {
+                if (auto* ts = dynamic_cast<sema::TypeSymbol*>(
+                        ctx_.exprSymbol(*targetMa->target))) {
+                    bareTargetSynth.kind = sema::TypeRef::Kind::Named;
+                    bareTargetSynth.declaration = ts;
+                    targetTR = &bareTargetSynth;
+                }
             }
             // #723: a qualified self-type access `Box<T>.n` inside the
             // monomorphized body carries the UNRESOLVED param `T` (Named,
@@ -1237,6 +1262,39 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                         fs->parent->genericParams.size()) {
                 for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i)
                     appendTypeArg(resolveArg(targetTR->genericArgs[i]));
+            } else if (targetTR && targetTR->kind == sema::TypeRef::Kind::Named &&
+                    targetTR->declaration && targetTR->declaration != fs->parent) {
+                // §22.12 (v0.309, #5152 — resolves the #4974 spec question): a
+                // static field declared on a base class, named through a
+                // DERIVED type (`D<string>._c` where `_c` is declared on
+                // `B<T>` and `class D<T>: B<T>`), names the DECLARING type's
+                // cell "at the substitution the base clause supplies" — "the
+                // two spellings are one cell". Walk the base-clause chain from
+                // the derived receiver (`targetTR`, e.g. `D<string>`) to
+                // `fs->parent` (`B`) via the shared #2840
+                // `computeAncestorGenericSubst` helper (the same vehicle
+                // #4950's itable patch and every inherited-member dispatch
+                // site use) and key the per-instantiation cell on THAT
+                // substitution, so `D<string>._c` and `B<string>._c` resolve
+                // to the same global.
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+                if (computeAncestorGenericSubst(targetTR, fs->parent, ancSubst,
+                                                 ancSema)) {
+                    const std::vector<std::string_view> parentParams =
+                        sema::genericParamNames(fs->parent);
+                    bool allBound = !parentParams.empty();
+                    for (auto pn : parentParams) {
+                        if (!ancSema.count(pn) || !ancSema[pn]) {
+                            allBound = false;
+                            break;
+                        }
+                    }
+                    if (allBound) {
+                        for (auto pn : parentParams)
+                            appendTypeArg(ancSema[pn]);
+                    }
+                }
             }
         }
 
