@@ -6995,9 +6995,21 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
     // §7.11 "No three-valued logic": `and` / `or` require both operands to be
     // non-nullable `bool`. A `bool?` operand is a compile error.
     if (op == "and" || op == "or") {
+        // fix #5137 (§7.11, v0.313): "the rule reads the operand's STATIC
+        // type, so an operand that §7.4 has narrowed non-null is a non-nullable
+        // operand and the ordinary operator applies to it unchanged" (#4718
+        // migration: read the NARROWED type at the gate, not the declared
+        // type). Without this read, a `bool?` operand that flow-narrowing
+        // (§7.4) has made non-null — `var b: bool? := true; b and true` —
+        // was rejected with the bare-bool? diagnostic below. The diagnostic
+        // text is preserved (#5137); only the gate's TYPEREAD is keyed on
+        // the narrowed type. operandStaticTypeAt is the ONE narrowing
+        // predicate (#3298), so the keying matches every other §7.11 gate
+        // (relational, range, slot, ordering pattern).
         auto isBoolNullable = [&](const ast::Expr* e) -> bool {
             if (!e) return false;
-            const TypeRef* t = ctx_.exprType(*e);
+            const TypeRef* t =
+                operandStaticTypeAt(e, ctx_.exprType(*e));
             return t && t->kind == TypeRef::Kind::Primitive &&
                    t->primitive == PrimitiveType::Bool && t->nullable;
         };
@@ -7024,7 +7036,8 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // `&`/`|`/`^` (§6.5), which are distinct operators.
         auto isNonBool = [&](const ast::Expr* e) -> bool {
             if (!e) return false;
-            const TypeRef* t = ctx_.exprType(*e);
+            const TypeRef* t =
+                operandStaticTypeAt(e, ctx_.exprType(*e));
             return t && !(t->kind == TypeRef::Kind::Primitive &&
                           t->primitive == PrimitiveType::Bool);
         };
@@ -8018,9 +8031,20 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         return;
     }
     if (op == "not") {
+        // fix #5137 (§7.11, v0.313): read the NARROWED static type, not the
+        // declared one. "the rule reads the operand's STATIC type, so an
+        // operand that §7.4 has narrowed non-null is a non-nullable operand
+        // and the ordinary operator applies to it unchanged" (#4718
+        // migration). Without this read, a `bool?` operand that flow-
+        // narrowing has made non-null — `if b <> null then not b end` —
+        // was rejected with the bare-bool? diagnostic below. Diagnostic
+        // text preserved (#5137); only the gate's TYPEREAD is keyed on the
+        // narrowed type. operandStaticTypeAt is the ONE narrowing predicate
+        // (#3298), so the keying matches every other §7.11 gate.
         // §7.11: `not bool?` is a compile error.
         if (ue.operand) {
-            const TypeRef* ot = ctx_.exprType(*ue.operand);
+            const TypeRef* ot =
+                operandStaticTypeAt(ue.operand.get(), ctx_.exprType(*ue.operand));
             if (ot && ot->kind == TypeRef::Kind::Primitive &&
                 ot->primitive == PrimitiveType::Bool && ot->nullable) {
                 ctx_.diagnostics().report(

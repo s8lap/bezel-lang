@@ -6219,7 +6219,16 @@ void ExprTC::checkAssignable(
 // inferred (unresolved identifiers, un-typed calls) are left alone
 // so this pass never produces false positives on incomplete typing.
 void ExprTC::checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
-    TypeRef* t = ctx_.exprType(cond);
+    // fix #5137 (§7.11, v0.313): "an operand whose static type is a nullable
+    // value type is a compile error … the rule reads the operand's STATIC
+    // type, so an operand that §7.4 has narrowed non-null is a non-nullable
+    // operand and the ordinary operator applies to it unchanged" (#4718
+    // migration: read the NARROWED type at the gate, not the declared type).
+    // Without this read, a `bool?` condition that flow-narrowing has made
+    // non-null (`var b: bool? := true; if b and …`) was rejected with the
+    // bare-bool? diagnostic below; the narrowing existed but the gate did
+    // not see it. operandStaticTypeAt is the ONE narrowing predicate (#3298).
+    TypeRef* t = operandStaticTypeAt(&cond, ctx_.exprType(cond));
     if (!t) return;
     // A `bool?` is NOT a valid condition: §21.2 requires the condition to be
     // `bool`, and §7.11 (no three-valued logic) makes a nullable bool in a
