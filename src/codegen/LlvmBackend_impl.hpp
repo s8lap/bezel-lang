@@ -8314,6 +8314,89 @@ private:
         return nullptr;
     }
 
+    // fix #5122 (§22.6 / §12 / §12.1, v0.307): a vtable-slot key for a METHOD
+    // that distinguishes overloads sharing name AND arity but differing in
+    // parameter types. #1085 keyed by name+arity (distinct arities → distinct
+    // slots); that fix's claim row 173 / Probe D proved that `M(Foo)` and
+    // `M(int)` STILL collide — both share the key `M#1`, so the second
+    // overload's slot overwrites the first's (last-writer-wins), and every
+    // base-typed-receiver call to the EARLIER-declared overload dispatches to
+    // the LATER-declared body's return value (the issue's `b.M(new Foo())`
+    // returns 20 from `M(int)`, not 10 from `M(Foo)`).
+    //
+    // Mirroring #1080's indexerSlotKey: extend the key with each parameter's
+    // type spelling. Two virtuals with the same name + arity but distinct
+    // param types → distinct keys → distinct slots; a base virtual and its
+    // derived override of the same arity AND same param types → identical key
+    // → override reuses the base's slot. The `#` separators can't appear in
+    // an identifier, the trailing `.` distinguishes a key that includes the
+    // spelling from one that did not (a `?` placeholder), and the arity is
+    // preserved (cheap redundancy against the spelling list).
+    std::string methodSlotKey(const sema::MethodSymbol* ms) {
+        std::string key(ms->name);
+        key += "#";
+        key += std::to_string(ms->params.size());
+        // Local declaration: walk the ast::MethodDecl's params (which carry
+        // the parameter `ast::Type*` directly). Imported/abstracted method:
+        // the AST is null (ModuleLoader reconstructs ParameterSymbols with
+        // `resolvedDeclType`); fall back to that side. Either path produces
+        // the same spelling for a type written identically in source, so a
+        // local override and an imported base method land on the same key.
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            for (const auto& p : md->params) {
+                key += "#";
+                if (p.type && p.type->name && !p.type->name->parts.empty()) {
+                    for (auto part : p.type->name->parts) {
+                        key += std::string(part);
+                        key += ".";
+                    }
+                } else {
+                    key += "?";
+                }
+            }
+        } else {
+            for (sema::Symbol* p : ms->params) {
+                key += "#";
+                auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+                sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
+                if (!tr) {
+                    key += "?";
+                } else if (tr->kind == sema::TypeRef::Kind::Primitive) {
+                    // #2545 lesson (see indexerSlotKey): an imported
+                    // parameter's primitive TypeRef has no AST `parts`; map
+                    // the PrimitiveType enum to the same lowercase spelling
+                    // the local-AST path produces, so the imported base and
+                    // the local override agree.
+                    switch (tr->primitive) {
+                        case sema::PrimitiveType::Bool:    key += "bool";    break;
+                        case sema::PrimitiveType::Char:    key += "char";    break;
+                        case sema::PrimitiveType::String:  key += "string";  break;
+                        case sema::PrimitiveType::Byte:    key += "byte";    break;
+                        case sema::PrimitiveType::SByte:   key += "sbyte";   break;
+                        case sema::PrimitiveType::Short:   key += "short";   break;
+                        case sema::PrimitiveType::UShort:  key += "ushort";  break;
+                        case sema::PrimitiveType::Int:     key += "int";     break;
+                        case sema::PrimitiveType::UInt:    key += "uint";    break;
+                        case sema::PrimitiveType::Long:    key += "long";    break;
+                        case sema::PrimitiveType::ULong:   key += "ulong";   break;
+                        case sema::PrimitiveType::Float:   key += "float";   break;
+                        case sema::PrimitiveType::Double:  key += "double";  break;
+                        case sema::PrimitiveType::Decimal: key += "decimal"; break;
+                        case sema::PrimitiveType::Object:  key += "Object";  break;
+                        default:                           key += "?";       break;
+                    }
+                    key += ".";
+                } else if (!tr->headName().empty()) {
+                    for (auto part : tr->headName()) key += part;
+                    key += ".";
+                } else {
+                    key += "?";
+                }
+            }
+        }
+        return key;
+    }
+
     // #1080 / §23.4: a vtable-slot key for an INDEXER that distinguishes
     // overloads by their index-parameter signature (two indexers `[i: int]` and
     // `[s: bool]` must get DISTINCT slots, not collide on the shared name
