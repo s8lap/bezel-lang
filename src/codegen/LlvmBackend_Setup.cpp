@@ -4270,8 +4270,21 @@ const std::vector<bool>& Emitter::widenedParamPositions(
             if (t == anc) return true;
         return false;
     };
-    std::string key = std::string(rootMs->name) + "#" +
-                      std::to_string(rootMs->params.size());
+    // fix #5122 follow-up (§12.1, v0.313): the slot key stored in
+    // vtableNameSlot_ is now methodSlotKey(rootMs) (name + arity + each
+    // param's type spelling), not the bare name+arity #5122 replaced. A
+    // stale name+arity key here never matches an entry in vtableNameSlot_
+    // (every stored key now carries the type-spelling suffix), so this scan
+    // silently found NO contributor for any slot family, `result` stayed
+    // all-false, and a value-typed nullable-widening override (`int` ->
+    // `int?`) dispatched through a base-typed reference called the WIDENED
+    // body with the NARROW (un-widened) ABI — the exact #1592 corruption
+    // this function exists to prevent (confirmed empirically: printed 1
+    // instead of 7, tests/codegen/virtual_dispatch_test.cpp
+    // override_valuetype_widen_dispatched_via_base_typed_reference).
+    // methodSlotKey(rootMs) reproduces the SAME key buildVtable used to
+    // install rootMs's own slot, so the lookup below finds it again.
+    std::string key = methodSlotKey(rootMs);
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
