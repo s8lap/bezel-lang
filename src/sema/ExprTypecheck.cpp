@@ -4333,6 +4333,23 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
 bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
                                                SourceLocation loc) {
     if (!initExpr) return false;
+    // fix #5063/#852 regression (§27.6, v0.307): restrict to a BARE method-
+    // group reference shape (Identifier/MemberAccess — mirrors
+    // `freshReferenceFormation`'s own shape test above), never any other
+    // expression kind. `ctx_.exprSymbol` is also set on an operator CALL
+    // (`v * 2`) to the resolved overload's MethodSymbol, for codegen's
+    // benefit — that is an already-selected, already-applied call, not an
+    // uncalled reference sitting in `var f := M.On;`'s position, and
+    // `overloads.size() < 2` below does not tell them apart (the operator
+    // method is still overloaded; it was simply already picked by ordinary
+    // call-argument overload resolution, upstream of this check). Without
+    // this guard, `var w := v * 2;` on a record with an overloaded `*`
+    // false-rejected as an "ambiguous method reference with no target type"
+    // — the record was called with the right operand type and never needed
+    // any target-typed disambiguation at all.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(initExpr) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(initExpr))
+        return false;
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*initExpr));
     if (!ms || !ms->parent) return false;
 
@@ -4393,7 +4410,8 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
 void ExprTC::checkAssignable(
     TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
     const ast::Expr* fromExpr,
-    const std::unordered_set<std::string_view>* freeTypeParamNames) {
+    const std::unordered_set<std::string_view>* freeTypeParamNames,
+    bool allowMethodRefOverloadSelection) {
     // fix #4897 (§27.1.1 v0.307 / §27.6): a bare (unqualified) method-group
     // identifier resolves its symbol (ctx_.setExprSymbol, ExprTypecheck_Exprs
     // .cpp's IdentifierExpr handling) but is never assigned a Function
@@ -5425,6 +5443,7 @@ void ExprTC::checkAssignable(
             // reference). The #1820 mint-announcing / iterable-family fences
             // further below re-check `from->funcReturn` directly; they pick
             // up the chosen overload through this rewrite too.
+            if (allowMethodRefOverloadSelection) {
             if (auto* ms0 = dynamic_cast<MethodSymbol*>(
                     ctx_.exprSymbol(*fromExpr))) {
                 const TypeRef* chosen = nullptr;
@@ -5536,6 +5555,7 @@ void ExprTC::checkAssignable(
                     case MethodRefOverloadResult::SingleOverload:
                         break;
                 }
+            }
             }
             for (std::size_t i = 0; i < selFrom->funcParams.size(); ++i) {
                 const TypeRef* targetParam = to->funcParams[i].type;
@@ -17277,6 +17297,28 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
     // for a value; §27.6 formation for a method reference — checkAssignable
     // distinguishes them from `value`). The return slot is judged separately
     // below, so it is copied here and this call adds no return-slot rule.
+    //
+    // fix #4901/#4968-c06 regression (§27.6, v0.307): `allowMethodRefOverload
+    // Selection=false` here is deliberate. #5019/#4978 taught checkAssignable
+    // to run target-typed OVERLOAD SELECTION (`selectMethodRefOverload`) for
+    // every `freshReferenceFormation` source, picking whichever overload in
+    // `H`'s group exactly fits the target and reporting nothing when one
+    // does — correct at an ordinary formation site (`var f: (int)->() :=
+    // H.On;`, #5019's own reason for existing), but not here: an
+    // event-handler position considers no overload but the one `h`
+    // (`ctx_.exprType`/`buildMethodRefType`'s single already-resolved
+    // symbol) already names — the manual re-check below (fix #4968) was
+    // written against exactly that "neither bridging conversion nor overload
+    // resolution" position. Without the opt-out, `Subscribe(H.On)` against an
+    // overloaded `H` silently picks the OTHER overload that happens to fit,
+    // and the manual check below (which still reads `h`, the first-declared
+    // overload) is bypassed by this call's now-silent success, replacing the
+    // pinned "not implicitly convertible" diagnostic with none at all or a
+    // differently-worded one. The single-candidate bridging path (`from`
+    // unchanged, `implicitlyConvertible`) is untouched — the manual check
+    // below still relies on it silently accepting e.g. `int -> double`
+    // (conversion_bridged_handler_rejected_until_4978_spec_27_6) so IT can
+    // report the representation-changing-conversion wording instead.
     const std::size_t errorsBefore = ctx_.diagnostics().errorCount();
     TypeRef* expected = ctx_.makeTypeRef();
     expected->kind = TypeRef::Kind::Function;
@@ -17294,7 +17336,9 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
     }
     expected->funcReturn = h->funcReturn;
     expected->funcReturnOwned = h->funcReturnOwned;
-    checkAssignable(h, expected, value->span.begin, what, value);
+    checkAssignable(h, expected, value->span.begin, what, value,
+                     /*freeTypeParamNames=*/nullptr,
+                     /*allowMethodRefOverloadSelection=*/false);
     if (ctx_.diagnostics().errorCount() != errorsBefore) return;
     // fix #4968: the parameter slot under the function-VALUE rule (see the
     // header) — checkAssignable admitted every §5.1 conversion for a formed

@@ -13105,17 +13105,49 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // formal (e.g. `method Apply<U>(f: U)` with `U := (string)->int`
                 // at the call site) has `p.type->kind == Named`, not Function, so
                 // the original gate skipped it. The argument IS a +1 closure producer,
-                // so it must be released after the call. Also admit when the formal
-                // is a method-own or class-own type param whose RESOLVED type at
-                // this call site is function.
+                // so it must be released after the call.
+                //
+                // fix-forward #1073/#4901-cluster regression (§28.14, v0.307):
+                // restricted to a METHOD-OWN type param only — never the
+                // enclosing TYPE's own generic param. #5116's original wording
+                // ("method-own or class-own") re-admitted the exact #1921/#2248
+                // UAF shape this arm's own header comment above warns about:
+                // `class Box<T> { F: T?; method Keep(x: T) F := x; end Keep; }`
+                // — `callBoundedScan` (Ownership_Checks.cpp) never enrolled a
+                // bare-Named formal in `callBoundedParams_` (its enrolment
+                // predicate is the AST shape `p.type->kind == Function`, by
+                // construction identical to this arm's ORIGINAL gate — the
+                // whole soundness argument rests on that shape coupling), so
+                // no escape check ever ran on `x`, and codegen has no signal
+                // that `Keep` does not squirrel `x` away into `this.F`. A
+                // METHOD-OWN type param is different in kind, not degree: no
+                // field of the enclosing type can be DECLARED at a method's
+                // own generic parameter (that name only exists for the
+                // duration of one activation), so a method-own-`T` argument
+                // can never be stored into a field, a collection reachable
+                // beyond the call, or returned through any slot that does not
+                // already name `T` in the callee's own signature — exactly
+                // the §28.14 call-bounded obligations the Function-typed shape
+                // is independently verified for. Bail (leak, the safe
+                // direction) whenever the Named head is not one of the
+                // callee's OWN `genericParams`, even if it verbatim matches an
+                // enclosing type's generic parameter of the same name.
                 bool formalIsFunction = p.type->kind == ast::TypeKind::Function;
-                if (!formalIsFunction && p.type->kind == ast::TypeKind::Named) {
+                if (!formalIsFunction && p.type->kind == ast::TypeKind::Named &&
+                    p.type->name && p.type->name->parts.size() == 1) {
+                    std::string_view formalHead = p.type->name->parts.front();
+                    bool isMethodOwnTypeParam = false;
+                    for (const auto& gp : mdCb->genericParams)
+                        if (gp.name == formalHead) {
+                            isMethodOwnTypeParam = true;
+                            break;
+                        }
                     // fix #5116 (§28.14 / §28.9 / §14.1, v0.307): the argument's
                     // sema type at this call site tells us whether this bare
                     // type-param formal is being used as a function type. If the
                     // argument is a lambda, its type is the function type that U
                     // is instantiated to — so check the argument's sema type.
-                    if (argExprs[ai]) {
+                    if (isMethodOwnTypeParam && argExprs[ai]) {
                         if (auto* argTy = ctx_.exprType(*argExprs[ai])) {
                             if (argTy->kind == sema::TypeRef::Kind::Function)
                                 formalIsFunction = true;

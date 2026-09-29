@@ -1697,11 +1697,24 @@ private:
     // means NONE — the ground-truth-conservative default every call site
     // that is not explicitly reasoning about a specific free-variable set
     // gets, matching `isFullyGroundTypeRef`'s existing conservative stance.
+    // `allowMethodRefOverloadSelection` (fix #4901/#4968-c06, §27.6 v0.307):
+    // true (the default) at every ordinary formation site — a `var`
+    // declaration, an assignment, a call argument — where #5019/#4978's
+    // target-typed overload selection over a bare method-group `fromExpr`
+    // is the intended §27.6 behavior. `checkEventHandlerArgument` passes
+    // false: an event-handler argument position performs neither a bridging
+    // conversion nor an overload search (fix #4968's header comment) — it
+    // checks the ONE already-resolved symbol's Function TypeRef, and a
+    // caller-supplied opt-out is the only way to keep that position's
+    // single-candidate semantics now that `freshReferenceFormation` alone
+    // triggers the overload search for every bare/qualified method-group
+    // `fromExpr`, formation site or not.
     void checkAssignable(
         TypeRef* from, TypeRef* to, SourceLocation loc,
         const std::string& what, const ast::Expr* fromExpr = nullptr,
         const std::unordered_set<std::string_view>* freeTypeParamNames =
-            nullptr);
+            nullptr,
+        bool allowMethodRefOverloadSelection = true);
 
     // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
     // every §5.1 conversion site. Verbatim (v0.240):
