@@ -46,12 +46,25 @@
 // block reachable from a live stack slot and read clean on BOTH sides.
 //
 // per §35.5, §28.6, §17.13, §28.8, §28.3, v0.307
+//
+// FOLLOW-UP (#5134, §28.3 K3.4, v0.308). The three
+// `spec_28_8_1_*` rows below originally pinned MEMORY SAFETY only, not a
+// diagnostic: the dataflow kept no `states_` entry for a pattern binding, so
+// `w.Dispose()` / `_ := w;` after `move w` compiled clean and the second
+// consume was merely inert (the move had already nulled the slot). Fix
+// #5134 seeds a real `Owned` `states_` entry for an owning-match arm's
+// transferred payload binding, which lets the EXISTING K3.4 double-consume
+// guard (§28.3) reject these three rows exactly as it already rejected the
+// same shape on an ordinary owned local. Updated below to assert the
+// rejection instead of the old silently-safe compile.
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"  // runAot — the strict AOT oracle
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::JitResult;
 using bezel::test::runAot;
 
@@ -229,40 +242,53 @@ BEZEL_TEST(owning_match_arm_discharges_4734,
 
 // --- THE SECOND-CONSUME SAFETY NET -----------------------------------------
 
+// Diagnostic emitted for a second consume of an owned binding whose
+// `states_` entry is already `MovedFrom` (Ownership_Checks.cpp, the K3.4
+// double-consume guard). Fix #5134 (§28.3 K3.4, §35.5, v0.308) seeds this
+// SAME `states_` entry for an owning-match arm's transferred payload
+// binding, so the guard below now fires on `w` exactly as it already did
+// on an ordinary owned local.
+const char* kMovedFromNeedle = "was already moved out at this point (\xc2\xa7""28.3)";
+
 BEZEL_TEST(owning_match_arm_discharges_4734,
            spec_28_8_1_move_then_dispose_is_not_a_double_free) {
-    // §28.8.1: "a moved-from binding is unreadable until reassigned" — but the
-    // dataflow keeps NO `states_` entry for a pattern binding, so it cannot
-    // REJECT this program the way it rejects the same shape on an ordinary
-    // owned local, and admitting `r.Dispose()` without more would have made it
-    // free a block the adopting `using var` also owns. The `move` now nulls
-    // the binding's slot, so the later reclaim reloads null and skips: the
-    // payload is disposed exactly ONCE, by `u`. (Diagnosing the second consume
-    // needs the `states_` entry #4634 introduces; this row pins the memory
-    // safety, not the diagnostic.)
+    // §28.8.1: "a moved-from binding is unreadable until reassigned". Before
+    // fix #5134 the dataflow kept NO `states_` entry for a pattern binding,
+    // so it could not REJECT this program the way it rejects the same shape
+    // on an ordinary owned local — `w.Dispose()` after `move w` compiled
+    // clean and the memory safety held only because the move nulled the
+    // binding's slot (a happy accident, not a diagnostic). Fix #5134 seeds
+    // the real `Owned` `states_` entry for the arm binding, so the SAME
+    // K3.4 double-consume guard (§28.3) that already rejects a second move
+    // of an ordinary owned local now also rejects this second consume of
+    // `w`, with the diagnostic below.
     auto r = runAot(prog(kDecls, armBody(
         "using var u := move w; w.Dispose();")));
-    expectRun(r, std::string("dispose a\ndispose b\nafter\n"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kMovedFromNeedle));
 }
 
 BEZEL_TEST(owning_match_arm_discharges_4734,
            spec_28_8_1_move_then_discard_is_not_a_double_free) {
     // The `_ := r;` twin of the row above. Pre-#4734 the discard emitted
-    // nothing so this shape was accidentally safe; making the discard REAL is
-    // what created the hazard the slot-null closes.
+    // nothing so this shape was accidentally safe. Fix #5134's `states_`
+    // entry now lets the discard's read of `w` see the MovedFrom state and
+    // reject with the same K3.4 diagnostic, rather than silently compiling.
     auto r = runAot(prog(kDecls, armBody("using var u := move w; _ := w;")));
-    expectRun(r, std::string("dispose a\ndispose b\nafter\n"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kMovedFromNeedle));
 }
 
 BEZEL_TEST(owning_match_arm_discharges_4734,
            spec_28_8_1_five_hundred_move_then_dispose_count_exactly_2n) {
-    // The amplified form: still exactly 2 disposals per iteration. A
-    // double free would abort (ran == false) and a leak would undercount.
+    // The amplified form of the same second-consume-after-move shape: fix
+    // #5134 rejects it at compile time on every iteration of the loop body
+    // (the loop never runs, since the program never compiles), so the
+    // program must fail to compile rather than run to any exit code.
     auto r = runAot(prog(kCountingDecls,
                          ampBody("using var u := move w; w.Dispose();")));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1000\n"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kMovedFromNeedle));
 }
 
 // --- THE CONTROLS: the BORROWING match must be untouched -------------------

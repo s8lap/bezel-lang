@@ -3324,6 +3324,26 @@ private:
                                       const ast::Expr* scrutinee,
                                       sema::Symbol* sym);
 
+    // fix #5134 (§35.5, §28.3 K3.4, v0.308): seed a fresh `states_` entry
+    // (Owned) for every one of `arm`'s pattern bindings already recorded in
+    // `owningMatchTransferBindings_` (populated earlier by
+    // `registerBorrowOnlyArmBindings`, which runs before any statement of
+    // the arm is checked — see its own doc comment). Called from
+    // `processBlock` at the arm's entry block (`CFGBlock::caseArmNode`),
+    // mirroring `seedOwnedIterVar`'s per-visit fresh-Owned seed: a payload
+    // binding is freshly transferred in at EVERY visit of this block, so
+    // re-seeding on each fixpoint pass is correct, not a clobber. Before
+    // this fix the binding had no `states_` entry at all, so a second
+    // `move w` / a use of `w` after `move w` went through completely
+    // untracked (MEASURED SEGV, #5134); with a real entry the EXISTING
+    // K3.4 double-consume / use-after-move / K7.4 maybe-consumed-join
+    // machinery — already correct for an ordinary owned local — covers the
+    // binding too, with no parallel state machine invented for it. The
+    // symmetric endState exemption (a transferred binding must never be
+    // reported "undischarged": its physical reclaim is codegen's own
+    // per-slot mark, #4617) lives in `run()`. // per §35.5, §28.3 K3.4, v0.308
+    void seedOwningMatchArmBindings(const ast::CaseArm& arm);
+
     // fix #4664 (§35.5 *The borrowing match* + §28.3 K8.3/K3.1, §19.3,
     // v0.307): the class/interface-typed arm pattern bindings that the `case`
     // construct does NOT transfer ownership into — every binding of a

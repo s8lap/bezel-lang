@@ -1264,6 +1264,24 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (ldAt->dischargedByArmTransfer) continue;
                 }
             }
+            // fix #5134 (§35.5 *The owning match*, §28.3 K3.4, v0.308): a
+            // §35.5 owning-match TRANSFERRED payload binding (fix #5134's
+            // `seedOwningMatchArmBindings` seed) must never be reported
+            // "undischarged" here regardless of whether THIS method's
+            // fixpoint end state sees it Owned, MovedFrom or maybe-consumed
+            // — its physical reclaim is codegen's own per-slot mark
+            // (`dischargeOwningMatchTransfers`, #4617), entirely independent
+            // of this dataflow's obligation tracking (see the doc comment on
+            // `owningMatchTransferBindings_`, Ownership_impl.hpp: "There is
+            // no `states_` obligation to consume here, and that is the
+            // point"). The `states_` entry exists ONLY so a second `move w`
+            // / a use of `w` after `move w` is caught mid-method by the
+            // ordinary K3.4/K7.4 machinery (#5134) — it was never meant to
+            // impose a NEW must-use/discharge obligation at scope end, and
+            // doing so would reject every legitimate "leave `w` unmoved,
+            // codegen disposes it" arm shape #4633/#4664/#4734 admitted.
+            // // per §35.5, §28.3 K3.4, v0.308
+            if (isOwningMatchTransferredArmBinding(sym)) continue;
             // #1634 / §22.4 / §28.8: companion to the handleAssignment fix
             // above — an `out owned` parameter's value transfers to the caller
             // at every method exit, releasing the callee-side obligation.
@@ -2648,6 +2666,13 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     if (block.forBodyEntry) {
         seedOwnedIterVar(*block.forBodyEntry);
     }
+    // fix #5134 (§35.5, §28.3 K3.4, v0.308): seed this arm's owning-match
+    // transferred payload bindings BEFORE the arm's own stmts / exprBody are
+    // processed below, for both block-form and expression-form arms (see
+    // `CFGBlock::caseArmNode`'s doc and `seedOwningMatchArmBindings`'s).
+    if (block.caseArmNode) {
+        seedOwningMatchArmBindings(*block.caseArmNode);
+    }
     // Each CFG block holds only straight-line statements plus the leaf
     // terminators break / continue / return / throw. The existing
     // per-statement transfer functions handle them. As of O11-real the CFG
@@ -2917,6 +2942,32 @@ void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
     // Track every iter var seeded for this method so the post-endState check
     // can detect break-only bodies (§29.2/#1329 addendum — see run()).
     seededIterVarSyms_.insert(iterSym);
+}
+
+// fix #5134 (§35.5, §28.3 K3.4, v0.308): see the declaration comment
+// (Ownership_impl.hpp) for the full rationale.
+void MethodOwnership::seedOwningMatchArmBindings(const ast::CaseArm& arm) {
+    if (owningMatchTransferBindings_.empty()) return;
+    std::vector<const ast::Node*> anchors;
+    collectArmBindingAnchors(arm.pattern.get(), anchors);
+    for (const ast::Node* anchor : anchors) {
+        sema::LocalSymbol* bindSym = nullptr;
+        for (const auto& s : ctx_.symbols()) {
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get()))
+                if (ls->decl == anchor) { bindSym = ls; break; }
+        }
+        if (!bindSym) continue;
+        if (!owningMatchTransferBindings_.count(bindSym)) continue;
+        LocalOwnership lo;
+        lo.state = OwnershipState::Owned;
+        lo.implicitDischarge = false;
+        // CaseArm is not an ast::Node (see Node.hpp), so there is no
+        // obligationOrigin node to anchor here; the anchor is unused for
+        // this binding anyway since its physical reclaim is codegen's own
+        // per-slot mark (#4617), never this dataflow's own diagnostics.
+        lo.obligationOrigin = nullptr;
+        states_[bindSym] = lo;
+    }
 }
 
 // §29.2 (#834): true when the for-loop's iterable has static type
@@ -3601,16 +3652,25 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     // the silent-degrade shape. There is nothing to mark
                     // disposed (no `states_` entry to move), so this stamps
                     // only the two flags codegen reads.
-                    // // per §35.5, §17.13, §28.3, v0.307
-                    if (!dstate &&
-                        isOwningMatchTransferredArmBinding(
+                    //
+                    // fix #5134 (§35.5, §28.3 K3.4, v0.308): `w` now DOES
+                    // have a `states_` entry (`seedOwningMatchArmBindings`),
+                    // seeded so a second `move`/use is caught — but that
+                    // would also flip this `!dstate` guard false and route
+                    // `_ := w;` through the GENERAL dstate-Owned announced-
+                    // consume branch below instead of this dedicated one,
+                    // silently changing #4734's discard behavior. Check
+                    // `isOwningMatchTransferredArmBinding` FIRST,
+                    // unconditionally on `dstate`, so this discard shape is
+                    // byte-for-byte what it was before #5134.
+                    // // per §35.5, §17.13, §28.3, v0.307/v0.308
+                    if (isOwningMatchTransferredArmBinding(
                             ctx_.exprSymbol(*id))) {
                         const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
                             true;
                         const_cast<ast::IdentifierExpr*>(id)
                             ->owningMatchTransferBinding = true;
-                    }
-                    if (dstate && dstate->state == OwnershipState::Owned) {
+                    } else if (dstate && dstate->state == OwnershipState::Owned) {
                         // fix #3253 / §17.13 / §28.10 (v0.256, #2071 residual): a
                         // discard `_ := alias;` over a `using var alias := r;`
                         // borrow-pin is NOT an announced-consume of `alias` —

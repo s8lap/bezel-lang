@@ -633,6 +633,11 @@ private:
         for (const auto& arm : s.arms) {
             CFGBlock* armEntry = cfg_.makeBlock(CFGBlock::Kind::Branch);
             cfg_.addEdge(from, armEntry);
+            // fix #5134 (§35.5, §28.3 K3.4, v0.308): record the arm on its
+            // entry block for BOTH body kinds (see CFGBlock::caseArmNode's
+            // doc) so the ownership pass can seed a fresh `states_` entry
+            // for the arm's owning-match transferred payload bindings.
+            armEntry->caseArmNode = &arm;
             // Record the arm's `when` guard (if any) on the arm entry
             // block so the ownership pass's processBlock walks it through
             // handleDischarge exactly like an if/while condition. The

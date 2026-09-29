@@ -181,6 +181,20 @@ struct CFGBlock {
     // only by the CFG builder's `visitCase`.
     const ast::Expr* caseArmExprBody = nullptr;
 
+    // fix #5134 (§35.5 *The owning match*, §28.3 K3.4, v0.308): for a
+    // `case` arm's entry Branch block (BOTH block-form and expression-form
+    // arms — unlike `caseArmExprBody` above, which is null for a block-form
+    // arm), the originating `CaseArm`. The ownership pass uses this to seed
+    // a fresh `states_` entry for each of the arm's §35.5 owning-match
+    // TRANSFERRED payload bindings at arm entry (mirrors `forBodyEntry` /
+    // `seedOwnedIterVar`'s per-iteration fresh-Owned seed): before this fix
+    // such a binding had no `states_` entry at all, so a second `move w` /
+    // a use of `w` after `move w` went through completely untracked and
+    // was silently admitted (MEASURED SEGV, #5134). Null for every
+    // non-case-arm-entry block. Additive; populated only by the CFG
+    // builder's `visitCase`. // per §35.5, §28.3 K3.4, v0.308
+    const ast::CaseArm* caseArmNode = nullptr;
+
     // F2 / O11-real: successor targets reached only along an *exception*
     // (stack-unwinding) edge from this block — an explicit `throw`, or the
     // over-approximated "a throwable call inside the try body" edge from a

@@ -23057,7 +23057,20 @@ void MethodOwnership::consumeMarkedArmTransfer(std::string_view name,
         if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
-    if (!ld || !classValued) {
+    // fix #5134 (§35.5, §28.3 K3.4, v0.308): a §35.5 owning-match
+    // TRANSFERRED payload binding's `decl` is the arm's `BindingPattern`
+    // (or #1271's naked-spelling anchor), never a `LocalDecl` — the
+    // LOCALDECL-ONLY bound below exists to keep this marker off owned
+    // parameters / collection- / task-valued bindings whose scope-end
+    // disposal machinery is untracked here (#2080), not to exclude a
+    // binding §35.5 itself already makes "an owned local of the arm
+    // body's scope". `owningMatchTransferBindings_` membership already
+    // guarantees `classValued` (`registerBorrowOnlyArmBindings` only
+    // inserts a class/interface payload), so this bypasses only the `ld`
+    // half of the gate, never the class-valued one. // per §35.5, §28.3
+    // K3.4, v0.308
+    const bool ownTransferBind = isOwningMatchTransferredArmBinding(sym);
+    if ((!ld && !ownTransferBind) || !classValued) {
         // Targeted first-landing bound: per-path scope-end disposal is wired
         // for plain class/interface LOCALS (null-guarded dynamicDispose);
         // owned parameters and collection-/task-valued bindings need their
@@ -23152,13 +23165,35 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
     std::size_t nonAbsorbingArms = 0;
     for (std::size_t ai = 0; ai < arms.size(); ++ai) {
         const ast::Expr* arm = arms[ai];
-        const ast::CaseArm* armNode = ai < armNodes.size() ? armNodes[ai]
+        // fix #5134: `isOwningMatchTransferBinding`'s armNode-scoped
+        // admission check below is gone (subsumed by the seeded `states_`
+        // entry — see the marked-transfer dispatch's own comment), but
+        // `armNode` is still needed to SEED that `states_` entry in the
+        // first place (`seedOwningMatchArmBindings` just below).
+        const ast::CaseArm* armNode =
+            ai < armNodes.size() ? armNodes[ai]
                                                            : nullptr;
         if (!arm) continue;
         const bool absorbing =
             dynamic_cast<const ast::ThrowExpr*>(arm) != nullptr ||
             dynamic_cast<const ast::NullLiteralExpr*>(arm) != nullptr;
         states_ = saved;
+        // fix #5134 (§35.5, §28.3 K3.4, v0.308): seed THIS arm's owning-
+        // match transferred payload bindings here too, not only at the
+        // arm's own CFG entry block (`CFGBlock::caseArmNode` /
+        // `processBlock`) — a `CaseExpr` used as a VALUE (e.g. a
+        // `LocalDecl` initializer) is explored EAGERLY, synchronously, from
+        // wherever that value is discharged, which runs BEFORE the CFG
+        // traversal ever reaches this arm's downstream Branch block. Without
+        // this seed the eager exploration below finds no `states_` entry
+        // for the binding and mis-rejects the very FIRST transfer with the
+        // pre-#4944 "not an owned binding at this point" diagnostic — a
+        // real regression this fix's own test suite caught (the CFG-only
+        // seed alone passed the STATEMENT-position #4944 test but failed
+        // the EXPRESSION-position one). `armNode` is null for a
+        // `ConditionalExpr` (an if-expression introduces no new bindings),
+        // so this is a no-op there. // per §35.5, §28.3 K3.4, v0.308
+        if (armNode) seedOwningMatchArmBindings(*armNode);
         std::vector<sema::Symbol*> savedList = std::move(armTransferConsumed_);
         armTransferConsumed_.clear();
         // fix #4006: the K8.3 scrutinee-self-transfer rejection is one
@@ -23195,15 +23230,26 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
         // arm-meet classifies OWNED for both spellings
         // (`common::armIsOwnedProducer`), so the receiver's own §28.3 rules
         // discharge it exactly once. // per §35.5, §28.3 K3.4/K8.3, v0.307
+        // fix #5134 (§35.5, §28.3 K3.4, v0.308): the `isOwningMatchTransfer-
+        // Binding(sym)` branch used to be a blanket "admitted, nothing to
+        // consume" no-op — correct for the FIRST transfer out of the
+        // binding, but a bare symbol-identity check with no notion of
+        // occurrence count, so it admitted a SECOND `move`/`owned` of the
+        // SAME already-transferred `sym` too (MEASURED SEGV, #5134). Now
+        // that `seedOwningMatchArmBindings` gives the binding a real
+        // `states_` entry, routing it through the ordinary
+        // `handleMarkedArmTransfer` / `handleMarkedArmMoveTransfer` call
+        // (exactly like any other named owned binding) lets the EXISTING
+        // K3.4 double-consume check do the rejecting — first transfer
+        // succeeds (Owned -> MovedFrom), a second one hits the "not an
+        // owned binding at this point" branch. No behavior change for a
+        // `move`/`owned` of a binding NOT in `owningMatchTransferBindings_`
+        // (that path was already `handleMarkedArmTransfer` /
+        // `handleMarkedArmMoveTransfer` before this fix).
+        // // per §35.5, §28.3 K3.4, v0.308
         if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(arm)) {
             if (!scrutRootName.empty() && mt->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("owned", mt->name, mt->span.begin);
-            } else if ((armNode &&
-                        isOwningMatchTransferBinding(*armNode, head,
-                                                     ctx_.exprSymbol(*mt))) ||
-                       isOwningMatchTransferredArmBinding(
-                           ctx_.exprSymbol(*mt))) {
-                // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmTransfer(*mt);
             }
@@ -23213,12 +23259,6 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
                 dynamic_cast<const ast::IdentifierExpr*>(mv->operand.get());
             if (!scrutRootName.empty() && id->name == scrutRootName) {
                 rejectScrutineeSelfTransfer("move", id->name, mv->span.begin);
-            } else if ((armNode &&
-                        isOwningMatchTransferBinding(*armNode, head,
-                                                     ctx_.exprSymbol(*id))) ||
-                       isOwningMatchTransferredArmBinding(
-                           ctx_.exprSymbol(*id))) {
-                // §35.5 payload transfer — admitted, nothing to consume.
             } else {
                 handleMarkedArmMoveTransfer(*mv);
             }
