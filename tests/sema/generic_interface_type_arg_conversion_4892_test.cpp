@@ -419,10 +419,10 @@ public record R(X: int): IEquatable<R>
   public method Equals(other: R): bool => X = other.X;
 end R;
 public class A: IEnumerable<int>
-  public constructor() end constructor;
+  private owned _xs: Array<int>;
+  public constructor() _xs := new Array<int>(); _xs.Add(1); _xs.Add(2); end constructor;
   public method GetEnumerator(): owned IEnumerator<int>
-    var xs: Array<int> := [1, 2];
-    return xs.GetEnumerator();
+    return _xs.GetEnumerator();
   end GetEnumerator;
 end A;
 public class Program
