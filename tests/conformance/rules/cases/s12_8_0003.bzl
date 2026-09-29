@@ -19,7 +19,7 @@ public class Base
 end Base;
 
 public class Derived(seed: int): Base(seed)
-  public constructor(n: int)
+  public constructor(n: int, k: int)
     this(n + seed);
   end constructor;
 end Derived;
