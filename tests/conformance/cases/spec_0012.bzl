@@ -10,8 +10,10 @@ n mod= 3;                  // n := n mod 3 — 2; a zero divisor raises DivideBy
 var s: short := 1;
 s <<= 2;                   // R = short (§6.5) — 4, no write-back involved
 var c: char := 'a';
-c += 1;                    // c := char(c + 1) — 'b'; §5.2's code-point check applies
-// var m: int? := 0;
+c += 1;                    // c := char(int(c) + 1) — 'b'; §5.2's code-point check applies
+var m: int? := 0;
+m += 1;                    // admitted: the initializer narrowed m non-null (§7.4) — 1
+m := null;                 // reassigned from null, a nullable-typed expression: the narrowing ends (§7.4)
 // m += 1;                 // compile error: `+` is not defined on a nullable operand
 //                         //   (§7.11) — write m := (m ?? 0) + 1; or narrow first
 // m++;                    // compile error: the same rule through §17.6's desugaring

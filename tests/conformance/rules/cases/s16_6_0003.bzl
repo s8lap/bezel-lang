@@ -12,7 +12,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    var x: int? := 5;
+    var x: int? := int.ParseOrNull("5");
     case x of
       1..10 => Console.WriteLine("in range"),
       _     => Console.WriteLine("other")
