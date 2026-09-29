@@ -3,8 +3,9 @@
 //! section: 4.3
 //! title: a floating-point literal within range compiles
 //! rule: A floating-point literal denotes the nearest representable value of
-//!   its type, provided its magnitude does not exceed the type's largest
-//!   finite value.
+//!   its type: its value rounded as IEEE 754 rounds to nearest, a tie to the
+//!   even significand. A literal whose value, so rounded, is not finite is a
+//!   compile error.
 //! cites: 4.3
 //! expect: accept
 module Conf;

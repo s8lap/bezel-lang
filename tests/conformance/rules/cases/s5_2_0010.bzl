@@ -2,9 +2,10 @@
 //! doc: spec
 //! section: 5.2
 //! title: converting an out-of-range binary float to decimal raises OverflowException
-//! rule: decimal(x) for binary-float x yields the nearest representable
-//!   decimal value; NaN, +/-Infinity, and magnitudes outside decimal's range
-//!   raise OverflowException.
+//! rule: decimal(x) for binary-float x yields the value of x's shortest
+//!   round-trip form, rounded as §4.4 states where that value is not in
+//!   decimal's set; NaN, +/-Infinity, and a value out of decimal's range as
+//!   §4.4 states it raise OverflowException.
 //! cites: 5.2, 6.4
 //! expect: run
 //! stdout: overflow
