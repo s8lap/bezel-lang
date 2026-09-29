@@ -394,8 +394,7 @@ public:
              const ast::Type* returnType = nullptr, bool returnOwned = false,
              bool isStatic = false,
              const GenericReturnContext* genericCtx = nullptr,
-             bool isGenericBody = false,
-             bool isEnumeratorImplMethod = false);
+             bool isGenericBody = false);
 
     // fix #3751: the CONSTRUCTOR whose body is being analysed, when the body
     // is a constructor's (null for a method / destructor / operator / lambda /
@@ -788,27 +787,6 @@ private:
     // False for constructors/destructors/operators (no return-borrow rule
     // applies to them here) and for instance methods. // per §28.3
     bool isStatic_ = false;
-    // fix #4931 follow-up (§28.3 / §29.2 / §29.11, v0.313): true when the
-    // enclosing method IS itself a class's own `GetEnumerator` /
-    // `GetOwningEnumerator` implementation (an instance method with exactly
-    // that name — the structural §29.2 protocol Bezel's `for`-desugaring and
-    // the `IEnumerable<T>`/`IOwningEnumerable<T>` coercion match on, declared
-    // or not). This is the ESTABLISHED #2975/#2969 wrap idiom: the wrap site
-    // (`wrapUserClassAsIEnumerable`, LlvmBackend_Assign.cpp) eagerly calls
-    // this method at the point the source is coerced to the interface head
-    // and folds the returned enumerator's source into the wrapper's own
-    // disposal — the `using var`/scope-bound local this method returns
-    // `<local>.GetEnumerator()` from is NOT freed out from under the
-    // returned enumerator at THIS method's own scope exit the way a plain
-    // function's identical-shaped body would be (the #4931 Mk() repro: a
-    // bare static factory with no interface-method role, where the source
-    // really does dangle). `checkReturnGetEnumeratorFromScopeBoundReceiver`
-    // consults this to admit the narrow, already-covered idiom without
-    // reopening #4931's actual rejection (Mk() stays static —
-    // `isEnumeratorImplMethod_` is only ever set true for a non-static
-    // GetEnumerator/GetOwningEnumerator method, per the call site in
-    // `Ownership.cpp`'s MethodDecl arm). // per §28.3, §29.2, §29.11, #4931
-    bool isEnumeratorImplMethod_ = false;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): true when this
     // method's declared return type is a bare type parameter (method- or
     // enclosing-type-level, non-`owned`) that is NOT `where T: value`-constrained.

@@ -86,13 +86,15 @@ std::string seqClass(const char* iface) {
         "class MyE: ") + iface + " "
         "  public static Live: int := 0; "
         "  public static Dtors: int := 0; "
-        "  public constructor() MyE.Live := MyE.Live + 1; end constructor; "
+        "  private owned _a: Array<int>; "
+        "  public constructor() "
+        "    _a := new Array<int>(1); MyE.Live := MyE.Live + 1; "
+        "  end constructor; "
         "  destructor "
         "    MyE.Live := MyE.Live - 1; MyE.Dtors := MyE.Dtors + 1; "
         "  end destructor; "
         "  public method GetEnumerator(): IEnumerator<int> "
-        "    using var a := new Array<int>(1); "
-        "    return a.GetEnumerator(); "
+        "    return _a.GetEnumerator(); "
         "  end GetEnumerator; "
         "end MyE; ";
 }
@@ -344,9 +346,10 @@ BEZEL_TEST(codegen_iface_head_raw_user_class_2975,
             "  public method Current(): int return _i; end Current; "
             "end RangeEnum; "
             "class MyRange: IEnumerable<int> "
+            "  private owned _a: Array<int>; "
+            "  public constructor() _a := new Array<int>(1); end constructor; "
             "  public method GetEnumerator(): IEnumerator<int> "
-            "    using var a := new Array<int>(1); "
-            "    return a.GetEnumerator(); "
+            "    return _a.GetEnumerator(); "
             "  end GetEnumerator; "
             "end MyRange; ")),
         0);
@@ -378,16 +381,20 @@ BEZEL_TEST(codegen_iface_head_raw_user_class_2975,
             "class MyRange: IEnumerable<int> "
             "  public static Dtors: int := 0; "
             "  destructor MyRange.Dtors := MyRange.Dtors + 1; end destructor; "
+            "  private owned _a: Array<int>; "
+            "  public constructor() _a := new Array<int>(1); end constructor; "
             "  public method GetEnumerator(): IEnumerator<int> "
-            "    using var a := new Array<int>(1); "
-            "    return a.GetEnumerator(); "
+            "    return _a.GetEnumerator(); "
             "  end GetEnumerator; "
             "end MyRange; ")),
         0);
 }
 
 // The SELF-ENUMERATING idiom (#2384): the class implements both halves, so
-// `structurallyIsEnumerator(srcTs)` is true and the wrap succeeds.
+// `structurallyIsEnumerator(srcTs)` is true and the wrap succeeds. Written as
+// #2384's own self-returning shape (`return this;`): the earlier body,
+// `using var a := …; return a.GetEnumerator();`, is the dangling-enumerator
+// return #4931 rejects (§28.3, §29.11).
 BEZEL_TEST(codegen_iface_head_raw_user_class_2975,
            self_enumerating_idiom_wrap_still_applies_29_2) {
     BEZEL_EXPECT_EQ(
@@ -397,16 +404,15 @@ BEZEL_TEST(codegen_iface_head_raw_user_class_2975,
             "  using var e: IEnumerable<int> := new SelfSeq(); "
             "  i := i + 1; "
             "end; return 0;",
-            "class SelfSeq: IEnumerable<int> "
+            "class SelfSeq: IEnumerable<int>, IEnumerator<int> "
             "  private _i: int := 0; "
             "  public method GetEnumerator(): IEnumerator<int> "
-            "    using var a := new Array<int>(1); "
-            "    return a.GetEnumerator(); "
+            "    return this; "
             "  end GetEnumerator; "
             "  public method MoveNext(): bool "
             "    _i := _i + 1; return _i <= 3; "
             "  end MoveNext; "
-            "  public method Current(): int return _i; end Current; "
+            "  public property Current: int get => _i; end Current; "
             "end SelfSeq; ")),
         0);
 }

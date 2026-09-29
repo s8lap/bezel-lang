@@ -372,13 +372,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor, const ast::Type* returnType, bool returnOwned,
          bool isStatic, const GenericReturnContext* genericCtx,
-         bool isGenericBody, bool isEnumeratorImplMethod) {
+         bool isGenericBody) {
     isAsync_ = isAsync;
     isDestructor_ = isDestructor;
     returnType_ = returnType;
     returnOwned_ = returnOwned;
     isStatic_ = isStatic;
-    isEnumeratorImplMethod_ = isEnumeratorImplMethod;
     // #2073 / §28.10: vacuous-pin lint gate. Suppress in generic bodies
     // (type-parameter-dependent classification). Defaults false at every
     // non-method entry point that does not pass it explicitly (ctor / dtor)
@@ -14799,22 +14798,6 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
     // Receiver`'s builtin gate exactly.
     if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee)))
         return;
-    // fix #4931 follow-up (§28.3 / §29.2 / §29.11, v0.313): the enclosing
-    // method IS ITSELF the class's own GetEnumerator/GetOwningEnumerator
-    // implementation (isEnumeratorImplMethod_, set at the MethodDecl call
-    // site in this file). This is the established #2975/#2969 wrap idiom:
-    // the coercion site (`wrapUserClassAsIEnumerable`, LlvmBackend_Assign.cpp)
-    // eagerly invokes THIS method and folds the returned enumerator's source
-    // into the wrapper's own disposal, so the `using var`/scope-bound local
-    // this method returns `<local>.GetEnumerator()` from is not freed out
-    // from under the caller the way an unrelated function's identically
-    // shaped body would be — the actual #4931 repro (Mk(), a bare static
-    // factory, never sets this flag: it has no receiver and is never named
-    // GetEnumerator/GetOwningEnumerator) stays rejected.
-    // tests/codegen/interface_head_unwrapped_user_class_disposal_2975_test.cpp
-    // and tests/codegen/builtin_interpolation_iface_head_2969_test.cpp pin
-    // this admitted shape under the ASan oracle (20-iteration leak loops).
-    if (isEnumeratorImplMethod_) return;
     // Result type must be the SYNC builtin enumerator SENTINEL — the exact
     // shape codegen wraps with `wrapUserClassAsIEnumerable` /
     // `wrapArrayAsIEnumerable` (LlvmBackend_Calls2.cpp:8376; the #2443
@@ -15323,23 +15306,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             const bool isGenericBody =
                 !md->genericParams.empty() ||
                 (enclosingType && !enclosingType->genericParams.empty());
-            // fix #4931 follow-up (§28.3 / §29.2 / §29.11, v0.313): flag the
-            // #2975/#2969 wrap-idiom shape — a non-static method literally
-            // named `GetEnumerator`/`GetOwningEnumerator` (the structural
-            // §29.2 protocol match, declared interface or not) — so
-            // `checkReturnGetEnumeratorFromScopeBoundReceiver` can admit its
-            // established `return <using-var-local>.GetEnumerator()` body
-            // without reopening #4931's actual rejection (a bare static
-            // factory of the same shape, e.g. Mk(), stays rejected: it is
-            // never named GetEnumerator/GetOwningEnumerator with a receiver).
-            const bool isEnumeratorImplMethod =
-                !methodIsStatic(*md) &&
-                (md->name == "GetEnumerator" ||
-                 md->name == "GetOwningEnumerator");
             mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md),
                    /*isDestructor=*/false, md->returnType.get(),
                    md->returnOwned, methodIsStatic(*md), &genericCtx,
-                   isGenericBody, isEnumeratorImplMethod);
+                   isGenericBody);
         } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
                    md->exprBody) {
             // §28.3 / §5.11 (#1007): an expression-bodied method `M(): T => E`

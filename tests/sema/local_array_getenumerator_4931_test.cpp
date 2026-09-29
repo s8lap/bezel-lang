@@ -246,3 +246,53 @@ BEZEL_TEST(local_array_getenumerator_4931,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "n=3 s=60\n");
 }
+
+// ===========================================================================
+// (6) Gate-3 fix-forward regression (§28.3 / §29.2 / §29.11, v0.313): the
+// dangling-enumerator shape is rejected in an INSTANCE method named
+// `GetEnumerator` too. A fix-forward exempted every method with that name;
+// this program then compiled and read a freed array (returned -9 instead of
+// 7 — a silent use-after-free). Being the enumerable protocol's own method
+// does not extend the `using var` local's lifetime past the method's scope.
+// ===========================================================================
+BEZEL_TEST(local_array_getenumerator_4931,
+           instance_getenumerator_returning_using_var_enumerator_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class MyE "
+        "  public method GetEnumerator(): IEnumerator<int> "
+        "    using var a: Array<int> := [7, 8, 9]; "
+        "    return a.GetEnumerator(); "
+        "  end GetEnumerator; "
+        "end MyE; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      var e := new MyE(); "
+        "      var it := e.GetEnumerator(); "
+        "      var junk: Array<int> := [100, 200, 300, 400, 500]; "
+        "      var has := it.MoveNext(); "
+        "      if has then "
+        "        var v := it.Current; "
+        "        if v <> 7 then return v; end; "
+        "      else "
+        "        return -777; "
+        "      end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("cannot return `a.GetEnumerator()`") !=
+                std::string::npos &&
+            d.message.find("using var") != std::string::npos &&
+            d.message.find("§28.3") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(found);
+}

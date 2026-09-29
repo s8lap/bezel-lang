@@ -213,10 +213,11 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
             "using var e: IEnumerable<int> := new MyE(); "
             "Console.WriteLine($\"val={e}\");",
             "class MyE: IEnumerable<int> "
+            "  private owned _a: Array<int>; "
+            "  public constructor() _a := new Array<int>(1); end constructor; "
             "  public method GetEnumerator(): IEnumerator<int> "
-            "    using var a := new Array<int>(1); "
-            "    a.Add(99); "
-            "    return a.GetEnumerator(); "
+            "    _a.Add(99); "
+            "    return _a.GetEnumerator(); "
             "  end GetEnumerator; "
             "end MyE; ")),
         std::string("val=M.MyE"));   // #2934 (§8.5, v0.252): was "val=MyE"
@@ -231,9 +232,10 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
             "using var e: IEnumerable<int> := new MyE(); "
             "Console.WriteLine($\"val={e}\");",
             "class MyE: IEnumerable<int> "
+            "  private owned _a: Array<int>; "
+            "  public constructor() _a := new Array<int>(1); end constructor; "
             "  public method GetEnumerator(): IEnumerator<int> "
-            "    using var a := new Array<int>(1); "
-            "    return a.GetEnumerator(); "
+            "    return _a.GetEnumerator(); "
             "  end GetEnumerator; "
             "  public override method ToString(): string return \"mine\"; "
             "  end ToString; "
