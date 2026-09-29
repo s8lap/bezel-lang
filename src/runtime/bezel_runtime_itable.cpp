@@ -19,6 +19,23 @@ extern "C" void** bz_itable_lookup(void** itmap, void* iface_td) {
     return nullptr;  // unreachable for a typed program
 }
 
+// fix #5115 (§11.1 / §11.2, v0.313): dispatch through a generic interface
+// at a concrete instantiation. A class listing the interface at two or more
+// instantiations carries one itab per instantiation, keyed by that
+// instantiation's descriptor and placed before its shared `iface_td` entry;
+// every other implementor carries only the shared entry. One pass: an
+// instantiation-keyed match wins, else the shared match.
+extern "C" void** bz_itable_lookup_inst(void** itmap, void* inst_td,
+                                        void* iface_td) {
+    if (!itmap) return nullptr;
+    void** shared = nullptr;
+    for (void** p = itmap; *p; p += 2) {
+        if (p[0] == inst_td) return (void**)p[1];
+        if (!shared && p[0] == iface_td) shared = (void**)p[1];
+    }
+    return shared;
+}
+
 // §31.4 (v0.162/v0.163) built-in exception object layout — byte offsets that
 // must match the codegen constants in LlvmBackend_impl.hpp (kExc*Offset):
 //   [0] vtable  [8] Message  [16] InnerException(TIE)  [24] CauseChain

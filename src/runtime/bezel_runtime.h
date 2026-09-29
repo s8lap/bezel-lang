@@ -1691,6 +1691,7 @@ void bz_encoding_ascii_write_bytes(const void* str, void* dest);
 // order; callers GEP into it by method index. No allocation: returns an
 // interior pointer into the static global itmap.
 void** bz_itable_lookup(void** itmap, void* iface_td);
+void** bz_itable_lookup_inst(void** itmap, void* inst_td, void* iface_td);
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------

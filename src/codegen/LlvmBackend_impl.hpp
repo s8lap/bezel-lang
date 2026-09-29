@@ -3636,6 +3636,13 @@ private:
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
              llvm::GlobalVariable*>
         itables_;
+    // fix #5115 (§11.1 / §11.2, v0.313): the static type of the receiver of
+    // the member call lowerCall is about to hand to emitMethodCall. Set
+    // immediately before that call and consumed (cleared) at emitMethodCall's
+    // entry, so it never leaks to a nested or later call. An interface
+    // dispatch whose receiver is a concrete generic-interface instantiation
+    // uses it to select that instantiation's itab (bz_itable_lookup_inst).
+    const sema::TypeRef* pendingIfaceRecvTy_ = nullptr;
     // §24 (#477 B7): per-class event-accessor functions (emit-once cache),
     // keyed by the class's own instance EventSymbol.
     std::unordered_map<const sema::EventSymbol*, llvm::Function*>
@@ -8015,6 +8022,94 @@ private:
             t = baseClassOf(t);
         }
         return nameOnly;
+    }
+
+    // fix #5115 (§11.1 / §11.2, v0.313): the class method witnessing interface
+    // method `iface` at ONE instantiation of its generic interface — `args`
+    // are that instantiation's concrete type arguments. §11.1 lets a class
+    // list a generic interface at two or more instantiations
+    // (`Point: IEquatable<Point>, IEquatable<int>`) with one member set, and
+    // §11.2's matching rule applies once per obligation under its own
+    // substitution — so the witness of `IEquatable<int>.Equals` is the
+    // overload whose parameter types equal `iface`'s under `T := int`.
+    // Returns nullptr when no same-arity candidate matches exactly; the
+    // caller then keeps findInterfaceImpl's arity-based pick.
+    sema::MethodSymbol* findInterfaceImplAt(
+        const sema::TypeSymbol* cls, const sema::MethodSymbol* iface,
+        const std::vector<const sema::TypeRef*>& args) {
+        if (!iface || !iface->parent) return nullptr;
+        const sema::TypeSymbol* idecl = iface->parent;
+        if (idecl->genericParams.size() != args.size() || args.empty())
+            return nullptr;
+        std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+        for (std::size_t i = 0; i < args.size(); ++i)
+            if (idecl->genericParams[i])
+                subst[idecl->genericParams[i]->name] = args[i];
+        // The interface parameter's type under `subst`. A bare type-parameter
+        // reference (resolved or AST-only, as a builtin interface's may be)
+        // maps straight to its argument, carrying a `T?` declaration's
+        // nullability; anything else goes through substituteTypeRefLocal.
+        auto ifaceParamTy = [&](const sema::ParameterSymbol* p)
+            -> const sema::TypeRef* {
+            std::string_view head;
+            bool nullable = false;
+            const sema::TypeRef* rt = p->resolvedDeclType;
+            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->declaration && rt->genericArgs.empty()) {
+                head = rt->headName();
+                nullable = rt->nullable;
+            } else if (!rt && p->declType &&
+                       p->declType->kind == ast::TypeKind::Named &&
+                       p->declType->genericArgs.empty() && p->declType->name &&
+                       p->declType->name->parts.size() == 1) {
+                head = p->declType->name->parts[0];
+                nullable = p->declType->nullable;
+            }
+            if (!head.empty()) {
+                auto it = subst.find(head);
+                if (it == subst.end() || !it->second) return rt;
+                if (nullable && !it->second->nullable) {
+                    auto nn = std::make_unique<sema::TypeRef>(*it->second);
+                    nn->nullable = true;
+                    const sema::TypeRef* r = nn.get();
+                    descArena_.push_back(std::move(nn));
+                    return r;
+                }
+                return it->second;
+            }
+            return rt ? substituteTypeRefLocal(rt, subst) : nullptr;
+        };
+        for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
+            for (sema::Symbol* m : t->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!ms || isStaticMethod(ms) || ms->name != iface->name ||
+                    !methodFns_.count(ms) ||
+                    ms->params.size() != iface->params.size())
+                    continue;
+                bool match = true;
+                for (std::size_t i = 0; match && i < ms->params.size(); ++i) {
+                    auto* cp = dynamic_cast<const sema::ParameterSymbol*>(
+                        ms->params[i]);
+                    auto* ip = dynamic_cast<const sema::ParameterSymbol*>(
+                        iface->params[i]);
+                    const sema::TypeRef* ct = cp ? cp->resolvedDeclType : nullptr;
+                    if (!ct && cp && cp->declType)
+                        ct = ctx_.resolvedType(*cp->declType);
+                    const sema::TypeRef* it = ip ? ifaceParamTy(ip) : nullptr;
+                    if (!ct || !it) { match = false; break; }
+                    if (methodSigTypeRefEqual(ct, it)) continue;
+                    // §11.2: an implementation may widen `T` to `T?`.
+                    if (ct->nullable && !it->nullable) {
+                        sema::TypeRef stripped = *ct;
+                        stripped.nullable = false;
+                        if (methodSigTypeRefEqual(&stripped, it)) continue;
+                    }
+                    match = false;
+                }
+                if (match) return ms;
+            }
+        }
+        return nullptr;
     }
 
     // fix #5113 (§22.6 / §14.2 / §12, v0.307): structural TypeRef equality for

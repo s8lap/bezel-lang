@@ -13311,6 +13311,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                               scopedClosureArgs.end());
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
+    // fix #5115: hand the receiver's static type to the itable dispatch.
+    pendingIfaceRecvTy_ = nullptr;
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(
+            call.callee.get()))
+        if (rma->target)
+            pendingIfaceRecvTy_ = ctx_.exprType(*rma->target);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
@@ -14319,6 +14325,9 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return false;
         return isUnsignedTargetExpr(*(*argExprs)[ai]);
     };
+    // fix #5115: consume the receiver type lowerCall recorded (if any).
+    const sema::TypeRef* ifaceRecvTy = pendingIfaceRecvTy_;
+    pendingIfaceRecvTy_ = nullptr;
     // fix #4963 (§5.1 `S → T → T?` / §14.1, v0.307): under an active generic
     // substitution a formal declared `T?` (or a bare `T` bound to a nullable
     // value type, #4830 case C) is not a nullable value type until it is
@@ -14984,9 +14993,39 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             auto descIt = descArray_.find(iface);
             if (descIt == descArray_.end()) { return nullptr; }
             llvm::Value* ifaceTd = descIt->second;
-            llvm::Value* itab = builder_.CreateCall(
-                llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
-                lookupFn, {itmapPtr, ifaceTd}, "itab");
+            // fix #5115 (§11.1 / §11.2, v0.313): a receiver statically typed
+            // at a concrete instantiation `I<args>` of a generic interface
+            // selects that instantiation's itab when the runtime class lists
+            // `I` at several instantiations (each obligation may have a
+            // different witness overload), else the shared td$I entry.
+            llvm::GlobalVariable* instTd = nullptr;
+            if (ifaceRecvTy && !iface->genericParams.empty()) {
+                const sema::TypeRef* rt = ifaceRecvTy;
+                if (!genericSubstSemaTy_.empty())
+                    rt = substituteTypeRefLocal(rt, genericSubstSemaTy_);
+                if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                    rt->declaration == iface && !rt->genericArgs.empty()) {
+                    std::vector<const sema::TypeRef*> ra(
+                        rt->genericArgs.begin(), rt->genericArgs.end());
+                    if (descArgsConcrete(ra)) {
+                        llvm::GlobalVariable* g = instanceDescriptorFor(iface, ra);
+                        if (g && g != descIt->second) instTd = g;
+                    }
+                }
+            }
+            llvm::Value* itab = nullptr;
+            if (instTd) {
+                auto* instLookupFn = declareC("bz_itable_lookup_inst", ptrTy(),
+                                              {ptrTy(), ptrTy(), ptrTy()});
+                itab = builder_.CreateCall(
+                    llvm::FunctionType::get(ptrTy(),
+                                            {ptrTy(), ptrTy(), ptrTy()}, false),
+                    instLookupFn, {itmapPtr, instTd, ifaceTd}, "itab");
+            } else {
+                itab = builder_.CreateCall(
+                    llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+                    lookupFn, {itmapPtr, ifaceTd}, "itab");
+            }
             unsigned k = ifaceMethodIndex_.at(ms);
             fnPtr = builder_.CreateLoad(
                 ptrTy(),

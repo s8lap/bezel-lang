@@ -5396,6 +5396,67 @@ void Emitter::declareVtables() {
                     mangledTypeName(iface));
             itables_[{ts, iface}] = itabGV;
 
+            // fix #5115 (§11.1 / §11.2, v0.313): a class listing a generic
+            // interface at TWO OR MORE concrete instantiations
+            // (`IEquatable<Point>, IEquatable<int>`) satisfies each obligation
+            // with a possibly different overload, but the single itab$C$I
+            // above can hold only one. Emit one itab per instantiation, keyed
+            // in the itmap by that instantiation's per-monomorphization
+            // descriptor (instanceDescriptorFor, LinkOnceODR so importer and
+            // exporter agree), placed BEFORE the shared td$I entry. A dispatch
+            // site whose receiver is statically `I<args>` looks up the
+            // instantiation key first and falls back to td$I
+            // (bz_itable_lookup_inst), so every single-instantiation class is
+            // unaffected. Only the method slots differ; the event/property
+            // slots and the trailing owner-kind flag are copied unchanged.
+            if (!iface->genericParams.empty() && !ifaceMethods.empty()) {
+                std::vector<std::pair<llvm::GlobalVariable*,
+                                      std::vector<const sema::TypeRef*>>>
+                    insts;
+                std::unordered_set<llvm::GlobalVariable*> seenInst;
+                for (auto& [bsym, bargs] : collectConcreteGenericBaseInsts(ts)) {
+                    if (bsym != iface || !descArgsConcrete(bargs)) continue;
+                    llvm::GlobalVariable* instTd =
+                        instanceDescriptorFor(iface, bargs);
+                    auto sit = descArray_.find(iface);
+                    if (!instTd ||
+                        (sit != descArray_.end() && instTd == sit->second))
+                        continue;
+                    if (seenInst.insert(instTd).second)
+                        insts.emplace_back(instTd, bargs);
+                }
+                if (insts.size() >= 2) {
+                    unsigned instIdx = 0;
+                    for (auto& [instTd, bargs] : insts) {
+                        std::vector<llvm::Constant*> instElems = itabElems;
+                        for (std::size_t mi = 0; mi < ifaceMethods.size(); ++mi) {
+                            sema::MethodSymbol* im = ifaceMethods[mi];
+                            sema::MethodSymbol* impl =
+                                findInterfaceImplAt(ts, im, bargs);
+                            if (!impl) continue;  // keep the shared pick
+                            auto mit = methodFns_.find(impl);
+                            if (mit == methodFns_.end()) continue;
+                            if (llvm::Function* thunk =
+                                    ensureNullableWideningThunk(im, impl))
+                                instElems[mi] = llvm::cast<llvm::Constant>(thunk);
+                            else
+                                instElems[mi] =
+                                    llvm::cast<llvm::Constant>(mit->second);
+                        }
+                        auto* instGV = new llvm::GlobalVariable(
+                            *module_, itabArrTy, /*isConstant=*/true,
+                            llvm::GlobalValue::InternalLinkage,
+                            llvm::ConstantArray::get(itabArrTy, instElems),
+                            "itab$" + mangledTypeName(ts) + "$" +
+                                mangledTypeName(iface) + "$inst" +
+                                std::to_string(instIdx++));
+                        itmapElems.push_back(instTd);
+                        itmapElems.push_back(
+                            llvm::ConstantExpr::getPointerCast(instGV, ptrTy()));
+                    }
+                }
+            }
+
             // Append td$I and itab$C$I to the itmap pair list.
             auto dit2 = descArray_.find(iface);
             if (dit2 != descArray_.end()) {
