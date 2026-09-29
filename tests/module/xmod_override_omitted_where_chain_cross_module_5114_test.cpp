@@ -210,4 +210,39 @@ BEZEL_TEST(xmod_override_omitted_where_chain_cross_module_5114,
     BEZEL_EXPECT_TRUE(hasValue);
 }
 
+// ===========================================================================
+// T5 — CROSS-MODULE CALL: an override that omits `where T: class` carries
+// the inherited constraint through the cross-module import/export path.
+// This pins b152988d's ModuleMetadataBuilder::convertGenericParams
+// importedBound fallback behavior.  fail-without is impossible since the
+// fix is already on origin/main; the test value is regression pin + §14.2
+// contract documentation.
+// ===========================================================================
+BEZEL_TEST(xmod_override_omitted_where_chain_cross_module_5114,
+           t5_cross_module_omit_where_meta_carries_class_constraint) {
+    // Single-module source: base with `where T: class`, subclass omits it.
+    const char* kSrc =
+        "module Lib5114T5; "
+        "public class Base5114T5 "
+        "  public virtual method M<T>(x: T): int "
+        "    where T: class "
+        "    return 0; "
+        "  end M; "
+        "end Base5114T5; "
+        "public class Sub5114T5 : Base5114T5 "
+        // Omit `where T: class` — inherits it from Base5114T5.M<T>.
+        "  public override method M<T>(x: T): int "
+        "    return 5; "
+        "  end M; "
+        "end Sub5114T5; "
+        "public class Entry public static method Main(): int => 0; end Entry; ";
+
+    ModuleMetadata meta = buildMetaFor5114(kSrc);
+    bool hasClass = gpHasSpecialConstraint(meta, "Sub5114T5", "M", "T", "class");
+    if (!hasClass) {
+        std::cerr << "Sub5114T5.M<T> missing 'class' special-constraint\n";
+    }
+    BEZEL_EXPECT_TRUE(hasClass);
+}
+
 }  // namespace bezel::module
