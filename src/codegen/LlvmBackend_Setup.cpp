@@ -13889,6 +13889,43 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                     v = outSlot;
                 }
             }
+        } else if (a.modifier == "out var" && a.value) {
+            // fix #4994 (§22.4 / §12.8, v0.307): `this(out var z, n)` /
+            // `base(out var z, n)` — a chain-call with a NAMED `out var`
+            // recipient. The formal's `out` modifier goes through the alias
+            // path below (`isByRefMod` is true for "out var"), but
+            // `lvalueAddr` has no address for a fresh local declared inline
+            // at the call site (the IdentifierExpr has no address until the
+            // slot is pre-created here), so that path would return null and
+            // the code would hit the #1386 ICE below. Pre-create the
+            // recipient's slot BEFORE the alias path sees it, exactly as
+            // `ensureOutVarSlots` does for an ordinary call and
+            // `ensureCtorOutVarSlots` does for a `new T(out var x)` call.
+            // The slot is sized from the CHAIN TARGET's formal parameter
+            // (`target->params[pi]`), not the source argument, which has no
+            // parameter of its own. §22.3 copy-out on normal return: the
+            // aliased slot is the recipient; the callee writes through the
+            // address directly (the same way a bare `out` param works on
+            // this path), so no separate copy-out step is needed — the
+            // recipient is written at its own storage address.
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                sema::Symbol* sym = ctx_.exprSymbol(*id);
+                auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+                bool alreadyMapped = (loc && loc->decl && locals_.count(loc->decl)) ||
+                                    locals_.count(id);
+                if (!alreadyMapped) {
+                    llvm::Type* slotTy = i32();
+                    if (const sema::TypeRef* fty = paramTypeOf(target->params[pi]))
+                        slotTy = lowerTypeRef(fty);
+                    llvm::AllocaInst* slot = entryAlloca(slotTy);
+                    // §7.9 default init: store zero/null so a skipped-call path
+                    // (e.g. short-circuit `and`/`or`) reads a defined value.
+                    builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+                    locals_[id] = slot;
+                    if (loc && loc->decl) locals_[loc->decl] = slot;
+                    v = slot;
+                }
+            }
         } else if (!a.value) {
             // fix #2579: the call never runs — release any bracket pins
             // recorded by earlier args so their refcount isn't stranded.
