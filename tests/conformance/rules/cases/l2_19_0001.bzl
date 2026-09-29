@@ -4,9 +4,10 @@
 //! title: a user record conforming to INumber<T> is usable through the
 //!   constraint
 //! rule: User types conform to INumber<T> by declaring and supplying the
-//!   statics; at a value conformer the operator witnesses are unmarked,
-//!   matching the erased signatures.
-//! cites: 2.19
+//!   statics — a conformer's `<` with the rest of §25.2's complete group —
+//!   and at a value conformer the operator witnesses are unmarked, matching
+//!   the erased signatures.
+//! cites: 2.19, 25.2
 //! expect: run
 //! stdout: 400
 module Conf;
@@ -19,6 +20,9 @@ public record Money(Cents: int): INumber<Money>
   public static method operator *(a: Money, b: Money): Money => new Money(a.Cents * b.Cents);
   public static method operator /(a: Money, b: Money): Money => new Money(a.Cents / b.Cents);
   public static method operator <(a: Money, b: Money): bool => a.Cents < b.Cents;
+  public static method operator >(a: Money, b: Money): bool => a.Cents > b.Cents;
+  public static method operator <=(a: Money, b: Money): bool => a.Cents <= b.Cents;
+  public static method operator >=(a: Money, b: Money): bool => a.Cents >= b.Cents;
 end Money;
 
 public class Program

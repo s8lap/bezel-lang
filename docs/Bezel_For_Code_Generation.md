@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.308. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.309. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.308 and `Bezel_Standard_Library.md` v0.308 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.309 and `Bezel_Standard_Library.md` v0.309 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -38,7 +38,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 10 | `x => x * 2` | `lambda(x) => x * 2` — the keyword is required; `lambda() => 0` needs the empty parens | §27.3 |
 | 11 | `(int)d`, `d as int` | `int(d)` — casts are call syntax on the type name. `as` yields `T?` and is a type test only | §5.2, §17.4 |
 | 12 | `var xs = [1,2,3];` | A collection literal has **no standalone type**: `var xs: Array<int> := [1, 2, 3];` or pass it where a parameter supplies the target | §15.4 |
-| 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog` | §12.7 |
+| 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog`. Over a **value**-typed `x` (primitive, record, enum), a class, interface, `string` or `Object` target is rejected — box first: `(var o: Object := p; o is IShape)` | §12.7, §19.3 |
 | 14 | `if (count)` truthiness | Conditions are `bool`. Write `count <> 0` | §4.1 |
 | 15 | `i++` as an expression, `++i` | `++`/`--` are **postfix-only statements**: `i++;` on its own line. Assignments are statements too and produce no value | §17.6, §17.2 |
 | 16 | `int? + int?` lifts | **Retired at v0.267.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work | §7.11, §6.6 |
@@ -151,7 +151,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Block property | `public property Balance: decimal` / `get => _b;` / `set => do … end;` / `end Balance;` | §23.3 |
 | Owned-taking setter | `set(owned);` or `set(owned x);` — the type is the property's and is never repeated | §23.3 |
 | Indexer | `public property [i: int]: string => _items[i];` — the block form closes with a bare `end;` | §23.4 |
-| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
+| Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A `this(...)` chain must end at a constructor with no `this(...)`; a cycle is rejected. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
 | Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). | §25.2, §9.2 |
@@ -432,7 +432,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 **`owned` is never admissible** on a record field (§9.7), on a local (use `using var`), on a generic type argument (`Array<owned T>` does not exist — use `OwningArray<T>`), on an inline-array element type, or doubled with an owning-inline-array slot marker. It is **redundant but admitted** on a mint-announcing return type (`GetEnumerator(): owned IEnumerator<T>`) and on a return of a move-only value type (an owning choice, §35.3).
 
-**`move` — the use-site transfer marker** (§22.3, §28.8.1). Four operand shapes: `move x` (a named local or `owned` parameter), `move obj.f` (an `owned` field), `move coll[i]` (an owning slot), and `move obj.f!` over a **nullable** owned field — §28.8.1's detach pattern, `move _slot!` then `_slot := null`.
+**`move` — the use-site transfer marker** (§22.3, §28.8.1). Four operand shapes: `move x` (a named local or `owned` parameter), `move obj.f` (an `owned` field), `move coll[i]` (an owning slot), and `move obj.f!` over a **nullable** owned field — §28.8.1's detach pattern, `move _slot!` then `_slot := null`. A trailing `!` never changes the spelling (§17.8): over a nullable owned local, `sink._f := x!;` and `throw x!;` consume like `sink._f := x;`, `M(move x!)` is the marked argument, and `sink._f := move x!;` is the redundant-marker error.
 
 *Required* — omitting it is a compile error ("this call consumes `x`; write `M(move x)`") — when a **named owned binding** feeds an `owned` argument (`M(move x)`), a local binding (`var y := move x;`, `using var y := move x;`), an assignment (`y := move x;`), an if-expression branch or expression-arm result (`(if c then move a else move b)`), or an owning-match scrutinee (`case move outcome of …`). A call that **raises** does not give the argument back: the transfer completes at call entry, the binding is still moved-from in the `catch` arm, and the callee's own exception-path discharge (or a constructor's unwinding) disposes the value (§28.8.1, §22.9).
 
@@ -532,6 +532,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 - A borrow may **not** be assigned to a local whose scope strictly encloses its source's scope — including flowing around a loop back edge. Rejected **at the assignment**, not at the later use.
 - A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3, v0.288).
 - A borrow may not be returned unless its source is one every caller can re-establish: receiver-sourced from an instance method, the receiver-parameter borrow of an extension method, or static storage through a **static property getter**.
+- A `ref` or plain `out` argument whose type can carry a borrow (a class, interface or function type, or a borrow-bearing record, choice or inline array) is a holder the callee may fill from any of the call's borrows — the receiver, the plain arguments, the other `ref` arguments' values — so each must be admissible into it exactly as `location := borrow` would be: `Put(ref outerLocal, innerUsingVar)` is rejected at the call (§28.3).
 - A closure — or a method reference over an instance receiver — is a **borrow-carrying value**: its source set is the union of its captures' sources (calling a closure yields a value carrying the closure's own set), and every rule in this list applies to it by that set (§28.3, v0.298). So: bind it to any local, plain `var` or `using var`, whose scope does not strictly enclose a source's (a local helper lambda over a borrow needs no `using var`); invoke it; pass it to a function-typed parameter (§28.14). While it captures anything, do **not** store it in a field or a collection, write it through `out`/`ref`, or return it from the method — a function type announces no sources, so the only storage route for a capture-bearing closure is a `scoped` parameter (§28.14); a capture-free closure goes anywhere. Reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability.
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
 
@@ -607,7 +608,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.308 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.309 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1550,7 +1551,7 @@ public class Ports
 end Ports;
 ```
 
-**A choice with an owned payload, matched by consuming.** A `case` over a *named* binding only peeks; consuming one is `case move outcome of …`, and a marked named slot takes just that payload.
+**A choice with an owned payload, matched by consuming.** A `case` over a *named* binding only peeks; consuming one is `case move outcome of …`, and a marked named slot takes just that payload. In an owning match a whole-value arm `var y => …` passes the value on only if the arm consumes `y` (`var z := y;`); otherwise the construct disposes it.
 
 ```bezel
 public choice PollOutcome
@@ -1662,6 +1663,8 @@ public method Log(params items: Array<string>);             // WRONG: no `params
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
 var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1, v0.295)
 var u := uint(-1);   var b2 := byte(300);   var c2 := char(0xD800);   // WRONG: a CONSTANT operand the conversion would reject is a COMPILE error (§5.2)
+var d := ch - '0';   var nx := char(ch + 1);   ch *= 2;             // WRONG: `char` is not arithmetic (§3.5) — `int(ch) - int('0')`, `char(int(ch) + 1)`; only `ch += n;`, `ch -= n;`, `ch++;`, `ch--;` advance a code point (§6.6)
+var c3 := char(65.5);                                         // WRONG: no float/double/decimal → char — char(int(x)) (§5.2)
 ```
 
 > §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading. §5.2/§5.4: an explicit conversion whose operand is a **compile-time constant** the conversion would reject — `uint(-1)`, `byte(300)`, `char(0xD800)`, `int(1e30)`, an enum cast matching no declared constant — is a compile error **at the conversion site**, never a deferred `OverflowException`; the runtime fault is for **non-constant** operands, and unreachable code is not exempt (v0.300). A saturating conversion is unaffected: `float(1e300)` is `Infinity`, constant operand or not.
@@ -1999,7 +2002,7 @@ if (flags & ADMIN) <> 0 then Grant(); end;     // ERROR when flags is `uint?` �
 case n of  1..5 => "small", _ => "other" end;  // ERROR when n is `int?`;  ✓ case n ?? 0 of ...
 ```
 
-Narrowing a **local** restores the ordinary operators: `if a <> null then var s := a + 1; end;` (§7.4).
+Narrowing a **local** restores the ordinary operators: `if a <> null then var s := a + 1; end;` (§7.4). A non-null initializer or assignment narrows too: `var m: int? := 0; m += 1;` is fine until `m` is reassigned from a nullable expression.
 
 For an `invariant` over a *mutable* nullable field, where narrowing is unavailable, use the short-circuit form (`and` short-circuits) or declare the field `readonly`:
 
@@ -2087,7 +2090,7 @@ Through v0.245 the marker was spelled `owned` at binding positions. After v0.246
 - **`(when …)` / `when … end when;` are gone.** A ladder of conditions is `(if c1 then a elif c2 then b else z)` or `if c1 then … elif c2 then … else … end;` — same type, same order, same ownership meet. `when` survives only as the arm guard (`var t when t > 30 => …`) and the `when true`/`when false` clause.
 - **`out owned var x` is gone.** `out var x` adopts the signature: a borrow against `out`, an owned local against `out owned` (discharge it yourself, or use `out using var x`, which is accepted only against `out owned`).
 - **`operator ++`/`operator --` are gone.** `++`/`--` are built-in statements on integer, floating-point, `decimal` and `char` operands only (§6.6's set — `char++` still works). Declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method.
-- **`import System.Collections.Generic;` is redundant.** Every §4 name is bare-visible (`Dictionary`, `Set`, `Stack`, `Queue`, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, the iteration interfaces). The line still compiles. Beware the new bare names when naming your own types: a same-named type in your module shadows the import; a same-named export from another imported module is an ambiguity error.
+- **`import System.Collections.Generic;` is redundant.** Every §4 name is bare-visible (`Dictionary`, `Set`, `Stack`, `Queue`, the spans, `Counter`, `FrozenArray`, `KeyNotFoundException`, the iteration interfaces). The line still compiles. Beware the new bare names when naming your own types: a same-named type in your module shadows the import; a same-named export from another imported module is an ambiguity error — as for every always-available name (`Task`, `Object`, `Type`, the exception types, …; qualify the import with its module name or an alias).
 
 ### 8.7 v0.290 — the stdlib regularization: nine defaults, four retired duals, one interface-declared read tier
 

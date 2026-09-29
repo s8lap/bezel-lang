@@ -12,7 +12,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    var n: int? := 80;
+    var n: int? := int.ParseOrNull("80");
     case n of
       70..100 => Console.WriteLine("high");,
       _       => Console.WriteLine("low");

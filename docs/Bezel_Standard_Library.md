@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.308 — September 2026**
+**Companion to the Bezel Language Specification, v0.309 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1128,7 +1128,7 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>`, and the collection-literal target pair (#807)
 
-The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The primitive numeric tower and `char` conform to the first three via compiler-provided conformances; user types conform by declaring and supplying the statics. The collection-literal target pair at the end of this section is conformed to by declaration only — by the ten built-in sequence collections in their own declarations ([§4.3](#sec-how-the-borrowing-and-owning-hierarchies-relate)) and by user classes.
+The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The primitive numeric tower and `char` conform to the first three via compiler-provided conformances; user types conform by declaring and supplying the statics. A conformer's `<` brings language spec [§25.2](Bezel_Language_Spec.md#sec-operator-overloading-restrictions)'s complete group with it — the type declares `>`, `<=`, and `>=` as well, as every type declaring a relational operator does — and that obligation is what entitles a `where T: INumber<T>` or `where T: ISteppable<T>` body to all four comparisons (§25.2, *Type-parameter operands*). The collection-literal target pair at the end of this section is conformed to by declaration only — by the ten built-in sequence collections in their own declarations ([§4.3](#sec-how-the-borrowing-and-owning-hierarchies-relate)) and by user classes.
 
 ```bezel
 public interface INumber<T> where T: INumber<T>

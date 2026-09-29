@@ -12,7 +12,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    var n: int? := 5;
+    var n: int? := int.ParseOrNull("5");
     var result := (case n of
       > 0 => "positive",
       _ => "other");
