@@ -1960,6 +1960,44 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // function-level comment.
                     checkGenericConstraintsAtExpr(ctx_, e.span.begin, argAsts,
                                                    instTy->genericArgs, ts);
+                    // fix #5176 (§19.3 v0.310 #5156, §3.6 rule 2): record
+                    // this generic TYPE-as-IdentifierExpr site (the canonical
+                    // static-receiver shape `B<int>.K(…)`, where `B<int>` is
+                    // an IdentifierExpr carrying typeArgs and `K` is a static
+                    // member of a generic class) so the per-instantiation
+                    // §19.3 join
+                    // (`checkDeferredRefTypeBindInGenericCaseInstantiations`)
+                    // sees the binding. Mirrors
+                    // `recordDefaultObligationsForConstruction` (the `new
+                    // T<...>()` constructor half, in ExprTypecheck.cpp) — both
+                    // are type-position spellings of a constructed generic and
+                    // want the same `genericInstantiationSites_` row keyed on
+                    // the TypeDecl + per-parameter argument. Idempotent vs the
+                    // constructor half — the constructor's `ne.span.begin` is a
+                    // NewExpr span, this IdentifierExpr's `e.span.begin` is its
+                    // own; a constructor invocation does not pass through this
+                    // IdentifierExpr path.
+                    auto argNameOf = [](const TypeRef* a) -> std::string {
+                        std::string base;
+                        if (a && a->declaration) base = std::string(a->declaration->name);
+                        else if (a && a->astNode && a->astNode->name &&
+                                 !a->astNode->name->parts.empty())
+                            base = std::string(a->astNode->name->parts.back());
+                        else return "the type argument";
+                        if (a->nullable) base += "?";
+                        return base;
+                    };
+                    for (std::size_t i = 0;
+                         i < ts->genericParams.size() && i < argAsts.size() &&
+                         i < instTy->genericArgs.size();
+                         ++i) {
+                        Symbol* gp = ts->genericParams[i];
+                        TypeRef* arg = instTy->genericArgs[i];
+                        if (!gp || !arg) continue;
+                        recordGenericInstantiationSite(
+                            ts->decl, gp->name, arg,
+                            argNameOf(arg), e.span.begin);
+                    }
                     // Return early — no further local/param/field type
                     // attachment is needed; the exprType is now set.
                     return;
@@ -11908,6 +11946,46 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                              ast::TypeDeclKind::Record ||
                          scrutTy->declaration->kind ==
                              ast::TypeDeclKind::Enum);
+                    // fix #5176 (§19.3 v0.310 #5156, §12.7) — the CaseExpr sibling of
+                    // ExprTypecheck.cpp's CaseStmt recorder trigger (same
+                    // posture, same shared Pass-2 join
+                    // `checkDeferredRefTypeBindInGenericCaseInstantiations`).
+                    // A typed binding pattern `var x: R` against a BARE
+                    // GENERIC-PARAMETER scrutinee (`v: T` over a method-level
+                    // T or a class-level T) is decided per instantiation
+                    // (§3.6 rule 2). At a value substitution the binding is
+                    // rejected at the instantiation site (no box possible).
+                    // Record here; replay at each instantiation site.
+                    if (bndIsRefType && scrutTy->kind == TypeRef::Kind::Named &&
+                        !scrutTy->declaration) {
+                        std::string_view scrutName = scrutTy->headName();
+                        if (!scrutName.empty()) {
+                            // METHOD-level parameter (a generic method's own).
+                            if (currentMethodDecl_) {
+                                for (const auto& gp :
+                                     currentMethodDecl_->genericParams) {
+                                    if (gp.name == scrutName) {
+                                        recordRefTypeBindInGenericCase(
+                                            currentMethodDecl_, scrutName,
+                                            bp->span.begin);
+                                        break;
+                                    }
+                                }
+                            }
+                            // TYPE-level parameter (a generic class's own).
+                            if (currentType_ && currentType_->decl) {
+                                for (const auto* gp :
+                                     currentType_->genericParams) {
+                                    if (gp && gp->name == scrutName) {
+                                        recordRefTypeBindInGenericCase(
+                                            currentType_->decl, scrutName,
+                                            bp->span.begin);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (scrutIsValuePrim) {
                         if (bndIsRefType)
                             ctx_.diagnostics().report(

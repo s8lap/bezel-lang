@@ -1,27 +1,33 @@
 // fix #1936 / §19.3 / §19.5: a typed binding pattern `var x: T` whose type T is a
 // REFERENCE type (class, interface, or built-in exception) against a VALUE-typed
 // scrutinee can never match. The concrete-scrutinee case is rejected up front by
-// sema (#1203/#1936, see the sema regression test), but a MONOMORPHIZED
-// type-parameter scrutinee — `case t of var x: IOException` in a generic body,
-// instantiated at `T = int` — is only decidable in codegen: sema sees the abstract
-// type parameter, so the arm passes admission and reaches the backend.
+// sema (#1203/#1936, see the sema regression test).
 //
-// Without the codegen guards, that monomorphization CRASHED the compiler:
-//   * a built-in exception pattern left `case.end` unterminated → malformed IR
-//     (the typed-binding built-in-exception branch was guarded on a POINTER
-//     scrutinee; a non-pointer value fell through to `return nullptr`);
-//   * a class/interface pattern reached emitIsA, which ICmp'd the non-pointer
-//     scrutinee against a null pointer → an ICmpInst assertion abort.
-// Both are fixed by a `!scrut->getType()->isPointerTy() → getInt1(false)` gate in
-// patternMatches (LlvmBackend_Exprs2.cpp), mirroring the bare-name NamedPattern
-// path. A value-typed scrutinee cleanly NO-MATCHES (takes `_`); a value pattern of
-// the same type still matches. Under `runAot` a compile abort surfaces as
-// r.ran == false → run() returns -999, so these FAIL WITHOUT the fix.
+// A MONOMORPHIZED type-parameter scrutinee — `case t of var x: IOException` in a
+// generic body, instantiated at `T = int` — is decided at the INSTANTIATION SITE
+// by the §3.6 rule 2 per-instantiation join (fix #5176 / §19.3 v0.310, ruling
+// #5156). Before that ruling the arm was admitted by sema and only the codegen
+// path was guarded: a `!scrut->getType()->isPointerTy() → getInt1(false)` gate
+// in patternMatches (LlvmBackend_Exprs2.cpp) defended against
+//   * a built-in exception pattern that left `case.end` unterminated (the
+//     typed-binding built-in-exception branch was guarded on a POINTER
+//     scrutinee; a non-pointer value fell through to `return nullptr`); and
+//   * a class/interface pattern that reached emitIsA, which ICmp'd the
+//     non-pointer scrutinee against a null pointer (ICmpInst assertion abort).
+// Under the v0.311 ruling those rows are REJECTED at the instantiation site —
+// pattern position never performs an implicit box of the scrutinee, so a value
+// instantiation can never produce a reference-typed binding target. The 1936
+// test is updated to assert the rejection; the codegen guards remain for any
+// case the §3.6 join does not yet cover (interface/class patterns admitted at
+// reference substitutions, and the pre-#5176 source). Under `runAot` a compile
+// reject surfaces as r.ran == false + r.diagnostics.hasErrors().
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 
 namespace {
@@ -31,26 +37,31 @@ int run(const std::string& prog) {
 }
 }  // namespace
 
-// §19.3/§19.5 (#1936): generic scrutinee `t: T` at T=int against a BUILT-IN
-// exception typed binding. Previously malformed IR (unterminated case.end); now
-// cleanly no-matches → the `_` arm → 9.
+// §19.3/§19.5 (#1936, v0.311 ruling, #5176): generic scrutinee `t: T` at T=int
+// against a BUILT-IN exception typed binding. The §3.6 per-instantiation join
+// REJECTS at the instantiation site — pattern position never boxes the
+// scrutinee, so the binding target is unproducible from a value instantiation.
 BEZEL_TEST(case_generic_value_scrutinee_ref_pattern_1936,
-           generic_int_vs_builtin_exception_no_match) {
-    BEZEL_EXPECT_EQ(run(
+           generic_int_vs_builtin_exception_rejected_at_site) {
+    auto r = runAot(
         "module M; class Program "
         "  public static method Pick<T>(t: T): int "
         "    return (case t of var x: IOException => 1, _ => 9); "
         "  end Pick; "
         "  public static method Main(): int "
         "    return Program.Pick<int>(5); "
-        "  end Main; end Program;"), 9);
+        "  end Main; end Program;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "reference-typed binding"));
 }
 
-// §19.3/§19.5 (#1936): generic scrutinee at T=int against a CLASS typed binding.
-// Previously an ICmpInst assertion abort in emitIsA; now cleanly no-matches → 9.
+// §19.3/§19.5 (#1936, v0.311 ruling, #5176): generic scrutinee at T=int against
+// a CLASS typed binding. Per-instantiation rejection.
 BEZEL_TEST(case_generic_value_scrutinee_ref_pattern_1936,
-           generic_int_vs_class_no_match) {
-    BEZEL_EXPECT_EQ(run(
+           generic_int_vs_class_rejected_at_site) {
+    auto r = runAot(
         "module M; "
         "class C public method M(): int return 0; end M; end C; "
         "class Program "
@@ -59,14 +70,18 @@ BEZEL_TEST(case_generic_value_scrutinee_ref_pattern_1936,
         "  end Pick; "
         "  public static method Main(): int "
         "    return Program.Pick<int>(5); "
-        "  end Main; end Program;"), 9);
+        "  end Main; end Program;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "reference-typed binding"));
 }
 
-// §19.3/§19.5 (#1936): generic scrutinee at T=int against an INTERFACE typed
-// binding. Same emitIsA crash class; now cleanly no-matches → 9.
+// §19.3/§19.5 (#1936, v0.311 ruling, #5176): generic scrutinee at T=int against
+// an INTERFACE typed binding. Per-instantiation rejection.
 BEZEL_TEST(case_generic_value_scrutinee_ref_pattern_1936,
-           generic_int_vs_interface_no_match) {
-    BEZEL_EXPECT_EQ(run(
+           generic_int_vs_interface_rejected_at_site) {
+    auto r = runAot(
         "module M; "
         "interface I method M(): int; end I; "
         "class Program "
@@ -75,7 +90,11 @@ BEZEL_TEST(case_generic_value_scrutinee_ref_pattern_1936,
         "  end Pick; "
         "  public static method Main(): int "
         "    return Program.Pick<int>(5); "
-        "  end Main; end Program;"), 9);
+        "  end Main; end Program;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "reference-typed binding"));
 }
 
 // Control (#1936, no over-rejection): the SAME generic form with a VALUE pattern

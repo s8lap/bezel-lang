@@ -1116,6 +1116,49 @@ private:
     // §3.6 rule 2 join, run once at the end of the pass beside the #3044 one.
     void checkDeferredAsTargetInstantiations();
 
+    // fix #5176 (§19.3 v0.310 #5156, §12.7) — the §3.6-rule-2 join for a typed
+    // binding pattern `var x: R` whose scrutinee `v` is a bare generic
+    // parameter (`v: T` or `v: T?` over a class-level T or a method-level T).
+    // §19.3 (v0.310, #5156): "against a reference type R ... a type-parameter
+    // scrutinee ... is decided per instantiation ... A `var r: R` arm is
+    // rejected at the instantiation site whatever the static answer, as `as`
+    // is, the diagnostic naming the explicit box and `where T: class`." The
+    // bare `R` arm and a class-headed named destructure are admitted and never
+    // selected at a value substitution (an arm that can never match); a
+    // destructure's slot bindings are member reads, not rejected at the site.
+    //
+    // The reuse target is `recordAsTargetTypeParamUse` /
+    // `checkDeferredAsTargetInstantiations` (§17.4, #2911) — same per-
+    // instantiation posture, the same `genericInstantiationSites_` set as the
+    // join table, and the same "a substitution that is itself a bare
+    // parameter cannot be judged here" guard (#3044 mirror). The pattern form
+    // adds the new direct arm in ExprTC's `case`/`when` typed-binding
+    // handler (the existing rejection in lines ~21833 / ~11709 covers a
+    // concrete value-primitive or value-record/enum scrutinee; this recorder
+    // covers the bare-generic-parameter scrutinee the concrete arm cannot
+    // see).
+    struct RefTypeBindInGenericCase {
+        const void* owner;   // the MethodDecl (method-level T) or TypeDecl
+                             // (class-level T) whose parameter `param` is
+        std::string param;   // the type parameter used as the scrutinee
+        SourceLocation loc;  // the `var x: R` site (named in the diagnostic)
+    };
+    std::vector<RefTypeBindInGenericCase> refTypeBindInGenericCases_;
+    // Record that `owner`'s body holds a typed binding pattern `var x: R`
+    // against a scrutinee whose static type is the bare parameter `param`.
+    // Matched against `genericInstantiationSites_` at the end of the pass.
+    void recordRefTypeBindInGenericCase(const void* owner,
+                                        std::string_view param,
+                                        SourceLocation loc);
+    // §3.6 rule 2 join for #5176 — walks `genericInstantiationSites_` (the
+    // existing TYPE- and METHOD-level site set, populated by
+    // `recordGenericInstantiationSite` from `new T<...>()` constructor calls,
+    // generic method call sites, and, for this fix, generic TYPE-as-static-
+    // receiver IdentifierExpr+typeArgs usages) and emits the §19.3 v0.310
+    // diagnostic for every site whose substituted argument is a value type
+    // (§19.3 / §12.7 / #5156).
+    void checkDeferredRefTypeBindInGenericCaseInstantiations();
+
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before
     // reaching its end? Conservatively returns true only when certain,

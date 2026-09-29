@@ -250,6 +250,10 @@ void ExprTC::run(const ast::SourceFile& src) {
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the same join for
     // `x as T`, over the same instantiation records.
     checkDeferredAsTargetInstantiations();
+    // fix #5176 (§19.3 v0.310 #5156, §12.7, §3.6 rule 2): the same join for
+    // a typed binding pattern `var x: R` over a bare generic-parameter
+    // scrutinee. Per-instantiation rejection at a value substitution.
+    checkDeferredRefTypeBindInGenericCaseInstantiations();
 }
 
 
@@ -443,6 +447,85 @@ void ExprTC::checkDeferredAsTargetInstantiations() {
             std::to_string(useLoc.line) +
             "), so this instantiation is rejected at the instantiation site "
             "(§3.6 rule 2): " + degenerate);
+    }
+}
+
+// fix #5176 (§19.3 v0.310 #5156, §12.7, §3.6 rule 2): see the declaration
+// in ExprTypecheck_impl.hpp. Modelled on `recordAsTargetTypeParamUse` /
+// `checkDeferredAsTargetInstantiations` (#2911) — same per-instantiation
+// posture, same `genericInstantiationSites_` join table, same "a substitution
+// that is itself a bare parameter cannot be judged here" guard (#3044 mirror).
+// The shape is different: §17.4's `as T` form rejects when the substitution is
+// an INLINE-ARRAY or UNIT (`degenerateAsTargetReason`); §19.3's `var x: R` form
+// rejects when the substitution is a VALUE type — a primitive non-string/non-
+// object, a record, or an enum (§19.3 / §12.7 — "no box possible"). Bare `R`
+// arms and class-headed destructures over a value substitution are NOT in
+// `refTypeBindInGenericCases_` — the recorder only fires for `bp->type`, the
+// typed-binding form the v0.310 ruling names; the bare `R` arm admits to a
+// never-match (per `is R`'s static answer) and is not rejected at the site
+// (#5156, §19.3).
+void ExprTC::recordRefTypeBindInGenericCase(const void* owner,
+                                            std::string_view param,
+                                            SourceLocation loc) {
+    if (!owner || param.empty()) return;
+    for (const auto& u : refTypeBindInGenericCases_)
+        if (u.owner == owner && u.param == param) return;  // one is enough
+    refTypeBindInGenericCases_.push_back(
+        {owner, std::string(param), loc});
+}
+
+void ExprTC::checkDeferredRefTypeBindInGenericCaseInstantiations() {
+    if (refTypeBindInGenericCases_.empty() ||
+        genericInstantiationSites_.empty())
+        return;
+    // §19.3 v0.310 #5156 — value-type predicate (§19.3 + #5156). Mirrors
+    // the existing `scrutIsValuePrim` / `scrutIsValueRecEnum` arms in the
+    // CaseStmt / CaseExpr typed-binding rejection (ExprTypecheck.cpp ~21868 /
+    // ExprTypecheck_Exprs.cpp ~11744), applied to the SUBSTITUTED argument
+    // here. A value substitution cannot form the implicit box the typed
+    // binding requires (§8.6, §19.3, §19.5) — reject.
+    auto isValueTypeAtInstantiation = [](const TypeRef* t) -> bool {
+        if (!t) return false;
+        if (t->kind == TypeRef::Kind::Primitive && !t->nullable) {
+            return t->primitive != PrimitiveType::String &&
+                   t->primitive != PrimitiveType::Object;
+        }
+        if (t->kind == TypeRef::Kind::Named && !t->nullable && t->declaration) {
+            return t->declaration->kind == ast::TypeDeclKind::Record ||
+                   t->declaration->kind == ast::TypeDeclKind::Enum;
+        }
+        return false;
+    };
+    for (const auto& site : genericInstantiationSites_) {
+        SourceLocation useLoc{};
+        bool bodyHasBinding = false;
+        for (const auto& u : refTypeBindInGenericCases_) {
+            if (u.owner != site.owner || u.param != site.param) continue;
+            bodyHasBinding = true;
+            useLoc = u.loc;
+            break;
+        }
+        if (!bodyHasBinding) continue;
+        TypeRef* a = site.arg;
+        if (!a || a->kind == TypeRef::Kind::Error) continue;
+        // A substitution that is itself an unresolved bare type parameter
+        // (a generic body instantiating another generic with its own `T`)
+        // cannot be judged here — its own instantiation sites will be. Same
+        // guard as the #3044 join beside this one.
+        if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
+        if (!isValueTypeAtInstantiation(a)) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, site.loc,
+            "type parameter `" + site.param +
+            "` is used as a `case` scrutinee against a reference-typed "
+            "binding in the generic body (line " +
+            std::to_string(useLoc.line) +
+            "), so this instantiation is rejected at the instantiation "
+            "site (§19.3, §3.6 rule 2): at value substitution `" + site.argName +
+            "` the binding would require an implicit conversion to a "
+            "reference type, which pattern position never performs. Use "
+            "`where " + site.param + ": class` to constrain the parameter, "
+            "or box the scrutinee explicitly.");
     }
 }
 
@@ -21980,6 +22063,65 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                              ast::TypeDeclKind::Record ||
                          scrutTy->declaration->kind ==
                              ast::TypeDeclKind::Enum);
+                    // fix #5176 (§19.3 v0.310 #5156, §12.7) — a typed binding
+                    // pattern `var x: R` against a BARE GENERIC-PARAMETER
+                    // scrutinee (`v: T` or `v: T?` over a method-level T in a
+                    // generic method, or a class-level T in a generic class).
+                    // §19.3 (v0.310, #5156): decided per instantiation
+                    // (§3.6 rule 2) — a bare `R` arm and a class-headed
+                    // destructure are admitted and never selected at a value
+                    // substitution (an arm that can never match); a `var r: R`
+                    // arm is rejected at the instantiation site at a value
+                    // substitution (no box possible), as `as T` is (§17.4 /
+                    // #2911). The concrete-primitive / concrete-record/enum
+                    // arms below can't see this — `scrutTy->kind ==
+                    // Kind::Named` AND `scrutTy->declaration == nullptr` is
+                    // the bare-parameter shape. Record the obligation here;
+                    // replay at each instantiation site in
+                    // `checkDeferredRefTypeBindInGenericCaseInstantiations`.
+                    // Runs BEFORE the `scrutIsValuePrim` arm so a value-
+                    // primitive scrutinee that happens to resolve to a bare
+                    // parameter (none today, but defensively) does not match
+                    // the first shape instead.
+                    if (bndIsRefType && scrutTy->kind == TypeRef::Kind::Named &&
+                        !scrutTy->declaration) {
+                        std::string_view scrutName = scrutTy->headName();
+                        if (!scrutName.empty()) {
+                            // METHOD-level: a generic method's own type
+                            // parameter. Match the recorded-as-method
+                            // instantiation sites in
+                            // `genericInstantiationSites_`.
+                            if (currentMethodDecl_) {
+                                for (const auto& gp :
+                                     currentMethodDecl_->genericParams) {
+                                    if (gp.name == scrutName) {
+                                        recordRefTypeBindInGenericCase(
+                                            currentMethodDecl_, scrutName,
+                                            bp->span.begin);
+                                        break;
+                                    }
+                                }
+                            }
+                            // TYPE-level: a generic class's type parameter.
+                            // Match the recorded-as-type instantiation sites
+                            // (constructor new via
+                            // `recordDefaultObligationsForConstruction`, and
+                            // generic TYPE-as-static-receiver usages via
+                            // the recording added by this fix in
+                            // `IdentifierExpr+typeArgs`).
+                            if (currentType_ && currentType_->decl) {
+                                for (const auto* gp :
+                                     currentType_->genericParams) {
+                                    if (gp && gp->name == scrutName) {
+                                        recordRefTypeBindInGenericCase(
+                                            currentType_->decl, scrutName,
+                                            bp->span.begin);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (scrutIsValuePrim) {
                         if (bndIsRefType)
                             ctx_.diagnostics().report(
