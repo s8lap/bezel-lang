@@ -5764,7 +5764,20 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
 // ownedLocal` is a mixed set and is likewise rejected. A `throw` arm (bottom)
 // and a `null`-literal arm impose no ownership and absorb. Only class/interface-
 // typed arms carry an ownership meaning; a value-typed conditional has no meet.
+//
+// fix #5060 (§28.3 K7.3, v0.307): the driver now fires from every read
+// position too (checkRead's ConditionalExpr/CaseExpr arms), as well as from
+// the binding-initializer / return / expr-body sites (the previous callers
+// at Ownership.cpp:1633, 6389, 8814), so one node can be reached more than
+// once on the emit pass — the armMeetReported_ dedupe mirrors the
+// coalesceMeetReported_ pattern, keeping the diagnostic to one report.
 void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
+    // fix #5060: dedupe against prior reports (the local-initializer / return
+    // / expr-body drivers also call in, and checkRead can reach the same node
+    // once per position-walk). Only inserted when actually reporting (not
+    // during the suppressDiag_ fixpoint phase), mirroring the
+    // coalesceMeetReported_ pattern in checkCoalesceMeetMixed.
+    if (armMeetReported_.count(&e)) return;
     std::vector<const ast::Expr*> arms;
     // fix #4964: the built-in `??` is the same K7 meet (§28.3 `a ?? b` row).
     // Peel `!` — `(a ?? b)!` has the meet's classification (§17.8).
@@ -5854,7 +5867,8 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
         }
         // PolyNull and value-typed borrows impose no ownership state (absorb).
     }
-    if (ownedArm && borrowArm)
+    if (ownedArm && borrowArm && !suppressDiag_) {
+        armMeetReported_.insert(&e);
         report(Severity::Error, borrowLoc,
                "the arms of this if/case expression mix an owned value with a "
                "borrow — the ownership meet is undefined (§28.3, v0.184): "
@@ -5864,6 +5878,7 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
                "— mark the named binding with the arm transfer (`owned x`, "
                "§28.3 K3.4 v0.209), bind the owned source first, or transfer "
                "both arms — so every arm has the same ownership");
+    }
 }
 
 // fix #4964 (§28.3 producer table `a ?? b` row, K7.1–K7.3, K7.5, K3.13,

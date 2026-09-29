@@ -1279,7 +1279,13 @@ private:
     // position `case`/`when` whose arms mix an owned value with a borrow.
     // fix #4964 (§28.3 `a ?? b` row, K7.3, v0.307): also the built-in `??`,
     // whose operands are the two arms of the same K7 meet.
+    // fix #5060 (§28.3 K7.3, v0.307): the if/case driver runs from every read
+    // position too (checkRead's ConditionalExpr/CaseExpr arms), as well as from
+    // the binding / return / expr-body drivers, so one node can be reached
+    // more than once on the emit pass — dedupe via armMeetReported_, mirroring
+    // the coalesceMeetReported_ pattern below.
     void checkArmMeetMixed(const ast::Expr& e);
+    std::unordered_set<const ast::Expr*> armMeetReported_;
 
     // fix #4964: the `??` half of checkArmMeetMixed, and the set of `??`
     // nodes already diagnosed. The `??` check runs from every read position

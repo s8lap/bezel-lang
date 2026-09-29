@@ -2802,10 +2802,46 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     // processing exactly once per block visit (the guard); marker-free
     // constructs keep the pre-v0.209 behavior (no ConditionalExpr/CaseExpr
     // recursion here).
-    if ((dynamic_cast<const ast::ConditionalExpr*>(&e) ||
-         dynamic_cast<const ast::CaseExpr*>(&e)) &&
-        exprContainsMarkedTransfer(e)) {
-        processMarkedArmConstruct(e);
+    if (dynamic_cast<const ast::ConditionalExpr*>(&e) ||
+        dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (exprContainsMarkedTransfer(e)) {
+            processMarkedArmConstruct(e);
+            return;
+        }
+        // fix #5060 (§28.3 K7.3, v0.307): drive checkArmMeetMixed for
+        // marker-free if/case at every read position. The pre-existing
+        // drivers (Ownership.cpp:1633 expr-body, 6389 local-initializer,
+        // 8814 return) only fire at those three sites — an if/case mixed
+        // meet reached anywhere else (an `owned` argument here, a
+        // field-assignment RHS, an interpolation hole, etc.) was silently
+        // accepted and the borrow arm's caller-attributed owner was handed
+        // a value the caller still owns, a heap-use-after-free. Measured on
+        // origin/main 0cbe41df with `agent_check --probe --asan`:
+        // `H.Take((if c then g else new Widget("n")))` over a borrowed
+        // parameter `g` and an `owned` parameter `w` — compiles clean,
+        // runs, `Take` disposes `g`, then `Main`'s `using var g` disposes
+        // it again (heap-use-after-free). The armMeetReported_ dedupe in
+        // checkArmMeetMixed keeps the diagnostic to one report when the
+        // node is reached more than once (binding-initializer + argument
+        // walk, return + expr-body, etc.). Falls through to the arm walk
+        // below so the read-side checks (use-after-dispose, etc.) on
+        // sub-expressions still fire alongside the K7.3 reject. // per
+        // §28.3, K7.3, v0.307
+        checkArmMeetMixed(e);
+        if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+            if (cd->condition) checkRead(*cd->condition, false);
+            if (cd->thenValue) checkRead(*cd->thenValue, false);
+            if (cd->elseValue) checkRead(*cd->elseValue, false);
+            return;
+        }
+        auto* ce = static_cast<const ast::CaseExpr*>(&e);
+        if (ce->scrutinee) checkRead(*ce->scrutinee, false);
+        for (const auto& arm : ce->arms) {
+            if (arm.guard) checkRead(*arm.guard, false);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody)
+                checkRead(*arm.exprBody, false);
+        }
         return;
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
