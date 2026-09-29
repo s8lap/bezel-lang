@@ -15004,13 +15004,13 @@ void ExprTC::checkDeferredNamedThisChain(const ast::ConstructorDecl& cd) {
 // body has been typechecked (called from `visitTopDecl` / `visitMember`
 // right after a type's members are visited, so argument types are in hand
 // for every hop, not just the first). At each `this(...)` chain call, find
-// the candidate constructors that §22.5-bind it (structural: names, arity,
-// defaults); with more than one, narrow to the single one that is also
-// §22.6-applicable to the typed arguments (mirrors #4791's own narrowing,
-// generalized to every hop rather than only the deferred domain) — an
-// unresolved ambiguity is left alone here, to the ranking / rejection
-// diagnostics `checkChainCallBinding` / `checkChainCallApplicability`
-// (#4824 / #4854) already give it. Follow the unique target; a walk that
+// the constructor it binds to by §22.6 over the full candidate set — every
+// other explicit constructor that §22.5-binds it AND the primary parameter
+// list (the set codegen's `ctorForArgs` + primary arm select from). A hop
+// won by the primary ends the walk; an unresolved ambiguity is left alone
+// here, to the ranking / rejection diagnostics `checkChainCallBinding` /
+// `checkChainCallApplicability` (#4824 / #4854) already give it. Follow the
+// unique target; a walk that
 // returns to the starting declaration is the cycle §12.8 forbids.
 void ExprTC::checkConstructorChainCycles(TypeSymbol* t) {
     if (!t) return;
@@ -15027,54 +15027,112 @@ void ExprTC::checkConstructorChainCycles(TypeSymbol* t) {
     }
     if (ctors.size() < 2) return;
 
-    // The single §22.5-binding OTHER constructor of `fromCd`'s chain call —
-    // structural (name/arity/defaults) when only one binds; when several
-    // structurally bind, the single one that is ALSO §22.6-applicable to the
-    // typed arguments (the same per-argument test #4791's own narrowing
-    // uses). Anything else (zero, or more than one applicable) is not a
-    // resolvable edge here (an unresolved type counts as inapplicable, so
-    // an unprovable edge can only hide a cycle, never invent one).
+    // The constructor `fromCd`'s `this(...)` call binds to under §22.6 —
+    // the SAME candidate set codegen's `ctorForArgs` + primary arm select
+    // from: every OTHER explicit constructor that §22.5-binds the call, PLUS
+    // the §22.10/§9.1 primary parameter list when the type has one. Each
+    // supplied argument is classified Exact / Convert / NotApplicable
+    // (`classifyArg`, after §5.1 constant narrowing), inapplicable
+    // candidates drop, and the unique candidate unambiguously better than
+    // every other (with the defaulted-arity tie-break) wins — `resolveOverload`'s
+    // ranking, without its diagnostics (the chain call's own §22.6 errors are
+    // `checkChainCallBinding` / `checkChainCallApplicability`'s).
+    // Returns null when the winner is the primary (it chains nowhere), when
+    // no candidate or no unique winner exists (a §22.6 error reported
+    // elsewhere), or when any argument/parameter shape is one this ranking
+    // does not model (a modifier, an `owned`/`scoped` formal, an unresolved
+    // type) — an unprovable edge can only hide a cycle, never invent one.
+    const std::vector<const Symbol*> primaryFields =
+        t->hasPositionalFields ? recordPositionalFieldSymbols(t)
+                               : std::vector<const Symbol*>();
     auto resolveTarget = [&](const ast::ConstructorDecl* fromCd,
                              const ast::CallExpr& call)
             -> const ast::ConstructorDecl* {
-        std::vector<const ast::ConstructorDecl*> structural;
+        for (const ast::CallArgument& a : call.args)
+            if (!a.modifier.empty() || a.isDiscard || !a.value) return nullptr;
+        const std::size_t nArg = call.args.size();
+        struct Cand {
+            const ast::ConstructorDecl* decl;  // null = the primary
+            std::vector<ArgMatch> grid;        // indexed by argument
+            bool fillsDefault = false;
+        };
+        std::vector<Cand> cands;
+        bool undecidable = false;
+        // Classify argument `ai` against parameter type `pt`; false drops
+        // the candidate. An unresolved type makes the hop undecidable.
+        auto classify = [&](Cand& c, int ai, const TypeRef* pt) -> bool {
+            const ast::Expr* av = call.args[static_cast<std::size_t>(ai)].value.get();
+            const TypeRef* at = ctx_.exprType(*av);
+            if (!at || !pt) { undecidable = true; return false; }
+            at = narrowIntConstantToTarget(av, const_cast<TypeRef*>(at),
+                                           const_cast<TypeRef*>(pt));
+            const ArgMatch m = classifyArg(at, pt);
+            if (m == ArgMatch::NotApplicable) return false;
+            c.grid[static_cast<std::size_t>(ai)] = m;
+            return true;
+        };
         for (const Node& n : ctors) {
-            if (n.decl == fromCd) continue;
-            if (bindArgsToParams(n.decl->params, call.args, call.span.begin,
-                                 std::string(), /*emit=*/false).ok)
-                structural.push_back(n.decl);
-        }
-        // Even a lone structural binder must be type-applicable: `this(7)`
-        // beside `constructor(a: bool)` binds by arity but resolves to the
-        // primary (§22.6), so it is no edge to that constructor.
-        const ast::ConstructorDecl* applicable = nullptr;
-        int applicableCount = 0;
-        for (const ast::ConstructorDecl* od : structural) {
+            const ast::ConstructorDecl* od = n.decl;
+            if (od == fromCd) continue;  // §12.8: another constructor
             const BindResult b = bindArgsToParams(od->params, call.args,
                                                   call.span.begin,
                                                   std::string(), false);
-            bool ok = b.ok;
+            if (!b.ok) continue;
+            Cand c{od, std::vector<ArgMatch>(nArg, ArgMatch::Exact), false};
+            bool ok = true;
             for (std::size_t j = 0; ok && j < od->params.size(); ++j) {
+                if (!od->params[j].modifier.empty()) return nullptr;
                 const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
-                if (ai < 0) continue;  // filled by its declared default
-                const ast::CallArgument& a =
-                    call.args[static_cast<std::size_t>(ai)];
-                if (!a.modifier.empty() || a.isDiscard || !a.value ||
-                    !od->params[j].type) { ok = false; break; }
-                const TypeRef* at = ctx_.exprType(*a.value);
-                const TypeRef* pt = ctx_.resolvedType(*od->params[j].type);
-                if (!at || !pt) { ok = false; break; }
-                at = narrowIntConstantToTarget(a.value.get(),
-                                              const_cast<TypeRef*>(at),
-                                              const_cast<TypeRef*>(pt));
-                if (classifyArg(at, pt) == ArgMatch::NotApplicable) {
-                    ok = false;
-                    break;
-                }
+                if (ai < 0) { c.fillsDefault = true; continue; }
+                const TypeRef* pt = od->params[j].type
+                    ? ctx_.resolvedType(*od->params[j].type) : nullptr;
+                ok = classify(c, ai, pt);
             }
-            if (ok) { ++applicableCount; applicable = od; }
+            if (undecidable) return nullptr;
+            if (ok) cands.push_back(std::move(c));
         }
-        return applicableCount == 1 ? applicable : nullptr;
+        if (!primaryFields.empty() &&
+            bindArgsToParams(sema::FormalsView::of(primaryFields), call.args,
+                             call.span.begin, std::string(), false).ok) {
+            const BindResult b =
+                bindArgsToParams(sema::FormalsView::of(primaryFields),
+                                 call.args, call.span.begin, std::string(),
+                                 false);
+            Cand c{nullptr, std::vector<ArgMatch>(nArg, ArgMatch::Exact),
+                   false};
+            bool ok = true;
+            for (std::size_t j = 0; ok && j < primaryFields.size(); ++j) {
+                const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+                if (ai < 0) { c.fillsDefault = true; continue; }
+                ok = classify(c, ai,
+                              primaryFields[j]
+                                  ? sema::storageComponentType(primaryFields[j],
+                                                               ctx_)
+                                  : nullptr);
+            }
+            if (undecidable) return nullptr;
+            if (ok) cands.push_back(std::move(c));
+        }
+        // §22.6: the unique candidate unambiguously better than every other.
+        auto better = [&](const Cand& x, const Cand& y) {
+            bool strict = false;
+            for (std::size_t i = 0; i < nArg; ++i) {
+                if (x.grid[i] == ArgMatch::Convert &&
+                    y.grid[i] == ArgMatch::Exact)
+                    return false;
+                if (x.grid[i] == ArgMatch::Exact &&
+                    y.grid[i] == ArgMatch::Convert)
+                    strict = true;
+            }
+            return strict || (!x.fillsDefault && y.fillsDefault);
+        };
+        for (const Cand& x : cands) {
+            bool wins = true;
+            for (const Cand& y : cands)
+                if (&x != &y && !better(x, y)) { wins = false; break; }
+            if (wins) return x.decl;  // null when the primary wins
+        }
+        return nullptr;
     };
 
     for (const Node& n : ctors) {
