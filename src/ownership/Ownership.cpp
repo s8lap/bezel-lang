@@ -6547,8 +6547,9 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
     // auto-drop can flag it even when its nested scope ends before the function
     // exit (so it never reaches `endState`). `using var`s are already Owned +
     // implicitly discharged and need no flag.
-    if (!ld.isUsing && lo.state == OwnershipState::Owned)
+    if (!ld.isUsing && lo.state == OwnershipState::Owned) {
         everOwnedPlainLocals_.insert(lsym);
+    }
     // §28.3 v0.190 SB-01 (#1872): thread the Owned-vs-Borrow verdict for a plain
     // `var` whose CALL initializer borrows an EXISTING task frame into codegen.
     // Codegen's plain-`var` task disposal gate treats every CallExpr initializer
@@ -8789,6 +8790,16 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // field chain) is admitted — its lifetime is wider than the call. // per
     // §28.3 v0.226, stdlib §4.5 v0.195, #2175
     checkReturnDrainFromScopeBoundReceiver(e);
+    // fix #4931 (§28.3 *Returning a deferred-activation frame* / §29.11 /
+    // §29.2, v0.307): the builtin `recv.GetEnumerator()` over a SCOPE-BOUND
+    // owned local / `using var` carries a borrow of `recv` that outlives its
+    // source. Mirrors the `checkReturnDrainFromScopeBoundReceiver` shape (a
+    // builtin call whose receiver is a tracked scope-bound local) and is
+    // required because `checkBorrowEscapesOnReturn`'s `returnedExprMayBorrow`
+    // gate skips the whole funnel for a builtin `IEnumerator<T>` sentinel
+    // result type (Named with no declaration — isBorrowableType returns
+    // false). // per §28.3, §29.11, §29.2, #4931
+    checkReturnGetEnumeratorFromScopeBoundReceiver(e);
     // §28.3 *Borrow lifetime rules* / §28.6 *Methods returning `this`* (issue
     // #3993): reject a direct (non-`move`, non-owned-field-read) borrow
     // returned through an `owned` return type — a borrowed parameter, `this`,
@@ -14520,6 +14531,33 @@ void MethodOwnership::checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
 // receiver-aliases-view property; a user-method Drain is classified by the
 // ordinary user-call rules and never reaches this check). // per §28.3
 // v0.226, stdlib §4.5 v0.195, #2175
+bool MethodOwnership::isLocalHeapCollectionTyped(sema::Symbol* sym) {
+    // fix #4931 helper: a local symbol whose DECLARED type is one of the
+    // heap-collection heads (Array<T>, OwningArray<T>, Stack<T>,
+    // OwningStack<T>, Queue, …, stdlib §4). The literal-initialized heap-
+    // allocated Array<T> / etc. local is the ONE source-classification gap
+    // producerState's CollectionLiteralExpr arm misses: the literal is
+    // untyped (`ctx_.exprType(literal) == null`) because its type comes from
+    // the declaration, so producerState defaults to Borrowed and the local
+    // never lands in `everOwnedPlainLocals_`. The heap backing is still
+    // allocated and disposed at scope end (the §28.3 affine auto-drop on
+    // the registerUsingDisposal path — codegen never bypasses this for a
+    // typed-heap-collection local). The DECLARED type is the authoritative
+    // signal: `var xs: Array<int> := [...]` is heap-allocated exactly
+    // because the declared type is `Array<int>`; `var xs := [...]` with no
+    // annotation is untyped at the literal site and never reaches this
+    // check (no declared type, no collection-literal lowering). // per
+    // §28.3, §15.4, #4931
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->decl) return false;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->type) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->headName().empty()) return false;
+    return common::isPatternAResultCollectionHead(rt->headName());
+}
+
 void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
         const ast::Expr& e) {
     auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
@@ -14651,6 +14689,228 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
     // here — the indexer's slot borrow is the only interesting source and
     // a `using var` cannot appear in indexer position. The chained-call
     // temporary case is already covered by #2169.
+    return;
+}
+
+// fix #4931 (§28.3 *Returning a deferred-activation frame* / §29.11 / §29.2,
+// v0.307): the SYNC half of `recv.GetEnumerator()` over a SCOPE-BOUND owned
+// local / `using var` carries a borrow of `recv` that outlives its source —
+// the array enumerator stores a raw pointer to the source array (`arrenum.<elem>`
+// = `{vtable, arr, idx, esz}` at LlvmBackend_Assign.cpp:~9746; Dispose = free(self)
+// reclaims the wrapper only), and the source's auto-drop at scope exit
+// reclaims the backing storage (§28.3 affine auto-drop / §28.10 using-var
+// dispose). The result is the wild-SEGV measured for `using var en := Mk()`
+// where `Mk(): owned IEnumerator<int> return xs.GetEnumerator()` over a
+// `var xs: Array<int>` local — the wrapper's `Current` reads `arr` which is
+// now a dead slot, exactly the [§9.7](#sec-records-and-disposal)'s "boxing a
+// borrow-bearing record" rejected shape in its enumerator form. §29.2's
+// for-desugaring bounds the borrow correctly (`using var __source := source`
+// pins the source for the enumerator's lifetime) — the unbound return leaks
+// the same borrow past the source's scope.
+//
+// The static check at `checkBorrowEscapesOnReturn` does NOT fire on this
+// shape: the call's result type is a builtin `IEnumerator<T>` sentinel
+// (Named with no declaration, single-part head `IEnumerator` /
+// `IOwningEnumerator`), so `isBorrowableType` answers false and the
+// `returnedExprMayBorrow` gate skips the whole check. The targeted shape is
+// the SAME one `checkReturnDrainFromScopeBoundReceiver` rejects above — a
+// builtin call (no MethodSymbol) whose receiver is a tracked scope-bound
+// owned local or `using var` — but `GetEnumerator()` (and the owning twin
+// `GetOwningEnumerator()`) additionally issues a fresh enumerator frame per
+// call (spec §29.11: "each call produces an independent enumerator") whose
+// runtime representation is the borrow (the drain-view, by contrast, aliases
+// the receiver's array directly). Narrow: only the SYNC builtin enumerator
+// heads (the §29.3 iterator-format ENUMERATOR half, the same gate codegen's
+// `resultIsEnumeratorSentinel` uses, LlvmBackend_Calls2.cpp:8376).
+//
+// A `this`-rooted chain is admitted (`this` outlives the call); a parameter
+// is admitted (the parameter outlives the call); a non-enumerator call is
+// not affected. The user-defined `return this;` self-returning enumerator
+// (`GetEnumerator(): IEnumerator<int> return this;`) is the §2443 carve:
+// codegen wraps the self-return in a freshly-calloc'd adapter whose Dispose
+// is owned by the caller (#2388/#2440), so the receiver-borrow is not
+// exposed through this surface — `resultIsEnumeratorSentinel` excludes the
+// self-return shape because the result type is the named `IEnumerator<T>`
+// interface, not the sentinel. Firing on the named-interface call shape
+// would be a false reject. // per §28.3, §29.11, §29.2, #2443, #4931
+void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
+        const ast::Expr& e) {
+    auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!ce || !ce->callee) return;
+    if (!ce->args.empty()) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma) return;
+    // The SYNC builtin enumerator heads; §29.3 iterator-format ENUMERATOR half.
+    // The owning twin is `GetOwningEnumerator` over an `IOwningEnumerable<T>`
+    // source (stdlib §4.13) — the same wrap shape, the same borrow source.
+    // Async enumerators (IAsyncEnumerator<T>) are out of scope: the static
+    // method's `e` here is a non-async body, so the call cannot reach an
+    // async enumerator (the receiver's drain path stays sync; an
+    // `await for` source is in `handleReturn`'s caller). Leave them to the
+    // async-body checks.
+    if (ma->member != "GetEnumerator" && ma->member != "GetOwningEnumerator")
+        return;
+    if (!ma->target) return;
+    // BUILTIN call only — a USER method named `GetEnumerator` (a class
+    // implementing IEnumerable<T> whose own GetEnumerator body is reachable)
+    // resolves a MethodSymbol and is classified by the ordinary user-call
+    // rules. The §2443 carve keeps the self-return shape (named-interface
+    // result, no sentinel) out of the borrow-pin decision; user two-class
+    // enumerators (a separate, freshly-`new`'d enumerator class) already fail
+    // the body-scan below on its own (a `new` producer is not receiver-
+    // sourced) and are unaffected. Mirrors `checkReturnDrainFromScopeBound-
+    // Receiver`'s builtin gate exactly.
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee)))
+        return;
+    // Result type must be the SYNC builtin enumerator SENTINEL — the exact
+    // shape codegen wraps with `wrapUserClassAsIEnumerable` /
+    // `wrapArrayAsIEnumerable` (LlvmBackend_Calls2.cpp:8376; the §2443
+    // sentinel gate). A named-interface result (the §2443 self-return
+    // shape) has `declaration` set and falls through here — admitted (the
+    // receiver-borrow is hidden by codegen's adapter wrap). A user method
+    // returning a non-sentinel enumerator also has `declaration` set —
+    // admitted (handled by the user-class rules).
+    const sema::TypeRef* rt = ctx_.exprType(e);
+    if (!rt) return;
+    if (rt->kind != sema::TypeRef::Kind::Named || rt->declaration) return;
+    if (!rt->astNode || !rt->astNode->name ||
+        rt->astNode->name->parts.empty()) return;
+    if (!common::isSyncIterFormatEnumeratorHead(rt->headName())) return;
+    // Receiver type must be a Named (builtin or user) class-typed source
+    // collection. The builtin half (Array<T>, OwningArray<T>, Stack<T>, …
+    // — stdlib §4) has no declaration in sema (its TypeRef is a sentinel
+    // the codegen wrap recognizes), and is exactly the borrow source
+    // shape measured. A user class implementing IEnumerable<T> resolves a
+    // MethodSymbol on `GetEnumerator` (gate above) and is admitted — its
+    // `usingVarInitIsRecognizedBorrow` / `methodReturnsOnlyReceiver-
+    // SourcedBorrows` decide whether the receiver-sourced borrow is
+    // surfaced; this check never reaches a user class.
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return;
+    // Identify the receiver: bare identifier or chain, mirroring
+    // `checkReturnDrainFromScopeBoundReceiver`. A bare IdentifierExpr whose
+    // symbol is a tracked scope-bound owned local / `using var` is the
+    // rejecting shape. A field-rooted chain (`this.f.GetEnumerator()`) is
+    // admitted — `this` outlives the call. A parameter is admitted —
+    // parameters outlive the call. Anything else (a non-tracked binding) is
+    // conservatively admitted; the runtime is the caller's problem.
+    const ast::Expr* recv = ma->target.get();
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {
+        if (id->name == "this") return;  // `this` outlives the call
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return;  // unresolved / import — admit conservatively
+        // A PARAMETER outlives the call — admit. LocalSymbol = local,
+        // ParameterSymbol = parameter, FieldSymbol = field (outlives the
+        // call as long as the receiver outlives it — admit unless the
+        // receiver is itself a tracked scope-bound local, which the
+        // MemberAccessExpr chain branch handles below).
+        if (!dynamic_cast<sema::LocalSymbol*>(sym)) return;
+        // A scope-bound LOCAL of a heap-collection type (§4.4 Array<T>,
+        // §4.5 OwningArray<T>, §4.6 LinkedList<T>, etc.) — the §28.3
+        // affine auto-drop / §28.10 using-var frees the heap backing at
+        // this method's exit, so the returned enumerator's borrow of the
+        // source dangles. Two ways to land here:
+        //
+        //   * `using var xs := [...]` / `var xs := new Array<int>(...)`
+        //     — `xs.state == Owned`, `everOwnedPlainLocals_` carries it.
+        //
+        //   * `var xs: Array<int> := [...]` (heap-collection literal
+        //     initializer typed via the declaration) — `xs.state ==
+        //     Borrowed` because producerState's CollectionLiteralExpr
+        //     arm gates on `ctx_.exprType(literal)` and the literal is
+        //     untyped (its type comes from the declaration); the
+        //     everOwnedPlainLocals_ insert at handleLocalDecl:6550 also
+        //     misses. The local is heap-allocated in spite of the
+        //     classification — codegen allocates it via the
+        //     collection-literal lowering — and is the SAME source
+        //     auto-drop boundary the Owned case reaches. Detect by
+        //     checking the local's DECLARED TYPE for a heap-collection
+        //     head; that is the only authoritative signal when the
+        //     dataflow classifier is blind.
+        const bool usingVar =
+            lookupState(id->name) &&
+            lookupState(id->name)->implicitDischarge;
+        const bool plainOwnedLocal =
+            lookupState(id->name) &&
+            lookupState(id->name)->state == OwnershipState::Owned &&
+            everOwnedPlainLocals_.count(sym) != 0;
+        const bool heapCollectionLiteralLocal =
+            !usingVar && !plainOwnedLocal &&
+            isLocalHeapCollectionTyped(sym);
+        if (!usingVar && !plainOwnedLocal && !heapCollectionLiteralLocal)
+            return;  // borrowed local of a non-heap type — borrow escapes by other rules
+        report(
+            Severity::Error, e.span.begin,
+            std::string("cannot return `") +
+            std::string(id->name) +
+            ".GetEnumerator()` — the enumerator stores a raw pointer "
+            "to the source collection (LlvmBackend_Assign.cpp arrenum, "
+            "v0.307), and the source `" +
+            std::string(id->name) +
+            "` is " +
+            (usingVar
+                 ? std::string("a `using var` disposed at the "
+                               "callee's scope end")
+                 : std::string(
+                       "a scope-bound owned local disposed at the "
+                       "callee's scope end")) +
+            ", so the returned enumerator's borrow of `" +
+            std::string(id->name) +
+            "` dangles (§28.3 *Returning a deferred-activation frame*; "
+            "§29.11; §29.2; bind the source in the caller's scope "
+            "and return the enumerator from there)");
+        return;
+    }
+    // A MemberAccessExpr receiver (`obj.f.GetEnumerator()`): walk the chain
+    // to its root identifier. `this`-rooted is admitted (outlives the
+    // call); a tracked scope-bound owned local / `using var` root is the
+    // same hazard as the bare-identifier case. A parameter root is
+    // admitted.
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(recv)) {
+        const ast::Expr* root = rma;
+        while (auto* hop = dynamic_cast<const ast::MemberAccessExpr*>(root))
+            root = hop->target.get();
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root)) {
+            if (id->name == "this") return;  // `this.f.GetEnumerator()` — admitted
+            if (auto* sym = ctx_.exprSymbol(*id)) {
+                if (auto* st = lookupState(id->name)) {
+                    const bool usingVar = st->implicitDischarge;
+                    const bool plainOwnedLocal =
+                        st->state == OwnershipState::Owned &&
+                        everOwnedPlainLocals_.count(sym) != 0;
+                    if (!usingVar && !plainOwnedLocal) return;
+                    report(
+                        Severity::Error, e.span.begin,
+                        std::string("cannot return `") +
+                        std::string(id->name) +
+                        ".GetEnumerator()` — the enumerator stores a raw "
+                        "pointer to the source collection, and the chain's "
+                        "source `" +
+                        std::string(id->name) +
+                        "` is " +
+                        (usingVar
+                             ? std::string("a `using var` disposed at the "
+                                           "callee's scope end")
+                             : std::string(
+                                   "a scope-bound owned local disposed at "
+                                   "the callee's scope end")) +
+                        ", so the returned enumerator's borrow dangles "
+                        "(§28.3 *Returning a deferred-activation frame*; "
+                        "§29.11; §29.2; bind the source in the caller's "
+                        "scope and return the enumerator from there)");
+                    return;
+                }
+                return;  // untracked bare identifier — admit
+            }
+            return;  // unresolved — admit conservatively
+        }
+        // Chain rooted in something other than an identifier (another call).
+        // Conservatively admitted — the chained-call temporary case is
+        // already covered by #2169.
+        return;
+    }
+    // An IndexExpr receiver (`arr[0].GetEnumerator()`) is conservatively
+    // admitted — the chained-call temporary case is already covered.
     return;
 }
 

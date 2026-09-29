@@ -2598,6 +2598,32 @@ private:
     // admitted; a non-Drain call is not affected. // per §28.3 v0.226,
     // stdlib §4.5 v0.195, #2175
     void checkReturnDrainFromScopeBoundReceiver(const ast::Expr& e);
+    // fix #4931 (§28.3 *Returning a deferred-activation frame* / §29.11 /
+    // §29.2, v0.307): reject `return xs.GetEnumerator()` (sync builtin over a
+    // class-typed scope-bound local / `using var` receiver). The array
+    // enumerator stores a raw pointer to the source array; the source's
+    // auto-drop at scope end reclaims the backing storage, and the returned
+    // enumerator's `Current` reads a dead slot. Fires from handleReturn BEFORE
+    // the §28.3 borrow-escape funnel — the call's result type is the builtin
+    // `IEnumerator<T>` sentinel (Named, no declaration), so the
+    // `returnedExprMayBorrow` gate skips the funnel entirely. Narrow: only
+    // the SYNC builtin enumerator heads (codegen's `resultIsEnumeratorSentinel`
+    // gate, §2443 carve out by `declaration` being set on the named-interface
+    // self-return shape). A `this`-rooted chain is admitted (outlives the
+    // call); a parameter is admitted (outlives the call); a user-method
+    // `GetEnumerator` (named-interface result) is admitted (the §2443 carve).
+    // // per §28.3, §29.11, §29.2, #2443, #4931
+    void checkReturnGetEnumeratorFromScopeBoundReceiver(const ast::Expr& e);
+    // fix #4931 helper: see Ownership.cpp's isLocalHeapCollectionTyped
+    // declaration for the contract. Used by
+    // `checkReturnGetEnumeratorFromScopeBoundReceiver` to recognize a
+    // literal-initialized heap-allocated local whose `producerState`-
+    // derived state is Borrowed (literal untyped, dataflow default) but
+    // whose DECLARED type is a heap-collection head — i.e. it IS heap-
+    // allocated and WILL be disposed at scope end. The same predicate
+    // could be reused by other "scope-bound source" reject shapes; kept
+    // private here pending a recorded ruling.
+    bool isLocalHeapCollectionTyped(sema::Symbol* sym);
     // §28.3 (v0.194, #1801 S5): reject a loop-carried bare-type-parameter
     // accumulation — `prev := Math.Max(prev, cur)` — where a contributing source
     // is a scope-bound owned local declared in a block the assignment target's
