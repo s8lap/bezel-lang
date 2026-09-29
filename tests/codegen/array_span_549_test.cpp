@@ -701,6 +701,47 @@ BEZEL_TEST(array_span_549, reverse_single_element_noop_spec_4_15) {
 }
 
 // ===========================================================================
+// §4.15 Reverse() — mutation-during-iteration (§29.12 / #5131).
+// ===========================================================================
+
+// §29.12 / #5131: Reverse() on an ArraySpan<T> is a structural modification
+// of the collection it views — "a repositioning made through a view is a
+// structural modification of the collection it views". A for-in loop over the
+// backing array must raise InvalidOperationException at the next advance after
+// the span Reverse(), exactly as Array<T>.Reverse() does since #4631.
+// Repros: [1,2,3] → after span.Reverse: [3,2,1].
+BEZEL_TEST(array_span_549, span_reverse_during_for_throws_5131) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  try "
+        "    for var x in a do a.AsSpan().Reverse(); end; "
+        "  catch InvalidOperationException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §29.12 / #5131: control — Fill() is element-level, NOT structural, so no
+// fault. The loop must complete normally. Per §29.12's direct-indexed-loop
+// desugaring over a concretely-typed Array<T>, each iteration's `x` is a live
+// read of `a[i]` taken at the TOP of that iteration, before the body runs —
+// same order as the pinned `array_indexer_set_no_throw` case (#1232) above.
+// Fill(10) writes ALL slots on iteration 0's body, so the reads for i=1 and
+// i=2 already observe 10: x sequence is 1 (i=0, pre-Fill), 10, 10 → sum 21.
+BEZEL_TEST(array_span_549, span_fill_during_for_no_fault_5131) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var s := 0; "
+        "  for var x in a do a.AsSpan().Fill(10); s := s + x; end; "
+        "  return s; "  // 1 + 10 + 10 = 21 (live per-iteration reads, not a snapshot)
+        "end Main; end C;"), 21);
+}
+
+// ===========================================================================
 // §4.15 CopyFrom(source): copies slot-by-slot from ReadOnlyArraySpan<T>.
 // ===========================================================================
 

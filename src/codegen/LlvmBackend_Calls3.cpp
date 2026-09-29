@@ -4617,6 +4617,17 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
             builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
+        // fix #5131 (§29.12, v0.308): Reverse() on a span view is a structural
+        // modification of the collection it views — "a repositioning made through
+        // a view is a structural modification of the collection it views" — so it
+        // must invalidate a live enumerator over the backing collection.  The span
+        // source is already in hand as `src`.  bz_array_note_repositioned no-ops
+        // when count <= 1 (same guard bz_array_sort carries).
+        {
+            auto* bumpFn = declareC("bz_array_note_repositioned",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(bumpFn, {src});
+        }
         return llvm::ConstantInt::get(i32(), 0);  // unit
     }
 
