@@ -352,6 +352,17 @@ const Entry kAstKeyedTables[] = {
      "freed mid-compile, so an address is never reused for another site's "
      "arguments). The value is owned by the "
      "`SemaContext` whose arena produced it — the one the entry lives in."},
+    {"methodRefSelectedOverloads_",
+     "CARRIED verbatim by all re-parse paths (fix #5019/#4978, §27.6 v0.307), "
+     "mirroring `exprTypes_`/`resolvedTypes_`: a method reference formed "
+     "inside a re-parsed generic method/ctor/dtor/field-init body resolves "
+     "its overload in `freshCtx`; codegen's method-thunk emission "
+     "(LlvmBackend_Exprs.cpp) reads `ctx_.methodRefSelectedOverload` on the "
+     "same `ast::Expr*` node from `mainCtx` afterward, so an uncarried entry "
+     "would silently fall back to the first-declared overload — the exact "
+     "wrong-code shape #5019 fixes, just relocated to a cross-module "
+     "generic-body reparse. `MethodSymbol*` values need no remap (stable "
+     "declaration-level symbols, not per-instantiation Locals)."},
 };
 
 // Every member name declared as an AST-keyed `std::unordered_map`, in

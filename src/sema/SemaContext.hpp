@@ -493,6 +493,23 @@ public:
     const std::unordered_map<const ast::Expr*, TypeRef*>& allExprTypes() const {
         return exprTypes_;
     }
+    // fix #5019/#4978 (§27.6 v0.307): the seventh AST-keyed side table
+    // (semacontext_ast_side_table_snapshot_test.cpp). CARRIED verbatim by
+    // every re-parse path, mirroring `allExprTypes()` immediately above —
+    // the same reasoning applies: a method reference formed inside a
+    // re-parsed generic method/ctor/dtor/field-init body resolves its
+    // overload in `freshCtx`, and codegen's method-thunk emission
+    // (LlvmBackend_Exprs.cpp) later reads `ctx_.methodRefSelectedOverload`
+    // on the SAME `ast::Expr*` node from `mainCtx` — with no entry it binds
+    // the first-declared overload instead, the exact silent-wrong-code
+    // shape #5019 exists to close, just relocated to a cross-module
+    // generic-body reparse. `MethodSymbol*` values are stable across
+    // contexts (a declaration-level symbol, not a per-instantiation Local),
+    // so the copy needs no remap, matching `resolvedTypes_`/`exprTypes_`.
+    const std::unordered_map<const ast::Expr*, MethodSymbol*>&
+    allMethodRefSelectedOverloads() const {
+        return methodRefSelectedOverloads_;
+    }
 
     // A small primitive-type cache: looking up the same primitive shape
     // (Int, Bool, String, …) should return the same TypeRef so equality
