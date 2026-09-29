@@ -64,14 +64,14 @@ BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
         "end P;");
 }
 
-// ── (2) SANITY CHECK: case-INSENSITIVE duplicate satisfies §9.8 step 2
-//        (which requires binding by case-insensitive name), so this is NOT
-//        an exact duplicate and MUST BE ADMITTED ───────────────────────────
-//        (§9.3 same-list is case-SENSITIVE per every #4775 reading; this
-//        differs at position 0 by case: `X` vs `x`)
+// ── (2) FLIPPED for fix #5132 (§9.3 / §22.6, v0.308). case-INSENSITIVE
+//        duplicate (`R(X)` + ctor(x)`) was an ACCEPT (the v0.307 predicate
+//        was case-sensitive); under §22.6 identity the parameter lists are
+//        indistinguishable (names — case included — do not distinguish) and
+//        §9.3 REJECTS. Same shape, new expectation. ──────────────────────
 BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
-           accepts_case_insensitive_duplicate_satisfies_spec_9_8) {
-    auto r = runAot(
+           rejects_case_insensitive_duplicate_spec_9_3) {
+    expectRecordDuplicateCtorRejected(
         "module M; "
         "record R(X: int) "
         "  public constructor(x: int) "
@@ -80,20 +80,19 @@ BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
         "end R; "
         "class P "
         "  public static method Main(): int "
-        "    var r := new R(5); "
-        "    return r.X; "
+        "    return 0; "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
-// ── (3) SANITY CHECK: different parameter name is NOT a duplicate and
-//        MUST BE ADMITTED ────────────────────────────────────────────────
-//        (differs at position 0 by name: `X` vs `Y`)
+// ── (3) FLIPPED for fix #5132 (§9.3 / §22.6, v0.308). A different
+//        parameter name (R(X) + ctor(Y)) was an ACCEPT; under §22.6
+//        names do not distinguish, so the parameter lists are
+//        indistinguishable (arity 1, type int, modifier none) and §9.3
+//        REJECTS. Same shape, new expectation. ─────────────────────────
 BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
-           accepts_different_name_satisfies_spec_9_3) {
-    auto r = runAot(
+           rejects_different_name_spec_9_3) {
+    expectRecordDuplicateCtorRejected(
         "module M; "
         "record R(X: int) "
         "  public constructor(Y: int) "
@@ -102,12 +101,9 @@ BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
         "end R; "
         "class P "
         "  public static method Main(): int "
-        "    var r := new R(5); "
-        "    return r.X; "
+        "    return 0; "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
 // ── (4) SANITY CHECK: same arity, same case-sensitive name, DIFFERENT
@@ -150,14 +146,16 @@ BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
         "end P;");
 }
 
-// ── (6) CONTROL: §9.8 combined-form record with case-insensitive match
-//        (the Vec2 pattern) — already accepted, must continue to work.
-//        `constructor(x: int, y: int)` against `Vec2(X: int, Y: int)`;
-//        §9.8 step 2 REQUIRES this binding. §9.3 status is #4775 Q1/Q2
-//        (still open); this row is NOT an exact duplicate (case differs). ─
+// ── (6) FLIPPED for fix #5132 (§9.3 / §22.6, v0.308). The §9.8 combined-form
+//        record with case-insensitive match (`Vec2(X, Y)` + `ctor(x, y)`)
+//        was an ACCEPT (the v0.307 predicate compared case-sensitively);
+//        under §22.6 the parameter lists are indistinguishable and §9.3
+//        REJECTS. Same shape, new expectation. (The §9.8 step 2 "supply a
+//        body for the primary" binding rule remains — it just does not
+//        survive the §22.6 identity match when names alone differ.)
 BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
-           accepts_vec2_case_insensitive_combined_form_satisfies_spec_9_8) {
-    auto r = runAot(
+           rejects_vec2_case_insensitive_combined_form_spec_9_3) {
+    expectRecordDuplicateCtorRejected(
         "module M; "
         "record Vec2(X: int, Y: int) "
         "  public constructor(x: int, y: int) "
@@ -167,10 +165,7 @@ BEZEL_TEST(record_body_ctor_duplicate_primary_5100,
         "end Vec2; "
         "class P "
         "  public static method Main(): int "
-        "    var v := new Vec2(3, 4); "
-        "    return v.X + v.Y; "
+        "    return 0; "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 7);
 }

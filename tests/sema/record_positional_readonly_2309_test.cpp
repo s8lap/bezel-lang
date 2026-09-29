@@ -367,8 +367,17 @@ BEZEL_TEST(record_positional_readonly_2309,
 // writes. Without this guard, every combined-form record that
 // initializes its positional fields in a constructor would fail to
 // compile.
+//
+// FLIPPED for fix #5132 (§9.3 / §22.6, v0.308). Under the v0.307 narrow
+// predicate the `record R(X, Y) + constructor(x, y)` shape was admitted
+// (case-sensitive name comparison made it not-an-exact-duplicate). Under
+// §22.6 overload identity (names do not distinguish), the body ctor and
+// the primary are indistinguishable, and §9.3 REJECTS the declaration.
+// The construction-window carve-out this row originally pinned is now
+// unobservable (the body ctor never compiles), so the row is flipped to
+// a §9.3 reject oracle.
 BEZEL_TEST(record_positional_readonly_2309,
-           combined_form_constructor_init_accepted_spec_9_2) {
+           combined_form_constructor_init_rejected_spec_9_3) {
     auto r = parseSemaAll(
         "module M; "
         "record R(X: int, Y: int) "
@@ -382,5 +391,7 @@ BEZEL_TEST(record_positional_readonly_2309,
         "    var r := new R(1, 2); "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "body constructor redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""9.3"));
 }

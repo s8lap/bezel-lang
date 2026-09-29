@@ -8,6 +8,18 @@
 // Y := scale; }` — even though `new Point2(5)` matches the body ctor and
 // not the primary.
 //
+// fix-forward #5132 (§9.3 / §11.1 / §22.6, v0.308): the v0.308 ruling on
+// the "same parameter list" clash sense (§11.3 / §22.6 overload identity;
+// parameter names and defaults do not distinguish) means the body ctor's
+// parameter list must DIFFER from the primary under §22.6 for the
+// combined-form defer path to apply. Tests (3) and (4) pinned body ctors
+// whose parameter lists differed from the primary only by name — under
+// v0.307 those were admissible (the predicate included names); under
+// v0.308 they clash at the declaration and the defer never runs. They
+// are flipped here in this commit (rows (3) REJECT, (4) replaced with a
+// truly different-arity/type shape that keeps the overload-selection
+// oracle alive).
+//
 // Sema path: `ExprTC::checkNewExprArgs` (src/sema/ExprTypecheck_Calls.cpp
 // at the `t->kind == ast::TypeDeclKind::Record` arm of
 // `t->hasPositionalFields`) unconditionally called `checkArgsAgainstParams`
@@ -34,20 +46,22 @@
 //     tests (2) and (4) in that file now exercise (and pass with) the
 //     fix on this file's primary-shape path.
 //   * tests/lit/sema/sema_serialization_550__record_combined_form_
-//     explicit_ctor_match_accepted_spec_9_8_v0182.bzl — pure
-//     declaration-side acceptance; never actually constructs via `new`.
+//     explicit_ctor_match_accepted_spec_9_8_v0182.bzl — FLIPPED in this
+//     commit (was a declaration-side accept under v0.307; under v0.308
+//     the same shape clashes and is now a REJECT control that names the
+//     §9.3 diagnostic).
 //
 // FAIL-WITHOUT / PASS-WITH (proven mechanically): with the new
 // `if (hasExplicitCtor) return;` line reverted (and the record branch
 // restored to its current unconditional positional-field check), test (1)
 // below reports the §22.5 "required parameter `Y` is not supplied" error
 // the issue itself measures; restored, it constructs `X=5 Y=5` and
-// returns 10 — the body ctor's own assignment runs. The other tests stay
-// green on both sides of the fix: (2) is the issue's companion on the
-// primary-shape path (the existing behavior it pins), (3) is the
-// `this(...)`-chained body ctor (codegen routes through `emitChainCall`),
-// (4) exercises overload selection when the body declares TWO body
-// ctors of different arity (each is matched positionally).
+// returns 10 — the body ctor's own assignment runs. (3) is REJECTED under
+// the v0.308 predicate at the declaration and never reaches the (4712)
+// defer-or-positional dispatch; the new reject oracle there names the
+// §9.3 redeclares-primary diagnostic. (4) is replaced with a truly
+// different-arity/type shape that keeps the overload-selection oracle
+// alive. (2) stays green on both sides.
 //
 // Filter run: `--area sema record_combined_form_explicit_ctor_dispatch`.
 
@@ -115,20 +129,16 @@ BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
-// ── (3) body ctor taking a reference-typed parameter — exercises the
-//        full assignment path inside the body ctor body (no chain to the
-//        primary, no named args, no overload set). The body ctor
-//        initializes positional storage via §9.3's "assigning the auto-
-//        generated read-only properties" wording and the body must run
-//        untouched. `new P(new R(7))` constructs an embedded record
-//        first, then the body ctor stores it into two positions and
-//        sums them. Pins the inlined-explicit-ctor path
-//        (`buildRecordValue`, lines 11015-11156) — including the
-//        retain/retain-release envelope for the parameter pass
-//        (`retainAssignedStringParams`, #2712). Sema path: deferred via
-//        this fix's widened record branch ──────────────────────────────
+// ── (3) FLIPPED for fix #5132 (§9.3 / §22.6, v0.308): body ctor with a
+//        single-int parameter of a DIFFERENT NAME than the primary's
+//        positional field is no longer accepted. Under §22.6 overload
+//        identity (arity, types, modifiers), the primary `record R(Val:
+//        int)` and body `constructor(v: int)` are indistinguishable — a
+//        §9.3 clash. The reject oracle names the §9.3 diagnostic and
+//        pins that body-ctor deferral (the fix in 4712) does not save
+//        the shape: the declaration is rejected outright. ────────────────
 BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
-           body_ctor_takes_reference_typed_arg) {
+           body_ctor_differing_only_by_name_rejected_spec_9_3) {
     auto r = runAot(
         "module M; "
         "public record R(Val: int) "
@@ -136,49 +146,50 @@ BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
         "    Val := v * 10; "
         "  end constructor; "
         "end R; "
-        "public record P(Sum1: int, Sum2: int) "
-        "  public constructor(r: R) "
-        "    Sum1 := r.Val + 1; "
-        "    Sum2 := r.Val + 2; "
-        "  end constructor; "
-        "end P; "
         "public class Program "
         "  public static method Main(): int "
-        "    var p := new P(new R(7)); "
-        "    return p.Sum1 + p.Sum2; "
+        "    var r := new R(7); "
+        "    return r.Val; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    // Sum1 := 71; Sum2 := 72. Total: 143.
-    BEZEL_EXPECT_EQ(r.exitCode, 143);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "body constructor redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""9.3"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// ── (4) overload selection — multiple differently-shaped body ctors on
-//        the same combined-form record. `new Box(3)` against two body
-//        ctors — `(n: int)` and `(s: string)` — must resolve by arity to
-//        the int one (3 → 30); `new Box("hi")` resolves to the string
-//        one (length 2 → 2). Both pins of `ctorForArgs`'s arity-first
-//        rank in the explicit-ctor path. Sema path: same defer as
-//        (1)/(3) ──────────────────────────────────────────────────────────
+// ── (4) FLIPPED for fix #5132: the previous row pinned two overload
+//        candidates for `new Box(...)` — `(n: int)` and `(s: string)`,
+//        against `record Box(Count: int)`. The `(n: int)` body ctor
+//        clashes with the primary under §22.6 (same arity 1, same type
+//        int, same modifier). The shape is REJECTED at the declaration
+//        before any overload-selection oracle can run. To keep the
+//        overload-selection idea, the row is REPLACED with a non-clashing
+//        shape: the primary is `Box(Count: int)` and the body ctor is
+//        `(s: string)` (different types) and `(s: string, n: int)` (more
+//        parameters) — both legitimately overload `Box` and exercise
+//        `ctorForArgs`'s arity/type rank. ──────────────────────────────
 BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
-           overloaded_body_ctors_dispatch_by_arity) {
+           overloaded_body_ctors_distinct_types_arity_accepted_spec_22_6) {
     auto r = runAot(
         "module M; "
         "public record Box(Count: int) "
-        "  public constructor(n: int) "
-        "    Count := n * 10; "
-        "  end constructor; "
         "  public constructor(s: string) "
         "    Count := s.Length; "
+        "  end constructor; "
+        "  public constructor(s: string, n: int) "
+        "    Count := s.Length + n * 10; "
         "  end constructor; "
         "end Box; "
         "public class Program "
         "  public static method Main(): int "
-        "    var b1 := new Box(3); "
-        "    var b2 := new Box(\"hi\"); "
+        "    var b1 := new Box(\"hi\"); "
+        "    var b2 := new Box(\"hi\", 3); "
         "    return b1.Count + b2.Count; "
         "  end Main; "
         "end Program;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 32);  // (3*10) + 2
+    BEZEL_EXPECT_EQ(r.exitCode, 34);  // 2 + (2 + 30)
 }

@@ -121,16 +121,15 @@ BEZEL_TEST(record_combined_form_ctor_conflicts_4702,
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
-// ── (3, companion / positive control / #4702 regression guard) a body
-//        constructor whose parameter TYPES match the primary's but whose
-//        NAMES differ only in case, and carries NO contract clause, stays
-//        ACCEPTED — this is the exact shape sema_serialization_550's lit
-//        test already relies on for §9.8's case-insensitive constructor
-//        selection; pinned here so a future attempt at §9.3's "same
-//        parameter list" disqualifier trips over this test rather than
-//        silently reintroducing the #4702 conflict ─────────────────────────
+// ── (3, FLIPPED for fix #5132 §9.3 / §22.6, v0.308) the case-insensitive
+//        same-type body ctor shape (X vs x) was a positive-control ACCEPT
+//        under the v0.307 predicate (case-sensitive name comparison).
+//        Under §22.6 overload identity (names — case included — do not
+//        distinguish) the parameter lists are identical and §9.3 REJECTS.
+//        Same shape, new expectation. This is the same flip recorded in
+//        the sema_serialization_550__..._accepted_spec_9_8 lit row. ──────
 BEZEL_TEST(record_combined_form_ctor_conflicts_4702,
-           same_type_shape_different_case_names_accepted_positive_control) {
+           same_type_shape_different_case_names_rejected_spec_9_3) {
     auto r = runAot(
         "module M; "
         "public record Vec2b(X: int, Y: int) "
@@ -141,12 +140,14 @@ BEZEL_TEST(record_combined_form_ctor_conflicts_4702,
         "end Vec2b; "
         "public class Program "
         "  public static method Main(): int "
-        "    var v := new Vec2b(1, 2); "
-        "    return v.X + v.Y; "
+        "    return 0; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 203);  // (1+100) + (2+100)
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "body constructor redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""9.3"));
 }
 
 // ── (4, companion / positive control) a different-shaped body constructor

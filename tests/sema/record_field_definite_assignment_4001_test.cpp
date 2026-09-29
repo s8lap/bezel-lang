@@ -230,12 +230,23 @@ BEZEL_TEST(sema_record_field_da_4001,
         77);
 }
 
-// A combined-form record whose explicit constructor's parameter list matches
-// the positional signature (§9.3's sanctioned "supply a body for the primary
-// constructor" shape) and assigns the body field.
+// FLIPPED for fix #5132 (§9.3 / §11.1 / §22.6, v0.308). The original row
+// pinned `record Combo4001OK(X: int)` + `constructor(x: int)` — a body
+// ctor whose parameter list differs from the primary only by name — as
+// an ACCEPT oracle ("combined form explicitly supplies a body for the
+// primary"). Under the v0.307 predicate (equal arity + equal names +
+// equal types + equal default presence + equal §22.6 modifier) the name
+// mismatch made it not-an-exact-duplicate, so it compiled; under v0.308
+// (overload identity — names do not distinguish) the body ctor and the
+// primary are indistinguishable and §9.3 rejects the declaration. The
+// reject oracle here names the §9.3 redeclares-primary diagnostic; the
+// row's RUNTIME check (return 10) is replaced with a compile-time
+// check. The companion `field_initializer_discharges_obligation_accepted`
+// and the nullable / value-typed body-field rows below still pin the
+// §7.9 obligation rule unchanged.
 BEZEL_TEST(sema_record_field_da_4001,
-           combined_form_primary_ctor_body_assigns_field_accepted_spec_9_3) {
-    BEZEL_EXPECT_EQ(runProg(std::string(kWidget) +
+           combined_form_primary_ctor_body_clashes_with_primary_rejected_spec_9_3) {
+    auto r = runAot(std::string(kWidget) +
         "public record Combo4001OK(X: int) "
         "  public readonly property Extra: Widget4001; "
         "  public constructor(x: int) "
@@ -248,8 +259,12 @@ BEZEL_TEST(sema_record_field_da_4001,
         "    var c := new Combo4001OK(5); "
         "    return c.Extra.Render(); "
         "  end Main; "
-        "end C;"),
-        10);
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "body constructor redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "\xC2\xA7""9.3"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // A NULLABLE body field has a well-defined default (`null`, §7.9's "Default

@@ -3,6 +3,14 @@
 // (v0.307) §11.1 states: "The body may not redeclare a constructor with the
 // same parameter list as the primary constructor."
 //
+// fix-forward #5132 (§11.1 / §9.3 / §22.6, v0.308): "same parameter list" is
+// §11.3's clash sense, i.e. §22.6 overload identity — arity, parameter
+// types, `ref`/`out` modifiers, ordinary `owned`. Parameter NAMES and
+// DEFAULTS do not distinguish. So body ctors differing from the primary
+// only by name (rows 4 and 7) or only by case (row 6, the §9.8 combined-
+// form record Vec2) are now REJECTED. Rows 4, 6, and 7 are flipped in
+// this commit to the §11.1 / §9.3 reject oracle.
+//
 // WHAT THE DEFECT WAS. The existing §11.3/§22.6 overload clash check compares
 // body constructors against each other (types-only), and the primary constructor
 // is not included in that group (it carries no ConstructorSymbol). Nothing
@@ -21,9 +29,11 @@
 //     §9.8 step 2 requires the name-matching explicit constructor that a
 //     types-only §9.3 reading would forbid — row 6.
 //
-// REJECT rows: same names + same types (rows 1, 5), and the `owned` variant
-// (row 8). ACCEPT rows: different types, different arity, different names,
-// the §9.8 record explicit-ctor match, and the #3751 `owned` convenience ctor.
+// REJECT rows (v0.308): same names + same types (rows 1, 5), same types
+// different names (row 4), the §9.8 record explicit-ctor match (row 6),
+// the `owned` variant same name (row 8), the `owned` variant different
+// name #3751 shape (row 7). ACCEPT rows: different types (row 2), different
+// arity (row 3).
 
 #include <cstdio>
 #include <string>
@@ -145,32 +155,31 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
 }
 
 // ---------------------------------------------------------------------------
-// Row 4 — ACCEPT control: single-parameter primary `(x: int)` and a
-// convenience body ctor `(y: int)` that chains to the primary. Same type,
-// different name — whether that is "the same parameter list" is the open
-// #4775 Q1, so the §11.1 check leaves it alone until the ruling.
+// Row 4 — FLIPPED for fix #5132 (§11.1 / §22.6, v0.308). Single-parameter
+// primary `(x: int)` and a body ctor `(y: int)` — same type, same modifier,
+// DIFFERENT name — was an ACCEPT control under the v0.307 narrow predicate
+// (which compared names); under v0.308 §22.6 overload identity the parameter
+// lists are identical (names do not distinguish), so §11.1 REJECTS. Same row,
+// new expectation.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(ctor_body_redeclares_primary_4839,
-           accepts_same_types_different_names) {
+           rejects_same_types_different_names_spec_11_1) {
     auto r = runAot(
         "module M; "
         "class K(x: int) "
         "  public constructor(y: int) "
         "    this(y + 1); "
         "  end constructor; "
-        "  public method V(): int return x; end V; "
         "end K; "
         "class C "
         "  public static method Main(): int "
-        "    var k := new K(y := 7); "
-        "    Console.WriteLine(k.V().ToString()); "
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("8\n"));
+    if (!hasError(r, "redeclares the primary constructor")) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(hasError(r, "§11.1"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,17 +208,15 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
 }
 
 // ---------------------------------------------------------------------------
-// Row 6 — ACCEPT (fix-forward): the §9.8 step 2 combined-form record shape.
-// `record Vec2(X: int, Y: int): ISerializable, IDeserializable` with an
-// explicit `constructor(x: int, y: int)` — the constructor §9.8 REQUIRES
-// (it binds exactly the components by case-insensitive name). §11.1 is the
-// class sentence and must not reject a record; the record rule is §9.3,
-// whose reading is the open #4775 Q2. Pre-fix-forward this was rejected with
-// the §11.1 diagnostic (lit row sema_serialization_550__record_combined_
-// form_explicit_ctor_match_accepted_spec_9_8_v0182).
+// Row 6 — FLIPPED for fix #5132 (§9.3 / §22.6, v0.308). `record Vec2(X, Y)`
+// with `constructor(x, y)` was an ACCEPT (fix-forward) under the v0.307
+// predicate (case-sensitive name comparison): the body ctor's parameter
+// list differed from the primary only by case. Under §22.6 overload
+// identity (names do not distinguish), the lists are identical and §9.3
+// REJECTS the declaration. Same shape, new expectation.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(ctor_body_redeclares_primary_4839,
-           accepts_record_combined_form_explicit_ctor_match_spec_9_8) {
+           rejects_record_combined_form_explicit_ctor_match_spec_9_3) {
     auto r = runAot(
         "module M; "
         "record Vec2(X: int, Y: int): ISerializable, IDeserializable "
@@ -220,30 +227,27 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
         "end Vec2; "
         "class C "
         "  public static method Main(): int "
-        "    Console.WriteLine(\"accepted\"); "
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
-    BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    // The accept oracle proper: the program compiled, linked and ran to
-    // completion. (Which constructor `new Vec2(a, b)` would pick is #4775's
-    // open question, so the program deliberately does not construct one.)
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("accepted\n"));
+    if (!hasError(r, "redeclares the primary constructor")) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(hasError(r, "\xC2\xA7""9.3"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // ---------------------------------------------------------------------------
-// Row 7 — ACCEPT (fix-forward): the #3751 shape. `class Base(owned r: Res)`
-// with `constructor(owned x: Res) this(owned x);` — same type and modifier,
-// different name (open #4775 Q1). Pre-fix-forward this was rejected with the
-// §11.1 diagnostic (lit row this_chain_3751__owned_marker_to_primary_ctor_
-// accepted). The chain runs and the object reads back its resource.
+// Row 7 — FLIPPED for fix #5132 (§11.1 / §22.6, v0.308). The #3751 shape
+// (`class Base(owned r: Res)` with `constructor(owned x: Res) this(owned x);`)
+// was an ACCEPT under the v0.307 predicate (names differ, but the predicate
+// included names). Under §22.6 overload identity, ordinary `owned` is part
+// of the matching key and names do not distinguish, so the lists are
+// identical and §11.1 REJECTS. (Lit row
+// this_chain_3751__owned_marker_to_primary_ctor_accepted was flipped in the
+// same commit.)
 // ---------------------------------------------------------------------------
 BEZEL_TEST(ctor_body_redeclares_primary_4839,
-           accepts_owned_convenience_ctor_different_name_3751_shape) {
+           rejects_owned_convenience_ctor_different_name_3751_shape) {
     auto r = runAot(
         "module M; "
         "class Res "
@@ -259,18 +263,13 @@ BEZEL_TEST(ctor_body_redeclares_primary_4839,
         "  public method Id(): int return _s.Id(); end Id; "
         "end Base; "
         "class C "
-        "  public static method Main(): int "
-        "    using var b := new Base(x := new Res(9)); "
-        "    Console.WriteLine(b.Id().ToString()); "
-        "    return 0; "
+        "  public static method Main(): int return 0; "
         "  end Main; "
         "end C;");
-    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
-    BEZEL_EXPECT_FALSE(hasError(r, "redeclares the primary constructor"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("9\n"));
+    if (!hasError(r, "redeclares the primary constructor")) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, "redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(hasError(r, "§11.1"));
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // ---------------------------------------------------------------------------

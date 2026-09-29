@@ -790,17 +790,31 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
                     "declaring positional fields is constructor-only "
                     "(\xC2\xA7""9.9, \xC2\xA7""9.3)");
             }
-            // fix #5100 (§9.3, v0.307): "The body may not declare a
-            // constructor with the same parameter list as the auto-generated
-            // primary constructor." Every candidate reading of #4775 Q1 rejects
-            // the exact-duplicate shape — same arity, and at each position
-            // the same case-sensitive name, resolved type, §22.6 overload
-            // modifier and default presence. Apply bb2040db's narrow predicate
-            // (which already does this for classes) to records as well.
+            // fix #5100 (§9.3, v0.307) + fix-forward #5132 (§9.3 / §11.1 /
+            // §22.6, v0.308): "The body may not declare a constructor with
+            // the same parameter list as the auto-generated primary
+            // constructor." The v0.308 ruling (per #4775's Q1/Q3/Q4 close)
+            // is that "same parameter list" is the §11.3 clash sense — i.e.
+            // §22.6's overload identity: arity, parameter types, `ref`/`out`
+            // modifiers, and ordinary `owned` on a participating position;
+            // parameter NAMES and DEFAULTS do not distinguish. So a record
+            // body constructor that differs from the primary only by name
+            // (e.g. `record Point(X: int, Y: int)` + `constructor(x: int, y:
+            // int)`) or only by default presence is now also a clash.
             // The primary's parameters are the record's positional fields.
             // imported-symbol seam (#3152, audit §4): the primary's
             // parameters come off the positional FieldSymbols (`posParam`),
             // not a TypeDecl downcast.
+            //
+            // The body constructor's parameters are matched against the
+            // PRIMARY's POSITIONAL components only — the combined form's
+            // body fields (§9.3's "alongside the positional fields") are
+            // NOT part of the primary's list, so they do not participate
+            // in this comparison; a body constructor with extra or
+            // differently-typed parameters relative to the positional set
+            // is a different overload and is not rejected here (it is
+            // itself admissible, and §9.8 step 2's name-binding rule is a
+            // separate concern).
             const std::vector<const Symbol*> primary =
                 recordPositionalFieldSymbols(t);
             if (primary.empty()) continue;
@@ -816,13 +830,10 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
                     break;
                 }
                 const ast::Param& pf = *pfs->posParam;
-                const ast::Param& bp = cd->params[i];
-                if (bp.name != pf.name ||
-                    (bp.defaultValue != nullptr) !=
-                        (pf.defaultValue != nullptr)) {
-                    listsMatch = false;
-                    break;
-                }
+                // §22.6 overload identity: arity, parameter types,
+                // `ref`/`out` modifiers, ordinary `owned`. Parameter NAMES
+                // and DEFAULTS do not participate (§9.3 / §11.1 / §22.6,
+                // v0.308).
                 TypeRef* paramType =
                     ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
                 TypeRef* primaryType =
@@ -843,7 +854,7 @@ void Resolver::checkRecordCombinedFormContractClauseConstructors() {
                     std::string("body constructor redeclares the primary ")
                         .append("constructor: it has the same parameter list ")
                         .append("as the auto-generated primary constructor ")
-                        .append("(\xC2\xA7""9.3, v0.307)"));
+                        .append("(\xC2\xA7""9.3, v0.308)"));
             }
         }
     }

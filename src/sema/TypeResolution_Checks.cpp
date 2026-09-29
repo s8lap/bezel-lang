@@ -514,26 +514,18 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
     // fix #4839 (§11.1, v0.307): "The body may not redeclare a constructor
     // with the same parameter list as the primary constructor."
     //
-    // fix-forward #4839 (§11.1 / §9.3 / §9.8, v0.307): the check is
-    // deliberately NARROW, for two reasons the spec text forces.
-    //
-    // (1) CLASSES ONLY. §11.1 is the class sentence. A record's primary is
-    // governed by §9.3's own sentence, and §9.8 step 2 REQUIRES a
-    // combined-form record that declares any explicit constructor to declare
-    // one binding exactly its components by (case-insensitive) name — for a
-    // purely positional component set that is `constructor(x: int, y: int)`
-    // beside `Vec2(X: int, Y: int)`, a list with the primary's types. Whether
-    // §9.3 forbids that shape is issue #4775 Q1/Q2, still awaiting a ruling;
-    // this §11.1 check must not decide it for records.
-    //
-    // (2) SAME NAMES, NOT JUST SAME TYPES. Whether "same parameter list"
-    // means the §22.6 type sequence or also the parameter names is the same
-    // open #4775 Q1 (issue #4839 was filed as blocked on it). Until it is
-    // ruled, reject only the shape EVERY reading rejects: equal arity and, at
-    // each position, the same name (case-sensitive), resolved type, §22.6
-    // overload modifier and default presence. `class Base(owned r: Res)` with
-    // `constructor(owned x: Res)` (the #3751 accept row) differs by name and
-    // is left to the ruling.
+    // fix-forward #5132 (§11.1 / §9.3 / §22.6, v0.308): the v0.307 check
+    // gated the rejection on identical parameter names AND default
+    // presence AND types AND §22.6 modifier. The v0.308 ruling (per
+    // #4775's Q1/Q3/Q4 close) is that "same parameter list" is the §11.3
+    // clash sense — i.e. §22.6's overload identity (arity, parameter
+    // types, `ref`/`out` modifiers, and ordinary `owned` on a participating
+    // position; parameter NAMES and DEFAULTS do not distinguish). So a
+    // body constructor differing from the primary only in name (e.g.
+    // `class Base(owned r: Res)` with `constructor(owned x: Res)`) or only
+    // by default presence now also clashes. This check applies to classes
+    // only — the record-side arm lives in `checkRecordExplicitCtorClash`
+    // (src/sema/TypeResolution.cpp).
     if (!classHasPrimaryCtor) return;
     // imported-symbol seam (#3152, audit §4): the primary's parameters are
     // read off the §9.1/§22.10 positional FieldSymbols (`posParam`) and each
@@ -551,11 +543,9 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
             auto* pfs = dynamic_cast<const FieldSymbol*>(primary[i]);
             if (!ps || !pfs || !pfs->posParam) { listsMatch = false; break; }
             const ast::Param& pf = *pfs->posParam;
-            if (ps->name != pf.name ||
-                ps->hasDefault != (pf.defaultValue != nullptr)) {
-                listsMatch = false;
-                break;
-            }
+            // §22.6 overload identity: arity, parameter types, `ref`/`out`
+            // modifiers, ordinary `owned`. Parameter NAMES and DEFAULTS do
+            // not participate (§9.3 / §11.1 / §22.6, v0.308).
             TypeRef* paramType =
                 ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
             TypeRef* primaryType =
@@ -564,8 +554,11 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                 listsMatch = false;
                 break;
             }
-            // Ordinary vs owned is part of the §22.6 identity; scoped and out
-            // are never distinguishable.
+            // Ordinary vs owned is part of the §22.6 identity; scoped and
+            // out are never distinguishable (the parameter list at the
+            // primary's positional-field side carries no `ref`/`out` —
+            // those would be `ref`/`out` parameters, which would be a
+            // different overload kind, not a clash under this rule).
             if (overloadModifier(ps->modifier) !=
                 overloadModifier(pf.modifier)) {
                 listsMatch = false;
@@ -577,7 +570,7 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                 Severity::Error, cs->declLoc,
                 std::string("body constructor redeclares the primary ")
                     .append("constructor: it has the same parameter list ")
-                    .append("as the primary constructor (§11.1, v0.307)"));
+                    .append("as the primary constructor (§11.1, v0.308)"));
         }
     }
 }
