@@ -1259,8 +1259,15 @@ constexpr std::array<BuiltinClassModulePath, 85> kBuiltinClassModulePaths = {{
     {"CString", "System"},
     {"WString", "System"},
     {"RawBytes", "System"},
-    // stdlib §2.17 (#1621): built-in EXCEPTIONS — all live in `System` per
-    // the stdlib's section structure. Each renders as "System.<Name>".
+    // fix #5177 (stdlib §2.13/§2.17, v0.310): built-in EXCEPTIONS' module
+    // path is the declaring module, NOT uniformly `System` — stdlib §2.17
+    // covers only the §31.4 built-in hierarchy actually declared in
+    // `System`. Ten rows are declared elsewhere and were wrongly rendering
+    // "System.<Name>": `KeyNotFoundException` (stdlib §4.8,
+    // System.Collections.Generic), the five §7.5 IO exceptions
+    // (System.IO), and `ChannelClosedException`/`ChannelFullException`/
+    // `DomainFaultedException`/`TimeoutException` (stdlib §6,
+    // System.Threading).
     {"Exception", "System"},
     {"ArgumentException", "System"},
     {"ArgumentNullException", "System"},
@@ -1273,22 +1280,26 @@ constexpr std::array<BuiltinClassModulePath, 85> kBuiltinClassModulePaths = {{
     {"NotImplementedException", "System"},
     {"NullReferenceException", "System"},
     {"IndexOutOfRangeException", "System"},
-    {"KeyNotFoundException", "System"},
+    // fix #5177 (stdlib §4.8, v0.310): declared in System.Collections.Generic.
+    {"KeyNotFoundException", "System.Collections.Generic"},
     {"MatchFailureException", "System"},
     {"OperationCanceledException", "System"},
     {"TypeInitializationException", "System"},
     {"FormatException", "System"},
     {"StackOverflowException", "System"},
-    {"ChannelClosedException", "System"},
-    {"ChannelFullException", "System"},
-    {"DomainFaultedException", "System"},
+    // fix #5177 (stdlib §6, v0.310): declared in System.Threading.
+    {"ChannelClosedException", "System.Threading"},
+    {"ChannelFullException", "System.Threading"},
+    {"DomainFaultedException", "System.Threading"},
     {"SerializationException", "System"},
-    {"TimeoutException", "System"},
-    {"IOException", "System"},
-    {"FileNotFoundException", "System"},
-    {"DirectoryNotFoundException", "System"},
-    {"EndOfStreamException", "System"},
-    {"PathTooLongException", "System"},
+    // fix #5177 (stdlib §6, v0.310): declared in System.Threading.
+    {"TimeoutException", "System.Threading"},
+    // fix #5177 (stdlib §7.5, v0.310): declared in System.IO.
+    {"IOException", "System.IO"},
+    {"FileNotFoundException", "System.IO"},
+    {"DirectoryNotFoundException", "System.IO"},
+    {"EndOfStreamException", "System.IO"},
+    {"PathTooLongException", "System.IO"},
     {"ContractViolationException", "System"},
     // stdlib §2.16 (§28.13): Shared<T>, Weak<T> — class heads in `System`.
     {"Shared", "System"},

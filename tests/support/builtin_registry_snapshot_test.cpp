@@ -931,6 +931,31 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
         BEZEL_EXPECT_TRUE(builtinClassModulePathOf(n).empty());
 }
 
+// fix #5177 (stdlib §2.13/§2.17, §4.8, §6, §7.5, v0.310): ten built-in
+// exceptions are declared OUTSIDE `System` and must render their actual
+// declaring module, not the uniform "System.<Name>" the table wrongly gave
+// every exception before this fix. `builtin_class_module_path_set` above
+// only asserts non-emptiness, so it could not have caught this — pin the
+// exact values here.
+BEZEL_TEST(builtin_registry_snapshot, builtin_exception_module_path_non_system_5177) {
+    // stdlib §4.8: declared in System.Collections.Generic.
+    BEZEL_EXPECT_EQ(builtinClassModulePathOf("KeyNotFoundException"),
+                     std::string_view("System.Collections.Generic"));
+    // stdlib §6: declared in System.Threading.
+    for (std::string_view n : {"ChannelClosedException", "ChannelFullException",
+                               "DomainFaultedException", "TimeoutException"})
+        BEZEL_EXPECT_EQ(builtinClassModulePathOf(n),
+                         std::string_view("System.Threading"));
+    // stdlib §7.5: declared in System.IO.
+    for (std::string_view n : {"IOException", "FileNotFoundException",
+                               "DirectoryNotFoundException",
+                               "EndOfStreamException", "PathTooLongException"})
+        BEZEL_EXPECT_EQ(builtinClassModulePathOf(n), std::string_view("System.IO"));
+    // Sanity: a genuinely System-declared exception is unaffected.
+    BEZEL_EXPECT_EQ(builtinClassModulePathOf("ArgumentException"),
+                     std::string_view("System"));
+}
+
 // fix #3119 (spec §3.4; stdlib §2.13 rule 2, v0.252): the 14 keyword-aliased
 // built-in types (spec §3.4). Per stdlib §2.13 rule 2 they render lowercase
 // in BOTH `Name` and `FullName`. Pinned here so a missed entry surfaces as

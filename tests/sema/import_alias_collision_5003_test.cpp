@@ -337,3 +337,43 @@ BEZEL_TEST(sema_import_alias_collision_5003,
     BEZEL_EXPECT_TRUE(rejectsWith(src, "ArrayBitWriter"));
     BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
 }
+
+// T18: `import System.IO as IOException;` — a follow-up of fix #5177
+// (stdlib §2.13/§2.17/§7.5, v0.310), which corrected `IOException`'s
+// module path from the uniform (wrong) "System" to its actual declaring
+// module "System.IO". `IOException` is NOT an §2.3 always-available bare
+// name (stdlib §7: "None are auto-imported" — System.IO's exceptions
+// require the explicit `import System.IO;`), so this exercises the SAME
+// second branch as T7's Mutex case (`builtinClassModulePathOf(alias) ==
+// dotted`) — but only fires now that `builtinClassModulePathOf("IOException")`
+// reads "System.IO" instead of "System": before #5177 this alias was
+// wrongly ACCEPTED (the table's mistaken "System" never equalled the
+// imported dotted name "System.IO"), silently leaving the alias
+// unreachable exactly as #5003's rationale describes. §2.2 / §2.7 rule 1.
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_collides_with_imported_stdlib_public_ioexception_rejected_5177) {
+    const char* src =
+        "module Conf; "
+        "import System.IO as IOException; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "public `IOException`"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "System.IO"));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "\xC2\xA7""2.2"));
+}
+
+// T18 control: `import System.IO as FileIO;` — a non-colliding alias for
+// the same module is ACCEPTED. `FileIO` is neither an always-available
+// bare name nor a public of System.IO, so neither branch fires and the
+// alias resolves normally.
+BEZEL_TEST(sema_import_alias_collision_5003,
+           alias_noncolliding_for_system_io_accepted_5177) {
+    const char* src =
+        "module Conf; "
+        "import System.IO as FileIO; "
+        "public class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;";
+    BEZEL_EXPECT_TRUE(runs(0, src));
+}
