@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.312 — September 2026**
+**Companion to the Bezel Language Specification, v0.313 — September 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -9540,5 +9540,36 @@ The rulings train: nine issue rulings, seven rulings and clarifications from pro
   *Guides:* no idiom a guide teaches changed; their re-validation pins stay. The code-generation reference is unchanged in substance (it states no rule either item changes); its three pins move to v0.312.
 
   *Corpus:* the rule corpus stays at 2,185 cases, none added or deleted and no verdict flipped. `s4_3_0003`, `s4_3_0004` and `s5_2_0005` have their `rule:` headers re-quoted for §4.3's and §5.2's rounding sentences, and `s4_3_0003` is retitled ("a floating-point literal whose IEEE rounding is not finite is a compile error"); verdicts and `s4_3_0003`'s `diagnostic: magnitude` needle unchanged (#5181). No case exercises #5182's shapes, and none quotes a sentence it changes. Gaps are recorded per item. The manifest is rebuilt from the case headers.
+
+---
+
+### v0.313 changelog (v0.312 → v0.313)
+
+**The question v0.312 filed, decided.** Binary-float `Parse` takes the literal's range: its input's value rounded once as v0.312's §4.3 rounds a literal, with `OverflowException` where that rounding is not finite, as `decimal.Parse` raises at its own boundary. The answer is the owner's decision (option (a) of #5193). The item passed an adversarial critique (one blocking and seven non-blocking findings, all resolved as proposed) and the composition gate against the landed rules it builds on.
+
+- **Stdlib §9.2 / §2.3, rationale §14.9 — binary-float `Parse` rounds as a literal does and raises `OverflowException` where the literal is out of range (ruling; [#5193](https://github.com/s8lap/bezel-lang/issues/5193)).** Stdlib §9.2 stated no range, overflow or rounding for `double.Parse`/`float.Parse`, `TryParse` or `ParseOrNull`. Stdlib §2.3 says `Convert.To*` raise `OverflowException` "when the value does not fit — the same contract as the §9 per-type `Parse` family", which presupposed a §9.2 contract. The runtime returns `strtod`'s `±Infinity` without a fault, so `double.Parse("1e999")` was `Infinity` while the literal `1e999` is a compile error (§4.3) and `decimal.Parse` raises at its own boundary (§9.3). §9.2 now states the contract in one closing paragraph that points at §4.3 for the rounding and the boundary. `Parse` yields its input's value rounded once to the type as §4.3 rounds a literal of that type, to nearest with ties to even. An input that spells a finite number whose rounding is not finite raises `OverflowException`, at §4.3's literal boundary: `double.Parse("1.7976931348623158e308")` is `double.MaxValue` and `float.Parse("3.4028235e38")` is `float.MaxValue`, while `double.Parse("1e999")`, `double.Parse("-1e999")` and `float.Parse("3.5e38")` raise. A value rounding to zero or to a subnormal is in range (`double.Parse("1e-400")` is `0`). `TryParse` returns `false` in every case where `Parse` would raise, in §9.3's words, and the span forms carry the string forms' contract. `ParseOrNull` returns `null` there by §9.2's own declaration comments (null exactly where `Parse` raises), and `Convert.ToDouble`/`TryToDouble` carry `double`'s contract by §2.3's mirror sentence, which holds as written; §9.2 restates neither. Grounds: the same digits get one verdict in source and in text; the three `Parse` families fault alike where the number spelled does not fit the type; and an input that spells a finite number the type cannot hold is unrepresentable input, which the strict-fault model (stdlib §3.2) makes a defined fault, never a silent substitution. The scope is inputs that spell a finite number, so a spelling of an infinity or a NaN is never an overflow. §9.2 states no input grammar. Stdlib §2.18's round trip, read over every value, already requires `Parse` to accept the spelling `ToString()` renders for each non-finite value; which spellings those are, and whether others are accepted, is #4890's to decide. **Declined:** `±Infinity` (option b). It is the answer of .NET since Core 3.0, Java and Python (Go returns `±Inf` with `ErrRange`; the owner's survey, sources not fetched, recorded in rationale §14.9). Here it would make one digit string a compile error in source and an infinity in text, and would need a binary-float carve-out in §2.3. §5.2's "The throw-vs-saturate split is therefore principled per target family", under which `float(d)` yields `±Infinity`, governs converting a value already in a binary type; `Parse` converts no value but reads a numeral, which is §4.3's case. Go's shape, the infinity with a range error beside it, needs an error slot the `Parse` family does not have and would be a second mechanism for one fault condition (stdlib §1's no-dual rule); rationale §14.9 records it, with no index row, since the issue did not propose it. Kernel: no contact. Body-locality: not applicable (a run-time library contract; `Parse` is a call, never a constant expression, §17.14). **Compiler (tracked):** the runtime returns `±Infinity` at `Parse`, `TryParse`, `Convert.ToDouble` and `Convert.TryToDouble`; binary-float `ParseOrNull` is not implemented (#2347); the `float` half lands with #5194's single rounding, or an overflow check on today's double-rounded value would raise for inputs the ruling parses to `float.MaxValue`.
+
+- **Migration.** *Newly rejected:* none (`Parse` is a call, so nothing becomes a compile error).
+
+  *Newly defined:*
+  - Binary-float `Parse`'s value (its input's value rounded once to the type, to nearest, ties to even, as §4.3 rounds a literal) and its range: an input that spells a finite number whose rounding is not finite raises `OverflowException` from `Parse` (string and span), gives `false` from `TryParse` (string and span) and `null` from `ParseOrNull`, and, through §2.3's unchanged mirror sentence, raises `OverflowException` from `Convert.ToDouble` and gives `false` from `Convert.TryToDouble`. A value rounding to zero or to a subnormal is in range (#5193). A program that parses such text today gets `±Infinity` from the runtime (tracked).
+  - §5.2's "The throw-vs-saturate split is therefore principled per target family" reaches converting a value already in a binary type (`float(d)` yields `±Infinity`), not `Parse`, which reads a numeral and takes §4.3's range; §5.2's text is unchanged (#5193).
+
+  *Doc-only:*
+  - Rationale §14.9 (#5193).
+  - The code-generation reference's `Double`/`Float` line states the range contract, and lists `ParseOrNull` as string-only, which is the stdlib's surface (§9.1, §9.2) (#5193).
+
+  *Spec-ahead-of-impl (tracking issue filed at landing):*
+  - the overflow check at binary-float `Parse`/`TryParse` and `Convert.ToDouble`/`TryToDouble`, where the runtime returns `±Infinity` at all four sites (#5193; no row flips; new failing rows listed in the tracker). Its `float` half lands with #5194's single rounding. Binary-float `ParseOrNull` is unimplemented and lands with #2347, taking the same contract.
+
+  *Filed as questions:*
+  - stdlib §9.2: the input grammar of `double.Parse`/`float.Parse` (sign, exponent form, a bare leading or trailing `.`, hex, digit separators, whitespace), which §9.1 and §9.3 state for their types and §9.2 does not (#5193).
+  - stdlib §2.15: the range of JSON `ReadFloat` for a JSON number whose rounding is not finite, including which rounding a `float` field takes; the runtime returns `±Infinity`, while `WriteFloat` raises `SerializationException` on a non-finite value (#5193).
+
+  *Folded into open issues:* which spellings of `±Infinity` and `NaN` `Parse` accepts, which §2.18's round trip ties to the rendered ones, joins #4890 (#5193).
+
+  *Guides:* no idiom a guide teaches changed; their re-validation pins stay. The code-generation reference's three pins move to v0.313.
+
+  *Corpus:* the rule corpus stays at 2,185 cases, none added, deleted or re-quoted, and no verdict flipped; no case quotes the new §9.2 paragraph. No case exercises binary-float `Parse`, `TryParse`, `ParseOrNull` or `Convert.ToDouble`/`TryToDouble`; the gap is recorded (#5193).
 
 ---

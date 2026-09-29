@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.312 — September 2026**
+**Companion to the Bezel Language Specification, v0.313 — September 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -5205,6 +5205,8 @@ end Float;
 ```
 
 `Float`'s `MinValue`, `MaxValue`, `Epsilon`, `PositiveInfinity`, `NegativeInfinity`, and `NaN` are the IEEE 754 binary32 standard values. The same `IeeeEquals`/`BitwiseEquals` distinction described for `Double` applies to `Float` with the appropriate bit-pattern width. `Epsilon` is the **smallest positive subnormal** value (the .NET meaning: ≈4.94e-324 for `double`, ≈1.40e-45 for `float`) — *not* the machine epsilon of numerical analysis (2⁻⁵² ≈ 2.22e-16 for `double`); tolerance comparisons use an explicit, domain-chosen tolerance, never `Epsilon`.
+
+**Parsing and range.** `Parse` yields the value its input spells, rounded once to the type as language spec [§4.3](Bezel_Language_Spec.md#sec-floating-point-types) rounds a literal of that type. An input that spells a finite number whose value, so rounded, is not finite — §4.3's out-of-range boundary for a literal of that type — raises `OverflowException`: the type cannot represent the number the input spells, and unrepresentable input is a defined fault, never a silent substitution (the strict-fault model of `Encoding`, [§3.2](#sec-encoding)). So `double.Parse("1.7976931348623158e308")` is `double.MaxValue` and `float.Parse("3.4028235e38")` is `float.MaxValue`, while `double.Parse("1e999")`, `double.Parse("-1e999")` and `float.Parse("3.5e38")` raise. A value that rounds to zero or to a subnormal is in range: `double.Parse("1e-400")` is `0`. `TryParse` returns `false` in every case where `Parse` would raise, and the span forms carry the string forms' contract.
 
 <a id="sec-decimal"></a>
 ### 9.3 `Decimal`
