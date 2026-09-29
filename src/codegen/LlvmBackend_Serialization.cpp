@@ -1344,16 +1344,33 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // its disposals (mirrors #2378's emitClassDeserialize pop).
     disposeStack_.pop_back();
 
-    // §9.8 v0.182 (#1572): if the record declares an explicit (non-static)
-    // constructor, the synthesized Deserialize CALLS the unique constructor
-    // whose parameter list binds exactly the serialized components, matched
-    // by declared identifier, case-insensitively — sema (the record ctor-
-    // selection check, TypeResolution_Checks.cpp) already validated that
-    // exactly one such constructor exists whenever this codegen runs. A
-    // record with NO explicit constructor falls through to the pre-existing
-    // storage-level construction below ("A record that declares no explicit
-    // constructor is constructed directly from the read components at the
-    // storage level").
+    // fix #5149 (§9.8 step 2, v0.309, #4775 Q2): the record constructor-
+    // selection rule has THREE branches, not two:
+    //   1. Exactly one EXPLICIT (non-static) constructor's parameter list
+    //      binds exactly the record's components — call IT (its body runs
+    //      with the deserialized slots as its args, its `requires`/`ensures`
+    //      clauses fire per §22.16 — §9.8 step 2 "more than one matches" is
+    //      read over the EXPLICIT constructors and the matching one wins).
+    //   2. Zero explicit ctors match AND the record declares positional
+    //      fields → the synthesized Deserialize calls the AUTO-GENERATED
+    //      PRIMARY of a record declaring positional fields (§9.3). The
+    //      primary assigns the positional fields, in declaration order, from
+    //      the deserialized slots — equivalent to a raw field-insert for the
+    //      positional components (body auto-property components of a
+    //      combined-form record stay at default(T) — §9.3 "the auto-
+    //      generated primary assigns the positional storage only"). The
+    //      primary carries no clause (§9.3 "the auto-generated primary
+    //      constructor can carry none"), so no contract evaluation runs.
+    //   3. Zero explicit ctors match AND the record has no positional
+    //      fields → impossible per sema (TypeResolution_Checks.cpp's
+    //      checkSerializationEligibility reports "no explicit constructor
+    //      has parameter names matching" before codegen runs); the loop
+    //      below is a defensive fallback (storage-level construction from
+    //      the read components — the same path the spec prescribes for "a
+    //      record that declares no explicit constructor").
+    // The pre-fix code labelled this branch as the no-explicit-ctor case
+    // only and was silent on the synthesized-primary fallback; #5149 makes
+    // branch (2) explicit.
     std::unordered_map<std::string, unsigned> compByNameLower;
     for (unsigned ci = 0; ci < components.size(); ++ci)
         compByNameLower[toLowerAscii(components[ci].declName)] = ci;
@@ -1451,10 +1468,31 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     }
 
     if (!result) {
-        // Build result struct: insert all non-skip fields from their slots
-        // (§9.8 v0.182: "A record that declares no explicit constructor is
-        // constructed directly from the read components at the storage
-        // level").
+        // fix #5149 (§9.8 step 2, v0.309, #4775 Q2): no explicit ctor matched.
+        // Build the result struct directly from the deserialized slots. The
+        // exact behavior depends on whether the record declares positional
+        // fields (auto-generated primary exists) or not:
+        //
+        //   * hasPositionalFields → the synthesized Deserialize runs the
+        //     AUTO-GENERATED PRIMARY, which per §9.3 "assigns the positional
+        //     storage only". `components` already excludes body auto-property
+        //     components of a combined-form record (`isComponent` is true
+        //     only for symbols whose `posParam != nullptr`, see the
+        //     components-collection loop above), so the storage-level
+        //     insert loop below naturally assigns positional fields only
+        //     and leaves body auto-properties at the zero-init default
+        //     populated at the entry-alloca above.
+        //
+        //   * !hasPositionalFields → impossible per sema
+        //     (TypeResolution_Checks.cpp's checkSerializationEligibility
+        //     rejects this with "no explicit constructor has parameter
+        //     names matching the serialized component set ... synthesized
+        //     primary is the fallback candidate when the record declares
+        //     positional fields" before codegen runs); the loop is the
+        //     defensive storage-level fallback the spec prescribes for
+        //     records with no explicit constructor (§9.8 v0.182: "A record
+        //     that declares no explicit constructor is constructed
+        //     directly from the read components at the storage level").
         result = builder_.CreateLoad(st, resultSlot, "deser.rec");
         for (unsigned ci = 0; ci < components.size(); ++ci) {
             if (components[ci].isSkip) continue;

@@ -12869,23 +12869,33 @@ void Resolver::checkSerializationEligibility() {
             }
         }
 
-        // §9.8 v0.182 (#1572): record constructor-selection check — the
-        // record-side counterpart to the class check above (same rule,
-        // written out at the top of this function's `else if (isClass)`
-        // branch). Applies only when Deserialize synthesis is actually
-        // needed and the record body declares one or more EXPLICIT
-        // constructors: "If the record declares one or more explicit
-        // constructors, the synthesized Deserialize calls the unique
-        // explicit constructor whose parameter list binds exactly the
-        // serialized components, matched by name — compared
-        // case-insensitively... If explicit constructors exist but none
-        // matches, more than one matches, ... the conformance declaration
-        // is a compile error naming the candidates." A record with NO
-        // explicit constructor (the common case — a purely positional
-        // record, or a body record with no author-declared constructor) is
-        // "constructed directly from the read components at the storage
-        // level" — no ambiguity is possible, so the check below is a no-op
-        // whenever `allCtors` comes back empty.
+        // §9.8 v0.182 (#1572), updated for §9.8 step 2 (v0.309, #4775 Q2): the
+        // record constructor-selection check, the record-side counterpart to
+        // the class check above. Applies only when Deserialize synthesis is
+        // actually needed and the record declares one or more EXPLICIT
+        // constructors. The spec rule: "If the record declares one or more
+        // explicit constructors, the synthesized Deserialize calls the
+        // unique explicit constructor — or, when no explicit constructor
+        // matches, the auto-generated primary of a record declaring
+        // positional fields (§9.3) — whose parameter list binds exactly
+        // the record's components — the serialized components together
+        // with every `serialized skip` component, which binds its
+        // default(T) — matched by name — compared case-insensitively ...
+        // If explicit constructors exist but none matches and the primary
+        // does not match either, more than one explicit constructor
+        // matches, or the case-insensitive comparison leaves a parameter
+        // ambiguous between two components, the conformance declaration
+        // is a compile error naming the candidates." So: exactly-one-
+        // matching explicit ctor → use it; more-than-one-matching explicit
+        // ctor → compile error; zero-matching explicit ctor + record
+        // declares positional fields → fall back to the synthesized
+        // primary; zero-matching explicit ctor + body record (no positional
+        // fields → no synthesized primary) → compile error. A record with
+        // NO explicit constructor at all (a purely positional record, or a
+        // body record with no author-declared constructor) is "constructed
+        // directly from the read components at the storage level" — no
+        // ambiguity is possible, so the check below is a no-op whenever
+        // `allCtors` comes back empty.
         if (!foundError && needsDeserializeCheck) {
             auto toLower = [](std::string_view sv) {
                 std::string r(sv);
@@ -12897,6 +12907,13 @@ void Resolver::checkSerializationEligibility() {
             // Collect the lowercased declared identifiers of ALL serialized
             // components — including `serialized skip` ones, which still
             // bind a constructor parameter (their value is default(T)).
+            // For a combined-form record (§9.3) the components include BOTH
+            // the positional fields AND the body's auto-properties: the
+            // explicit ctor's parameter list may bind either kind.
+            // (Pre-fix this loop was `if (td->hasPositionalFields) { ... }
+            // else { ... }`, treating a record as either positional or body
+            // form — never both — so a combined-form record's body ctor
+            // binding an auto-property component could not match.)
             std::unordered_set<std::string> compNamesLower;
             std::vector<std::string> compNamesOrig;
             if (td->hasPositionalFields) {
@@ -12904,15 +12921,19 @@ void Resolver::checkSerializationEligibility() {
                     compNamesLower.insert(toLower(pf.name));
                     compNamesOrig.push_back(std::string(pf.name));
                 }
-            } else {
-                for (const Symbol* m : t->members) {
-                    if (!hasAstAutoPropertyDecl(m)) continue;
-                    compNamesLower.insert(toLower(m->name));
-                    compNamesOrig.push_back(std::string(m->name));
-                }
+            }
+            for (const Symbol* m : t->members) {
+                if (!hasAstAutoPropertyDecl(m)) continue;
+                compNamesLower.insert(toLower(m->name));
+                compNamesOrig.push_back(std::string(m->name));
             }
 
-            // Collect non-static explicit constructors and check which match.
+            // Collect non-static EXPLICIT constructors and check which match.
+            // The auto-generated primary of a record declaring positional
+            // fields (§9.1) is NOT a ConstructorSymbol — it has no
+            // ast::ConstructorDecl — so it is intentionally absent from this
+            // loop. The post-loop check below consults it as the fallback
+            // when no explicit constructor matches (§9.8 step 2, v0.309).
             std::vector<std::string> matchingCtors;
             std::vector<std::string> allCtors;
             for (const Symbol* m : t->members) {
@@ -12946,29 +12967,26 @@ void Resolver::checkSerializationEligibility() {
                 if (allMatch) matchingCtors.push_back(ctorDesc);
             }
 
-            // No explicit constructor at all: storage-level construction
-            // applies (§9.8 v0.182) — nothing to disambiguate, skip.
-            if (!allCtors.empty() && matchingCtors.size() != 1) {
-                std::string candidates;
-                for (const auto& c : allCtors) {
-                    if (!candidates.empty()) candidates += ", ";
-                    candidates += c;
-                }
+            // §9.8 step 2 (v0.309, #4775 Q2): the explicit-constructors-vs-
+            // synthesized-primary disambiguation. "More than one matches" is
+            // read over the EXPLICIT constructors, with the primary consulted
+            // ONLY when none of them matches. So:
+            //   - matchingCtors.size() == 1 → use that explicit ctor. OK.
+            //   - matchingCtors.size() > 1 → ambiguous across explicit ctors;
+            //     compile error naming them. (The primary is not consulted
+            //     because an explicit ctor already wins.)
+            //   - matchingCtors.empty():
+            //       - td->hasPositionalFields → fall back to the synthesized
+            //         primary. OK.
+            //       - else → no primary exists; compile error naming the
+            //         non-matching explicit ctor(s).
+            if (!allCtors.empty()) {
                 std::string compSet;
                 for (const auto& n : compNamesOrig) {
                     if (!compSet.empty()) compSet += ", ";
                     compSet += n;
                 }
-                if (matchingCtors.empty()) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "record `" + std::string(t->name) + "` declares "
-                        "`IDeserializable`: no explicit constructor has "
-                        "parameter names matching the serialized component "
-                        "set {" + compSet + "} — candidates: " + candidates +
-                        " (§9.8 v0.182: constructor selection is by name, "
-                        "case-insensitive, order-insensitive)");
-                } else {
+                if (matchingCtors.size() > 1) {
                     std::string matchList;
                     for (const auto& c : matchingCtors) {
                         if (!matchList.empty()) matchList += ", ";
@@ -12980,10 +12998,32 @@ void Resolver::checkSerializationEligibility() {
                         "`IDeserializable`: more than one explicit "
                         "constructor matches the serialized component set — "
                         "ambiguous: " + matchList +
-                        " (§9.8 v0.182: the unique matching constructor is "
-                        "required)");
+                        " (§9.8 step 2, v0.309: \"more than one matches\" "
+                        "is read over the explicit constructors, with the "
+                        "synthesized primary consulted only when none "
+                        "matches)");
+                    foundError = true;
+                } else if (matchingCtors.empty() && !td->hasPositionalFields) {
+                    std::string candidates;
+                    for (const auto& c : allCtors) {
+                        if (!candidates.empty()) candidates += ", ";
+                        candidates += c;
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: no explicit constructor has "
+                        "parameter names matching the serialized component "
+                        "set {" + compSet + "} — candidates: " + candidates +
+                        " (§9.8 step 2, v0.309: constructor selection is by "
+                        "name, case-insensitive, order-insensitive; the "
+                        "synthesized primary is the fallback candidate when "
+                        "the record declares positional fields)");
+                    foundError = true;
                 }
-                foundError = true;
+                // else: matchingCtors.size() == 1 → use this explicit ctor
+                // else: matchingCtors.empty() && td->hasPositionalFields →
+                //   use synthesized primary (the new acceptance path).
             }
         }
 
