@@ -12704,10 +12704,44 @@ void ExprTC::bindNestedDestructuringNames(
         nestedWork.pop_back();
         const ast::DestructuringPattern* nd = cur.pat;
         TypeRef* ndScrutTy = cur.scrutTy;
-        std::vector<FieldSymbol*> ndFields = fieldsOfRecord(nd->typeName.get());
+        // fix #4848 (§19.3/§35.5, v0.308): a nested pattern's head can name a
+        // CHOICE CASE, not only a record — `Wrap(W(var a, var b))` where
+        // `Wrap`'s payload `inner: Outer` is itself a (move-only, owning)
+        // choice and `W` is one of `Outer`'s cases. `fieldsOfRecord` below
+        // only matches a top-level TypeSymbol of kind Record by name, so a
+        // choice-case head like `W` was never found there — MEASURED:
+        // `ndFields` came back empty, every binding beneath the nested
+        // pattern (`a`, `b`) got a null `declType`, and the arm body's read
+        // through it (`a.Ping()`) silently failed to lower to a value
+        // (#2961's Warning) instead of compiling to the borrow §35.5 "The
+        // borrowing match" specifies for a nested move-only choice payload.
+        // Resolve the choice-case shape first, on the PARENT slot's own
+        // substituted scrutinee type (`ndScrutTy`) — mirroring the choice
+        // handling the four TOP-LEVEL caller loops already perform
+        // (`findChoiceCaseOnScrutinee` + `substitutedChoicePayloadType`),
+        // which this shared nested walk never had.
+        const ChoiceCaseSymbol* ndChoiceCase =
+            ndScrutTy ? findChoiceCaseOnScrutinee(
+                            ndScrutTy, nd->typeName && !nd->typeName->parts.empty()
+                                           ? nd->typeName->parts.back()
+                                           : std::string_view{})
+                      : nullptr;
+        std::vector<FieldSymbol*> ndFields =
+            ndChoiceCase ? std::vector<FieldSymbol*>{}
+                         : fieldsOfRecord(nd->typeName.get());
         for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
             const auto& s = nd->subPatterns[i];
             TypeRef* fieldTy = nullptr;
+            if (ndChoiceCase && ndChoiceCase->caseDecl &&
+                i < ndChoiceCase->caseDecl->payload.size()) {
+                // per §35.5, §14.1 (v0.226) — same substitution
+                // `substitutedChoicePayloadType` the top-level choice-payload
+                // caller loops use for a slot's own payload type.
+                fieldTy = const_cast<TypeRef*>(
+                    common::substitutedChoicePayloadType(
+                        ndChoiceCase->caseDecl->payload[i],
+                        ndScrutTy->declaration, ndScrutTy, ctx_));
+            } else
             // fix #3957 (§19.3/§9.1/§9.2, v0.294): `storageComponentType`
             // (sema/Symbol.hpp), not the bare `posParam->type` — an imported
             // record's positional field carries a synthetic `posParam` whose
