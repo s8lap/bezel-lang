@@ -198,11 +198,11 @@ s6_6_0009	pass
 s6_6_0010	pass	
 s6_6_0011	pass	
 s6_6_0012	pass	
-s6_6_0013	fail	divergence
-s6_6_0014	fail	divergence
+s6_6_0013	pass	
+s6_6_0014	pass	
 s6_6_0015	pass	
 s7_1_0001	pass	
-s7_1_0002	fail	divergence
+s7_1_0002	pass	
 s7_2_0001	pass	
 s7_3_0001	pass	
 s7_3_0002	pass	
@@ -243,11 +243,11 @@ s7_10_0003	pass
 s7_10_0004	pass	
 s7_10_0005	pass	
 s7_10_0006	pass	
-s7_11_0001	fail	divergence
+s7_11_0001	pass	
 s7_11_0002	pass	
-s7_11_0003	fail	divergence
+s7_11_0003	pass	
 s7_11_0004	pass	
-s7_11_0005	fail	divergence
+s7_11_0005	pass	
 s7_11_0006	pass	
 s7_11_0007	pass	
 s7_11_0008	pass	
@@ -604,7 +604,7 @@ s16_6_0001	pass
 s16_6_0002	pass	
 s16_6_0003	pass	
 s16_6_0004	pass	
-s16_6_0005	fail	divergence
+s16_6_0005	pass	
 s17_1_0001	pass	
 s17_1_0003	pass	
 s17_1_0006	pass	
@@ -1860,7 +1860,7 @@ l2_18_0006	pass
 l2_18_0007	pass	
 l2_18_0008	pass	
 l2_18_0009	pass	
-l2_19_0001	fail	divergence
+l2_19_0001	pass	
 l2_19_0002	pass	
 l2_19_0003	pass	
 l2_19_0004	pass	
