@@ -45,6 +45,14 @@ struct RecordSubstEnv;
 
 namespace bezel::sema {
 
+// fix #5003 (§2.2 / §2.3, v0.307) — fix #5140 (§2.3, v0.309): is `n` the
+// simple name of an §2.3 always-available bare name? Full row enumeration
+// and rationale live next to the definition in TypeResolution.cpp:64.
+// Reused from ExprTypecheck.cpp (which only sees this declaration) so both
+// type-resolution and expression-typecheck consult the same table on the
+// §2.3 imported-public collision (the #5140 fix).
+bool isAlwaysAvailableBareName(std::string_view n);
+
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
 
 // §9.8 / #2325: the CLASS half of serialization synthesis-eligibility

@@ -127,6 +127,10 @@ void ExprTC::run(const ast::SourceFile& src) {
     importAliases_.clear();
     sourceImports_.clear();
     ambiguousImportNames_.clear();
+    // fix #5140 (§2.3, v0.309): per-file §2.3 imported-public-vs-always-
+    // available collision set; populated in the import loop below and
+    // read by the IdentifierExpr / MemberAccessExpr visitors.
+    ambiguousAlwaysAvailableNames_.clear();
     importedExtensions_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
@@ -207,6 +211,22 @@ void ExprTC::run(const ast::SourceFile& src) {
                 for (TypeSymbol* t : *exported) {
                     if (t->name.empty()) continue;
                     if (localNames.count(std::string_view(t->name))) continue;
+                    // fix #5140 (§2.3, v0.309): see TypeResolution.cpp's
+                    // matching loop — an imported public with the same
+                    // identifier as an §2.3 always-available name makes
+                    // the bare name ambiguous here too. The Counter row
+                    // (std lib §4.14) is held pending the (identifier,
+                    // generic arity) keying spec ruling. Skip moduleScope
+                    // insertion so the type-resolution pass's always-
+                    // available fallback runs; the IdentifierExpr visitor
+                    // consults `ambiguousAlwaysAvailableNames_` to emit
+                    // the same §2.3 diagnostic in expression position.
+                    if (isAlwaysAvailableBareName(t->name) &&
+                        t->name != "Counter") {
+                        ambiguousAlwaysAvailableNames_.insert(
+                            std::string(t->name));
+                        continue;
+                    }
                     auto [originIt, inserted] =
                         importedNameOrigin.emplace(std::string(t->name), dotted);
                     if (inserted) {

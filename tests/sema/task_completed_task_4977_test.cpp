@@ -268,19 +268,22 @@ BEZEL_TEST(task_completed_task_4977,
 
 // ── Part 6: a user type named `Task` IMPORTED from another module ──
 //
-// narrow #4977. `import Lib;` makes Lib's public `Task` visible by bare name
-// (§2.2); the IdentifierExpr visitor finds it by scope lookup ahead of the
-// builtin fallback. ModuleLoader's imported TypeSymbol carries
-// `decl == nullptr`, so 9debb70c's `decl == nullptr` gate misread it as the
-// builtin and rejected `Task.Answer` — a program origin/main 466a28e2
-// accepts and runs to 42. This row pins that base behaviour; the gate is now
-// pointer identity with the builtin's symbol. (Whether a user module's
-// `Task` should instead make the bare name ambiguous against the
-// always-available one is a separate spec question — §2.3 states that
-// ambiguity rule only for the `System.Collections.Generic` row — and this
-// row does not decide it; it only keeps #4977 from flipping the verdict.)
+// FLIPPED by #5140 (§2.3, v0.309). Pre-#5140 this row passed: `import Lib;`
+// made Lib's public `Task` visible by bare name (§2.2), the IdentifierExpr
+// visitor found it by scope lookup ahead of the builtin fallback, and
+// `Task.Answer` ran to 42. The §2.3 fix (every-row-alike ambiguity rule)
+// makes the bare name ambiguous: each side is reachable by qualification
+// (the imported public via `Lib.Task`, the always-available via
+// `System.Threading.Task`). Part 7 (module-qualified `Lib.Task`) and Part
+// 8 (alias-qualified `L.Task`) still succeed unchanged — both are
+// qualification forms. Part 5 (alias named `Task`) is also untouched —
+// the alias-naming-itself path is a separate §2.2 rule.
+//
+// The previous comment's "spec question only for the
+// System.Collections.Generic row" parenthetical is now obsolete: #5140
+// applies the rule "every row alike" per spec §2.3 (v0.309).
 BEZEL_TEST(task_completed_task_4977,
-           imported_user_task_bare_static_property_is_unaffected) {
+           imported_user_task_bare_static_property_is_ambiguous) {
     const std::string mainSrc =
         "module M;\n"
         "import Lib;\n"
@@ -289,7 +292,8 @@ BEZEL_TEST(task_completed_task_4977,
         "    return Task.Answer;\n"
         "  end Main;\n"
         "end C;\n";
-    BEZEL_EXPECT_EQ(42, buildAndRunWithLib(kLibWithUserTask, mainSrc));
+    // #5140: bare `Task` is now ambiguous (§2.3) — compile rejects.
+    BEZEL_EXPECT_EQ(-1, buildAndRunWithLib(kLibWithUserTask, mainSrc));
 }
 
 // ── Part 7: module-qualified user `Task` (§2.7 rule 2) ──

@@ -1624,6 +1624,31 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // reading). A dotted head keeps the historical type-first order so
         // `Color.Red` / `Data.M()`-style static access still resolves its head
         // to the top-level type.
+        //
+        // fix #5140 (§2.3, v0.309): if the bare name collides with an
+        // imported public of the same identifier, the import loop
+        // (ExprTypecheck.cpp:207-216) does NOT put the imported symbol in
+        // moduleScope — so `lookupName` returns null and the existing
+        // "unresolved identifier" path would misread the case as undefined
+        // rather than ambiguous. Detect it here and emit the §2.3
+        // diagnostic. The Counter row (§2.3 Row 10) is held pending the
+        // (identifier, generic arity) keying spec question — mirror the
+        // TypeResolution gate.
+        if (!ambiguousAlwaysAvailableNames_.empty() &&
+            ambiguousAlwaysAvailableNames_.count(std::string(id->name)) &&
+            id->name != "Counter") {
+            ctx_.diagnostics().report(
+                Severity::Error, id->span.begin,
+                std::string("bare name `") + std::string(id->name) +
+                "` is ambiguous: an imported public shadows the always-"
+                "available type; qualify it via a module-qualified name "
+                "or an import alias (\xC2\xA7""2.3 / \xC2\xA7""2.2, v0.309; "
+                "fix #5140)");
+            // Fall through; the identifier is left without an exprSymbol
+            // so downstream visitors see the failed resolution and the
+            // §2.3 diagnostic stands without an "unresolved identifier"
+            // double-error.
+        }
         Symbol* sym =
             lookupName(id->name,
                        /*memberBeforeModuleType=*/&e != maTargetHint_);

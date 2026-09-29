@@ -210,6 +210,28 @@ private:
     // bare ambiguous name is a compile error; qualification resolves it.
     std::unordered_set<std::string> ambiguousImportNames_;
 
+    // fix #5140 (§2.3, v0.309): bare names ambiguous because an explicitly
+    // imported module exports a public with the same identifier as an
+    // §2.3 always-available name. Spec §2.3 says the imported public "does
+    // not shadow [the always-available name] but makes the bare name
+    // ambiguous in that file under §2.2's collision rule — every row
+    // alike". Per the issue's HOLD note the `Counter` row of §2.3 Row 10
+    // (stdlib §4.14) is NOT flipped here pending a companion spec question
+    // on (identifier, generic arity) keying; this commit does not key on
+    // name alone and excludes Counter to keep the held regression rows
+    // green. Populated in Resolver::run from the same import loop that
+    // populates `ambiguousImportNames_` (TypeResolution.cpp:308-321).
+    // Reading site: resolveNamed in TypeResolution_Names.cpp (the always-
+    // available resolution arm around line 2687), which emits the §2.3
+    // diagnostic.
+    std::unordered_set<std::string> ambiguousAlwaysAvailableNames_;
+
+    // fix #5140 (§2.3, v0.309): the importing module (dotted name) for
+    // each entry in `ambiguousAlwaysAvailableNames_`, used by the §2.3
+    // diagnostic to name both collision sides. Parallel to the (single-
+    // sided) `importedNameOrigin` map below.
+    std::unordered_map<std::string, std::string> ambiguousAlwaysAvailableNameImportingModule_;
+
     // Slice S38 (§13.7 / Appendix C.2): a class's base class and
     // implemented interfaces must be at least as visible as the class.
     // Effective top-level visibility defaults to `internal`. Restricted

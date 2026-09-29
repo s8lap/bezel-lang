@@ -61,7 +61,10 @@ namespace bezel::sema {
 // rejects any `import Foo as bool;` at parse time (an alias would be a
 // parse error long before reaching this check), so they need not be
 // enumerated.
-constexpr bool isAlwaysAvailableBareName(std::string_view n) {
+//
+// Declared in TypeResolution.hpp (fix #5140) so ExprTypecheck.cpp's
+// import-collision check can consult the SAME table.
+bool isAlwaysAvailableBareName(std::string_view n) {
     return
         // Row 3 / 4 / 5 (core types, disposal interfaces, Task family).
         n == "Object" || n == "Type" ||
@@ -193,6 +196,10 @@ void Resolver::run(const ast::SourceFile& src) {
     sourceImports_.clear();
     importAliases_.clear();
     ambiguousImportNames_.clear();
+    // fix #5140 (§2.3, v0.309): per-file §2.3 imported-public-vs-always-
+    // available collision set, populated by the import loop below.
+    ambiguousAlwaysAvailableNames_.clear();
+    ambiguousAlwaysAvailableNameImportingModule_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
         std::string dotted;
@@ -309,6 +316,24 @@ void Resolver::run(const ast::SourceFile& src) {
                 if (t->name.empty()) continue;
                 // §2.2: local declarations shadow imports — do not overwrite.
                 if (localNames.count(std::string_view(t->name))) continue;
+                // fix #5140 (§2.3, v0.309): a same-named public exported by an
+                // explicitly imported module does not shadow the always-available
+                // name but makes the bare name **ambiguous** in this file under
+                // §2.2's collision rule (every row alike per spec §2.3). Do NOT
+                // insert into `moduleScope.names` so the always-available
+                // resolution path (TypeResolution_Names.cpp around line 2687)
+                // remains the only `first` candidate; record the bare name as
+                // ambiguous and the importing module for the diagnostic.
+                // HOLD: `Counter` (§2.3 Row 10 / stdlib §4.14) is excluded here
+                // pending the companion spec question on (identifier, generic
+                // arity) keying — see issue #5140.
+                if (isAlwaysAvailableBareName(t->name) &&
+                    t->name != "Counter") {
+                    ambiguousAlwaysAvailableNames_.insert(std::string(t->name));
+                    ambiguousAlwaysAvailableNameImportingModule_.emplace(
+                        std::string(t->name), dotted);
+                    continue;
+                }
                 auto [originIt, inserted] =
                     importedNameOrigin.emplace(std::string(t->name), dotted);
                 if (inserted) {

@@ -2685,6 +2685,47 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // we record a Named ref with a null declaration and verify
         // generic arity against the spec's declared form.
         if (t.name->parts.size() == 1) {
+            // fix #5140 (§2.3, v0.309): the bare always-available name
+            // collides with an imported public of the same identifier —
+            // emit the §2.3 diagnostic and turn the TypeRef into an
+            // Error so downstream passes do not paper over the error
+            // with a degraded zero/null value. Each side is reachable
+            // by qualification (the always-available one through its
+            // §2.7-rule-2 module-qualified form, the imported one
+            // through its source module's dotted name or an alias).
+            // The check runs BEFORE the `builtinTypeArity` arm because
+            // the always-available set is broader than the builtin-type
+            // table (e.g. `BitReader` is in `isAlwaysAvailableBareName`
+            // but not in `builtinTypeArity` — the spec's §2.3 Row 10
+            // whole-stdlib§4 promise).
+            // `Counter` (§2.3 Row 10 / stdlib §4.14) is held pending
+            // the (identifier, generic arity) keying spec question, so
+            // `isAlwaysAvailableBareName` is paired with the TypeRes-
+            // olution.cpp gate that excluded `Counter` at population —
+            // here we mirror it so the diagnostic never fires for the
+            // held rows even if some other path set the flag.
+            if (!ambiguousAlwaysAvailableNames_.empty() &&
+                ambiguousAlwaysAvailableNames_.count(std::string(first)) &&
+                first != "Counter") {
+                auto impIt = ambiguousAlwaysAvailableNameImportingModule_
+                    .find(std::string(first));
+                std::string importingModule =
+                    (impIt !=
+                     ambiguousAlwaysAvailableNameImportingModule_.end())
+                        ? impIt->second : std::string("(unknown module)");
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    std::string("bare name `") + std::string(first) +
+                    "` is ambiguous: an imported public from `" +
+                    importingModule +
+                    "` shadows the always-available type; qualify it "
+                    "via a module-qualified name (e.g. `" + importingModule +
+                    "." + std::string(first) +
+                    "`) or an import alias (\xC2\xA7""2.3 / \xC2\xA7""2.2, "
+                    "v0.309; fix #5140)");
+                ref.kind = TypeRef::Kind::Error;
+                return;
+            }
             int arity = builtinTypeArity(first);
             if (arity != kNotBuiltin) {
                 // §2.15 / issue #631: BinarySerializer / BinaryDeserializer

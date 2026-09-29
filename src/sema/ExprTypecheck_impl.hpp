@@ -183,6 +183,14 @@ private:
     std::unordered_set<std::string> sourceImports_;
     // §2.2 v0.164 / #1365: bare names ambiguous due to import collision.
     std::unordered_set<std::string> ambiguousImportNames_;
+    // fix #5140 (§2.3, v0.309): bare names ambiguous due to a §2.3
+    // imported-public-vs-always-available collision. Mirrors the field of
+    // the same name in TypeResolution_impl.hpp; populated in the import
+    // loop at ExprTypecheck.cpp:207-216. Read in the IdentifierExpr /
+    // MemberAccessExpr visitors so the expression-typecheck pass emits the
+    // same §2.3 diagnostic the type-resolution pass emits at the type-
+    // position use site.
+    std::unordered_set<std::string> ambiguousAlwaysAvailableNames_;
     // §26.5 step 2 / §2.5 (#735): the extension blocks reconstructed from the
     // modules this source file `import`s — §26.5 requires the search to cover
     // "the current module AND all imported modules". Populated in run() from
