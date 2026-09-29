@@ -2052,7 +2052,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                         if (pd->type) {
                             if (auto* rt = ctx_.resolvedType(*pd->type)) {
-                                ctx_.setExprType(&e, rt);
+                                // fix #5061 (§11.2 / §14.1): substitute the
+                                // generic base's type arguments, as the
+                                // FieldSymbol arm and `this.Q` already do.
+                                ctx_.setExprType(&e,
+                                    substituteMemberType(rt, nullptr,
+                                                         ps->parent));
                             }
                         }
                     } else if (ctx_.isImported(ps)) {
