@@ -208,7 +208,30 @@ private:
     // §2.2 v0.164 / #1365: bare names ambiguous because ≥2 imported modules
     // export a public type with the same name (§2.2 collision rule). Using a
     // bare ambiguous name is a compile error; qualification resolves it.
-    std::unordered_set<std::string> ambiguousImportNames_;
+    // fix #5172 (§2.2, v0.310): the key is the (name, arity) PAIR, not the
+    // bare name — two imports exporting `Counter` (arity 0) and `Counter<T>`
+    // (arity 1) are NOT ambiguous (they are distinct rule-1 types); only
+    // collisions at the same (name, arity) are the §2.2 collision.
+    struct PairHash {
+        size_t operator()(const std::pair<std::string, std::size_t>& p) const {
+            return std::hash<std::string>{}(p.first) ^
+                   (std::hash<std::size_t>{}(p.second) * 0x9e3779b9);
+        }
+    };
+    std::unordered_set<std::pair<std::string, std::size_t>, PairHash>
+        ambiguousImportNames_;
+
+    // fix #5172 (§2.2, v0.310): every imported type is recorded here by
+    // (name, arity), regardless of whether it collides with a local
+    // declaration. The bare-name scope (`moduleScope.names`) still keeps
+    // ONE entry per name (the current-module shadowing rule for arity=0
+    // is unchanged), but a reference with `genericArgs.size() > 0` consults
+    // this side table to find the arity-matching candidate. Used in
+    // resolveNamed's Slice S24 arity-selecting lookup (the §2.2 v0.310
+    // "arity selects among rule 1's types" rule).
+    std::unordered_map<std::pair<std::string, std::size_t>, TypeSymbol*,
+                       PairHash>
+        importedByArity_;
 
     // fix #5140 (§2.3, v0.309): bare names ambiguous because an explicitly
     // imported module exports a public with the same identifier as an

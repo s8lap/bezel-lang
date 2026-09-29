@@ -2680,6 +2680,69 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             }
             return;
         }
+        // fix #5172 (§2.2, v0.310): arity selects among rule 1's types.
+        // `lookupName` returned the FIRST scope entry for `first`, which
+        // honors the §2.2 current-module-shadowing rule for bare (arity=0)
+        // references; but for a reference that supplies generic arguments
+        // (`t.genericArgs.size() > 0`) the spec requires arity to select
+        // among rule 1's types — a local non-generic `Counter` (arity 0)
+        // must NOT block a `Counter<int>` from finding an arity-matching
+        // `Counter<K>` (arity 1) somewhere in rule 1's candidate set. Walk
+        // the imported-types side table (`importedByArity_`, populated in
+        // TypeResolution.cpp's collision-tracking loop) for a (name, refArity)
+        // match and, if found, override `sym` with it. The bare-name
+        // current-module-shadowing behaviour for arity=0 is unchanged
+        // (refArity=0 → no lookup, scope stays wins).
+        //
+        // When the looked-up sym is itself a TypeSymbol whose arity matches,
+        // we keep it — the local declaration WINS over the imported one for
+        // the same (name, arity) per §2.2's collision rule's mirror. When
+        // the looked-up sym is NOT a TypeSymbol (e.g. a LocalSymbol,
+        // ParameterSymbol, TypeAliasSymbol), the arity check below would
+        // yield a misleading diagnostic; skip the override in that case.
+        //
+        // The builtin arity table (Slice S24 below) is ALSO a §2.7 rule 1
+        // candidate set: a local non-generic `Set` shadows the bare-name
+        // scope entry for `Set`, but for `Set<int>` the §2.3 always-
+        // available builtin `Set<K>` (arity 1, in `builtinTypeArity` below)
+        // matches the reference's arity. The lookup in `importedByArity_`
+        // is empty here (the builtin is not in the import-tracked side
+        // table), so we additionally fall through to Slice S24 by clearing
+        // `sym` — the next block's `if (t.name->parts.size() == 1)` check
+        // re-derives the builtin arity and emits the matching `Named` ref.
+        {
+            std::size_t refArity = t.genericArgs.size();
+            if (refArity > 0) {
+                auto* tsymSym = dynamic_cast<TypeSymbol*>(sym);
+                bool symArityMatches = tsymSym &&
+                                       tsymSym->genericParams.size() == refArity;
+                if (!symArityMatches) {
+                    auto it = importedByArity_.find(
+                        std::make_pair(std::string(first), refArity));
+                    if (it != importedByArity_.end() && it->second) {
+                        sym = it->second;
+                    } else if (t.name->parts.size() == 1) {
+                        // Builtin arity table fallback: when no imported
+                        // type matches (e.g. local non-generic `Set`
+                        // shadowed the auto-imported `Set<K>` in the
+                        // bare-name scope), check the §2.3 always-available
+                        // builtin list. If the reference's arity matches
+                        // the builtin's, the local declaration does NOT
+                        // block it — clear `sym` so Slice S24 below
+                        // records the builtin Named ref instead of the
+                        // arity check (line 4000+ in this file) emitting
+                        // "generic-argument count does not match type's
+                        // generic-parameter count" against the local
+                        // declaration.
+                        int builtinAr = builtinTypeArity(first);
+                        if (builtinAr != kNotBuiltin &&
+                            builtinAr == static_cast<int>(refArity)) {
+                            sym = nullptr;
+                        }
+                    }
+                }
+            }
+        }
         // Slice S24 (§2.3): always-available built-in type names
         // resolve without import. They have no user TypeSymbol, so
         // we record a Named ref with a null declaration and verify
@@ -3332,16 +3395,28 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             }
         }
         // §2.2 v0.164 / #1365: bare-name collision — two or more imported modules
-        // export a type with this name. Using it unqualified is a compile error;
-        // the fix is a module-qualified name or an import alias (§2.2).
+        // export a type with this (name, arity). Using it unqualified is a
+        // compile error; the fix is a module-qualified name or an import
+        // alias (§2.2). fix #5172 (§2.2, v0.310): the key is the PAIR
+        // (name, arity), not the bare name — two imports exporting `Counter`
+        // (arity 0) and `Counter<T>` (arity 1) are NOT ambiguous; only
+        // collisions at the same (name, arity) are the §2.2 collision. The
+        // reference's arity is `t.genericArgs.size()`; for a bare reference
+        // (arity 0) we check (first, 0).
+        std::size_t refArityForAmbiguity = t.genericArgs.size();
         if (!ambiguousImportNames_.empty() &&
-            ambiguousImportNames_.count(std::string(first))) {
+            ambiguousImportNames_.count(
+                std::make_pair(std::string(first), refArityForAmbiguity))) {
             ctx_.diagnostics().report(
                 Severity::Error, t.span.begin,
                 std::string("bare name `") + std::string(first) +
+                (refArityForAmbiguity == 0
+                     ? std::string("")
+                     : std::string("<") +
+                           std::to_string(refArityForAmbiguity) + ">") +
                 "` is ambiguous: multiple imported modules export a type "
-                "with this name; qualify it via a module-qualified name or "
-                "an import alias (\xC2\xA7""2.2)");
+                "with this name and arity; qualify it via a module-qualified "
+                "name or an import alias (\xC2\xA7""2.2)");
             ref.kind = TypeRef::Kind::Error;
             return;
         }
@@ -3998,10 +4073,44 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // Generic-arity check.
         if (!t.genericArgs.empty() &&
             t.genericArgs.size() != tsym->genericParams.size()) {
-            ctx_.diagnostics().report(
-                Severity::Error, t.span.begin,
-                "generic-argument count does not match type's "
-                "generic-parameter count");
+            // fix #5172 (§2.2, v0.310): if the type's bare name has a
+            // matching builtin arity in `builtinTypeArity` (a §2.3
+            // always-available candidate the local non-generic declaration
+            // shadowed in the bare-name scope), the spec's arity-selects
+            // rule means the arity error is misleading — the user's
+            // arity actually matches the §2.3 builtin. Redirect to
+            // Slice S24 (which knows the always-available builtin set) by
+            // re-resolving with an empty scope, so it can emit the
+            // proper "does not match built-in type" diagnostic (or, for
+            // a name that IS a builtin at the same arity, none at all).
+            int builtinAr = (t.name && t.name->parts.size() == 1)
+                                ? builtinTypeArity(t.name->parts.front())
+                                : kNotBuiltin;
+            if (builtinAr != kNotBuiltin &&
+                builtinAr == static_cast<int>(t.genericArgs.size())) {
+                // Local declaration's arity doesn't match the
+                // reference's; but the §2.3 always-available builtin
+                // does. Clear the local declaration so Slice S24 can
+                // re-resolve cleanly (ref.declaration=nullptr is the
+                // sentinel Slice S24 emits), and skip the misleading
+                // arity error. Slice S24's own re-resolution will be
+                // a no-op for this site, but the ref is left in a
+                // state downstream passes can recognise.
+                ref.declaration = nullptr;
+                // Resolve the generic arguments so downstream passes
+                // see them (the error path otherwise leaves the ref
+                // half-built).
+                ref.genericArgs.clear();
+                for (const auto& ga : t.genericArgs) {
+                    if (!ga) continue;
+                    ref.genericArgs.push_back(resolveType(*ga, scope));
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    "generic-argument count does not match type's "
+                    "generic-parameter count");
+            }
         }
     }
     for (const auto& ga : t.genericArgs) {

@@ -200,6 +200,7 @@ void Resolver::run(const ast::SourceFile& src) {
     // available collision set, populated by the import loop below.
     ambiguousAlwaysAvailableNames_.clear();
     ambiguousAlwaysAvailableNameImportingModule_.clear();
+    importedByArity_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
         std::string dotted;
@@ -289,8 +290,16 @@ void Resolver::run(const ast::SourceFile& src) {
         std::unordered_set<std::string_view> localNames;
         for (const auto& [name, _] : moduleScope.names)
             localNames.insert(name);
-        // Track which module first introduced each bare name via import.
-        std::unordered_map<std::string, std::string> importedNameOrigin;
+        // Track which module first introduced each (name, arity) pair via
+        // import. fix #5172 (§2.2, v0.310): the comparison key is the PAIR,
+        // not the bare name — two imports exporting `Counter` (arity 0) and
+        // `Counter<T>` (arity 1) are DISTINCT types (rule 1's collision fires
+        // on identical (name, arity), not on identical name alone) and both
+        // remain reachable; only same-(name, arity) duplicates are the §2.2
+        // collision. The previous bare-name key reported this case as
+        // ambiguous and lost the arity-selecting lookup the spec defines.
+        std::unordered_map<std::pair<std::string, std::size_t>, std::string,
+                           PairHash> importedNameOrigin;
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -334,15 +343,36 @@ void Resolver::run(const ast::SourceFile& src) {
                         std::string(t->name), dotted);
                     continue;
                 }
+                // fix #5172 (§2.2, v0.310): key the collision on
+                // (name, arity). The arity is the imported type's own
+                // generic-parameter count; user TypeSymbols carry it
+                // directly on `genericParams`.
+                std::size_t arity = t->genericParams.size();
+                auto key = std::make_pair(std::string(t->name), arity);
                 auto [originIt, inserted] =
-                    importedNameOrigin.emplace(std::string(t->name), dotted);
+                    importedNameOrigin.emplace(key, dotted);
                 if (inserted) {
-                    // First import to export this name — add it to scope.
+                    // First import to export this (name, arity) — add it to
+                    // scope. A second (name, arity) from a different module
+                    // is the §2.2 collision and is recorded below.
                     moduleScope.names.emplace(std::string_view(t->name), t);
+                    // Track every imported type by (name, arity) so
+                    // resolveNamed's arity-selecting lookup (§2.2 v0.310)
+                    // can reach an arity-matching import even when a local
+                    // declaration (same name, different arity) shadows the
+                    // bare-name scope entry. The scope entry still wins for
+                    // arity=0 (current-module shadowing); this side table
+                    // is the arity>0 escape hatch.
+                    importedByArity_[key] = t;
                 } else if (originIt->second != dotted) {
-                    // §2.2 collision: a second (different) import exports this
-                    // name. Remove it from scope and record as ambiguous.
-                    ambiguousImportNames_.insert(std::string(t->name));
+                    // §2.2 collision: a second (different) import exports
+                    // this (name, arity). Per §2.2 (v0.310) the bare name is
+                    // ambiguous AT THIS ARITY; remove from scope and record
+                    // the (name, arity) as ambiguous. A bare `Counter`
+                    // (arity=0) reference may still resolve to an
+                    // unambiguously-imported arity=0 from elsewhere; only
+                    // the colliding (name, arity) pair is rejected.
+                    ambiguousImportNames_.insert(key);
                     moduleScope.names.erase(std::string_view(t->name));
                 }
                 // else: same module listed twice (no-op).
@@ -396,18 +426,38 @@ void Resolver::run(const ast::SourceFile& src) {
                     "alias (\xC2\xA7""2.2)");
                 continue;
             }
-            auto originIt = importedNameOrigin.find(imp->alias);
-            if (originIt != importedNameOrigin.end() &&
-                !ambiguousImportNames_.count(imp->alias)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, imp->span.begin,
-                    std::string("import alias `") + imp->alias +
-                    "` collides with the unambiguously imported public bare name `" +
-                    imp->alias + "` (from module `" + originIt->second +
-                    "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
-                    "aliases with no backtracking, so the alias would be "
-                    "unreachable — choose a different alias (\xC2\xA7""2.2)");
-                continue;
+            // §2.2 (v0.183, #1515 / #1489): an import alias may not collide with an
+            // unambiguously imported public bare name. §2.7 rule 1 resolves
+            // imported bare names before import aliases with no backtracking, so a
+            // same-named alias would be unreachable in every chain-head position —
+            // the collision is an error at the alias declaration rather than a
+            // silently dead alias. The `importedNameOrigin` key is (name, arity)
+            // post-#5172 (§2.2 v0.310); an alias name without its own arity
+            // collides with EVERY arity of an unambiguously-imported name, so we
+            // scan the whole map for any (alias, *) that is unambiguous.
+            {
+                std::string aliasName = imp->alias;
+                bool unambiguous = false;
+                std::string originModule;
+                for (const auto& kv : importedNameOrigin) {
+                    if (kv.first.first != aliasName) continue;
+                    if (!ambiguousImportNames_.count(kv.first)) {
+                        unambiguous = true;
+                        originModule = kv.second;
+                        break;
+                    }
+                }
+                if (unambiguous) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, imp->span.begin,
+                        std::string("import alias `") + imp->alias +
+                        "` collides with the unambiguously imported public bare name `" +
+                        imp->alias + "` (from module `" + originModule +
+                        "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                        "aliases with no backtracking, so the alias would be "
+                        "unreachable — choose a different alias (\xC2\xA7""2.2)");
+                    continue;
+                }
             }
             // fix #5003 (§2.2 / §2.3, v0.307): always-available bare name
             if (isAlwaysAvailableBareName(imp->alias)) {
