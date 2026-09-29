@@ -2485,6 +2485,16 @@ private:
     // multi-hop alias chains) is deferred. Only fires when the source local
     // is still in the Owned state at the return point.
     void checkIndirectEscapeOnReturn(const ast::Expr& e);
+    // fix #4962 (§17.15 / §28.3, v0.307): a return-position binding atom
+    // `return (var z := q; z);` peels to the body `z`, and
+    // `checkIndirectEscapeOnReturn` then reads `states_[z].source` to
+    // detect a one-hop escape. The atom-clause LocalDecl never reaches
+    // handleLocalDecl until processBindAtom fires from checkRead (later),
+    // so `states_[z].source` is empty when handleReturn's checks run.
+    // This helper pre-populates the per-clause source for every binding-
+    // atom clause reachable from the return expression so the indirect-
+    // escape check sees the carried source and rejects — compile-time.
+    void populateReturnAtomClauseBorrowSources(const ast::Expr& e);
 
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2): given a holder
     // local bound from a bare-type-parameter call (`var m := Pick(a, b);`),

@@ -7081,6 +7081,82 @@ sema::Symbol* MethodOwnership::carriedEscapeBoundSourceLiveAt(
     return nullptr;
 }
 
+// fix #4962 (§17.15 / §28.3, v0.307): a return-position binding atom
+// `return (var z := q; z);` peels through `peelBindAtomToBody` to the
+// body's bare identifier `z`, and `checkIndirectEscapeOnReturn` then
+// reads `states_[z].source` to detect a one-hop escape. handleLocalDecl
+// normally populates that field for the statement-form twin
+// `var z := q; return z;`, but a binding-atom clause's LocalDecl never
+// reaches handleLocalDecl until processBindAtom fires from checkRead →
+// handleDischarge (line 2795), which executes AFTER handleReturn. The
+// §28.3 / §9.7 indirect-escape check therefore consults an empty
+// `states_[z].source` and silently accepts the escape; the source `q`
+// is a fresh `new Widget("q")` — a plain owned local auto-disposed at
+// the method's exit — so `z`'s borrow of `q` outlives `q`'s scope, and
+// the caller reads (and disposes) a freed `Widget`. This helper pre-
+// populates the per-clause `states_[lsym].source` for every binding-
+// atom clause reachable from the return expression so the indirect-
+// escape check sees the carried source and rejects — compile-time,
+// never runtime.
+//
+// Mirrors handleLocalDecl's source arm verbatim (Ownership.cpp ~line
+// 6620): skip `owned`-marked clauses (the K3.4 marker branch MOVES the
+// source, so no borrow is in flight) and skip `using var` clauses
+// (§28.10's pin semantics are enforced by codegen, and a `using var`
+// can never itself `return`). For a span / borrow-bearing-record
+// holder, the pre-scan at `collectBorrowUsesStmt`'s ReturnStmt arm
+// (line ~12012) already calls `collectRecordBorrowSource(*cl)` per
+// clause — that path is left untouched, so this helper only fills the
+// class-typed alias-holder case `borrowSourceForExpr` already covers.
+//
+// Walker descends through BindExpr (clauses first, then body),
+// BinaryExpr (the `??` form, where either operand may carry an atom),
+// and ConditionalExpr / CaseExpr (where both arms may carry one).
+// Stops at any other node — leaves, calls, member reads, casts, and
+// `??` are not legal atom containers at the return position.
+void MethodOwnership::populateReturnAtomClauseBorrowSources(const ast::Expr& e) {
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses) {
+            if (!cl || !cl->initializer) continue;
+            // Mirror handleLocalDecl's gates: the `owned` marker is a MOVE,
+            // and `using var` is a §28.10 pin (no `return`-escape source).
+            if (cl->initializerHasOwnedMarker || cl->isUsing) continue;
+            if (sema::LocalSymbol* lsym = findLocalSymbol(*cl)) {
+                if (sema::Symbol* src = borrowSourceForExpr(*cl->initializer)) {
+                    BorrowSource bs;
+                    bs.sym = src;
+                    states_[lsym].source = bs;
+                }
+            }
+        }
+        if (bx->body) populateReturnAtomClauseBorrowSources(*bx->body);
+        return;
+    }
+    if (auto* co = dynamic_cast<const ast::BinaryExpr*>(&e); co && co->op == "??") {
+        // `return (var z := p ?? q; z);` — the `??` form is admitted by
+        // checkIndirectEscapeOnReturn as one of the borrowed-holder
+        // expressions; pre-populate each operand's atoms.
+        if (co->left) populateReturnAtomClauseBorrowSources(*co->left);
+        if (co->right) populateReturnAtomClauseBorrowSources(*co->right);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->thenValue) populateReturnAtomClauseBorrowSources(*ce->thenValue);
+        if (ce->elseValue) populateReturnAtomClauseBorrowSources(*ce->elseValue);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        // Conservative: walk every arm's expression body. The ownership
+        // pass treats each arm as a fresh source-window, but a binding
+        // atom inside any arm still needs its clause source populated.
+        for (const auto& arm : cx->arms) {
+            if (arm.exprBody)
+                populateReturnAtomClauseBorrowSources(*arm.exprBody);
+        }
+        return;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // §35.5 / §9.7 (v0.220, #2180) — case-arm payload-binding borrow provenance.
 //

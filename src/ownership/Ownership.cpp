@@ -8774,6 +8774,19 @@ void MethodOwnership::moveOnlyArrayLeakScan(
 }
 
 void MethodOwnership::handleReturn(const ast::Expr& e) {
+    // fix #4962 (§17.15 / §28.3, v0.307): pre-populate
+    // `states_[clause].source` for every binding-atom clause reachable
+    // from the return expression so the §28.3 / §9.7 indirect-escape
+    // check below sees the carried source. Without this, an atom
+    // clause's LocalDecl never reaches handleLocalDecl until
+    // processBindAtom fires from checkRead → handleDischarge (line
+    // 2795), which executes AFTER handleReturn. The indirect-escape
+    // check then consults an empty `states_[z].source` and silently
+    // accepts the one-hop escape (heap-use-after-free once the source
+    // local is auto-disposed at scope end). Mirrors handleLocalDecl's
+    // source arm exactly: skip `owned`-marked (a MOVE, no borrow in
+    // flight) and `using var` (§28.10 pin, not a return-escape source).
+    populateReturnAtomClauseBorrowSources(e);
     // §28.9 / §9.7 escape checks (issue #360). These run before the
     // bare-identifier discharge fast-path below so that a returned
     // closure or borrow-bearing record is examined even when it is the
