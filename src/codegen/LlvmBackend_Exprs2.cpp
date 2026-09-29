@@ -80,6 +80,15 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
         l = degradedBoolOperand({bin.left.get(), &bin, bin.right.get()},
                                 "left operand of a short-circuit operator");
     }
+    // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
+    // `and`/`or` (src/sema/ExprTypecheck_Exprs.cpp ~6925) admits a `bool?`
+    // operand narrowed non-null by §7.4. Sema returns success and codegen
+    // receives the operand as the declared `{i8 hasVal; i1 payload}` struct,
+    // but the short-circuit branch needs an `i1` — extract the payload here.
+    // The pre-extraction soundness precondition of unwrapNarrowedNullableOperand
+    // (a sema gate that rejects the un-narrowed form) is satisfied by the
+    // #5137 sema half in this same lane.
+    l = unwrapNarrowedNullableOperand(l, bin.left.get());
     // §22.4 / §7.9 (v0.235, #2395): pre-create/zero-init any inline
     // `out var` slot inside the RIGHT operand — the one THIS operator may
     // SKIP (`and` skips it when `l` is false, `or` skips it when `l` is
@@ -108,6 +117,10 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
         r = degradedBoolOperand({bin.right.get(), &bin, bin.left.get()},
                                 "right operand of a short-circuit operator");
     }
+    // fix #5137: same extraction for the RHS — the right operand of `and`/`or`
+    // is also admitted by the §7.11 gate when narrowed, and the PHI below
+    // needs an `i1`.
+    r = unwrapNarrowedNullableOperand(r, bin.right.get());
     auto* rhsEndBB = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
@@ -571,6 +584,16 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             return res;
         }
     }
+
+    // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
+    // `not` (src/sema/ExprTypecheck_Exprs.cpp ~7959) admits a `bool?`
+    // operand narrowed non-null by §7.4. Sema returns success and codegen
+    // receives the operand as the declared `{i8 hasVal; i1 payload}` struct,
+    // but `CreateNot` below needs an `i1` — extract the payload here. The
+    // pre-extraction soundness precondition of unwrapNarrowedNullableOperand
+    // (a sema gate that rejects the un-narrowed form) is satisfied by the
+    // #5137 sema half in this same lane.
+    if (op == "not") v = unwrapNarrowedNullableOperand(v, un.operand.get());
 
     if (op == "-") {
         // §4.4 fix #521: decimal negation — flip bit 31 of flags (sign bit).
@@ -14909,6 +14932,16 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     if (!c.condition || !c.thenValue || !c.elseValue) return nullptr;
     llvm::Value* cond = lowerExpr(*c.condition);
     if (!cond) return nullptr;
+    // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
+    // if-expression-conditions (src/sema/ExprTypecheck.cpp ~6201, the
+    // "if-expression" ctx) admits a `bool?` condition narrowed non-null by §7.4.
+    // Sema returns success and codegen receives the condition as the declared
+    // `{i8 hasVal; i1 payload}` struct, but `CreateCondBr` below needs an
+    // `i1` — extract the payload here. The pre-extraction soundness
+    // precondition of unwrapNarrowedNullableOperand (a sema gate that rejects
+    // the un-narrowed form) is satisfied by the #5137 sema half in this same
+    // lane.
+    cond = unwrapNarrowedNullableOperand(cond, c.condition.get());
 
     // §20 / §5.1: the conditional's result type is the §20 common type of
     // its branches, which sema records on the expression. The branches may

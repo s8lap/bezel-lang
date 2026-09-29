@@ -6390,6 +6390,17 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
     for (const ast::IfStmt::Branch* br : chain) {
         llvm::Value* cond =
             br->condition ? lowerExpr(*br->condition) : nullptr;
+        // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
+        // if-conditions (src/sema/ExprTypecheck.cpp ~6201) admits a `bool?`
+        // condition narrowed non-null by §7.4. Sema returns success and codegen
+        // receives the condition as the declared `{i8 hasVal; i1 payload}`
+        // struct, but `CreateCondBr` below needs an `i1` — extract the payload
+        // here. The pre-extraction soundness precondition of
+        // unwrapNarrowedNullableOperand (a sema gate that rejects the
+        // un-narrowed form) is satisfied by the #5137 sema half in this same
+        // lane.
+        if (cond && br->condition.get())
+            cond = unwrapNarrowedNullableOperand(cond, br->condition.get());
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "if.body", currentFn_);
         auto* nextBB = llvm::BasicBlock::Create(llvm_, "if.next", currentFn_);
         if (cond) builder_.CreateCondBr(cond, bodyBB, nextBB);
@@ -6540,6 +6551,16 @@ bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
     builder_.CreateBr(condBB);
     builder_.SetInsertPoint(condBB);
     llvm::Value* cond = ws.condition ? lowerExpr(*ws.condition) : nullptr;
+    // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
+    // while-conditions (src/sema/ExprTypecheck.cpp ~6201) admits a `bool?`
+    // condition narrowed non-null by §7.4. Sema returns success and codegen
+    // receives the condition as the declared `{i8 hasVal; i1 payload}` struct,
+    // but `CreateCondBr` below needs an `i1` — extract the payload here. The
+    // pre-extraction soundness precondition of unwrapNarrowedNullableOperand
+    // (a sema gate that rejects the un-narrowed form) is satisfied by the
+    // #5137 sema half in this same lane.
+    if (cond && ws.condition.get())
+        cond = unwrapNarrowedNullableOperand(cond, ws.condition.get());
     if (cond) builder_.CreateCondBr(cond, bodyBB, endBB);
     else builder_.CreateBr(endBB);
 
