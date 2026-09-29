@@ -5605,6 +5605,48 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     if (dictTy->genericArgs.size() <= 1) return nullptr;
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
     llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : nullptr;
+    // fix #5106 (§28.9 / §28.11, v0.307, narrow): when V is itself a BORROWING
+    // builtin collection (Dictionary<K2,V2> / SortedDictionary<K2,V2> /
+    // Array<T> / Stack<T> / Queue<T> / LinkedList<T> / FrozenArray<T>), the
+    // outer Dictionary<K,V>'s value slot stores the inner collection's
+    // pointer (the inner's `bz_dict_t*` / `bz_array_t*` etc.) DIRECTLY —
+    // the boxed-struct test below returns false for these V (Dictionary
+    // lowers to `i8*`, not a struct), so without this arm `dictValueBoxFreer`
+    // returns nullptr, `buildCollectionTempDisposal` (LlvmBackend_Setup.cpp)
+    // leaves `dictValueDisposer = nullptr`, and `bz_dict_free(outer, nullptr)`
+    // leaks every stored inner bz_dict_t header + buckets + order + nested
+    // key allocations — measured 422 B per repro (96 B inner header + 256 B
+    // inner buckets + 64 B inner order + 6 B inner "inner" key), ASan/LSan
+    // direct leak at scope end.
+    //
+    // The dispose is the SAME shape the §28.11 element-policy table emits for
+    // an OwningArray<Array<T>> slot (#4054): call the inner collection's
+    // matching runtime free fn (`bz_dict_free` for Dictionary/SortedDictionary,
+    // `bz_array_free` for Array/Stack/Queue/FrozenArray, `bz_llist_free` for
+    // LinkedList) with NULL inner disposer — the borrow family does not own
+    // its elements; passing the inner's element disposer would double-free
+    // values whose real owner is elsewhere. This is exactly
+    // `borrowingCollectionDisposerThunk(valTy, name)`, which caches one thunk
+    // per V and uses §2.8.3-rule-3 mangled names for reproducibility (#3548).
+    //
+    // Narrow to non-owning, non-nullable V: OwningDictionary<K,OwningArray<T>>
+    // is rejected by sema at instantiation (§28.11), and a nullable V would
+    // need the same wrapper-walk shape fix #3802 introduced for nullable
+    // record/choice — not the borrow-collection case. ElementPolicy already
+    // classifies these V via `isBorrowingBuiltinCollection`
+    // (LlvmBackend_ElementPolicy.cpp:248); we mirror that exact name set
+    // inline so this function stays self-contained.
+    if (!valTy->nullable &&
+        valTy->kind == sema::TypeRef::Kind::Named && !valTy->declaration &&
+        valTy->astNode && valTy->astNode->name &&
+        !valTy->astNode->name->parts.empty()) {
+        std::string_view vn = valTy->headName();
+        if (vn == "Dictionary" || vn == "SortedDictionary" ||
+            vn == "Array" || vn == "Stack" || vn == "Queue" ||
+            vn == "LinkedList" || vn == "FrozenArray") {
+            return borrowingCollectionDisposerThunk(valTy, vn);
+        }
+    }
     if (!dictValueIsBoxedStruct(valLlvm)) return nullptr;
     // fix #3798 (stdlib §4.8 / §28.9, v0.286): when V is a non-nullable record
     // or choice that owns a string (directly or transitively through a
