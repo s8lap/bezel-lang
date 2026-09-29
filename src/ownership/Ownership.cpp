@@ -14563,11 +14563,32 @@ bool MethodOwnership::isLocalHeapCollectionTyped(sema::Symbol* sym) {
     // annotation is untyped at the literal site and never reaches this
     // check (no declared type, no collection-literal lowering). // per
     // §28.3, §15.4, #4931
+    //
+    // fix narrow #4931 (§21.1, v0.307): `ls->decl` is not always a
+    // `LocalDecl` — a §21.1 runtime `const` local builds a separate
+    // `LocalConstDecl` AST node with its own `type` field, and
+    // `const xs: Array<int> := [...]` reaches this same check (the
+    // `checkReturnGetEnumeratorFromScopeBoundReceiver` receiver-symbol test
+    // above admits any `sema::LocalSymbol`, const or var). The bare
+    // `LocalDecl`-only cast fell through to `return false` for a const
+    // receiver, so `return xs.GetEnumerator()` over `const xs: Array<int> :=
+    // [...]` was silently admitted — the SAME dangling-enumerator shape (1)
+    // rejects for `var`, since `constInitializerRejected` (§21.1) does not
+    // catch it either: the collection literal is Borrowed-classified by the
+    // very producerState gap this helper works around, so it is never a
+    // rejected "owned production" at the const binding site. Read the
+    // declared type off whichever node kind `ls->decl` actually is, mirroring
+    // the canonical LocalDecl/LocalConstDecl split (LlvmBackend_Setup.cpp's
+    // `localDeclInitView`).
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
     if (!ls || !ls->decl) return false;
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-    if (!ld || !ld->type) return false;
-    const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
+    const ast::Type* declType = nullptr;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+        declType = ld->type.get();
+    else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+        declType = lc->type.get();
+    if (!declType) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*declType);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     if (rt->headName().empty()) return false;
     return common::isPatternAResultCollectionHead(rt->headName());

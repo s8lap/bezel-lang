@@ -103,6 +103,42 @@ BEZEL_TEST(local_array_getenumerator_4931,
 }
 
 // ===========================================================================
+// (1b) §28.3 / §29.11 / §29.2 / §21.1 — the same shape with a §21.1 runtime
+// `const` local instead of `var`: REJECTED. `const xs: Array<int> :=
+// [...]` builds a `LocalConstDecl` AST node (not `LocalDecl`), and the
+// collection-literal initializer is Borrowed-classified by the same
+// producerState gap the `var` case (1) exploits, so `constInitializerRejected`
+// does not reject it at the binding site either — the const receiver reaches
+// `checkReturnGetEnumeratorFromScopeBoundReceiver` exactly like a `var`
+// receiver does (`checkReturnGetEnumeratorFromScopeBoundReceiver` admits any
+// `sema::LocalSymbol`), so the SAME dangling-enumerator return must be
+// rejected. // per §28.3, §21.1, §15.4, #4931
+// ===========================================================================
+BEZEL_TEST(local_array_getenumerator_4931,
+           return_local_const_array_getenumerator_rejected_spec_21_1) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "public class Program "
+        "  static method Mk(): owned IEnumerator<int> "
+        "    const xs: Array<int> := [10, 20, 30]; "
+        "    return xs.GetEnumerator(); "
+        "  end Mk; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("cannot return `xs.GetEnumerator()`") !=
+                std::string::npos &&
+            d.message.find("scope-bound owned local") != std::string::npos &&
+            d.message.find("§28.3") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// ===========================================================================
 // (3) §28.3 CONTROL — `return xs.GetEnumerator()` over a PARAMETER
 // (the §2175 / §4931 admitted shape): the parameter outlives the call,
 // so the borrow is sound. Pre-fix this also compiled (it was correctly
