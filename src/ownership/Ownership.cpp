@@ -14741,7 +14741,7 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
 // A `this`-rooted chain is admitted (`this` outlives the call); a parameter
 // is admitted (the parameter outlives the call); a non-enumerator call is
 // not affected. The user-defined `return this;` self-returning enumerator
-// (`GetEnumerator(): IEnumerator<int> return this;`) is the §2443 carve:
+// (`GetEnumerator(): IEnumerator<int> return this;`) is the #2443 carve:
 // codegen wraps the self-return in a freshly-calloc'd adapter whose Dispose
 // is owned by the caller (#2388/#2440), so the receiver-borrow is not
 // exposed through this surface — `resultIsEnumeratorSentinel` excludes the
@@ -14769,7 +14769,7 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
     // BUILTIN call only — a USER method named `GetEnumerator` (a class
     // implementing IEnumerable<T> whose own GetEnumerator body is reachable)
     // resolves a MethodSymbol and is classified by the ordinary user-call
-    // rules. The §2443 carve keeps the self-return shape (named-interface
+    // rules. The #2443 carve keeps the self-return shape (named-interface
     // result, no sentinel) out of the borrow-pin decision; user two-class
     // enumerators (a separate, freshly-`new`'d enumerator class) already fail
     // the body-scan below on its own (a `new` producer is not receiver-
@@ -14779,8 +14779,8 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
         return;
     // Result type must be the SYNC builtin enumerator SENTINEL — the exact
     // shape codegen wraps with `wrapUserClassAsIEnumerable` /
-    // `wrapArrayAsIEnumerable` (LlvmBackend_Calls2.cpp:8376; the §2443
-    // sentinel gate). A named-interface result (the §2443 self-return
+    // `wrapArrayAsIEnumerable` (LlvmBackend_Calls2.cpp:8376; the #2443
+    // sentinel gate). A named-interface result (the #2443 self-return
     // shape) has `declaration` set and falls through here — admitted (the
     // receiver-borrow is hidden by codegen's adapter wrap). A user method
     // returning a non-sentinel enumerator also has `declaration` set —

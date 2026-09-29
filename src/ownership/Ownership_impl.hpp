@@ -2614,10 +2614,10 @@ private:
     // `IEnumerator<T>` sentinel (Named, no declaration), so the
     // `returnedExprMayBorrow` gate skips the funnel entirely. Narrow: only
     // the SYNC builtin enumerator heads (codegen's `resultIsEnumeratorSentinel`
-    // gate, §2443 carve out by `declaration` being set on the named-interface
+    // gate, #2443 carve out by `declaration` being set on the named-interface
     // self-return shape). A `this`-rooted chain is admitted (outlives the
     // call); a parameter is admitted (outlives the call); a user-method
-    // `GetEnumerator` (named-interface result) is admitted (the §2443 carve).
+    // `GetEnumerator` (named-interface result) is admitted (the #2443 carve).
     // // per §28.3, §29.11, §29.2, #2443, #4931
     void checkReturnGetEnumeratorFromScopeBoundReceiver(const ast::Expr& e);
     // fix #4931 helper: see Ownership.cpp's isLocalHeapCollectionTyped
