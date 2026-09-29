@@ -11,8 +11,10 @@
 module Conf;
 
 public class Program
+  public static method Maybe(): string? => "abc";
+
   public static method Main()
-    var a: string? := "abc";
+    var a: string? := Maybe();
     var b: string := "abd";
     if a < b then
       Console.WriteLine("less");

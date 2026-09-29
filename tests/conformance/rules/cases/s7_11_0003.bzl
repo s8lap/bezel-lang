@@ -12,7 +12,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    var a: int? := 5;
+    var a: int? := int.ParseOrNull("5");
     var b: int := 10;
     if a < b then
       Console.WriteLine("less");

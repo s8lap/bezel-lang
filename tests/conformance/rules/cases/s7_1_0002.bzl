@@ -13,8 +13,10 @@ public class Widget
 end Widget;
 
 public class Program
+  public static method Find(): owned Widget? => new Widget();
+
   public static method Main()
-    var maybe: Widget? := new Widget();
+    var maybe: Widget? := Find();
     var w: Widget := maybe;
   end Main;
 end Program;

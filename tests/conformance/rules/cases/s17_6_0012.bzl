@@ -3,7 +3,7 @@
 //! section: 17.6
 //! title: ++ on a char target applies the code-point rules of the conversion
 //! rule: "For a `char` target the §5.2 code-point rules apply (`c++` is
-//!   `c := char(c + 1)`)."
+//!   `c := char(int(c) + 1)`)."
 //! cites: 17.6, 6.6, 5.2
 //! expect: run
 //! stdout: True

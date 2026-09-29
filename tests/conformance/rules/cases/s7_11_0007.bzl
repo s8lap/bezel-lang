@@ -9,8 +9,10 @@
 module Conf;
 
 public class Program
+  public static method Maybe(): bool? => true;
+
   public static method Main()
-    var flag: bool? := true;
+    var flag: bool? := Maybe();
     if flag and true then
       Console.WriteLine("yes");
     end;

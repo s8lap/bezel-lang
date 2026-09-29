@@ -13,7 +13,7 @@ module Conf;
 
 public class Program
   public static method Main()
-    var n: int? := 5;
+    var n: int? := int.ParseOrNull("5");
     var b := n in 1..10;
   end Main;
 end Program;
