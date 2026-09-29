@@ -7,8 +7,9 @@
 | **Written against** | spec/stdlib **v0.179** (refreshed 2026-07-07 from the v0.156 draft) |
 | **Tracking issue** | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |
 | **Design influences** | JS `fetch` (WHATWG) for ergonomics; `ky`/`got` for the fixes to fetch's known traps; **not** .NET `HttpClient` |
+| **Currency note** | Refreshed 2026-09-17 to v0.306: `Task.WhenAllOwned` respelled `Task.WhenAll` (v0.250 merge, stdlib §6.7); the stdlib §11 slot quotation re-derived from the landed text and its line-number citation dropped (the hypothetical-`HttpClient` clause left the sentence, v0.269/v0.306). Written-against pin unchanged. |
 
-The stdlib already reserves the slot: *"`System.Net` and `System.Net.Http` — networking and HTTP. The language specification's async examples use a hypothetical `HttpClient`; a real one will live here."* (stdlib §11, L3808). This proposal fills that slot.
+The stdlib already reserves the slot: *"`System.Net` and `System.Net.Http` — networking and HTTP. A real HTTP client will live here."* (stdlib §11, v0.306). This proposal fills that slot.
 
 This document was adversarially reviewed against the docs before filing and refreshed to v0.179 (citations, ownership/async soundness, and grammar legality of every snippet re-checked); the issues it depends on are listed in §9.
 
@@ -284,7 +285,7 @@ Every request method returns `OwningTask<HttpResponse>`; the await must sit in a
 
 ### 4.2 Concurrent requests
 
-Fan-out uses the existing aggregation surface (stdlib §6.7): `Task.WhenAllOwned<HttpResponse>(owned tasks: OwningArray<OwningTask<HttpResponse>>): OwningTask<OwningArray<HttpResponse>>`. No new machinery.
+Fan-out uses the existing aggregation surface (stdlib §6.7): `Task.WhenAll<HttpResponse>(owned tasks: OwningArray<OwningTask<HttpResponse>>): OwningTask<OwningArray<HttpResponse>>`. No new machinery.
 
 ### 4.3 The single-consumption body
 

@@ -1,10 +1,10 @@
 # 0052 - Machine-grade diagnostics and a compiler query API
 
-**Status:** under-review — draft
+**Status:** accepted — accepted **staged as designed** (delegated, critic-gated ruling on [#2039](https://github.com/s8lap/bezel-lang/issues/2039), 2026-07-24, spec v0.220): S0 and S1 open after the R0 drain or as one coordinator-designated infra lane; S2 gated on S1 + 0040 Q1; S3 doubly gated (0040 Stage 1 + observed S2 usage). ⚠ This header read `under-review — draft` from that ruling until 2026-09-17 — the ledger lagged the tracker by eight weeks; corrected with the S0 brief below (§9).
 **Tracking issue:** [#2039](https://github.com/s8lap/bezel-lang/issues/2039)
 **Target:** Tooling only — reference-compiler surface (`bezelc` output formats, a diagnostic-code catalogue, `--explain`, a batch query mode, staged server modes). **Zero normative spec change**, defended in §2.1: Appendix [D](../Bezel_Language_Spec.md#appendix-d-conformance-levels)'s diagnostic-identity latitude (v0.163) is exercised, not narrowed — the code registry is reference-compiler surface, deliberately *not* a spec registry. No grammar change, no stdlib change.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision), compiler @ `bf96dd6`
-**Currency note:** Refreshed 2026-08-11 to v0.246: transfer-marker consume spellings respelled `move` in the §2 example and the `--explain BZL2803` display (v0.246). Written-against pin unchanged.
+**Currency note:** Refreshed 2026-08-11 to v0.246: transfer-marker consume spellings respelled `move` in the §2 example and the `--explain BZL2803` display (v0.246). Written-against pin unchanged. **Refreshed 2026-09-17 to v0.306** (compiler @ `29410e29`): the seven spec anchors §1.2 cites re-verified present; the `19xx` bucket description no longer names `when` (retired v0.289, 0122 L1); §24 is a tombstone since the `event` retirement (v0.187) so bucket `24` mints nothing and is recorded as reserved-by-history; the §2.3 shared anchor resolver now has a landed seed, `scripts/check_src_citations.py` (#4455, 2026-09-17); the §2.10 workflow gains the `internal:`-site disposition column that family K of the defect campaign needs; and §9 (the S0 implementation brief) is new. Written-against pin unchanged — the design is not revised, only re-anchored and staged for implementation.
 
 This proposal expands item **P12** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to commissioning depth. Where it sharpens or diverges from the P12 sketch, the divergence is recorded in §8. *Reference convention: an unprefixed §-reference is a language-spec reference; `stdlib §`, `rationale §`, and `0040 §`/`0043 §`/… prefixes are written out; this proposal's own sections are cited as "§N below" or from context.*
 
@@ -24,7 +24,7 @@ In an agent loop the compiler is the teacher and diagnostic quality is the rewar
 | §28.3 [*The consume-site freeze*](../Bezel_Language_Spec.md#sec-consume-site-freeze) | "the diagnostic names the consumed binding, the borrow, and the borrow's surviving use" |
 | §28.8.1 [*The field-restoration rule*](../Bezel_Language_Spec.md#sec-the-field-restoration-rule) | "identifies the move site, the unrestored exit path, and the three standard remedies" |
 | [§30.5](../Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal) | the bare-`await` error "identifies the offending await and references the principle"; the un-consumed `OwningTask<T>` error "names the owned-consuming positions admitted by the rule … and points to the `using var` form" |
-| [§29.11](../Bezel_Language_Spec.md#sec-multiple-enumeration) | "names the consumed binding, the consuming use, and the `.ToArray()` materialization remedy" |
+| [§29.11](../Bezel_Language_Spec.md#sec-multiple-enumeration) | "names the consumed binding, the consuming use, and the `.ToArray()` materialization remedy"  ⚠ *v0.306 still reads this way, but the same section withdrew materialization as a remedy at v0.265 (#2557) — the mandate sentence was not updated; filed as [#4457](https://github.com/s8lap/bezel-lang/issues/4457). Mint the `29xx` seed against the corrected sentence.* |
 | [§17.13](../Bezel_Language_Spec.md#sec-the-discard-_) | the `Task` discard error "names `Task.FireAndForget` specifically" |
 
 **1.3 What the spec deliberately does *not* mandate.** Appendix [D](../Bezel_Language_Spec.md#appendix-d-conformance-levels)'s **Diagnostic identity (v0.163)** paragraph: the spec mandates *when* a diagnostic is produced and in places what it should name, but "deliberately defines no error-code registry or message taxonomy. Diagnostic identity — codes, exact wording, formatting — is implementation-defined," with a code registry contemplated only "if multiple implementations materialize." So the content is pinned, the identity is free — exactly the room a reference-compiler surface needs, and the boundary this proposal must not cross (§2.1 below).
@@ -45,7 +45,7 @@ Everything here is behavior of the reference compiler's *output and query* surfa
 
 **Buckets.**
 
-- `01`–`34` — the spec's chapters 1–34. A diagnostic is bucketed by the chapter of the rule it enforces (the same section the repo's `// per §NN.N` comment discipline already names at the emission site), not by the compiler pass that detects it: `28xx` is ownership (§28), `30xx` async (§30), `19xx` the `case`/`when` constructs, and so on. Appendix C invariants carry their owning chapter's bucket (each invariant already cites one); Appendix A syntax errors carry the bucket of the construct's home chapter (the §19.1 missing-`of` error is `19xx`).
+- `01`–`34` — the spec's chapters 1–34. A diagnostic is bucketed by the chapter of the rule it enforces (the same section the repo's `// per §NN.N` comment discipline already names at the emission site), not by the compiler pass that detects it: `28xx` is ownership (§28), `30xx` async (§30), `19xx` the `case` construct (the `when` form was retired at v0.289, 0122 L1 — a `19xx` code for it would have been retired under clause 1 below, which is the contract working as intended), and so on. Bucket `24` (Events, a tombstone since v0.187 — the chapter keeps its anchor for citation stability and has no rules) mints nothing; a future chapter reusing the number takes a `35`–`49` slot instead, so the mnemonic never lies. `35xx` is choices (§35, landed v0.200). Appendix C invariants carry their owning chapter's bucket (each invariant already cites one); Appendix A syntax errors carry the bucket of the construct's home chapter (the §19.1 missing-`of` error is `19xx`).
 - `00` — the driver front door: usage errors, file I/O, link failures, and construct-agnostic parse errors with no home chapter. Not spec-mandated; coded anyway so the JSON stream is total.
 - `35`–`49` — reserved for future spec chapters.
 - `51`–`84` — continuation buckets: when a chapter's 99 serials exhaust, its continuation bucket is `cc + 50` (§28 overflows into `78xx`). Deterministic, so a reader can still compute the chapter from the code.
@@ -334,7 +334,7 @@ Why goals belong in this proposal at all: the agent-loop argument from §1.5 cut
 
 The registry only stays truthful if minting is cheap and reviewed. The workflow, designed for the repo's actual traffic (bug-fix lanes shipping spec-cited regression tests):
 
-1. A fix lane converting or adding an emission site takes the **next free serial** in the rule's chapter bucket and adds one `DIAG(…)` line — severity, section, anchor, revision, origin, summary — plus the explain page. The anchor is copied from the spec heading the site's `// per §NN.N` comment already cites; `check_diags.sh` fails the PR if it doesn't resolve.
+1. A fix lane converting or adding an emission site takes the **next free serial** in the rule's chapter bucket and adds one `DIAG(…)` line — severity, section, anchor, revision, origin, summary — plus the explain page. A `99xx` entry (an `internal:` degrade site) carries one more field, its **disposition**: `ice` (aborts), `wrong-value` (ships a bounded wrong value) or `unsafe-pointer` (ships a pointer the program may dereference). That column *is* the per-site record issue #2924 asks for and family K of [`defect-campaign-2026-09.md`](defect-campaign-2026-09.md) anchors on — the registry gives it a home, and `check_diags.sh` can then assert that no `unsafe-pointer` site carries `Warning` severity (the only disposition that must never ship a binary). The anchor is copied from the spec heading the site's `// per §NN.N` comment already cites; `check_diags.sh` fails the PR if it doesn't resolve.
 2. The lane's regression test keys on the **code** (`// CHECK: [BZL28nn]` / `hasCode`), plus at most one wording fragment for readability. Reviewers check one thing the CI can't: that the cited anchor is the rule the site actually enforces (the same §-citation discipline CLAUDE.md already imposes on comments, now load-bearing).
 3. Serial collisions between parallel lanes are ordinary merge conflicts on `registry.def` — visible, trivially resolved by renumbering the younger entry *before* it lands (never after: a landed code is frozen by §2.2 clause 1).
 4. Retirement (rule removed, split, or reclassified by a spec revision) is a PR that flips the entry's status, names successors, and updates the explain page to say what happened and where to look — the registry doubles as the diagnostic-surface changelog, which no other artifact currently records.
@@ -401,6 +401,96 @@ Each stage is independently shippable and independently useful; S0 alone retires
 3. **Latency is goals-plus-benchmark, not a feature.** P12 lists latency as part of the item; this proposal declines to promise numbers and instead institutionalizes measurement (§2.9), with `--check` as the one concrete latency *mechanism* shipped.
 4. **Runtime diagnostics are explicitly out.** Contract violations at runtime (0043's exception surface) and property-test counterexample reports (0053) are adjacent but not this API; the boundary is compile-time analysis output. P12 did not distinguish; this proposal does.
 
-## 9. Relations
+## 9. S0 implementation brief (added 2026-09-17, compiler @ `29410e29`)
+
+*Written without a build ([#4451](https://github.com/s8lap/bezel-lang/issues/4451)); every implementation fact below is a source read cited by file and line. It turns the S0 deliverables the #2039 ruling names — "registry.def X-macro, trailing-tag renderer, lit-collision audit, BZL2801–BZL2805 seed from §28.3's five recommended messages, explain pages, check_diags.sh on the shared resolver" — into a work-list an implementer can execute without re-deriving the design. Nothing here changes §2–§8.*
+
+### 10.1 Why S0 now, in bug-fixing mode
+
+S0 touches no lowering, no ownership rule, no runtime: it adds a field to `Diagnostic`, a table, a renderer suffix, and a build-free script. It is the one tooling item that **pays the bug campaign back directly**:
+
+| Campaign need | What S0 supplies |
+|---|---|
+| Family B's rows assert the **diagnostic text** "cannot move from disposed local" because the exit code cannot tell the §28.2 Warning from the §28.3 Error (#4023) | A code per rule: `BZL28nn` for the §28.3 rejection vs a different serial for the §28.2 warning; the row keys on the code and the wording is free to improve |
+| Family K needs a per-site disposition record for the 12 (now more) `internal:` Warning sites (#2924) | The `99xx` bucket with the disposition column (§2.10 step 1); `check_diags.sh` asserts the invariant |
+| The rule corpus's first classification (#4383, 2,148 cases) must decide "did the compiler reject *for the rule under test*" | A case expecting `BZL2805` is unambiguous; a case expecting "an error" is not (#2988's `hasErrors()` problem, restated) |
+| `check_src_citations.py` (#4455) already resolves every `§N.N` in `src/` against all documents' headings | It is the seed of §2.3's shared resolver: extend it from *section numbers* to *anchor ids* and both gates share one truth |
+
+The measured surface (2026-09-17, `grep` over the tree): **256** `report(Severity::…)` emission sites in `src/` (248 Error, 4 Warning, the rest Note); **648** message strings carry a `(§N.N)` citation inside the text; **1,136** test assertions across **817** test files match message substrings (`.message.find("…")`); **125** lit tests, **84** with `CHECK` lines, **46** `CHECK` lines match a `§` citation, **129** `CHECK-NEXT`/`CHECK-SAME` lines, and **0** end-anchored (`{{$}}`) `CHECK` lines. The last number is the lit-collision audit's headline (§9.4).
+
+### 10.2 The engine change (one struct, one renderer)
+
+Today: `struct Diagnostic { Severity severity; std::string message; SourceLocation location; }` at `src/support/Diagnostic.hpp:22–26`, reported through `DiagnosticEngine::report(Severity, SourceLocation, std::string)` (`:31`), printed as `path:line:col: message` at four sites in `src/driver/Driver.cpp` (`:632`, `:644`, `:773`, `:785`).
+
+S0 adds:
+
+- `DiagCode code = DiagCode::Unregistered;` to `Diagnostic` (a `uint16_t`-backed enum generated from `registry.def`; `Unregistered` renders as `BZL0000` per §2.4's rollout rule) and an overload `report(DiagCode, Severity, SourceLocation, std::string)`. The three-argument `report` stays and stamps `Unregistered`, so **every existing emission site compiles unchanged** and the conversion is per-site and incremental.
+- The four print sites collapse to one `renderText(const Diagnostic&)` in `Diagnostic.cpp`, emitting `path:line:col: message [BZLnnnn]` — the trailing tag, appended after the message and after its `(§N.N)` citation, never before. Four copies of one format is the duplicated-spelling shape the census warns about; S0 is the excuse to close it.
+- `--explain BZLnnnn` in `src/main.cpp`'s argument loop (`:76–:150` today), which prints the embedded page and exits 0; `--explain` with an unknown code exits 2 with "no such code" and the nearest active codes.
+
+### 10.3 `src/support/registry.def` — the X-macro and the seed
+
+One line per code, in the §2.2 format, plus the disposition field for `99xx`:
+
+```
+// DIAG(serial, severity, section, anchor, introduced, origin, summary)
+// DIAG_INTERNAL(serial, severity, disposition, summary)   — bucket 99 only
+DIAG(2801, Warning, "28.3", "sec-diagnostics", "v0.197", SpecMandated,
+     "owned value dropped without disposal (auto-drop must-use warning)")
+DIAG(2802, Error,   "28.3", "sec-diagnostics", "v0.197", SpecMandated,
+     "borrow outlives the source it borrows from")
+DIAG(2803, Error,   "28.3", "sec-diagnostics", "v0.197", SpecMandated,
+     "read of a moved-from binding")
+DIAG(2804, Error,   "28.3", "sec-diagnostics", "v0.197", SpecMandated,
+     "move of a `using var` binding")
+DIAG(2805, Error,   "28.3", "sec-consume-site-freeze", "v0.197", SpecMandated,
+     "consume of an owned binding while a live borrow of its value exists")
+```
+
+Then the §1.2 mandated-content family in the order §5 lists: §28.8.1 field-restoration (`28xx`), §30.5 bare-`await` and un-consumed `OwningTask<T>` (`30xx`, two codes), §29.11 multiple enumeration (`29xx`), §17.13 the `Task` discard naming `FireAndForget` (`17xx`), and the §19.1 missing-`of` syntax error (`19xx`). **All seven anchors §1.2 cites are present in the v0.306 spec** (`sec-diagnostics`, `sec-consume-site-freeze`, `sec-the-field-restoration-rule`, `sec-result-lifetime-and-task-disposal`, `sec-multiple-enumeration`, `sec-the-discard-_`, `appendix-d-conformance-levels` — re-verified 2026-09-17), so the seed needs no re-anchoring. The `introduced` field of each seed row is the revision the *rule* was mandated at, not S0's landing revision; the lane reads the changelog for each.
+
+The generated artifacts, all from this one file: the `DiagCode` enum, the code→metadata lookup `renderText` uses, the `--explain` index, and the `--query registry` dump (S1). One fact, one home.
+
+### 10.4 The lit-collision audit — done by reading, result: zero modifications expected
+
+§5's S0 exit criterion is "gate green with **zero** lit modifications". The audit question is whether appending ` [BZLnnnn]` to the end of every diagnostic line can break an existing `FileCheck` match. Read against `tests/lit/*.bzl` (125 files) on 2026-09-17:
+
+- `CHECK:` and `CHECK-SAME:` are substring matches; a suffix appended *after* the matched text cannot break them. 46 `CHECK` lines match a `§` citation; every one of those is a substring of the line (e.g. `// CHECK-SAME: spec §14.2`).
+- `CHECK-NEXT:` constrains which *line* follows, not where the previous line ends; a longer previous line is still one line. 129 such lines, none affected.
+- The only pattern a trailing tag breaks is an **end-anchored** match, `{{$}}` — and there are **0** in the tree.
+- `NODIAG-NOT: error` / `NODIAG-NOT: §` (the accept-case idiom) are unaffected: a program that compiles clean prints nothing, tag or no tag.
+- The gtest side: `diagnosticMessageContains` (`tests/support/aot_result_asserts.hpp:98`) and the 1,136 `.message.find("…")` assertions test `Diagnostic::message`, which S0 leaves **untagged** — the tag lives in the rendered text only. So the gtest track is untouched by construction, not by audit.
+
+The residual risk is a test that compares a *rendered* stderr line for equality; `scripts/extract_diag_to_lit.py` generates `CHECK` lines from bezelc's own output, so future extractions will carry the tag, and a `// CHECK-SAME: [BZL2805]` becomes the idiom §2.10 step 2 asks for. The lane re-runs this audit mechanically before landing (`grep -c '{{\$}}' tests/lit/*.bzl` must still be 0).
+
+### 10.5 `scripts/check_diags.sh` on the shared resolver
+
+`scripts/check_src_citations.py` (#4455) already does the hard half: `defined_sections()` reads the headings of the spec, stdlib, rationale and every guide (the lesson recorded in its own docstring — a checker that reads the spec's headings alone manufactures false positives). S0 extends it, rather than writing a second resolver, by:
+
+1. factoring `defined_sections()` and a new `defined_anchors()` (every `<a id="sec-…">` and `appendix-…` id, the same two styles `check_docs.sh` check 1 resolves at `:242–:266`) into `scripts/docrefs.py`, imported by `check_src_citations.py`, `check_diags.py` and — when 0054's S0 lands — its trace-coverage tool. **This discharges 0052 Q4 and 0054's joint-custody clause with one file**, and answers "who owns the resolver": the script family under `scripts/`, gated by `gate_full_cycle.sh` like its siblings.
+2. `check_diags.py` then asserts §2.3's four checks over `registry.def` and the explain pages: anchor resolution, section sanity, explain totality, registry integrity (no serial reused across active+retired; retired names successors; severity/origin/disposition well-formed) — plus the family-K invariant: no `99xx` entry with disposition `unsafe-pointer` and severity `Warning`.
+3. It ships with `--self-test` (plants a dangling anchor and a reused serial in a temp copy and proves both are caught) and lands as a phase in `gate_full_cycle.sh` beside the `src-citation phase` (`:852–:867`), self-test first, fail-closed — the discipline [`oracle-ratchets-2026-09.md`](oracle-ratchets-2026-09.md) §0.1 states for the whole script family.
+
+### 10.6 Explain pages
+
+One Markdown-in-a-string page per active code, embedded in the binary (a generated `explain_pages.inc` from `docs/explain/BZLnnnn.md`? — **no**: the ruling and §2.1 keep the registry and pages under `src/`, not `docs/`, so the six normative documents and `check_docs.sh` are not touched; the pages live at `src/support/explain/BZLnnnn.md` and are embedded at build time). Each page: the rule in one paragraph, the spec anchor as a link, one rejected example and one accepted rewrite, and the standard remedies the spec names where it names them (§28.8.1's three). Citation policy per Q5's lean: landed normative documents only; `check_diags.py` resolves every citation in every page.
+
+### 10.7 Conversion order and the exit criterion
+
+Convert emission sites in this order, each conversion a small commit that adds the `DIAG` row, stamps the site, and updates that site's lit test to `CHECK-SAME: [BZLnnnn]`:
+
+1. the five §28.3 seeds (they are the most-tested rejections in the suite, so the tag's harmlessness is proven on the widest surface first);
+2. the §1.2 mandated-content family;
+3. the ownership pass's remaining Error sites (`src/ownership/`, the bulk of the 248 — bucket `28`, overflowing into `78` per §2.2 when serial 99 is reached);
+4. sema's reject families (`src/sema/`, buckets by chapter);
+5. the `99xx` internal sites, each with its disposition — this step is family K's anchor deliverable and should be reviewed by that family's lane.
+
+**Exit:** every `report(` in `src/ownership/` and `src/sema/` carries a code (`grep -c 'report(Severity::' src/ownership src/sema` returns 0 — a ratchet in the same family as the deprecated-JIT one, baseline exact-not-ceiling), `--explain` answers every active code, `check_diags.py` is in the gate, and the lit track has had zero edits except the additive `CHECK-SAME: [BZLnnnn]` lines.
+
+### 10.8 What S0 deliberately leaves to S1
+
+`secondary_spans` (today three ownership diagnostics interpolate a second location into prose — "was here" / "declared at line" — measured 2026-09-17), `ownership_trace`, fixits, `--diag-format=json`, `--check` and `--query`. S0's `Diagnostic` gains only `code`; the S1 fields are added in one further schema step so that S0 cannot be blocked on the trace serialization design.
+
+## 10. Relations
 
 [#2039](https://github.com/s8lap/bezel-lang/issues/2039) (tracking) · [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) P12 (mandate) · proposal [0040](0040-build-system.md) (driver verbs; S3's graph + Q1) · proposal [0043](0043-behavioral-contracts.md) §6.1/§7 (clause identity + tier vocabulary in the `contract` payload) · proposal [0046](0046-ownership-kernel-consolidation.md) (K1–K9; `kernel` payload + explain derivations) · proposal 0054 (drafted in parallel; shared spec-anchor infrastructure) · proposal [0022](0022-test-framework.md) (code-keyed assertions; report span reuse) · spec Appendix [D](../Bezel_Language_Spec.md#appendix-d-conformance-levels) *Diagnostic identity* (the latitude this stays inside) · spec §28.3 [*Diagnostics*](../Bezel_Language_Spec.md#sec-diagnostics) (the mandated-content anchor) · `tests/README.md` + `scripts/extract_diag_to_lit.py` (the wording-fragility evidence) · `scripts/check_docs.sh` (the anchor-gate discipline §2.3 reuses).

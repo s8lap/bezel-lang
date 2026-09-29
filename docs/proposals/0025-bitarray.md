@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1452](https://github.com/s8lap/bezel-lang/issues/1452) |
 | **Target module(s)** | `System.Collections.Generic` (stdlib §4) — new §4.20 |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
+| **Currency note** | Refreshed 2026-09-17 to v0.306: the two "`System.Collections.Generic` is not auto-imported" claims (§D1, §6 item 2) corrected — §4 has been auto-imported since **v0.289** (0122 L3), and the quoted stdlib §4 sentence no longer exists. §D2/§D3/§D4's citations re-verified (`OwningBuffer<T>.Length`, `Array<T>.Sort`/`Reverse` — restored on `Array<T>` itself at v0.275 — and the `Span<T>` indexer bounds-check all stand). No tier-2 flags. Written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #28 (P1), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
 | **Depends on** | [Proposal 0008](0008-integer-toolkit.md) / [#1437](https://github.com/s8lap/bezel-lang/issues/1437) — `BitOperations.PopCount` is used internally for `PopCount`. `BitArray` without `PopCount` is independent; `PopCount` requires 0008 to land first. |
 
@@ -29,7 +30,7 @@ There is no bit-packed boolean collection in the stdlib today. The natural alter
 
 *Why `sealed`.* `BitArray` is declared `sealed`. Beyond the usual "no subclass needs to extend it" reasoning, `sealed` is what makes it **sendable** under §30.14 rule 1 (an open class is never sendable). With its single backing field an `owned Array<uint>`, the sendability derivation goes through — see §D9.
 
-*Why §4, not a new module.* `BitArray` is a collection of booleans; it belongs beside `Array<T>` and `Queue<T>` in `System.Collections.Generic`. Note that `System.Collections.Generic` is **not** auto-imported — spec §2.3 auto-imports only `System` and `System.Text`, and stdlib §4 states "None are auto-imported except the iteration-interface family." A program using `BitArray` therefore writes `import System.Collections.Generic;`, exactly as it must for `Dictionary`/`Queue`.
+*Why §4, not a new module.* `BitArray` is a collection of booleans; it belongs beside `Array<T>` and `Queue<T>` in `System.Collections.Generic`. Note that `System.Collections.Generic` **is** auto-imported (v0.289, graduation batch 0122 L1–L18 item L3) — spec §2.3 carries the module row and stdlib §4 states "**Auto-imported:** this module is on language spec §2.3's auto-import list, so every name below resolves in every file with no `import`". A program using `BitArray` therefore needs no import line at all, exactly as for `Dictionary`/`Queue`; the bare name `BitArray` joins §2.3's stated cost, which is the price the row records. *(Written against v0.177, when §4 required an explicit `import System.Collections.Generic;`; the home-module argument is unchanged either way.)*
 
 *Internal representation.* The backing store is an internal `owned Array<uint>` field (the `owned` marker matters for the §D9 sendability derivation) with `(Length + 31) / 32` elements; bit `i` occupies bit position `i mod 32` of word `i / 32`. This is an implementation detail (the implementation may use `ulong` for performance or other packing strategies); it is not part of the contract. The spec says *class over an internal packed storage*; what the storage is remains internal.
 
@@ -219,7 +220,7 @@ end;
 ## 6. Declined alternatives (register)
 
 1. **Value record instead of class** — `BitArray` is mutable and owns backing storage; value records with in-place mutation are "inadvisable" (§9.4). (§D1)
-2. **New module (e.g., `System.Collections`)** — `BitArray` is a collection; §4 (`System.Collections.Generic`) is the natural home, beside `Array<T>`/`Queue<T>`. No new module needed. (Like the rest of §4 it requires an explicit `import System.Collections.Generic` — it is not auto-imported.) (§D1)
+2. **New module (e.g., `System.Collections`)** — `BitArray` is a collection; §4 (`System.Collections.Generic`) is the natural home, beside `Array<T>`/`Queue<T>`. No new module needed. (Like the rest of §4 it is auto-imported — v0.289; no `import System.Collections.Generic` line is needed.) (§D1)
 3. **Count instead of Length** — `Count` signals resizable semantics; `Length` matches `OwningBuffer<T>` and the fixed-size convention. (§D2)
 4. **Return-new (non-mutating) And/Or/Xor** — allocates an intermediate per operation; in-place matches the collection mutation conventions of §4 (`Array<T>.Sort`, `Array<T>.Reverse`). `Clone` covers the non-destructive need. (§D3)
 5. **No `IEnumerable<bool>` (indexed-only)** — `BitArray` is concrete, not generic; the §4.14 conditional-interface limitation does not apply; direct conformance unlocks `for`-loops and LINQ at no extra cost. (§D8)

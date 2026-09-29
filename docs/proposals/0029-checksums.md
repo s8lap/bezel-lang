@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1454](https://github.com/s8lap/bezel-lang/issues/1454) |
 | **Target module(s)** | `System.IO.Hashing` (new module; requires `import System.IO.Hashing`) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified clean at v0.306 (2026-09-17 sweep) — §4.2's §8.6 span/`IEnumerable` quotation still matches the landed text, `IReadOnlySpan<byte>` (§4.16), `Encoding.ASCII.GetBytes`, `Array<T>(size, fill)`, `new FileStream(path, mode)` (the v0.290 `access := FileAccess.ReadWrite` default leaves the two-argument call unchanged) and `Stream.Read(buffer, offset, count)` (the one recorded `(offset, count)` window exception, stdlib §1) all read as cited. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #27 (P1), wave D3 (the design plan lists #27 under wave D3); depends on proposal 0008 (integer toolkit — [#1437](https://github.com/s8lap/bezel-lang/issues/1437)) |
 
 ---

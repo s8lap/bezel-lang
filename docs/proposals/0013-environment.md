@@ -6,7 +6,7 @@
 | **Target module** | `System` (auto-imported): additions to `Environment` (§2.4) + new `OperatingSystem` static class |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1441](https://github.com/s8lap/bezel-lang/issues/1441) |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified at v0.306 (2026-09-17 sweep) with no tier-1 respell applied. **Pinned-spelling record (v0.231, the changelog's own instruction for this file):** stdlib §2.4 renamed `GetEnvironmentVariable`→`Get`, `SetEnvironmentVariable`→`Set`, `GetEnvironmentVariables`→`Variables`, and the v0.231 migration entry directs that proposals 0011, 0013 and 0045 "keep their pinned long-name spellings and take a currency note at their next revalidation, not a retro-edit" — this is that note; read every `Get*EnvironmentVariable*` below as the v0.177 spelling of the current member. §2.4 has also since gained `GetInt`/`GetBool` and `Exit`, so §1's "already exists" enumeration is a pinned, not a current, list. `CurrentDirectory`, `ProcessId` and `OperatingSystem` are still absent from the landed stdlib, so the gap this proposal fills is open. Written-against pin unchanged. |
 | **Gap-review item** | #12 (P0+2×P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 
 ---

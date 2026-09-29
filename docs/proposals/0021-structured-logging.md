@@ -5,6 +5,7 @@
 | **Status** | under-review — Draft for owner review |
 | **Target module** | `System.Diagnostics` (a new §8.3, beside `Stopwatch`/`Debug`; requires `import System.Diagnostics`) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
+| **Currency note** | Re-verified at v0.306 (2026-09-17 sweep): no tier-1 respells — the §6.8 `Domain.Spawn` async-entry row, §6.9's bounded-channel drop contract, §30.14's sendability derivation for `LogEvent`, and the `Array<LogField>` collection-literal target all still read as cited. ⚠ **Two tier-2 flags** recorded in `proposals-currency-2026-09-17.md` §3: (1) D2's "Bezel has no sum-type / closed-union construct" premise is dead — `choice` shipped at v0.200 (spec §35) — and v0.265 additionally makes a record with an `Object`-typed field borrow-bearing, which changes D2's stated reason for declining `Value: Object`; (2) §3's per-level `ILogger` convenience ladder predates v0.290's one-`:=`-defaulted-signature rule (stdlib §1). Written-against pin unchanged. |
 | **Tracking issue** | [#1460](https://github.com/s8lap/bezel-lang/issues/1460) |
 | **Gap-review item** | #8 (P0, diagnostics) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md); wave **D3** in the [gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) ("design after 0002 experience") |
 | **Design influences** | .NET `Microsoft.Extensions.Logging` `ILogger` (levels + `IsEnabled`); Serilog for the structured-fields idea — but **not** its message-template auto-capture (declined, §D3); Rust `tracing`/`log` for the facade-plus-sink split |

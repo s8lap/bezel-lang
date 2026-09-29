@@ -6,6 +6,7 @@
 | **Tracking issue** | — (none yet) |
 | **Target module(s)** | `System.Security.Cryptography` (new module; requires `import System.Security.Cryptography`) — the [stdlib §11](../Bezel_Standard_Library.md#11-modules-deferred-to-future-revisions) deferred line made concrete |
 | **Written against** | spec/stdlib **v0.227** |
+| **Currency note** | Refreshed 2026-09-17 to v0.306: one use-site respell in §9's worked example (*Usage examples*) — `out owned var presented` → `out var presented` (the `out owned var` use-site spelling was retired at v0.289; the inline declaration adopts the callee's announced classification, spec §28.3 / Appendix A.4). Declaration-position `out owned` slots are unchanged. Stream windowing (`Read(buffer, offset, count)`) re-verified against stdlib §7.1's recorded `(offset, count)` exception to the v0.282 window convention. No tier-2 flag. Written-against pin unchanged. |
 | **Origin** | Adversarial stdlib review pass, 2026-07 (confirmed gap). **Not** among the 31 ranked gaps of the [2026-07 gap review](stdlib-gap-review-2026-07.md) — this proposal extends that map; the review touches the domain only through its decline register (#2: *BigInteger rides the crypto milestone*) and the §11 placeholder line |
 | **Design influences** | .NET `System.Security.Cryptography` (`SHA256.HashData`, `HMACSHA256`, `CryptographicOperations.FixedTimeEquals`, `RandomNumberGenerator`) for names and shapes; proposals 0008/0029 for the house accumulator pattern; proposal 0009 for the byte-in/byte-out conventions; proposal 0007 for the OpenSSL substrate posture |
 
@@ -296,7 +297,7 @@ import System.Security.Cryptography;
 public method VerifySignature(secret: string, body: Array<byte>, signatureHex: string): bool
   var key := Encoding.UTF8.GetBytes(secret);                   // §3.2; owned, trivial-dispose
   var expected := HmacSha256.Compute(key.AsReadOnlySpan(), body.AsReadOnlySpan());
-  if not Convert.TryFromHexString(signatureHex, out owned var presented) then
+  if not Convert.TryFromHexString(signatureHex, out var presented) then
     return false;                                              // malformed hex ≠ a fault here
   end;
   // `presented` is narrowed non-null past the check (§22.4 when-true postcondition).

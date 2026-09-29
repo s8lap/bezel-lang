@@ -8,7 +8,7 @@
 | **Written against** | spec/stdlib **v0.227** |
 | **Origin** | Adversarial stdlib review pass, 2026-07 (confirmed gap). **Not** among the 31 ranked gaps of the [2026-07 gap review](stdlib-gap-review-2026-07.md) — this proposal extends that map: no stdlib section covers compression, no §11 deferred-module line names it, and no proposal 0001–0067 designs it. The nearest recorded trace is proposal [0002](0002-http-server.md)'s deferred list, which names "compression" with no design behind it |
 | **Design influences** | .NET `System.IO.Compression` (`GZipStream`/`DeflateStream`) for the wrapper concept — **not** its mode-enum constructor; proposal [0006](0006-stream-family.md) for the owned-wrapping stream discipline this proposal anchors on; zlib's deflate/inflate API as the streaming substrate model |
-| **Currency note** | Refreshed 2026-08-11 to v0.246: caller-side transfer marker respelled `move` (`Decompress(move fs)`); declaration-side `owned` unchanged. Written-against pin unchanged. |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: caller-side transfer marker respelled `move` (`Decompress(move fs)`); declaration-side `owned` unchanged. Written-against pin unchanged. **2026-09-17 sweep — refreshed to v0.306:** one use-site respell in §9's worked example (*Usage examples*), `out owned var data` → `out var data` (the `out owned var` use-site spelling was retired at v0.289; the inline declaration adopts the callee's announced classification, spec §28.3 / Appendix A.4). The `out owned result: Array<byte>?` **declaration** slots in the proposed signatures are unchanged. No tier-2 flag. Written-against pin unchanged. |
 
 Every type and method this proposal builds on is cited to `Bezel_Standard_Library.md` or the language spec; everything new is **proposed** and appears in §5. Surface that exists only in another *proposal* (0006's `CopyToAsync`/`MemoryStream`, 0009's encodings) is cited as proposal surface, never as current stdlib.
 
@@ -304,7 +304,7 @@ end PackAsync;
 var compressed := Gzip.Compress(payload.AsReadOnlySpan());        // payload: Array<byte>
 
 // 4. One-shot, untrusted input: the cap is mandatory and the Try form is total.
-if Gzip.TryDecompress(upload.AsReadOnlySpan(), 8 * 1024 * 1024, out owned var data) then
+if Gzip.TryDecompress(upload.AsReadOnlySpan(), 8 * 1024 * 1024, out var data) then
   Process(data);        // narrowed non-null past the check (§22.4 when-true postcondition)
 end;
 

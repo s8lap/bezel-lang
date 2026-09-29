@@ -5,7 +5,7 @@
 | **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Text.RegularExpressions` (new; explicit `import`) |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified clean at v0.306 (2026-09-17 sweep) — §28.14's *call-bounded* parameter default, §29.11's `ToArray()` re-enumeration remedy, `Range<int>`, §10.5's enum restrictions and the `ReadOnlyStringSpan`/`ReadOnlySpan` type names all still read as cited. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
 | **Tracking issue** | [#1449](https://github.com/s8lap/bezel-lang/issues/1449) |
 | **Gap-review item** | #19 (2026-07 ranking, wave D3) — *"Regex engine — P1; deferred in stdlib §11"* |
 | **Design character** | **RFC** — the load-bearing decision (engine family) is a language-values question, not a mechanical one. This proposal *frames the fork and recommends*; the fork is now resolved under delegated ruling authority (see "Rulings recorded at acceptance" below). |
