@@ -14974,6 +14974,173 @@ void ExprTC::checkDeferredNamedThisChain(const ast::ConstructorDecl& cd) {
     }
 }
 
+// fix #5151 (§12.8 / Appendix C.5, v0.309): the general `this(...)` chain
+// cycle check. §12.8: "the chain must end: following each constructor's
+// `this(...)` to the constructor it resolves to (§22.6) — resolved at the
+// declaration, not per instantiation — must reach a constructor that does
+// not chain with `this(...)`. A constructor that reaches itself — directly
+// or through other constructors of the type — is a compile error at its
+// declaration, reported naming the participating constructors, as for an
+// inheritance cycle (§12.10)."
+//
+// WHAT WAS MISSING. `Resolver::checkTypeConstructorChains`'s #3793 arity
+// heuristic (TypeResolution_Checks.cpp) judges only a DIRECT self-chain
+// (a leading `this(...)` whose arity matches its own constructor's and no
+// OTHER ConstructorSymbol's), and — per its own comment — "exempts every
+// type with a primary list, class or record" outright, so it never even
+// looks at a cycle among a primary-having type's body constructors.
+// `checkDeferredNamedThisChain`'s own cycle walk (#4791, above) is narrower
+// still: it only runs in the deferred-NAMED domain (a call whose arity
+// matches its own constructor's, no OTHER same-arity sibling exists, and a
+// named argument does not name its own parameter). A defaulted-parameter
+// cycle between two body constructors of a RECORD or a same-arity cycle
+// between two constructors distinguished only by parameter TYPE fell
+// through both: neither is a direct self-chain (the resolver's siblingMatch
+// / same-arity tests both find another candidate and back off), and the
+// #4791 domain requires a named argument mismatching its OWN constructor,
+// which a same-arity / positional chain never has.
+//
+// THE FIX. Walk the graph once per TYPE, after every local constructor's
+// body has been typechecked (called from `visitTopDecl` / `visitMember`
+// right after a type's members are visited, so argument types are in hand
+// for every hop, not just the first). At each `this(...)` chain call, find
+// the candidate constructors that §22.5-bind it (structural: names, arity,
+// defaults); with more than one, narrow to the single one that is also
+// §22.6-applicable to the typed arguments (mirrors #4791's own narrowing,
+// generalized to every hop rather than only the deferred domain) — an
+// unresolved ambiguity is left alone here, to the ranking / rejection
+// diagnostics `checkChainCallBinding` / `checkChainCallApplicability`
+// (#4824 / #4854) already give it. Follow the unique target; a walk that
+// returns to the starting declaration is the cycle §12.8 forbids.
+void ExprTC::checkConstructorChainCycles(TypeSymbol* t) {
+    if (!t) return;
+    struct Node {
+        const ast::ConstructorDecl* decl;
+    };
+    std::vector<Node> ctors;
+    for (Symbol* m : t->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        ctors.push_back({cd});
+    }
+    if (ctors.size() < 2) return;
+
+    // The single §22.5-binding OTHER constructor of `fromCd`'s chain call —
+    // structural (name/arity/defaults) when only one binds; when several
+    // structurally bind, the single one that is ALSO §22.6-applicable to the
+    // typed arguments (the same per-argument test #4791's own narrowing
+    // uses). Anything else (zero, or more than one applicable) is not a
+    // resolvable edge here (an unresolved type counts as inapplicable, so
+    // an unprovable edge can only hide a cycle, never invent one).
+    auto resolveTarget = [&](const ast::ConstructorDecl* fromCd,
+                             const ast::CallExpr& call)
+            -> const ast::ConstructorDecl* {
+        std::vector<const ast::ConstructorDecl*> structural;
+        for (const Node& n : ctors) {
+            if (n.decl == fromCd) continue;
+            if (bindArgsToParams(n.decl->params, call.args, call.span.begin,
+                                 std::string(), /*emit=*/false).ok)
+                structural.push_back(n.decl);
+        }
+        // Even a lone structural binder must be type-applicable: `this(7)`
+        // beside `constructor(a: bool)` binds by arity but resolves to the
+        // primary (§22.6), so it is no edge to that constructor.
+        const ast::ConstructorDecl* applicable = nullptr;
+        int applicableCount = 0;
+        for (const ast::ConstructorDecl* od : structural) {
+            const BindResult b = bindArgsToParams(od->params, call.args,
+                                                  call.span.begin,
+                                                  std::string(), false);
+            bool ok = b.ok;
+            for (std::size_t j = 0; ok && j < od->params.size(); ++j) {
+                const int ai = j < b.paramToArg.size() ? b.paramToArg[j] : -1;
+                if (ai < 0) continue;  // filled by its declared default
+                const ast::CallArgument& a =
+                    call.args[static_cast<std::size_t>(ai)];
+                if (!a.modifier.empty() || a.isDiscard || !a.value ||
+                    !od->params[j].type) { ok = false; break; }
+                const TypeRef* at = ctx_.exprType(*a.value);
+                const TypeRef* pt = ctx_.resolvedType(*od->params[j].type);
+                if (!at || !pt) { ok = false; break; }
+                at = narrowIntConstantToTarget(a.value.get(),
+                                              const_cast<TypeRef*>(at),
+                                              const_cast<TypeRef*>(pt));
+                if (classifyArg(at, pt) == ArgMatch::NotApplicable) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) { ++applicableCount; applicable = od; }
+        }
+        return applicableCount == 1 ? applicable : nullptr;
+    };
+
+    for (const Node& n : ctors) {
+        const ast::ConstructorDecl* cd = n.decl;
+        if (cd->body.empty() || !cd->body[0]) continue;
+        bool isThis = false;
+        const ast::CallExpr* chain = ast::chainCallOfStmt(*cd->body[0], isThis);
+        if (!chain || !isThis) continue;
+        // A misplaced/duplicated chain call already carries §12.8's own
+        // diagnostic (`Resolver::checkTypeConstructorChains`); do not pile a
+        // second one onto the same constructor.
+        bool wellFormed = true;
+        for (std::size_t i = 1; i < cd->body.size() && wellFormed; ++i) {
+            bool ignored = false;
+            if (cd->body[i] && ast::chainCallOfStmt(*cd->body[i], ignored))
+                wellFormed = false;
+        }
+        if (!wellFormed) continue;
+
+        // Follow the resolved chain from `cd`, watching for a return to
+        // `cd` itself; `path` collects the participating constructors.
+        const ast::ConstructorDecl* cur = cd;
+        const ast::CallExpr* curChain = chain;
+        std::vector<const ast::ConstructorDecl*> path{cd};
+        bool cyclic = false;
+        while (true) {
+            const ast::ConstructorDecl* next = resolveTarget(cur, *curChain);
+            if (!next) break;
+            if (next == cd) { cyclic = true; break; }
+            if (std::find(path.begin(), path.end(), next) != path.end())
+                break;  // a cycle NOT involving `cd` — reported from its own
+                        // earliest member's walk.
+            path.push_back(next);
+            if (next->body.empty() || !next->body[0]) break;
+            bool nextIsThis = false;
+            const ast::CallExpr* nextChain =
+                ast::chainCallOfStmt(*next->body[0], nextIsThis);
+            if (!nextChain || !nextIsThis) break;
+            cur = next;
+            curChain = nextChain;
+        }
+        if (!cyclic) continue;
+        // One report per cycle, at the declaration of its earliest member
+        // (§12.8: "a compile error at its declaration, reported naming the
+        // participating constructors"): every member's walk finds the same
+        // cycle, so only the walk starting at that member reports.
+        bool earliest = true;
+        for (const auto* o : path)
+            if (o != cd && o->span.begin.offset < cd->span.begin.offset)
+                earliest = false;
+        if (!earliest) continue;
+        std::string names;
+        for (const auto* o : path) {
+            if (!names.empty()) names += ", ";
+            names += "`" + std::string(t->name) +
+                     methodSignatureString("", o->params) + "`";
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, cd->span.begin,
+            "`this(...)` constructor chain cycle in `" +
+            std::string(t->name) + "`: the constructors " + names +
+            " chain to one another and never reach a constructor that does "
+            "not chain with `this(...)` (§12.8, Appendix C.5)");
+    }
+}
+
 // fix #4905 (§22.3 "Parameter modifiers" / §22.5 / §22.6, v0.307): the
 // §22.3 call-site `ref`/`out` rule at a `this(...)` / `base(...)` constructor
 // chain call. "The caller writes `ref` at the call site", `out` likewise, and

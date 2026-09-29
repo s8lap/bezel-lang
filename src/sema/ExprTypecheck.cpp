@@ -14257,6 +14257,11 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                                                   /*implicitSpelling=*/true);
             }
         }
+        // fix #5151 (§12.8 / Appendix C.5, v0.309): the general `this(...)`
+        // chain cycle check, run once per type now that every local
+        // constructor's body (and so every chain call's arguments) has been
+        // typechecked above.
+        checkConstructorChainCycles(tsym);
         currentType_ = save;
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §26.1: inside an extension block, `this` is the receiver. For an
@@ -16797,6 +16802,9 @@ void ExprTC::visitMember(const ast::Member& m) {
             for (const auto& innerM : nt->decl->members) {
                 if (innerM) visitMember(*innerM);
             }
+            // fix #5151 (§12.8 / Appendix C.5, v0.309): same cycle check as
+            // `visitTopDecl`'s, for a NESTED type's own constructors.
+            checkConstructorChainCycles(nested);
             currentType_ = save;
         }
     } else if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(&m)) {

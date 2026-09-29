@@ -2893,6 +2893,15 @@ private:
     // with a specific diagnostic otherwise. See the definition in
     // ExprTypecheck_Calls.cpp.
     void checkDeferredNamedThisChain(const ast::ConstructorDecl& cd);
+    // fix #5151 (§12.8 / Appendix C.5, v0.309): a general cycle walk over the
+    // RESOLVED `this(...)` chain graph of `t`'s own (local, non-static)
+    // constructors, run once per type after every member has been
+    // typechecked. Replaces the resolver's #3793 arity-only self-chain check
+    // (which exempted every type with a primary constructor list) and
+    // generalizes it to a cycle of any length among body constructors,
+    // disambiguated by §22.6 applicability when more than one candidate
+    // structurally binds a hop. See the definition in ExprTypecheck_Calls.cpp.
+    void checkConstructorChainCycles(TypeSymbol* t);
     // fix #4905 (§22.3 / §22.5 / §22.6, v0.307): the §22.3 call-site
     // `ref`/`out` rule at a `this(...)` / `base(...)` chain call — reports a
     // mismatch only when no candidate constructor binding the call accepts
