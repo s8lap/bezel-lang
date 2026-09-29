@@ -75,17 +75,6 @@ using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotCheckedLenient;
 
-namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
-
 // ===========================================================================
 // A — method-own `U` argument widened to an `Object?` field, escaping the
 // call. Looped 50x: the pre-existing leak (48 bytes/call = 2400 bytes/50
@@ -116,7 +105,6 @@ BEZEL_TEST(codegen_5127_escape, method_own_type_param_object_field_escape_no_uaf
         "    return total; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 50);
 }
@@ -161,7 +149,6 @@ BEZEL_TEST(codegen_5127_escape, method_own_type_param_wrapped_closure_return_no_
     // an earlier revision of this row summed 42 per call (2100 raw), whose
     // truncated exit code (2100 mod 256 = 52) still looked plausible and
     // silently pinned the wrong number until this comment's fix.
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 50);
 }
