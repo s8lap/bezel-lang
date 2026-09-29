@@ -9857,6 +9857,35 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                               *ctorArgExprs[pi]);
                             llvm::Value* argVal = wrapArgForNullableValueFormal(
                                 args[pi + 1], formal, argUns);
+                            // fix #4823 (§5.1 "Implicit numeric conversions",
+                            // v0.307): `wrapArgForNullableValueFormal` only
+                            // handles a NULLABLE-value formal, so a plain
+                            // (non-`?`) numeric formal fell through
+                            // unwidened — a non-constant `int` argument at a
+                            // `double` ctor parameter bound the inlined
+                            // body's alloca at the ARGUMENT's own i32 width
+                            // while the body's uses of the formal (e.g.
+                            // `$"F{v}"`) expect double, so the inlined body
+                            // emitted a mismatched call parameter and
+                            // `verifyModule` rejected the module ("Call
+                            // parameter type does not match function
+                            // signature!"). #4046 covered only an int
+                            // LITERAL argument (constant-folded before this
+                            // point). Reuse `coerceExprValueToSlot` — the
+                            // same widening an ordinary compiled method-call
+                            // argument gets (LlvmBackend_Layout.cpp) —
+                            // rather than new logic; it is a no-op for a
+                            // non-numeric / already-matching value.
+                            if (formal) {
+                                llvm::Type* declLTy = lowerTypeRef(formal);
+                                if (declLTy && argVal->getType() != declLTy)
+                                    argVal = coerceExprValueToSlot(
+                                        argVal, declLTy,
+                                        pi < ctorArgExprs.size()
+                                            ? ctorArgExprs[pi]
+                                            : nullptr,
+                                        argUns);
+                            }
                             auto* slot = entryAlloca(argVal->getType());
                             builder_.CreateStore(argVal, slot);
                             paramSlots_[cs->params[pi]] = slot;
