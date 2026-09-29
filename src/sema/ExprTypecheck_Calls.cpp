@@ -5621,6 +5621,55 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         } else if (md && !md->returnType) {
             // No return type ascription → unit.
+            //
+            // fix #5162 (§14.1/§14.2/§5.1, v0.309): the `md->returnType`
+            // guard above (~L5042) is where `explicitSubst` gets populated
+            // from an EXPLICIT `<...>` type-argument list at the call site
+            // (`obj.Method<T>(...)`) — but that whole arm is skipped for a
+            // void-returning method (no `md->returnType` to substitute
+            // into), so `explicitSubst` stayed empty here and the later
+            // `checkCallArity(ce, ms, &explicitSubst)` (~L13821) checked the
+            // caller's argument against the bare, unsubstituted method-own
+            // type parameter (e.g. `U`) instead of the concrete instantiation
+            // (e.g. `() -> int`). A function-typed argument to a bare-`U`
+            // formal was rejected with a spurious "not implicitly
+            // convertible to the target type (§5.1)" purely because the
+            // callee happened to be void — the non-void sibling with an
+            // identical formal/argument shape compiled cleanly. Mirror just
+            // the explicit-type-argument-list half of the sibling arm here
+            // (no return-type substitution applies — there is no return
+            // type): build `explicitSubst` from the call's own `<...>` list
+            // and re-run the method's `where`-constraint and async-
+            // borrow-bearing checks against it, exactly as the non-void arm
+            // does before consuming `explicitSubst`.
+            if (md && !md->genericParams.empty()) {
+                const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+                    nullptr;
+                if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce.callee.get()))
+                    callTypeArgs = &callMa->typeArgs;
+                else if (auto* callNcm =
+                             dynamic_cast<const ast::NullCondMemberExpr*>(
+                                 ce.callee.get()))
+                    callTypeArgs = &callNcm->typeArgs;
+                else if (auto* callId = dynamic_cast<const ast::IdentifierExpr*>(
+                             ce.callee.get()))
+                    callTypeArgs = &callId->typeArgs;
+                if (callTypeArgs && !callTypeArgs->empty()) {
+                    for (std::size_t gi = 0;
+                         gi < md->genericParams.size() &&
+                         gi < callTypeArgs->size(); ++gi) {
+                        if (!(*callTypeArgs)[gi]) continue;
+                        TypeRef* concreteArg =
+                            ctx_.resolvedType(*(*callTypeArgs)[gi]);
+                        if (concreteArg)
+                            explicitSubst[md->genericParams[gi].name] =
+                                concreteArg;
+                    }
+                    checkMethodGenericConstraints(explicitSubst);
+                    checkAsyncInstantiationBorrowBearing(explicitSubst);
+                }
+            }
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
             ctx_.setExprType(&ce, unit);
