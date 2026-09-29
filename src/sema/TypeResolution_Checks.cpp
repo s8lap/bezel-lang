@@ -12989,18 +12989,57 @@ void Resolver::checkSerializationEligibility() {
             // else { ... }`, treating a record as either positional or body
             // form — never both — so a combined-form record's body ctor
             // binding an auto-property component could not match.)
+            //
+            // fix #5179 (§9.8 step 2, v0.310): detect case-folded collisions
+            // between components. §9.8 step 2 says "the case-insensitive
+            // comparison leaves a parameter ambiguous between two
+            // components" is a compile error at the conformance declaration;
+            // dc ruling 2026-09-29 made the rule concrete — reject two
+            // components whose case-folded names collide, intrinsic to the
+            // type (no explicit-ctor selection can resolve it). The set
+            // alone (pre-fix) masked the collision: `Foo` and `foo` both
+            // lowered to `foo`, so the set held one entry, and no ctor's
+            // arity-N parameter list could biject against a size-1 set when
+            // there were two components — the matching fell through to the
+            // synthesized primary and the record was silently accepted. We
+            // track the first component to register each lowered name so
+            // the diagnostic names both colliding components.
             std::unordered_set<std::string> compNamesLower;
             std::vector<std::string> compNamesOrig;
+            std::unordered_map<std::string, std::string> compLowerFirstOrig;
+            auto addComponent = [&](std::string_view name) {
+                std::string orig(name);
+                std::string lowered = toLower(name);
+                auto prior = compLowerFirstOrig.find(lowered);
+                if (prior != compLowerFirstOrig.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: components `" + prior->second +
+                        "` and `" + orig + "` are ambiguous between two "
+                        "components under the case-insensitive comparison "
+                        "§9.8 step 2 uses to match constructor parameters — "
+                        "both lowercase to `" + lowered +
+                        "` (§9.8 step 2, v0.310; Appendix C.8)");
+                    foundError = true;
+                    return;
+                }
+                compLowerFirstOrig.emplace(lowered, orig);
+                compNamesLower.insert(lowered);
+                compNamesOrig.push_back(orig);
+            };
             if (td->hasPositionalFields) {
                 for (const auto& pf : td->positionalFields) {
-                    compNamesLower.insert(toLower(pf.name));
-                    compNamesOrig.push_back(std::string(pf.name));
+                    if (foundError) break;
+                    addComponent(pf.name);
                 }
             }
-            for (const Symbol* m : t->members) {
-                if (!hasAstAutoPropertyDecl(m)) continue;
-                compNamesLower.insert(toLower(m->name));
-                compNamesOrig.push_back(std::string(m->name));
+            if (!foundError) {
+                for (const Symbol* m : t->members) {
+                    if (!hasAstAutoPropertyDecl(m)) continue;
+                    addComponent(m->name);
+                    if (foundError) break;
+                }
             }
 
             // Collect non-static EXPLICIT constructors and check which match.
