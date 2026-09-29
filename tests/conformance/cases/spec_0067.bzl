@@ -1,4 +1,4 @@
-// Non-null owned slots; initializer required at declaration
+// Non-null owned slots; no default slots, so initialized explicitly (§7.9)
 var fixed: [3 owned]Connection := [
   Connect("primary"), Connect("secondary"), Connect("tertiary")
 ];

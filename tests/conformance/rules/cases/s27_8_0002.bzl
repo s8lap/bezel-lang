@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 27.8
 //! title: a generic type alias may not reference itself
-//! rule: A generic alias may not reference itself (no recursive aliases) and
-//!   must resolve to a concrete type after substitution.
+//! rule: An alias may not reference itself, directly or through other
+//!   aliases, in its aliased type or in its `where` clause.
 //! cites: 27.8
 //! expect: reject
 //! diagnostic: recursive

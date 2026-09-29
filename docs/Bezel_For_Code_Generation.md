@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.307. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.308. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.307 and `Bezel_Standard_Library.md` v0.307 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.308 and `Bezel_Standard_Library.md` v0.308 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -28,7 +28,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 |---|---|---|---|
 | 1 | `{ }` blocks | `end;` — or `end Name;` / `end for;` / `end constructor;`. Braces appear **only** inside string interpolation; there is no fourth bracket kind | §1.6 |
 | 2 | `x = 1;` assigns | `x := 1;` assigns. `=` is **equality** | A.6, §17.3 |
-| 3 | `a == b`, `a != b` | `a = b`, `a <> b` | §17.3 |
+| 3 | `a == b`, `a != b` | `a = b`, `a <> b`. On `double`/`float`, `=` is reflexive (`NaN = NaN` is `true`), so the NaN self-test `x != x` is `Double.IsNaN(x)`, never `x <> x` | §17.3, §4.3.1 |
 | 4 | `&&`, `\|\|`, `!x` | `and`, `or`, `not x`. Postfix `!` is the null-forgiving operator, nothing else | §17.1, §7.8 |
 | 5 | `a % b` | `a mod b`; the compound form is one token, `mod=` | §17.1, A.6 |
 | 6 | `else if`, `switch`, `foreach` | `elif` (`if … then … elif … then … else … end;` is the only condition ladder — there is no `when` construct); `case … of … end case;` (scrutinee); `for var x in xs do … end;`. **`foreach` does not exist in Bezel** | §19, §20, §21.4 |
@@ -589,7 +589,7 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 **Escaping an element borrow.** Over a **concrete** collection type the chain is slot → collection → binding, and keeping the reference past the loop is fine while the collection lives. Over an **interface-typed** source the compiler cannot see the backing, so the variable's source is conservatively the loop's own enumerator — a scope-bound local — and any escape is **rejected** (§29.2). Remedy: take the parameter at a concrete collection type, or give the elements an owner that outlives the loop.
 
-**Mutating what you iterate, and using what you removed** (§29.12, §28.11). `for var x in xs do … xs.Remove(x); … end;` compiles and **warns**: the next advance raises `InvalidOperationException`. Silent and correct: collect the matches into a second collection and remove after the loop; `xs.Remove(x); break;` (no advance follows); an indexer-set `xs[i] := v` (element-level, not structural); or `while xs.Count > 0 do using var x := xs.PopLast(); … end;` on an owning collection. On an **owning** collection `var w := xs[0]; xs.RemoveAt(0); w.Ping();` compiles and **warns**: `RemoveAt` disposed the element `w` borrows (checked mode faults there). Re-take the borrow after the mutation, take the element out first with `PopAt(0)`, or mutate after the last use. Neither warning fires through a different binding (`var ys := xs;`), and neither is suppressible per site.
+**Mutating what you iterate, and using what you removed** (§29.12, §28.11). `for var x in xs do … xs.Remove(x); … end;` compiles and **warns**: the next advance raises `InvalidOperationException`. Silent and correct: collect the matches into a second collection and remove after the loop; `xs.Remove(x); break;` (no advance follows); an indexer-set `xs[i] := v` (element-level, not structural); or `while xs.Count > 0 do using var x := xs.PopLast(); … end;` on an owning collection. On an **owning** collection `var w := xs[0]; xs.RemoveAt(0); w.Ping();` compiles and **warns**: `RemoveAt` disposed the element `w` borrows (checked mode faults there). Re-take the borrow after the mutation, take the element out first with `PopAt(0)`, or mutate after the last use. Neither warning fires through a different binding (`var ys := xs;`, or a span over `xs`: its `Reverse()` still faults at the next advance, its `Fill`/`CopyFrom` do not), and neither is suppressible per site.
 
 **Materializing is not a liveness remedy at class element types** (v0.265). `ToArray()`/`ToSet()`/`ToDictionary(…)` there build **borrowing** collections, so the materialized slots dangle exactly as the original borrow did; materialize-first is the **re-enumeration** remedy over a *live* backing, nothing more. What does remedy a dead-on-arrival element borrow: consume each element inside the loop body that borrows it, or give the elements an owner (an `IOwningEnumerable<T>` producer, consumed by owning iteration into an owning collection, with the accessor applied to *that* collection). Where the producer is a borrowing minting iterator you cannot change, **no retention remedy exists** (§29.11).
 
@@ -607,7 +607,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.307 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.308 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -2063,8 +2063,10 @@ end Port;
 
 ```bezel
 var p := default(Port);            // ERROR: not defaultable
-var q: Port;                       // ERROR: default-initialized storage
-var slots: [8]Port;                // ERROR: default slots
+var q: Port;                       // fine: a local is uninitialized, never default-filled (§7.9)
+_ := q.Value;                      // ERROR: `q` read before it is assigned
+var slots: [8]Port;
+slots[0] := new Port(1);           // ERROR: an element store uses the unassigned array; assign the whole array
 var r := p with(Value := -1);      // ERROR: `with` is rejected on a constructor-only record
 ```
 
