@@ -11567,6 +11567,14 @@ private:
     // box (nothing extra to free). The two are mutually exclusive, so the
     // value box is never freed twice.
     llvm::Function* dictValueBoxFreer(const sema::TypeRef* dictTy);
+    // fix #5106 (§28.9 / §28.11, v0.313): the FLAT value free for a borrowing
+    // Dictionary<K,V> whose V is itself a borrowing builtin collection.
+    // Installed ONLY at the dict-literal-root registration sites for a root in
+    // `dictFlatValueFreeSafe_` — never through `dictValueBoxFreer`, whose
+    // generic callers do not own their values (see the definition).
+    llvm::Function* dictBorrowingValueFlatFreer(const sema::TypeRef* dictTy);
+    llvm::Function* literalRootFlatValueFreer(const ast::Node* declNode,
+                                              const sema::TypeRef* dictTy);
 
     // fix #5084 (stdlib §4.8 / §5.1 "Nullable conversions", v0.307): promote a
     // Dictionary/OwningDictionary VALUE to its nullable-value tagged `{i8,T}`
@@ -14195,7 +14203,7 @@ private:
               // fix #5106 follow-up: moves with literalTreeAggregateEligible_
               // (same producer, same staleness guard) — see its own
               // declaration comment.
-              dictBorrowingValueAliasUnsafe_(e.dictBorrowingValueAliasUnsafe_) {}
+              dictFlatValueFreeSafe_(e.dictFlatValueFreeSafe_) {}
         ~BorrowingReclaimSetScope() {
             e_.borrowingArrayFreeEligible_ =
                 std::move(borrowingArrayFreeEligible_);
@@ -14222,8 +14230,8 @@ private:
                 takeCurrentDictFreeEligibleFn_;                    // fix #3880
             e_.literalTreeAggregateEligible_ =
                 std::move(literalTreeAggregateEligible_);
-            e_.dictBorrowingValueAliasUnsafe_ =        // fix #5106 follow-up
-                std::move(dictBorrowingValueAliasUnsafe_);
+            e_.dictFlatValueFreeSafe_ =        // fix #5106 follow-up
+                std::move(dictFlatValueFreeSafe_);
         }
         BorrowingReclaimSetScope(const BorrowingReclaimSetScope&) = delete;
         BorrowingReclaimSetScope& operator=(const BorrowingReclaimSetScope&) =
@@ -14248,7 +14256,7 @@ private:
         std::unordered_set<const void*> takeCurrentDictFreeEligible_;  // #3880
         llvm::Function* takeCurrentDictFreeEligibleFn_;                // #3880
         std::unordered_set<const void*> literalTreeAggregateEligible_;
-        std::unordered_set<const void*> dictBorrowingValueAliasUnsafe_;  // #5106 follow-up
+        std::unordered_set<const void*> dictFlatValueFreeSafe_;  // #5106 follow-up
     };
 
     // fix #3926 (§28.3 / §28.4 / §28.5 / §28.9, v0.294): the STRING-release
@@ -16347,30 +16355,19 @@ private:
     // interior nodes leak. That is the deliberate safe direction — a bounded
     // leak, never a use-after-free.
     std::unordered_set<const void*> literalTreeAggregateEligible_;
-    // fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): populated
-    // alongside `literalTreeAggregateEligible_` by the SAME aggregateCandidates
-    // loop (LlvmBackend_Setup.cpp) — the set of dict-literal-root LocalDecls
-    // where an interior-node ALIAS (`var inner := d[key];`) provably ESCAPES
-    // the declaring scope (returned / captured / stored / passed to an owned
-    // sink). #5106 added a FLAT disposer (dictValueBoxFreer) for a
-    // Dictionary<K,V>'s own scope-end free when V is itself a borrowing
-    // builtin collection, installed unconditionally whenever the STRICT
-    // literal-tree aggregate check (literalTreeInteriorAliasSafe, which denies
-    // ANY interior bind, escaping or not) fails to admit the root — exactly
-    // #5106's own regression shape (`var inner := d["k"]; ... `, never
-    // returned). That flat disposer is correct when the alias never escapes,
-    // but a flat free at the ROOT's scope end double-frees / dangles an alias
-    // that DOES escape (measured: `interior_alias_returned_no_uaf` returned a
-    // stale value instead of the expected 24 — a silent UAF, not a crash).
-    // This set is the finer-grained, escape-only test: it is consulted at the
-    // same three literal-root disposal-registration sites as
-    // `literalTreeNodeDisposerFor` and forces `dictValueDisposer` back to
-    // null (the safe leak direction, matching #2660's own philosophy) when an
-    // alias is proven to escape — leaving #5106's flat fix intact for every
-    // non-escaping shape. Same staleness-guard contract as
-    // `literalTreeAggregateEligible_` (keyed on `dictLiteralFreeEligibleFn_`,
-    // cleared/saved/restored at every one of that set's four sites).
-    std::unordered_set<const void*> dictBorrowingValueAliasUnsafe_;
+    // fix #5106 (§15.4 / §28.9 / §28.11, v0.313): populated by the SAME
+    // candidate scan as `literalTreeAggregateEligible_` (LlvmBackend_Setup.cpp)
+    // — the dict-literal-root LocalDecls for which the FLAT value free
+    // (`dictBorrowingValueFlatFreer`) is PROVEN sound: V is a borrowing builtin
+    // collection, every literal value is a fresh collection (a nested literal
+    // or a `new` of a builtin), the root never escapes, and no interior node
+    // read out of the root can outlive it (`dictFlatValueFreeSafe`). A POSITIVE
+    // set on purpose: the gate-3 fix-forward's negative escape set
+    // (`dictBorrowingValueAliasUnsafe_`) let an alias passed as a constructor
+    // argument and stored in a field through (ASan SEGV). Absent from the set
+    // ⇒ no flat free ⇒ the values leak, never dangle. Same staleness-guard
+    // contract as `literalTreeAggregateEligible_`.
+    std::unordered_set<const void*> dictFlatValueFreeSafe_;
     // fix #2660: true if every node of `lit` (recursively, through the
     // element/value type `collTy`) is a fresh nested collection literal —
     // condition (b) above. False for a flat literal (nothing to free) and for
@@ -16386,23 +16383,15 @@ private:
     bool literalTreeInteriorAliasSafe(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         const ast::Node* ld) const;
-    // fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): a companion,
-    // LESS strict test used only when `literalTreeInteriorAliasSafe` above
-    // has already denied `ld` — is there a `var alias := ld[key];` local
-    // whose OWN value provably escapes the declaring scope (returned,
-    // captured, stored, passed to an owned sink)? Unlike
-    // `literalTreeInteriorAliasSafe` (default-deny on the bind itself,
-    // escaping or not — the STRICT test the aggregate mechanism needs),
-    // this test runs the ordinary `StringEscapeWalker` (default mode) on
-    // each such alias local, so a non-escaping bind (#5106's own regression
-    // shape: `var inner := d["k"]; inner.TryGetValue(...)`) answers false —
-    // see `dictBorrowingValueAliasUnsafe_`'s declaration comment for why
-    // that distinction matters (the FLAT #5106 `dictValueBoxFreer` disposer
-    // must stay installed for the non-escaping shape and must NOT be
-    // installed for the escaping one).
-    bool dictBorrowingValueAliasEscapes(
+    // fix #5106 (§15.4 / §28.9 / §28.11, v0.313): the interior-alias half of
+    // `dictFlatValueFreeSafe_`. The same DEFAULT-DENY InteriorAliasWalker as
+    // `literalTreeInteriorAliasSafe`, in its flat mode: additionally admits a
+    // plain `var alias := ld[k];` bind, and a call of a non-retaining member
+    // (`nodeMemberCallIsNonRetaining`) on an interior node, while every BARE
+    // mention of an alias (return, argument, assignment, capture) still denies.
+    bool dictFlatValueFreeSafe(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::Node* ld);
+        const ast::Node* ld) const;
     // fix #2660: the `void(void*)` thunk that reclaims ONE interior node of a
     // literal-tree aggregate whose node type is `nodeTy` (bz_array_free /
     // bz_dict_free / bz_llist_free, with the node's OWN element disposer derived

@@ -3279,7 +3279,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedLiteralTreeAggElig = literalTreeAggregateEligible_;
         // fix #5106 follow-up: moves with literalTreeAggregateEligible_ —
         // same producer (collectBorrowingArrayFreeEligible), same guard.
-        auto savedDictBorrowingValueAliasUnsafe = dictBorrowingValueAliasUnsafe_;
+        auto savedDictFlatValueFreeSafe = dictFlatValueFreeSafe_;
         // fix #3728 (§15.1.1 / §15.3 / §28.9, v0.286): emitAsyncLambda now ALSO
         // recomputes the §15.3 move-only owning inline-array TRANSFER set for
         // the lambda body and keys it to the lambda resume fn (the same
@@ -3330,8 +3330,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         takeCurrentDictFreeEligibleFn_ = savedTakeCurrentDictFreeEligFn;   // #3880
         literalTreeAggregateEligible_ =
             std::move(savedLiteralTreeAggElig);                            // #2660
-        dictBorrowingValueAliasUnsafe_ =
-            std::move(savedDictBorrowingValueAliasUnsafe);        // #5106 follow-up
+        dictFlatValueFreeSafe_ =
+            std::move(savedDictFlatValueFreeSafe);        // #5106 follow-up
         // fix #3728: restore half of the save two-step above.
         moveOnlyArrayTransferred_ = std::move(savedMoveOnlyArrayTransferred);
         moveOnlyArrayTransferredFn_ = savedMoveOnlyArrayTransferredFn;

@@ -131,3 +131,102 @@ BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 1);
 }
+
+// ===========================================================================
+// Gate-3 fix-forward (§28.11 / §28.9 / §15.4, v0.313): the #5106 FLAT value
+// free must run ONLY where the dictionary provably holds the sole reference to
+// each value. A borrowing Dictionary<K,V> does not own its values (§28.11), so
+// an interior alias that outlives the root, or a value owned elsewhere, must
+// not be freed by it. Each row was an ASan SEGV (use-after-free) with the flat
+// free installed unconditionally; with the fix the values leak (the safe
+// direction, as before #5106), so these rows use runAotCheckedLenient — the
+// generated-code ASan net still catches any use-after-free / double free.
+// ===========================================================================
+namespace {
+int runLenient(const std::string& src) {
+    auto r = bezel::test::runAotCheckedLenient(src);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// An interior alias passed as a CONSTRUCTOR ARGUMENT and stored in a field of
+// an object that outlives the root (the reviewer's probe).
+BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
+           interior_alias_stored_via_ctor_arg_no_uaf_spec_28_11) {
+    std::string src =
+        "module M; "
+        "class Box "
+        "  public field: Array<int>; "
+        "  public constructor(f: Array<int>) field := f; end constructor; "
+        "end Box; "
+        "class C "
+        "  public static method Leak(): owned Box "
+        "    var groups: Dictionary<string, Array<int>> := "
+        "      [\"primes\": [2, 3, 5]]; "
+        "    var inner := groups[\"primes\"]; "
+        "    return new Box(inner); "
+        "  end Leak; "
+        "  public static method Main(): int "
+        "    var b := C.Leak(); "
+        "    var churn: Dictionary<string, Array<int>> := "
+        "      [\"p\": [9, 9, 9], \"q\": [8, 8]]; "
+        "    var sink := churn[\"p\"][0] + churn[\"q\"][1]; "
+        "    return b.field[0] + b.field[2] + sink; "
+        "  end Main; "
+        "end C;";
+    BEZEL_EXPECT_EQ(runLenient(src), 24);
+}
+
+// The same escape with no alias local: `root[k]` passed directly.
+BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
+           interior_index_stored_via_ctor_arg_no_uaf_spec_28_11) {
+    std::string src =
+        "module M; "
+        "class Box "
+        "  public field: Array<int>; "
+        "  public constructor(f: Array<int>) field := f; end constructor; "
+        "end Box; "
+        "class C "
+        "  public static method Leak(): owned Box "
+        "    var groups: Dictionary<string, Array<int>> := "
+        "      [\"primes\": new Array<int>(3)]; "
+        "    groups[\"primes\"].Add(2); groups[\"primes\"].Add(3); "
+        "    groups[\"primes\"].Add(5); "
+        "    return new Box(groups[\"primes\"]); "
+        "  end Leak; "
+        "  public static method Main(): int "
+        "    var b := C.Leak(); "
+        "    var churn: Dictionary<string, Array<int>> := "
+        "      [\"p\": [9, 9, 9], \"q\": [8, 8]]; "
+        "    var sink := churn[\"p\"][0] + churn[\"q\"][1]; "
+        "    return b.field[0] + b.field[2] + sink; "
+        "  end Main; "
+        "end C;";
+    BEZEL_EXPECT_EQ(runLenient(src), 24);
+}
+
+// A non-literal `new Dictionary` whose value is a local owned elsewhere: the
+// generic disposal path (scope end of the `using var`) must not free it.
+BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
+           new_dict_added_value_owned_elsewhere_no_uaf_spec_28_11) {
+    std::string src =
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    var tot := 0; "
+        "    while i < 50 do "
+        "      var a: Array<int> := [1, 2, 3]; "
+        "      do "
+        "        using var d := new Dictionary<string, Array<int>>(); "
+        "        d.Add(\"k\", a); "
+        "        tot := tot + d[\"k\"].Count; "
+        "      end; "
+        "      tot := tot + a[0]; "
+        "      i := i + 1; "
+        "    end; "
+        "    return tot - 200; "
+        "  end Main; "
+        "end C;";
+    BEZEL_EXPECT_EQ(runLenient(src), 0);
+}

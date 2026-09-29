@@ -10199,7 +10199,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // exactly one function — but the invariant the disposer comment states
     // must actually hold.
     literalTreeAggregateEligible_.clear();
-    dictBorrowingValueAliasUnsafe_.clear();  // fix #5106 follow-up: same guard
+    dictFlatValueFreeSafe_.clear();  // fix #5106 follow-up: same guard
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -16373,14 +16373,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             if (llvm::Function* nodeFree =
                                     literalTreeNodeDisposerFor(declNode, dictTy))
                                 dd.dictValueDisposer = nodeFree;
-                        // fix #5106 follow-up (§15.4/§28.9/§28.11, v0.313):
-                        // an interior alias of `declNode`'s value provably
-                        // ESCAPES — neither the aggregate disposer above nor
-                        // #5106's flat one may run (see
-                        // `dictBorrowingValueAliasUnsafe_`'s comment).
-                        if (dictBorrowingValueAliasUnsafe_.count(
-                                static_cast<const void*>(declNode)))
-                            dd.dictValueDisposer = nullptr;
+                        // fix #5106 (§15.4/§28.9/§28.11, v0.313): otherwise
+                        // the FLAT value free, only for a root proven in
+                        // `dictFlatValueFreeSafe_` (see its comment).
+                        if (!dd.dictValueDisposer)
+                            dd.dictValueDisposer =
+                                literalRootFlatValueFreer(declNode, dictTy);
                         disposeStack_.back().push_back(dd);
                     }
                     return;
@@ -19993,11 +19991,10 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     if (llvm::Function* nodeFree =
                             literalTreeNodeDisposerFor(ld, dt))
                         d.dictValueDisposer = nodeFree;
-                // fix #5106 follow-up: an escaping interior alias — see
-                // `dictBorrowingValueAliasUnsafe_`'s comment.
-                if (dictBorrowingValueAliasUnsafe_.count(
-                        static_cast<const void*>(ld)))
-                    d.dictValueDisposer = nullptr;
+                // fix #5106: the proven-safe flat value free — see
+                // `dictFlatValueFreeSafe_`'s comment.
+                if (!d.dictValueDisposer)
+                    d.dictValueDisposer = literalRootFlatValueFreer(ld, dt);
                 disposeStack_.back().push_back(d);
                 isAwaitCollection = true;
             }
@@ -21302,10 +21299,10 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             if (llvm::Function* nodeFree =
                     literalTreeNodeDisposerFor(ld, dictTy))
                 d.dictValueDisposer = nodeFree;
-        // fix #5106 follow-up: an escaping interior alias — see
-        // `dictBorrowingValueAliasUnsafe_`'s comment.
-        if (dictBorrowingValueAliasUnsafe_.count(static_cast<const void*>(ld)))
-            d.dictValueDisposer = nullptr;
+        // fix #5106: the proven-safe flat value free — see
+        // `dictFlatValueFreeSafe_`'s comment.
+        if (!d.dictValueDisposer)
+            d.dictValueDisposer = literalRootFlatValueFreer(ld, dictTy);
         disposeStack_.back().push_back(d);
         return;
     }
@@ -33903,7 +33900,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     dictLiteralFreeEligible_.clear();       // #2143
     takeCurrentDictFreeEligible_.clear();   // fix #3880
     literalTreeAggregateEligible_.clear();  // #2660
-    dictBorrowingValueAliasUnsafe_.clear();  // fix #5106 follow-up
+    dictFlatValueFreeSafe_.clear();  // fix #5106 follow-up
     // fix issue 2802 / §21.1: the eligibility sets are keyed on the AST node pointer (const void*), and the consumers (escape walker's `target`, collectSafeViewAliases, lowerLocalDecl's `dictLiteralFreeEligible_` lookup, ...) all compare via `const void*` — so widening the candidate vector type from `const ast::LocalDecl*` to `const ast::Node*` admits §21.1 `const` locals (LocalConstDecl, a different Stmt subtype) without changing any downstream pointer-identity comparison. The pre-issue-2802 type was the local reason the dict-literal form below elided a `const` binding: collectBorrowingArrayFreeEligible's scan lambda only matched LocalDecl, so a `const d: Dictionary<K,V> := [k:v, ...]` (the issue's measured repro: 832 KB / 10000 allocs leaked per 2000 iters) was never added to dictLiteralCandidates, the escape-walk never ran for it, and dictLiteralFreeEligible_ never received it — the literal's table was allocated by materializeHeapDictLiteral but never reclaimed, exactly the issue's defect. Admitting const locals here is the fix for issue 2802.
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> dictCandidates;  // #1028
@@ -33915,6 +33912,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
     std::vector<const ast::Node*> takeCurrentDictCandidates;  // fix #3880
     std::vector<const ast::Node*> aggregateCandidates;    // #2660
+    std::vector<const ast::Node*> flatValueCandidates;    // #5106
     // fix #2802: build the LocalDeclInitView from whichever AST node kind
     // the scanner hit — a plain `var` (LocalDecl) supplies initializer/type/
     // isUsing from its own fields; a §21.1 `const` (LocalConstDecl) supplies
@@ -33945,6 +33943,50 @@ void Emitter::collectBorrowingArrayFreeEligible(
                     if (const sema::TypeRef* rt = ctx_.resolvedType(*v.type))
                         if (isLiteralTreeAggregate(lit, rt))
                             aggregateCandidates.push_back(node);
+                    // fix #5106 (§15.4 / §28.9 / §28.11, v0.313): an
+                    // independent candidacy for the FLAT value free — a
+                    // borrowing Dictionary/SortedDictionary literal whose V is
+                    // a borrowing builtin collection and whose every value is
+                    // FRESH (a nested collection literal or a `new` of a
+                    // builtin collection), so the table holds the only
+                    // reference to each. A value naming an existing local
+                    // (`["k": a]`) is owned elsewhere and is never freed here.
+                    if (const sema::TypeRef* rt = ctx_.resolvedType(*v.type)) {
+                        auto headOf = [](const sema::TypeRef* t) {
+                            return (t && t->astNode && t->astNode->name &&
+                                    !t->astNode->name->parts.empty())
+                                       ? t->headName()
+                                       : std::string_view{};
+                        };
+                        auto isBorrowingColl = [&](const sema::TypeRef* t) {
+                            if (!t || t->declaration || t->nullable) return false;
+                            if (t->kind != sema::TypeRef::Kind::Named) return false;
+                            std::string_view h = headOf(t);
+                            return h == "Dictionary" || h == "SortedDictionary" ||
+                                   h == "Array" || h == "Stack" || h == "Queue" ||
+                                   h == "LinkedList" || h == "FrozenArray";
+                        };
+                        std::string_view rh = headOf(rt);
+                        if (lit->isDict && !rt->declaration &&
+                            (rh == "Dictionary" || rh == "SortedDictionary") &&
+                            rt->genericArgs.size() > 1 &&
+                            isBorrowingColl(rt->genericArgs[1]) &&
+                            !lit->elements.empty()) {
+                            bool allFresh = true;
+                            for (const auto& el : lit->elements) {
+                                const ast::Expr* x = el.get();
+                                if (dynamic_cast<const ast::CollectionLiteralExpr*>(x))
+                                    continue;
+                                if (dynamic_cast<const ast::NewExpr*>(x)) {
+                                    const sema::TypeRef* xt = ctx_.exprType(*x);
+                                    if (isBorrowingColl(xt)) continue;
+                                }
+                                allFresh = false;
+                                break;
+                            }
+                            if (allFresh) flatValueCandidates.push_back(node);
+                        }
+                    }
                 }
             }
             // #1930: a plain `var g := <src>.GroupBy(sel).First()/…` — a bare-GroupBy
@@ -34246,31 +34288,27 @@ void Emitter::collectBorrowingArrayFreeEligible(
         w.safeViewAliases = &safeViews;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (w.escaped) continue;
-        if (!literalTreeInteriorAliasSafe(body, ld)) {
-            // fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): the
-            // STRICT check just above denies ANY interior bind
-            // (`var inner := ld[key];`), escaping or not — #5106's own
-            // regression tests deliberately write that exact shape and rely
-            // instead on #5106's FLAT `dictValueBoxFreer` disposer (installed
-            // at the three literal-root registration sites when
-            // `literalTreeNodeDisposerFor` — gated on
-            // `literalTreeAggregateEligible_` — returns null). That flat
-            // disposer is unconditional: it does not know whether the bound
-            // alias itself escapes. When it does
-            // (`var inner := ld[key]; ... return inner;`), the flat free at
-            // `ld`'s scope end dangles the escaped alias — a silent UAF
-            // (measured: `interior_alias_returned_no_uaf` returned a stale
-            // value instead of 24, not a crash). Record `ld` here so the
-            // three registration sites can force `dictValueDisposer` back to
-            // null (the safe leak direction) instead of installing #5106's
-            // flat thunk, WITHOUT touching the non-escaping shape #5106's own
-            // tests need (dictBorrowingValueAliasEscapes below only fires
-            // when the bound alias is proven to escape).
-            if (dictBorrowingValueAliasEscapes(body, ld))
-                dictBorrowingValueAliasUnsafe_.insert(static_cast<const void*>(ld));
-            continue;
-        }
+        if (!literalTreeInteriorAliasSafe(body, ld)) continue;
         literalTreeAggregateEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #5106 (§15.4 / §28.9 / §28.11, v0.313): the FLAT value free's proof
+    // (`dictFlatValueFreeSafe_`). Candidacy (the scan above) already
+    // established that V is a borrowing builtin collection and that every
+    // literal value is a fresh collection, so the dictionary holds the only
+    // reference to each value at construction. Two more must hold: the root
+    // never escapes (same walk as the aggregate roots), and no interior node
+    // read out of the root can outlive it (`dictFlatValueFreeSafe`,
+    // default-deny). Failing either leaves the values leaking.
+    for (const ast::Node* ld : flatValueCandidates) {
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (w.escaped) continue;
+        if (!dictFlatValueFreeSafe(body, ld)) continue;
+        dictFlatValueFreeSafe_.insert(static_cast<const void*>(ld));
     }
 }
 
@@ -34483,6 +34521,27 @@ struct InteriorAliasWalker {
     // alias an interior node of the target tree, held to the same whitelist as
     // an interior node read out of the root.
     std::unordered_set<const void*> nodeAliases;
+    // fix #5106 (§15.4 / §28.9 / §28.11, v0.313): set only by
+    // `dictFlatValueFreeSafe`. Admits a plain `var alias := root[k];` bind
+    // (the alias joins `nodeAliases` for the rest of the walk — a LocalSymbol's
+    // decl is unique, so it can never be mistaken for another binding) and a
+    // call of a `nodeMemberCallIsNonRetaining` member on an interior node.
+    // Off for the #2660 aggregate walk, which is unchanged.
+    bool flatAliasMode = false;
+
+    // Members of an interior node whose CALL neither returns the node (or a
+    // view/enumerator over it) nor stores it anywhere: queries and in-place
+    // mutators of the node's own contents. Their arguments are still walked
+    // with nodeOk=false, so passing an interior node INTO one denies.
+    static bool nodeMemberCallIsNonRetaining(std::string_view m) {
+        return m == "TryGetValue" || m == "ContainsKey" ||
+               m == "ContainsValue" || m == "Contains" || m == "IndexOf" ||
+               m == "Add" || m == "TryAdd" || m == "AddLast" ||
+               m == "AddFirst" || m == "Insert" || m == "Remove" ||
+               m == "RemoveAt" || m == "RemoveFirst" || m == "RemoveLast" ||
+               m == "Clear" || m == "Push" || m == "Pop" || m == "Peek" ||
+               m == "Enqueue" || m == "Dequeue";
+    }
 
     bool isTarget(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -34588,6 +34647,28 @@ struct InteriorAliasWalker {
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // fix #5106 (flatAliasMode only): `node.M(args)` for a
+            // non-retaining M, where `node` is an interior-node alias or
+            // `root[k]` — the receiver is a call-bounded borrow.
+            if (flatAliasMode) {
+                if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(
+                        c->callee.get())) {
+                    if (nodeMemberCallIsNonRetaining(m->member) &&
+                        !isTarget(m->target.get())) {
+                        auto* rix = dynamic_cast<const ast::IndexExpr*>(
+                            m->target.get());
+                        if (isNodeAlias(m->target.get()) ||
+                            (rix && isTarget(rix->target.get()))) {
+                            if (rix)
+                                for (auto& a : rix->indices)
+                                    expr(a.value.get(), /*nodeOk=*/false);
+                            for (auto& a : c->args)
+                                expr(a.value.get(), /*nodeOk=*/false);
+                            return;
+                        }
+                    }
+                }
+            }
             expr(c->callee.get(), /*nodeOk=*/false);
             for (auto& a : c->args) expr(a.value.get(), /*nodeOk=*/false);
             return;
@@ -34693,6 +34774,19 @@ struct InteriorAliasWalker {
     void stmt(const ast::Stmt* s) {
         if (!s || !safe) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // fix #5106 (flatAliasMode only): `var inner := root[k];` binds
+            // an interior node to a tracked alias instead of denying.
+            if (flatAliasMode && !ld->isUsing) {
+                auto* ix =
+                    dynamic_cast<const ast::IndexExpr*>(ld->initializer.get());
+                if (ix && isTarget(ix->target.get())) {
+                    for (auto& a : ix->indices)
+                        expr(a.value.get(), /*nodeOk=*/false);
+                    nodeAliases.insert(static_cast<const void*>(
+                        static_cast<const ast::Node*>(ld)));
+                    return;
+                }
+            }
             expr(ld->initializer.get(), false);
             return;
         }
@@ -34801,6 +34895,14 @@ struct InteriorAliasWalker {
                     safe = false;
                     return;
                 }
+                // fix #5106 (flatAliasMode only): iterating an interior-node
+                // ALIAS yields that node's ELEMENTS, one level below the
+                // depth-1 values the flat free reclaims (with a NULL element
+                // disposer), so the loop variable need not be tracked.
+                if (flatAliasMode && !isTarget(fs->iterable.get())) {
+                    stmts(fs->body);
+                    return;
+                }
                 const void* alias =
                     static_cast<const void*>(static_cast<const ast::Node*>(fs));
                 const bool inserted = nodeAliases.insert(alias).second;
@@ -34869,80 +34971,30 @@ bool Emitter::literalTreeInteriorAliasSafe(
 }
 
 
-// fix #5106 follow-up (§15.4 / §28.9 / §28.11, v0.313): see the declaration
-// comment (LlvmBackend_impl.hpp) and `dictBorrowingValueAliasUnsafe_`'s own
-// comment for the full story. Finds every `var`/`const` local in `body`
-// whose initializer is EXACTLY a single-level index into `ld`
-// (`ld[<anything>]`) and, for each, runs the ordinary (non-borrowing)
-// `StringEscapeWalker` over `body` with that alias local as the tracked
-// target — the SAME walker `collectBorrowingArrayFreeEligible`'s flat
-// families use to decide whether a plain local escapes. Returns true as
-// soon as any such alias is found to escape.
-bool Emitter::dictBorrowingValueAliasEscapes(
+// fix #5106 (§15.4 / §28.9 / §28.11, v0.313): see the declaration comment
+// (LlvmBackend_impl.hpp). The flat free reclaims only the DEPTH-1 values, so
+// the same default-deny walk as `literalTreeInteriorAliasSafe` applies, with
+// `flatAliasMode` admitting the two borrow shapes #5106's own regression
+// shapes use: a plain `var inner := ld[k];` bind (the alias is then held to
+// the interior-node whitelist for the rest of the walk, so `return inner;`,
+// `f(inner)`, `new Box(inner)`, `x := inner` and a capture all still deny),
+// and a call of a non-retaining member on an interior node
+// (`inner.TryGetValue(k, out v)`, `inner.AddLast(x)`).
+bool Emitter::dictFlatValueFreeSafe(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::Node* ld) {
-    std::vector<const ast::Node*> aliasLocals;
-    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
-        if (!s) return;
-        LocalDeclInitView v = localDeclInitView(s);
-        if (v.init) {
-            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(v.init)) {
-                if (auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(
-                            ix->target.get())) {
-                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
-                            ctx_.exprSymbol(*id))) {
-                        if (loc->decl &&
-                            static_cast<const void*>(loc->decl) == ld)
-                            aliasLocals.push_back(s);
-                    }
-                }
-            }
-        }
-        // Recurse — mirrors collectBorrowingArrayFreeEligible's own scan.
-        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
-            for (auto& b : is->ifBranch.body) scan(b.get());
-            for (auto& br : is->elifBranches)
-                for (auto& b : br.body) scan(b.get());
-            for (auto& b : is->elseBody) scan(b.get());
-        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-            for (auto& b : ws->body) scan(b.get());
-        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-            for (auto& b : fs->body) scan(b.get());
-        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
-            for (auto& b : d->body) scan(b.get());
-        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
-            for (auto& b : ts->body) scan(b.get());
-            for (auto& c : ts->catches) scan(c.body.get());
-            for (auto& b : ts->finallyBody) scan(b.get());
-        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            for (auto& arm : cs->arms)
-                for (auto& a : arm.stmts) scan(a.get());
-        }
+        const ast::Node* ld) const {
+    InteriorAliasWalker w{ctx_, static_cast<const void*>(ld)};
+    w.flatAliasMode = true;
+    w.mayYieldNode = [this](const ast::Expr* e) -> bool {
+        if (!e) return true;
+        const sema::TypeRef* t = ctx_.exprType(*e);
+        if (!t) return true;
+        if (t->declaration) return false;
+        return isDictTypeName(t) || isLinkedListTypeName(t) ||
+               isCollectionTypeName(t);
     };
-    for (auto& s : body) scan(s.get());
-    for (const ast::Node* aliasDecl : aliasLocals) {
-        // fix #5106 follow-up: the alias local IS itself a borrowing builtin
-        // collection (that is the whole reason it reached this scan — see
-        // the caller's `isBorrowingNodeColl` gate on `ld`'s value type), so
-        // it gets the SAME `borrowingArrayMode` relaxation the flat
-        // `borrowingArrayFreeEligible_` family uses: a `for var x in alias`
-        // iteration or a binding into a proven-safe view BORROWS the
-        // backing and is not itself an escape. Without this, #5106's own
-        // `nested_dict_array_value_disposes_inner_spec_28_9` regression
-        // test (`var inner := d["k"]; for var x in inner do … end;`)
-        // misclassified the for-in as an escape, forced the disposer back
-        // to null, and turned the correct #5106 flat free into a leak
-        // (LSan-caught, run() reporting -999 instead of the expected 1).
-        std::unordered_set<const void*> safeViews;
-        collectSafeViewAliases(body, aliasDecl, safeViews);
-        StringEscapeWalker w{ctx_, static_cast<const void*>(aliasDecl)};
-        w.borrowingArrayMode = true;
-        w.safeViewAliases = &safeViews;
-        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (w.escaped) return true;
-    }
-    return false;
+    w.stmts(body);
+    return w.safe;
 }
 
 
