@@ -5845,17 +5845,54 @@ static void materializeConstraintUpChain(
                     ms->genericParams.size() != cur->genericParams.size())
                     continue;
                 // An IMPORTED candidate has no `decl` (only `declType`), so
-                // its parameter types cannot be compared here — bail
-                // safely rather than guess.
-                // SEAM-DEBT: #4988 same seam as the `cur->decl` read above —
-                // no AST to compare an imported ancestor's parameter types
-                // against, so this bails to "no ancestor found" (safe:
-                // `materializeConstraintUpChain`'s pre-#5075 behaviour for an
-                // unmatched level is to leave `dgp->constraints` empty)
-                // rather than mis-comparing.
+                // `overrideParamsMatch` cannot verify a full-signature match
+                // here (the imported param's type lives on `resolvedDeclType`,
+                // see ModuleLoader::convertParams, not on the `declType` that
+                // `overrideParamsMatch` reads — and so this comparison would
+                // false-reject for every imported member). The loop pre-filter
+                // (name + param count + generic arity) is the strongest signal
+                // we have for an imported candidate.
+                //
+                // fix #5075 T8 (§14.2, v0.307): when the imported ancestor's
+                // constraint payload is available via
+                // `ctx.importedGenericConstraints(ms)` (ModuleLoader,
+                // #2391), materialize that set positionally onto `dgp` and
+                // stop the climb. This closes the 3-module chain Leaf (local)
+                // -> Mid (local, omitted) -> Base (IMPORTED from a different
+                // dep): the climb walks Leaf -> Mid (both local, no AST
+                // constraint at Mid) -> Base (in another dep, no AST
+                // available here). Without consulting the imported side
+                // table, Leaf's `T` is left unconstrained and codegen's
+                // i32-placeholder fast path takes the wrong branch on
+                // `a.Equals(b)` (exit 92 — the original #5075 repro).
+                //
+                // When the side table is absent (stale metadata, or the base
+                // declared no `where` clauses at all for this parameter),
+                // fall back to the previous safe behaviour: leave
+                // `dgp->constraints` empty. CLAUDE.md rule 4 — the safe
+                // direction is the one that preserves the long-standing
+                // accept for unrecognised shapes, not the one that tightens.
                 if (!dynamic_cast<const ast::MethodDecl*>(ms->decl) &&
-                    !ms->params.empty())
-                    return;
+                    !ms->params.empty()) {
+                    const auto* iGCs = ctx.importedGenericConstraints(ms);
+                    if (iGCs && gi < iGCs->size()) {
+                        const ImportedGenericConstraint& bic = (*iGCs)[gi];
+                        for (std::string_view kind :
+                             bic.specialConstraints) {
+                            GenericParamConstraint c;
+                            c.kind = kind;
+                            dgp->constraints.push_back(c);
+                        }
+                        for (TypeRef* bound : bic.constraintTypes) {
+                            GenericParamConstraint c;
+                            c.kind = "type";
+                            c.importedBound = bound;
+                            dgp->constraints.push_back(c);
+                        }
+                    }
+                    return;  // imported ancestor is the climb boundary
+                              // (#5091's narrow — no same-module AST past it)
+                }
                 if (overrideParamsMatch(cur, ms)) {
                     anc = ms;
                     break;
