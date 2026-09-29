@@ -127,6 +127,60 @@ BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
     BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
 }
 
+// §5.3 (v0.313): `T(x)` over a NULLABLE operand "first requires the value
+// to be present ... and then converts identically", so `char(x)` with
+// `x: double?` is rejected exactly like the non-nullable source (review of #5138).
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           char_of_nullable_double_local_rejected) {
+    auto r = check("var d: double? := 65.0; var c: char := char(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
+// §5.3: the nullable-target form over a nullable `double?` source.
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           nullable_char_of_nullable_double_rejected) {
+    auto r = check("var d: double? := 65.0; var c: char? := char?(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
+// §5.3 (v0.313): `T(x)` over a NULLABLE operand "first requires the value
+// to be present ... and then converts identically", so `char(x)` with
+// `x: float?` is rejected exactly like the non-nullable source (review of #5138).
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           char_of_nullable_float_local_rejected) {
+    auto r = check("var d: float? := 65.0f; var c: char := char(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
+// §5.3: the nullable-target form over a nullable `float?` source.
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           nullable_char_of_nullable_float_rejected) {
+    auto r = check("var d: float? := 65.0f; var c: char? := char?(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
+// §5.3 (v0.313): `T(x)` over a NULLABLE operand "first requires the value
+// to be present ... and then converts identically", so `char(x)` with
+// `x: decimal?` is rejected exactly like the non-nullable source (review of #5138).
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           char_of_nullable_decimal_local_rejected) {
+    auto r = check("var d: decimal? := 65.0m; var c: char := char(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
+// §5.3: the nullable-target form over a nullable `decimal?` source.
+BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,
+           nullable_char_of_nullable_decimal_rejected) {
+    auto r = check("var d: decimal? := 65.0m; var c: char? := char?(d);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagWithAll(r, {kNeedle, kSpelling}));
+}
+
 // An out-of-range double still gets THIS diagnostic, not the (now
 // unreachable) constant-overflow one — the unconditional check runs first.
 BEZEL_TEST(s5_2_float_decimal_to_char_rejected_5138,

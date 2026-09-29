@@ -138,12 +138,14 @@ BEZEL_TEST(cross_module_lib_ck_constant_fold_4877,
     }));
 }
 
-// REJECT row 2 — `char(Lib.C.K)` for `Lib.C.K: double := 1.0e30` is
-// out-of-range (a positive finite double truncated to an integer is
-// not a valid Unicode code-point unless it lies in U+0000–U+10FFFF
-// excluding U+D800–U+DFFF, per §5.2). Pre-fix: false accept. Post-fix:
-// §5.2 / §17.14 / fix #4801 diagnostic, the same shape the LOCAL
-// `int(...)` rejects (#4801).
+// REJECT row 2 — `char(Lib.C.K)` for `Lib.C.K: double := 1.0e30`. Since
+// #5138 (§5.2, v0.313) a `float`/`double`/`decimal` source does not
+// convert to `char` at all (a code point, not a number), so the operand
+// is rejected unconditionally, constant or not, before the #4801/#4877
+// constant-fold arm (which only rejected out-of-range values) runs. The
+// row's original fold needles ("a `double` constant expression whose
+// value is", "conversion to `char`") no longer apply; the diagnostic now
+// points to `char(int(x))`.
 BEZEL_TEST(cross_module_lib_ck_constant_fold_4877,
            char_of_imported_double_overflow_rejected) {
     const std::string libSrc =
@@ -168,10 +170,9 @@ BEZEL_TEST(cross_module_lib_ck_constant_fold_4877,
     bezel::sema::typecheckExpressions(*impSf, impCtx);
     BEZEL_EXPECT_TRUE(impDiags.hasErrors());
     BEZEL_EXPECT_TRUE(hasDiagWithAll(impDiags, {
-        "a `double` constant expression whose value is `1e+30`",
-        "conversion to `char`",
-        kTrunc,
-        "§17.14",
+        "does not convert to `char`",
+        "char(int(x))",
+        "§5.2",
     }));
 }
 

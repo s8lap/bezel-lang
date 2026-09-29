@@ -3543,6 +3543,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (ce.args.size() == 1 && ce.args[0].value) {
                     const TypeRef* argTy =
                         ctx_.exprType(*ce.args[0].value);
+                    // fix #5138 (§5.3, v0.313): `T(x)` over a nullable
+                    // operand "first requires the value to be present ...
+                    // and then converts identically", so a nullable
+                    // `float?`/`double?`/`decimal?` source to `char` is
+                    // rejected exactly as the non-nullable source is.
+                    if (pt == PrimitiveType::Char && argTy &&
+                        argTy->kind == TypeRef::Kind::Primitive &&
+                        argTy->nullable &&
+                        (argTy->primitive == PrimitiveType::Float ||
+                         argTy->primitive == PrimitiveType::Double ||
+                         argTy->primitive == PrimitiveType::Decimal)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "a `float`/`double`/`decimal` source does "
+                            "not convert to `char` — a code point, not "
+                            "a number (§5.2, §5.3 nullable operand); "
+                            "write `char(int(x))` for the truncation and "
+                            "the code-point check as the two conversions "
+                            "they are");
+                        return;
+                    }
                     if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
                         !argTy->nullable) {
                         PrimitiveType srcPt = argTy->primitive;
