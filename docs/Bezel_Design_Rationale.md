@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.312 — September 2026**
+**Companion to the Bezel Language Specification, v0.313 — September 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -2068,6 +2068,15 @@ A binary float has three candidate decimal values: its exact binary expansion, a
 The survey (the owner's, 2026-09; sources not re-fetched for this revision). Java's `BigDecimal.valueOf(double)` converts through `Double.toString`'s canonical form, which its documentation calls generally the preferred way; `new BigDecimal(double)` gives the exact expansion, with a documented warning. Kotlin's `Double.toBigDecimal()` and `Float.toBigDecimal()` convert through `toString`. Go's shopspring `decimal.NewFromFloat` uses the shortest round-trip digits. Python's `Decimal(float)` gives the exact expansion (`Decimal(0.1)` is `0.1000000000000000055511151231257827…`), and its documentation flags the surprise. .NET's `(decimal)double` rounds to 15 significant digits (7 for `float`), which collapses distinct doubles (`(decimal)(0.1 + 0.2)` is `0.3`) and differs from .NET's own shortest-round-trip `double.ToString()`.
 
 **Declined:** the exact expansion, which puts 28 digits of binary noise into every non-dyadic value; a fixed significant-digit rounding, which needs a precision constant beside the one `ToString()` already defines and maps distinct doubles to one decimal. The shortest form is injective on doubles, so distinct doubles of magnitude at least 10^−12 give distinct decimals. Below that, §4.4's scale bound of 28 merges values, as it must for any rule. The rounding there reads the shortest form, not the binary expansion, so `decimal(2.5e-28)` is a tie that goes to the even `2e-28`, as the literal `2.5e-28m` does.
+
+<a id="sec-binary-float-parse-range"></a>
+### 14.9 Binary-float `Parse` faults where the literal does (v0.313)
+
+`double.Parse` and `float.Parse` read a numeral at run time, and stdlib §9.2 gives them the literal's reading: the value rounded once to the type as spec §4.3 rounds a literal, with `OverflowException` exactly where that rounding is not finite. So `double.Parse("1e999")` faults where the literal `1e999` is a compile error, `TryParse` answers `false` there, and `Convert.ToDouble` follows by stdlib §2.3's mirror sentence. Three grounds carry it. One digit string gets one verdict, in source and in text. The `Parse` families fault alike: the integers (stdlib §9.1) and `decimal` (stdlib §9.3) already raise `OverflowException` where the number spelled does not fit the type. And input that spells a number the type cannot hold is a data problem, which the stdlib's strict-fault model (stdlib §3.2) reports rather than substitutes. Spec §5.2's per-target-family split, under which `float(d)` overflows to `±Infinity`, governs converting a value already in a binary type, as §6.3 governs arithmetic on one. `Parse` converts no value: it reads a numeral, and §4.3 declines to let a numeral denote an infinity. Underflow is in range, as for a literal: a numeral that rounds to zero or to a subnormal denotes that value.
+
+The survey (the owner's, 2026-09; sources not fetched for this revision). .NET's `double.Parse` returns `±Infinity` on overflow since .NET Core 3.0, and raised `OverflowException` before it. Java's `Double.parseDouble` and Python's `float` return the infinity. Go's `strconv.ParseFloat` returns `±Inf` together with an error whose `Err` is `ErrRange`, and C's `strtod` returns `±HUGE_VAL` and sets `errno` to `ERANGE`. Bezel sides with the earlier .NET contract, and in substance with Go and C, which report the range error rather than hide it. Having no out-of-band error slot, it reports through the fault, and `TryParse` is the branch-shaped tier.
+
+**Declined:** `±Infinity`, the majority's answer, which makes one digit string a compile error as a literal and an infinity as text, and needs a binary-float carve-out in stdlib §2.3; and the infinity with a range error beside it (Go's shape), which needs an error slot the `Parse` family does not have and would be a second mechanism for one fault condition (stdlib §1's no-dual rule).
 
 <a id="sec-strings"></a>
 ## 15. Strings
