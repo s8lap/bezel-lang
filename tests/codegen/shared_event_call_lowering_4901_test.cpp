@@ -559,31 +559,45 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
 // rows assert its handler-slot diagnostic. The `+=` forms below still reach
 // the codegen gate. The overload-group row (p06) is the deliberate SOUND
 // spurious reject of #4978: §27.6 resolves `H.On` against the `(int) -> ()`
-// target to `On(int)`, which the compiler does not implement yet — flip it to
-// an accept-and-run row when #4978 lands.
+// target to `On(int)`, which #4978 (v0.313) now implements, so that row is an
+// accept-and-run row below.
 // -----------------------------------------------------------------------
 
-// p06: an overload GROUP `H.On` (On(string) / On(int)) on an int feed. Sema
-// binds the method reference to the string overload without consulting the
-// target type; admitted, the int payload was read as a string — SEGV.
+// p06 (flipped by #4978, spec §27.6 v0.313): an overload GROUP `H.On`
+// (On(string) declared first, On(int)) on an int feed resolves against the
+// `(int) -> ()` target to `On(int)`. Accept-and-run: the int overload fires
+// with the raised value, through both the source and the ISharedEvent face.
+static const char* kGroupProg =
+    "module M; "
+    "import System.Threading; "
+    "class Bus "
+    "  public static owned readonly Feed: SharedEventSource<int> := new(); "
+    "  public static property Face: ISharedEvent<int> => Feed; "
+    "end Bus; "
+    "class H "
+    "  public static method On(x: string) Console.WriteLine($\"str:{x}\"); end On; "
+    "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On; "
+    "end H; "
+    "class C "
+    "  public static method Main(): int "
+    "    var sub := Bus.Feed.Subscribe(H.On); "
+    "    Bus.Feed.Raise(5); "
+    "    sub.Dispose(); "
+    "    var s2 := Bus.Face.Subscribe(H.On); "
+    "    Bus.Feed.Raise(6); "
+    "    s2.Dispose(); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
 BEZEL_TEST(codegen_shared_event_call_lowering_4901,
-           overloaded_static_method_group_rejected_on_source_subscribe) {
-    BEZEL_EXPECT_TRUE(rejectedWith(std::string(kNegPrelude) +
-        "end Box; "
-        "class H "
-        "  public static method On(x: string) Console.WriteLine($\"str:{x}\"); end On; "
-        "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On; "
-        "end H; "
-        "class C "
-        "  public static method Main(): int "
-        "    var sub := Bus.Feed.Subscribe(H.On); "
-        "    Bus.Feed.Raise(5); "
-        "    sub.Dispose(); "
-        "    return 0; "
-        "  end Main; "
-        "end C;",
-        {"the handler argument of `Subscribe` (stdlib \xC2\xA7""6.5, v0.307)",
-         "not implicitly convertible to the target type (\xC2\xA7""5.1)"}));
+           overloaded_static_method_group_accepted_and_runs_on_source_subscribe) {
+    BEZEL_EXPECT_EQ(runAotOut(kGroupProg), std::string("int:5\nint:6"));
+}
+
+BEZEL_TEST(codegen_shared_event_call_lowering_4901,
+           overloaded_static_method_group_subscribe_is_leak_clean) {
+    BEZEL_EXPECT_EQ(runChecked(kGroupProg), 0);
 }
 
 // p08: a static of arity 2 on an int feed — admitted, the second parameter

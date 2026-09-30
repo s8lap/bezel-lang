@@ -9,7 +9,8 @@ namespace bezel::codegen {
 bool sharedEventHandlerAdmissible(
         sema::SemaContext& ctx, const ast::Expr* handler,
         const ast::Expr* receiver, const sema::TypeRef* payload,
-        llvm::function_ref<bool(std::string_view)> isBuiltinName);
+        llvm::function_ref<bool(std::string_view)> isBuiltinName,
+        bool honourSelectedOverload);
 
 namespace {
 // §23.4 (#774): exact structural match between an indexer's first parameter
@@ -8621,7 +8622,11 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
         if (as.op == "+=" && isSharedEventSourceTypeName(tgtTy) &&
             !sharedEventHandlerAdmissible(
                 ctx_, as.value.get(), as.target.get(), payloadTy,
-                [this](std::string_view n) { return isBuiltinTypeRefName(n); })) {
+                [this](std::string_view n) { return isBuiltinTypeRefName(n); },
+                // #4978 scope: only the `.Subscribe`/`.Add`/`.Remove` arms
+                // honour a selector-chosen overload; `+=` on an overloaded
+                // group stays the #4901 deliberate spurious reject.
+                /*honourSelectedOverload=*/false)) {
             ctx_.diagnostics().report(
                 Severity::Error, as.value->span.begin,
                 "`+=` on a `SharedEventSource<T>` is lowered only for a "

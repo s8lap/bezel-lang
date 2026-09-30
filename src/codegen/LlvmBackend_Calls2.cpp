@@ -4444,7 +4444,8 @@ bool sharedEventIsBareMemberOf(sema::SemaContext& ctx, const ast::Expr* e,
 bool sharedEventHandlerAdmissible(
         sema::SemaContext& ctx, const ast::Expr* handler,
         const ast::Expr* receiver, const sema::TypeRef* payload,
-        llvm::function_ref<bool(std::string_view)> isBuiltinName) {
+        llvm::function_ref<bool(std::string_view)> isBuiltinName,
+        bool honourSelectedOverload) {
     if (!handler || !payload) return false;
     // (1) capture-free: a static method reference.
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(handler);
@@ -4459,6 +4460,14 @@ bool sharedEventHandlerAdmissible(
             return false;
     }
     auto* ms = dynamic_cast<const sema::MethodSymbol*>(ctx.exprSymbol(*handler));
+    // fix #4978 (§27.6, v0.313): the formation-site selector resolved an
+    // overload GROUP against the `(T) -> ()` target and published the chosen
+    // overload; `exprSymbol` still holds the first-declared one. Judge (and
+    // later lower) the chosen overload, exactly as the plain-event path does.
+    const sema::MethodSymbol* selectedMs =
+        honourSelectedOverload ? ctx.methodRefSelectedOverload(*handler)
+                               : nullptr;
+    if (selectedMs) ms = selectedMs;
     if (!ms || ms->extensionDecl || ms->isOperator || !ms->parent ||
         !ms->genericParams.empty())
         return false;
@@ -4470,7 +4479,10 @@ bool sharedEventHandlerAdmissible(
     // (2) exactly `(T) -> ()`.
     {
         std::unordered_set<const sema::TypeSymbol*> seen;
-        if (sharedEventMethodIsOverloaded(ms, ms->parent, seen)) return false;
+        // A selector-chosen overload is already resolved against the target
+        // type (§27.6); only an unresolved group is a spurious-shape reject.
+        if (!selectedMs &&
+            sharedEventMethodIsOverloaded(ms, ms->parent, seen)) return false;
     }
     if (sema::formalParamCount(*ms) != 1) return false;
     if (!sema::formalParamModifier(*ms, 0).empty()) return false;
@@ -4792,7 +4804,8 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         call.args[0].value && isISharedEventTypeName(recvTy) &&
         sharedEventHandlerAdmissible(ctx_, call.args[0].value.get(),
                                      ma->target.get(), sharedPayload,
-                                     builtinName)) {
+                                     builtinName,
+                                     /*honourSelectedOverload=*/true)) {
         llvm::Value* src = lowerExpr(*ma->target);
         if (!src) return std::optional<llvm::Value*>(nullptr);
         const sema::TypeRef* payload = sharedPayload;
@@ -4870,7 +4883,8 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
                    call.args[0].name.empty() &&
                    sharedEventHandlerAdmissible(
                        ctx_, call.args[0].value.get(), ma->target.get(),
-                       sharedPayload, builtinName))
+                       sharedPayload, builtinName,
+                       /*honourSelectedOverload=*/true))
                 : (ma->member == "Raise" &&
                    sharedEventRaiseAdmissible(ctx_, call, sharedPayload,
                                               builtinName));
