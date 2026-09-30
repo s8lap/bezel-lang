@@ -16793,7 +16793,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             failFn,
             {lowerStringLiteralConst(
                 // a source-form literal: the quotes are stripped
-                "\"internal: virtual call to imported generic method `" +
+                "\"virtual call to imported generic method `" +
                     std::string(ms->name) +
                     "` reached a class this module does not know (declared "
                     "in a module compiled after it); its override cannot be "
