@@ -76,7 +76,7 @@ These require explicit human direction:
 ## Build toolchain
 
 - Built with **clang++** against Fedora's system **LLVM**, C++20. Never introduce CMake, source or CI that assumes g++; detect the compiler with clang feature tests, not `__GNUC__` version checks.
-- Configure auto-detects ccache, mold (else lld), `-gsplit-dwarf`, the shared `libLLVM`, and a PCH. ccache needs `sloppiness = pch_defines,time_macros` in `~/.config/ccache/ccache.conf`; keep `max_size` at 80G.
+- Configure auto-detects ccache, mold (else lld), `-gsplit-dwarf`, the shared `libLLVM`, and a PCH. ccache needs `sloppiness = pch_defines,time_macros` and `file_clone = true` in `~/.config/ccache/ccache.conf`, with `max_size = 180G`. Cloned entries are stored uncompressed and btrfs reports uncompressed sizes, so 180G is about 80G on disk; don't lower it.
 - **The suite is six per-area binaries** (`build/tests/bezel_tests_{codegen,ownership,sema,frontend,module,support}`); `bezel_tests` is still the target name. For a path, read `build/tests/test_binaries.txt`; never hardcode one.
 - `BEZEL_TEST_FILTER=<substr>` selects tests (the binaries **ignore `--gtest_filter`**). `BEZEL_TEST_ENUMERATE=1` lists what would run.
 - **Oracles.** `runAot` / `runAotChecked` drive the real AOT path (fork-isolated `Driver::compileFile` + clang link + native exec): the strict oracle. **The in-process JIT harness is deprecated**: it skips ownership / definite-assignment and `verifyModule`. Write new tests on `runAot` only, and port a JIT test whenever you touch one. The remaining count is ratcheted by `scripts/check_deprecated_jit_oracle.py` (exact baseline; after porting, `--update`).

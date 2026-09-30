@@ -134,8 +134,13 @@ op is also memory-caged (12–14G). Small probe compiles/runs use
 `dev_heavy.sh probe <cmd>` (own small cage, no slice accounting). Scratch
 artifacts (probe binaries, big logs, scratch build trees) go in
 `/var/tmp/bezel-scratch` — never `/tmp`, which is tmpfs (RAM): a scratch build
-tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
-80G (a full 40G cache thrashes under multi-worktree churn).
+tree parked there permanently consumes gigabytes. Keep ccache at about 80G on
+disk (a full 40G cache thrashes under multi-worktree churn). Since 2026-10-01
+that is `max_size = 180G` with `file_clone = true`. Clone hits and stores write
+no object data, since they reflink on the btrfs NVMe. Cloned entries are stored
+uncompressed, and btrfs reports uncompressed sizes, so `max_size` counts
+uncompressed bytes. Measured: ccache's own compression was 2.3×, so 180G holds
+the entries the old 80G did.
 
 **The slice bounds cpu+mem, not the NUMBER of compiles** — N lanes × `-j16`
 put 100+ clang on 18 cores in R20 (134 measured). The optional fix is the
