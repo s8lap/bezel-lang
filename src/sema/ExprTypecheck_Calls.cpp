@@ -18678,7 +18678,107 @@ void ExprTC::checkImportedNewExprArgs(
                     "takes 0 (§22.7)");
         return;
     }
-    if (ctors.size() != 1) return;  // imported ctor overloads deferred
+    if (ctors.size() != 1) {
+        // fix #5206 (§22.5 / §22.6, v0.313): `new ImportedT(...)` against 2+
+        // constructors. The imported ctors carry no AST decl, so the
+        // candidates are read through `FormalsView` over the
+        // `ConstructorSymbol` (§2.8.3 rule 4: the program types the same
+        // whichever artifact declared the type). Mirrors the LOCAL overload
+        // arm of `checkNewExprArgs`: the §22.5 binder filters, then §22.6
+        // ranking (`resolveOverload`) reports the no-applicable / ambiguous
+        // diagnostic. Diagnosis only: the winner is NOT published, so
+        // codegen's imported-ctor lowering is unchanged. A call with a
+        // call-site modifier or discard stays deferred, as on the local arm.
+        for (const auto& a : ne.args)
+            if (!a.modifier.empty() || a.isDiscard) return;
+        std::vector<const ConstructorSymbol*> cands;
+        std::vector<BindResult> binds;
+        for (const ConstructorSymbol* c : ctors) {
+            BindResult b = bindArgsToParams(sema::FormalsView::of(*c), ne.args,
+                                            ne.span.begin, std::string(),
+                                            /*emit=*/false);
+            if (!b.ok) continue;
+            cands.push_back(c);
+            binds.push_back(std::move(b));
+        }
+        const std::string newDesc =
+            std::string("`new ") + std::string(t->name) + "`";
+        if (cands.empty()) {
+            const ConstructorSymbol* reportOn = nullptr;
+            for (const ConstructorSymbol* c : ctors) {
+                if (sema::FormalsView::of(*c).size() != ne.args.size())
+                    continue;
+                if (reportOn) { reportOn = nullptr; break; }
+                reportOn = c;
+            }
+            if (reportOn) {
+                (void)bindArgsToParams(sema::FormalsView::of(*reportOn),
+                                       ne.args, ne.span.begin, newDesc,
+                                       /*emit=*/true);
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) +
+                    "`: no constructor of `" + std::string(t->name) +
+                    "` can bind these arguments — each candidate leaves a "
+                    "required parameter unbound, lacks a parameter the call "
+                    "names, or takes fewer arguments (§22.5, §22.6)");
+            return;
+        }
+        // Per-candidate parameter types laid out in CALL-ARGUMENT order (the
+        // local arm's #4780 re-indexing); defaulted slots carry no pressure.
+        const std::size_t nSupplied = ne.args.size();
+        std::vector<std::vector<const TypeRef*>> paramTypes(cands.size());
+        std::vector<std::string> candNames(cands.size());
+        std::vector<bool> fillsDefault(cands.size(), false);
+        for (std::size_t c = 0; c < cands.size(); ++c) {
+            std::vector<const TypeRef*> byArg(nSupplied, nullptr);
+            std::vector<bool> seen(nSupplied, false);
+            const std::size_t np = sema::FormalsView::of(*cands[c]).size();
+            for (std::size_t j = 0; j < np; ++j) {
+                const int ai = binds[c].paramToArg[j];
+                if (ai < 0) { fillsDefault[c] = true; continue; }
+                if (static_cast<std::size_t>(ai) >= nSupplied ||
+                    seen[static_cast<std::size_t>(ai)])
+                    return;  // not a bijection onto the arguments: defer
+                seen[static_cast<std::size_t>(ai)] = true;
+                auto* ps = dynamic_cast<ParameterSymbol*>(cands[c]->params[j]);
+                TypeRef* pt = ps && ps->resolvedDeclType
+                                  ? substituteMemberType(ps->resolvedDeclType,
+                                                         &ne, t)
+                                  : nullptr;
+                const ast::CallArgument& carg =
+                    ne.args[static_cast<std::size_t>(ai)];
+                if (carg.value && pt)
+                    (void)narrowIntConstantToTarget(
+                        carg.value.get(), ctx_.exprType(*carg.value), pt);
+                byArg[static_cast<std::size_t>(ai)] = pt;
+            }
+            paramTypes[c].swap(byArg);
+            std::string sig;
+            for (std::size_t j = 0; j < np; ++j) {
+                if (j) sig += ", ";
+                sig += std::string(sema::formalParamName(*cands[c], j));
+            }
+            candNames[c] = std::string("new ") + std::string(t->name) + "(" +
+                           sig + ")";
+        }
+        std::vector<const TypeRef*> argTypes(nSupplied, nullptr);
+        std::vector<const ast::Expr*> argExprs;
+        argExprs.reserve(nSupplied);
+        for (std::size_t i = 0; i < nSupplied; ++i) {
+            if (ne.args[i].value)
+                argTypes[i] = ctx_.exprType(*ne.args[i].value);
+            argExprs.push_back(ne.args[i].value.get());
+        }
+        // resolveOverload reports the ambiguous / unreachable diagnostic
+        // itself; Undecidable (unresolved types) defers, as before.
+        (void)resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
+                              ne.span.begin, newDesc, std::string(),
+                              argExprs);
+        return;
+    }
     ConstructorSymbol* cs = ctors[0];
     const std::size_t nparams = cs->params.size();
     const std::string desc =
