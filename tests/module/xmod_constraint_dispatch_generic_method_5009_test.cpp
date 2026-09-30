@@ -99,8 +99,8 @@
 //   T18-T23 ★ bodies with a lambda (p8b / q1 / q3 / q4) or a member of a
 //        nested generic call's result (p6c / q7) are REJECTED with #1943's
 //        diagnostic (43854953: they bound, did not lower, and returned 0)
-//   T24 ★ CODEGEN BACKSTOP: a body that binds but does not lower (a sibling
-//        generic class at T) is REJECTED at the call site, not 0
+//   T24 ★ a sibling generic class at T: once a backstop reject (it bound but
+//        did not lower), now 107 across modules (#5160)
 //   T25  DIFFERENTIAL CONTROL for T18-T24 in ONE module -> 99
 //   T26 ★ `virtual VBox<T>` (a sibling generic class at T) on its own class
 //        is REJECTED with #1943's diagnostic (bd0405e6: 0, twin 107)
@@ -861,21 +861,22 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
 }
 
 // ===========================================================================
-// T24 — ★ THE CODEGEN BACKSTOP. `GenBox` instantiates a sibling generic class
-// at T. It has no lambda and no generic method call, so the pre-attach refusal
-// lets it through, and on the pre-backstop tree it returned 0 with an INTERNAL
-// #2491 warning (MEASURED). Any INTERNAL degrade while a constraint-route body
-// is emitted is now a located error at the call site.
-// // per §14.1 / §2.8.3 rule 2 / #1943, v0.307
+// T24 — ★ THE CODEGEN BACKSTOP's original shape. `GenBox` instantiates a
+// sibling generic class at T. It has no lambda and no generic method call, so
+// the pre-attach refusal lets it through, and on the pre-backstop tree it
+// returned 0 with an INTERNAL #2491 warning (MEASURED); the backstop made it a
+// located error at the call site. The degrade itself was #5160: the re-parse
+// context could not type `b.Get()` on the attached generic sibling. With the
+// sibling's signature types carried into that context, the body lowers and
+// the call returns its one-module value (T25), 107.
+// // per §14.1 / §2.8.3 rule 2 / #1943 / #5160, v0.313
 // ===========================================================================
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           body_that_does_not_lower_is_rejected_not_zero) {
-    auto r = compileImport5009(depLow5009(),
-                               appLow5009("T24", "GL5009.GenBox(s)"));
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    BEZEL_EXPECT_TRUE(r.err.find(lowerReject5009("GenBox")) !=
-                      std::string::npos);
+           body_with_sibling_generic_class_keeps_value_across_modules) {
+    int rc = buildImportAndRun5009(depLow5009(),
+                                   appLow5009("T24", "GL5009.GenBox(s)"));
+    if (rc == -2) return;  // dependency toolchain unavailable
+    BEZEL_EXPECT_EQ(rc, 107);
 }
 
 // ===========================================================================

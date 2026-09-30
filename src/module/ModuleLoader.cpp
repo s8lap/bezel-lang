@@ -3886,6 +3886,58 @@ static void astTypeMentionsNames5009(
 // `Box<string>.Get()` returns the field at the correct `ptr` offset instead of
 // the i32-placeholder offset.  Returns false (leaving decl untouched) on any
 // parse/sema failure, so the §14.1/#783 sema gate stays in force for that shape.
+// fix #5160 (§14.1 / §2.8.2 clause 2 / §2.8.3 rule 4, v0.313): a sibling
+// type registered into a body re-parse's fresh context is the REAL imported
+// TypeSymbol, so its members are the imported symbols. Their signature types,
+// though, live in `mainCtx`'s side tables, which the fresh context does not
+// share: the loader-recorded wire types (`importedReturnType` /
+// `importedMemberType`) and, for a member whose own body was re-parsed and
+// attached earlier (a GENERIC sibling, #783, e.g. `Box<U>.Get(): U`), the
+// `resolvedType` entries of that attached declaration's return and parameter
+// type nodes. Without them the fresh typecheck gave `b.Get()` no type at all
+// (no diagnostic), everything built on it (`var x := b.Get(); x.Area()`) went
+// untyped, and codegen degraded the body to a zero return (INTERNAL #2491):
+// MEASURED `NB<T>(b: Box<T>): int where T: IShape => b.Get().Area() + 50`
+// was rejected by the #5009 backstop across modules (single-module twin 57).
+// Carried BY IDENTITY, like #3748's field-initializer carry: the TypeRefs are
+// the ones mainCtx's own sema consumed.
+static void carrySiblingSignatureTypes5160(const sema::SemaContext& mainCtx,
+                                           sema::SemaContext& freshCtx,
+                                           const sema::TypeSymbol* sib) {
+    if (!sib) return;
+    auto carryAst = [&](const ast::Type* t) {
+        if (!t) return;
+        if (sema::TypeRef* r = mainCtx.resolvedType(*t))
+            freshCtx.setResolvedType(t, r);
+    };
+    for (sema::Symbol* mem : sib->members) {
+        if (!mem) continue;
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem)) {
+            if (sema::TypeRef* rt = mainCtx.importedReturnType(ms))
+                freshCtx.setImportedReturnType(ms, rt,
+                                               mainCtx.importedReturnOwned(ms));
+            // SEAM-ACCESSOR: both-sources carry (#5160): the wire type above is
+            // the imported source; the re-parsed decl's type nodes (#783) are the
+            // AST source, and they exist only when the member was re-parsed.
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                carryAst(md->returnType.get());
+                for (const auto& p : md->params) carryAst(p.type.get());
+            }
+            // SEAM-ACCESSOR: the operator arm of the same both-sources carry.
+            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl)) {
+                carryAst(od->returnType.get());
+                for (const auto& p : od->params) carryAst(p.type.get());
+            }
+        } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem)) {
+            if (sema::TypeRef* ty = mainCtx.importedMemberType(fs))
+                freshCtx.setImportedMemberType(fs, ty);
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(mem)) {
+            if (sema::TypeRef* ty = mainCtx.importedMemberType(ps))
+                freshCtx.setImportedMemberType(ps, ty);
+        }
+    }
+}
+
 static bool parseAndAttachMethodBody(
     const MetaTypeDecl& td,
     const MetaMember& target,
@@ -3949,6 +4001,7 @@ static bool parseAndAttachMethodBody(
                 if (!sib || sib->name.empty()) continue;
                 if (sib->name == td.name) continue;
                 freshCtx.registerImportedType(moduleName, sib);
+                carrySiblingSignatureTypes5160(mainCtx, freshCtx, sib);
             }
         }
     }
@@ -3960,8 +4013,10 @@ static bool parseAndAttachMethodBody(
     // tests/module/xmod_generic_method_783_test.cpp).
     if (!moduleName.empty())
         for (sema::TypeSymbol* sib : constraintSiblings)
-            if (sib && !sib->name.empty())
+            if (sib && !sib->name.empty()) {
                 freshCtx.registerImportedType(moduleName, sib);
+                carrySiblingSignatureTypes5160(mainCtx, freshCtx, sib);
+            }
     sema::resolveTypes(*sf, freshCtx);
     if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
