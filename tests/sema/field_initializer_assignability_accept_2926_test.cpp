@@ -191,7 +191,7 @@ BEZEL_TEST(sema_field_initializer_assignability_accept_2926, generic_type_param_
     BEZEL_EXPECT_EQ(runProg(
         "module A2926e; "
         "class Box<U> "
-        "  public V: U := Box.Noop; "
+        "  public V: U := Box<U>.Noop; "
         "  public owned A: Array<U> := new Array<U>(); "
         "  public static method Noop(x: int): int return x; end Noop; "
         "  public static method Id(x: int): int return x; end Id; "

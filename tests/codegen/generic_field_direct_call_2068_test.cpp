@@ -110,7 +110,7 @@ BEZEL_TEST(generic_field_direct_call_2068, pair_function_field_42) {
 BEZEL_TEST(generic_field_direct_call_2068, class_box_function_field_42) {
     BEZEL_EXPECT_EQ(run(
         "module M; class Box<U> "
-        "  public V: U := Box.Noop; "
+        "  public V: U := Box<U>.Noop; "
         "  public static method Noop(x: int): int return x; end Noop; "
         "  public static method Id(x: int): int return x; end Id; "
         "  public static method Main(): int "

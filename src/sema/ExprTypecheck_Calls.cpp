@@ -22688,18 +22688,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // static-vs-instance correctness of the member is
                 // enforced by the static-context checks, not here.)
                 //
-                // §22.12 / #696: a generic class's static members must be
-                // accessed with explicit type arguments on the type name
-                // (e.g. `Counter<int>.n`, not bare `Counter.n`).  Each
+                // §22.12 / §14.1 / #5185: a generic class's static members
+                // must be accessed with explicit type arguments on the type
+                // name (e.g. `Counter<int>.n`, not bare `Counter.n`). Each
                 // distinct instantiation has its own static state, so an
-                // unqualified name is ambiguous and ill-formed.
-                //
-                // Exception: inside the generic class's OWN body (ts ==
-                // currentType_) the bare name is the self-reference form
-                // (implicitly Tag<T>.field for the current instantiation)
-                // — that idiom is accepted and resolves correctly in
-                // codegen when genericSubst_ is active.
-                if (!ts->genericParams.empty() && ts != currentType_) {
+                // unqualified name is ambiguous and ill-formed. Per §14.1
+                // "Instantiation and its site" (v0.311) this holds inside
+                // the generic type's own declaration too — member bodies,
+                // field initializers, and member signatures all fix the
+                // bare name at arity 0 (§C.1). The current instantiation
+                // is reached through §2.7's enclosing-type member lookup
+                // (bare member name → enclosing type's own member), NOT
+                // by writing the enclosing type's bare name as a
+                // receiver.
+                if (!ts->genericParams.empty()) {
                     auto* tid =
                         dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
                     if (tid && tid->typeArgs.empty()) {
@@ -22708,7 +22710,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             std::string("generic type `") +
                             std::string(ts->name) +
                             "` requires type arguments when accessing its "
-                            "static members from outside the class body — "
+                            "static members — "
                             "use `" + std::string(ts->name) +
                             "<T>.` with the concrete type arguments "
                             "(§22.12)");

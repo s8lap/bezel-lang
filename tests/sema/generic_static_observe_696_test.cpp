@@ -1,6 +1,7 @@
 // Spec-derived tests for §22.12 / issue #696: per-instantiation static
 // observability — accessing a generic class's static member without type
-// arguments is ILL-FORMED outside the class body.
+// arguments is ILL-FORMED, including inside the class's own body
+// (per §14.1 / #5185, v0.311).
 //
 // §22.12 (normative): "A static member of a *generic* class is accessed by
 // supplying the type arguments on the type name in receiver position —
@@ -133,12 +134,15 @@ BEZEL_TEST(sema_generic_static_696,
 }
 
 // ---------------------------------------------------------------------------
-// WELL-FORMED: bare access INSIDE the generic class's own body is accepted
-// (the self-reference idiom: Tag.disposed inside Tag<T> means Tag<T>.disposed)
+// ILL-FORMED: bare access INSIDE the generic class's own body is also
+// diagnosed (per §14.1 / #5185, v0.311 — the bare name fixes arity 0 the
+// same as outside; the current instantiation is reached through §2.7's
+// enclosing-type member lookup, not by writing the bare enclosing type as
+// a receiver).
 // ---------------------------------------------------------------------------
 
-// (6) §22.12 / #696: bare `Counter.n` inside Counter<T>'s OWN method body is
-// the self-reference form and must NOT produce a diagnostic.
+// (6) §14.1 / §22.12 / #5185: bare `Counter.n` inside Counter<T>'s OWN method
+// body fixes arity 0 and must produce the same diagnostic as outside the body.
 BEZEL_TEST(sema_generic_static_696,
            bare_generic_static_inside_own_class_body_ok_spec_22_12) {
     auto r = parseSemaTc(
@@ -149,11 +153,11 @@ BEZEL_TEST(sema_generic_static_696,
         "    Counter.n := Counter.n + 1; "
         "  end Bump; "
         "end Counter;");
-    BEZEL_EXPECT_FALSE(hasGenericStaticError(r));
+    BEZEL_EXPECT_TRUE(hasGenericStaticError(r));
 }
 
-// (7) §22.12 / #696: bare `Tag.disposed` inside Tag<T>'s destructor body is
-// the self-reference form (mirrors the #684 test shape) — must not diagnose.
+// (7) §14.1 / §22.12 / #5185: bare `Tag.disposed` inside Tag<T>'s destructor
+// body fixes arity 0 — must be diagnosed (mirrors the #684 test shape).
 BEZEL_TEST(sema_generic_static_696,
            bare_generic_static_in_destructor_body_ok_spec_22_12) {
     auto r = parseSemaTc(
@@ -165,7 +169,7 @@ BEZEL_TEST(sema_generic_static_696,
         "    Tag.disposed := Tag.disposed + 1; "
         "  end destructor; "
         "end Tag;");
-    BEZEL_EXPECT_FALSE(hasGenericStaticError(r));
+    BEZEL_EXPECT_TRUE(hasGenericStaticError(r));
 }
 
 // ---------------------------------------------------------------------------

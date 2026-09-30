@@ -3135,7 +3135,7 @@ BEZEL_TEST(cross_module_import,
         // the path that crashed: staticFieldGlobal looked up genericSubst_
         // and tried to call getInitializer() on the imported external ref.
         "  destructor "
-        "    Tag.disposed := Tag.disposed + 1; "
+        "    Tag<T>.disposed := Tag<T>.disposed + 1; "
         "  end destructor; "
         "end Tag;");
     // Step 1: compile-to-object (bezelc -c) must succeed.
@@ -3204,7 +3204,7 @@ BEZEL_TEST(cross_module_import,
         "  public static destroyed: int := 0; "
         "  public constructor() end constructor; "
         "  destructor "
-        "    Box.destroyed := Box.destroyed + 1; "
+        "    Box<T>.destroyed := Box<T>.destroyed + 1; "
         "  end destructor; "
         "end Box;");
     bezel::Driver driver;

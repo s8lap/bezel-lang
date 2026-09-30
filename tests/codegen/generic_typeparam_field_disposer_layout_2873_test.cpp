@@ -232,7 +232,7 @@ BEZEL_TEST(generic_typeparam_field_disposer_layout_2873,
         "class G<T> public static d: int := 0; public v: T; "
         "  public owned cell: Cell := new Cell(); public a: int := 41; "
         "  public s: string := \"z\"; "
-        "  destructor G.d := G.d + 1; end destructor; end G; "
+        "  destructor G<T>.d := G<T>.d + 1; end destructor; end G; "
         "class C public static method Main(): int "
         "  var bad := 0; var k := 0; "
         "  while k < 20 do "
