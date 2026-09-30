@@ -145,14 +145,27 @@ machine-wide build jobserver: `scripts/jobserver_ctl.sh start` (a systemd
 pool (its `-j` is stripped); two exceptions do NOT join: `cmake --build
 --preset …` (cmake adds the preset's `jobs` itself) and a caller whose
 `MAKEFLAGS` is already set. Each build keeps one implicit job, so none starves and a
-one-TU relink never queues behind a cold build. With no daemon, builds behave
-exactly as before; `gate.sh` always opts out (`BEZEL_JOBSERVER=off`). ⚠ It is
+one-TU relink never queues behind a cold build. With no daemon, `dev_heavy.sh`
+joins nothing and the compiles fall back to the launcher's slots (below);
+`gate.sh` always opts out (`BEZEL_JOBSERVER=off`). ⚠ It is
 a **memory safety valve, not a speed-up** (measured R20: capped builds kept
 MemAvailable ≥11G where uncapped fell to 4.9G, but took ~40% longer each).
-Lanes must build through `dev_heavy.sh`/`agent_check.sh` — a bare `cmake
---build -j16` bypasses the pool — and must NOT add their own "wait until fewer
-than K builds" gate on top: a hand-rolled gate that other lanes ignore starved
-one lane for 70 min in R20.
+Lanes must build through `dev_heavy.sh`/`agent_check.sh` and must NOT add their
+own "wait until fewer than K builds" gate on top: a hand-rolled gate that other
+lanes ignore starved one lane for 70 min in R20.
+Two layers enforce this since 2026-09-30, when a coordinator's lane briefs said
+`cmake --build build --target bezel_tests_sema -j` (unlimited `make -j`, outside
+`dev_heavy.sh`): 499 clang, and the OOM killer took three Claude sessions and
+plasmashell. (1) Every generated compile and link runs through
+`scripts/build_token.sh`, which takes a pool token unless its make/ninja already
+joined the pool, or one of 16 machine-wide flock slots when no launcher-aware
+daemon runs. A bare `make -j` therefore queues instead of fanning out, however it
+was started. (2) A Claude Code PreToolUse hook (`scripts/claude_hooks/build_guard.py`,
+installed as `~/.claude/hooks/bezel_build_guard.py` in `~/.claude/settings.json`)
+refuses a bare `cmake --build`/make/ninja in a build dir, a `BEZEL_JOBSERVER=off`
+or `MAKEFLAGS=` override, and an Agent prompt or `*brief*` file that tells a lane
+to run one, and names the command to run instead. Denials are logged to
+`/var/tmp/bezel-scratch/build-guard/denials.log`. After changing the hook, re-copy it.
 `start` refuses to run from a linked worktree. A *dedicated* daemon worktree (e.g.
 `/mnt/fast/wt-jobserver21`) needs `BEZEL_JOBSERVER_ALLOW_WORKTREE=1`. The unit name is
 `bezel-jobserver` for the default token dir, and `bezel-jobserver-<hash8>` for any other

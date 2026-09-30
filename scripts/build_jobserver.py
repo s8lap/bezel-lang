@@ -30,6 +30,14 @@ Two properties the FIFO needs that plain `mkfifo` does not give:
     the FIFO, a make with k running children holds k-1 tokens; if the pool is
     short of N minus that sum on --confirm consecutive audits, it writes the
     difference back. It never tops the pool above N.
+  * Jobs of a build that did NOT join (a bare `make -j`, `ninja -j64`) take
+    their token through scripts/build_token.sh, the compile/link launcher
+    CMakeLists.txt installs. That launcher holds the FIFO open under the comm
+    `bzl-tok-held` while it holds one token (`bzl-tok-wait` / `bzl-tok-done`
+    while it holds none); the audit counts it, and a pool with only launchers
+    in it is busy, not idle. `serve` publishes `features` ("launcher1 <pid>")
+    so the launcher can tell this daemon from an older one that would re-mint
+    launcher-held tokens as a leak.
 
 Subcommands:
   serve [--tokens N] [--dir D] [--interval S] [--confirm K]
@@ -38,7 +46,8 @@ Subcommands:
   rewrite-args -- ARGS...     print ARGS minus -j/--parallel forms, NUL-separated
 
 State lives in D (default /var/tmp/bezel-scratch/jobserver): `fifo`, `pid`,
-`tokens`, and `samples.tsv` (one audit row per interval, for evaluation).
+`tokens`, `features`, and `samples.tsv` (one audit row per interval, for
+evaluation).
 """
 from __future__ import annotations
 
@@ -55,6 +64,13 @@ import time
 
 DEFAULT_DIR = os.environ.get("BEZEL_JOBSERVER_DIR", "/var/tmp/bezel-scratch/jobserver")
 TOKEN = b"+"
+# The launcher protocol this daemon speaks (scripts/build_token.sh checks it).
+FEATURES = "launcher1"
+BUILD_TOOLS = ("make", "gmake", "ninja", "ninja-build")
+LAUNCHER_PREFIX = "bzl-tok-"
+LAUNCHER_HOLDING = "bzl-tok-held"
+SAMPLES_HEADER = ("epoch\tavailable\texpected_held\tmakes\tclang\t"
+                  "mem_avail_mb\trepaired\tlaunchers\n")
 
 
 def _read(path: str) -> str:
@@ -63,7 +79,8 @@ def _read(path: str) -> str:
 
 
 def _paths(d: str) -> dict[str, str]:
-    return {k: os.path.join(d, k) for k in ("fifo", "pid", "tokens", "samples.tsv")}
+    return {k: os.path.join(d, k)
+            for k in ("fifo", "pid", "tokens", "features", "samples.tsv")}
 
 
 def available_tokens(fd: int) -> int:
@@ -119,21 +136,28 @@ def _comm(pid: int) -> str:
         return ""
 
 
-def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int]:
-    """(tokens the live makes should be holding, number of make holders).
+def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int, int]:
+    """(tokens the holders should be holding, make/ninja holders, launchers).
 
     A make running k children holds k-1 tokens (one child uses its implicit
-    slot). Non-make holders (e.g. a `status` probe) hold none."""
+    slot). A build_token.sh launcher holds one token while its comm is
+    `bzl-tok-held` and none while it waits or hands it back. Other holders
+    (e.g. a `status` probe) hold none."""
     held = 0
     makes = 0
+    launchers = 0
     for pid in _fifo_holders(fifo, self_pid):
+        comm = _comm(pid)
         # Fedora installs ninja as `ninja-build`; an unrecognised holder's
         # tokens read as a leak and get re-minted (R22: pool unbounded).
-        if _comm(pid) not in ("make", "gmake", "ninja", "ninja-build"):
-            continue
-        makes += 1
-        held += max(0, _children_count(pid) - 1)
-    return held, makes
+        if comm in BUILD_TOOLS:
+            makes += 1
+            held += max(0, _children_count(pid) - 1)
+        elif comm.startswith(LAUNCHER_PREFIX):
+            launchers += 1
+            if comm == LAUNCHER_HOLDING:
+                held += 1
+    return held, makes, launchers
 
 
 def _count_procs(names: tuple[str, ...]) -> int:
@@ -177,6 +201,8 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
         f.write(f"{tokens}\n")
     with open(p["pid"], "w") as f:
         f.write(f"{os.getpid()}\n")
+    with open(p["features"], "w") as f:
+        f.write(f"{FEATURES} {os.getpid()}\n")
 
     stop = False
 
@@ -187,10 +213,19 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
 
-    new_file = not os.path.exists(p["samples.tsv"])
+    # An existing file may carry an older header (no `launchers` column):
+    # repeat the header whenever this daemon's columns differ from the last one.
+    last_header = ""
+    try:
+        with open(p["samples.tsv"]) as f:
+            for line in f:
+                if line.startswith("epoch\t"):
+                    last_header = line
+    except OSError:
+        pass
     log = open(p["samples.tsv"], "a", buffering=1)
-    if new_file:
-        log.write("epoch\tavailable\texpected_held\tmakes\tclang\tmem_avail_mb\trepaired\n")
+    if last_header != SAMPLES_HEADER:
+        log.write(SAMPLES_HEADER)
     streak: list[int] = []   # per-audit deficits while the pool looks short
     surplus_streak: list[int] = []  # per-audit surpluses while it looks over-full
     idle_audits = 0
@@ -213,12 +248,12 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
                 if k:
                     time.sleep(0.05)
                 avail = available_tokens(fd)
-                held, makes = expected_outstanding(p["fifo"], os.getpid())
+                held, makes, launchers = expected_outstanding(p["fifo"], os.getpid())
                 d_k = tokens - avail - held  # >0: tokens nobody holds
                 deficit = d_k if deficit is None else min(deficit, d_k)
                 dmax = d_k if dmax is None else max(dmax, d_k)
             repaired = 0
-            if makes == 0:
+            if makes == 0 and launchers == 0:
                 # Idle: the pool must hold exactly N. Restore it both ways
                 # (a lost token, or an over-return) once idle is confirmed.
                 streak.clear()
@@ -264,9 +299,15 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
             log.write(
                 f"{int(time.time())}\t{avail}\t{held}\t{makes}\t"
                 f"{_count_procs(('clang', 'clang++', 'cc1plus'))}\t"
-                f"{_mem_available_kb() // 1024}\t{repaired}\n"
+                f"{_mem_available_kb() // 1024}\t{repaired}\t{launchers}\n"
             )
     finally:
+        # features first: a launcher must never see it without a live pid.
+        try:
+            if _read(p["features"]).split()[1:] == [str(os.getpid())]:
+                os.unlink(p["features"])
+        except (OSError, IndexError):
+            pass
         try:
             if _read(p["pid"]) == str(os.getpid()):
                 os.unlink(p["pid"])
@@ -303,7 +344,7 @@ def status(d: str) -> int:
         avail = available_tokens(fd)
     finally:
         os.close(fd)
-    held, makes = expected_outstanding(p["fifo"], os.getpid())
+    held, makes, launchers = expected_outstanding(p["fifo"], os.getpid())
     n = _read(p["tokens"])
     pid = _read(p["pid"])
     # `clang` is measured HERE, synchronously, not read back from the
@@ -318,7 +359,8 @@ def status(d: str) -> int:
     # leak signature this field exists to make visible immediately.
     clang = _count_procs(("clang", "clang++", "cc1plus"))
     print(f"build_jobserver: pid={pid} tokens={n} available={avail} "
-          f"held~{held} makes={makes} clang={clang} fifo={p['fifo']}")
+          f"held~{held} makes={makes} launchers={launchers} clang={clang} "
+          f"fifo={p['fifo']}")
     return 0
 
 

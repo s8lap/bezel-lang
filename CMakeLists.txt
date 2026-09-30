@@ -249,6 +249,25 @@ elseif(BEZEL_LLD)
     set(BEZEL_FUSE_LD -fuse-ld=lld)
     message(STATUS "Bezel: using lld linker")
 endif()
+#  * build token launcher: every compile and link takes a slot from the
+#    machine-wide build token pool (scripts/build_jobserver.py) unless the
+#    make/ninja running it already joined that pool. It goes in front of ccache.
+#    The limit is in the generated rule, so it holds however the build is
+#    started: a bare `cmake --build -j` (unlimited `make -j`) queues for tokens
+#    instead of starting hundreds of compilers (2026-09-30 box-wide OOM). There
+#    is no configure-time opt-out; BEZEL_JOBSERVER=off at build time (gate.sh)
+#    is the only one. See the script header for the per-job decision.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    set(BEZEL_BUILD_TOKEN_LAUNCHER "${CMAKE_SOURCE_DIR}/scripts/build_token.sh")
+    foreach(_bezel_lang C CXX)
+        list(PREPEND CMAKE_${_bezel_lang}_COMPILER_LAUNCHER "${BEZEL_BUILD_TOKEN_LAUNCHER}")
+        list(PREPEND CMAKE_${_bezel_lang}_LINKER_LAUNCHER "${BEZEL_BUILD_TOKEN_LAUNCHER}")
+    endforeach()
+    message(STATUS "Bezel: compiles and links take build tokens (scripts/build_token.sh)")
+else()
+    message(WARNING "Bezel: no build token launcher (it needs Linux /proc); "
+                    "this build's parallelism is not bounded")
+endif()
 #  * split DWARF: the RelWithDebInfo build carries full `-g` debug info, and
 #    everything links statically into one 300M+ test binary that is relinked on
 #    every change. With -gsplit-dwarf the debug info goes into separate .dwo

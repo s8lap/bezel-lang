@@ -133,7 +133,7 @@ case "${1:-status}" in
   status)
     python3 "$js" status --dir "$dir" || exit 1
     if [ -f "$dir/samples.tsv" ]; then
-      echo "last audits (epoch available held makes clang mem_avail_mb repaired):"
+      echo "last audits (epoch available held makes clang mem_avail_mb repaired launchers):"
       tail -n 5 "$dir/samples.tsv"
     fi
     ;;

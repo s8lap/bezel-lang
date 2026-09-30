@@ -347,8 +347,14 @@ if(BEZEL_CCACHE_RELOCATABLE)
     # CMakeLists.txt), so PCH'd test TUs still hit across trees. The .sum is
     # deleted before every PCH compile and written only after it succeeds;
     # with no .sum ccache falls back to the PCH bytes. See the script header.
+    # BEZEL_BUILD_TOKEN_LAUNCHER (top-level CMakeLists.txt) goes first here
+    # too: this property replaces the global launcher for the PCH compile.
+    # Unquoted, so an unset launcher adds no empty argument.
+    set(_bezel_pch_launcher ${BEZEL_BUILD_TOKEN_LAUNCHER}
+        "${CMAKE_CURRENT_SOURCE_DIR}/pch_sum_launcher.sh" "${CMAKE_SOURCE_DIR}"
+        "${BEZEL_SOURCE_DIR_REAL}" ${BEZEL_CCACHE_RELOCATABLE_LAUNCHER} "--")
     set_target_properties(bezel_tests_pch PROPERTIES CXX_COMPILER_LAUNCHER
-        "${CMAKE_CURRENT_SOURCE_DIR}/pch_sum_launcher.sh;${CMAKE_SOURCE_DIR};${BEZEL_SOURCE_DIR_REAL};${BEZEL_CCACHE_RELOCATABLE_LAUNCHER};--")
+        "${_bezel_pch_launcher}")
     set_property(TARGET bezel_tests_pch APPEND PROPERTY ADDITIONAL_CLEAN_FILES
         ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.sum
         ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/bezel_tests_pch.dir/cmake_pch.hxx.pch.inputs)
