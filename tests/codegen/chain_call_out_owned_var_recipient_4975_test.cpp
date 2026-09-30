@@ -67,13 +67,6 @@ using bezel::test::JitResult;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // Disposal-counted class: `_n` is the live-instance count, read back through
 // `AtomicInteger<int>` (a class type — v0.221 §22.12 rule 2 form (iii)
 // rejects a mutable static primitive).
@@ -189,7 +182,6 @@ std::string baseOutUsingVarProgram() {
 BEZEL_TEST(chain_call_out_owned_var_recipient_4975,
            base_chain_out_using_var_auto_dispose_single_shot) {
     JitResult r = runAotChecked(baseOutUsingVarProgram());
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
@@ -223,7 +215,6 @@ BEZEL_TEST(chain_call_out_owned_var_recipient_4975,
         "  end Main; "
         "end Program4975uv2;";
     JitResult r = runAotChecked(prog);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
