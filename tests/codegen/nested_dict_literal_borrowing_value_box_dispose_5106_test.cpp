@@ -111,9 +111,8 @@ BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
 
 // ── Repro 3: nested Dictionary literal where V is LinkedList<long>. Inner
 // is a bz_llist_t; freed via bz_llist_free(inner, nullptr) at outer dispose.
-// Without the fix: bz_llist_t header + nodes leak. The elements are long-typed
-// locals: an int literal argument to AddLast hits the separate widening bug
-// #5201 (stack-buffer-overflow), which is not this row's property.
+// Without the fix: bz_llist_t header + nodes leak. The int-literal AddLast
+// arguments are widened to long (#5201, §5.1 v0.313).
 // §28.9 / §28.11 (#5106).
 BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
            nested_dict_linkedlist_value_disposes_inner_spec_28_9) {
@@ -124,8 +123,8 @@ BEZEL_TEST(nested_dict_literal_borrowing_value_box_dispose_5106,
         "    var d: Dictionary<string, LinkedList<long>> := "
         "      [\"k\": new LinkedList<long>()]; "
         "    var inner: LinkedList<long> := d[\"k\"]; "
-        "    var a: long := 7; inner.AddLast(a); "
-        "    var b: long := 8; inner.AddLast(b); "
+        "    inner.AddLast(7); "
+        "    inner.AddLast(8); "
         "    if inner.Count = 2 then return 1; else return 0; end if; "
         "  end Main; "
         "end C;";
