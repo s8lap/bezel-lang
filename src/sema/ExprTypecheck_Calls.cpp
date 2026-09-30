@@ -17977,19 +17977,22 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // otherwise name the failure generically, citing §22.5/§22.6.
         if (decls.empty()) {
             const std::size_t n = ne.args.size();
-            const ast::ConstructorDecl* reportOn = nullptr;
+            // fix #5042: the lone candidate of the call's raw arity is read
+            // off the ConstructorSymbol (`FormalsView`), not `cs->decl`; no
+            // candidate binds here, so `bindArgsToParams(emit=true)` reports
+            // that candidate's own §22.5 failure (the same text
+            // `checkArgsAgainstParams` gives, which runs this binder first).
+            const ConstructorSymbol* reportOn = nullptr;
             for (ConstructorSymbol* cs : ctors) {
-                // SEAM-DEBT: #5042 imported ctor (decl null) is skipped, leaving the generic §22.6 error; no ctor param-list accessor yet
-                auto* cdecl = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                if (!cdecl || cdecl->params.size() != n) continue;
+                if (sema::FormalsView::of(*cs).size() != n) continue;
                 if (reportOn) { reportOn = nullptr; break; }
-                reportOn = cdecl;
+                reportOn = cs;
             }
             if (reportOn) {
-                checkArgsAgainstParams(
-                    reportOn->params, ne.args, ne.span.begin,
+                (void)bindArgsToParams(
+                    sema::FormalsView::of(*reportOn), ne.args, ne.span.begin,
                     std::string("`new ") + std::string(t->name) + "`",
-                    &ne, t);
+                    /*emit=*/true);
                 return;
             }
             ctx_.diagnostics().report(
