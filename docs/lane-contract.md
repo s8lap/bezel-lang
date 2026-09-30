@@ -5,8 +5,11 @@ briefs averaged ~1,500 words, most of it this boilerplate. A brief should now ca
 SPECIFIC to its assignment.*
 
 ## Setup
-1. You are in a git worktree. **First command:** `bash scripts/lane_setup.sh` (puts `build/` on the
-   NVMe — a lane build is create-dominated and `/home` does ~5 durable creates/s vs the NVMe's ~846).
+1. You are in a git worktree under **`/mnt/fast/worktrees/`** (the NVMe). **First command:**
+   `bash scripts/lane_setup.sh`. It makes an in-tree `build/` and puts the AOT bincache on the NVMe:
+   a lane build is create-dominated, and `/home` does ~5 durable creates/s vs the NVMe's ~846. An
+   in-tree build there also reuses other worktrees' compiles through ccache (#5010). If it prints
+   "on the slow disk", your worktree is in the wrong place: say so in your handback.
 2. **Read `CLAUDE.md` (especially *Lane rules* and *Test and oracle rules*) and `tests/README.md`
    before anything else.** They are binding; this contract only elaborates them.
 

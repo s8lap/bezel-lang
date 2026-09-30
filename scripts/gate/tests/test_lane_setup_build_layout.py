@@ -79,6 +79,29 @@ class LaneSetupBuildLayoutTest(unittest.TestCase):
         self.assertTrue(build.is_symlink(), r.stdout)
         self.assertTrue(os.readlink(build).startswith(self.fast_root + "/"),
                         os.readlink(build))
+        self.assertIn("on the slow disk", r.stdout,
+                      "a worktree off the fast disk must be told where lane "
+                      "worktrees belong")
+
+    def test_worktree_moved_onto_the_fast_disk_drops_its_old_symlink(self):
+        # The state a worktree is in after being moved from /home to the NVMe
+        # with its build/ link intact: the linked tree is bound (CMakeCache.txt)
+        # to the old source path, and the link keeps relocatable keys off.
+        repo = Repo(self._fast + "/repo", self.env)
+        old_tree = pathlib.Path(self.fast_root) / "repo-0123abcd"
+        old_tree.mkdir(parents=True)
+        (old_tree / "CMakeCache.txt").write_text("# configured for the old path\n")
+        (repo.root / "build").symlink_to(old_tree)
+        r = self._setup(repo)
+        build = repo.root / "build"
+        self.assertFalse(build.is_symlink(),
+                         "a worktree on the fast disk must not keep a build/ "
+                         "symlink (#5010)\n" + r.stdout)
+        self.assertTrue(build.is_dir(), r.stdout)
+        self.assertTrue((old_tree / "CMakeCache.txt").exists(),
+                        "only the link is replaced; the old tree is gc_scratch's\n"
+                        + r.stdout)
+        self.assertNotIn("on the slow disk", r.stdout)
 
 
 if __name__ == "__main__":

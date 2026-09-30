@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # lane_setup.sh — first command a fix-lane runs inside its worktree.
 #
-# WHY: a lane worktree's build/ tree lands on /home (sda3), which does ~5 durable
-# file creates/s; the NVMe at /mnt/fast does ~846/s. A cold lane build is
-# create-dominated, so putting the build tree on the NVMe is the single biggest
-# per-lane throughput lever we have (see memory: storage-layout-ssd).
+# WHY: a build tree on /home (sda3) does ~5 durable file creates/s; the NVMe at
+# /mnt/fast does ~846/s. A cold lane build is create-dominated, so the build tree
+# must be on the NVMe (see memory: storage-layout-ssd).
 #
-# This symlinks ./build -> /mnt/fast/lane-builds/<worktree-name> BEFORE the first
-# configure, so agent_check.sh / cmake see a normal ./build path and nothing else
-# changes. Idempotent: safe to re-run, refuses to clobber a real (non-symlink)
-# build dir that already holds objects.
+# Lane worktrees live on the NVMe, at /mnt/fast/worktrees/<name> (CLAUDE.md).
+# There build/ is a REAL in-tree dir, which is what turns on the cross-worktree
+# ccache keys (#5010). A worktree still on /home gets the older layout, a
+# ./build -> /mnt/fast/lane-builds/<worktree-name> symlink (per-worktree ccache
+# keys, no cross-worktree hits), and a warning naming the right location.
+# Idempotent: safe to re-run, refuses to clobber a real (non-symlink) build dir
+# that already holds objects.
 #
 # Usage:  bash scripts/lane_setup.sh [--owner <name>]
 #   --owner <name>  also bind this worktree to <name> and its current branch
@@ -25,6 +27,8 @@ if [ "${1:-}" = "--owner" ]; then
 fi
 
 FAST_ROOT="${BEZEL_LANE_BUILD_ROOT:-/mnt/fast/lane-builds}"
+# Where lane worktrees belong: a sibling of FAST_ROOT on the same disk.
+WT_HOME="${BEZEL_WORKTREE_ROOT:-$(dirname "$FAST_ROOT")/worktrees}"
 
 # Resolve the worktree root from git, not $PWD, so it works from a subdir.
 WT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
@@ -162,18 +166,40 @@ else
   echo "[lane_setup] To enable: set BEZEL_AOT_FAST_ROOT=/your/fast/disk or BEZEL_AOT_CACHE_DIR / BEZEL_AOT_SCRATCH_DIR."
 fi
 
+# "On the fast disk" is decided by device number, not by path prefix (the #3008
+# lesson: inspect what the name resolves to).
+_wt_dev="$(stat -L -c %d "$WT" 2>/dev/null)"
+_fast_dev="$(stat -L -c %d "$FAST_ROOT" 2>/dev/null)"
+ON_FAST=0
+[ -n "$_wt_dev" ] && [ "$_wt_dev" = "$_fast_dev" ] && ON_FAST=1
+slow_disk_warning() {
+  echo "[lane_setup] ⚠ this worktree is on the slow disk ($WT)."
+  echo "[lane_setup]   Lane worktrees belong on the NVMe: git worktree add $WT_HOME/<name> ... (CLAUDE.md)."
+  echo "[lane_setup]   Here build/ is a symlink with per-worktree ccache keys: no cross-worktree hits (#5010)."
+}
+
 if [ -L "$WT/build" ]; then
+  if [ "$ON_FAST" = 1 ]; then
+    # A worktree MOVED onto the fast disk keeps the build/ symlink it had on
+    # /home. The linked tree cannot serve it (CMakeCache.txt binds a build tree
+    # to its source path, so the next configure fails), and the symlink turns
+    # off the relocatable keys below. Replace the LINK only; the old tree's
+    # backref names a path that is gone, so gc_scratch.sh reaps it.
+    echo "[lane_setup] worktree is on the fast disk but build/ -> $(readlink "$WT/build");" \
+         "replacing the link with a real in-tree build/ (the old tree is left for gc_scratch.sh)"
+    rm -f "$WT/build"
   # fix #3005: REPAIR A DANGLING LINK — this early return used to refuse to fix
   # the exact state this script creates. When /mnt/fast/lane-builds/<name> is
   # reaped (or was cleared by hand, as 68 GB of orphans were on 2026-08-08) the
   # worktree keeps a symlink pointing at nothing. `[ -L ]` is true, so the lane
   # was told "already a symlink" and every later cmake/build failed on a path
   # that does not exist. Nine live worktrees were measured in exactly this state.
-  if [ ! -e "$WT/build" ]; then
+  elif [ ! -e "$WT/build" ]; then
     echo "[lane_setup] build/ symlink DANGLES -> $(readlink "$WT/build") (target reaped) — repairing"
     rm -f "$WT/build"
   else
     echo "[lane_setup] build/ already a symlink -> $(readlink "$WT/build")"
+    slow_disk_warning
     exit 0
   fi
 fi
@@ -199,17 +225,15 @@ fi
 # rewrites paths relative to the PHYSICAL cwd. Through the symlink the keys
 # keep the lane name and a fresh worktree misses on every TU (#4991 measured
 # 0 of 3 shareable TUs); in-tree, it hits on everything but the handful of TUs
-# that embed a per-tree path. "Same filesystem" is decided by device number,
-# not by path prefix (the #3008 lesson: inspect what the name resolves to).
-_wt_dev="$(stat -L -c %d "$WT" 2>/dev/null)"
-_fast_dev="$(stat -L -c %d "$FAST_ROOT" 2>/dev/null)"
-if [ -n "$_wt_dev" ] && [ "$_wt_dev" = "$_fast_dev" ]; then
+# that embed a per-tree path. ON_FAST is computed above.
+if [ "$ON_FAST" = 1 ]; then
   mkdir -p "$WT/build" || { echo "[lane_setup] could not create $WT/build"; exit 0; }
   echo "[lane_setup] worktree is on the fast disk — build/ is a REAL in-tree dir" \
        "(cross-worktree ccache hits, #5010)"
   exit 0
 fi
 
+slow_disk_warning
 mkdir -p "$TARGET" || { echo "[lane_setup] could not create $TARGET"; exit 0; }
 # fix #3005: leave a BACKREF so a future orphan reaper can identify the owning
 # worktree directly instead of inferring it from the directory basename. Nothing

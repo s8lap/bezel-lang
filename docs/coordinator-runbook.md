@@ -161,8 +161,10 @@ plasmashell. (1) Every generated compile and link runs through
 joined the pool, or one of 16 machine-wide flock slots when no launcher-aware
 daemon runs. A bare `make -j` therefore queues instead of fanning out, however it
 was started. (2) A Claude Code PreToolUse hook (`scripts/claude_hooks/build_guard.py`,
-installed as `~/.claude/hooks/bezel_build_guard.py` in `~/.claude/settings.json`)
-refuses a bare `cmake --build`/make/ninja in a build dir, a `BEZEL_JOBSERVER=off`
+installed as `~/.claude/hooks/bezel_build_guard.py` in `~/.claude/settings.json`,
+with one `--root` each for the main checkout, `/var/tmp/bezel-scratch` and
+`/mnt/fast`, which holds the lane worktrees; it acts only on a session cwd or a
+command under a root) refuses a bare `cmake --build`/make/ninja in a build dir, a `BEZEL_JOBSERVER=off`
 or `MAKEFLAGS=` override, and an Agent prompt or `*brief*` file that tells a lane
 to run one, and names the command to run instead. Denials are logged to
 `/var/tmp/bezel-scratch/build-guard/denials.log`. After changing the hook, re-copy it.
@@ -221,8 +223,10 @@ and the current worktree are never touched), (b) drops stale
 scratch into `/var/tmp/bezel-scratch/root-quarantine/` (moved, not deleted;
 self-purged after 14 days). Run `scripts/gc_scratch.sh` (dry-run) any time to
 preview, `--apply` to act; `scripts/reap_orphans.sh` clears processes a dead
-agent orphaned. ⚠ **Per-worktree build dirs do NOT necessarily live inside the
-worktree.** `scripts/lane_setup.sh` symlinks a lane's `build/` out to
+agent orphaned. Lane worktrees live in `/mnt/fast/worktrees/<name>` (see *Lane
+hygiene*) with a real in-tree `build/`, which `git worktree remove` deletes along
+with the worktree. ⚠ **A worktree on another disk keeps its build dir outside the
+worktree.** For one of those, `scripts/lane_setup.sh` symlinks `build/` out to
 `/mnt/fast/lane-builds/<name>` (the NVMe), so `git worktree remove` deletes only
 the symlink and **orphans the tree**. That is not theoretical: 68 GB accumulated
 across 54 orphans in four days and had to be cleared by hand (#3005), while this
@@ -629,6 +633,34 @@ dispose-count/ASan-clean for a double-free.
 
 ### Lane hygiene
 
+- **Lane worktrees go in `/mnt/fast/worktrees/<name>`**
+  (`git worktree add /mnt/fast/worktrees/<name> <branch>`; the directory is
+  shared, so name it like the branch). Never `.claude/worktrees` or anywhere else
+  on `/home`, which rules out the Agent tool's `isolation: "worktree"`: put the
+  absolute path in the brief instead. There are two reasons:
+  - A lane build is create-dominated, and `/home` (the OS HDD) sustains ~5
+    durable creates/s against the NVMe's ~846.
+  - With the worktree and its `build/` on one filesystem, `build/` is a real
+    in-tree dir and CMake turns on relocatable ccache keys (`base_dir` plus
+    `-ffile-prefix-map`, #5010), so compiles are keyed by content, not by
+    worktree path. Measured: a fresh worktree at an already-built commit got 483
+    of 487 cacheable compiles from ccache (99.2%), and `bezel_tests_sema` built
+    in 140 s instead of 1449 s. Across the 2026-09-29/30 runs, 38.7% of lane
+    compiles duplicated a compile another lane had already done, which
+    per-worktree keys could never share.
+
+  Concurrent cold builds of the same sources still each compile; only finished
+  compiles are shared. A worktree on `/home` still works (`lane_setup.sh` gives
+  it the old `build/` symlink into `/mnt/fast/lane-builds/` and warns), but it
+  shares nothing.
+- **Moving a worktree onto the NVMe.** `git worktree move` cannot cross
+  filesystems. Copy it with `rsync -aH` leaving out the build dir, run
+  `git worktree repair <new path>` from the main checkout, then `lane_setup.sh`
+  in the new place. Never carry a build dir across: its `CMakeCache.txt` binds
+  the old source path. So the first build after a move is a full one, served
+  from ccache when another worktree has built the same sources. On 2026-10-01 the
+  worktrees active in the previous day were moved this way; older ones stayed in
+  `.claude/worktrees/`.
 - **`cd` into your worktree as the literal first action**, and never leave it.
   All writes, builds, `git` commands and test files go there. Lanes have written
   regression tests into the shared checkout because that is the path of least
@@ -663,8 +695,8 @@ dispose-count/ASan-clean for a double-free.
   `git branch --show-current` before every pick.
 - Scratch, worktrees and build dirs never go in `/tmp` — it is a 16 GB tmpfs with
   a uid quota, and exhausting it makes **every** Bash call return exit 1 with no
-  output, which looks exactly like a harness failure. Use
-  `/var/tmp/bezel-scratch/` or `/mnt/fast/`.
+  output, which looks exactly like a harness failure. Scratch goes in
+  `/var/tmp/bezel-scratch/`, worktrees in `/mnt/fast/worktrees/`.
 - Uncommitted WIP recovered from a crashed run is an **unverified hypothesis**,
   not work that is 80% done. Re-derive the diagnosis from the issue and HEAD:
   5 of 5 inherited WIPs were once defective, and two would have shipped a bug.

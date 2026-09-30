@@ -8,8 +8,9 @@
 # and a 2-day-old entry almost never hits. Reusing the SAME worktrees across waves
 # keeps each lane's build/ warm, so wave 2+ rebuilds only the delta.
 #
-# Each pool worktree gets its build/ symlinked to the NVMe by lane_setup.sh — see
-# that script for why (sda3 does ~5 durable creates/s vs the NVMe's ~846).
+# Pool worktrees live on the NVMe, in /mnt/fast/worktrees (CLAUDE.md), where
+# lane_setup.sh gives each a real in-tree build/ and so cross-worktree ccache
+# hits (#5010); see that script for why the build must be on the NVMe at all.
 #
 # Usage:
 #   scripts/lane_pool.sh prepare [N] [BASE]   # create/refresh N lanes at BASE (default 5, origin/main)
@@ -23,10 +24,11 @@
 set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
-POOL_DIR="${BEZEL_LANE_POOL:-$REPO/.claude/lane-pool}"
+POOL_DIR="${BEZEL_LANE_POOL:-${BEZEL_WORKTREE_ROOT:-/mnt/fast/worktrees}}"
 CMD="${1:-list}"; N="${2:-5}"; BASE="${3:-origin/main}"
 
-lane_path() { echo "$POOL_DIR/lane-$1"; }
+# Named like the branch, since the directory is shared with every other worktree.
+lane_path() { echo "$POOL_DIR/lane-pool-$1"; }
 
 prepare() {
   mkdir -p "$POOL_DIR"

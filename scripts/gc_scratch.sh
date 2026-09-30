@@ -54,7 +54,7 @@ if [ "$DO_WT" = 1 ]; then
       echo "[gc] KEEP (WIP, uncommitted): $wt"; continue
     fi
     # ── IN-USE guards ───────────────────────────────────────────────────────
-    # A REUSED warm-pool worktree (.claude/worktrees/pool-N) becomes "landed"
+    # A REUSED warm-pool worktree (/mnt/fast/worktrees/<name>) becomes "landed"
     # the instant its batch is pushed — which is exactly when the next lane is
     # starting work in it. Since gate_and_push.sh runs this script with --apply
     # after every successful push, the WIP + unmerged guards alone would delete

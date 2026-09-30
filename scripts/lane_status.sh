@@ -35,8 +35,12 @@ now=$(date +%s)
 declare -a WTS=()
 if [ "$#" -gt 0 ]; then
   for a in "$@"; do
-    if [ -d "$a" ]; then WTS+=("$a")
-    elif [ -d "$ROOT/.claude/worktrees/$a" ]; then WTS+=("$ROOT/.claude/worktrees/$a")
+    if [ -d "$a" ]; then WTS+=("$a"); continue; fi
+    # A basename: look it up among the registered worktrees, wherever they
+    # live (/mnt/fast/worktrees now; .claude/worktrees for older ones).
+    m="$(git -C "$ROOT" worktree list --porcelain | sed -n 's/^worktree //p' |
+         awk -v b="$a" '{n=split($0, p, "/")} p[n]==b')"
+    if [ -n "$m" ]; then while read -r w; do WTS+=("$w"); done <<< "$m"
     else echo "[lane_status] no such worktree: $a" >&2; fi
   done
 else
@@ -68,11 +72,14 @@ for p in /proc/[0-9]*; do
 done
 
 proc_hits() { # $1 = worktree path -> count of live build/test procs attributable to it
-  # ⚠ lane_setup.sh symlinks <wt>/build -> /mnt/fast/lane-builds/<name>, and a
-  # compiler's cwd resolves through the symlink, so matching the worktree path
-  # ALONE reports zero on a fully busy lane. Match the NVMe build dir too.
+  # ⚠ For a worktree on /home, lane_setup.sh symlinks <wt>/build ->
+  # /mnt/fast/lane-builds/<name>, and a compiler's cwd resolves through the
+  # symlink, so matching the worktree path ALONE reports zero on a fully busy
+  # lane. Match the NVMe build dir too. An in-tree build/ (worktrees on the
+  # NVMe) is already covered by the worktree path, so it is not counted twice.
   local wt="$1" n=0
   local blink; blink="$(readlink -f "$wt/build" 2>/dev/null)"
+  case "$blink" in "$(readlink -f "$wt")"/*) blink="" ;; esac
   for c in "${!CWDS[@]}"; do
     case "$c" in "$wt"*) n=$((n+1));; esac
     [ -n "$blink" ] && case "$c" in "$blink"*) n=$((n+1));; esac

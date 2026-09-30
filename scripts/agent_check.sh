@@ -84,7 +84,7 @@ DH="$ROOT/scripts/dev_heavy.sh"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 JOBS="${JOBS:-16}"
 # per #3547: qualify by worktree basename so concurrent lanes (distinct
-# worktrees under .claude/lane-pool/) don't clobber each other's configure/test
+# worktrees under /mnt/fast/worktrees/) don't clobber each other's configure/test
 # logs and --probe outputs in one shared directory. BEZEL_AGENT_SCRATCH
 # overrides entirely (e.g. to opt back into the old shared location).
 SCRATCH="${BEZEL_AGENT_SCRATCH:-/var/tmp/bezel-scratch/agent-probe/$(basename "$ROOT")}"
