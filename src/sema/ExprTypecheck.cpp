@@ -20055,6 +20055,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // (#2153: lifted forms like `int? += ulong?` reach this
                     // branch on the underlying primitives and reject
                     // identically.)
+                    // §6.6 (v0.313, #5211): a `char` target's right operand is
+                    // typed as in `int op e` under §6.2 — "a non-constant `uint`
+                    // or `ulong` operand has no §6.2 promotion with `int` and is
+                    // a compile error". `char` widens to `uint`/`ulong` under
+                    // §5.1, so the generic no-conversion test above never sees
+                    // the pair; reject it here (a constant stays admitted under
+                    // §5.1 constant narrowing).
+                    if (tTy->primitive == P::Char &&
+                        (rTy->primitive == P::UInt ||
+                         rTy->primitive == P::ULong) &&
+                        !isLitDerived(as->value.get())) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->value->span.begin,
+                            std::string("compound assignment `") +
+                            std::string(as->op) + "` on a `char` target has "
+                            "no `" + spellN(rTy) + "` right operand: the "
+                            "right operand is typed as in `int " + binOp +
+                            " e` (§6.2), and a non-constant `uint` or `ulong` "
+                            "has no §6.2 promotion with `int` — convert "
+                            "explicitly, e.g. `c := char(long(c) " + binOp +
+                            " long(e));` (§6.6, v0.313)");
+                    } else
                     if (integerWriteBack &&
                         !primitiveWidens(tTy->primitive,
                                          rTy->primitive) &&
