@@ -212,15 +212,20 @@ BEZEL_TEST(async_await_extra_kinds_2226, await_followed_by_null_cond_member) {
 }
 
 // ── Repro 6: `await` as the operand of a type-test (`is C`) ─────────────────
-// Value: 1 (the test passes because Slow returns int, which is not C). //
+// Value: 2 (the test is false because Slow's boxed result is not a C).
+// v0.313 §12.7 "Value-typed operands" (#5146): the operand is declared
+// `Object` (an explicit box), because an `int` operand tested against the
+// class `C` is now a compile error. The await-as-type-test-operand shape this
+// row pins is unchanged.
 // per §17.4 / §30.7
 BEZEL_TEST(async_await_extra_kinds_2226, await_in_type_test_operand) {
     expectStable(
         "module M; "
         "class C "
-        "  public static async method Slow(): Task<int> "
+        "  public static async method Slow(): Task<Object> "
         "    await Task.Delay(40); "
-        "    return 7; "
+        "    var o: Object := 7; "
+        "    return o; "
         "  end Slow; "
         "  public static async method Main(): Task<int> "
         "    var ok := (await Slow()) is C; "
