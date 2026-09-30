@@ -3388,8 +3388,36 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // same helper, now shared (`ensureNullableElementValue`). Spill through one
     // place so the "slot type == element type" invariant cannot be restated
     // wrongly in a fifth arm.
-    auto llElemSlot = [&](llvm::Value* v) -> llvm::AllocaInst* {
+    auto llElemSlot = [&](llvm::Value* v, const ast::Expr* srcExpr)
+                          -> llvm::AllocaInst* {
         v = ensureNullableElementValue(llElemRef, v);
+        // fix #5201 (§5.1, v0.313): the slot's allocated type must equal the
+        // element's LLVM type so the runtime memcpy of `esz` bytes reads
+        // exactly the slot's bytes, no more (overflow) and no less (truncation).
+        // §5.1's numeric widening is the call-site coercion: an `int`-typed
+        // literal passed where `long` is expected must arrive at the slot as
+        // an i64. `lowerExpr` returns the source expression's declared width
+        // (`int` literal → i32), so when the element is a wider non-nullable
+        // primitive integer we coerce to `elemLLTy` here. A nullable element is
+        // already wrapped by `ensureNullableElementValue` into the correct
+        // `{i8 hasValue; <payload>}` struct shape, so this guard is restricted
+        // to the bare non-nullable case. Signedness of the source is consulted
+        // so an unsigned source (`uint` local, an `L`-suffixed literal of
+        // unsigned type) zero-extends rather than sign-extends (§5.1, issue
+        // #410 — every widen direction picks ZExt vs SExt from source
+        // signedness). `coerceNumericToType` itself returns `v` unchanged when
+        // the pair of types is not a §5.1 widening (no-op when the types
+        // already match), so this is safe on every already-correct shape
+        // (`LinkedList<int>.AddLast(7)`, an `Object` element, an `i64` source).
+        if (v && llElemRef && !llElemRef->nullable &&
+            llElemRef->kind == sema::TypeRef::Kind::Primitive &&
+            v->getType()->isIntegerTy() &&
+            elemLLTy->isIntegerTy() &&
+            v->getType()->getIntegerBitWidth() <
+                elemLLTy->getIntegerBitWidth()) {
+            v = coerceNumericToType(
+                v, elemLLTy, srcExpr && isUnsignedTargetExpr(*srcExpr));
+        }
         llvm::AllocaInst* s = entryAlloca(v->getType());
         builder_.CreateStore(v, s);
         return s;
@@ -3418,7 +3446,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // a pre-boxed `Object` local, `LinkedList<int>`) is unchanged.
         v = boxForTarget(v, llElemRef, call.args[0].value.get());
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
+        llvm::AllocaInst* slot = llElemSlot(v, call.args[0].value.get());  // fix #4579 / #5201
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3470,7 +3498,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // before it is spilled to the node.
         v = boxForTarget(v, llElemRef, call.args[0].value.get());
         llRetainElem(v, call.args[0].value.get());   // fix #2686
-        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
+        llvm::AllocaInst* slot = llElemSlot(v, call.args[0].value.get());  // fix #4579 / #5201
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3499,7 +3527,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // fixed would still SIGSEGV.
         v = boxForTarget(v, llElemRef, call.args[1].value.get());
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
+        llvm::AllocaInst* slot = llElemSlot(v, call.args[1].value.get());  // fix #4579 / #5201
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,
@@ -3522,7 +3550,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // same box, same reason, same measured overflow shape.
         v = boxForTarget(v, llElemRef, call.args[1].value.get());
         llRetainElem(v, call.args[1].value.get());   // fix #2686
-        llvm::AllocaInst* slot = llElemSlot(v);      // fix #4579
+        llvm::AllocaInst* slot = llElemSlot(v, call.args[1].value.get());  // fix #4579 / #5201
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* r = builder_.CreateCall(fn,

@@ -6289,6 +6289,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
+            // fix #5201 (§5.1, v0.313): the slot's allocated type must equal
+            // the element's LLVM type so the runtime memcpy of `esz` bytes
+            // reads exactly the slot's bytes. `lowerExpr` returns the source
+            // expression's declared width (`int` literal → i32), so when the
+            // element is a wider non-nullable primitive integer we coerce to
+            // the element's LLVM type here. §5.1's table admits int→long (the
+            // literal-int case the issue reports) and uint→long; signedness of
+            // the source selects ZExt vs SExt (#410). `coerceNumericToType`
+            // itself returns `v` unchanged when the types match, so every
+            // already-correct shape (`Array<int>.Add(7)`, an Object element,
+            // a long source) is unchanged.
+            if (v && arrElemRef && !arrElemRef->nullable &&
+                arrElemRef->kind == sema::TypeRef::Kind::Primitive &&
+                v->getType()->isIntegerTy() &&
+                v->getType()->getIntegerBitWidth() <
+                    lowerTypeRef(arrElemRef)->getIntegerBitWidth()) {
+                v = coerceNumericToType(
+                    v, lowerTypeRef(arrElemRef),
+                    isUnsignedTargetExpr(*call.args[0].value));
+            }
             v = ensureNullableElem(v);
             // #819 / §14.4: an element bound to an INTERFACE/Object element slot
             // must be heap-boxed when it is a value type (record/enum/primitive)
