@@ -25,6 +25,10 @@
 
 namespace bezel::sema {
 
+// fwd decl — defined below (§12.9); reused by #5146's operand-side generic
+// instantiation join, which runs earlier in this file's layout.
+static bool isValueTypeArg(const TypeRef* t);
+
 // §5.1 (#738): does the compile-time integer constant `v` fit the range of a
 // narrower integer target type? Used to gate implicit literal/constant
 // narrowing (an out-of-range constant is a §5.1 error, not silent truncation).
@@ -254,6 +258,10 @@ void ExprTC::run(const ast::SourceFile& src) {
     // a typed binding pattern `var x: R` over a bare generic-parameter
     // scrutinee. Per-instantiation rejection at a value substitution.
     checkDeferredRefTypeBindInGenericCaseInstantiations();
+    // fix #5146 (§12.7/§8.6 / §3.6 rule 2, v0.309): the OPERAND-side sibling
+    // of the join above — `v as ReferenceTarget` where `v`'s declared type is
+    // the bare type parameter.
+    checkDeferredAsOperandInstantiations();
 }
 
 
@@ -526,6 +534,60 @@ void ExprTC::checkDeferredRefTypeBindInGenericCaseInstantiations() {
             "reference type, which pattern position never performs. Use "
             "`where " + site.param + ": class` to constrain the parameter, "
             "or box the scrutinee explicitly.");
+    }
+}
+
+// fix #5146 (§12.7/§8.6 / §3.6 rule 2, v0.309): see the declaration in
+// ExprTypecheck_impl.hpp — the OPERAND-side sibling of
+// `recordAsTargetTypeParamUse` / `checkAsTargetInstantiations`.
+void ExprTC::recordAsOperandTypeParamUse(const void* owner,
+                                         std::string_view param,
+                                         std::string_view targetName,
+                                         SourceLocation loc) {
+    if (!owner || param.empty()) return;
+    for (const auto& u : asOperandTypeParamUses_)
+        if (u.owner == owner && u.param == param) return;  // one is enough
+    asOperandTypeParamUses_.push_back(
+        {owner, std::string(param), std::string(targetName), loc});
+}
+
+void ExprTC::checkDeferredAsOperandInstantiations() {
+    if (asOperandTypeParamUses_.empty() || genericInstantiationSites_.empty())
+        return;
+    for (const auto& site : genericInstantiationSites_) {
+        SourceLocation useLoc{};
+        std::string targetName;
+        bool bodyCastsOperand = false;
+        for (const auto& u : asOperandTypeParamUses_) {
+            if (u.owner != site.owner || u.param != site.param) continue;
+            bodyCastsOperand = true;
+            useLoc = u.loc;
+            targetName = u.targetName;
+            break;
+        }
+        if (!bodyCastsOperand) continue;
+        TypeRef* a = site.arg;
+        if (!a || a->kind == TypeRef::Kind::Error) continue;
+        // A substitution that is itself an unresolved bare type parameter
+        // cannot be judged here — its own instantiation sites will be. Same
+        // guard as the #3044/#2911 joins beside this one.
+        if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
+        if (!isValueTypeArg(a)) continue;  // reference substitution: fine
+        ctx_.diagnostics().report(
+            Severity::Error, site.loc,
+            "type parameter `" + site.param +
+            "` is used as an `as` OPERAND against the reference target `" +
+            targetName + "` in the generic body (line " +
+            std::to_string(useLoc.line) +
+            "), so this instantiation — which binds `" + site.param +
+            "` to the value type `" + site.argName +
+            "` — is rejected at the instantiation site (§3.6 rule 2): an "
+            "operand whose declared type is a value type cannot be tested "
+            "with `as` against a reference target — the test could not "
+            "discriminate at runtime and would need an implicit boxing "
+            "conversion, which a type-test operand never performs (§12.7). "
+            "Box explicitly and test the box, or add `where " + site.param +
+            ": class` to exclude value substitutions");
     }
 }
 

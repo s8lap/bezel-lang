@@ -47,9 +47,23 @@
 //   reference / unrelated class, `as`-> legal, null         (as_unrelated_class_*)
 //   reference / unimplemented iface  -> legal, false        (unimplemented_interface_*)
 //   reference / real downcast        -> legal, TRUE         (POSITIVE CONTROL)
-//   value / mismatched primitive     -> legal, false        (value_unrelated_*)
+//   value / mismatched primitive, `is string` (REFERENCE target) -> COMPILE
+//                                        ERROR as of #5146 (v0.309 §12.7's
+//                                        "Value-typed operands", below)
 //   boxed Object / matching value    -> legal, TRUE         (POSITIVE CONTROL)
 //   boxed Object / mismatched value  -> legal, false        (boxed_mismatched_*)
+//
+// FLIP (fix #5146, v0.309): §12.7's "Value-typed operands" paragraph, added
+// after this file's v0.283 baseline, makes an operand whose DECLARED type is
+// a value type tested against a REFERENCE target (a class, an interface,
+// `string`, or `Object`) a COMPILE ERROR — unlike the reference/unrelated-
+// class and reference/unimplemented-interface rows above, which stay legal
+// (the operand there is itself a reference type). The row directly below,
+// `value_unrelated_primitive_is_test_answers_false_spec_12_7` (`x: int` vs
+// `string`, a REFERENCE target), is exactly that shape and is updated to
+// assert the new compile error rather than a runtime `false`. The
+// `boxed_mismatched_value_*` row stays legal: its target (`double`) is a
+// VALUE type, which this rule does not reach.
 //
 // NOT COVERED HERE, deliberately: the `OfType<U>()` defect itself. #3410's
 // OBSERVATION (no relatedness check) is real, but the defect it exposes is
@@ -63,6 +77,7 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotOut;
 
 namespace {
@@ -175,12 +190,17 @@ BEZEL_TEST(codegen_type_test_unrelated_3410,
 // Value operand, mismatched value target — §12.7.
 // =====================================================================
 
-// §12.7: `x is string` on an `int` is legal and false. This is the cell #3410's
-// `OfType` analogue (`Array<int>.OfType<string>()`) sits in — and the language's
-// answer here is a value, not a diagnostic.
+// FLIP (fix #5146, v0.309 §12.7 "Value-typed operands"): `x is string` on a
+// DECLARED `int` is no longer legal — `int` is a value type and `string` is a
+// REFERENCE target, so the test could not discriminate at runtime and would
+// need an implicit boxing conversion, which a type-test operand never
+// performs. Pre-#5146 this cell was the language's `OfType` analogue and
+// answered `false` at runtime (see the file header's pre-flip note); it is
+// now a compile error naming §12.7, and the `OfType` cell it used to justify
+// no longer applies to a value-typed element type either.
 BEZEL_TEST(codegen_type_test_unrelated_3410,
            value_unrelated_primitive_is_test_answers_false_spec_12_7) {
-    BEZEL_EXPECT_EQ(runAotOut(
+    auto r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int := 5; "
@@ -188,7 +208,18 @@ BEZEL_TEST(codegen_type_test_unrelated_3410,
         "    else Console.WriteLine(\"no\"); end; "
         "    return 0; "
         "  end Main; "
-        "end C;"), std::string("no"));
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("cannot be tested with") != std::string::npos &&
+            d.message.find("\xC2\xA7""12.7") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(found);
 }
 
 // §12.7 + §8.6: same shape one type wider — an `int` that reached an `Object`

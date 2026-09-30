@@ -1159,6 +1159,26 @@ private:
     // (§19.3 / §12.7 / #5156).
     void checkDeferredRefTypeBindInGenericCaseInstantiations();
 
+    // fix #5146 (§12.7/§8.6, v0.309): the generic-carrier half of "Value-typed
+    // operands". `v: T` tested with `as` against a CONCRETE REFERENCE target
+    // (`v as IShape`) is decided per instantiation (§3.6 rule 2): a reference
+    // substitution runs the ordinary runtime cast; a VALUE substitution has no
+    // boxing conversion to perform it with, so that instantiation is rejected
+    // — the same two-facts-in-either-order join as `AsTargetTypeParamUse`
+    // above, but for the OPERAND side rather than the target side, and reusing
+    // the same `genericInstantiationSites_` recording.
+    struct AsOperandTypeParamUse {
+        const void* owner;   // the ast::MethodDecl whose body holds the `as`
+        std::string param;   // the type parameter used as the `as` OPERAND
+        std::string targetName;  // the concrete reference target's spelling
+        SourceLocation loc;  // the `v as ReferenceTarget` site
+    };
+    std::vector<AsOperandTypeParamUse> asOperandTypeParamUses_;
+    void recordAsOperandTypeParamUse(const void* owner, std::string_view param,
+                                     std::string_view targetName,
+                                     SourceLocation loc);
+    void checkDeferredAsOperandInstantiations();
+
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before
     // reaching its end? Conservatively returns true only when certain,

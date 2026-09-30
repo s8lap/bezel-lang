@@ -378,6 +378,81 @@ static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
     return {};
 }
 
+// fix #5146 (§12.7/§8.6, v0.309): "Value-typed operands" — is `d` (the
+// operand's DECLARED type, nullability already stripped by the caller) one of
+// the value-typed kinds the rule names: "a primitive, record, enum, choice,
+// inline array, or the unit type"? A declaration-less Named ref is either a
+// value-builtin annotation (DateTime/TimeSpan/…, admitted) or a bare
+// type-parameter (excluded here — the generic carve-out is the caller's job,
+// via currentScopeGenericParamNames).
+static bool typeTest5146ValueOperandKind(const TypeRef* d) {
+    if (!d) return false;
+    switch (d->kind) {
+        case TypeRef::Kind::Primitive:
+            return d->primitive != PrimitiveType::String &&
+                   d->primitive != PrimitiveType::Object &&
+                   d->primitive != PrimitiveType::None;
+        case TypeRef::Kind::Named:
+            if (d->declaration)
+                return d->declaration->kind == ast::TypeDeclKind::Record ||
+                       d->declaration->kind == ast::TypeDeclKind::Enum ||
+                       d->declaration->kind == ast::TypeDeclKind::Choice;
+            return isValueBuiltinByName(exprsNamedTypeSimpleName(d));
+        case TypeRef::Kind::InlineArray:
+        case TypeRef::Kind::Unit:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// fix #5146 (§12.7/§8.6, v0.309): is `t` (the type-test TARGET, already
+// resolved) one of the REFERENCE kinds the rule names — "a class, an
+// interface — including one the value type implements — `string`, or
+// `Object`"? `genericNames` excludes a bare type parameter used as the
+// target itself (an unrelated shape this rule does not reach), and a
+// declaration-less non-value-builtin Named ref is a builtin reference type
+// (IEnumerable<T>, Array<T>, …).
+static bool typeTest5146ReferenceTargetKind(
+    const TypeRef* t,
+    const std::unordered_set<std::string_view>& genericNames) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Primitive)
+        return t->primitive == PrimitiveType::String ||
+               t->primitive == PrimitiveType::Object;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration)
+        return t->declaration->kind == ast::TypeDeclKind::Class ||
+               t->declaration->kind == ast::TypeDeclKind::Interface;
+    std::string_view n = exprsNamedTypeSimpleName(t);
+    if (n.empty() || isValueBuiltinByName(n)) return false;
+    if (t->genericArgs.empty() && genericNames.count(n) > 0)
+        return false;  // bare type-parameter target, not this rule's concern
+    return true;
+}
+
+// fix #5146: a short kind label for the diagnostic — the exact spelling is
+// not needed to name the remedy, only the value-typed KIND the rule fired on.
+static const char* typeTest5146OperandKindLabel(const TypeRef* d) {
+    if (!d) return "value type";
+    switch (d->kind) {
+        case TypeRef::Kind::Primitive: return "primitive value type";
+        case TypeRef::Kind::Unit: return "unit type `()`";
+        case TypeRef::Kind::InlineArray: return "inline-array type";
+        case TypeRef::Kind::Named:
+            if (d->declaration) {
+                switch (d->declaration->kind) {
+                    case ast::TypeDeclKind::Record: return "record type";
+                    case ast::TypeDeclKind::Enum: return "enum type";
+                    case ast::TypeDeclKind::Choice: return "choice type";
+                    default: break;
+                }
+            }
+            return "value-builtin type";
+        default: return "value type";
+    }
+}
+
 // #625 / §12 / §31 / fix #2950 / fix #2971: the "does `ts` inherit a built-in
 // exception" wrapper that used to live here is gone. It answered only half the
 // question the unqualified-identifier resolver actually asks — the other half
@@ -2864,6 +2939,73 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "descriptor collapses, so the test would confuse "
                         "distinct instantiations and bind a value at a wrong "
                         "static type (§12.7/§2.8.3 rule 4/§17.4)");
+            }
+        }
+        // fix #5146 (§12.7/§8.6, v0.309): "Value-typed operands" — an operand
+        // whose static type is a value type (or the nullable form of one)
+        // tested by `is`/`is not`/`as` against a REFERENCE target (a class,
+        // an interface, `string`, or `Object`) is a compile error, exactly as
+        // the §19.3 type pattern is: the test could not discriminate at
+        // runtime, and answering it would need an implicit boxing conversion,
+        // which a type-test operand never performs. The rule reads the
+        // operand's DECLARED type — `declaredTypeOf` for a simple local/
+        // parameter, so a carrier narrowed to a value type by THIS section
+        // keeps its declared `Object`/interface (reference) kind — and skips
+        // a bare generic type-parameter carrier `v: T`/`v: T?` entirely: its
+        // verdict is decided per instantiation instead (§3.6 rule 2) — the
+        // `as` half just below (recordAsOperandTypeParamUse /
+        // checkDeferredAsOperandInstantiations) and the `is`/`is not` static
+        // decision (codegen, filed as a separate follow-up — #5146's
+        // conformance predicate is not yet implemented there).
+        if (te->testType && te->operand) {
+            TypeRef* target = ctx_.resolvedType(*te->testType);
+            if (target && target->kind != TypeRef::Kind::Error) {
+                TypeRef* operandDecl = ctx_.exprType(*te->operand);
+                if (auto* opId = dynamic_cast<const ast::IdentifierExpr*>(
+                        te->operand.get());
+                    opId && opId->name != "this" && opId->name != "base") {
+                    if (Symbol* opSym = lookupName(opId->name)) {
+                        if (dynamic_cast<LocalSymbol*>(opSym) ||
+                            dynamic_cast<ParameterSymbol*>(opSym)) {
+                            if (TypeRef* dt = declaredTypeOf(opSym))
+                                operandDecl = dt;
+                        }
+                    }
+                }
+                auto genericNames = currentScopeGenericParamNames();
+                bool operandIsGenericCarrier =
+                    operandDecl && operandDecl->kind == TypeRef::Kind::Named &&
+                    !operandDecl->declaration &&
+                    operandDecl->genericArgs.empty() &&
+                    genericNames.count(operandDecl->headName()) > 0;
+                if (!operandIsGenericCarrier &&
+                    typeTest5146ReferenceTargetKind(target, genericNames) &&
+                    typeTest5146ValueOperandKind(operandDecl)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        "an operand whose declared type is a " +
+                        std::string(typeTest5146OperandKindLabel(operandDecl)) +
+                        " cannot be tested with `" + std::string(te->op) +
+                        "` against the reference target `" +
+                        std::string(exprsNamedTypeSimpleName(target)) +
+                        "` — the test could not discriminate at runtime and "
+                        "would need an implicit boxing conversion, which a "
+                        "type-test operand never performs (§12.7). Box "
+                        "explicitly and test the box: `var o: Object := "
+                        "<expr>; o " + std::string(te->op) + " " +
+                        std::string(exprsNamedTypeSimpleName(target)) + "`");
+                } else if (operandIsGenericCarrier && te->op == "as" &&
+                           typeTest5146ReferenceTargetKind(target,
+                                                           genericNames) &&
+                           currentMethodDecl_) {
+                    for (const auto& gp : currentMethodDecl_->genericParams) {
+                        if (gp.name != operandDecl->headName()) continue;
+                        recordAsOperandTypeParamUse(
+                            currentMethodDecl_, gp.name,
+                            exprsNamedTypeSimpleName(target), e.span.begin);
+                        break;
+                    }
+                }
             }
         }
         if (te->op == "is" || te->op == "is not") {
