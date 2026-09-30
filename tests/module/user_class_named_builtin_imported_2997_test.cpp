@@ -74,7 +74,10 @@
 #include "test_harness.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstdlib>
+#include <iterator>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -108,7 +111,8 @@ void writeSource(const std::string& path, const std::string& src) {
 // cross_module_type_name_collision_1488_test.cpp, narrowed to one dependency
 // and extended with sanitizeAddress (the leak oracle this family needs).
 int buildLibAndRunChecked(const std::string& libSrc, const std::string& mainSrc,
-                          const std::string& tag) {
+                          const std::string& tag,
+                          std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
     std::string stem = "bezel_2997_" + tag + "_" + unique_stem("");
     TempFile libSrcF((dir / (stem + "_lib.bzl")).string());
@@ -134,8 +138,24 @@ int buildLibAndRunChecked(const std::string& libSrc, const std::string& mainSrc,
     // owned-field cascade leaves 200 Payloads on the heap — LSan exits non-zero.
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
+    // Optionally capture the importer compile's stderr (diagnostic text).
+    TempFile errF((dir / (stem + "_main.err")).string());
+    int saved = -1;
+    if (capturedStderr) {
+        std::fflush(stderr);
+        saved = ::dup(STDERR_FILENO);
+        int sink = ::open(errF.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (sink >= 0) { ::dup2(sink, STDERR_FILENO); ::close(sink); }
+    }
     bezel::CompileResult rMain = bezel::test::compileFileForTest(driver, 
         mainSrcF.path, mainExeF.path, deps, opts);
+    if (capturedStderr) {
+        std::fflush(stderr);
+        if (saved >= 0) { ::dup2(saved, STDERR_FILENO); ::close(saved); }
+        std::ifstream in(errF.path);
+        capturedStderr->assign((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    }
     if (!rMain.success) return -1;
 
     int status = std::system(mainExeF.path.c_str());
@@ -192,13 +212,19 @@ std::string libExportingUserClass(const std::string& moduleName,
 // up as 200 leaked allocations, which no stray single allocation can mimic.
 std::string mainImportingUserClass(const std::string& mainModule,
                                    const std::string& importModule,
-                                   const char* className) {
+                                   const char* className,
+                                   bool qualify = false) {
+    // `qualify`: spell the type `<importModule>.<className>` (§2.3 / §2.2,
+    // v0.309, fix #5140: a bare always-available name shadowed by an imported
+    // public is ambiguous, so `Random` must be module-qualified).
+    std::string typeName = qualify ? importModule + "." + className
+                                   : std::string(className);
     return "module " + mainModule + "; "
         "import " + importModule + "; "
         "class C public static method Main(): int "
         "  var i := 0; var acc := 0; "
         "  while i < 200 do "
-        "    using var s := new " + std::string(className) + "(); "
+        "    using var s := new " + typeName + "(); "
         "    acc := acc + s.Tag; "
         "    i := i + 1; "
         "  end; "
@@ -208,12 +234,13 @@ std::string mainImportingUserClass(const std::string& mainModule,
 }
 
 // Runs one colliding name cross-module and reports WHICH name failed.
-void expectImportedUserClassDisposed(const char* className) {
+void expectImportedUserClassDisposed(const char* className,
+                                     bool qualify = false) {
     std::string libMod = std::string("Lib") + className;
     std::string mainMod = std::string("App") + className;
     int code = buildLibAndRunChecked(
         libExportingUserClass(libMod, className),
-        mainImportingUserClass(mainMod, libMod, className),
+        mainImportingUserClass(mainMod, libMod, className, qualify),
         className);
     if (code != 0) {
         std::cout << "    #2997: imported user class named `" << className
@@ -256,7 +283,23 @@ BEZEL_TEST(user_class_named_builtin_imported_2997,
            imported_random_runs_user_disposal_spec_28_9) {
     // Pre-fix: #2973's own guard did not reach the imported spelling for the
     // same reason (builtinTypeName saw the imported class as the built-in).
-    expectImportedUserClassDisposed("Random");
+    // Module-qualified (`LibRandom.Random`): the bare spelling is ambiguous
+    // under §2.3 (v0.309, fix #5140) — pinned by the next row.
+    expectImportedUserClassDisposed("Random", /*qualify=*/true);
+}
+
+BEZEL_TEST(user_class_named_builtin_imported_2997,
+           imported_random_bare_name_is_ambiguous_rejected_spec_2_3) {
+    // The old fixture shape: bare `new Random()` with an imported public
+    // `Random` in scope is rejected (§2.3 / §2.2, v0.309; fix #5140).
+    std::string diagText;
+    int code = buildLibAndRunChecked(
+        libExportingUserClass("LibRandom", "Random"),
+        mainImportingUserClass("AppRandomBare", "LibRandom", "Random"),
+        "RandomBare", &diagText);
+    BEZEL_EXPECT_EQ(-1, code);
+    BEZEL_EXPECT_TRUE(diagText.find("bare name `Random` is ambiguous") !=
+                      std::string::npos);
 }
 
 BEZEL_TEST(user_class_named_builtin_imported_2997,
