@@ -77,17 +77,20 @@ const char* kIntH =
 // ---------------------------------------------------------------------------
 // REJECT — the issue's three repros (event member `Subscribe`).
 // ---------------------------------------------------------------------------
+// #4978 flip (§27.6, v0.313): the overloaded group is now resolved against
+// the `(int) -> ()` slot, so the `int` overload is bound and RUNS (it was a
+// sound spurious reject while only the first-declared overload was tried).
 BEZEL_TEST(plain_event_handler_signature_4968,
-           c06_overloaded_group_string_first_rejected_stdlib_6_5_spec_27_6) {
+           c06_overloaded_group_string_first_selects_int_stdlib_6_5_spec_27_6) {
     auto r = runAot(prog(
         "class H\n"
         "  public static method On(x: string) Console.WriteLine($\"str:{x}\"); end On;\n"
         "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On;\n"
         "end H;\n",
         "using var s := Clicked.Subscribe(H.On); Fire(5);"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(hasDiag(r, "handler argument of `Subscribe` (stdlib §6.5",
-                              "not implicitly convertible"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("int:5\n"));
 }
 
 BEZEL_TEST(plain_event_handler_signature_4968,

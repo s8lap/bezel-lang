@@ -17508,6 +17508,31 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
         }
     }
     if (!h || h->kind != TypeRef::Kind::Function) return;
+    // fix #4978 (§27.6 "Method references to overloaded methods", v0.313):
+    // a method GROUP at a synchronous handler position is resolved against
+    // the slot's target function type `(payload) -> ()`, exactly as at any
+    // formation site — `ctx_.exprType` above names only the first-declared
+    // overload. Only a UNIQUE winner is adopted (its symbol is published for
+    // codegen's thunk emission, which reads `methodRefSelectedOverload`);
+    // no fit / ambiguity keeps the first-declared overload so the checks
+    // below report as before. Async slots (`-> Task`) keep the old path.
+    if (payload && !isAsync &&
+        (dynamic_cast<const ast::MemberAccessExpr*>(value) ||
+         dynamic_cast<const ast::IdentifierExpr*>(value)) &&
+        dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*value))) {
+        TypeRef* target = ctx_.makeTypeRef();
+        target->kind = TypeRef::Kind::Function;
+        TypeRef::FuncParam tp;
+        tp.type = payload;
+        target->funcParams.push_back(tp);
+        TypeRef* unit = ctx_.makeTypeRef();
+        unit->kind = TypeRef::Kind::Unit;
+        target->funcReturn = unit;
+        const TypeRef* chosen = nullptr;
+        if (selectMethodRefOverload(value, target, chosen) ==
+                MethodRefOverloadResult::Unique && chosen)
+            h = const_cast<TypeRef*>(chosen);
+    }
     // A function value or a method reference: the ordinary argument check
     // against `(T) -> R`, where R is the handler's own return slot (§27.1.1
     // for a value; §27.6 formation for a method reference — checkAssignable
