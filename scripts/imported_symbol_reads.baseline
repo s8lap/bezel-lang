@@ -52,7 +52,7 @@
 2    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
 11   src/sema/ExprTypecheck.cpp
-20   src/sema/ExprTypecheck_Calls.cpp
+18   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 7    src/sema/PureChecker.cpp
 7    src/sema/StaticInitCycles.cpp

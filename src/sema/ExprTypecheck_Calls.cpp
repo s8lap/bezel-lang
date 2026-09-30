@@ -18860,23 +18860,11 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
         return nullptr;
     auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target));
     if (es) {
-        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-            if (!ed->type) return nullptr;  // no-payload → unit (no param)
-            return ctx_.resolvedType(*ed->type);
-        }
-        // fix #3211 (§24/§2.5, v0.254): imported event — `decl` is null
-        // because ModuleLoader never reconstructs an ast::EventDecl for an
-        // imported member (mirrors the #503/#2414 Property/Indexer
-        // limitation; the wire side carries the type in MetaMember::type →
-        // ModuleLoader::fieldTypes_, published via ctx.setImportedMemberType).
-        // A Unit type — the exporter's encoding of an omitted `: T` — means
-        // a no-payload event → null, matching the local `!ed->type` path and
-        // codegen's own #2421 `Emitter::eventPayloadType` fallback
-        // (LlvmBackend_Calls2.cpp:2667).
-        if (es->decl != nullptr) return nullptr;  // non-EventDecl decl
-        TypeRef* rt = ctx_.importedMemberType(es);
-        if (!rt || rt->kind == TypeRef::Kind::Unit) return nullptr;
-        return rt;
+        // fix #5042: both-sources accessor (local EventDecl `: T` / imported
+        // wire type, a Unit wire type meaning no payload, #3211).
+        TypeRef* payload = nullptr;
+        if (!sema::eventPayloadResolvedType(*es, ctx_, payload)) return nullptr;
+        return payload;
     }
     // §6.5 / §24 (#1610): a Subscribe/Add/Remove on a value held in a local,
     // parameter, or field of static type EventSource<T>/AsyncEventSource<T>
@@ -18914,8 +18902,8 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
 // IEvent<T>/IAsyncEvent<T> face (the only member stdlib §6.5 gives the face)?
 // Fills the handler slot: `payload` (null for a no-payload event, whose
 // handler is `() -> ()`), `isAsync` (handler returns `Task`) and `asyncKnown`
-// (false only for an imported `event`, whose declaration — and so its `async`
-// marker — ModuleLoader does not reconstruct; see eventHandlerPayloadType).
+// (true for every `event`: an imported one answers off the wire `async` bit,
+// #5042; false only for a receiver whose async-ness is not known here).
 //
 // fix #4898 (narrow, stdlib §6.5; spec §27.1.1/§27.6/§28.14, v0.307): the
 // SharedEventSource<T> / ISharedEvent<T> cross-domain publication-point pair is
@@ -18937,22 +18925,13 @@ bool ExprTC::plainEventHandlerSlot(const ast::Expr* callee, TypeRef*& payload,
     const bool addRemove = ma->member == "Add" || ma->member == "Remove";
     if (!subscribe && !addRemove) return false;
     if (auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target))) {
-        // SEAM-DEBT: #5042 imported event (decl null) takes the wire-payload branch below; no both-sources event payload/async accessor yet
-        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-            if (ed->type) {
-                payload = ctx_.resolvedType(*ed->type);
-                if (!payload) return false;  // unresolved: reported elsewhere
-            }
-            isAsync = ed->isAsync;
-            asyncKnown = true;
-            return true;
-        }
-        if (es->decl != nullptr) return false;
-        // Imported event (decl null): the payload survives on the wire; a
-        // Unit type is the exporter's encoding of an omitted `: T`.
-        TypeRef* rt = ctx_.importedMemberType(es);
-        if (!rt) return false;
-        if (rt->kind != TypeRef::Kind::Unit) payload = rt;
+        // fix #5042: both sources (local EventDecl / imported wire tables)
+        // through the sema accessors, so an imported `async event` is
+        // classified exactly as its local twin (#4968 left it asyncKnown =
+        // false, skipping the `(T) -> Task` handler check).
+        if (!sema::eventPayloadResolvedType(*es, ctx_, payload)) return false;
+        isAsync = sema::eventHandlerIsAsync(*es, ctx_);
+        asyncKnown = true;
         return true;
     }
     const TypeRef* recvTy = ctx_.exprType(*ma->target);

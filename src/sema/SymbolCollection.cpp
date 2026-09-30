@@ -872,6 +872,38 @@ TypeRef* methodReturnResolvedType(const MethodSymbol& ms,
     return ctx.importedReturnType(&ms);
 }
 
+// fix #5042 (§24 / stdlib §6.5, v0.313; #4968 seam debt, umbrella #3152): the
+// both-sources readers of an `event` member's handler slot. Local events answer
+// off the `ast::EventDecl`; an imported event has no decl (ModuleLoader never
+// reconstructs one) and answers off the loader's wire side tables
+// (`importedMemberType` = payload, `importedEventIsAsync` = the `async` bit
+// carried by MetaMember::isEventAsync, #2421).
+bool eventHandlerIsAsync(const EventSymbol& es, const SemaContext& ctx) {
+    // SEAM-ACCESSOR: the local half; `async` lives on the EventDecl only.
+    if (auto* ed = dynamic_cast<const ast::EventDecl*>(es.decl))
+        return ed->isAsync;
+    // SEAM-ACCESSOR: the imported half, the wire-carried async bit.
+    return ctx.importedEventIsAsync(&es);
+}
+
+bool eventPayloadResolvedType(const EventSymbol& es, const SemaContext& ctx,
+                              TypeRef*& payload) {
+    payload = nullptr;
+    // SEAM-ACCESSOR: the local half; the `: T` annotation on the EventDecl.
+    if (auto* ed = dynamic_cast<const ast::EventDecl*>(es.decl)) {
+        if (!ed->type) return true;  // no payload: the handler is `() -> ()`
+        payload = ctx.resolvedType(*ed->type);
+        return payload != nullptr;   // unresolved: reported elsewhere
+    }
+    if (es.decl != nullptr) return false;
+    // The imported half: a Unit wire type is the exporter's encoding of an
+    // omitted `: T` (#3211).
+    TypeRef* rt = ctx.importedMemberType(&es);
+    if (!rt) return false;
+    if (rt->kind != TypeRef::Kind::Unit) payload = rt;
+    return true;
+}
+
 const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
                                      std::size_t pos) {
     if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->type.get();

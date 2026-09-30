@@ -2019,6 +2019,16 @@ bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx);
 TypeRef* methodReturnResolvedType(const MethodSymbol& ms,
                                   const SemaContext& ctx);
 
+// fix #5042 (§24 / stdlib §6.5, v0.313): an `event` member's handler slot, read
+// both-sources. `eventHandlerIsAsync`: does the handler return `Task`? (the
+// EventDecl's `async` locally, the wire bit for an import). `eventPayloadResolvedType`
+// fills `payload` (null for a no-payload event, whose handler is `() -> ()`)
+// and returns false when the payload is unavailable (an unresolved local `: T`,
+// or an import with no wire type).
+bool eventHandlerIsAsync(const EventSymbol& es, const SemaContext& ctx);
+bool eventPayloadResolvedType(const EventSymbol& es, const SemaContext& ctx,
+                              TypeRef*& payload);
+
 // §22.5 "Optional parameters" / §2.5 (v0.254, #3178 — family M5 of umbrella
 // #3152): does formal `pos` declare a default (`:= Expr`)? Same dual sourcing —
 // the `ast::Param`'s `defaultValue` locally, `ParameterSymbol::hasDefault` for
