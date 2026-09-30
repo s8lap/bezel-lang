@@ -4708,7 +4708,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
                 (recvTy && recvTy->genericArgs.size() > 1)
                     ? recvTy->genericArgs[1] : nullptr;
             sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
-                op, valTy, ctx_.exprType(*as.value));
+                op, valTy, ctx_.exprType(*as.value), ctx_.stmtOperatorSymbol(as));
             if (opMethod) {
                 // §25.1: desugar to get → overload call → set.
                 std::vector<llvm::Value*> args{cur, rhs};
@@ -4875,7 +4875,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             (recvTy && !recvTy->genericArgs.empty())
                 ? recvTy->genericArgs[0] : nullptr;
         sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
-            op, elemTyRef, ctx_.exprType(*as.value));
+            op, elemTyRef, ctx_.exprType(*as.value),
+            ctx_.stmtOperatorSymbol(as));
         if (opMethod) {
             // §25.1: desugar to get → overload call → set. The write-back MUST
             // reuse the already-evaluated recv/idx (the shared block below)

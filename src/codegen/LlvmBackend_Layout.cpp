@@ -224,7 +224,7 @@ llvm::Value* Emitter::emitImplicitOne(llvm::Type* t) {
 // through its own base chain.
 sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
         const std::string& binOp, const sema::TypeRef* leftTy,
-        const sema::TypeRef* rightTy) {
+        const sema::TypeRef* rightTy, const sema::Symbol* recorded) {
     if (binOp.empty()) return nullptr;
     // fix #2932 (§25.2, v0.240): the CLASS base chain of a type symbol, walked
     // by `classBaseOf`. `baseTypes` carries interfaces too; only a CLASS base
@@ -331,6 +331,16 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
         }
         return nullptr;
     };
+    // fix #5205 (§22.6/§25.2, v0.313): sema ranked the overloads (exact beats
+    // convert, ties rejected) and recorded the winner; honour it when it is an
+    // operator of this token whose parameters accept the operands, so the two
+    // searches cannot pick different overloads. Otherwise (generic-body
+    // instantiations re-resolve) fall back to the search below.
+    if (auto* rm = dynamic_cast<const sema::MethodSymbol*>(recorded))
+        if (rm->isOperator && rm->operatorToken == binOp &&
+            rm->params.size() == 2 && paramMatches(rm->params[0], leftTy) &&
+            paramMatches(rm->params[1], rightTy))
+            return const_cast<sema::MethodSymbol*>(rm);
     if (leftTy && leftTy->kind == sema::TypeRef::Kind::Named &&
         leftTy->declaration)
         if (sema::MethodSymbol* m = findOnType(leftTy->declaration)) return m;

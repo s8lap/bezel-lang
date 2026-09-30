@@ -2232,7 +2232,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
                 sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
-                    op, ctx_.exprType(*as->target), ctx_.exprType(*as->value));
+                    op, ctx_.exprType(*as->target), ctx_.exprType(*as->value),
+                    ctx_.stmtOperatorSymbol(*as));
                 if (opMethod) {
                     // §25.1 / §25.2: dispatch to the user-defined binary
                     // operator with args in source order {target, value} (the

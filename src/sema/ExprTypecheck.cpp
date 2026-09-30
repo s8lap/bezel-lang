@@ -20183,86 +20183,140 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // narrowing, which also RE-TYPES `operandExpr` to the
                 // parameter's type so codegen's later `lowerExpr`/
                 // `ctx_.exprType(*as->value)` reads the narrowed width.
-                auto operandMatchesParam = [&](const ast::Expr* operandExpr,
-                                               const TypeRef* operandTy,
-                                               Symbol* paramSym,
-                                               bool allowConstantNarrowing) -> bool {
+                // fix #5205 (§22.6 / §25.2, v0.313): rank the applicable
+                // overloads exactly as findBinaryOperator does (#5110). Per
+                // position a candidate is Exact (the operand's type IS the
+                // parameter's) or Converting (widening, constant narrowing,
+                // nullable wrap, derived-to-base); `a` beats `b` when it is
+                // better-or-equal at both positions and strictly better at
+                // one; with no unique best the compound is a §22.6 ambiguity
+                // error. Constant narrowing is probed side-effect-free and
+                // re-applied to the WINNER only.
+                enum class Q { Inapplicable, Exact, Converting };
+                auto qualityOf = [&](const ast::Expr* operandExpr,
+                                     TypeRef* operandTy,
+                                     Symbol* paramSym) -> Q {
                     auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
-                    if (!ps) return false;
+                    if (!ps) return Q::Inapplicable;
                     TypeRef* pt = ps->declType
                                       ? ctx_.resolvedType(*ps->declType)
                                       : ps->resolvedDeclType;
-                    if (!pt || !operandTy) return false;
-                    // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
-                    // a primitive param accepts a primitive operand under
-                    // §5.1's rules; a Named param needs the operand's
-                    // declaration (or a derived one) with §7.11 nullability
-                    // agreement (user-operator lifting over T? is deferred).
-                    if (pt->kind == TypeRef::Kind::Primitive)
-                        return primitiveOperandMatchesParam(
-                            operandExpr, const_cast<TypeRef*>(operandTy), pt,
-                            allowConstantNarrowing);
+                    if (!pt || !operandTy) return Q::Inapplicable;
+                    // §7.11: no user-operator lifting over a nullable operand.
+                    if (operandTy->nullable && !pt->nullable)
+                        return Q::Inapplicable;
+                    const bool sameNull = operandTy->nullable == pt->nullable;
+                    if (pt->kind == TypeRef::Kind::Primitive) {
+                        if (operandTy->kind != TypeRef::Kind::Primitive)
+                            return Q::Inapplicable;
+                        if (pt->primitive == operandTy->primitive)
+                            return sameNull ? Q::Exact : Q::Converting;
+                        if (primitiveWidens(operandTy->primitive, pt->primitive))
+                            return Q::Converting;
+                        if (!operandExpr) return Q::Inapplicable;
+                        TypeRef* n = narrowIntConstantToTarget(operandExpr,
+                                                               operandTy, pt);
+                        if (n == operandTy) return Q::Inapplicable;
+                        ctx_.setExprType(const_cast<ast::Expr*>(operandExpr),
+                                         operandTy);
+                        return Q::Converting;
+                    }
                     if (pt->kind != TypeRef::Kind::Named || !pt->declaration ||
                         operandTy->kind != TypeRef::Kind::Named ||
                         !operandTy->declaration)
-                        return false;
-                    return (pt->declaration == operandTy->declaration ||
-                            isSubtype(operandTy->declaration,
-                                      pt->declaration)) &&
-                           (pt->nullable || !operandTy->nullable);
+                        return Q::Inapplicable;
+                    if (pt->declaration == operandTy->declaration)
+                        return sameNull ? Q::Exact : Q::Converting;
+                    if (isSubtype(operandTy->declaration, pt->declaration))
+                        return Q::Converting;
+                    return Q::Inapplicable;
                 };
-                // fix #3628 (§22.15 rule 6, v0.286): returns the matched
-                // MethodSymbol (was previously bool-only) so it can be
-                // PUBLISHED — this is §25.2's full "union of the operator
-                // overloads declared on the static types of both operands,
-                // including inherited" search, the same one codegen's
-                // `findCompoundOperatorOverload` (LlvmBackend_Layout.cpp)
-                // repeats to pick the operator it actually calls at runtime.
-                // `PureBodyWalker` reads the published symbol via
-                // `ctx_.stmtOperatorSymbol` instead of re-resolving — a
-                // narrower direct-members-only rescan (as the pre-existing
-                // result-type check just above uses) would silently miss an
-                // INHERITED operator and leave rule 6 unenforced for it.
+                struct Ranked5205 { MethodSymbol* m; bool e0, e1; };
+                auto better5205 = [](const Ranked5205& x,
+                                     const Ranked5205& y) {
+                    bool geq = (x.e0 || !y.e0) && (x.e1 || !y.e1);
+                    bool strict = (x.e0 && !y.e0) || (x.e1 && !y.e1);
+                    return geq && strict;
+                };
+                bool ambiguous5205 = false;
+                std::string ambCandidates5205;
                 auto typeDeclaresApplicable =
-                    [&](TypeSymbol* decl,
-                        bool allowConstantNarrowing) -> MethodSymbol* {
+                    [&](TypeSymbol* decl) -> MethodSymbol* {
                     if (!decl) return nullptr;
+                    std::vector<Ranked5205> app;
                     for (MethodSymbol* m :
                          collectInheritedOperators(decl, binOp, 2)) {
                         if (m->params.size() < 2) continue;
-                        if (operandMatchesParam(nullptr, tTy, m->params[0],
-                                                allowConstantNarrowing) &&
-                            operandMatchesParam(as->value.get(), rTy,
-                                                m->params[1],
-                                                allowConstantNarrowing))
-                            return m;
+                        Q q0 = qualityOf(nullptr, tTy, m->params[0]);
+                        if (q0 == Q::Inapplicable) continue;
+                        Q q1 = qualityOf(as->value.get(), rTy, m->params[1]);
+                        if (q1 == Q::Inapplicable) continue;
+                        app.push_back({m, q0 == Q::Exact, q1 == Q::Exact});
+                    }
+                    for (const Ranked5205& c : app) {
+                        bool best = true;
+                        for (const Ranked5205& o : app)
+                            if (o.m != c.m && !better5205(c, o)) {
+                                best = false;
+                                break;
+                            }
+                        if (best) return c.m;
+                    }
+                    if (!app.empty()) {
+                        ambiguous5205 = true;
+                        for (const Ranked5205& c : app) {
+                            auto spell5205 = [&](Symbol* p) {
+                                auto* ps =
+                                    dynamic_cast<ParameterSymbol*>(p);
+                                TypeRef* t =
+                                    !ps ? nullptr
+                                        : ps->declType
+                                              ? ctx_.resolvedType(*ps->declType)
+                                              : ps->resolvedDeclType;
+                                return rangeElementTypeName(t);
+                            };
+                            if (!ambCandidates5205.empty())
+                                ambCandidates5205 += ", ";
+                            ambCandidates5205 += "`operator " + binOp + "(" +
+                                spell5205(c.m->params[0]) + ", " +
+                                spell5205(c.m->params[1]) + ")`";
+                        }
                     }
                     return nullptr;
                 };
-                // #5063 (§22.6 "exact beats convert"): try every candidate
-                // WITHOUT constant narrowing first, exactly as
-                // findBinaryOperator's `tryOperand` does, so a plain `int`
-                // literal against both `operator *(V, byte)` and
-                // `operator *(V, int)` prefers the exact `int` overload
-                // regardless of which is declared first.
                 MethodSymbol* matchedOp =
-                    typeDeclaresApplicable(tTy->declaration,
-                                           /*allowConstantNarrowing=*/false);
-                if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
-                    rTy->declaration)
-                    matchedOp = typeDeclaresApplicable(
-                        rTy->declaration, /*allowConstantNarrowing=*/false);
-                if (!matchedOp) {
-                    matchedOp = typeDeclaresApplicable(
-                        tTy->declaration, /*allowConstantNarrowing=*/true);
-                    if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
-                        rTy->declaration)
-                        matchedOp = typeDeclaresApplicable(
-                            rTy->declaration, /*allowConstantNarrowing=*/true);
+                    typeDeclaresApplicable(tTy->declaration);
+                if (!matchedOp && !ambiguous5205 &&
+                    rTy->kind == TypeRef::Kind::Named && rTy->declaration)
+                    matchedOp = typeDeclaresApplicable(rTy->declaration);
+                if (ambiguous5205) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->span.begin,
+                        "ambiguous operator `" + binOp + "`: no applicable "
+                        "overload is unambiguously better (candidates: " +
+                        ambCandidates5205 + ") — every candidate needs an "
+                        "implicit conversion where no other is exact; add an "
+                        "explicit cast to the operand so exactly one "
+                        "candidate matches exactly (§22.6)");
+                }
+                if (matchedOp) {
+                    // Re-apply constant narrowing on the winner only.
+                    if (Symbol* ps1 = matchedOp->params[1]) {
+                        auto* pps = dynamic_cast<ParameterSymbol*>(ps1);
+                        TypeRef* pt = !pps ? nullptr
+                                      : pps->declType
+                                            ? ctx_.resolvedType(*pps->declType)
+                                            : pps->resolvedDeclType;
+                        if (pt && pt->kind == TypeRef::Kind::Primitive &&
+                            rTy->kind == TypeRef::Kind::Primitive &&
+                            pt->primitive != rTy->primitive &&
+                            !primitiveWidens(rTy->primitive, pt->primitive))
+                            narrowIntConstantToTarget(as->value.get(), rTy, pt);
+                    }
                 }
                 bool hasApplicableOp = matchedOp != nullptr;
                 if (matchedOp) ctx_.setStmtOperatorSymbol(as, matchedOp);
-                if (!hasApplicableOp) {
+                if (!hasApplicableOp && !ambiguous5205) {
                     const char* kindWord = "";
                     switch (tTy->declaration->kind) {
                         case ast::TypeDeclKind::Record:

@@ -5355,7 +5355,11 @@ private:
     // "For built-in numeric types" anyway).
     sema::MethodSymbol* findCompoundOperatorOverload(
         const std::string& binOp, const sema::TypeRef* leftTy,
-        const sema::TypeRef* rightTy);
+        const sema::TypeRef* rightTy,
+        // fix #5205 (§22.6/§25.2, v0.313): sema's recorded resolution for the
+        // statement (`stmtOperatorSymbol`). When it is a matching operator it
+        // IS the answer, so codegen never re-ranks and cannot disagree.
+        const sema::Symbol* recorded = nullptr);
     llvm::Value* emitCompoundOpTyped(const std::string& op, llvm::Value* l,
                                      llvm::Value* r,
                                      const sema::TypeRef* leftTy,
