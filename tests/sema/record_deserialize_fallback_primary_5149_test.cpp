@@ -74,8 +74,10 @@ void expectDriverRejectsWithText(const std::string& src, const char* needle) {
 }  // namespace
 
 // ===========================================================================
-// T1 REDO — `record Vec2(X: int, Y: int)` with a non-matching body ctor:
-// now accepted via the synthesized primary (§9.8 step 2, v0.309), and the
+// T1 REDO — `record Vec2(X: int, Y: int)` with a non-matching body ctor of a
+// DIFFERENT parameter list (three ints; a same-list ctor would clash with the
+// primary, §9.3 v0.308): accepted via the synthesized primary (§9.8 step 2,
+// v0.313), and the
 // serialized → deserialized round-trip preserves X and Y.
 //
 // Pre-fix sema rejected this with "no explicit constructor has parameter
@@ -89,8 +91,8 @@ BEZEL_TEST(sema_record_deserialize_fallback_primary_5149,
         "module Probe; "
         "import System.Serialization; "
         "public record Vec2(X: int, Y: int): ISerializable, IDeserializable "
-        "  public constructor(width: int, height: int) "
-        "    X := width; Y := height; "
+        "  public constructor(width: int, height: int, scale: int) "
+        "    X := width * scale; Y := height * scale; "
         "  end constructor; "
         "end Vec2; "
         "public class C public static method Main(): int "
@@ -108,7 +110,11 @@ BEZEL_TEST(sema_record_deserialize_fallback_primary_5149,
 
 // ===========================================================================
 // T2 — heterogeneous validating-ctor record (matching components in another
-// order) STAYS accepted through its explicit constructor.
+// order) STAYS accepted through its explicit constructor. Components are of
+// distinct types (int, string) so the reordered ctor `(y: string, x: int)` is a
+// different overload from the primary `(int, string)` under §9.3 (v0.308) /
+// §22.6 identity; the ctor body adds 100 to X so the asserted X == 103 proves
+// the explicit ctor ran, not the primary.
 //
 // §9.8 step 2, v0.309: a validating constructor with the same components in
 // another order stays accepted and wins — "more than one matches is read over
@@ -127,22 +133,46 @@ BEZEL_TEST(sema_record_deserialize_fallback_primary_5149,
     auto r = runAot(
         "module Probe; "
         "import System.Serialization; "
-        "public record Pair(X: int, Y: int): ISerializable, IDeserializable "
-        "  public constructor(y: int, x: int) "
-        "    X := y; Y := x; "
+        "public record Pair(X: int, Y: string): ISerializable, IDeserializable "
+        "  public constructor(y: string, x: int) "
+        "    X := x + 100; Y := y; "
         "  end constructor; "
         "end Pair; "
         "public class C public static method Main(): int "
         "  using var s := new JsonSerializer(); "
-        "  var p := new Pair(3, 4); "
+        "  var p := new Pair(3, \"b\"); "
         "  p.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := Pair.Deserialize(d); "
-        "  return (if p2.X + p2.Y = 7 then 42 else 91); "
+        "  return (if p.X = 3 and p2.X = 103 and p2.Y = \"b\" then 42 else 91); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// ===========================================================================
+// T1-OLD-SHAPE — the shape T1 used before #5132: a body constructor whose
+// parameter list is (int, int), the same as `record Vec2(X: int, Y: int)`'s
+// auto-generated primary. §9.3 (v0.308): the body may not declare a
+// constructor with the same parameter list as the primary, in §11.3's clash
+// sense (§22.6 overload identity: names and defaults do not distinguish), so
+// this is rejected with the §9.3 diagnostic.
+// ===========================================================================
+BEZEL_TEST(sema_record_deserialize_fallback_primary_5149,
+           body_ctor_same_param_list_as_primary_rejected_9_3) {
+    expectDriverRejectsWithText(
+        "module Probe; "
+        "import System.Serialization; "
+        "public record Vec2(X: int, Y: int): ISerializable, IDeserializable "
+        "  public constructor(width: int, height: int) "
+        "    X := width; Y := height; "
+        "  end constructor; "
+        "end Vec2; "
+        "public class C public static method Main(): int "
+        "  return 0; "
+        "end Main; end C;",
+        "body constructor redeclares the primary constructor");
 }
 
 // ===========================================================================
