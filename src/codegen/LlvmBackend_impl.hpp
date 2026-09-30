@@ -5409,7 +5409,7 @@ private:
     // `char` (i32) type. Shared by the explicit `char(n)` cast
     // (lowerPrimCastScalar) and the §6.6 char compound-assignment/increment
     // write-back (emitCompoundOp) so both enforce the identical §5.2 contract.
-    llvm::Value* emitCharRangeCheck(llvm::Value* payload);
+    llvm::Value* emitCharRangeCheck(llvm::Value* payload, bool srcUns = false);
 
     // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t);

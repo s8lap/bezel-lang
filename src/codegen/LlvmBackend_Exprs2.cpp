@@ -10210,10 +10210,16 @@ llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
 // write-back (emitCompoundOp), so both enforce the identical §5.2 contract —
 // the fix for #1961, where the compound/increment path skipped this check and
 // stored an invalid char (a type-invariant violation).
-llvm::Value* Emitter::emitCharRangeCheck(llvm::Value* payload) {
+//
+// #5207: `srcUns` gives the source's signedness. A narrow unsigned source
+// (byte, ushort, uint) must ZERO-extend to i64 for the range check (SExt read
+// byte 200 / ushort 0xFFFF / uint as negative), and a source narrower than the
+// 32-bit char must be widened, not truncated, on the way out.
+llvm::Value* Emitter::emitCharRangeCheck(llvm::Value* payload, bool srcUns) {
     using P = sema::PrimitiveType;
     llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
-    llvm::Value* v64  = builder_.CreateSExt(payload, i64ty, "ctoi64");
+    llvm::Value* v64  = srcUns ? builder_.CreateZExt(payload, i64ty, "ctoi64")
+                               : builder_.CreateSExt(payload, i64ty, "ctoi64");
     llvm::Value* neg  = builder_.CreateICmpSLT(
         v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
     llvm::Value* hi   = builder_.CreateICmpSGT(
@@ -10227,8 +10233,10 @@ llvm::Value* Emitter::emitCharRangeCheck(llvm::Value* payload) {
         builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
     emitGuardThrow(bad, "OverflowException");
     llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
-    if (payload->getType() != dstCharTy)
-        return builder_.CreateTrunc(payload, dstCharTy);
+    unsigned sw = payload->getType()->getIntegerBitWidth();
+    if (sw > 32) return builder_.CreateTrunc(payload, dstCharTy);
+    if (sw < 32)  // value is in range (>= 0), so zext is exact for either sign
+        return builder_.CreateZExt(payload, dstCharTy, "ctochar");
     return payload;
 }
 
@@ -10252,7 +10260,7 @@ llvm::Value* Emitter::lowerPrimCastScalar(sema::PrimitiveType targetPt,
     // §5.2 (L679): casting an integer to char requires the value to be in
     // U+0000–U+10FFFF excluding the surrogate range U+D800–U+DFFF.
     if (targetPt == P::Char && payload->getType()->isIntegerTy())
-        return emitCharRangeCheck(payload);
+        return emitCharRangeCheck(payload, srcUns);
     llvm::Type* dstTy = lowerPrimitive(targetPt);
     llvm::Type* srcTy = payload->getType();
     bool dstFP  = dstTy->isFloatingPointTy();
@@ -10550,31 +10558,14 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     // raise OverflowException.  This check must precede the same-width-identity
     // path below (int → char: both are i32, so srcTy==dstTy would skip it).
     if (target == P::Char && src->getType()->isIntegerTy()) {
-        // Widen to i64 for the unsigned range check so negative int values
-        // (sign-extended) compare correctly against the unsigned bounds.
-        llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
-        llvm::Value* v64  = builder_.CreateSExt(src, i64ty, "ctoi64");
-        // below zero?
-        llvm::Value* neg  = builder_.CreateICmpSLT(
-            v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
-        // above U+10FFFF?
-        llvm::Value* hi   = builder_.CreateICmpSGT(
-            v64, llvm::ConstantInt::get(i64ty, 0x10FFFF), "chi");
-        // in surrogate range [0xD800, 0xDFFF]?
-        llvm::Value* sg_lo = builder_.CreateICmpSGE(
-            v64, llvm::ConstantInt::get(i64ty, 0xD800), "csglo");
-        llvm::Value* sg_hi = builder_.CreateICmpSLE(
-            v64, llvm::ConstantInt::get(i64ty, 0xDFFF), "csghi");
-        llvm::Value* surr  = builder_.CreateAnd(sg_lo, sg_hi, "csurr");
-        // any of the three conditions triggers OverflowException
-        llvm::Value* bad   = builder_.CreateOr(
-            builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
-        emitGuardThrow(bad, "OverflowException");
-        // Value is now known valid; truncate or keep as i32 char.
-        llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
-        if (src->getType() != dstCharTy)
-            return builder_.CreateTrunc(src, dstCharTy);
-        return src;
+        // #5207: shared with lowerPrimCastScalar; honours source signedness
+        // and widths below 32 bits (byte/sbyte/short/ushort).
+        bool srcUnsC = isUnsignedTargetExpr(argE);
+        if (auto* st = ctx_.exprType(argE))
+            if (st->kind == sema::TypeRef::Kind::Named && st->declaration &&
+                st->declaration->kind == ast::TypeDeclKind::Enum)
+                srcUnsC = enumIsUnsigned(st->declaration);
+        return emitCharRangeCheck(src, srcUnsC);
     }
     llvm::Type* dstTy = lowerPrimitive(target);
     llvm::Type* srcTy = src->getType();
