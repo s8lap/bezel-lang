@@ -183,8 +183,10 @@ BEZEL_TEST(decimal_div_precision_4870, tenth_div_three_clamps_to_scale_28) {
         "0.0333333333333333333333333333\n");
 }
 
-// §6.4, #4870: decimal.MaxValue / 10m -> 7922816251426433759354395033
-// control: scale >= 0 path, truncation convention unchanged (also pinned in decimal_div_overflow_4864).
+// §6.4 (v0.309) / fix #5147: decimal.MaxValue / 10m — same value as the
+// non-Checked row in decimal_div_overflow_4864: at scale 1, the exact
+// quotient 7922816251426433759354395033.5 fits (mantissa = MaxValue), so
+// the algorithm extends by one long-division step and keeps the .5.
 BEZEL_TEST(decimal_div_precision_4870, max_value_div_ten_unchanged) {
     BEZEL_EXPECT_EQ(runAotChecked(
         "module M; class C "
@@ -197,7 +199,7 @@ BEZEL_TEST(decimal_div_precision_4870, max_value_div_ten_unchanged) {
         "    return 0; "
         "  end Main; "
         "end C;").stdoutText,
-        "7922816251426433759354395033\n");
+        "7922816251426433759354395033.5\n");
 }
 
 // §6.4, #4870: decimal.MaxValue / 1.5m -> 52818775009509558395695966890

@@ -109,9 +109,9 @@ BEZEL_TEST(decimal_div_overflow_4864, max_value_div_one_in_range) {
         "79228162514264337593543950335\n");
 }
 
-// §6.4: decimal.MaxValue / 10m stays in range (rs_signed == 0; the quotient
-// truncates toward zero, dropping the exact ".5" — a pre-existing, unrelated
-// precision characteristic of this path, not a regression from this fix).
+// §6.4 (v0.309) / fix #5147: decimal.MaxValue / 10m — exact quotient is
+// ...033.5; at scale 1 the mantissa (MaxValue) fits, so the algorithm
+// extends q by one long-division step and rounds the resulting exact value.
 BEZEL_TEST(decimal_div_overflow_4864, max_value_div_ten_in_range) {
     BEZEL_EXPECT_EQ(runAot(
         "module M; class C "
@@ -121,7 +121,7 @@ BEZEL_TEST(decimal_div_overflow_4864, max_value_div_ten_in_range) {
         "    return 0; "
         "  end Main; "
         "end C;").stdoutText,
-        "7922816251426433759354395033\n");
+        "7922816251426433759354395033.5\n");
 }
 
 // §6.4: 1m / 3m stays in range (rs_signed == 28, upscaled entirely via

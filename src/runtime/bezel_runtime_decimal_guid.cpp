@@ -322,6 +322,8 @@ extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
 // §4.4 / §6.4: decimal / decimal.
 // PRE: divisor is non-zero (codegen checks via emitGuardThrow before calling).
 // per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
+// per fix #5147 / §6.4, v0.313: round the truncated quotient at the largest
+// fitting scale s ≤ 28, to nearest, ties to even (banker's rounding).
 extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
                                 bz_decimal_t* out, void* ove_vtable) {
     __uint128_t mb = dec_mantissa(b);
@@ -382,16 +384,57 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
             }
         }
     }
-    if (rs_signed > 28) {
-        // fix #4870 / §4.4, v0.307: `extra` may bring sa + extra to 29, which
-        // with sb == 0 gives a scale-29 result — outside the 0..28 scale range
-        // every other decimal operation in this file produces (0.1m / 3m
-        // printed 29 fractional digits, and 0.0000000000000000000000000001m /
-        // 3m printed 0.00000000000000000000000000003, below the smallest
-        // non-zero decimal). Drop the excess digit, truncating like the rest
-        // of this division.
-        q /= kPow10[rs_signed - 28];
-        rs_signed = 28;
+    // fix #5147 / §6.4, v0.313: extend q via long-division to the highest
+    // scale s ≤ 28 whose rounded mantissa (q + 0..9) fits in 96 bits. Each
+    // step multiplies q by 10 and appends the next true quotient digit
+    // (rem*10/mb); rem shrinks to r10 % mb. The threshold `q > (kMax96 -
+    // digit) / 10` keeps `q * 10 + digit` (the actual next digit, not the
+    // conservative 9) ≤ kMax96, so `dec_store` cannot see an overflow from
+    // the extension itself. The conservative `(kMax96 - 10) / 10` is wrong:
+    // e.g. for MaxValue/10 the next digit is 5 and `q * 10 + 5` exactly
+    // equals kMax96.
+    while (rs_signed < 28) {
+        __uint128_t r10 = rem * 10;  // rem < mb <= kMax96: no wrap
+        __uint128_t digit = r10 / mb;
+        if (q > (kMax96 - digit) / 10) break;
+        q = q * 10 + digit;
+        rem = r10 % mb;
+        ++rs_signed;
+    }
+    // fix #4870 / §4.4, v0.307 + fix #5147 / §6.4, v0.313: if `extra` + sa
+    // landed at 29 (rs_signed > 28), the quotient needs more fractional digits
+    // than a decimal can hold. Drop the lowest digits by long division WITHOUT
+    // rounding them individually (per-digit half-up double-rounds and ignores
+    // `rem`): `dropTop` is the most significant dropped digit, `sticky` is set
+    // if any lower dropped digit or the remainder is nonzero. Together they
+    // feed the single round-to-nearest-even decision below.
+    bool clamped = false;
+    bool sticky = (rem != 0);
+    uint32_t dropTop = 0;
+    while (rs_signed > 28) {
+        if (clamped && dropTop != 0) sticky = true;
+        dropTop = (uint32_t)(q % 10);
+        q = q / 10;
+        clamped = true;
+        --rs_signed;
+    }
+    if (!clamped) {
+        // No digit was clamped: the first dropped digit is the next true
+        // quotient digit, the rest is the sticky remainder.
+        __uint128_t r10 = rem * 10;  // rem < mb <= kMax96: no wrap
+        dropTop = (uint32_t)(r10 / mb);
+        sticky = (r10 % mb) != 0;
+    }
+    // fix #5147 / §6.4, v0.313: ONE round-half-to-even at the final scale
+    // rs_signed (<= 28): up when the dropped value exceeds half, or is exactly
+    // half and q is odd. A nonzero quotient that rounds to zero is zero.
+    {
+        bool round_up = dropTop > 5 ||
+                        (dropTop == 5 && (sticky || (q % 2) != 0));
+        // If q + 1 exceeds the 96-bit mantissa, `dec_store` falls back to a
+        // lower scale (§6.4 overflow rule); at scale 0 it signals
+        // OverflowException.
+        if (round_up) q += 1;
     }
     uint32_t rs = (uint32_t)rs_signed;
     dec_store(out, q, rs, rsign, ove_vtable);
