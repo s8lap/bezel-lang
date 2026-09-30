@@ -90,11 +90,19 @@ GATE_AND_PUSH = SCRIPTS / "gate_and_push.sh"
 
 # A git environment that works on a machine with no user identity configured and
 # cannot be perturbed by the operator's own git config.
+# Auto-maintenance off: after a commit, push or fetch, git 2.55 may start a
+# detached `git maintenance run --auto` (a `git repack`) in the fixture repo,
+# which races TemporaryDirectory's cleanup ("Directory not empty:
+# .../work/.git/objects"). Whether it starts depends on the object set, so it
+# flaked only in checkouts whose scripts/ held .pyc files (2026-09-30).
 GIT_ENV = dict(
     os.environ,
     GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
     GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
     GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+    GIT_CONFIG_COUNT="2",
+    GIT_CONFIG_KEY_0="maintenance.auto", GIT_CONFIG_VALUE_0="false",
+    GIT_CONFIG_KEY_1="gc.auto", GIT_CONFIG_VALUE_1="0",
 )
 
 
@@ -114,7 +122,10 @@ def _make_repo(path, marker):
     path = pathlib.Path(path)
     path.mkdir(parents=True, exist_ok=True)
     _git(path, "init", "-q", "-b", "main")
-    shutil.copytree(str(SCRIPTS), str(path / "scripts"))
+    # Only the scripts themselves: a checkout's __pycache__ is not the tree
+    # under test, and it changes the fixture's object set.
+    shutil.copytree(str(SCRIPTS), str(path / "scripts"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
     (path / "marker.txt").write_text(marker)
     _git(path, "add", "-A")
     _git(path, "commit", "-q", "-m", "seed " + marker)
