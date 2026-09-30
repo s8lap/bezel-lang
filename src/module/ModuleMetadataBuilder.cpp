@@ -593,13 +593,20 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
 // ran the BASE body for a GV2 receiver, 107 with no warning (twin 207). The
 // cross-module override selection that last row exposes is #5031. Keeping the
 // body off the wire leaves the call on the pre-#5009 path.
+//
+// fix #5124 (§14.1 / §2.8.3 rule 4 / §11 override semantics, v0.313): a
+// `virtual` or `override` method is shipped again. The importer now lowers
+// its call through `emitVirtualGenericDispatch` with every shipped candidate
+// monomorphized at the call's type arguments, candidates found among the
+// imported classes as well as the local ones, and the constraint-route
+// backstop covering those specializations (see that function). Without the
+// body the call could only reach the i32-placeholder template, which #5009
+// fix-forward 4 refuses at compile time. `abstract` stays excluded: it has
+// no body. An interface member is excluded at the caller.
 bool isConstraintUsingGenericMethod(const ast::MethodDecl& md,
                                     sema::SemaContext& ctx) {
     if (md.genericParams.empty()) return false;
-    if (hasModifier(md.modifiers, "virtual") ||
-        hasModifier(md.modifiers, "override") ||
-        hasModifier(md.modifiers, "abstract"))
-        return false;
+    if (hasModifier(md.modifiers, "abstract")) return false;
     std::unordered_set<std::string_view> names;
     for (const auto& gp : md.genericParams)
         if (!gp.name.empty()) names.insert(gp.name);

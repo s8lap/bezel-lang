@@ -4238,11 +4238,18 @@ static bool parseAndAttachMethodBody(
     //   unchanged: it is not treated, or marked, as a constraint-route body;
     // - any other one (metadata from a writer that still shipped it) is not
     //   attached, so the call keeps the pre-#5009 template path.
+    //
+    // fix #5124 (§14.1 / §2.8.3 rule 4, v0.313): `virtual` and `override`
+    // bodies are on the route again. The exporter ships them, and codegen's
+    // `emitVirtualGenericDispatch` now monomorphizes every candidate it
+    // selects among (imported classes included) under the same
+    // constraint-route backstop as emitInlineGenericMethod, so such a body is
+    // attached and marked here like a statically dispatched one. An interface
+    // member or an `abstract` method still takes the branch below.
     if (failClosed) {
         bool dynamicDispatch = td.kind == MetaTypeDeclKind::Interface;
         for (const std::string& mod : target.modifiers)
-            if (mod == "virtual" || mod == "override" || mod == "abstract")
-                dynamicDispatch = true;
+            if (mod == "abstract") dynamicDispatch = true;
         if (dynamicDispatch) {
             bool preExistingRoute = !td.genericParams.empty();
             if (const auto* pmd =

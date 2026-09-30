@@ -8169,8 +8169,8 @@ private:
     // Named AST whose single-part name matches one of the OWNING METHOD's
     // genericParams), the override redeclares `<T>` under its own scope, so
     // the AST pointers differ but the references are equivalent.
-    static bool methodSigParamsMatch(const sema::MethodSymbol* a,
-                                     const sema::MethodSymbol* b) {
+    bool methodSigParamsMatch(const sema::MethodSymbol* a,
+                              const sema::MethodSymbol* b) const {
         if (!a || !b) return false;
         if (a->params.size() != b->params.size()) return false;
         auto isOwnTypeParamRef = [](const sema::MethodSymbol* m,
@@ -8189,6 +8189,19 @@ private:
             if (!pa || !pb) return false;
             const sema::TypeRef* ta = pa->resolvedDeclType;
             const sema::TypeRef* tb = pb->resolvedDeclType;
+            // fix #5124 (§11 override semantics / §2.8.3 rule 4, v0.313): a
+            // LOCAL formal may carry only its AST type (resolved through the
+            // side table) while an IMPORTED one carries only the wire-built
+            // `resolvedDeclType`. Comparing the two needs both as TypeRefs;
+            // before, the mixed pair fell to the AST-only fallback, failed,
+            // and an importer's override of an imported virtual generic
+            // method was not recognised as one (MEASURED: its base-typed
+            // receiver ran the base body, 127 where the twin gives 37).
+            // Only the MIXED pair is resolved; two AST-only formals keep the
+            // #5113 T40 structural fallback below unchanged.
+            if (!ta && tb && pa->declType) ta = ctx_.resolvedType(*pa->declType);
+            else if (ta && !tb && pb->declType)
+                tb = ctx_.resolvedType(*pb->declType);
             if (ta && tb) {
                 if (!methodSigTypeRefEqual(ta, tb)) return false;
                 continue;

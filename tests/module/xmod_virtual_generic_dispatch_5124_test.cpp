@@ -1,5 +1,5 @@
 // Regression tests for #5124 (split into #5160 and #5161): a constrained
-// generic method called ACROSS a module boundary.
+// generic method called ACROSS a module boundary through a virtual dispatch.
 //
 // Spec: §14.1 / §14.2 (generic methods are monomorphized per type argument),
 // §2.8.3 rule 4 (an imported generic is instantiated in the importing module),
@@ -11,7 +11,11 @@
 //           call to an attached generic sibling member (`b.Get()` on
 //           `BoxVO5124<T>`), so even the NON-virtual `NB` degraded to a zero
 //           return (rejected by the #5009 backstop; twin 57).
-
+//   #5161 / #5124 — virtual / override bodies were not shipped, so the
+//           dispatch had no body to specialize (no substitution, `ret 0`), and
+//           neither imported overrides nor an importer's override of an
+//           imported virtual generic method were dispatch candidates.
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -112,6 +116,46 @@ Run5124 buildImportAndRun5124(const std::string& libSrc,
     return r;
 }
 
+// A dependency D, a LIBRARY L that imports D and makes the virtual call, and
+// a main M that imports both. Returns the raw wait status (-1: no program).
+int buildLibCallSiteAndRun5124(const std::string& depSrc,
+                               const std::string& libSrc,
+                               const std::string& mainSrc) {
+    auto dir = fs::temp_directory_path();
+    std::string id = unique_stem("bz5124c_");
+    TempFile5124 depSrcF((dir / (id + "_dep.bzl")).string());
+    TempFile5124 depObjF((dir / (id + "_dep.o")).string());
+    TempFile5124 libSrcF((dir / (id + "_lib.bzl")).string());
+    TempFile5124 libObjF((dir / (id + "_lib.o")).string());
+    TempFile5124 mainSrcF((dir / (id + "_main.bzl")).string());
+    TempFile5124 mainExeF((dir / id).string());
+    writeSource5124(depSrcF.path, depSrc);
+    writeSource5124(libSrcF.path, libSrc);
+    writeSource5124(mainSrcF.path, mainSrc);
+    bezel::Dependency d;
+    d.metadataPath = depObjF.path;
+    d.objectPath = depObjF.path;
+    bezel::Dependency l;
+    l.metadataPath = libObjF.path;
+    l.objectPath = libObjF.path;
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(depSrcF.path, depObjF.path).success)
+            return -1;
+    }
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(libSrcF.path, libObjF.path, {d}).success)
+            return -1;
+    }
+    bezel::Driver driver;
+    if (!bezel::test::compileFileForTest(driver, mainSrcF.path, mainExeF.path,
+                                         {d, l})
+             .success)
+        return -1;
+    return bezel::test::runProgramForTest(mainExeF.path);
+}
+
 int buildLocalAndRun5124(const std::string& src) {
     auto dir = fs::temp_directory_path();
     std::string id = unique_stem("bz5124l_");
@@ -198,9 +242,84 @@ void probe5124(const std::string& tag, const std::string& body, int want) {
 
 }  // namespace
 
+// #5124 original repro: base-typed receiver holding the imported override.
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_base_receiver_runs_imported_override_5124) {
+    probe5124("P1", "using var g := new GVO5124Drv(); var b: GVO5124 := g; "
+                    "return b.VB(bx);", 207);
+}
+// #5161: the base body itself, specialized at the call's type argument.
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_14_1_virtual_base_body_specialized_5161) {
+    probe5124("P2", "using var g := new GVO5124(); return g.VB(bx);", 127);
+}
+// #5124: a bare `T` formal (no generic sibling in the body).
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_bare_t_formal_imported_override_5124) {
+    probe5124("P3", "using var g := new GVO5124Drv(); var b: GVO5124 := g; "
+                    "return b.VP(s);", 207);
+}
 // #5160: the non-virtual static twin, generic sibling call `b.Get()`.
 BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_2_8_3_static_generic_sibling_call_5160) {
     probe5124("P4", "return GVO5124.NB(bx);", 57);
+}
+// #5161: the override called through its own static type.
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_14_1_derived_receiver_override_5161) {
+    probe5124("P5", "using var g := new GVO5124Drv(); return g.VB(bx);", 207);
+}
+// #5124: the importer's own override of the imported virtual generic method.
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_importer_override_of_imported_method_5124) {
+    probe5124("P6", "using var g := new Mine5124(); var b: GVO5124 := g; "
+                    "return b.VB(bx);", 37);
+}
+
+// The call site is in a LIBRARY (§2.4) compiled before the module that
+// declares the receiver's class. `LibL5124.Call` knows `GVO5124`, `GVO5124Drv`
+// (its dependency) and dispatches them correctly (rows a, b). An instance of
+// the later module's `Mine5124` is a class the library cannot know; running
+// the base body for it would return 127 where §11 requires 37 (the same
+// closed-world limit a dependency-internal virtual generic call has). The
+// constraint-route dispatch traps that instance instead (row c): the program
+// aborts, it never returns a wrong value.
+namespace {
+const char* kLib5124 =
+    "module L5124; import D5124; "
+    "public static class LibL5124 "
+    "  public static method Call(g: GVO5124): int "
+    "    using var s := new SqVO5124(); "
+    "    var bx := new BoxVO5124<SqVO5124>(s); "
+    "    return g.VB(bx); "
+    "  end Call; "
+    "end LibL5124; ";
+
+int libCallSite5124(const std::string& tag, const std::string& body) {
+    return buildLibCallSiteAndRun5124(
+        "module D5124; " + std::string(kDecls5124), kLib5124,
+        "module M5124" + tag + "; import D5124; import L5124; " +
+            std::string(kMine5124) +
+            "class C5124 public static method Main(): int " + body +
+            " end Main; end C5124;");
+}
+}  // namespace
+
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_library_call_site_known_override_5124) {
+    int st = libCallSite5124(
+        "La", "using var g := new GVO5124Drv(); return LibL5124.Call(g);");
+    BEZEL_EXPECT_TRUE(st != -1 && WIFEXITED(st));
+    BEZEL_EXPECT_EQ(WIFEXITED(st) ? WEXITSTATUS(st) : -1, 207);
+}
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_library_call_site_base_5124) {
+    int st = libCallSite5124(
+        "Lb", "using var g := new GVO5124(); return LibL5124.Call(g);");
+    BEZEL_EXPECT_TRUE(st != -1 && WIFEXITED(st));
+    BEZEL_EXPECT_EQ(WIFEXITED(st) ? WEXITSTATUS(st) : -1, 127);
+}
+BEZEL_TEST(xmod_virtual_generic_dispatch_5124, spec_11_library_call_site_unknown_class_traps_5124) {
+    int st = libCallSite5124(
+        "Lc", "using var g := new Mine5124(); return LibL5124.Call(g);");
+    BEZEL_EXPECT_TRUE(st != -1);
+    // SIGABRT from bz_debug_assert_fail; under the sanitizer sweep the shell
+    // reports it as exit 128+6 (see runProgramForTest).
+    bool aborted = st != -1 && ((WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT) ||
+                                (WIFEXITED(st) && WEXITSTATUS(st) == 134));
+    BEZEL_EXPECT_TRUE(aborted);
 }
 
 }  // namespace bezel::module

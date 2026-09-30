@@ -103,12 +103,12 @@
 //        did not lower), now 107 across modules (#5160)
 //   T25  DIFFERENTIAL CONTROL for T18-T24 in ONE module -> 99
 //   T26 ★ `virtual VBox<T>` (a sibling generic class at T) on its own class
-//        is REJECTED with #1943's diagnostic (bd0405e6: 0, twin 107)
-//   T27 ★ the same through a base-typed receiver on an override
-//        (bd0405e6: 0, twin 207)
+//        -> 107 across modules since #5124 (bd0405e6: 0; then rejected)
+//   T27 ★ the same through a base-typed receiver on an override -> 207
+//        (bd0405e6: 0; then rejected)
 //   T28 ★ a plain `v.Area() + 100 + k` virtual body through a base-typed
-//        receiver on an override (bd0405e6: 107 with NO warning, twin 207;
-//        override selection across modules is #5031)
+//        receiver on an override -> 207 (bd0405e6: 107 with NO warning;
+//        override selection across modules is #5031; then rejected)
 //   T29-T31 DIFFERENTIAL CONTROLS for T26-T28 in ONE module -> 107 / 207 / 207
 //
 // Every accept row asserts the constraint method's exact VALUE — "compiled"
@@ -974,14 +974,11 @@ std::string mainV5009(const std::string& call) {
            " end Main; end CV5009;";
 }
 
-void expectVirtualReject5009(const std::string& tag, const std::string& call,
-                             const std::string& name) {
-    auto r = compileImport5009(
-        std::string("module DepV5009; ") + kVirtDecls5009,
-        "module AppV5009" + tag + "; import DepV5009; " + mainV5009(call));
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    BEZEL_EXPECT_TRUE(r.err.find(widthReject5009(name)) != std::string::npos);
+int runVirtualImport5009(const std::string& tag, const std::string& call) {
+    return buildImportAndRun5009(
+        std::string("module DepV5009") + tag + "; " + kVirtDecls5009,
+        "module AppV5009" + tag + "; import DepV5009" + tag + "; " +
+            mainV5009(call));
 }
 
 int runVirtualLocal5009(const std::string& tag, const std::string& call) {
@@ -994,37 +991,47 @@ int runVirtualLocal5009(const std::string& tag, const std::string& call) {
 // T26 — ★ THIRD REVIEW, shape (a). A virtual generic method whose body
 // instantiates a sibling generic class at T. On bd0405e6 its body was shipped
 // and lowered by emitVirtualGenericDispatch, outside both of fix-forward 2's
-// layers: exit 0, twin 107 (MEASURED). The body is no longer shipped, and the
-// vtable-slot call gets #1943's located diagnostic (b30c6f12: an unlocated
-// IR-verifier abort).
-// // per §14.1 / §2.8.3 rule 4 / #1943, v0.307
+// layers: exit 0, twin 107 (MEASURED). Fix-forward 3 stopped shipping it and
+// rejected the call with #1943's diagnostic. #5124 ships `virtual` /
+// `override` bodies again on the constraint route, #5160 lets the body type
+// its sibling call, and the dispatch specializes every candidate under the
+// backstop: the call returns its one-module value (T29), 107.
+// // per §14.1 / §2.8.3 rule 4 / #5124, v0.313
 // ===========================================================================
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           virtual_generic_method_body_is_rejected_not_zero) {
-    expectVirtualReject5009("T26", kVirtCallA5009, "VBox");
+           virtual_generic_method_body_keeps_value_across_modules) {
+    int rc = runVirtualImport5009("T26", kVirtCallA5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 107);
 }
 
 // ===========================================================================
 // T27 — ★ shape (b): the same body, overridden, called through a base-typed
-// receiver on the derived object. bd0405e6: 0, twin 207 (MEASURED).
-// // per §14.1 / §12 / §2.8.3 rule 4 / #1943, v0.307
+// receiver on the derived object. bd0405e6: 0, twin 207 (MEASURED). The
+// imported override is now a dispatch candidate (#5124): 207 (T30).
+// // per §14.1 / §12 / §2.8.3 rule 4 / #5124, v0.313
 // ===========================================================================
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           overridden_virtual_generic_method_is_rejected_not_zero) {
-    expectVirtualReject5009("T27", kVirtCallB5009, "VBox");
+           overridden_virtual_generic_method_keeps_value_across_modules) {
+    int rc = runVirtualImport5009("T27", kVirtCallB5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 207);
 }
 
 // ===========================================================================
 // T28 — ★ shape (c), SILENT WRONG CODE on bd0405e6: a plain body that lowers,
 // overridden, through a base-typed receiver on the derived object. The
 // cross-module dispatch ran the BASE body: 107 with no warning, twin 207
-// (MEASURED). The override-selection hole itself is #5031; here the call is
-// kept off the constraint route, so it is rejected.
-// // per §14.1 / §12 / §2.8.3 rule 4 / #1943 / #5031, v0.307
+// (MEASURED). The override-selection hole itself is #5031; fix-forward 3
+// kept the call off the constraint route and rejected it. With the imported
+// override a dispatch candidate (#5124), the call selects it: 207 (T31).
+// // per §14.1 / §12 / §2.8.3 rule 4 / #5031 / #5124, v0.313
 // ===========================================================================
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           overridden_virtual_plain_body_is_rejected_not_base_value) {
-    expectVirtualReject5009("T28", kVirtCallC5009, "VPlain");
+           overridden_virtual_plain_body_selects_override_across_modules) {
+    int rc = runVirtualImport5009("T28", kVirtCallC5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 207);
 }
 
 // ===========================================================================
@@ -1126,16 +1133,6 @@ std::string mainB5009(const std::string& call) {
            " end Main; end CB5009;";
 }
 
-void expectBoundReject5009(const std::string& tag, const std::string& call,
-                           const std::string& name) {
-    auto r = compileImport5009(
-        std::string("module DepB5009; ") + kBoundDecls5009,
-        "module AppB5009" + tag + "; import DepB5009; " + mainB5009(call));
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    BEZEL_EXPECT_TRUE(r.err.find(lowerReject5009(name)) != std::string::npos);
-}
-
 int runBoundImport5009(const std::string& tag, const std::string& call) {
     return buildImportAndRun5009(
         std::string("module DepB5009") + tag + "; " + kBoundDecls5009,
@@ -1149,27 +1146,38 @@ int runBoundLocal5009(const std::string& tag, const std::string& call) {
 }
 }  // namespace
 
-// T32-T35 — ★ the silent zeros, now located rejects.
-// // per §14.1 / §14.2 new() / §2.8.3 rule 4 / #1943, v0.307
+// T32-T35 — ★ the silent zeros. Fix-forward 4 made them located rejects;
+// since #5124 their `virtual` / `override` bodies cross on the constraint
+// route and the dispatch specializes them at the explicit type argument, so
+// each returns its one-module value (T38-T41): 95 / 47 / 48 / 48.
+// // per §14.1 / §14.2 new() / §2.8.3 rule 4 / #5124, v0.313
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           virtual_new_bound_method_without_t_argument_is_rejected_not_zero) {
-    expectBoundReject5009("T32", kBoundNew5009, "Mk");
+           virtual_new_bound_method_without_t_argument_keeps_value) {
+    int rc = runBoundImport5009("T32", kBoundNew5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 95);
 }
 
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           virtual_bound_method_with_only_int_argument_is_rejected_not_zero) {
-    expectBoundReject5009("T33", kBoundCnt5009, "Cnt");
+           virtual_bound_method_with_only_int_argument_keeps_value) {
+    int rc = runBoundImport5009("T33", kBoundCnt5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 47);
 }
 
-// // per §14.1 / §12 / §2.8.3 rule 4 / #1943 / #5031, v0.307
+// // per §14.1 / §12 / §2.8.3 rule 4 / #5031 / #5124, v0.313
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           overridden_bound_method_via_base_receiver_is_rejected_not_zero) {
-    expectBoundReject5009("T34", kBoundCntSub5009, "Cnt");
+           overridden_bound_method_via_base_receiver_keeps_value) {
+    int rc = runBoundImport5009("T34", kBoundCntSub5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 48);
 }
 
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           overridden_bound_method_via_derived_receiver_is_rejected_not_zero) {
-    expectBoundReject5009("T35", kBoundCntSubD5009, "Cnt");
+           overridden_bound_method_via_derived_receiver_keeps_value) {
+    int rc = runBoundImport5009("T35", kBoundCntSubD5009);
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 48);
 }
 
 // T36 — the NON-virtual twin keeps the constraint route and its value.

@@ -15181,8 +15181,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // with identical widths and silently returned 0 (MEASURED on
         // 8575510a; twins 95 / 47 / 48). Fail closed on the BOUND instead —
         // see importedGenericLacksConstraintBody5009.
+        //
+        // fix #5124 (§14.1 / §2.8.3 rule 4, v0.313): an imported virtual
+        // method whose shipped body IS attached on the constraint route is
+        // meant to be lowered by emitVirtualGenericDispatch, per candidate
+        // and per type argument. Reaching the slot call means that dispatch
+        // was not taken or declined, and the slot still holds the defining
+        // module's placeholder template, the silent zero #5009 closed. Refuse
+        // it on the same terms.
         if (!isIfaceMethod &&
-            importedGenericLacksConstraintBody5009(ctx_, ms)) {
+            (importedGenericLacksConstraintBody5009(ctx_, ms) ||
+             (ctx_.isImported(ms) && ctx_.isConstraintRouteBody(ms)))) {
             ctx_.diagnostics().report(Severity::Error, callLoc,
                                       boundBodyReject5009(ms->name, true));
             if (fnTy->getReturnType()->isVoidTy()) return nullptr;
@@ -16393,6 +16402,33 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     };
     std::vector<Branch> branches;
     sema::MethodSymbol* defaultImpl = nullptr;
+    // fix #5124: the descriptors of the known classes whose instances run
+    // `defaultImpl` (see `unknownDescriptorTrap`), and whether one of them is
+    // generic below the static type.
+    std::vector<llvm::Constant*> defaultDescs;
+    bool defaultGeneric = false;
+
+    // Every class whose instances could reach the call: the module's own
+    // classes, then (fix #5124, §11 override semantics / §2.8.3 rule 4,
+    // v0.313) the imported ones. With only the local scan, an imported class
+    // overriding an imported virtual generic method (`D.GDrv.VB` over
+    // `D.G.VB`) was no candidate, and a base-typed receiver holding it ran
+    // the base body (MEASURED on the #5124 WIP 961ab42c: 0 / 127 for 207).
+    // Every module linked into a program is loaded here (`--import`), so an
+    // executable's call site sees every class; a LIBRARY's call site cannot
+    // see a class of a module compiled after it, which the
+    // `unknownDescriptorTrap` below covers for the constraint route.
+    std::vector<const sema::TypeSymbol*> candidateClasses;
+    {
+        std::unordered_set<const sema::TypeSymbol*> seen;
+        auto take = [&](const sema::Symbol* sym) {
+            auto* c = dynamic_cast<const sema::TypeSymbol*>(sym);
+            if (!c || c->kind != ast::TypeDeclKind::Class) return;
+            if (seen.insert(c).second) candidateClasses.push_back(c);
+        };
+        for (const auto& sym : ctx_.symbols()) take(sym.get());
+        for (const sema::Symbol* sym : ctx_.importedSymbols()) take(sym);
+    }
 
     if (!ifaceParent) {
         // CLASS parent: the static class's own override is the natural default
@@ -16400,14 +16436,26 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         // inherits this default — no branch needed for it (dedup by impl).
         defaultImpl = mostDerived(staticType);
         if (!defaultImpl) defaultImpl = ms;
-        for (const auto& sym : ctx_.symbols()) {
-            auto* c = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!c || c->kind != ast::TypeDeclKind::Class) continue;
+        // fix #5124: the static class itself runs the default.
+        if (auto sit = descArray_.find(staticType); sit != descArray_.end())
+            defaultDescs.push_back(sit->second);
+        if (!staticType->genericParams.empty()) defaultGeneric = true;
+        for (const sema::TypeSymbol* c : candidateClasses) {
             if (c == staticType) continue;
             if (!isSubclassOf(c, staticType)) continue;
             if (!descArray_.count(c)) continue;
             sema::MethodSymbol* impl = mostDerived(c);
-            if (!impl || impl == defaultImpl) continue;  // inherits the default
+            if (!impl || impl == defaultImpl) {  // inherits the default
+                // fix #5124: remember it for the unknown-class guard. A
+                // generic link below the static type gives the instances
+                // per-instantiation descriptors (#1843), which this list
+                // cannot enumerate.
+                for (const sema::TypeSymbol* t2 = c; t2 && t2 != staticType;
+                     t2 = baseClassOf(t2))
+                    if (!t2->genericParams.empty()) defaultGeneric = true;
+                defaultDescs.push_back(descArray_.find(c)->second);
+                continue;
+            }
             Branch b{c, impl};
             // fix #2896: does any link strictly below `staticType` declare type
             // parameters? If so this candidate's descriptor and its override's
@@ -16467,9 +16515,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         // since the default is only correct for the one class it belongs to). The
         // last implementer becomes the default branch.
         std::vector<Branch> all;
-        for (const auto& sym : ctx_.symbols()) {
-            auto* c = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!c || c->kind != ast::TypeDeclKind::Class) continue;
+        for (const sema::TypeSymbol* c : candidateClasses) {
             if (!implementsIface(c, staticType)) continue;
             if (!descArray_.count(c)) continue;
             sema::MethodSymbol* impl = mostDerived(c);
@@ -16478,6 +16524,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         }
         if (all.empty()) return nullptr;  // no implementer — bail safely
         defaultImpl = all.back().impl;
+        defaultDescs.push_back(descArray_.find(all.back().cls)->second);
+        if (!all.back().cls->genericParams.empty()) defaultGeneric = true;
         all.pop_back();
         branches = std::move(all);
     }
@@ -16493,15 +16541,26 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // returned 0 here (twins 107 / 207), and override selection across the
     // module boundary picked the base body (#5031). Checked before any
     // instruction is emitted.
+    //
+    // fix #5124 (§14.1 / §2.8.3 rule 4 / §11, v0.313): a constraint-route body
+    // is no longer refused here. The exporter ships `virtual` / `override`
+    // bodies again and the candidate scan above now sees the imported
+    // overrides, so each candidate is monomorphized at the call's type
+    // arguments below, under the same backstop emitInlineGenericMethod
+    // applies (an INTERNAL degrade while any constraint-route specialization
+    // is built becomes this located error). An implementation WITHOUT its
+    // body is still refused.
+    bool anyConstraintRoute = false;
     {
         // Fix-forward 4: an imported implementation whose bound-carrying body
         // did not cross the boundary (importedGenericLacksConstraintBody5009)
         // is refused on the same terms as the slot call in emitMethodCall.
         auto refused = [&](const sema::MethodSymbol* m) {
-            return ctx_.isConstraintRouteBody(m) ||
-                   importedGenericLacksConstraintBody5009(ctx_, m);
+            if (ctx_.isConstraintRouteBody(m)) anyConstraintRoute = true;
+            return importedGenericLacksConstraintBody5009(ctx_, m);
         };
-        bool constraintRouteImpl = refused(ms) || refused(defaultImpl);
+        bool constraintRouteImpl = refused(ms);
+        if (refused(defaultImpl)) constraintRouteImpl = true;
         for (const Branch& b : branches)
             if (refused(b.impl)) constraintRouteImpl = true;
         if (constraintRouteImpl) {
@@ -16586,20 +16645,52 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         return fn;
     };
 
+    // fix #5124: the constraint-route backstop for this dispatch (see the
+    // guard above). Any `internal:` warning reported while the candidates'
+    // specializations are built, or a candidate that cannot be specialized,
+    // fails the compile at the call site: declining here would send the call
+    // to the vtable slot, i.e. the placeholder template.
+    const SourceLocation constraintRouteSite = callSiteLoc_;
+    const std::size_t constraintRouteDiagMark =
+        ctx_.diagnostics().diagnostics().size();
+    auto constraintRouteFail = [&]() -> llvm::Value* {
+        ctx_.diagnostics().report(
+            Severity::Error, constraintRouteSite,
+            "calling imported generic method `" + std::string(ms->name) +
+            "`: its body could not be monomorphized across the module "
+            "boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #5009) "
+            "\xE2\x80\x94 a candidate of this virtual call did not lower, "
+            "so the call would silently compute a wrong value. Call it "
+            "within the module that defines it");
+        if (llvm::FunctionType* ft = methodFnType(ms))
+            if (!ft->getReturnType()->isVoidTy())
+                return llvm::PoisonValue::get(ft->getReturnType());
+        return nullptr;
+    };
+    auto degradedSinceMark = [&]() {
+        const std::vector<Diagnostic>& ds = ctx_.diagnostics().diagnostics();
+        for (std::size_t di = constraintRouteDiagMark; di < ds.size(); ++di)
+            if (ds[di].severity == Severity::Warning &&
+                ds[di].message.rfind("internal:", 0) == 0)
+                return true;
+        return false;
+    };
+
     // Build all specializations up front (each into its own standalone function);
     // none is emitted inline into the current block.
     llvm::Function* defFn = specForImpl(defaultImpl);
-    if (!defFn) return nullptr;
+    if (!defFn) return anyConstraintRoute ? constraintRouteFail() : nullptr;
     // fix #2896: carry the descriptor CONSTANT, not the class — for a generic
     // candidate it is the per-instantiation global, not `descArray_[cls]`.
     std::vector<std::pair<llvm::Constant*, llvm::Function*>> brFns;
     for (auto& b : branches) {
         llvm::Function* f = specForImpl(b.impl, &b);
-        if (!f) return nullptr;
+        if (!f) return anyConstraintRoute ? constraintRouteFail() : nullptr;
         llvm::Constant* desc = b.desc;
         if (!desc) {
             auto dit = descArray_.find(b.cls);
-            if (dit == descArray_.end()) return nullptr;
+            if (dit == descArray_.end())
+                return anyConstraintRoute ? constraintRouteFail() : nullptr;
             desc = dit->second;
         }
         brFns.push_back({desc, f});
@@ -16610,11 +16701,17 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // the caller's existing path rather than half an emitted dispatch.
     for (std::size_t i = 0; i < brFns.size(); ++i)
         if (brFns[i].second->getFunctionType() != defFn->getFunctionType())
-            return nullptr;
+            return anyConstraintRoute ? constraintRouteFail() : nullptr;
+    if (anyConstraintRoute && degradedSinceMark()) return constraintRouteFail();
+    // fix #5124: the unknown-class guard needs every default-running class's
+    // descriptor; a generic one has per-instantiation descriptors (#1843)
+    // this dispatch cannot enumerate, so fail closed at compile time.
+    if (anyConstraintRoute && defaultGeneric) return constraintRouteFail();
 
     // Common case: no subclass overrides differently — a direct call to the
     // single specialization is correct (the dynamic type always most-derives it).
-    if (brFns.empty()) {
+    // fix #5124: not on the constraint route, whose default is guarded below.
+    if (brFns.empty() && !anyConstraintRoute) {
         if (args.size() != defFn->arg_size()) return nullptr;
         llvm::Value* r = builder_.CreateCall(defFn, args);
         emitPendingCheck();
@@ -16656,6 +16753,41 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     }
     // Default branch (current block = the last nextBB).
     if (args.size() != defFn->arg_size()) return nullptr;
+    // fix #5124 (§11 override semantics / §2.8.3 rule 4, v0.313): the
+    // unknown-class guard. This dispatch is closed-world: it knows the classes
+    // of the modules loaded into THIS compile. A library's call site cannot
+    // know a subclass declared in a module compiled after it, and running the
+    // default body for such an instance would silently compute a wrong value
+    // (the shape of the pre-existing module-internal case, MEASURED 127 for
+    // 37). On the constraint route the default runs only for a class known to
+    // inherit it; any other descriptor aborts with a message, never a wrong
+    // value. Every compare is emitted after all specializations were built, so
+    // no bail below leaves a half-emitted dispatch.
+    if (anyConstraintRoute) {
+        llvm::BasicBlock* okBB =
+            llvm::BasicBlock::Create(llvm_, "vgen.known", currentFn_);
+        for (llvm::Constant* dd : defaultDescs) {
+            llvm::BasicBlock* nextBB =
+                llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
+            builder_.CreateCondBr(builder_.CreateICmpEQ(td, dd, "vgen.def"),
+                                  okBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+        }
+        auto* failFn = declareC("bz_debug_assert_fail",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(
+            failFn,
+            {lowerStringLiteralConst(
+                // a source-form literal: the quotes are stripped
+                "\"internal: virtual call to imported generic method `" +
+                    std::string(ms->name) +
+                    "` reached a class this module does not know (declared "
+                    "in a module compiled after it); its override cannot be "
+                    "dispatched (#5124)\"",
+                false)});
+        builder_.CreateUnreachable();
+        builder_.SetInsertPoint(okBB);
+    }
     llvm::Value* dr = builder_.CreateCall(defFn, args);
     emitPendingCheck();
     incoming.push_back({hasResult ? dr : nullptr, builder_.GetInsertBlock()});
