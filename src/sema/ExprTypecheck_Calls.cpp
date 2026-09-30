@@ -15021,6 +15021,10 @@ void ExprTC::checkConstructorChainCycles(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
+        // SEAM-ACCESSOR: `t` is the type whose members were JUST visited
+        // (declaration-site walk over the module being compiled, never an
+        // imported symbol) and the walk needs each constructor's BODY chain
+        // call, which only an ast::ConstructorDecl holds (§12.8, v0.313).
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
         ctors.push_back({cd});

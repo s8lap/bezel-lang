@@ -8881,7 +8881,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // `pos2` is needed here; §22.5 binding correctness of the call itself
         // is `checkChainCallBinding`'s question, already asked and diagnosed
         // there.
-        const ast::ConstructorDecl* calleeChainCtor2 = nullptr;
+        const sema::ConstructorSymbol* calleeChainCtor2 = nullptr;
         if (!calleeMd2 && !calleeMs2 && !calleeXd2 && currentType_) {
             if (auto* callId2 = dynamic_cast<const ast::IdentifierExpr*>(
                     ce->callee.get())) {
@@ -8901,11 +8901,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             auto* cs2 =
                                 dynamic_cast<sema::ConstructorSymbol*>(m2);
                             if (!cs2 || cs2->isStatic) continue;
-                            auto* od2 = dynamic_cast<const ast::ConstructorDecl*>(
-                                cs2->decl);
-                            if (!od2 || od2->params.size() != ce->args.size())
+                            // per §2.5 / §22.3 (v0.313): arity via the
+                            // both-source accessor, so an IMPORTED base
+                            // class's constructor (no ast::ConstructorDecl)
+                            // is found too.
+                            if (sema::formalParamCount(*cs2) != ce->args.size())
                                 continue;
-                            calleeChainCtor2 = od2;
+                            calleeChainCtor2 = cs2;
                             break;
                         }
                     }
@@ -8957,9 +8959,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     return ps2->resolvedDeclType;
             // fix #4975: the chain-call target constructor resolved above.
             if (calleeChainCtor2) {
-                if (pos < calleeChainCtor2->params.size() &&
-                    calleeChainCtor2->params[pos].type)
-                    return ctx_.resolvedType(*calleeChainCtor2->params[pos].type);
+                if (const ast::Type* t2 =
+                        sema::formalParamDeclType(*calleeChainCtor2, pos))
+                    if (auto* r2 = ctx_.resolvedType(*t2)) return r2;
+                if (pos < calleeChainCtor2->params.size())
+                    if (auto* ps2 = dynamic_cast<ParameterSymbol*>(
+                            calleeChainCtor2->params[pos]))
+                        return ps2->resolvedDeclType;
                 return nullptr;
             }
             return nullptr;
