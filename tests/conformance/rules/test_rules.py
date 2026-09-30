@@ -6,11 +6,14 @@ doc-example harness.
 Run: python3 -m unittest discover -s tests/conformance/rules
 """
 
+import glob
 import io
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import corpus
@@ -1562,6 +1565,167 @@ class TestClassifyFilterMerge_4814(unittest.TestCase):
         self.assertEqual(rc, 0)
         banked = runner.read_baseline(self.baseline)
         self.assertGreater(len(banked), 0)
+
+
+class TestWorkdirLocation(unittest.TestCase):
+    """#5196: rule-corpus work directories MUST NOT live under /tmp.
+
+    /tmp on the project's boxes is a quota-limited tmpfs. A rule-corpus
+    run that is killed (SIGKILL, OOM, timeout) before its `finally` block
+    cleans up accumulates work directories there — six were measured at
+    230–573 MB each, ~2.5 GB total, that stayed for days after the runs
+    ended, pushing swap out and throttling the lane pools. The fix is to
+    route the per-run work directory through `_choose_workroot()`, which
+    defaults to /var/tmp/bezel-scratch/rulecorpus and honors
+    BEZEL_RULECORPUS_TMPDIR for overrides. These tests pin both halves:
+    the leak is absent, and the override works.
+    """
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp()
+        write_corpus(self.base, [ACCEPT, REJECT, RUN])
+        corpus.main(["build"], base_dir=self.base)
+        self.bezelc = os.path.join(self.base, "bezelc")
+        with open(self.bezelc, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.bezelc, 0o755)
+        self.baseline = os.path.join(self.base, "baseline.tsv")
+        # Snapshot any /tmp/rulecorpus-* that pre-existed so the assertion
+        # isolates the leak to this test rather than the host's state.
+        self.before_tmp = set(glob.glob('/tmp/rulecorpus-*'))
+
+    def tearDown(self):
+        shutil.rmtree(self.base, ignore_errors=True)
+        # Best-effort cleanup of anything that leaked during this test
+        # (a FAIL-WITHOUT run would leave dirs behind; we never want the
+        # test itself to be the source of the leak it is pinning absent).
+        leaked = set(glob.glob('/tmp/rulecorpus-*')) - self.before_tmp
+        for p in leaked:
+            shutil.rmtree(p, ignore_errors=True)
+
+    def all_as_spec_says(self):
+        return FakeCompiler({
+            "s28_5_0001": ((0, ""), (0, "")),
+            "s28_5_0002": ((1, "error: owned is not admitted here"), (0, "")),
+            "s18_5_0001": ((0, ""), (0, "[null]\n")),
+        })
+
+    def test_no_rulecorpus_dirs_leaked_into_tmp_after_a_green_run(self):
+        """#5196 regression: a green run must NOT leave /tmp/rulecorpus-*."""
+        rc = runner.main([self.bezelc, "--baseline", self.baseline],
+                         base_dir=self.base, run=self.all_as_spec_says())
+        self.assertEqual(rc, 0)
+        after = set(glob.glob('/tmp/rulecorpus-*'))
+        leaked = after - self.before_tmp
+        self.assertEqual(leaked, set(),
+            "#5196: runner.py leaked rulecorpus work dir(s) into /tmp: {}"
+            .format(sorted(leaked)))
+
+    def test_workdir_lives_off_tmp_at_creation_time(self):
+        """#5196: the work dir must be created OFF /tmp, not just cleaned up
+        out of /tmp.
+
+        A green run's `finally` block wipes the dir, so a green-run post-glob
+        always shows nothing — that assertion catches the symptom after a
+        SIGKILL/timeout, not the cause. The bug itself is the `tempfile.
+        mkdtemp(prefix="rulecorpus-")` call that defaulted the parent dir
+        to `tempfile.gettempdir()` (which is /tmp on this box). Intercept
+        mkdtemp and pin where the rulecorpus-* call lands: the fix routes
+        it through `_choose_workroot()` (default /var/tmp/bezel-scratch/
+        rulecorpus, override BEZEL_RULECORPUS_TMPDIR), so the result must
+        NOT start with /tmp/.
+        """
+        captured = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            result = real_mkdtemp(*args, **kwargs)
+            captured.append((args, kwargs, result))
+            return result
+
+        with unittest.mock.patch('tempfile.mkdtemp', side_effect=spy):
+            rc = runner.main([self.bezelc, "--baseline", self.baseline],
+                             base_dir=self.base, run=self.all_as_spec_says())
+        self.assertEqual(rc, 0)
+        rulecorpus = [c for c in captured
+                      if c[1].get('prefix', '').startswith('rulecorpus-')]
+        self.assertEqual(len(rulecorpus), 1,
+            "expected exactly one rulecorpus mkdtemp call from runner.main(); "
+            "got {} (caller's tempfile.mkdtemp calls are also intercepted, "
+            "so a non-1 count means the runner stopped calling mkdtemp)".format(
+                [(c[1].get('prefix'), c[2]) for c in captured]))
+        _, kwargs, result = rulecorpus[0]
+        self.assertIn('dir', kwargs,
+            "#5196: runner.py must pass dir= to mkdtemp so the work dir "
+            "lives under the project scratch root, not /tmp")
+        self.assertFalse(result.startswith('/tmp/'),
+            "#5196: rulecorpus work dir {!r} landed under /tmp — must live "
+            "off the quota-limited tmpfs".format(result))
+
+    def test_no_rulecorpus_dirs_leaked_into_tmp_on_a_crashing_run(self):
+        """#5196 regression: a run that raises out of the seam must not leak either.
+
+        The `finally` block still removes the work dir on the exception path,
+        but more importantly the dir must never have been created under /tmp
+        in the first place — a kill (SIGKILL) skips the finally entirely,
+        and that is the scenario the leak was measured under (#5196)."""
+        def boom(cmd, cwd=None):
+            raise RuntimeError("simulated compiler crash (#5196)")
+
+        try:
+            runner.main([self.bezelc, "--baseline", self.baseline],
+                         base_dir=self.base, run=boom)
+            self.fail("boom() should have raised out of runner.main()")
+        except RuntimeError as e:
+            self.assertIn("simulated compiler crash", str(e))
+        after = set(glob.glob('/tmp/rulecorpus-*'))
+        leaked = after - self.before_tmp
+        self.assertEqual(leaked, set(),
+            "#5196: runner.py leaked rulecorpus work dir(s) into /tmp on a "
+            "crashing run: {}".format(sorted(leaked)))
+
+    def test_bezel_rulecorpus_tmpdir_env_var_overrides_workroot(self):
+        """#5196: BEZEL_RULECORPUS_TMPDIR redirects the workroot (and the
+        override does not itself become a /tmp leak)."""
+        custom = tempfile.mkdtemp(prefix="custom-rulecorpus-")
+        old = os.environ.get('BEZEL_RULECORPUS_TMPDIR')
+        os.environ['BEZEL_RULECORPUS_TMPDIR'] = custom
+        captured = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            result = real_mkdtemp(*args, **kwargs)
+            captured.append((args, kwargs, result))
+            return result
+
+        try:
+            with unittest.mock.patch('tempfile.mkdtemp', side_effect=spy):
+                rc = runner.main([self.bezelc, "--baseline", self.baseline],
+                                 base_dir=self.base,
+                                 run=self.all_as_spec_says())
+            self.assertEqual(rc, 0)
+            rulecorpus = [c for c in captured
+                          if c[1].get('prefix', '').startswith('rulecorpus-')]
+            self.assertEqual(len(rulecorpus), 1,
+                "expected exactly one rulecorpus mkdtemp call under the "
+                "override; got {}".format(
+                    [(c[1].get('prefix'), c[2]) for c in captured]))
+            _, kwargs, result = rulecorpus[0]
+            # The work dir landed under `custom` (the override took).
+            self.assertTrue(result.startswith(custom + os.sep) or
+                            os.path.dirname(result) == custom,
+                "BEZEL_RULECORPUS_TMPDIR override did not route the workdir: "
+                "got {!r}, expected under {!r}".format(result, custom))
+            # And it was cleaned up by the try/finally when main() returned.
+            self.assertEqual(os.listdir(custom), [],
+                "workdir under override was not cleaned up after main() "
+                "returned; leftover children = {}".format(os.listdir(custom)))
+        finally:
+            if old is None:
+                os.environ.pop('BEZEL_RULECORPUS_TMPDIR', None)
+            else:
+                os.environ['BEZEL_RULECORPUS_TMPDIR'] = old
+            shutil.rmtree(custom, ignore_errors=True)
 
 
 if __name__ == "__main__":

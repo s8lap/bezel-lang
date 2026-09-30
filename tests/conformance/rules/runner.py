@@ -27,6 +27,7 @@ observed — the regeneration protocol, run on a box with a current bezelc.
 """
 
 import argparse
+import atexit
 import os
 import re
 import shutil
@@ -47,6 +48,24 @@ REGRESSION = "REGRESSION"
 KNOWN = "KNOWN"
 UNBANKED = "UNBANKED"
 UNCLASSIFIED = "UNCLASSIFIED"
+
+
+def _choose_workroot():
+    """Where the per-run work directory lives. Per #5196, never /tmp.
+
+    /tmp on the project's boxes is a quota-limited tmpfs: rule-corpus work
+    directories accumulate when the runner is killed (SIGKILL, timeout, OOM)
+    before the `finally` block can `shutil.rmtree` them, filling the quota and
+    pushing swap out. The CLAUDE.md "Build toolchain" rule ("Scratch never
+    goes in `/tmp`") forbids it. The default lives under the project scratch
+    root at /var/tmp/bezel-scratch/rulecorpus; tests and lanes can redirect
+    via BEZEL_RULECORPUS_TMPDIR (same discipline as BEZEL_DIFF_WORKROOT in
+    scripts/behaviour_differential.py).
+    """
+    override = os.environ.get('BEZEL_RULECORPUS_TMPDIR')
+    if override:
+        return override
+    return '/var/tmp/bezel-scratch/rulecorpus'
 
 
 def read_baseline(path):
@@ -358,7 +377,15 @@ def main(argv, base_dir=None, run=conformance.caged_run):
 
     baseline = read_baseline(args.baseline)
     cases_dir = os.path.join(base, "cases")
-    tmpdir = tempfile.mkdtemp(prefix="rulecorpus-")
+    workroot = _choose_workroot()
+    os.makedirs(workroot, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="rulecorpus-", dir=workroot)
+    # Belt-and-braces: the try/finally below handles every exit path inside
+    # main(), but atexit fires at interpreter shutdown too (sys.exit,
+    # uncaught exception, KeyboardInterrupt). Together they cover every
+    # path except SIGKILL, which no Python can recover from. The primary fix
+    # is moving the work dir off /tmp (#5196); this is the cleanup side.
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
     results = {}
     diag_misses = []
     try:
