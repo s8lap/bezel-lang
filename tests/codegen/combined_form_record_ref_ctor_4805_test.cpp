@@ -127,13 +127,13 @@ BEZEL_TEST(rec_ref_ctor_4805, combined_form_non_ref_param_literal_arg_accepts) {
     const char src[] = R"(
 module M;
 public record NonRefRec(Y: int)
-  public constructor(y: int)
-    Y := y;
+  public constructor(y: long)
+    Y := int(y);
   end constructor;
 end NonRefRec;
 public class Program
   public static method Main(): int
-    var r := new NonRefRec(99);
+    var r := new NonRefRec(99L);
     return r.Y;
   end Main;
 end Program;

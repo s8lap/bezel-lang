@@ -382,7 +382,8 @@ BEZEL_TEST(codegen_serialization_550,
            record_combined_form_explicit_ctor_rerun_spec_9_8_v0182) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "record Vec2(X: int, Y: int): ISerializable, IDeserializable "
+        "record Vec2(X: int): ISerializable, IDeserializable "
+        "  public property Y: int; "
         "  public constructor(x: int, y: int) "
         "    X := x + 100; "
         "    Y := y + 100; "

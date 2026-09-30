@@ -382,7 +382,7 @@ BEZEL_TEST(inheritance_clause_explicit_ctor_named_binding_4520,
     auto r = runAotChecked(
         "module M; "
         "class B(n: int, s: string) "
-        "  public constructor(a: int, b: string) "
+        "  public constructor(b: string, a: int) "
         "    this(a, b); "
         "  end constructor; "
         "  public method Show() "

@@ -19,6 +19,7 @@
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -88,11 +89,11 @@ BEZEL_TEST(two_hop_primary_chain_3760, single_hop_chain_still_works) {
         "module M; "
         "class C(x: int) "
         "  public readonly property X: int := x; "
-        "  public constructor(a: int) this(a + 1); end constructor; "
+        "  public constructor(a: int, b: int) this(a + b); end constructor; "
         "end C; "
         "class MainClass "
         "  public static method Main(): int "
-        "    var c := new C(a := 10); "
+        "    var c := new C(a := 10, b := 1); "
         "    Console.WriteLine(c.X.ToString()); "
         "    return 0; "
         "  end Main; "
@@ -195,4 +196,23 @@ BEZEL_TEST(two_hop_primary_chain_3760, self_chain_still_rejected) {
         if (d.message.find("§22.10") != std::string::npos) { found = true; break; }
     BEZEL_EXPECT_TRUE(found);
     BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #5132 pin (spec §9.3 / §11.3 / §22.6, v0.313): the shape this file's rows
+// used before #5132 -- a body constructor whose parameter list equals the
+// primary's -- is now rejected, which is why the accept rows above use a
+// distinct parameter list. Asserts the specific diagnostic, not just failure.
+BEZEL_TEST(two_hop_primary_chain_3760,
+           old_same_param_list_shape_rejected_as_primary_redeclaration_5132) {
+    auto r = runAot(
+        "module M; "
+        "class C(x: int) "
+        "  public constructor(a: int) this(a + 1); end constructor; "
+        "end C; "
+        "class C "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "body constructor redeclares the primary constructor"));
 }

@@ -68,6 +68,7 @@
 
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "support/driver_run_support.hpp"
 #include "support/scratch_dir.hpp"
@@ -345,7 +346,7 @@ BEZEL_TEST(base_clause_primary_ctor_both_forms_3731,
            same_arity_explicit_ctor_wins_spec_22_10) {
     const std::string src =
         "module L3731e; "
-        "class Base(bp: int) "
+        "class Base(bp: long) "
         "  public bx: int := 11; "
         "  public constructor(v: int) "
         "    this(v * 100); "
@@ -504,6 +505,28 @@ BEZEL_TEST(base_clause_primary_ctor_both_forms_3731,
     BEZEL_EXPECT_TRUE(
         r.stdoutText.find("made=200 live=0") != std::string::npos);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("made=0") == std::string::npos);
+}
+
+
+// #5132 pin (spec §9.3 / §11.3 / §22.6, v0.313): the shape this file's rows
+// used before #5132 -- a body constructor whose parameter list equals the
+// primary's -- is now rejected, which is why the accept rows above use a
+// distinct parameter list. Asserts the specific diagnostic, not just failure.
+BEZEL_TEST(base_clause_primary_ctor_both_forms_3731,
+           old_same_param_list_shape_rejected_as_primary_redeclaration_5132) {
+    auto r = runAot(
+        "module M; "
+        "class Base(bp: int) "
+        "  public constructor(v: int) "
+        "    this(v * 100); "
+        "  end constructor; "
+        "end Base; "
+        "class C "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "body constructor redeclares the primary constructor"));
 }
 
 }  // namespace bezel::codegen

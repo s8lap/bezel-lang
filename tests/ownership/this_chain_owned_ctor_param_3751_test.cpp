@@ -163,14 +163,12 @@ const char* kPrimaryOwned =
 // had NO correct form: pre-fix it was rejected outright.
 // FAIL-WITHOUT: compile error "the `owned` call-site marker is only valid on an
 // argument to an `owned` parameter" (measured on a31fb7b).
-// `Main` calls `new Base(x := new Res(i))`, not the positional
-// `new Base(new Res(i))` issue 3751 used: #5099 (834a491e) made the primary
-// (`owned r: Res`) and this convenience constructor (`owned x: Res`) tie at
-// stage 8 on a single positional exact-match argument, exactly as it
-// resolved the same shape in ctor_body_redeclares_primary_4839's
-// `accepts_owned_convenience_ctor_different_name_3751_shape` row. Naming the
-// argument selects the convenience constructor unambiguously per §22.5; the
-// chain-ownership behavior under test is unchanged.
+// The convenience constructor carries a trailing `salt: int` so its parameter
+// list differs from the primary's `(owned r: Res)`: #5132 (§9.3 / §11.3 /
+// §22.6, v0.313) rejects a body constructor with the primary's parameter list
+// (`(owned x: Res)` differs from it only by name), and #5099 had already made
+// that shape a stage-8 tie. `new Base(new Res(i), 0)` selects the convenience
+// constructor by arity; the chain-ownership behavior under test is unchanged.
 // ═══════════════════════════════════════════════════════════════════════════
 // per §22.10 (convenience constructors chain via `this(...)`) / §22.3 (call-site
 // marker) / §28.8 (ownership transfer), issue #3751
@@ -180,7 +178,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         std::string("module M3751a; ") + kRes +
         "class Base(owned r: Res) "
         "  private owned _s: Res := r; "
-        "  public constructor(owned x: Res) "
+        "  public constructor(owned x: Res, salt: int) "
         "    this(owned x); "
         "  end constructor; "
         "  public method Id(): int "
@@ -192,7 +190,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "    var i: int := 0; "
         "    var acc: int := 0; "
         "    while i < 200 do "
-        "      using var b := new Base(x := new Res(i)); "
+        "      using var b := new Base(new Res(i), 0); "
         "      acc := acc + b.Id(); "
         "      i := i + 1; "
         "    end while; "
@@ -220,9 +218,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
 // because `recordMovesIn` marks a `move` operand moved-from without consulting
 // any formal list at all. It was therefore accepted for a PLAIN parameter too;
 // T11 pins that the fix does not lose the correct rejection.
-// Same #5099 primary/body-ctor tie as T1: `Main` calls
-// `new Base(x := new Res(i))` so §22.5 named-argument binding selects the
-// convenience constructor, not the positional call issue 3751 used.
+// Same `salt: int` parameter-list distinction from the primary as T1 (#5132).
 // ═══════════════════════════════════════════════════════════════════════════
 // per §22.3 (the transfer marker `M(move x)`) / §28.8.1, issue #3751
 BEZEL_TEST(this_chain_owned_ctor_param_3751,
@@ -231,7 +227,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         std::string("module M3751b; ") + kRes +
         "class Base(owned r: Res) "
         "  private owned _s: Res := r; "
-        "  public constructor(owned x: Res) "
+        "  public constructor(owned x: Res, salt: int) "
         "    this(move x); "
         "  end constructor; "
         "  public method Id(): int "
@@ -243,7 +239,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "    var i: int := 0; "
         "    var acc: int := 0; "
         "    while i < 200 do "
-        "      using var b := new Base(x := new Res(i)); "
+        "      using var b := new Base(new Res(i), 0); "
         "      acc := acc + b.Id(); "
         "      i := i + 1; "
         "    end while; "

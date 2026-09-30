@@ -70,6 +70,7 @@
 // exactly what an exit-status oracle cannot see.
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT harness
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -299,7 +300,7 @@ BEZEL_TEST(base_chain_convenience_ctor_blind_pairing_3562,
         "  end Next; "
         "end Counter; "
         "class B(n: int, k: int := Counter.Next()) "
-        "  public constructor(w: int, v: int) "
+        "  public constructor(w: string, v: int) "
         "    this(v); "
         "  end constructor; "
         "  public method Show() "
@@ -308,7 +309,7 @@ BEZEL_TEST(base_chain_convenience_ctor_blind_pairing_3562,
         "end B; "
         "class D : B "
         "  public constructor() "
-        "    base(9, 3); "
+        "    base(\"nine\", 3); "
         "  end constructor; "
         "end D; "
         "class C "
@@ -460,4 +461,30 @@ BEZEL_TEST(base_chain_convenience_ctor_blind_pairing_3562,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("4\nconv\n4\n"));
+}
+
+// #5132 pin (spec §9.3 / §11.3 / §22.6, v0.313): the shape this file's rows
+// used before #5132 -- a body constructor whose parameter list equals the
+// primary's -- is now rejected, which is why the accept rows above use a
+// distinct parameter list. Asserts the specific diagnostic, not just failure.
+BEZEL_TEST(base_chain_convenience_ctor_blind_pairing_3562,
+           old_same_param_list_shape_rejected_as_primary_redeclaration_5132) {
+    auto r = runAot(
+        "module M; "
+        "class B(n: int, k: int := 0) "
+        "  public constructor(w: int, v: int) "
+        "    this(v); "
+        "  end constructor; "
+        "end B; "
+        "class D : B "
+        "  public constructor() "
+        "    base(9, 3); "
+        "  end constructor; "
+        "end D; "
+        "class C "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "body constructor redeclares the primary constructor"));
 }
