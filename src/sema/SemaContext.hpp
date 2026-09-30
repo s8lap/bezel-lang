@@ -480,6 +480,31 @@ public:
         auto it = methodRefSelectedOverloads_.find(&e);
         return it == methodRefSelectedOverloads_.end() ? nullptr : it->second;
     }
+    // fix #5208 (§27.6, v0.313): the formation-site record of a method
+    // reference: the referenced overload's own Function TypeRef (`source`)
+    // and the target function type it was checked against (`target`), set by
+    // checkAssignable's fresh-reference-formation arm once the §5.1 slot
+    // checks pass. Codegen's makeMethodThunk reads it to synthesize the §27.6
+    // adapter ("formation bridges a conversion") for a slot whose §5.1
+    // conversion changes representation. A miss means no adapter is known
+    // for that expression (the pre-#5208 behaviour). Keyed like
+    // `methodRefSelectedOverloads_`; carried by every re-parse path.
+    struct MethodRefFormation {
+        const TypeRef* source = nullptr;
+        const TypeRef* target = nullptr;
+    };
+    void setMethodRefFormation(const ast::Expr* e, const TypeRef* source,
+                               const TypeRef* target) {
+        if (e && source && target) methodRefFormations_[e] = {source, target};
+    }
+    const MethodRefFormation* methodRefFormation(const ast::Expr& e) const {
+        auto it = methodRefFormations_.find(&e);
+        return it == methodRefFormations_.end() ? nullptr : &it->second;
+    }
+    const std::unordered_map<const ast::Expr*, MethodRefFormation>&
+    allMethodRefFormations() const {
+        return methodRefFormations_;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -1244,6 +1269,9 @@ private:
     // above.
     std::unordered_map<const ast::Expr*, MethodSymbol*>
         methodRefSelectedOverloads_;
+    // fix #5208 (§27.6, v0.313): see `setMethodRefFormation` above.
+    std::unordered_map<const ast::Expr*, MethodRefFormation>
+        methodRefFormations_;
     // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
     // operator for a STATEMENT operator form (`a += b`, `t++`). See
     // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.

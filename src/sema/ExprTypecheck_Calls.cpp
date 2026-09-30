@@ -14419,6 +14419,38 @@ void ExprTC::checkCallArity(
                                    std::string(ms->name) + "`",
                                    recvTarget, ms->parent, md, /*extBinding=*/nullptr,
                                    explicitSubst);
+        else if (md->genericParams.empty()) {
+            // fix #5208 (§27.6, v0.313): overload resolution validated the
+            // call by applicability, never through checkAssignable, so a
+            // method reference bound to a function-typed parameter of the
+            // chosen overload reached codegen with no formation record — and
+            // with no adapter for a representation-changing §5.1 slot
+            // conversion. Run the formation check for exactly those arguments
+            // against the chosen overload's parameter type.
+            for (std::size_t j = 0;
+                 j < md->params.size() && j < b.paramToArg.size(); ++j) {
+                const int ai = b.paramToArg[j];
+                if (ai < 0 || !md->params[j].type) continue;
+                const ast::CallArgument& a =
+                    ce.args[static_cast<std::size_t>(ai)];
+                if (!a.value || !a.modifier.empty()) continue;
+                if (!dynamic_cast<const ast::IdentifierExpr*>(a.value.get()) &&
+                    !dynamic_cast<const ast::MemberAccessExpr*>(a.value.get()))
+                    continue;
+                if (!dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*a.value)))
+                    continue;
+                TypeRef* pt = ctx_.resolvedType(*md->params[j].type);
+                TypeRef* at = ctx_.exprType(*a.value);
+                if (!pt || !at || pt->kind != TypeRef::Kind::Function ||
+                    at->kind != TypeRef::Kind::Function)
+                    continue;
+                checkAssignable(at, pt, a.value->span.begin,
+                                std::string("argument `") +
+                                    std::string(md->params[j].name) + "` to "
+                                    "call to `" + std::string(ms->name) + "`",
+                                a.value.get());
+            }
+        }
         return;
     }
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,

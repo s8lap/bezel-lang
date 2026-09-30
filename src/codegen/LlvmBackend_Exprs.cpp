@@ -7252,8 +7252,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // there is no static interface type to instantiate from; the #2766
             // substitution simply does not apply and the erased signature is
             // used, exactly as before.
-            if (isStaticMethod(emitMs)) return makeMethodThunk(emitMs, nullptr);
-            else if (currentThis_) return makeMethodThunk(emitMs, currentThis_);
+            if (isStaticMethod(emitMs)) return makeMethodThunk(emitMs, nullptr, nullptr, &e);
+            else if (currentThis_) return makeMethodThunk(emitMs, currentThis_, nullptr, &e);
         }
     }
     // CG60: `Class.StaticMethod` or `obj.InstanceMethod` used as a
@@ -7369,7 +7369,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             const sema::TypeRef* recvTy =
                 (!isStaticMethod(emitMs) && ma->target) ? ctx_.exprType(*ma->target)
                                                     : nullptr;
-            return makeMethodThunk(emitMs, recv, recvTy);
+            return makeMethodThunk(emitMs, recv, recvTy, &e);
         }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics

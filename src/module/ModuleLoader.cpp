@@ -2893,6 +2893,8 @@ static bool parseAndAttachCtorBody(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // fix #2839 (§14/#662c / §27.3 Lambda expressions, v0.240): carry the
     // body's per-lambda parameter lists too — the fourth AST-keyed side table,
     // and the only one no remap loop copied. codegen's lowerLambda reads
@@ -3156,6 +3158,8 @@ static bool parseAndAttachDtorBody(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // fix #2855 (§27.3 Lambda expressions, v0.240): and the per-lambda
     // parameter lists, the copy #2839 added to the method and ctor paths and
     // #2856 to the field-initializer path. codegen's lowerLambda reads
@@ -3522,6 +3526,8 @@ static bool parseAndAttachBaseCtorArgs(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // Lambda-parameter lists (carried verbatim so `lowerLambda` finds them
     // when the base-clause expression closes over a sibling lambda — rare
     // but covered for symmetry with the ctor/dtor/method paths, #2839).
@@ -4531,6 +4537,8 @@ static bool parseAndAttachMethodBody(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // fix #2839 (§14.1/#783 / §27.3 Lambda expressions, v0.240): lambdaParams_
     // is the FOURTH side table this reconstruction has to carry, and it was the
     // only one nothing copied. codegen's lowerLambda reads
@@ -4851,6 +4859,8 @@ static bool parseAndAttachPropertyBody(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // Copy the pattern-symbols side table (#2857 precedent).
     for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
         if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
@@ -5126,6 +5136,8 @@ static bool parseAndAttachExtensionPropertyBody(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
 
     // (7) Attach the freshly-parsed PropertyDecl to the imported
     //     PropertySymbol. Keep the source + AST alive (string_view fields
@@ -5659,6 +5671,8 @@ static bool parseAndAttachFieldInit(
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     // fix #2856 (§22.8 Field initializers / §27.3 Lambda expressions, v0.240):
     // carry the initializer's per-lambda parameter lists too — the same table
     // and the same one-line copy #2839 added to the method and ctor paths, and
@@ -6016,6 +6030,8 @@ static bool parseAndAttachInvariants(const MetaTypeDecl& td,
         if (expr && ref) mainCtx.setExprType(expr, ref);
     for (const auto& [mrExpr, mrMs] : freshCtx.allMethodRefSelectedOverloads())
         if (mrExpr && mrMs) mainCtx.setMethodRefSelectedOverload(mrExpr, mrMs);
+    for (const auto& [mfExpr, mf] : freshCtx.allMethodRefFormations())
+        mainCtx.setMethodRefFormation(mfExpr, mf.source, mf.target);  // #5208
     for (const auto& [lam, syms] : freshCtx.allLambdaParams())
         if (lam) mainCtx.setLambdaParams(lam, syms);
     for (const auto& [pat, sym] : freshCtx.allPatternSymbols())

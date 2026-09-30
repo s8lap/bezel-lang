@@ -5305,9 +5305,91 @@ bool Emitter::forVarCapturedInBody(const ast::ForStmt& fs) {
 }
 
 
+// fix #5208 (§27.6 / §5.1, v0.313): classify one slot of a method-reference
+// formation. §27.6: formation "may bridge representation-changing conversions
+// by synthesizing an adapter at the reference site". A pair that lowers to the
+// same LLVM type (identity, reference upcasts, char<->int, ...) is
+// representation-preserving and needs none (§5.1 "Reference conversions").
+Emitter::MrSlotAdapt Emitter::classifyMethodRefSlot(const sema::TypeRef* from,
+                                                    const sema::TypeRef* to) {
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (!from || !to) return MrSlotAdapt::None;
+    if (isBareTypeParamRef(from) || isBareTypeParamRef(to))
+        return MrSlotAdapt::None;
+    llvm::Type* fl = lowerTypeRef(from);
+    llvm::Type* tl = lowerTypeRef(to);
+    if (!fl || !tl || fl == tl || fl->isVoidTy() || tl->isVoidTy())
+        return MrSlotAdapt::None;
+    auto valuePrim = [](const sema::TypeRef* t) {
+        return t->kind == K::Primitive && t->primitive != P::String &&
+               t->primitive != P::Object;
+    };
+    auto concrete = [](const sema::TypeRef* t) {
+        return t->kind == K::Primitive ||
+               (t->kind == K::Named && t->declaration);
+    };
+    auto valueNamed = [](const sema::TypeRef* t) {
+        return t->kind == K::Named && t->declaration &&
+               (t->declaration->kind == ast::TypeDeclKind::Record ||
+                t->declaration->kind == ast::TypeDeclKind::Enum);
+    };
+    if (valuePrim(from) && valuePrim(to)) {
+        if (!from->nullable && !to->nullable) return MrSlotAdapt::Numeric;
+        if (!from->nullable && to->nullable) return MrSlotAdapt::Wrap;
+        if (from->nullable && to->nullable) return MrSlotAdapt::Lift;
+        return MrSlotAdapt::Unsupported;
+    }
+    if (isObjectOrInterfaceTarget(to) && (valuePrim(from) || valueNamed(from)))
+        return MrSlotAdapt::Box;
+    if (valueNamed(from) && !from->nullable && valueNamed(to) && to->nullable &&
+        from->declaration == to->declaration)
+        return MrSlotAdapt::Wrap;
+    if (concrete(from) && concrete(to)) return MrSlotAdapt::Unsupported;
+    return MrSlotAdapt::None;
+}
+
+llvm::Value* Emitter::applyMethodRefSlotAdapt(MrSlotAdapt k, llvm::Value* v,
+                                              const sema::TypeRef* from,
+                                              const sema::TypeRef* to) {
+    using K = sema::TypeRef::Kind;
+    const bool uns = from->kind == K::Primitive && isUnsignedPrim(from->primitive);
+    llvm::Type* tl = lowerTypeRef(to);
+    switch (k) {
+        case MrSlotAdapt::None:
+        case MrSlotAdapt::Unsupported:
+            return v;
+        case MrSlotAdapt::Numeric:
+            return coerceNumericToType(v, tl, uns);
+        case MrSlotAdapt::Wrap: {
+            llvm::Value* payload = v;
+            if (from->kind == K::Primitive) {
+                auto* st = llvm::dyn_cast<llvm::StructType>(tl);
+                if (st && st->getNumElements() == 2)
+                    payload = coerceNumericToType(v, st->getElementType(1), uns);
+            }
+            return coerceReturnToNullableValue(payload, to, uns);
+        }
+        case MrSlotAdapt::Lift: {
+            auto* st = llvm::dyn_cast<llvm::StructType>(tl);
+            if (!st || st->getNumElements() != 2) return v;
+            llvm::Value* has = builder_.CreateExtractValue(v, 0);
+            llvm::Value* pay = builder_.CreateExtractValue(v, 1);
+            pay = coerceNumericToType(pay, st->getElementType(1), uns);
+            llvm::Value* r = llvm::Constant::getNullValue(tl);
+            r = builder_.CreateInsertValue(r, has, 0);
+            return builder_.CreateInsertValue(r, pay, 1);
+        }
+        case MrSlotAdapt::Box:
+            return boxValue(v, from);
+    }
+    return v;
+}
+
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                              llvm::Value* receiverVal,
-                             const sema::TypeRef* recvStaticTy) {
+                             const sema::TypeRef* recvStaticTy,
+                             const ast::Expr* refExpr) {
     llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
     if (it != methodFns_.end()) origFn = it->second;
@@ -5468,6 +5550,85 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // paths so the kind tag is consistent across every reference to this method.
     FnValKind kind = closureKindForMethod(ms, extRef);
 
+    // fix #5208 (§27.6, v0.313): the formation-site adapter plan. Sema recorded
+    // the callee's own function type and the target it was checked against;
+    // each slot whose §5.1 conversion changes representation is bridged in the
+    // thunk (parameters: target type -> callee type; return: callee -> target).
+    // `thunkSig` is the thunk's user-visible signature (the callee's own `methTy`
+    // when nothing is bridged) and is part of the cache key, so a bridged
+    // reference never shares a thunk with an unbridged one.
+    struct MrSlotPlan {
+        MrSlotAdapt kind = MrSlotAdapt::None;
+        const sema::TypeRef* from = nullptr;
+        const sema::TypeRef* to = nullptr;
+    };
+    std::vector<MrSlotPlan> mrParamPlan;
+    MrSlotPlan mrRetPlan;
+    llvm::FunctionType* thunkSig = methTy;
+    if (refExpr && !extRef) {
+        if (const auto* mf = ctx_.methodRefFormation(*refExpr)) {
+            const sema::TypeRef* src = mf->source;
+            const sema::TypeRef* tgt = mf->target;
+            const std::size_t thisSlots = instMethod ? 1 : 0;
+            if (src && tgt && src->kind == sema::TypeRef::Kind::Function &&
+                tgt->kind == sema::TypeRef::Kind::Function &&
+                src->funcParams.size() == tgt->funcParams.size() &&
+                src->funcParams.size() + thisSlots == methTy->getNumParams()) {
+                bool any = false, bad = false;
+                std::vector<llvm::Type*> sigParams(methTy->param_begin(),
+                                                   methTy->param_end());
+                mrParamPlan.resize(src->funcParams.size());
+                for (std::size_t i = 0; i < src->funcParams.size(); ++i) {
+                    if (!src->funcParams[i].modifier.empty() ||
+                        !tgt->funcParams[i].modifier.empty()) continue;
+                    // Trust the recorded callee type only where it agrees with
+                    // the ABI the callee was actually emitted at.
+                    if (lowerTypeRef(src->funcParams[i].type) !=
+                        methTy->getParamType(i + thisSlots)) continue;
+                    MrSlotPlan sp;
+                    sp.from = tgt->funcParams[i].type;
+                    sp.to = src->funcParams[i].type;
+                    sp.kind = classifyMethodRefSlot(sp.from, sp.to);
+                    if (sp.kind == MrSlotAdapt::None) continue;
+                    if (sp.kind == MrSlotAdapt::Unsupported) { bad = true; break; }
+                    mrParamPlan[i] = sp;
+                    sigParams[i + thisSlots] = lowerTypeRef(sp.from);
+                    any = true;
+                }
+                llvm::Type* sigRet = methTy->getReturnType();
+                if (!bad && src->funcReturn && tgt->funcReturn &&
+                    lowerTypeRef(src->funcReturn) == methTy->getReturnType()) {
+                    mrRetPlan.from = src->funcReturn;
+                    mrRetPlan.to = tgt->funcReturn;
+                    mrRetPlan.kind =
+                        classifyMethodRefSlot(mrRetPlan.from, mrRetPlan.to);
+                    if (mrRetPlan.kind == MrSlotAdapt::Box ||
+                        mrRetPlan.kind == MrSlotAdapt::Unsupported) {
+                        bad = true;
+                    } else if (mrRetPlan.kind != MrSlotAdapt::None) {
+                        sigRet = lowerTypeRef(mrRetPlan.to);
+                        any = true;
+                    }
+                }
+                if (bad) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, refExpr->span.begin,
+                        "the method reference `" + std::string(ms->name) +
+                        "` needs a conversion between its parameter/return "
+                        "types and the target function type that this "
+                        "compiler cannot yet bridge with a formation-site "
+                        "adapter (\xC2\xA7""27.6 v0.313, \xC2\xA7""5.1; "
+                        "fix #5208): it would pass a value of the wrong "
+                        "representation; write a lambda that converts "
+                        "explicitly");
+                    return nullptr;
+                }
+                if (any)
+                    thunkSig = llvm::FunctionType::get(sigRet, sigParams, false);
+            }
+        }
+    }
+
     // #1170 / §24: reuse a cached thunk for this method so a named method
     // reference resolves to a STABLE fn pointer (the cell's fn at offset 0).
     // This lets `event -= OnTick` match the `event += OnTick` handler by value
@@ -5478,7 +5639,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // fix #2766: the LLVM signature is part of the key — see methodThunks_'s
     // declaration. Same method + same instantiated signature still yields ONE
     // thunk, so #1170's `+=`/`-=` identity is unaffected.
-    if (auto cit = methodThunks_.find({ms, extRef, methTy});
+    if (auto cit = methodThunks_.find({ms, extRef, thunkSig});
         cit != methodThunks_.end())
         return buildMethodClosureCell(cit->second, instMethod, receiverVal, kind);
 
@@ -5506,10 +5667,11 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
         // (it comes from env instead).
         for (std::size_t i = (instMethod ? 1 : 0);
              i < methTy->getNumParams(); ++i)
-            thunkParamTys.push_back(methTy->getParamType(i));
+            thunkParamTys.push_back(thunkSig->getParamType(i));
     }
     llvm::Type* retTy = methTy->getReturnType();
-    auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
+    auto* thunkFnTy = llvm::FunctionType::get(thunkSig->getReturnType(),
+                                              thunkParamTys, false);
 
     // Create thunk function.
     static std::atomic<unsigned> thunkCtr{0};
@@ -5615,8 +5777,28 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
             callArgs.push_back(loadedThis);
         }
     }
-    for (; argIt != thunk->args().end(); ++argIt)
-        callArgs.push_back(&*argIt);
+    // fix #5208 (§27.6): bridge each parameter from the target's type to the
+    // callee's. A box minted for an Object/interface parameter is a §28.3
+    // unbound owned temporary; release it after the call exactly when the
+    // callee provably does not retain the parameter (the same rule as an
+    // ordinary call's argument, #2952) — otherwise leave it (never a double
+    // free).
+    std::vector<llvm::Value*> mrBoxesToRelease;
+    for (std::size_t ui = 0; argIt != thunk->args().end(); ++argIt, ++ui) {
+        llvm::Value* av = &*argIt;
+        if (ui < mrParamPlan.size() &&
+            mrParamPlan[ui].kind != MrSlotAdapt::None) {
+            const MrSlotPlan& sp = mrParamPlan[ui];
+            av = applyMethodRefSlotAdapt(sp.kind, av, sp.from, sp.to);
+            if (sp.kind == MrSlotAdapt::Box && av && !dynamicDispatch) {
+                if (const auto* callee =
+                        dynamic_cast<const ast::Member*>(ms->decl))
+                    if (isCalleeParamNonEscaping(callee, ui))
+                        mrBoxesToRelease.push_back(av);
+            }
+        }
+        callArgs.push_back(av);
+    }
 
     // §27.6 (#738): dispatch through the receiver's vtable/itable for a virtual
     // or interface method (mirrors emitMethodCall's dynamic path); otherwise call
@@ -5848,8 +6030,14 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
         phi->addIncoming(result, objDispEnd);
         result = phi;
     }
+    for (llvm::Value* b : mrBoxesToRelease) emitBoxRelease(b);  // #5208
     if (retTy->isVoidTy()) builder_.CreateRetVoid();
-    else builder_.CreateRet(result);
+    else {
+        if (mrRetPlan.kind != MrSlotAdapt::None)  // fix #5208 (§27.6)
+            result = applyMethodRefSlotAdapt(mrRetPlan.kind, result,
+                                             mrRetPlan.from, mrRetPlan.to);
+        builder_.CreateRet(result);
+    }
 
     // Restore emitter state.
     currentFn_ = savedFn;
@@ -5867,7 +6055,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
 
     // #1170 / §24: cache the thunk so subsequent references to this method
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
-    methodThunks_[{ms, extRef, methTy}] = thunk;
+    methodThunks_[{ms, extRef, thunkSig}] = thunk;
 
     return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
 }

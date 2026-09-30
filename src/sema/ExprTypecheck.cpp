@@ -5736,6 +5736,12 @@ void ExprTC::checkAssignable(
                 reportNotConvertible();
                 return;
             }
+            // fix #5208 (§27.6, v0.313): formation bridges any §5.1 conversion
+            // with an adapter synthesized at the reference site. Record the
+            // chosen overload's own function type and the target it was
+            // checked against so codegen's thunk can perform each slot's
+            // conversion (LlvmBackend_Layout.cpp makeMethodThunk).
+            ctx_.setMethodRefFormation(fromExpr, selFrom, to);
         }
         // §27.6 / fix #1820 (v0.223 ruling delta (5); carried in v0.282): a
         // method reference over a STATIC callee whose declared return type

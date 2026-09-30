@@ -18984,9 +18984,27 @@ private:
     // declared type is a bare type parameter — methodFnType(ms) lowers those
     // unbound `T`s to a placeholder `i32`, an ABI that is wrong for every
     // reference-typed instantiation and truncates the argument to 32 bits.
+    // fix #5208 (§27.6, v0.313): `refExpr` is the method-reference expression
+    // being formed. Sema recorded its target function type there
+    // (`ctx_.methodRefFormation`); a slot whose §5.1 conversion changes
+    // representation (numeric widening, nullable wrapping, boxing) is bridged
+    // by the thunk itself — the compiler-synthesized adapter of §27.6. Null
+    // (or no recorded formation) forms the thunk at the callee's own ABI.
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
                                  llvm::Value* receiverVal,
-                                 const sema::TypeRef* recvStaticTy = nullptr);
+                                 const sema::TypeRef* recvStaticTy = nullptr,
+                                 const ast::Expr* refExpr = nullptr);
+
+    // fix #5208 (§27.6 / §5.1, v0.313): how one function-type slot of a
+    // method-reference formation is bridged. `from` is the type the value
+    // arrives as, `to` the type the other side expects (parameter slots:
+    // target -> callee; return slot: callee -> target).
+    enum class MrSlotAdapt { None, Numeric, Wrap, Lift, Box, Unsupported };
+    MrSlotAdapt classifyMethodRefSlot(const sema::TypeRef* from,
+                                      const sema::TypeRef* to);
+    llvm::Value* applyMethodRefSlotAdapt(MrSlotAdapt k, llvm::Value* v,
+                                         const sema::TypeRef* from,
+                                         const sema::TypeRef* to);
 
     // §27.6 (v0.184, #1758): produce a closure { thunk, null-env } for a bare
     // reference to a primitive-intrinsic static method (`int.Parse`,

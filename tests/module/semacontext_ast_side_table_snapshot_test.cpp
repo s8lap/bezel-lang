@@ -363,6 +363,15 @@ const Entry kAstKeyedTables[] = {
      "wrong-code shape #5019 fixes, just relocated to a cross-module "
      "generic-body reparse. `MethodSymbol*` values need no remap (stable "
      "declaration-level symbols, not per-instantiation Locals)."},
+    {"methodRefFormations_",
+     "CARRIED verbatim by all re-parse paths (fix #5208, §27.6 v0.313), "
+     "beside `methodRefSelectedOverloads_`: a method reference formed inside "
+     "a re-parsed generic body records its source/target Function TypeRefs "
+     "in `freshCtx`; codegen's makeMethodThunk reads "
+     "`ctx_.methodRefFormation` from `mainCtx` to synthesize the §27.6 "
+     "conversion adapter, so an uncarried entry would silently drop the "
+     "adapter (the #5208 wrong-representation shape). TypeRef values live in "
+     "the fresh context kept alive with the re-parsed AST."},
 };
 
 // Every member name declared as an AST-keyed `std::unordered_map`, in
