@@ -84,9 +84,12 @@ bool hasError(const std::string& program, const char* keyword) {
 const char* kNoMember = "on built-in type `";
 
 // Position A — the filed repro: a LOCAL DECLARATION demands a value.
+// Position A — the filed repro: a LOCAL DECLARATION demands a value.
+// §2.3 / #5034: Stopwatch now requires `import System.Diagnostics;` — adding it
+// so the test reaches the member-lookup diagnostic rather than the §2.3 gate.
 std::string bogusInLocalDecl(const char* ctor) {
     return std::string(
-        "module M; import System.Threading; "
+        "module M; import System.Diagnostics; import System.Threading; "
         "class C public static method Main(): int "
         "  using var x := ") + ctor + "; "
         "  var v := x.TotallyBogusMember(1, 2); "
@@ -109,7 +112,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // `Random.NextInt(1, 3)` — the exact spelling that surfaced #2935. stdlib
     // §2.7's real API is `Next(minValue, maxValue)`; `NextInt` does not exist.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var r := new Random(); "
         "  var v := r.NextInt(1, 3); "
@@ -168,7 +171,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // callable has no return type — `return` may not carry a value" — so a
     // `return expr;` reaching codegen is in a callable that has a return type.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public static method Get(r: Random): int "
         "    return r.TotallyBogusMember(1, 2); "
@@ -235,7 +238,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // construction (this HAS a sema type; that has none), pinned so the
     // merge order can never quietly start mattering.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  var u: () := (); "
         "  var o: Object := (); "
@@ -255,7 +258,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // stdlib §2.7's actual surface. The oracle is the VALUE, not exit 0: the
     // result must land inside the requested range on every draw.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var r := new Random(); "
         "  var bad := 0; "
@@ -275,7 +278,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
            real_stringbuilder_api_still_works_stdlib_3_1) {
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var sb := new StringBuilder(); "
         "  sb.Append(\"ab\"); "
@@ -356,7 +359,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // Oracle: the disposal count (§4.5 — the view disposes every element
     // exactly once), not exit 0.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
@@ -386,7 +389,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // keep compiling — the receiver is a Primitive TypeRef, not a registry
     // built-in, so the gate cannot see it.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public method M(o: Object): int var s := o.Anything(); return 0; "
         "  end M; "
@@ -404,7 +407,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // resolve normally — this must compile and return the real value, not be
     // swept up by a name test.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Random public method Roll(): int return 4; end Roll; end Random; "
         "class C public static method Main(): int "
         "  using var r := new Random(); "
@@ -444,7 +447,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
            bogus_member_on_bare_expr_getter_receiver_rejected_issue_4193) {
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public property Sw: Stopwatch get => Stopwatch.StartNew(); end; "
         "  public method Test(): int "
@@ -471,7 +474,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // from the expression-bodied getter above, so this is not just the same
     // code path exercised twice.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public property Sw: Stopwatch "
         "    get => do "
@@ -512,7 +515,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // Error the two REJECTED tests above assert), not merely return a
     // different exit code.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public property Sw: Stopwatch get => Stopwatch.StartNew(); end; "
         "  public method Test(): int "
@@ -537,7 +540,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // See the expression-getter sibling above for the single-access oracle
     // rationale — identical here, through the block-form getter instead.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public property Sw: Stopwatch "
         "    get => do "
@@ -568,7 +571,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // `IdentifierExpr` to key `postGetterFootprint_` on. Pinned here so a
     // FUTURE fix to issue 4200 has a control proving it changed something.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  new Stopwatch().TotallyBogusNewChainedMember4193(); "
         "  return 0; "

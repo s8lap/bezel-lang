@@ -151,7 +151,7 @@ std::string builtinHead(const std::string& kw, const std::string& extra,
                         const std::string& pre, const std::string& bind,
                         const std::string& use) {
     return
-        "module M; " + extra +
+        "module M; import System.Diagnostics; " + extra +
         "class C "
         "  public static async method Inner(): Task<int> "
         "    return 1; "

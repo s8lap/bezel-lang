@@ -71,7 +71,7 @@ namespace {
 // built-in, accumulating into `acc`; `expected` is the exact total, so a "fix"
 // that stopped the loop doing its work would not pass either.
 std::string loopProg(const std::string& body, int expected) {
-    return "module M; class C "
+    return "module M; import System.Diagnostics; class C "
            "  public static method Main(): int "
            "    var acc: int := 0; "
            "    var i: int := 0; "

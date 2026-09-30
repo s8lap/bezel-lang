@@ -71,7 +71,7 @@ int runChecked(const std::string& prog) {
 //    entry, so a {i8, i32} lowering truncates the bz_dict_t*. §7.1.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, sorted_set_nullable_annotation_7_1) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var s := new SortedSet<int>(); "
         "  var o: SortedSet<int>? := s; "
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, sorted_set_nullable_annot
 //    absence from the hand-list was the original #1406 defect. §7.1.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, sorted_dictionary_nullable_annotation_7_1) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var d := new SortedDictionary<int, int>(); "
         "  var o: SortedDictionary<int, int>? := d; "
@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, sorted_dictionary_nullabl
 //    the `?` annotation instead of being crushed into an i32 payload. §7.1.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, array_span_nullable_annotation_7_1) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); "
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, array_span_nullable_annot
 //    disturb the nullable-VALUE path that runs before the #568 branch.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, guid_nullable_annotation_7_2) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  var g: Guid? := null; "
         "  if g <> null then return 1; end; "
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, guid_nullable_annotation_
 //    kHeapPointerReferenceBuiltins turns this case into a compile failure.)
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, inferred_type_arg_binds_heap_builtin_14_2) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
         "  public static method Echo<T>(v: T): T where T: class "
         "    return v; "
@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, inferred_type_arg_binds_h
 //    safe while this stays true. §7.10 / §14.1.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, bare_type_param_still_a_parameter_7_10) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 4; end Res; "
         "class Box<T> "
         "  private _v: T? := null; "
@@ -205,7 +205,7 @@ BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, bare_type_param_still_a_p
 //    set must not be able to hijack it. §7.1.
 BEZEL_TEST(codegen_builtin_typeref_name_registry_2757, user_type_shadowing_builtin_name_7_1) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Stopwatch "
         "  public N: int := 5; "
         "  public constructor() end; "

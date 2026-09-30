@@ -494,9 +494,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §8.1 / issue #646: Stopwatch — heap-allocated timing class.
         // §8.2 / issue #646: Debug — static class for assertions and logging.
         // Both require `import System.Diagnostics` per spec (stdlib §8); the
-        // compiler does not yet enforce this gate, matching the existing pattern
-        // for System.IO types (File/Directory/Path) which also resolve without
-        // import in the current implementation.
+        // gate enforcing that import lives below at the §2.3 admission site,
+        // mirroring #631's System.Serialization pattern. The admission here
+        // makes the type name resolvable to a Named ref with a null
+        // declaration; the import gate fires only when the required import
+        // is absent (and emits a diagnostic so codegen does not silently run).
         n == "Stopwatch" || n == "Debug") return 0;
     // §32.5 / stdlib §10: FFI-boundary types. IntPtr/UIntPtr are
     // compiler-intrinsic value types (pointer-sized integers); CString,
@@ -2811,6 +2813,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         "` is declared in `System.Serialization` and "
                         "requires `import System.Serialization;` "
                         "(\xC2\xA7""2.15, #631)");
+                }
+                // §8 / issue #5034: Stopwatch (§8.1) and Debug (§8.2) live in
+                // System.Diagnostics (stdlib §8) and require an explicit
+                // `import System.Diagnostics;` (spec §2.3, v0.307: "All other
+                // library modules require explicit `import`"). Before this
+                // gate the admission table above let both resolve without
+                // import, which contradicted §2.3 and silently codegen'd
+                // programs with a hidden module dependency. Mirrors the
+                // System.Serialization pattern above (issue #631); sibling
+                // of #3807 (System.IO / System.Threading, not yet enforced).
+                if ((first == "Stopwatch" || first == "Debug") &&
+                    !sourceImports_.count("System.Diagnostics")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("`") + std::string(first) +
+                        "` is declared in `System.Diagnostics` and "
+                        "requires `import System.Diagnostics;` "
+                        "(\xC2\xA7""2.3, #5034)");
                 }
                 ref.kind = TypeRef::Kind::Named;
                 ref.declaration = nullptr;

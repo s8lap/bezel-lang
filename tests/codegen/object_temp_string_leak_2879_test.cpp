@@ -230,7 +230,7 @@ const char* kBoundObjectNoOverRelease =
 // Console.WriteLine. Both must close the leak.
 // ===========================================================================
 const char* kDebugWriteLineProducer =
-    "module M2879G; "
+    "module M2879G; import System.Diagnostics; "
     "public class H2879G "
     "  public S: string := \"h\"; "
     "  public method Fresh(): Object => \"x\" + S; "

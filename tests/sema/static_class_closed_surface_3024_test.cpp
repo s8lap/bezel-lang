@@ -116,7 +116,7 @@ const std::vector<StaticClassCase>& staticCases() {
 
 // Program prefix common to every bogus-member case.
 std::string bogusProgram(const char* name, const char* imports) {
-    return std::string("module M; ") + imports +
+    return std::string("module M; import System.Diagnostics; ") + imports +
            "class C public static method Main(): int\n"
            "  var v := " + name + ".TotallyBogusMember(1, 2);\n"
            "  _ := v;\n"

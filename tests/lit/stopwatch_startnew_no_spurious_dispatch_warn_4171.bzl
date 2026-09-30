@@ -40,6 +40,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class Widget4171
   public constructor() end constructor;
 end Widget4171;

@@ -69,9 +69,12 @@ bool hasError(const std::string& program, const char* keyword) {
     return false;
 }
 
+// §2.3 / #5034: Debug now requires `import System.Diagnostics;` per the §2.3
+// admission gate. Adding it unconditionally here keeps the helper usable for any
+// builtin without needing to know which module each belongs to.
 std::string newLocal(const char* ctor) {
     return std::string(
-        "module M; import System.Threading; "
+        "module M; import System.Diagnostics; import System.Threading; "
         "class C public static method Main(): int "
         "  var x := ") + ctor + "; "
         "  Console.WriteLine(\"constructed\"); "
@@ -230,7 +233,7 @@ BEZEL_TEST(builtin_static_class_new_2974,
     // via `Guid.Empty` / `default(Guid)` — and that is pinned in
     // tests/codegen/builtin_closed_ctor_surface_2994_test.cpp.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  var g := new Guid(); "
         "  Console.WriteLine(g.ToString()); "
@@ -309,7 +312,7 @@ BEZEL_TEST(builtin_static_class_new_2974,
     // explicitly-unmeasured question ("whether a USER-declared `static class`
     // is also instantiable"): it is not.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "public static class Helper "
         "  public static method Ping(): int return 1; end Ping; "
         "end Helper; "
@@ -353,7 +356,7 @@ BEZEL_TEST(builtin_static_class_new_2974,
     // so the gate — which requires a declaration-less registry built-in — must
     // not claim it.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Path "
         "  public readonly property Depth: int := 3; "
         "end Path; "
@@ -371,7 +374,7 @@ BEZEL_TEST(builtin_static_class_new_2974,
     // The eight rejected names are all still usable the way the stdlib declares
     // them — as static-call receivers. Oracle is the VALUE.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  var joined := Path.Combine(\"a\", \"b\"); "
         "  var bits := BitConverter.DoubleToInt64Bits(0.0); "

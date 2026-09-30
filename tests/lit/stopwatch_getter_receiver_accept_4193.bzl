@@ -35,6 +35,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class C
   public property SwExpr: Stopwatch get => Stopwatch.StartNew(); end;
 

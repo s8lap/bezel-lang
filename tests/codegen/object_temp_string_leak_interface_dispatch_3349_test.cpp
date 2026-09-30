@@ -172,7 +172,7 @@ const char* kInterfaceInterpolationProducer =
 // lowered path (mirrors shape G of the #2879 file).
 // ===========================================================================
 const char* kInterfaceDebugWriteLineProducer =
-    "module M3349D; "
+    "module M3349D; import System.Diagnostics; "
     "public interface IFresh3349D "
     "  method Fresh(): Object; "
     "end IFresh3349D; "

@@ -67,7 +67,7 @@ int runChecked(const std::string& prog) {
 //    indexer. Main returns 7 (the head is present). ──────────────────────────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_owning_indexer_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 0; end Res; "
         "class Inner<T> where T: class "
         "  private owned _a: OwningArray<T> := new OwningArray<T>(); "
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_owning_indexer_7_10) {
 //    generic's `T?` whose body contains `return null;` is the whole of it. ────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, minimal_forward_return_null_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 0; end Res; "
         "class Inner<T> where T: class "
         "  public method Head(): T? "
@@ -136,7 +136,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, minimal_forward_return_null_7_
 //    twice (L1<U> → L2<V> → L3<T>). ────────────────────────────────────────────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, three_level_forward_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 0; end Res; "
         "class L3<T> where T: class "
         "  public method Head(): T? return null; end Head; "
@@ -165,7 +165,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, three_level_forward_7_10) {
 //    to `int` must forward exactly as a class-constrained one does. ───────────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_value_type_arg_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Inner<T> "
         "  public method Head(): T? return null; end Head; "
         "end Inner; "
@@ -202,7 +202,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_value_type_arg_7_10) {
 //    still be caught here, by the value rather than by the verifier.
 BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_long_type_arg_width_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Inner<T> "
         "  private _v: T? := null; "
         "  public method Put(v: T) _v := v; end Put; "
@@ -234,7 +234,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_long_type_arg_width_7_
 //    form, and the forward must lower identically. ─────────────────────────────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_interface_constraint_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "interface IFoo method Tag(): int; end IFoo; "
         "class Res: IFoo public method Tag(): int return 5; end Tag; end Res; "
         "class Inner<T> where T: IFoo "
@@ -262,7 +262,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_interface_constraint_7
 //    Here the field is null, so the forwarded result must compare EQUAL to null.
 BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_nullable_field_value_7_10) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 0; end Res; "
         "class Inner<T> where T: class "
         "  private _v: T? := null; "
@@ -288,7 +288,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, forward_nullable_field_value_7
 //    concrete `$spec$<Type>` path, only the unbound-parameter one. ────────────
 BEZEL_TEST(codegen_generic_nullable_forward_2743, single_generic_no_wrapper_14_1) {
     auto r = jit(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Res public n: int := 0; end Res; "
         "class Inner<T> where T: class "
         "  private owned _a: OwningArray<T> := new OwningArray<T>(); "
@@ -324,7 +324,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, single_generic_no_wrapper_14_1
 //    first draft of the fix regressed it to an IR-verify failure.
 BEZEL_TEST(codegen_generic_nullable_forward_2743, type_param_bound_to_heap_builtin_7_10) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Box<T> where T: class "
         "  private _v: T? := null; "
         "  public method Set(v: T) _v := v; end Set; "
@@ -351,7 +351,7 @@ BEZEL_TEST(codegen_generic_nullable_forward_2743, type_param_bound_to_heap_built
 //    §7.1 (Non-nullable and nullable types) / stdlib §8.1. Filed as #2757.
 BEZEL_TEST(codegen_generic_nullable_forward_2743, direct_nullable_heap_builtin_7_1) {
     int e = runChecked(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var s := new Stopwatch(); "
         "  var o: Stopwatch? := s; "

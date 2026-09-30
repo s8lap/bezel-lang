@@ -96,7 +96,7 @@ std::string outOf(const std::string& src) {
 }
 
 std::string prog(const std::string& mainBody, const std::string& prelude = "") {
-    return "module M; " + prelude +
+    return "module M; import System.Diagnostics; " + prelude +
            "class C public static method Main(): int " + mainBody +
            " end Main; end C;";
 }

@@ -133,9 +133,11 @@ std::string factoryProg(const std::string& head, const std::string& ctor) {
 // `Stopwatch.StartNew()`, a built-in static factory — supply the full body
 // of the `Make` method as a single string and let this helper wire up the
 // `using var` use site.
+// §2.3 / #5034: Stopwatch lives in System.Diagnostics; the import is required
+// so the ExprTypecheck gate (§2.3) does not reject the generated program.
 std::string factoryProgBody(const std::string& head,
                             const std::string& body) {
-    return "module M; class C "
+    return "module M; import System.Diagnostics; class C "
            "  public static method Make(): " + head + " " +
            body +
            "  end Make; "

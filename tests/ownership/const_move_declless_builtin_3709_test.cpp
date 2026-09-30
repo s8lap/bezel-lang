@@ -96,8 +96,11 @@ constexpr const char* kConstOwnedProductionMsg =
 
 // `binding` is substituted with either `const y := move v;` or
 // `var y := move v;` / a non-`move` control.
+// §2.3 / #5034: Stopwatch lives in System.Diagnostics; adding the import here
+// unconditionally keeps the helper usable for any builtin without the caller
+// needing to know which module each builtin belongs to.
 std::string builtinProg(const std::string& newExpr, const std::string& binding) {
-    return "module M; class C "
+    return "module M; import System.Diagnostics; class C "
            "  public static method Main(): int "
            "    var v := " +
            newExpr + "; " + binding +

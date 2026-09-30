@@ -219,7 +219,7 @@ BEZEL_TEST(codegen_console_leak_1031, writeline_interpolation_loop_no_unbounded_
 // after the write (Debug output is special-lowered, bypassing the normal call-arg
 // disposal). A string-local borrow must NOT be released (no double-free).
 const char* kDebugWriteLineInterpFresh_1032 =
-    "module M; class C public static method Main(): int "
+    "module M; import System.Diagnostics; class C public static method Main(): int "
     "  var n := 9; Debug.WriteLine($\"d {n}\"); return 0; "
     "end Main; end C;";
 BEZEL_TEST(codegen_console_leak_1032, debug_writeline_interpolation_released) {
@@ -227,7 +227,7 @@ BEZEL_TEST(codegen_console_leak_1032, debug_writeline_interpolation_released) {
 }
 
 const char* kDebugWriteLineStringLocalBorrow_1032 =
-    "module M; class C public static method Main(): int "
+    "module M; import System.Diagnostics; class C public static method Main(): int "
     "  var s := \"msg\"; Debug.WriteLine(s); return 0; "
     "end Main; end C;";
 BEZEL_TEST(codegen_console_leak_1032, debug_writeline_string_local_borrow_not_released) {

@@ -56,7 +56,7 @@ const char* kFactory =
 BEZEL_TEST(codegen_generic_new_stopwatch_2025,
            make_stopwatch_constructs_usable_stopwatch_spec_8_1) {
     std::string src =
-        std::string("module M; ") + kFactory +
+        std::string("module M; import System.Diagnostics; ") + kFactory +
         "class C public static method Main(): int "
         "  using var sw := Factory.Make<Stopwatch>(); "
         "  sw.Start(); "
@@ -75,7 +75,7 @@ BEZEL_TEST(codegen_generic_new_stopwatch_2025,
 BEZEL_TEST(codegen_generic_new_stopwatch_2025,
            make_stopwatch_sibling_direct_new_still_works_spec_8_1) {
     std::string src =
-        std::string("module M; ") +
+        std::string("module M; import System.Diagnostics; ") +
         "class C public static method Main(): int "
         "  using var sw := new Stopwatch(); "
         "  if sw.ElapsedMilliseconds = 0L then return 1; end; "

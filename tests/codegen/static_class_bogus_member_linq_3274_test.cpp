@@ -156,7 +156,7 @@ const std::vector<OtherStaticCase>& otherStaticCases() {
         {"File",        ""},
         {"Directory",   ""},
         {"Path",        ""},
-        {"Debug",       ""},
+        {"Debug",       "import System.Diagnostics; "},
         {"Domain",      "import System.Threading; "},
     };
     return kCases;

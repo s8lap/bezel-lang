@@ -13,6 +13,8 @@
 
 module M4182;
 
+import System.Diagnostics;
+
 class HasSw
   public sw: Stopwatch;
   public constructor() sw := Stopwatch.StartNew(); end constructor;

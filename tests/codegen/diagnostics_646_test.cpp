@@ -41,8 +41,11 @@ int run(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
+// §2.3 / #5034: Stopwatch now requires `import System.Diagnostics;` per the
+// §2.3 admission gate. Adding it unconditionally here keeps the helper usable
+// for any builtin without needing to know which module each belongs to.
 std::string prog(const std::string& mainBody) {
-    return "module M; "
+    return "module M; import System.Diagnostics; "
            "class C public static method Main(): int "
            + mainBody +
            " end Main; end C;";

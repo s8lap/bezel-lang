@@ -326,7 +326,7 @@ BEZEL_TEST(user_class_named_builtin_imported_2997,
     // "simplification" that drops the moduleName guard backwards (rejecting real
     // builtins) is caught.
     int code = buildSingleChecked(
-        "module GenSW; class C public static method Main(): int "
+        "module GenSW; import System.Diagnostics; class C public static method Main(): int "
         "  var i := 0; "
         "  while i < 50 do "
         "    using var s := Stopwatch.StartNew(); "
@@ -346,7 +346,7 @@ BEZEL_TEST(user_class_named_builtin_imported_2997,
     // releases the real builtins alongside the fix.
     auto loop = [](const char* decl) {
         return std::string(
-            "module GenB; class C public static method Main(): int "
+            "module GenB; import System.Diagnostics; class C public static method Main(): int "
             "  var i := 0; while i < 50 do ") + decl +
             " i := i + 1; end; return 0; end Main; end C;";
     };

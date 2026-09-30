@@ -71,6 +71,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class C
   public static method Main(): int
     var acc: int := 0;

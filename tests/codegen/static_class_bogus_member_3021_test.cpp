@@ -180,7 +180,7 @@ const std::vector<StaticCase>& allStaticCases() {
 // two-arg call. Pre-fix: exit 0, `v`=0, only an INTERNAL warning.
 // Post-fix: Error diagnostic with the row's needle.
 std::string valueDemanding2Args(const StaticCase& c) {
-    return std::string("module M; ") + c.imports +
+    return std::string("module M; import System.Diagnostics; ") + c.imports +
         "class C public static method Main(): int "
         "  var v := " + c.name + ".TotallyBogusMember(1, 2); "
         "  _ := v; "
@@ -194,7 +194,7 @@ std::string valueDemanding2Args(const StaticCase& c) {
 // issue's "verified live" line refers to — exit 0, no error, no
 // INTERNAL warning either (statements have no value to degrade).
 std::string statement0Args(const StaticCase& c) {
-    return std::string("module M; ") + c.imports +
+    return std::string("module M; import System.Diagnostics; ") + c.imports +
         "class C public static method Main(): int "
         "  " + c.name + ".TotallyBogusMember(); "
         "  return 0; "
@@ -204,7 +204,7 @@ std::string statement0Args(const StaticCase& c) {
 // Program for the statement form with two args. Pre-fix: same silent
 // degrade as the var-decl form but reached through the discard path.
 std::string statement2Args(const StaticCase& c) {
-    return std::string("module M; ") + c.imports +
+    return std::string("module M; import System.Diagnostics; ") + c.imports +
         "class C public static method Main(): int "
         "  " + c.name + ".TotallyBogusMember(1, 2); "
         "  return 0; "
@@ -388,7 +388,7 @@ BEZEL_TEST(static_class_bogus_member_3021,
 BEZEL_TEST(static_class_bogus_member_3021,
            user_class_named_path_still_compiles) {
     BEZEL_EXPECT_TRUE(ranCleanly(
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Path public "
         "  static method Combine(a: string, b: string): string "
         "    return a; "

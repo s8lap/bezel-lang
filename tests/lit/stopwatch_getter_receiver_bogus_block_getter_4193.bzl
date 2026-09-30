@@ -10,6 +10,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class C
   public property SwBlock: Stopwatch
     get => do

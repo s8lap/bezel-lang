@@ -31,7 +31,7 @@ using bezel::test::runAot;
 BEZEL_TEST(chained_new_shaped_builtin_receiver_undispatchable_member_4200,
            new_stopwatch_legitimate_members_work) {
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  new Stopwatch().Start(); "
         "  new Stopwatch().Stop(); "

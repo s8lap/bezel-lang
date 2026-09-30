@@ -86,7 +86,7 @@ const char* kUnimplemented =
 // and the `.Length` read faulted at address 0x8.
 std::string toStringThenLength(const char* ctor) {
     return std::string(
-        "module M; import System.Threading; "
+        "module M; import System.Threading; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var x := ") + ctor + "; "
         "  var s := x.ToString(); "
@@ -100,7 +100,7 @@ std::string toStringThenLength(const char* ctor) {
 // linear scan with nothing to notice.
 std::string getHashCodeThenPrint(const char* ctor) {
     return std::string(
-        "module M; import System.Threading; "
+        "module M; import System.Threading; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var x := ") + ctor + "; "
         "  var h := x.GetHashCode(); "
@@ -115,7 +115,7 @@ std::string getHashCodeThenPrint(const char* ctor) {
 // and the same wrongly-typed value shipped.
 std::string equalsThenBranch(const char* ctor) {
     return std::string(
-        "module M; import System.Threading; "
+        "module M; import System.Threading; import System.Diagnostics; "
         "class C public static method Main(): int "
         "  using var x := ") + ctor + "; "
         "  var b := x.Equals(x); "

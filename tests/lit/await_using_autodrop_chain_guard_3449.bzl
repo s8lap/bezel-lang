@@ -82,6 +82,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class C
   public static async method Run(): Task<int>
     var acc: int := 0;

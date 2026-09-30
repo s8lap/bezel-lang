@@ -2402,6 +2402,26 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // TypeSymbol (null decl) so member access can proceed; the
             // codegen handles known methods (Write/WriteLine, etc.)
             // as intrinsics.
+            //
+            // §2.3 / #5034 carve-out: Stopwatch (§8.1) and Debug (§8.2) live in
+            // System.Diagnostics (stdlib §8) and require an explicit
+            // `import System.Diagnostics;`. The compiler previously recognised
+            // them here unconditionally (like the auto-imported classes),
+            // which silently codegen'd programs with a hidden module
+            // dependency. Emit a compile error when the required import is
+            // absent — mirrors the System.Serialization gate at
+            // TypeResolution_Names.cpp (#631) and the sibling fix for type
+            // position in the same file (also #5034). System.IO/Threading
+            // (#3807) is still open and not gated here.
+            if ((id->name == "Stopwatch" || id->name == "Debug") &&
+                !sourceImports_.count("System.Diagnostics")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    std::string("`") + std::string(id->name) +
+                    "` is declared in `System.Diagnostics` and "
+                    "requires `import System.Diagnostics;` "
+                    "(\xC2\xA7""2.3, #5034)");
+            }
             auto* ts = builtinClassSym(id->name);
             ctx_.setExprSymbol(&e, ts);
         } else if (currentType_ && !inStaticMember_ &&

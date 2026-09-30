@@ -220,7 +220,7 @@ BEZEL_TEST(user_class_named_builtin_using_disposal_2991,
            genuine_builtins_are_still_released_at_scope_exit_spec_28_3) {
     auto loop = [](const char* decl) {
         return std::string(
-            "module M; class C public static method Main(): int "
+            "module M; import System.Diagnostics; class C public static method Main(): int "
             "  var i := 0; while i < 200 do ") + decl + " i := i + 1; end; "
             "  return 0; end Main; end C;";
     };

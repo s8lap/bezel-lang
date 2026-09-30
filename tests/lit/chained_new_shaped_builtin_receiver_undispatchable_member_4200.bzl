@@ -20,6 +20,8 @@
 
 module M;
 
+import System.Diagnostics;
+
 class C
   public static method Main(): int
     // The issue's own verbatim reproducer — must emit the warning.

@@ -27,11 +27,11 @@ using bezel::test::runAot;
 
 namespace {
 
-// A bare `module M; class C ... end C;` shell — Stopwatch is a compiler
-// intrinsic (stdlib §8.1), so no import is required (matches the existing
-// diagnostics_646 suite's `prog()` helper).
+// `import System.Diagnostics;` is required by the §2.3 admission gate (#5034);
+// the helper injects it so generated programs reach Stopwatch/Debug cleanly.
+// The previous comment predates the gate.
 std::string stopwatchProg(const std::string& mainBody) {
-    return "module M; class C\n  public static method Main(): int\n" +
+    return "module M;\nimport System.Diagnostics;\nclass C\n  public static method Main(): int\n" +
            mainBody + "\n  end Main;\nend C;\n";
 }
 
