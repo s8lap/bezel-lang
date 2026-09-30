@@ -12768,6 +12768,44 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                 }
             }
+            // §22.12 (v0.313, #5204 — the static-METHOD sibling of #5152): a
+            // static method declared on a generic base and named through a
+            // DERIVED type (`D<string>.Bump()`, `class D<T>: B<T>`; or a
+            // bare non-generic `E.Bump()`, `class E: B<int>`) runs at the
+            // substitution the base clause supplies (`B<string>`), so the
+            // `B<T>._c` it touches is the ONE cell of that declaring
+            // instantiation, whatever type name reaches it. The block above
+            // only fires when the receiver's declaration IS `ms->parent`;
+            // for a derived receiver walk the base chain with the shared
+            // computeAncestorGenericSubst (the same vehicle #5152's
+            // staticFieldGlobal uses) and install that substitution.
+            {
+                sema::TypeRef bareRecvSynth;
+                const sema::TypeRef* dTy = nullptr;
+                if (auto* recvId2 = dynamic_cast<const ast::IdentifierExpr*>(
+                        callMa->target.get())) {
+                    dTy = ctx_.exprType(*recvId2);
+                    if (!dTy && recvId2->typeArgs.empty()) {
+                        if (auto* ts = dynamic_cast<sema::TypeSymbol*>(
+                                ctx_.exprSymbol(*recvId2))) {
+                            bareRecvSynth.kind = sema::TypeRef::Kind::Named;
+                            bareRecvSynth.declaration = ts;
+                            dTy = &bareRecvSynth;
+                        }
+                    }
+                }
+                if (dTy && dTy->kind == sema::TypeRef::Kind::Named &&
+                    dTy->declaration && dTy->declaration != ms->parent) {
+                    std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*>
+                        ancSema;
+                    if (computeAncestorGenericSubst(dTy, ms->parent, ancSubst,
+                                                    ancSema)) {
+                        genericSubst_ = std::move(ancSubst);
+                        genericSubstSemaTy_ = std::move(ancSema);
+                    }
+                }
+            }
         }
     }
     // per §14.1/§14.2 (issue #1278): a generic *method* (its own `<T>`
