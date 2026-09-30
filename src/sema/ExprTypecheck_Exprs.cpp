@@ -431,6 +431,22 @@ static bool typeTest5146ReferenceTargetKind(
     return true;
 }
 
+// fix #5146: display name for the diagnostic's REFERENCE TARGET (already
+// confirmed by `typeTest5146ReferenceTargetKind` to be `string`/`Object` or a
+// Named class/interface) — `exprsNamedTypeSimpleName` alone answers empty for
+// `string`/`Object` since those are `TypeRef::Kind::Primitive`, not `Named`,
+// which left the diagnostic's target name and its "Box explicitly" remedy
+// with an empty backtick pair.
+static std::string_view typeTest5146TargetDisplayName(const TypeRef* t) {
+    if (!t) return {};
+    if (t->kind == TypeRef::Kind::Primitive) {
+        if (t->primitive == PrimitiveType::String) return "string";
+        if (t->primitive == PrimitiveType::Object) return "Object";
+        return {};
+    }
+    return exprsNamedTypeSimpleName(t);
+}
+
 // fix #5146: a short kind label for the diagnostic — the exact spelling is
 // not needed to name the remedy, only the value-typed KIND the rule fired on.
 static const char* typeTest5146OperandKindLabel(const TypeRef* d) {
@@ -2987,13 +3003,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         std::string(typeTest5146OperandKindLabel(operandDecl)) +
                         " cannot be tested with `" + std::string(te->op) +
                         "` against the reference target `" +
-                        std::string(exprsNamedTypeSimpleName(target)) +
+                        std::string(typeTest5146TargetDisplayName(target)) +
                         "` — the test could not discriminate at runtime and "
                         "would need an implicit boxing conversion, which a "
                         "type-test operand never performs (§12.7). Box "
                         "explicitly and test the box: `var o: Object := "
                         "<expr>; o " + std::string(te->op) + " " +
-                        std::string(exprsNamedTypeSimpleName(target)) + "`");
+                        std::string(typeTest5146TargetDisplayName(target)) + "`");
                 } else if (operandIsGenericCarrier && te->op == "as" &&
                            typeTest5146ReferenceTargetKind(target,
                                                            genericNames) &&
@@ -3002,7 +3018,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         if (gp.name != operandDecl->headName()) continue;
                         recordAsOperandTypeParamUse(
                             currentMethodDecl_, gp.name,
-                            exprsNamedTypeSimpleName(target), e.span.begin);
+                            typeTest5146TargetDisplayName(target), e.span.begin);
                         break;
                     }
                 }
