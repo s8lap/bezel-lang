@@ -115,8 +115,8 @@ namespace {
 const std::string kLib5126 =
     "module XLib5126; "
     "public class C(x: int) "
-    "  public constructor(y: int) "
-    "    this(y); "
+    "  public constructor(y: int, w: int) "
+    "    this(y + w); "
     "  end constructor; "
     "  public method Show() "
     "    Console.WriteLine(x.ToString()); "
