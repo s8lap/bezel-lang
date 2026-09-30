@@ -137,9 +137,9 @@ const char* kLib3174 =
     "  end constructor; "
     "end ImpureBodyRec; "
     "public record PosShadow(A: int) "
-    "  public constructor(a: int) "
+    "  public constructor(a: long) "
     "    Console.WriteLine(\"shadow ctor ran\"); "
-    "    this.A := a * 2; "
+    "    this.A := 2; "
     "  end constructor; "
     "end PosShadow;";
 
@@ -174,9 +174,9 @@ const char* kLocalDecls3174 =
     "  end constructor; "
     "end ImpureBodyRec; "
     "public record PosShadow(A: int) "
-    "  public constructor(a: int) "
+    "  public constructor(a: long) "
     "    Console.WriteLine(\"shadow ctor ran\"); "
-    "    this.A := a * 2; "
+    "    this.A := 2; "
     "  end constructor; "
     "end PosShadow;";
 
@@ -483,13 +483,17 @@ BEZEL_TEST(xmod_pure_ctor_chain_3174,
 // T6 — REFUTATION PIN (#3174's "Related" section, second half): an IMPORTED
 // POSITIONAL record carrying a shadowing IMPURE constructor of matching arity
 // is REJECTED in a pure body — the false ACCEPT #3174 predicted does not occur.
+// The shadow's parameter list differs from the primary's (`long` vs `int`) so the
+// record is spec-valid under §9.3, v0.308 (a body constructor with the SAME
+// parameter list as the primary is rejected; fix #5132); `Make(x: long)` selects
+// the impure body constructor by §22.6 overload resolution.
 // ===========================================================================
 BEZEL_TEST(xmod_pure_ctor_chain_3174,
            t6_imported_positional_record_impure_shadow_ctor_rejected_22_15) {
     std::string err;
     int rc = runImported3174(
         "public class C3174T6 "
-        "  public static pure method Make(x: int): int "
+        "  public static pure method Make(x: long): int "
         "    var r := new PosShadow(x); "
         "    return r.A; "
         "  end Make; "
@@ -510,7 +514,7 @@ BEZEL_TEST(xmod_pure_ctor_chain_3174,
     int rc = runSingleModule3174(
         sameModuleProgram3174(
             "public class C3174T6b "
-            "  public static pure method Make(x: int): int "
+            "  public static pure method Make(x: long): int "
             "    var r := new PosShadow(x); "
             "    return r.A; "
             "  end Make; "
@@ -520,6 +524,31 @@ BEZEL_TEST(xmod_pure_ctor_chain_3174,
         "t6b", &err);
     BEZEL_EXPECT_EQ(rc, -1);
     BEZEL_EXPECT_TRUE(mentions3174(err, "record construction is not admitted"));
+}
+
+// ===========================================================================
+// T7 — the OLD T6 fixture shape (`record PosShadow(A: int)` beside
+// `constructor(a: int)`) is a §9.3 (v0.308) clash and is REJECTED; pins why
+// t6/t6b's shadow constructor now takes `long`. (fix-forward #5132)
+// ===========================================================================
+BEZEL_TEST(xmod_pure_ctor_chain_3174,
+           t7_positional_record_same_arity_same_types_shadow_ctor_rejected_9_3) {
+    std::string err;
+    int rc = runSingleModule3174(
+        "module PureChainCtl3174T7; "
+        "public record PosShadow(A: int) "
+        "  public constructor(a: int) "
+        "    this.A := a * 2; "
+        "  end constructor; "
+        "end PosShadow; "
+        "public class C3174T7 "
+        "  public static method Main(): int => 0; "
+        "end C3174T7;",
+        "t7", &err);
+    BEZEL_EXPECT_EQ(rc, -1);
+    BEZEL_EXPECT_TRUE(mentions3174(
+        err, "body constructor redeclares the primary constructor"));
+    BEZEL_EXPECT_TRUE(mentions3174(err, "§9.3"));
 }
 
 }  // namespace bezel::module
