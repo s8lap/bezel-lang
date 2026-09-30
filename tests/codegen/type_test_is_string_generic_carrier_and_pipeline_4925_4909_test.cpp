@@ -113,6 +113,9 @@ BEZEL_TEST(codegen_type_test_4925_4909,
 // runtime instance of its own IEnumerable<T> at all" — is a separate
 // emitIsA-walk-bound defect. No row pins it here; that ships with #4909.1.
 
+// §12.7 (v0.313) / narrow #5159: `int` conforms to `IEquatable<int>` (stdlib
+// §9.1) and not to `IEquatable<string>`, so T1<int>(7) is 1 (was 0 while the
+// value-substituted carrier's interface test was silently dropped).
 // §12.7 / §17.4 (#4925 control — bare type-parameter operand AT A NON-STRING
 // monomorphization). A `v: T` carrier at T = int must still fall through to
 // the descriptor walk without crashing: the #4909 / #4925 widening turns
@@ -131,6 +134,56 @@ BEZEL_TEST(codegen_type_test_4925_4909,
         "  end T1; "
         "  public static method Main(): int "
         "    Console.WriteLine(T1<int>(7)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), std::string("1"));
+}
+
+// §12.7 "Value-typed operands" (v0.313), narrow #5159: at T = int, `v is Object`
+// is true, `v is IEquatable<int>` true, `v is IComparable<int>` true,
+// `v is IEquatable<string>` false, and `is not` is the negation.
+BEZEL_TEST(codegen_type_test_4925_4909,
+           value_carrier_is_object_and_interface_static_answer_spec_12_7_5159) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; "
+        "public class C "
+        "  public static method T1<T>(v: T): int "
+        "    var r := 0; "
+        "    if v is Object then r := r + 1; end; "
+        "    if v is IEquatable<int> then r := r + 2; end; "
+        "    if v is IComparable<int> then r := r + 4; end; "
+        "    if v is IEquatable<string> then r := r + 8; end; "
+        "    if v is not IEquatable<string> then r := r + 16; end; "
+        "    return r; "
+        "  end T1; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(T1<int>(7)); "
+        "    Console.WriteLine(T1<bool>(true)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), std::string("23\n17"));
+}
+
+// KNOWN #5159 GAP (pinned as the CURRENT answer, not the spec's): a record
+// value substituted for `v: T` and tested against an interface it implements
+// should be true (§12.7 v0.313, §14.2), but the variance-aware conformance
+// predicate is not reachable from codegen, so it answers false. Flip this row
+// when the gap closes.
+BEZEL_TEST(codegen_type_test_4925_4909,
+           known_gap_5159_record_carrier_is_interface_answers_false) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; "
+        "public interface IShape method Area(): int; end IShape; "
+        "public record Sq(Side: int): IShape "
+        "  public method Area(): int return Side * Side; end Area; "
+        "end Sq; "
+        "public class C "
+        "  public static method T1<T>(v: T): int "
+        "    if v is IShape then return 1; end; "
+        "    return 0; "
+        "  end T1; "
+        "  public static method Main(): int "
+        "    Console.WriteLine(T1<Sq>(new Sq(3))); "
         "    return 0; "
         "  end Main; "
         "end C;"), std::string("0"));

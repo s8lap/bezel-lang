@@ -3350,6 +3350,33 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                                     llvm::ConstantPointerNull::get(ptrTy()))
             : obj;
     }
+    // narrow #5159 (§12.7 "Value-typed operands", v0.313): a CONCRETE
+    // non-nullable VALUE-type operand — reached only through a generic
+    // carrier's value substitution (`v: T` at T = int), since sema rejects the
+    // written form (#5146) — tested by `is` / `is not` against `Object` or an
+    // interface takes, allocating nothing, the answer the boxed value would
+    // give: `Object` is always true for a value; an interface is true iff the
+    // value's type conforms (§14.2). Primitives decide through
+    // primitiveConformsToBuiltinInstanceIface (IEquatable<P> / IComparable<P>).
+    // KNOWN #5159 GAP: a record / enum / choice against an interface answers
+    // `false` here — the variance-aware §14.2 predicate it needs is not
+    // reachable from codegen (sema::argSatisfiesTypeBound is exact-
+    // instantiation only). `as` is untouched (rejected at the instantiation
+    // site by #5146).
+    if ((te.op == "is" || te.op == "is not") && opTyResolved &&
+        concreteValueTypeOperand(opTyResolved) &&
+        !obj->getType()->isPointerTy() && isObjectOrInterfaceTarget(rt)) {
+        bool answer = false;
+        if (rt->kind == sema::TypeRef::Kind::Primitive) {
+            answer = true;  // Object
+        } else if (opTyResolved->kind == sema::TypeRef::Kind::Primitive) {
+            answer = sema::primitiveConformsToBuiltinInstanceIface(
+                         opTyResolved->primitive, rt->headName(),
+                         rt->genericArgs) ==
+                     sema::PrimBuiltinIfaceConformance::Conforms;
+        }
+        return builder_.getInt1(te.op == "is" ? answer : !answer);
+    }
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
     // emitIsA's descriptor walk cannot run on it. Recognize it via
