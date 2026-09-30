@@ -13361,9 +13361,30 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     if (underlying &&
                         underlying->kind ==
                             sema::TypeRef::Kind::Primitive &&
-                        underlying->nullable &&
                         underlying->primitive == scrutTy->primitive) {
-                        return hasVal;  // matching nullable-primitive alias
+                        // fix #5183 (§19.3 / §19.1 / §27.8, v0.311): an alias
+                        // is a pure synonym (§27.8), so the bare-NamedPattern
+                        // arm lowers AS the aliased primitive's type pattern
+                        // over a nullable-value scrutinee. §19.3's refutable
+                        // null test of a present value applies: a `T` (or
+                        // `T?`) pattern over a `T?` scrutinee matches exactly
+                        // when the value is present (hasValue). Pre-#5183 this
+                        // arm additionally required `underlying->nullable`
+                        // to match `scrutTy->nullable`, which rejected a
+                        // non-nullable alias on a nullable scrutinee with the
+                        // #1847 / #4083-arm-2 `not supported by the backend`
+                        // diagnostic — a backstop originally installed to
+                        // prevent an IR-verify crash on the same-shape empty
+                        // alt-list sibling (#4083), NOT a spec verdict (§27.8
+                        // + §19.3 + §19.1 do not allow the rejection). Drop
+                        // the `underlying->nullable` gate; the alias lowers
+                        // as the aliased type's pattern regardless of the
+                        // alias's own nullability. The non-primitive
+                        // (function, InlineArray) fall-through still emits
+                        // the diagnostic for the non-Primitive-kind case,
+                        // preserving the `fn_alias_on_nullable_int_bare_rejected_not_crashed`
+                        // sibling.
+                        return hasVal;
                     }
                     ctx_.diagnostics().report(
                         Severity::Error, np->span.begin,

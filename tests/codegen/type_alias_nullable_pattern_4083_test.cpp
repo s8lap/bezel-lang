@@ -140,15 +140,24 @@ BEZEL_TEST(type_alias_nullable_pattern_4083,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kBackstopMsg));
 }
 
-// §19.3 / §27.8 (v0.294): the SAME non-Named-kind alias shape, over a
-// NON-NULLABLE-primitive scrutinee of a matching primitive type — the
-// alias is `int` (NOT nullable) and the scrutinee is `int` (also NOT
-// nullable). Both backstop paths (`#4076`'s `Named`-only arm returns
-// null → fall through → #1847) must produce the same clean diagnostic;
-// pre-#4083 the isNullableVal branch was never on the path, but this
-// pins the post-#4083 behavior — diagnostic fires, never-match.
+// fix #5183 (§19.3 / §19.1 / §27.8, v0.311): an alias is a pure synonym
+// (§27.8), so the arm `case x of AliasNonNullableInt4083 => 7` over
+// `x: int?` IS the `int` type pattern (§19.3) over an `int?` scrutinee.
+// §19.3's refutable null test of a present value applies; the arm
+// matches when the value is present (42 → 7). Pre-#5183 the isNullableVal
+// branch's bare-NamedPattern alias arm (#4083) gated on
+// `underlying->nullable == scrutTy->nullable`, treating a non-nullable
+// primitive alias as a non-match and falling through to the
+// #1847 / #4083-arm-2 `not supported by the backend` diagnostic — a
+// backstop originally installed to prevent an IR-verify crash, not a
+// spec verdict. §27.8 + §19.3 + §19.1 do not allow the rejection: the
+// alias lowers as the aliased type's pattern (here, `int` over `int?`)
+// and the `int` pattern over a nullable value is the refutable null
+// test of §19.5, matching exactly when the value is present. The
+// `fn_alias_on_nullable_int_bare_rejected_not_crashed` sibling and the
+// nullable-alias-on-nullable rows are unaffected.
 BEZEL_TEST(type_alias_nullable_pattern_4083,
-           non_nullable_prim_alias_on_nullable_scrutinee_rejected_not_crashed) {
+           non_nullable_prim_alias_on_nullable_scrutinee_runs) {
     auto r = runAot(
         "module M; "
         "type AliasNonNullableInt4083 := int; "
@@ -158,14 +167,45 @@ BEZEL_TEST(type_alias_nullable_pattern_4083,
         "    return (case x of AliasNonNullableInt4083 => 7, _ => 0); "
         "  end Main; "
         "end C;");
-    // The alias is `int`, but the scrutinee is `int?`. Their `nullable`
-    // bits differ, so the #4083 alias arm does NOT return hasVal
-    // (§19.5 "matches only non-null values" — the alias describes the
-    // non-nullable primitive, the scrutinee's outer wrapper is null-
-    // tagged). Same-primitive-but-different-nullability is treated by
-    // the diagnostic fall-through (alias exists, underlying kind is
-    // Primitive but nullable=false ≠ scrutTy nullable=true). Pre-fix:
-    // bare `return nullptr` → CRASH. Post-fix: clean §19.3 diagnostic.
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kBackstopMsg));
+    BEZEL_EXPECT_EQ(r.diagnostics.hasErrors(), false);  // per §27.8 + §19.3, accepted
+    BEZEL_EXPECT_EQ(r.exitCode, 7);                     // §19.3 refutable null test matches
+}
+
+// fix #5183 (§19.3 / §19.1 / §27.8, v0.311): the sibling — the same
+// alias pattern over an UN-NARROWED `int?` parameter. Per §19.1 the
+// scrutinee is read after §7.4 narrowing; with no narrowing at the
+// `case`, it is `int?` and the arm IS the refutable null test of
+// §19.5 (matches only non-null values). `F(null)` does NOT match
+// (alias arm rejected, wildcard fires → 0); `F(42)` matches (alias
+// arm fires → 7). Pins both the present and absent legs of §19.5
+// together with the #5183 flip.
+BEZEL_TEST(type_alias_nullable_pattern_4083,
+           non_nullable_prim_alias_on_nullable_scrutinee_parameter_unnarrowed) {
+    auto rNull = runAot(
+        "module M; "
+        "type AliasNonNullableInt5183 := int; "
+        "class C "
+        "  public static method F(x: int?): int "
+        "    return (case x of AliasNonNullableInt5183 => 7, _ => 0); "
+        "  end F; "
+        "  public static method Main(): int "
+        "    return C.F(null); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(rNull.diagnostics.hasErrors(), false);
+    BEZEL_EXPECT_EQ(rNull.exitCode, 0);  // §19.5: alias arm does NOT match null
+
+    auto rPresent = runAot(
+        "module M; "
+        "type AliasNonNullableInt5183 := int; "
+        "class C "
+        "  public static method F(x: int?): int "
+        "    return (case x of AliasNonNullableInt5183 => 7, _ => 0); "
+        "  end F; "
+        "  public static method Main(): int "
+        "    return C.F(42); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(rPresent.diagnostics.hasErrors(), false);
+    BEZEL_EXPECT_EQ(rPresent.exitCode, 7);  // §19.5: alias arm matches present value
 }
