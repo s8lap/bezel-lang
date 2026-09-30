@@ -1261,6 +1261,9 @@ struct Loader {
                 // null for an imported PropertySymbol, so the walk would
                 // have answered "no").
                 p->accessorIsPure = mm.accessorIsPure;
+                // fix #5209 (§23.3, v0.313): `set(owned)` wire bit — see
+                // PropertySymbol::setterTakesOwned.
+                p->setterTakesOwned = mm.setterTakesOwned;
                 // fix #3630 narrow (§22.15 v0.286, over-reject follow-up):
                 // carry the existing `MetaMember::isAutoProperty` wire bit
                 // (#2478's 13th scalar) onto the importer-side
@@ -1360,6 +1363,9 @@ struct Loader {
                 // PropertySymbols with `isIndexer = true`, mirror of the
                 // hasSetter/hasGetter/etc. twin above).
                 p->accessorIsPure = mm.accessorIsPure;
+                // fix #5209 (§23.3, v0.313): `set(owned)` wire bit — see
+                // PropertySymbol::setterTakesOwned.
+                p->setterTakesOwned = mm.setterTakesOwned;
                 // fix #3630 narrow: twin of the Property case above — an
                 // indexer's auto-property bit rides `mm.isAutoProperty` too.
                 // (The exporter excludes indexers, so this is always false

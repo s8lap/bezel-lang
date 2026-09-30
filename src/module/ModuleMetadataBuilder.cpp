@@ -1886,6 +1886,15 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                     out.accessorIsPure = true;
                     break;
                 }
+            // fix #5209 (§23.3, v0.313): carry `set(owned)` so the importer's
+            // caller-side unbound-temporary disposal (§28.3) skips a setter
+            // that takes the value over. See MetaMember::setterTakesOwned.
+            out.setterTakesOwned = false;
+            for (const auto& a : pd->accessors)
+                if (a.isSet && a.setterParamMod == "owned") {
+                    out.setterTakesOwned = true;
+                    break;
+                }
             // §14.1 / §23 / §23.1 / §23.3 / §23.4 / §2.5 / §2.8.2 /
             // §2.8.3 rule 4 (fix #2893, v0.240): export the FULL
             // PropertyDecl source text (from the visibility/modifier

@@ -878,6 +878,15 @@ struct PropertySymbol : MemberSymbol {
     // regression measured on xmod_pure_ctor_chain_3174.t5 and
     // xmod_record_sibling_ctor_3219.t1b).
     bool isAutoProperty = false;
+    // fix #5209 (§23.3 "Explicit setter parameter modifier", v0.313): whether
+    // this property's (or indexer's) SETTER is declared `set(owned)`. Set on
+    // BOTH sides — SymbolCollection's PropertyDecl arm from `pd->accessors`
+    // (`isSet && setterParamMod == "owned"`), ModuleLoader's Property/Indexer
+    // cases from `MetaMember::setterTakesOwned`. Codegen consults it (an
+    // imported PropertySymbol has no `decl` to walk) to decide whether a fresh
+    // owned temporary passed as the value is the caller's to dispose (plain
+    // setter: yes, §28.3) or transferred to the setter (`set(owned)`: no).
+    bool setterTakesOwned = false;
 };
 
 struct EventSymbol : MemberSymbol {};

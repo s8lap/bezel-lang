@@ -7069,6 +7069,14 @@ const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) 
 }
 
 
+bool Emitter::propSetterMayTakeOwned(const sema::PropertySymbol* ps) const {
+    // fix #5209 (§23.3, v0.313): the symbol-side bit is set for a local
+    // property from its accessor list and for an imported one from the
+    // `MetaMember::setterTakesOwned` wire scalar. A null symbol is the
+    // conservative "may take owned" (no caller-side dispose).
+    return !ps || ps->setterTakesOwned;
+}
+
 bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
     if (!computedSetterOf(target)) return false;
     llvm::Value* v = nullptr;
@@ -7846,6 +7854,12 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
                 emitBoxRelease(v);
         }
     }
+    // fix #5209 (§23.3 + §28.3, v0.313): mirror #5119 — a fresh owned class
+    // temporary served to a plain (non-`set(owned)`) imported setter is an
+    // unbound owned temporary, disposed at the end of the full expression.
+    if (valueExpr && !propSetterMayTakeOwned(ps) &&
+        isFreshOwnedClassProducer(valueExpr))
+        emitDisposeAndReclaim(v);
     return true;
 }
 

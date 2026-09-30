@@ -8012,6 +8012,12 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
             builder_.SetInsertPoint(doneBB);
         }
     }
+    // fix #5209 (§23.3 + §28.3, v0.313): mirror #5119 — a fresh owned class
+    // temporary served to a plain (non-`set(owned)`) virtual/interface setter
+    // is an unbound owned temporary, disposed at the end of the full expression.
+    if (valueExpr && !propSetterMayTakeOwned(ps) &&
+        isFreshOwnedClassProducer(valueExpr))
+        emitDisposeAndReclaim(v);
     return true;
 }
 

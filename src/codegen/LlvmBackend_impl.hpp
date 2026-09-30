@@ -6618,6 +6618,9 @@ private:
     // store path; a non-property target is not one). Used to run a custom
     // setter on `obj.P := v`.
     const ast::PropertyAccessor* computedSetterOf(const ast::Expr& target);
+    // fix #5209: true when a property's setter is `set(owned)` (local decl or
+    // imported wire bit); a null symbol is conservatively "yes".
+    bool propSetterMayTakeOwned(const sema::PropertySymbol* ps) const;
 
     // §22.9: run a block-form property setter for `obj.P := value`. Binds
     // `value` (anchored on the PropertyDecl in sema) to a slot, sets `this`

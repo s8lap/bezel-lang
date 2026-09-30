@@ -965,6 +965,19 @@ struct MetaMember {
     // pre-#3618 reader's `sc.size() < 18` gate never looks past.
     bool accessorIsPure = false;
 
+    // fix #5209 (§23.3 "Explicit setter parameter modifier", v0.313, additive
+    // within v7 — same shape as accessorIsPure above): for a Property (or
+    // Indexer) member, whether its SETTER is declared `set(owned)`. A 20th
+    // trailing scalar in MEMBER_BLOCK's REC_SCALARS; NO schema bump (a
+    // pre-#5209 reader's `sc.size() < 19` gates never look past index 18; a
+    // #5209 reader given an older blob reads the missing 20th as `false`,
+    // i.e. a plain setter — the classification an old dependency already
+    // exhibits). Needed because an imported PropertySymbol has no AST decl to
+    // walk: the importer's caller-side "dispose a fresh owned temporary passed
+    // to a plain setter" (§28.3 *Unbound owned temporaries*) must not fire for
+    // a `set(owned)` setter, which takes the value over.
+    bool setterTakesOwned = false;
+
     // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
     // and named arguments" / §2.8.3 rule 4; spec v0.254) — the §22.10
     // primary-constructor parameter's DEFAULT-VALUE EXPRESSION TEXT, for a

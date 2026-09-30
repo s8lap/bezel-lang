@@ -334,6 +334,10 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // defaults to `false` for every non-Property/Indexer kind, matching the
     // emission's `0u : 0u` for those kinds — see emitMember's 19th slot).
     hashBool(h, m.accessorIsPure);
+    // fix #5209 (§23.3/§2.8.3 rule 3): `set(owned)` vs plain setter changes
+    // the caller-side disposal an importer emits, so it folds like
+    // accessorIsPure above.
+    hashBool(h, m.setterTakesOwned);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -682,6 +686,8 @@ MetaMember::MetaMember(const MetaMember& o)
       // above; the gtest equality / MetaMember copy ctor path needs it for
       // the symbol-table snapshot tests (ModuleMetadata_test.cpp).
       accessorIsPure(o.accessorIsPure),
+      // fix #5209: same copy role as accessorIsPure.
+      setterTakesOwned(o.setterTakesOwned),
       contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
@@ -715,6 +721,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         // fix #3618 (§22.15 / §2.8.3 rule 3): same shape as posParamBodyRef
         // above.
         accessorIsPure = o.accessorIsPure;
+        setterTakesOwned = o.setterTakesOwned;  // fix #5209
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -777,6 +784,8 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // signature change. See hashMember for why it must compare when
            // it differs.
            accessorIsPure == o.accessorIsPure &&
+           // fix #5209 (§23.3/§2.8.3 rule 3): see hashMember.
+           setterTakesOwned == o.setterTakesOwned &&
            contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
@@ -1098,6 +1107,9 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         // 19th: #3618 (always emitted, ignored for non-Property/Indexer
         // members by the reader's `sc.size() >= 19` branch below).
         m.accessorIsPure ? 1u : 0u,
+        // 20th: #5209 (always emitted, ignored for non-Property/Indexer
+        // members; a pre-#5209 reader never looks past index 18).
+        m.setterTakesOwned ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -2073,6 +2085,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // sema/Symbol.hpp) keys off the PropertySymbol reconstruction alone, so
     // non-property kinds see no behavior change.
     m.accessorIsPure = sc.size() >= 19 && sc[18] != 0;
+    // fix #5209 (§23.3 / §2.8.2): 20th scalar; a pre-#5209 blob (at most 19
+    // scalars) reads `false` — a plain setter, the classification a stale
+    // dependency already exhibits.
+    m.setterTakesOwned = sc.size() >= 20 && sc[19] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

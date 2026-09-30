@@ -279,6 +279,13 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
                 sym->accessorIsPure = true;
                 break;
             }
+        // fix #5209 (§23.3, v0.313): `set(owned)` — see PropertySymbol::
+        // setterTakesOwned.
+        for (const auto& a : pd->accessors)
+            if (a.isSet && a.setterParamMod == "owned") {
+                sym->setterTakesOwned = true;
+                break;
+            }
         // fix #3630 narrow (§22.15 v0.286, over-reject follow-up): LOCAL
         // twin of the ModuleLoader Property case's
         // `p->isAutoProperty = mm.isAutoProperty`. The exporter writes
