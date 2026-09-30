@@ -21,7 +21,9 @@ namespace {
 
 bool hasError(const JitResult& r, const char* sub) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(sub) != std::string::npos) return true;
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(sub) != std::string::npos)
+            return true;
     return false;
 }
 
