@@ -68,10 +68,14 @@ BEZEL_TEST(codegen_1961_char_compound, increment_above_max_throws) {
         throwsOverflow("var c: char := char(0x10FFFF); c++;"), 1);
 }
 
-// §5.2 via `*=`: `c *= 2` at the max code point overshoots the range → Overflow.
+// fix #5150 (§6.6, v0.309): respelled `c *= 2` as `c := char(int(c) * 2)` —
+// the previous test row relied on the spec-violating `c *=` admission and is a
+// behaviour flip: §6.6 (v0.309) says "`c *= 2` and `c /= 2` are compile
+// errors". The explicit `char(int(c) * 2)` form shows the same Overflow
+// at 0x10FFFF * 2 = 0x21FFFE (outside U+10FFFF).
 BEZEL_TEST(codegen_1961_char_compound, times_equals_above_max_throws) {
     BEZEL_EXPECT_EQ(
-        throwsOverflow("var c: char := char(0x10FFFF); c *= 2;"), 1);
+        throwsOverflow("var c: char := char(0x10FFFF); c := char(int(c) * 2);"), 1);
 }
 
 // §5.2 via `-=`: `c -= 1` at U+0000 desugars to `char(-1)`, below the range.

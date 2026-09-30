@@ -101,11 +101,14 @@ BEZEL_TEST(codegen_1996_char_wide_rhs, minus_equals_in_range_long_stores) {
         run("var c: char := char(100); c -= 35L; return int(c);"), 65);
 }
 
-// In-range `*=` with a long RHS: char(5) *= 13L → char(65) = 'A' (the multiply
-// runs at full width but the product is in range).
+// fix #5150 (§6.6, v0.309): respelled `c *= 13L` as `c := char(int(c) * 13L)` —
+// the previous test row relied on the spec-violating `c *=` admission and is a
+// behaviour flip: §6.6 (v0.309) says "`c *= 2` and `c /= 2` are compile errors".
+// The explicit `char(int(c) * 13L)` form is valid Bezel and produces the same
+// result (5 * 13 = 65 = 'A').
 BEZEL_TEST(codegen_1996_char_wide_rhs, times_equals_in_range_long_stores) {
     BEZEL_EXPECT_EQ(
-        run("var c: char := char(5); c *= 13L; return int(c);"), 65);
+        run("var c: char := char(5); c := char(int(c) * 13L); return int(c);"), 65);
 }
 
 // CONTROL — an ordinary small-RHS (int) char compound is unchanged: 'A' += 1 →

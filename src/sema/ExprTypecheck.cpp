@@ -19968,19 +19968,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         (isTrueInt(tTy->primitive) ||
                          tTy->primitive == P::Char) &&
                         isTrueInt(rTy->primitive);
-                    // fix-forward #5054 (§6.6, v0.307): the write-back pair
-                    // §6.6 admits for a `char` TARGET is broader than
-                    // `integerKindPair` above (which is scoped to the
-                    // unrelated #4513 "no conversion either way" wording and
-                    // must not change) — a `char` RHS is admitted too, e.g.
-                    // `n += m` where `n: char` and `m: char?` narrowed
-                    // non-null (§7.4): both operands promote to `int` for
-                    // the write-back's R computation exactly as `int(c) +
-                    // int(c)` would. A char target against any other
-                    // non-integer rhs (`c += 1.5`) still falls through and
-                    // is rejected below — unchanged.
+                    // fix #5150 (§6.6, v0.309): `allowCharWriteBack` must be
+                    // NARROWED to `+=` and `-=` only. §6.6 (v0.309) is explicit:
+                    // "`c += 1` is `c := char(int(c) + 1)`" but "`c *= 2`,
+                    // `c /= 2` and `c mod= n` are compile errors — `char` is
+                    // not an arithmetic type, so a code point is advanced, never
+                    // scaled". The previous code admitted `*=` and `/=` on a
+                    // char target because it used a broad `(isTrueInt(rTy) ||
+                    // rTy == Char)` predicate — the desugaring at those ops would
+                    // be `c := char(int(c) * int(r))` / `c := char(int(c) /
+                    // int(r))`, which scales rather than advances the code point.
+                    // Fix: gate `allowCharWriteBack` to `+` and `-` (the stripped
+                    // binOp values for `+=` and `-=`).
                     const bool allowCharWriteBack =
                         tTy->primitive == P::Char &&
+                        (binOp == "+" || binOp == "-") &&
                         (isTrueInt(rTy->primitive) ||
                          rTy->primitive == P::Char);
                     // gate-fail fix-forward #5054/#3109 (§6.6/§6.1, v0.307):

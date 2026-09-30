@@ -87,10 +87,14 @@ BEZEL_TEST(codegen_1963_char_signed, increment_positive_still_correct) {
     BEZEL_EXPECT_EQ(run("var c: char := 'A'; c++; return int(c);"), 66);
 }
 
-// §6.2 `*=` with a value already in range: `char(3) *= 20` = char(60) = '<'.
-// Signed smul; no spurious overflow.
+// fix #5150 (§6.6, v0.309): respelled `c *= 20` as `c := char(int(c) * 20)` —
+// the previous test row relied on the spec-violating `c *=` admission and
+// is a behaviour flip: §6.6 (v0.309) says "`c *= 2` and `c /= 2` are
+// compile errors — `char` is not an arithmetic type, so a code point is
+// advanced, never scaled". The explicit `char(int(c) * 20)` form is valid
+// Bezel and produces the same result (3 * 20 = 60 = '<').
 BEZEL_TEST(codegen_1963_char_signed, times_equals_in_range_signed) {
-    BEZEL_EXPECT_EQ(run("var c: char := char(3); c *= 20; return int(c);"), 60);
+    BEZEL_EXPECT_EQ(run("var c: char := char(3); c := char(int(c) * 20); return int(c);"), 60);
 }
 
 // §17.6 Array<char> indexer compound with a negative RHS routes through the

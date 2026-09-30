@@ -31,6 +31,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::diagnosticMessageContains;
+using bezel::test::diagnosticMessageCount;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
@@ -188,4 +189,89 @@ BEZEL_TEST(char_arithmetic_rejected_5054,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`char`"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not defined"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "3.5"));
+}
+
+// T9: fix #5150 (§6.6, v0.309) — `c *= 2` and `c /= 2` on a `char`
+// target must be rejected. §6.6 (v0.309) is explicit: "`c += 1` is
+// `c := char(int(c) + 1)`" but "`c *= 2`, `c /= 2` and `c mod= n` are
+// compile errors — `char` is not an arithmetic type, so a code point is
+// advanced, never scaled". The previous implementation admitted `*=` and
+// `/=` because `allowCharWriteBack` used a broad `(isTrueInt(rTy) ||
+// rTy == Char)` predicate; the desugaring would be `c := char(int(c) *
+// int(r))` / `c := char(int(c) / int(r))`, which scales rather than
+// advances the code point and violates the spec. Fix: narrow
+// `allowCharWriteBack` to `+=` and `-=` only.
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           char_times_eq_rejected_spec_6_6) {
+    auto r = runAot(
+        "module M5150_9A; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c: char := 'a'; "
+        "    c *= 2; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`char`"));
+}
+
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           char_div_eq_rejected_spec_6_6) {
+    auto r = runAot(
+        "module M5150_9B; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c: char := 'a'; "
+        "    c /= 2; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`char`"));
+}
+
+// T10: #5150 x #5211 interaction (§6.6, v0.313) — a `char` target under
+// `*=`, `/=` or `mod=` is rejected by the §6.6 "`+=`/`-=` only" rule FIRST,
+// with a single diagnostic, even when the right operand is a non-constant
+// `uint` (which #5211's own arm, "typed as in `int op e`", would also
+// reject for `+=`/`-=`). The #5211 wording must be ABSENT here: the operator,
+// not the operand type, is the reason the compound form is inadmissible.
+// `mod=` already reports two operator-level diagnostics (the `mod=` §6.1
+// line plus the §3.5 operand line) for ANY right operand, e.g. `c mod= 2`;
+// that pre-dates #5211 and is not pinned here, so its expected count is -1.
+static void expectOnlyOperatorRejection(const char* moduleName,
+                                        const char* op, int expectedErrors) {
+    std::string src =
+        std::string("module ") + moduleName + "; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c: char := 'a'; "
+        "    var u: uint := uint(3); "
+        "    c " + op + " u; "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`char`"));
+    BEZEL_EXPECT_TRUE(!diagnosticMessageContains(r, "typed as in"));
+    BEZEL_EXPECT_TRUE(!diagnosticMessageContains(r, "right operand"));
+    if (expectedErrors >= 0)
+        BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is not defined for `char` operands"), expectedErrors);
+}
+
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           char_times_eq_uint_rhs_single_operator_diagnostic_5150_5211) {
+    expectOnlyOperatorRejection("M5150_10A", "*=", 1);
+}
+
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           char_div_eq_uint_rhs_single_operator_diagnostic_5150_5211) {
+    expectOnlyOperatorRejection("M5150_10B", "/=", 1);
+}
+
+BEZEL_TEST(char_arithmetic_rejected_5054,
+           char_mod_eq_uint_rhs_single_operator_diagnostic_5150_5211) {
+    expectOnlyOperatorRejection("M5150_10C", "mod=", -1);
 }
