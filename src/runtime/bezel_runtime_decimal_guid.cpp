@@ -160,6 +160,78 @@ static bool dec_align(__uint128_t ma, uint32_t sa,
     return true;
 }
 
+// per fix #5147 / §6.4, v0.313: +, -, * compute the exact result in a 192-bit
+// magnitude and round ONCE (to nearest, a tie to the even last digit) at the
+// largest scale s <= 28 whose rounded mantissa is at most 2^96 - 1.
+struct DecWide { __uint128_t lo; uint64_t hi; };  // hi * 2^128 + lo
+
+static void wide_mul10(DecWide& w) {
+    const __uint128_t M64 = ~(uint64_t)0;
+    __uint128_t a = (w.lo & M64) * 10;
+    __uint128_t b = (w.lo >> 64) * 10 + (a >> 64);
+    w.lo = (b << 64) | (a & M64);
+    w.hi = w.hi * 10 + (uint64_t)(b >> 64);
+}
+static DecWide wide_add(const DecWide& x, const DecWide& y) {
+    DecWide r; r.lo = x.lo + y.lo;
+    r.hi = x.hi + y.hi + (r.lo < x.lo ? 1 : 0);
+    return r;
+}
+static bool wide_ge(const DecWide& x, const DecWide& y) {
+    return x.hi != y.hi ? x.hi > y.hi : x.lo >= y.lo;
+}
+static DecWide wide_sub(const DecWide& x, const DecWide& y) {  // x >= y
+    DecWide r; r.lo = x.lo - y.lo;
+    r.hi = x.hi - y.hi - (x.lo < y.lo ? 1 : 0);
+    return r;
+}
+static uint32_t wide_divmod10(DecWide& w) {
+    const __uint128_t M64 = ~(uint64_t)0;
+    uint64_t r = (uint64_t)(w.hi % 10);
+    w.hi /= 10;
+    __uint128_t cur = ((__uint128_t)r << 64) | (w.lo >> 64);
+    __uint128_t q1 = cur / 10; r = (uint64_t)(cur % 10);
+    cur = ((__uint128_t)r << 64) | (w.lo & M64);
+    __uint128_t q0 = cur / 10; r = (uint64_t)(cur % 10);
+    w.lo = (q1 << 64) | q0;
+    return (uint32_t)r;
+}
+
+// `q` is the truncated mantissa at scale `s`; `dropTop` is the most
+// significant dropped digit and `sticky` is set when any lower dropped digit
+// is nonzero. One round-half-to-even decision at the final scale; if q + 1
+// exceeds 2^96 - 1, drop one more digit (from the UNROUNDED q) and decide
+// again, so the fallback never double-rounds. At scale 0 that is overflow.
+static bool dec_store_rounded(bz_decimal_t* out, __uint128_t q, uint32_t s,
+                              int neg, uint32_t dropTop, bool sticky,
+                              void* ove_vtable) {
+    for (;;) {
+        bool up = dropTop > 5 || (dropTop == 5 && (sticky || (q % 2) != 0));
+        __uint128_t r = q + (up ? 1 : 0);
+        if (r <= kMax96) return dec_store(out, r, s, neg, ove_vtable);
+        if (s == 0) { bz_set_exc(ove_vtable); return false; }
+        if (dropTop != 0) sticky = true;
+        dropTop = (uint32_t)(q % 10);
+        q /= 10;
+        --s;
+    }
+}
+
+// Reduce a 192-bit magnitude at scale `s` to a <= 96-bit mantissa at scale
+// <= 28 by dropping digits (tracking dropTop/sticky), then round once.
+static bool dec_store_wide(bz_decimal_t* out, DecWide w, uint32_t s, int neg,
+                           void* ove_vtable) {
+    uint32_t dropTop = 0;
+    bool sticky = false;
+    while (w.hi != 0 || w.lo > kMax96 || s > 28) {
+        if (s == 0) { bz_set_exc(ove_vtable); return false; }  // §6.4 overflow
+        if (dropTop != 0) sticky = true;
+        dropTop = wide_divmod10(w);
+        --s;
+    }
+    return dec_store_rounded(out, w.lo, s, neg, dropTop, sticky, ove_vtable);
+}
+
 // §4.4 / §6.4: decimal + decimal
 // per fix #521 / §6.4: ove_vtable is the OverflowException vtable; stored in
 // bz_exc on overflow so codegen's emitPendingCheck() unwinds.
@@ -168,18 +240,22 @@ extern "C" void bz_decimal_add(const bz_decimal_t* a, const bz_decimal_t* b,
     __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
     uint32_t sa = dec_scale(a), sb = dec_scale(b);
     int signa = dec_sign(a), signb = dec_sign(b);
-    __uint128_t ra, rb; uint32_t rs;
-    dec_align(ma, sa, mb, sb, &ra, &rb, &rs);
+    // per fix #5147 / §6.4, v0.313: align exactly in 192 bits (no lossy
+    // per-operand rounding), then round the exact sum once.
+    uint32_t rs = sa > sb ? sa : sb;
+    DecWide wa = {ma, 0}, wb = {mb, 0};
+    for (uint32_t i = sa; i < rs; ++i) wide_mul10(wa);
+    for (uint32_t i = sb; i < rs; ++i) wide_mul10(wb);
     int rsign;
-    __uint128_t rm;
+    DecWide rm;
     if (signa == signb) {
-        rm = ra + rb; rsign = signa;
-        // carry: may overflow 96 bits, dec_store will reduce scale.
+        rm = wide_add(wa, wb); rsign = signa;
+    } else if (wide_ge(wa, wb)) {
+        rm = wide_sub(wa, wb); rsign = signa;
     } else {
-        if (ra >= rb) { rm = ra - rb; rsign = signa; }
-        else          { rm = rb - ra; rsign = signb; }
+        rm = wide_sub(wb, wa); rsign = signb;
     }
-    dec_store(out, rm, rs, rsign, ove_vtable);
+    dec_store_wide(out, rm, rs, rsign, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal - decimal
@@ -212,111 +288,31 @@ extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
              a2 = (uint32_t)(ma >> 64);
     uint64_t b0 = (uint32_t)(mb),          b1 = (uint32_t)(mb >> 32),
              b2 = (uint32_t)(mb >> 64);
-    // 6x6 32-bit partial products, sum into 5 64-bit accumulators.
+    // per fix #5147 / §6.4, v0.313: exact 192-bit schoolbook product. Each
+    // step's running sum (limb + 32x32 product + carry) stays below 2^64, so
+    // carries propagate one 32-bit limb at a time. (The earlier column-sum
+    // carry landed one limb too low and corrupted large products.)
+    uint64_t al[3] = {a0, a1, a2}, bl[3] = {b0, b1, b2};
     uint64_t c[6] = {0, 0, 0, 0, 0, 0};
-    // Each partial: a_i * b_j -> add at position i+j.
-    auto add64 = [&](int pos, uint64_t v) {
-        while (v && pos < 6) {
-            uint64_t old = c[pos];
-            c[pos] += v;
-            v = (c[pos] < old) ? 1 : 0;
-            ++pos;
+    for (int i = 0; i < 3; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 3; ++j) {
+            uint64_t cur = c[i + j] + al[i] * bl[j] + carry;
+            c[i + j] = cur & 0xFFFFFFFF;
+            carry = cur >> 32;
         }
-    };
-    add64(0, a0 * b0);
-    add64(1, a0 * b1); add64(1, a1 * b0);
-    add64(2, a0 * b2); add64(2, a1 * b1); add64(2, a2 * b0);
-    add64(3, a1 * b2); add64(3, a2 * b1);
-    add64(4, a2 * b2);
-
-    // Reassemble into __uint128_t pairs: lo128 (c[0..3]) and hi128 (c[4..5]).
-    __uint128_t lo128 = ((__uint128_t)c[1] << 32) | c[0];
-    lo128 |= ((__uint128_t)(c[2] & 0xFFFFFFFF) << 64);
-    lo128 |= ((__uint128_t)(c[2] >> 32) << 96);
-    // Actually, let's recompute more carefully with 32-bit limbs.
-    // We have 6 limbs of 32 bits (indices 0..5 × 32 = 192 bits total).
-    // Reconstruct the 192-bit value.
-    // Limb i holds bits [i*32 .. i*32+63] worth (up to 64-bit partial sums,
-    // but we need to propagate carries properly).
-    // Propagate carries:
-    for (int i = 0; i < 5; ++i) {
-        c[i+1] += c[i] >> 32;
-        c[i] &= 0xFFFFFFFF;
+        c[i + 3] += carry;
     }
-    // Now c[0..5] are each 32-bit values representing the 192-bit product.
-    // Reconstruct as __uint128_t lo + hi.
     __uint128_t product_lo = (((__uint128_t)c[3] << 96) |
-                               ((__uint128_t)c[2] << 64) |
-                               ((__uint128_t)c[1] << 32) |
-                                (__uint128_t)c[0]);
+                              ((__uint128_t)c[2] << 64) |
+                              ((__uint128_t)c[1] << 32) |
+                               (__uint128_t)c[0]);
     uint64_t product_hi_words = ((uint64_t)c[5] << 32) | c[4];
-    // product = product_hi_words * 2^128 + product_lo
-    // We need to reduce this into a 96-bit mantissa by dividing by powers
-    // of 10 (adjusting scale down). If product_hi_words != 0, we must
-    // scale down until the result fits in 96 bits.
-
-    // Reconstruct as a scaled value: try to reduce scale while trimming
-    // the product to 96 bits.
-    // Simple approach: divide by 10^k until it fits, reducing sa by k.
-    // Use 192-bit division by 10 iteratively.
-    // product / 10: (hi * 2^128 + lo) / 10
-    while (product_hi_words != 0 || product_lo > kMax96) {
-        // Divide 192-bit value by 10.
-        // hi_words / 10 = q_hi, remainder r_hi
-        uint64_t q_hi = product_hi_words / 10;
-        uint64_t r_hi = product_hi_words % 10;
-        // (r_hi * 2^128 + lo) / 10 = lo / 10 + r_hi * (2^128 / 10)
-        // 2^128 / 10 = 34028236692093846346337460743176821145 + rem
-        // This is complex; use a simpler iterative approach.
-        // Divide the 192-bit number by 10:
-        // Let N = hi * 2^128 + lo.
-        // q = N / 10, r = N mod 10.
-        // We compute r first, then divide.
-        // r = (product_hi_words * (2^128 mod 10) + product_lo mod 10) mod 10
-        // 2^128 mod 10 = 6 (since 2^4=16≡6 and cycles with period 4; 128/4=32, rem=0 → 2^128≡6 mod 10)
-        // Actually: 2^1=2, 2^2=4, 2^3=8, 2^4=6(mod10), 2^5=2... period 4.
-        // 128 mod 4 = 0 → 2^128 ≡ 2^4 ≡ 6 (mod 10).
-        // remainder = (product_hi_words * 6 + (product_lo % 10)) % 10
-        // This only gives us the last digit, but we need to do the full division.
-        // Use 64-bit chunks:
-        // Treat as 6 × 32-bit limbs and do long division.
-        uint64_t limbs[6];
-        for (int i = 0; i < 4; ++i) limbs[i] = (product_lo >> (32*i)) & 0xFFFFFFFF;
-        limbs[4] = product_hi_words & 0xFFFFFFFF;
-        limbs[5] = product_hi_words >> 32;
-        uint64_t rem = 0;
-        for (int i = 5; i >= 0; --i) {
-            uint64_t cur = (rem << 32) | limbs[i];
-            limbs[i] = cur / 10;
-            rem = cur % 10;
-        }
-        // Reconstruct.
-        product_hi_words = ((uint64_t)limbs[5] << 32) | limbs[4];
-        product_lo = (((__uint128_t)limbs[3] << 96) |
-                      ((__uint128_t)limbs[2] << 64) |
-                      ((__uint128_t)limbs[1] << 32) |
-                       (__uint128_t)limbs[0]);
-        // If sa > 0, reduce scale (divides by 10, legal rounding).
-        // If sa == 0, the product genuinely exceeds MaxValue — OverflowException.
-        if (sa > 0) { --sa; }
-        else {
-            // §6.4: OverflowException — product > MaxValue with no remaining
-            // scale to reduce.  Cannot represent the result.
-            bz_set_exc(ove_vtable);
-            return;
-        }
-        if (rem >= 5) {
-            // Round: add 1 to the truncated result.
-            __uint128_t old = product_lo;
-            if (product_hi_words == 0) {
-                product_lo += 1;
-            } else {
-                product_lo += 1;
-                if (product_lo < old) product_hi_words += 1;
-            }
-        }
-    }
-    dec_store(out, product_lo, sa, rsign, ove_vtable);
+    // product = product_hi_words * 2^128 + product_lo, at scale sa (<= 56).
+    // per fix #5147 / §6.4, v0.313: reduce to scale <= 28 and 96 bits with ONE
+    // round-half-to-even; OverflowException when it does not fit at scale 0.
+    DecWide prod = {product_lo, product_hi_words};
+    dec_store_wide(out, prod, sa, rsign, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal / decimal.
@@ -428,16 +424,11 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
     // fix #5147 / §6.4, v0.313: ONE round-half-to-even at the final scale
     // rs_signed (<= 28): up when the dropped value exceeds half, or is exactly
     // half and q is odd. A nonzero quotient that rounds to zero is zero.
-    {
-        bool round_up = dropTop > 5 ||
-                        (dropTop == 5 && (sticky || (q % 2) != 0));
-        // If q + 1 exceeds the 96-bit mantissa, `dec_store` falls back to a
-        // lower scale (§6.4 overflow rule); at scale 0 it signals
-        // OverflowException.
-        if (round_up) q += 1;
-    }
+    // If q + 1 exceeds the 96-bit mantissa, dec_store_rounded drops another
+    // digit from the unrounded q (§6.4 overflow rule); at scale 0 it signals
+    // OverflowException.
     uint32_t rs = (uint32_t)rs_signed;
-    dec_store(out, q, rs, rsign, ove_vtable);
+    dec_store_rounded(out, q, rs, rsign, dropTop, sticky, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal mod decimal.
