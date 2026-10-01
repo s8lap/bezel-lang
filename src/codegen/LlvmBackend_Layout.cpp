@@ -3376,19 +3376,38 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // reachable from codegen (sema::argSatisfiesTypeBound is exact-
     // instantiation only). `as` is untouched (rejected at the instantiation
     // site by #5146).
-    if ((te.op == "is" || te.op == "is not") && opTyResolved &&
-        concreteValueTypeOperand(opTyResolved) &&
+    // fix-forward #5234 (§12.7 "Value-typed operands", v0.313): a NULLABLE
+    // value carrier (`v: T?` at T = int, the `{i8, T}` struct) takes the same
+    // per-instantiation answer, "true exactly when `v` is non-null and `R` is
+    // `Object` or an interface the boxed value converts to": the underlying
+    // type's answer combined with the hasValue test. Before #5234 the operand
+    // resolved without its `?` and rode this arm ignoring null.
+    sema::TypeRef nullableUnderlying;
+    const bool nullableCarrier =
+        opTyResolved && opTyResolved->nullable &&
+        isNullableValueTy(opTyResolved) && obj->getType()->isStructTy();
+    if (nullableCarrier) {
+        nullableUnderlying = *opTyResolved;
+        nullableUnderlying.nullable = false;
+    }
+    const sema::TypeRef* valueOpTy =
+        nullableCarrier ? &nullableUnderlying : opTyResolved;
+    if ((te.op == "is" || te.op == "is not") && valueOpTy &&
+        concreteValueTypeOperand(valueOpTy) &&
         !obj->getType()->isPointerTy() && isObjectOrInterfaceTarget(rt)) {
         bool answer = false;
         if (rt->kind == sema::TypeRef::Kind::Primitive) {
             answer = true;  // Object
-        } else if (opTyResolved->kind == sema::TypeRef::Kind::Primitive) {
+        } else if (valueOpTy->kind == sema::TypeRef::Kind::Primitive) {
             answer = sema::primitiveConformsToBuiltinInstanceIface(
-                         opTyResolved->primitive, rt->headName(),
+                         valueOpTy->primitive, rt->headName(),
                          rt->genericArgs) ==
                      sema::PrimBuiltinIfaceConformance::Conforms;
         }
-        return builder_.getInt1(te.op == "is" ? answer : !answer);
+        llvm::Value* holds = builder_.getInt1(answer);
+        if (nullableCarrier && answer)  // per §12.7: null is an instance of no type
+            holds = nullablePrimHasValue(obj);
+        return te.op == "is" ? holds : builder_.CreateNot(holds);
     }
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so

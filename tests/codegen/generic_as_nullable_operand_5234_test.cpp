@@ -163,3 +163,95 @@ BEZEL_TEST(generic_as_nullable_operand_5234, is_over_nullable_param_null_test_sp
         "    G.Show<int>(n);\n",
         "yes\nno\n");
 }
+
+// fix-forward #5234 (§12.7 "Value-typed operands", v0.313): `v is Object` over
+// a carrier `v: T?` at a value type is "true exactly when v is non-null and R
+// is Object": 5 -> true, null -> false; `is not` the negation. Pre-fix-forward
+// the nullable operand skipped the reference-target arm and printed False x4.
+BEZEL_TEST(generic_as_nullable_operand_5234, is_object_over_nullable_int_spec_12_7_v0_313) {
+    expectOut(
+        "  public static method IsObj<T>(v: T?): bool\n"
+        "    return v is Object;\n"
+        "  end IsObj;\n"
+        "  public static method NotObj<T>(v: T?): bool\n"
+        "    return v is not Object;\n"
+        "  end NotObj;\n",
+        "    var p: int? := 5;\n"
+        "    var n: int? := null;\n"
+        "    Console.WriteLine(G.IsObj<int>(p));\n"
+        "    Console.WriteLine(G.IsObj<int>(n));\n"
+        "    Console.WriteLine(G.NotObj<int>(p));\n"
+        "    Console.WriteLine(G.NotObj<int>(n));\n",
+        "True\nFalse\nFalse\nTrue\n");
+}
+
+// Same at a record instantiation.
+BEZEL_TEST(generic_as_nullable_operand_5234, is_object_over_nullable_record_spec_12_7_v0_313) {
+    expectOut(
+        "  public static method IsObj<T>(v: T?): bool\n"
+        "    return v is Object;\n"
+        "  end IsObj;\n"
+        "  public static method NotObj<T>(v: T?): bool\n"
+        "    return v is not Object;\n"
+        "  end NotObj;\n",
+        "    var p: R? := new R(1, 2);\n"
+        "    var n: R? := null;\n"
+        "    Console.WriteLine(G.IsObj<R>(p));\n"
+        "    Console.WriteLine(G.IsObj<R>(n));\n"
+        "    Console.WriteLine(G.NotObj<R>(p));\n"
+        "    Console.WriteLine(G.NotObj<R>(n));\n",
+        "True\nFalse\nFalse\nTrue\n");
+}
+
+// An interface the value type does not implement: false for 5 and null.
+BEZEL_TEST(generic_as_nullable_operand_5234, is_unimplemented_interface_over_nullable_spec_12_7_v0_313) {
+    JitResult r = runAot(
+        "module M;\n"
+        "interface IShape end IShape;\n"
+        "record R(X: int, Y: int);\n"
+        "class G\n"
+        "  public static method Is<T>(v: T?): bool\n"
+        "    return v is IShape;\n"
+        "  end Is;\n"
+        "end G;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var p: int? := 5;\n"
+        "    var n: int? := null;\n"
+        "    var r: R? := new R(1, 2);\n"
+        "    Console.WriteLine(G.Is<int>(p));\n"
+        "    Console.WriteLine(G.Is<int>(n));\n"
+        "    Console.WriteLine(G.Is<R>(r));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\nFalse\nFalse\n"));
+}
+
+// A builtin interface the primitive implements: non-null only.
+BEZEL_TEST(generic_as_nullable_operand_5234, is_implemented_builtin_interface_over_nullable_spec_12_7_v0_313) {
+    expectOut(
+        "  public static method Is<T>(v: T?): bool\n"
+        "    return v is IEquatable<int>;\n"
+        "  end Is;\n",
+        "    var p: int? := 5;\n"
+        "    var n: int? := null;\n"
+        "    Console.WriteLine(G.Is<int>(p));\n"
+        "    Console.WriteLine(G.Is<int>(n));\n",
+        "True\nFalse\n");
+}
+
+// `string` target: a value type is never a string, null or not.
+BEZEL_TEST(generic_as_nullable_operand_5234, is_string_over_nullable_int_spec_12_7_v0_313) {
+    expectOut(
+        "  public static method Is<T>(v: T?): bool\n"
+        "    return v is string;\n"
+        "  end Is;\n",
+        "    var p: int? := 5;\n"
+        "    var n: int? := null;\n"
+        "    Console.WriteLine(G.Is<int>(p));\n"
+        "    Console.WriteLine(G.Is<int>(n));\n",
+        "False\nFalse\n");
+}
