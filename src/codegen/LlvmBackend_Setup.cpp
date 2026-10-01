@@ -35392,6 +35392,62 @@ void Emitter::collectSafeViewAliases(
                             common::isSyncIterFormatEnumerableHead(
                                 dt->headName()))
                             views.push_back(s);
+                        // fix #4913 (§28.2 / §8.6, v0.307): an `Object`- or
+                        // interface-typed binding of an `Array<T>` local is
+                        // likewise a BORROW view (§28.11: Array<T> conforms to
+                        // the read-only iteration interfaces; Object is the
+                        // universal view), so the interface/Object slot does
+                        // NOT claim ownership of the array's backing and the
+                        // slot's own scope-end disposal frees only the slot's
+                        // wrapper/value, never the backing. Without admitting
+                        // these to `views`, the escape walker taints `a` on
+                        // the `var o: Object := a;` binding and excludes it
+                        // from `borrowingArrayFreeEligible_`, leaking the
+                        // backing at scope end (measured 120 B / 2 allocs per
+                        // iteration: 100 iter × 120 B = 12000 B / 200 allocs
+                        // on the issue's repro). The per-view escape walk
+                        // below still runs (proving the view itself never
+                        // escapes past `a`'s scope), so admitting them is
+                        // sound — the walker only treats the binding as a
+                        // borrow when the view is independently proven
+                        // non-escaping. Distinct from the IEnumerable-style
+                        // iterator-format-Enumerable arm above: those have
+                        // `!dt->declaration` (declaration-less generic
+                        // specializations through the §29.2 representation
+                        // path); Object and the concrete interface heads
+                        // Array conforms to (stdlib §4.1:
+                        // IReadOnlyCollection / IReadOnlyList / ICollection
+                        // / IList, plus Object) DO have a declaration
+                        // pointer, so they need a parallel arm keyed on the
+                        // head name. Reuses `kBuiltinForInEnumerableHeads`'s
+                        // six interface heads verbatim (the for-in lowering
+                        // already treats all six as borrowing enumerable
+                        // views) — that predicate is the authority for "an
+                        // interface view of a bz_array_t-backed collection
+                        // is a borrow", and widening `safeViewAliases` to
+                        // match keeps the eligibility predicate and the
+                        // actual view semantics in lock-step.
+                        else if (dt && (
+                                    (dt->kind == sema::TypeRef::Kind::Named &&
+                                     dt->astNode && dt->astNode->name &&
+                                     !dt->astNode->name->parts.empty() &&
+                                     common::isBuiltinForInEnumerableHead(
+                                         dt->headName())) ||
+                                    // fix #4913 (§28.2 / §8.6, v0.307): the
+                                    // builtin `Object` PRIMITIVE is also a
+                                    // borrowing view of an Array<T> — distinct
+                                    // shape from the generic-instantiation
+                                    // Named TypeRefs above (Object is a
+                                    // PrimitiveType with primitive ==
+                                    // PrimitiveType::Object, not a Named
+                                    // type). The slot holds a borrow, the
+                                    // slot's scope-end disposal frees only
+                                    // the box/value the slot holds, and the
+                                    // array's backing stays owned by the
+                                    // source `a`.
+                                    (dt->kind == sema::TypeRef::Kind::Primitive &&
+                                     dt->primitive == sema::PrimitiveType::Object)))
+                            views.push_back(s);
                     }
                 }
             }
