@@ -104,21 +104,20 @@ BEZEL_TEST(as_cast_value_typed_record_4958,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
 }
 
-// (c) The mismatched-type `null` arm: `p as Q` (where p is Pt). The wrap
-// branch falls through to the sibling bug — `nullableValueNull(rt)` was
-// called with the same non-nullable `rt`, so the produced `{i8 0, i32 0}`
-// was wrong-shaped against the i64-carrying `Q?`. The ?? coalesce to a
-// fresh Q then reads A=0.
+// (c) §12.7 (v0.310/#5157) — flip: `p as Q` where p is Pt was admit
+// (produces null, ?? returns new Q(0).A = 0), now reject (different concrete
+// record types). Assert the diagnostic before the ran-check — otherwise a
+// program that neither compiles nor runs vacuously passes the test.
 BEZEL_TEST(as_cast_value_typed_record_4958,
-           record_local_as_other_record_returns_null) {
+           record_as_other_record_rejected_spec_12_7) {
     auto r = runAotChecked(
         "module M; "
         "record Pt(X: int, Y: int); "
         "record Q(A: int); "
         "class H "
         "  public static method MissIt(p: Pt): int "
-        "    var r := (p as Q); "
-        "    return (r ?? new Q(0)).A; "
+        "    var rr := (p as Q); "
+        "    return (rr ?? new Q(0)).A; "
         "  end MissIt; "
         "end H; "
         "class C "
@@ -128,10 +127,7 @@ BEZEL_TEST(as_cast_value_typed_record_4958,
         "    return 0; "
         "  end Main; "
         "end C; ");
-    BEZEL_EXPECT_TRUE(r.ran);
-    if (!r.ran) return;
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 }  // namespace

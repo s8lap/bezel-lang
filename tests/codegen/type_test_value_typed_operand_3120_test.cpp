@@ -181,54 +181,95 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
 }
 
 // =====================================================================
-// The static-decision is not just for matching types — a non-matching
-// target on a concrete value operand must answer false, AND must NOT
-// collapse to true. Pre-fix: both arms printed 2 (silently dropped). Want
-// 3 (1 + 2), confirming the false branch and the false else.
+// Flips per #5175 (§12.7, v0.310/#5157): concrete value typed operand
+// against a different value type is now a compile error. The old admit rows
+// for non-matching targets become reject rows. Same-type admit stays.
 // =====================================================================
 
-// §12.7 — different primitive targets: `int is long`, `int is double`,
-// `int is Pt` all decide false; `int is int` decides true.
-// bit 1 (int is int), 2 (int is long), 4 (int is double), 8 (int is Pt).
-// Want 15.
+// §12.7 — same type: `int is int` still admits. Want 1.
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           non_matching_target_on_primitive_spec_12_7) {
+           matching_target_on_primitive_still_admits_spec_12_7) {
     BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var p: int := 7; "
+        "    if p is int then return 1; end; "
+        "    return 2; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §12.7 (v0.310/#5157) — flip: `int is long` was admit, now reject.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           int_is_long_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(runAot(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var p: int := 7; "
+        "    if p is long then return 99; end; "
+        "    return 3; "
+        "  end Main; "
+        "end C;").diagnostics.hasErrors());
+}
+
+// §12.7 (v0.310/#5157) — flip: `int is double` was admit, now reject.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           int_is_double_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(runAot(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var p: int := 7; "
+        "    if p is double then return 99; end; "
+        "    return 3; "
+        "  end Main; "
+        "end C;").diagnostics.hasErrors());
+}
+
+// §12.7 (v0.310/#5157) — flip: `int is Pt` was admit, now reject.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           int_is_record_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(runAot(
         "module M; "
         "record Pt(X: int, Y: int); "
         "class C "
         "  public static method Main(): int "
         "    var p: int := 7; "
-        "    var code := 0; "
-        "    if p is int    then code := code + 1;  end; "
-        "    if p is long   then code := code + 100; end; "
-        "    if p is double then code := code + 100; end; "
-        "    if p is Pt     then code := code + 100; end; "
-        "    return code; "
+        "    if p is Pt then return 99; end; "
+        "    return 3; "
         "  end Main; "
-        "end C;"), 1);
+        "end C;").diagnostics.hasErrors());
 }
 
-// §12.7 — different inline-array sizes: `[3]int is [4]int` is false,
-// `[3]int is [3]int` is true. Want 1.
+// §12.7 (v0.310/#5157) — flip: `[3]int is [4]int` was admit, now reject.
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           non_matching_inline_array_target_spec_12_7_15_1) {
-    BEZEL_EXPECT_EQ(run(
+           inline_array_size_mismatch_rejected_spec_12_7_15_1) {
+    BEZEL_EXPECT_TRUE(runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    var a: [3]int := [1, 2, 3]; "
         "    if a is [4]int then return 99; end; "
+        "    return 1; "
+        "  end Main; "
+        "end C;").diagnostics.hasErrors());
+}
+
+// §12.7 — same inline-array type: `[3]int is [3]int` still admits. Want 1.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           matching_inline_array_target_still_admits_spec_12_7_15_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var a: [3]int := [1, 2, 3]; "
         "    if a is [3]int then return 1; end; "
         "    return 2; "
         "  end Main; "
         "end C;"), 1);
 }
 
-// §12.7 — different records (same shape, different declaration): false.
-// Want 1.
+// §12.7 (v0.310/#5157) — flip: `a is B` was admit, now reject.
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           non_matching_record_target_spec_12_7) {
-    BEZEL_EXPECT_EQ(run(
+           record_type_mismatch_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(runAot(
         "module M; "
         "record A(X: int); "
         "record B(X: int); "
@@ -236,6 +277,20 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
         "  public static method Main(): int "
         "    var a: A := new A(7); "
         "    if a is B then return 99; end; "
+        "    return 1; "
+        "  end Main; "
+        "end C;").diagnostics.hasErrors());
+}
+
+// §12.7 — same record type: `a is A` still admits. Want 1.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           matching_record_target_still_admits_spec_12_7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record A(X: int); "
+        "class C "
+        "  public static method Main(): int "
+        "    var a: A := new A(7); "
         "    if a is A then return 1; end; "
         "    return 2; "
         "  end Main; "
@@ -248,11 +303,11 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
 // values.
 // =====================================================================
 
-// §12.7 — `is not` on a concrete value operand: target identical → false.
-// bit 1 `is not int` (false), 2 `is not long` (true). Want 3.
+// §12.7 (v0.310/#5157) — flip: `p is not long` was admit (returns 2),
+// now reject (different concrete value type).
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           is_not_on_value_typed_operand_spec_12_7) {
-    BEZEL_EXPECT_EQ(run(
+           int_is_not_long_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    var p: int := 7; "
@@ -260,6 +315,19 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
         "    if p is not int  then code := code + 100; end; "
         "    if p is not long then code := code + 2;   end; "
         "    return code; "
+        "  end Main; "
+        "end C;").diagnostics.hasErrors());
+}
+
+// §12.7 — `p is not int` still admits (same type, returns false). Want 2.
+BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
+           is_not_same_type_still_admits_spec_12_7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var p: int := 7; "
+        "    if p is not int then return 99; end; "
+        "    return 2; "
         "  end Main; "
         "end C;"), 2);
 }
@@ -279,11 +347,11 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
         "end C;"), 1);
 }
 
-// §17.4 — `x as T` on a value-typed operand where target != operand's
-// static type produces T? null. Want 1.
+// §17.4 (v0.310/#5157) — flip: `p as long` where p is int was admit
+// (produces null), now reject (different concrete value types).
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           as_mismatch_is_null_spec_17_4) {
-    BEZEL_EXPECT_EQ(run(
+           as_value_type_mismatch_rejected_spec_17_4) {
+    BEZEL_EXPECT_TRUE(runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    var p: int := 7; "
@@ -291,7 +359,7 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
         "    if q = null then return 1; end; "
         "    return 2; "
         "  end Main; "
-        "end C;"), 1);
+        "end C;").diagnostics.hasErrors());
 }
 
 // =====================================================================

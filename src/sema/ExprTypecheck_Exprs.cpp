@@ -378,6 +378,51 @@ static std::string_view exprsNamedTypeSimpleName(const TypeRef* ref) {
     return {};
 }
 
+// fix #5175 (§12.7/§17.4, v0.310/#5157): is `r` a concrete value type for the
+// "value type other than its own" rule — a primitive (not string/Object), the
+// unit type, an inline array, or a record/enum/choice declaration? The
+// nullable form counts as its underlying type; a type parameter (a Named with
+// no declaration) never does.
+static bool concreteValueTyped5175(const TypeRef* r) {
+    if (!r) return false;
+    switch (r->kind) {
+    case TypeRef::Kind::Primitive:
+        return r->primitive != PrimitiveType::String &&
+               r->primitive != PrimitiveType::Object;
+    case TypeRef::Kind::Unit:
+    case TypeRef::Kind::InlineArray:
+        return true;
+    case TypeRef::Kind::Named:
+        return r->declaration &&
+               (r->declaration->kind == ast::TypeDeclKind::Record ||
+                r->declaration->kind == ast::TypeDeclKind::Enum ||
+                r->declaration->kind == ast::TypeDeclKind::Choice);
+    default:
+        return false;
+    }
+}
+
+// fix #5175: both sides concrete value types (nullability ignored) and the
+// target is not the operand's own type.
+static bool valueTypeMismatch5175(const TypeRef* op, const TypeRef* tt) {
+    if (!concreteValueTyped5175(op) || !concreteValueTyped5175(tt))
+        return false;
+    if (op->kind != tt->kind) return true;
+    switch (op->kind) {
+    case TypeRef::Kind::Primitive: return op->primitive != tt->primitive;
+    case TypeRef::Kind::Named: return op->declaration != tt->declaration;
+    case TypeRef::Kind::Unit: return false;
+    case TypeRef::Kind::InlineArray:
+        return op->arrayOwned != tt->arrayOwned ||
+               op->arraySizeValue != tt->arraySizeValue ||
+               (op->arrayElement && tt->arrayElement &&
+                op->arrayElement->kind == TypeRef::Kind::Primitive &&
+                tt->arrayElement->kind == TypeRef::Kind::Primitive &&
+                op->arrayElement->primitive != tt->arrayElement->primitive);
+    default: return false;
+    }
+}
+
 // fix #5146 (§12.7/§8.6, v0.309): "Value-typed operands" — is `d` (the
 // operand's DECLARED type, nullability already stripped by the caller) one of
 // the value-typed kinds the rule names: "a primitive, record, enum, choice,
@@ -2993,6 +3038,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // checkDeferredAsOperandInstantiations) and the `is`/`is not` static
         // decision (codegen, filed as a separate follow-up — #5146's
         // conformance predicate is not yet implemented there).
+        TypeRef* operandDeclared5175 = nullptr;
         if (te->testType && te->operand) {
             TypeRef* target = ctx_.resolvedType(*te->testType);
             if (target && target->kind != TypeRef::Kind::Error) {
@@ -3008,6 +3054,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                     }
                 }
+                operandDeclared5175 = operandDecl;
                 auto genericNames = currentScopeGenericParamNames();
                 bool operandIsGenericCarrier =
                     operandDecl && operandDecl->kind == TypeRef::Kind::Named &&
@@ -3044,7 +3091,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 }
             }
         }
+        // fix #5175 (§12.7/§17.4, v0.310/#5157): a concrete value-typed
+        // operand (the DECLARED type of a simple local/parameter, so a
+        // type-narrowed Object/interface carrier stays a reference operand;
+        // the nullable form counts as a value-typed operand) tested against a
+        // value type other than its own or its own nullable form is a compile
+        // error. A type parameter on either side is decided per instantiation
+        // (§3.6 rule 2): a `T`/`T?` operand or target has no declaration and is
+        // never a concrete value type here, so it is never rejected.
+        auto reportValueTypeMismatch5175 = [&](const TypeRef* tt) {
+            if (!valueTypeMismatch5175(operandDeclared5175, tt)) return;
+            ctx_.diagnostics().report(
+                Severity::Error, e.span.begin,
+                "a concrete value-typed operand can only be tested against "
+                "its own type or the nullable form of its own type — a "
+                "different value type is a compile error (§12.7/§17.4)");
+        };
         if (te->op == "is" || te->op == "is not") {
+            if (te->testType)
+                reportValueTypeMismatch5175(ctx_.resolvedType(*te->testType));
             ctx_.setExprType(&e,
                              ctx_.primitiveTypeRef(PrimitiveType::Bool));
         } else if (te->op == "as" && te->testType) {
@@ -3106,6 +3171,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         break;
                     }
                 }
+                reportValueTypeMismatch5175(tt);
                 // fix #4332 (§15.4, v0.298): thread the `as` target type onto
                 // a collection-literal operand. The operand was already visited
                 // by visitChildren before this handler ran, without any target —
