@@ -421,6 +421,10 @@ class KillTest(HookTestBase):
 
     def test_brief_that_forbids_or_scopes_is_allowed(self):
         for text in ("Name-scoped pkill is machine-wide; PID-scoped kill preferred.",
+                     # lines from dc's own notice to the peer, refused by the first version
+                     "REFUSED for every lane: patterns by name (`pkill -f bezel_tests_codegen`), "
+                     "killall, `kill $(pgrep …)`, `ps|grep|xargs kill`.",
+                     "ALLOWED: `kill <PID>`, `pgrep -f '/mnt/fast/worktrees/<wt>/x' | xargs kill`.",
                      "Never use pkill/killall by name; kill by PID.",
                      "Name-scoped kills (`pkill clang`) are FORBIDDEN.",
                      "Kill your own build: pkill -f \"$(readlink -f /mnt/fast/worktrees/x/build)/\"",

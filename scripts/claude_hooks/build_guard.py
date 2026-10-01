@@ -858,7 +858,7 @@ class Guard:
 # ------------------------------------------------------------- prose / briefs --
 
 NEGATION = re.compile(r"\b(never|don'?t|do not|not|no|forbidden|prohibited|avoid|instead|"
-                      r"bypass(es|ed)?|wrong|incident|withdrawn|unlimited|unbounded|against)\b|❌|✗",
+                      r"bypass(es|ed)?|wrong|incident|withdrawn|unlimited|unbounded|against|refused|refuses|denied|blocked)\b|❌|✗",
                       re.I)
 # Command-shaped mentions only: `pkill <arg>` in backticks, at a line start or with an
 # option; not prose like "a pkill-by-name" or "name-scoped pkill is machine-wide".
@@ -894,7 +894,10 @@ def lint_prose(text: str) -> list[tuple[str, str]]:
             if kind == "build" and ("dev_heavy.sh build" in line[:m.start()] or
                                     "agent_check.sh" in line[:m.start()]):
                 continue
-            if kind == "kill" and PROSE_KILL_SCOPED.search(line[m.start():]):
+            # A pkill's scope follows it; an `xargs kill`'s or `kill $(...)`'s source
+            # (`pgrep -f <lane path>/ | xargs kill`) may precede it.
+            if kind == "kill" and PROSE_KILL_SCOPED.search(
+                    line[m.start():] if rx is PROSE_PKILL else line):
                 continue
             if rx is PROSE_PKILL and not (line[:m.start()].count("`") % 2 or
                                           PROSE_LINE_START.match(line[:m.start()]) or
