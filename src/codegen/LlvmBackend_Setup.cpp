@@ -30038,6 +30038,89 @@ bool Emitter::lowerOwnedTaskFieldStore(const ast::Expr& target,
 
 
 namespace {
+// narrow #5129 (§27.5 / §28.3 / §28.9 / §28.14, v0.313): true when argument
+// `ai` of `call` is a plain (no-modifier) argument bound to a formal whose
+// declared type is a bare METHOD-OWN generic parameter `U` of a locally
+// compiled, non-async, non-virtual user method, instantiated at this call
+// site to a non-nullable function type, AND the callee body uses that formal
+// by direct invocation alone (calleeBodyUsesFormalOnlyByInvocation,
+// LlvmBackend_Calls2.cpp — fail-closed). ClosureEscapeWalker then treats a
+// bare `target` identifier there as a non-consuming read, so a
+// producer-initialized closure local passed as `s.Keep<() -> int>(f)` keeps
+// its +1 in its own slot and is released ONCE at its scope end — instead of
+// being classified escaping and never released (the 48 B/call leak of
+// #5129).
+//
+// Why an invocation-only callee is a borrow position (§28.3 borrows; §28.9
+// runtime-managed function values): `x(...)` reads through the cell's
+// function pointer and takes no reference, so once the callee returns it
+// holds nothing. Every other use of `x` is refused, NOT because the callee
+// could never retain through it, but because the retaining paths do not
+// uniformly take a reference of their own — `l.Add(x)` into a
+// caller-supplied `Array<U>` takes none (issue #5216: the same missing +1
+// turned the R25 attempt at releasing this local into a use-after-free) —
+// so the local's +1 may be the only one keeping the stored cell alive.
+// Those shapes keep today's leak (the safe direction) and are the residual
+// this fix narrows #5129 to; the pinned
+// codegen_5127_escape.method_own_type_param_object_field_escape_no_uaf row
+// (an `Object?` field store) stays on runAotCheckedLenient for that reason.
+//
+// The call site is deliberately untouched (the R24 attempt released any
+// function-typed identifier argument after the call, which also fired for
+// parameters and aliases whose slot owns no +1 — see
+// async_iterator_lambda_closure_release_3553 /
+// codegen_1073_closure_arg.released_on_unwind_edge_spec_28_3 /
+// closure_local_reassign_release_4174 / codegen_closure_refcount_422). The
+// escape walk is the one place that proves the slot is the sole owner
+// (producer-initialized, never aliased, reassigned, captured, returned, or
+// passed anywhere else that escapes); its verdict gates the release, which
+// happens strictly LATER than lowerCallDispatch's #5116 literal release
+// (scope end, not call end).
+//
+// Every clause fails closed (→ ESCAPE → leak): an unresolved or imported
+// callee, a non-generic callee, an argument or formal modifier, an async
+// callee, an unmappable named/positional argument, a formal that is not
+// exactly a method-own `U`, or a callee body with any non-invocation use.
+inline bool closureArgBindsMethodOwnTypeParamBorrow(
+        const sema::SemaContext& ctx, const ast::CallExpr& call,
+        std::size_t ai) {
+    if (ai >= call.args.size() || !call.args[ai].value) return false;
+    if (!call.args[ai].modifier.empty()) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(
+        call.callee ? ctx.exprSymbol(*call.callee) : nullptr);
+    if (!ms || ms->isOperator || ctx.isImported(ms)) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || md->genericParams.empty()) return false;
+    for (auto mod : md->modifiers)
+        if (mod == "async") return false;
+    // Map the argument to its formal (positional or named).
+    std::size_t pidx = md->params.size();
+    const auto& a = call.args[ai];
+    if (a.name.empty()) {
+        for (std::size_t j = 0; j < ai; ++j)
+            if (!call.args[j].name.empty()) return false;
+        pidx = ai;
+    } else {
+        for (std::size_t j = 0; j < md->params.size(); ++j)
+            if (md->params[j].name == a.name) { pidx = j; break; }
+    }
+    if (pidx >= md->params.size()) return false;
+    const ast::Param& p = md->params[pidx];
+    if (!p.modifier.empty() || !p.type) return false;
+    if (p.type->kind != ast::TypeKind::Named || !p.type->name ||
+        p.type->name->parts.size() != 1 || p.type->nullable)
+        return false;
+    bool methodOwn = false;
+    for (const auto& gp : md->genericParams)
+        if (gp.name == p.type->name->parts.front()) { methodOwn = true; break; }
+    if (!methodOwn) return false;
+    const sema::TypeRef* at = ctx.exprType(*a.value);
+    if (!at || at->kind != sema::TypeRef::Kind::Function || at->nullable)
+        return false;
+    return calleeBodyUsesFormalOnlyByInvocation(*md, p.name);
+}
+
+
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
 // closure local is "escaped" if its identifier appears anywhere except a
@@ -30577,6 +30660,15 @@ struct ClosureEscapeWalker {
             expr(c->callee.get(), /*safeRead=*/true);
             for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
                 bool safeArg = getOrAddFactoryTargetSafe && ai == 1;
+                // narrow #5129 (§27.5 / §28.3 / §28.14, v0.313): a bare
+                // target identifier bound to a method-own type-param formal
+                // of an invocation-only callee is a non-consuming read (see
+                // closureArgBindsMethodOwnTypeParamBorrow above); the
+                // caller keeps its +1 and releases it at scope end if
+                // nothing else escapes it.
+                if (!safeArg && isTargetIdent(c->args[ai].value.get()) &&
+                    closureArgBindsMethodOwnTypeParamBorrow(ctx, *c, ai))
+                    safeArg = true;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
             }
             return;
