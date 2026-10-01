@@ -3079,14 +3079,36 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         std::string(typeTest5146TargetDisplayName(target)) + "`");
                 } else if (operandIsGenericCarrier && te->op == "as" &&
                            typeTest5146ReferenceTargetKind(target,
-                                                           genericNames) &&
-                           currentMethodDecl_) {
-                    for (const auto& gp : currentMethodDecl_->genericParams) {
-                        if (gp.name != operandDecl->headName()) continue;
-                        recordAsOperandTypeParamUse(
-                            currentMethodDecl_, gp.name,
-                            typeTest5146TargetDisplayName(target), e.span.begin);
-                        break;
+                                                           genericNames)) {
+                    bool recorded = false;
+                    // METHOD-level carrier (a method's own parameter shadows
+                    // a same-named type-level one, so it is matched first).
+                    if (currentMethodDecl_) {
+                        for (const auto& gp : currentMethodDecl_->genericParams) {
+                            if (gp.name != operandDecl->headName()) continue;
+                            recordAsOperandTypeParamUse(
+                                currentMethodDecl_, gp.name,
+                                typeTest5146TargetDisplayName(target),
+                                e.span.begin);
+                            recorded = true;
+                            break;
+                        }
+                    }
+                    // fix #5210 (§12.7 v0.313, §3.6 rule 2): TYPE-level
+                    // carrier — the generic class's own parameter; its
+                    // instantiation sites are `new G<int>()` and the
+                    // generic-type static receiver, recorded keyed on the
+                    // TypeDecl (as the #5176 case-scrutinee join does).
+                    if (!recorded && currentType_ && currentType_->decl) {
+                        for (const auto* gp : currentType_->genericParams) {
+                            if (!gp || gp->name != operandDecl->headName())
+                                continue;
+                            recordAsOperandTypeParamUse(
+                                currentType_->decl, gp->name,
+                                typeTest5146TargetDisplayName(target),
+                                e.span.begin);
+                            break;
+                        }
                     }
                 }
             }
