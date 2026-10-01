@@ -7154,6 +7154,31 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 }
             }
             if (!v) return nullptr;
+            // fix #5221 (§5.1 / §8.6, v0.313): a value-typed (record / struct /
+            // primitive) argument bound to an Object/interface formal of the
+            // function TYPE is boxed here, exactly as buildOrderedArgs boxes it
+            // at a direct call. This invoke path builds its own argument list,
+            // so before this the raw value reached the `ptr` parameter (IR
+            // verification failure). boxForTarget is a no-op for a reference
+            // source or a non-Object/interface formal.
+            //
+            // The minted box is deliberately NOT released after the call: the
+            // callee is unknown here, so the ParamEscapeWalker proof that
+            // buildOrderedArgs requires (#2952) is unavailable, and a callee
+            // that stores its parameter (`_saved := v`) does not retain the
+            // box, so a caller-side release would be a use-after-free (MEASURED
+            // on this fix). Leaking the 24-byte box is the safe direction
+            // #2823 / #2874 / #2952 record for an unanalyzable callee.
+            if (pi < rt->funcParams.size() && rt->funcParams[pi].type &&
+                a.value) {
+                const sema::TypeRef* boxFormal =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                llvm::Value* savedBoxMint = lastBoxMint_;
+                lastBoxMint_ = nullptr;
+                v = boxForTarget(v, boxFormal, a.value.get());
+                lastBoxMint_ = savedBoxMint;
+                if (!v) return nullptr;
+            }
             args.push_back(v);
             // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): collect the lowered
             // closure-cell value for the post-call release when the AST was a
