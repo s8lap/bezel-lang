@@ -3673,9 +3673,26 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         const sema::TypeRef* operandTy = opTyResolved;  // fix #3090 / #4812
         if (operandTy && isNullableValueTy(operandTy) &&
             obj->getType()->isStructTy()) {
+            // fix #5195 (§12.7/§19.3, v0.312/#5170 correction): the
+            // hasValue branch was returning true for ANY non-null nullable
+            // value, but §12.7 requires false when the target is a different
+            // type. Compare the underlying non-nullable types: if identical
+            // to the target, the test answer is hasValue (true = present =
+            // match); if different, the answer is false (different types can
+            // never match). Also gates the bare type-parameter nullable
+            // carrier (`v: T?` at T=int) so only int? is int returns true,
+            // while int? is long returns false.
+            sema::TypeRef underlying = *operandTy;
+            underlying.nullable = false;
+            const bool typesMatch = staticTypeIdentical(&underlying, rt);
             llvm::Value* hasVal = nullablePrimHasValue(obj);  // i1
-            if (te.op == "is") return hasVal;
-            if (te.op == "is not") return builder_.CreateNot(hasVal);
+            if (te.op == "is") {
+                return typesMatch ? hasVal : builder_.getInt1(false);
+            }
+            if (te.op == "is not") {
+                return typesMatch ? builder_.CreateNot(hasVal)
+                                 : builder_.getInt1(true);
+            }
         }
         // fix #3120 (§12.7 / §8.6 / §17.4, v0.252): a CONCRETE non-nullable
         // VALUE-type operand (a primitive / record / enum / value-builtin /
