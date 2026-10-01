@@ -3464,13 +3464,14 @@ private:
     // read of the null they returned. That is the same silent-wrong-answer
     // class #4170/#4176 closed at the other shorthand sites, and #4208
     // removed from the method-return position, left standing at this one.
-    // Reports the §17.7 exclusion at the operand's own span. `rt` may be
-    // null (a lambda whose return type would arrive only by target
-    // inference — outside the written-declared-type family entirely, per
-    // §17.7's "A lambda whose return type arrives only by target inference
-    // ... [is] outside the family"); it is used only to name the type in
-    // the suggested explicit spelling.
+    // Reports the §17.7 exclusion at the operand's own span.
+    // `lam->retType != nullptr` means the lambda HAS an explicit `: T`
+    // ascription (ascribed-return clause governs); otherwise the return type
+    // arrived only by target inference, and the general-expression-context
+    // clause governs (§17.7, v0.306, fix #4498).
+    // `rt` names the type in the suggested explicit spelling.
     void rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                           const ast::LambdaExpr* lam,
                                            const TypeRef* rt);
 
     // fix s17_7_0008 (§17.7, v0.307; fourth sibling of

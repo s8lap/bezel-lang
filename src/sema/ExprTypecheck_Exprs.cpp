@@ -1250,22 +1250,47 @@ bool ExprTC::rejectNewOnInlineArray(const ast::NewExpr& ne,
 // #2491 zero/null backstop swallows, so the position compiled and
 // SEGV'd instead of being rejected. Both spellings of the excluded
 // position route here.
+//
+// fix #4498 (§17.7, v0.306): when `lam->retType == nullptr` (no explicit `: T`
+// ascription; return type arrived by target inference only), cite the
+// general-expression-context clause instead of the ascribed-return clause.
+// A target-inference-only lambda is outside the written-declared-type family
+// altogether; §17.7's closing catch-all governs here, not the ascribed-return
+// carve-out.
 void ExprTC::rejectNewShorthandAtLambdaReturn(const ast::NewExpr& ne,
+                                               const ast::LambdaExpr* lam,
                                                const TypeRef* rt) {
     std::string named = "new T(...)";
     if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration)
         named = "new " + std::string(rt->declaration->name) + "(...)";
-    ctx_.diagnostics().report(
-        Severity::Error, ne.span.begin,
-        "the `new()` shorthand is not permitted at a lambda's return. "
-        "§17.7 grants the shorthand exactly four positions — field "
-        "initializers, typed local-variable declarations, default "
-        "parameter values, and a `return` statement of a method with a "
-        "declared return type — and excludes this one: \"It is not "
-        "permitted at an expression body or at a lambda's ascribed "
-        "return\". (A lambda whose return type arrives only by target "
-        "inference is outside the written-declared-type family "
-        "altogether.) Name the type explicitly (`" + named + "`) (§17.7)");
+    const bool hasAscription = (lam != nullptr && lam->retType != nullptr);
+    if (hasAscription) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "the `new()` shorthand is not permitted at a lambda's return. "
+            "§17.7 grants the shorthand exactly four positions — field "
+            "initializers, typed local-variable declarations, default "
+            "parameter values, and a `return` statement of a method with a "
+            "declared return type — and excludes this one: \"It is not "
+            "permitted at an expression body or at a lambda's ascribed "
+            "return\". Name the type explicitly (`" + named +
+                "`) (§17.7, v0.306)");
+    } else {
+        // fix #4498 (§17.7, v0.306): the lambda has no `: T` ascription; its
+        // return type arrived only from the outer target type. Cite the
+        // general-expression-context clause, not the ascribed-return carve-out.
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "the `new()` shorthand is not permitted at a lambda's return when "
+            "the type must be inferred from context. "
+            "§17.7 grants the shorthand exactly four positions — field "
+            "initializers, typed local-variable declarations, default "
+            "parameter values, and a `return` statement of a method with a "
+            "declared return type — and excludes it in general expression "
+            "contexts where the type would have to be inferred from broader "
+            "context. Name the type explicitly (`" + named +
+                "`) (§17.7, v0.306)");
+    }
 }
 
 // fix s17_7_0008 (§17.7, v0.307): see the declaration in
@@ -11512,7 +11537,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     dynamic_cast<const ast::NewExpr*>(lam->exprBody.get())) {
                 if (!shNe->type)
                     rejectNewShorthandAtLambdaReturn(
-                        *shNe,
+                        *shNe, lam,
                         currentReturnType_ ? currentReturnType_
                                            : lamTargetRet);
             }

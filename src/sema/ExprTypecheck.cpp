@@ -18825,7 +18825,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (auto* shNe =
                     dynamic_cast<const ast::NewExpr*>(rs->value.get())) {
                 if (!shNe->type)
-                    rejectNewShorthandAtLambdaReturn(*shNe, currentReturnType_);
+                    rejectNewShorthandAtLambdaReturn(
+                        *shNe,
+                        static_cast<const ast::LambdaExpr*>(rs->value.get()),
+                        currentReturnType_);
             }
         }
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
