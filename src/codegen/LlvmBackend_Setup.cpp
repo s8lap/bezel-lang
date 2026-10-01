@@ -23021,6 +23021,12 @@ inline bool markedOwnedSourceEligible(const sema::SemaContext& ctx,
 struct UnwindIneligibleWalker {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
+    // fix #5243 / §28.3 (v0.313): does the `:=` lowering NULL an `owned`
+    // parameter source stored into this target? True iff the target is an
+    // owned class / collection / task field lvalue (the exact predicate the
+    // #5218 null-store in lowerStmt is gated on). Supplied by the Emitter
+    // (the three predicates are Emitter members); unset => never eligible.
+    std::function<bool(const ast::Expr&)> ownedFieldStoreNulls;
 
     // Record the symbol behind an identifier as consumed/ineligible.
     void markIdent(const ast::Expr* e) {
@@ -23529,7 +23535,32 @@ struct UnwindIneligibleWalker {
                     }
                 }
             }
-            bool eligibleSource = markedEligibleSource || indexerSetEligibleSource;
+            // fix #5243 / §28.3 K1.4 / K7.4 (v0.313): a bare `owned` PARAMETER
+            // stored into an owned class / collection / task FIELD
+            // (`self.f := x;`) has its slot nulled right after the store
+            // (#5218, lowerStmt), so the null-guarded unwind disposal is
+            // exactly-once: a throw that PRECEDES the store (or sits on a
+            // sibling branch that never stores) finds the parameter live and
+            // disposes it once; a throw AFTER the store finds the null slot
+            // and skips it (the field owns the value). Tainting it here
+            // dropped the unwind disposal for the no-store throwing path and
+            // leaked the parameter. Restricted to the exact shape the
+            // lowering nulls (`:=`, no `owned` marker, owned-parameter source,
+            // owned field target) so `eligible => nulled` stays exact.
+            bool fieldStoreEligibleSource = false;
+            if (ownedFieldStoreNulls && as->op == ":=" &&
+                !as->valueHasOwnedMarker && as->value && as->target) {
+                if (auto* vid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->value.get())) {
+                    auto* vps = dynamic_cast<sema::ParameterSymbol*>(
+                        ctx.exprSymbol(*vid));
+                    fieldStoreEligibleSource =
+                        vps && vps->modifier == "owned" &&
+                        ownedFieldStoreNulls(*as->target);
+                }
+            }
+            bool eligibleSource = markedEligibleSource || indexerSetEligibleSource ||
+                                  fieldStoreEligibleSource;
             expr(as->value.get(), /*consuming=*/!eligibleSource);
             return;
         }
@@ -23616,6 +23647,10 @@ void Emitter::collectUnwindIneligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     unwindIneligible_.clear();
     UnwindIneligibleWalker w{ctx_, unwindIneligible_};
+    w.ownedFieldStoreNulls = [this](const ast::Expr& t) {
+        return isOwnedClassFieldLvalue(t) || isOwnedCollectionFieldLvalue(t) ||
+               isOwnedTaskField(t);
+    };
     for (auto& s : body) w.stmt(s.get());
 }
 
