@@ -3071,7 +3071,14 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     // qualified name (`C.K`, `Color.Red`, `System.IO.Stream`) is resolved by
     // codegen's constValueForPatternName / enum / type-descriptor handlers and
     // is not the reported defect.
-    if (np->name->parts.size() != 1) return;
+    // §19.3 / Appendix C.1 (v0.313, #5238): a QUALIFIED name denoting a value
+    // type other than the concrete value scrutinee's own (`M.Qt`, `Lib.Qt`)
+    // is the same compile error as the bare form below.
+    if (np->name->parts.size() != 1) {
+        if (TypeSymbol* qts = resolveCasePatternTypeSymbol(np->name->parts))
+            rejectOtherValueTypeNamedPattern(np, qts, scrutDecl);
+        return;
+    }
     std::string_view last = np->name->parts.back();
 
     // (1) Enum-constant pattern: a bare name that is a constant of the scrutinee
@@ -3315,6 +3322,13 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
             reportNamedPatternIsValue(np, last);
             return;
         }
+        // §19.3 / Appendix C.1 (v0.313, #5238): a bare name resolving to an
+        // IMPORTED (or nested) value type is not in `symbols()`, so the
+        // local-type branch above never saw it.
+        if (auto* its = dynamic_cast<TypeSymbol*>(s))
+            rejectOtherValueTypeNamedPattern(np, its, scrutDecl);
+        else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(s))
+            rejectOtherValueTypeNamedPattern(np, nts->type, scrutDecl);
         // Any other resolved symbol kind (TypeSymbol / NestedTypeSymbol /
         // GenericParamSymbol / ConstMemberSymbol / EnumConstantSymbol /
         // TypeAliasSymbol / MethodSymbol …) is a type, constant, or otherwise
@@ -3329,6 +3343,82 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
         "`" + std::string(last) + "` does not name a type or a constant, so it "
         "cannot be a top-level `case` pattern (\xC2\xA7""19.3): a bare "
         "identifier there is a type test, and this name is not in scope");
+}
+
+TypeSymbol* ExprTC::resolveCasePatternTypeSymbol(
+    const std::vector<std::string_view>& parts) {
+    if (parts.empty()) return nullptr;
+    auto descend = [&](TypeSymbol* ts, std::size_t from) -> TypeSymbol* {
+        for (std::size_t i = from; ts && i < parts.size(); ++i) {
+            TypeSymbol* next = nullptr;
+            for (Symbol* m : ts->members)
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m))
+                    if (nt->name == parts[i]) { next = nt->type; break; }
+            ts = next;
+        }
+        return ts;
+    };
+    auto findIn = [&](const std::vector<TypeSymbol*>* types,
+                      std::size_t idx) -> TypeSymbol* {
+        if (!types || idx >= parts.size()) return nullptr;
+        for (TypeSymbol* t : *types)
+            if (t && t->name == parts[idx]) return descend(t, idx + 1);
+        return nullptr;
+    };
+    // §2.2: import alias head.
+    if (auto it = importAliases_.find(std::string(parts[0]));
+        it != importAliases_.end())
+        return findIn(ctx_.importedTypesOf(it->second), 1);
+    // §2.7 rule 2: longest imported-module prefix, then type + nested path.
+    for (std::size_t k = parts.size() - 1; k >= 1; --k) {
+        std::string prefix;
+        for (std::size_t i = 0; i < k; ++i) {
+            if (i) prefix += '.';
+            prefix += std::string(parts[i]);
+        }
+        if (!sourceImports_.count(prefix)) continue;
+        if (const auto* exported = ctx_.importedTypesOf(prefix))
+            return findIn(exported, k);
+    }
+    // This module's own name as the qualifier (`M.Qt`).
+    if (ctx_.module()) {
+        if (auto* md = dynamic_cast<const ast::ModuleDecl*>(ctx_.module()->decl);
+            md && md->name && !md->name->parts.empty() &&
+            md->name->parts.size() < parts.size()) {
+            const std::size_t n = md->name->parts.size();
+            bool match = true;
+            for (std::size_t i = 0; i < n; ++i)
+                if (md->name->parts[i] != parts[i]) { match = false; break; }
+            if (match)
+                for (const auto& sym : ctx_.symbols())
+                    if (auto* ts = dynamic_cast<TypeSymbol*>(sym.get()))
+                        if (ts->name == parts[n]) return descend(ts, n + 1);
+        }
+    }
+    // An enclosing-type nested path (`Outer.Inner`).
+    if (Symbol* head = lookupName(parts[0])) {
+        if (auto* ts = dynamic_cast<TypeSymbol*>(head)) return descend(ts, 1);
+        if (auto* nts = dynamic_cast<NestedTypeSymbol*>(head))
+            return descend(nts->type, 1);
+    }
+    return nullptr;
+}
+
+void ExprTC::rejectOtherValueTypeNamedPattern(const ast::NamedPattern* np,
+                                              const TypeSymbol* ts,
+                                              const TypeRef* scrutDecl) {
+    if (!ts || !scrutDecl || !isValueScrutineeShapeForTypePattern(scrutDecl))
+        return;
+    if (ts->kind != ast::TypeDeclKind::Record &&
+        ts->kind != ast::TypeDeclKind::Enum &&
+        ts->kind != ast::TypeDeclKind::Choice)
+        return;
+    if (scrutDecl->kind == TypeRef::Kind::Named &&
+        static_cast<const void*>(scrutDecl->declaration) ==
+            static_cast<const void*>(ts))
+        return;  // its own type
+    ctx_.diagnostics().report(Severity::Error, np->span.begin,
+                              otherValueTypePatternMessage(np->name->parts.back()));
 }
 
 // §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern that

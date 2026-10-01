@@ -1611,6 +1611,19 @@ private:
     // parameter (a carrier narrowed to a value type keeps its declared
     // Object/interface kind, §12.7 "Value-typed operands"), else `scrutTy`.
     TypeRef* caseScrutineeDeclaredType(const ast::Expr* scrut, TypeRef* scrutTy);
+    // §19.3 / Appendix C.1 (v0.313, #5238): the user/imported TypeSymbol a
+    // top-level NamedPattern's dotted name denotes, mirroring the resolver's
+    // type-position order (§2.2 import alias, §2.7 rule 2 imported-module
+    // prefix, this module's own name prefix, an enclosing-type nested path).
+    // Null when the name is not a type (an enum constant `Color.Red`, a
+    // const, a value).
+    TypeSymbol* resolveCasePatternTypeSymbol(
+        const std::vector<std::string_view>& parts);
+    // The #5188 different-value-type reject for a pattern already known to
+    // name `ts` (record/enum/choice), against the scrutinee's DECLARED type.
+    void rejectOtherValueTypeNamedPattern(const ast::NamedPattern* np,
+                                          const TypeSymbol* ts,
+                                          const TypeRef* scrutDecl);
 
     // §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern
     // that resolves to a runtime VALUE (a local, parameter, or field) rather

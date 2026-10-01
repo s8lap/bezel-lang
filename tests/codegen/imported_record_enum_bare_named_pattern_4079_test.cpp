@@ -222,14 +222,16 @@ BEZEL_TEST(imported_record_enum_bare_named_pattern_4079,
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
-// ── T5 — §19.5 (#1206's `sameType=false` path): an IMPORTED record
-// pattern naming a DIFFERENT record than the scrutinee's static type must
-// NEVER match — the wildcard arm fires, value 0. Guards against a fix
-// that resolves the imported record but always reports a match
-// regardless of identity. Pins `scrutTy->declaration == ts` as the
-// equality criterion, exactly like the local case.
+// ── T5 — Appendix C.1 / §12.7 / §19.3 (v0.313, #5238; flipped from the
+// #4079-era "falls through, value 0" pin): an IMPORTED record pattern naming a
+// DIFFERENT record than the concrete value scrutinee's static type can never
+// match, and C.1 makes it a compile error ("the same concrete operand or
+// scrutinee against a value type other than its own ... is a compile error"),
+// exactly as the local form (#5188). The reject text is pinned by
+// tests/sema/case_type_pattern_qualified_imported_5238_test.cpp; this row pins
+// that the AOT driver rejects the program (it no longer reaches codegen).
 BEZEL_TEST(imported_record_enum_bare_named_pattern_4079,
-           imported_record_bare_nonmatch_falls_through) {
+           imported_record_bare_other_record_rejected_5238) {
     const std::string lib =
         "module LibTwoRec4079; "
         "public record LibPtTwo4079(x: int, y: int); "
@@ -247,7 +249,5 @@ BEZEL_TEST(imported_record_enum_bare_named_pattern_4079,
     BEZEL_EXPECT_TRUE(libH.ok);
     if (!libH.ok) return;
     AppHandle a = buildApp(libH.objPath, app);
-    BEZEL_EXPECT_TRUE(a.ok);
-    if (!a.ok) return;
-    BEZEL_EXPECT_EQ(runExe(a.exePath), 0);
+    BEZEL_EXPECT_FALSE(a.ok);
 }
