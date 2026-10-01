@@ -16904,10 +16904,12 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // and matters only when some visible class is public and neither
     // sealed, closed nor static (§12.4 / §11.7: only such a class can be
     // subclassed by a later module). INTERFACE parent: there is no shared
-    // slot, so the guard is descriptor-only — every known implementer is
-    // matched by its descriptor, and a public interface's unknown
-    // implementer aborts; declined when a known implementer is generic (its
-    // per-instantiation descriptors cannot be enumerated, #1843).
+    // vtable slot, but the receiver's ITABLE entry for the interface is the
+    // same identity (fix-forward #5214) — every known implementer is matched
+    // by its descriptor, an unknown class whose entry is a known
+    // implementation runs that implementation, and any other entry aborts;
+    // declined when a known implementer is generic (its per-instantiation
+    // descriptors cannot be enumerated, #1843).
     bool slotGuard = false;
     bool descGuard = false;
     unsigned guardSlot = 0;
@@ -16946,7 +16948,13 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                 guardDefaultFn = llvm::cast<llvm::Constant>(defFnIt->second);
             }
         } else if (staticType->visibility == ast::Visibility::Public &&
-                   !defaultGeneric) {
+                   !defaultGeneric && ifaceMethodIndex_.count(ms) &&
+                   descArray_.count(staticType)) {
+            // fix-forward #5214: the itable entry (vptr[1] → itab$C$I[k],
+            // §13) plays the vtable slot's role here, so a later module's
+            // class that merely INHERITS a known implementer's body
+            // (`class P: AImpl`, no override) is recognized and dispatched
+            // rather than aborted (MEASURED on 236b0701: abort for 12).
             descGuard = true;
             for (const Branch& b : branches)
                 if (!b.cls->genericParams.empty()) descGuard = false;
@@ -17208,18 +17216,74 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                                   okBB, nextBB);
             builder_.SetInsertPoint(nextBB);
         }
+        // The receiver's implementation of `ms`, by identity: its vtable
+        // slot (class parent) or, fix-forward #5214, its itable entry for the
+        // interface (interface parent: vptr[1] = itmap, bz_itable_lookup(itmap,
+        // td$I)[k], the same load the ordinary §13 dispatch performs). Both
+        // hold the declarer's exported function for an implementation on a
+        // non-generic chain, one symbol with one address in every module.
+        llvm::Value* slotFn = nullptr;
         if (slotGuard) {
-            llvm::Value* slotFn = builder_.CreateLoad(
+            slotFn = builder_.CreateLoad(
                 ptrTy(),
                 builder_.CreateGEP(ptrTy(), vptr,
                                    {builder_.getInt32(guardSlot)}),
                 "vgen.slot");
+        } else if (descGuard) {
+            llvm::Value* itmapPtr = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}),
+                "vgen.itmap");
+            auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                      {ptrTy(), ptrTy()});
+            llvm::Value* itab = builder_.CreateCall(
+                lookupFn, {itmapPtr, descArray_.find(staticType)->second},
+                "vgen.itab");
+            // A receiver whose itmap lacks the interface is impossible for a
+            // typed program (bezel_runtime_itable.cpp); keep the abort below
+            // reachable rather than dereferencing null.
+            llvm::BasicBlock* haveBB =
+                llvm::BasicBlock::Create(llvm_, "vgen.itab.ok", currentFn_);
+            llvm::BasicBlock* noneBB =
+                llvm::BasicBlock::Create(llvm_, "vgen.itab.none", currentFn_);
+            builder_.CreateCondBr(builder_.CreateIsNull(itab), noneBB, haveBB);
+            builder_.SetInsertPoint(haveBB);
+            slotFn = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(
+                    ptrTy(), itab,
+                    {builder_.getInt32(ifaceMethodIndex_.find(ms)->second)}),
+                "vgen.ifn");
             llvm::BasicBlock* nextBB =
                 llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
-            builder_.CreateCondBr(
-                builder_.CreateICmpEQ(slotFn, guardDefaultFn, "vgen.inh"),
-                okBB, nextBB);
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(noneBB);
+            // Fall to the abort with a null probe (compares all false).
+            builder_.CreateBr(nextBB);
             builder_.SetInsertPoint(nextBB);
+            llvm::PHINode* phi = builder_.CreatePHI(ptrTy(), 2, "vgen.probe");
+            phi->addIncoming(slotFn, haveBB);
+            phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), noneBB);
+            slotFn = phi;
+            // The default implementation's own identity, when its declarer
+            // chain is non-generic (the class-parent `guardDefaultFn`).
+            bool defChainGeneric = false;
+            for (const sema::TypeSymbol* t = defaultImpl->parent; t;
+                 t = baseClassOf(t))
+                if (!t->genericParams.empty()) defChainGeneric = true;
+            auto dfit = methodFns_.find(defaultImpl);
+            if (!defChainGeneric && dfit != methodFns_.end() && dfit->second)
+                guardDefaultFn = llvm::cast<llvm::Constant>(dfit->second);
+        }
+        if (slotFn) {
+            if (guardDefaultFn) {
+                llvm::BasicBlock* nextBB =
+                    llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(slotFn, guardDefaultFn, "vgen.inh"),
+                    okBB, nextBB);
+                builder_.SetInsertPoint(nextBB);
+            }
             // A later module's class inheriting a KNOWN override (no
             // override of its own) runs that override's specialization.
             // Only an override declared on a non-generic chain has a shared
@@ -17229,6 +17293,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             for (std::size_t i = 0; i < branches.size(); ++i) {
                 const Branch& b = branches[i];
                 if (b.hasSubst || b.desc || !b.impl->parent ||
+                    (b.impl == defaultImpl && guardDefaultFn) ||
                     !seenImpl.insert(b.impl).second)
                     continue;
                 bool genericChain = false;

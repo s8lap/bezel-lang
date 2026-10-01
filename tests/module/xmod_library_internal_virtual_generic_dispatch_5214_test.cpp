@@ -594,4 +594,55 @@ BEZEL_TEST(xmod_library_internal_virtual_generic_dispatch_5214,
         {lib, app + mainOf5214("RI5214.Run(new EImpl5214())")}));
 }
 
+// INTERFACE parent, fix-forward #5214 (§12.1 / §13 / §14.2, v0.313): an
+// importer class that merely INHERITS a library implementer's virtual body
+// runs that body — the receiver's itable entry for the interface is the
+// library's exported function. On 236b0701 the interface guard was
+// descriptor-only and such a correct program aborted (MEASURED by the
+// non-author review: abort for 12). An importer class that OVERRIDES the
+// body is the later-module override the library cannot specialize, and
+// aborts; a GENERIC importer subclass with no override inherits the body
+// like the non-generic one.
+BEZEL_TEST(xmod_library_internal_virtual_generic_dispatch_5214,
+           spec_14_2_interface_parent_importer_inherits_library_implementer) {
+    const std::string lib =
+        "module SK5214; "
+        "public interface IG5214 "
+        "  method VI<T>(x: T): int; "
+        "end IG5214; "
+        "public class AImpl5214: IG5214 "
+        "  public constructor() end constructor; "
+        "  public virtual method VI<T>(x: T): int return 12; end VI; "
+        "end AImpl5214; "
+        "public static class RI5214 "
+        "  public static method Run(g: IG5214): int "
+        "    return g.VI(5); "
+        "  end Run; "
+        "end RI5214; ";
+    const std::string app =
+        "module SL5214; import SK5214; "
+        "class P5214: AImpl5214 "
+        "  public constructor() end constructor; "
+        "end P5214; "
+        "class Q5214: AImpl5214 "
+        "  public constructor() end constructor; "
+        "  public override method VI<T>(x: T): int return 99; end VI; "
+        "end Q5214; "
+        "class GP5214<X>: AImpl5214 "
+        "  public constructor() end constructor; "
+        "end GP5214; ";
+    // inherits the library implementer: the library's body, 12
+    expectValue5214(buildChainAndRun5214(
+                        {lib, app + mainOf5214("RI5214.Run(new P5214())")}),
+                    "12");
+    // overrides it in the later module: loud, never the library's 12
+    expectTrap5214(buildChainAndRun5214(
+        {lib, app + mainOf5214("RI5214.Run(new Q5214())")}));
+    // a generic importer subclass with no override inherits the body too
+    expectValue5214(
+        buildChainAndRun5214(
+            {lib, app + mainOf5214("RI5214.Run(new GP5214<string>())")}),
+        "12");
+}
+
 }  // namespace bezel::module
