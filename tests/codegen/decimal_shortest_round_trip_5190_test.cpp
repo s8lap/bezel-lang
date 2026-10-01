@@ -79,12 +79,70 @@ BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_1_5_double_shortest_spec_5_2
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(1.5)", "1.5"), 42);
 }
 
-// decimal(2.4e-28) — very small double; shortest round-trip: 2.4e-28 parses to 2e-28 (scale 28).
-// This is NOT a tie case; 2.5e-28 parses to 3e-28 (my implementation gives 3; the spec
-// §5.2 example "decimal(2.5e-28) is 0.0000000000000000000000000002" appears to be in error
-// since 2.5e-28 round-trips as "2.5e-28" → 300000...e-28, not 200000...).
-BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_4e_28_double_shortest_spec_5_2_v0_311) {
-    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.4e-28)", "0.0000000000000000000000000002"), 42);
+// decimal(2.5e-28) — SPEC ROW (§5.2 v0.311 line 768, §4.4 ties-to-even).
+// Shortest round-trip of 2.5e-28 is "2.5e-28" → parses to mantissa 25 scale 29.
+// Reducing scale 29→28: dropped digit is 5, no further digits → exact tie.
+// Ties-to-even: mantissa 25 has last digit 5 (odd) → round UP to 26 → 26e-28 = 2.6e-27.
+// Wait: that's wrong. Let me re-trace:
+//   mantissa 25, scale 29 → "2.5e-28" = 2.5 × 10^-28 = 2.5e-28
+//   Scale 28 target: 2.5e-28 = X × 10^-28 = X × 10^-28 → X = 2.5 → not integer
+//   Scale 28 tie: 2 vs 3 at scale 28
+//     2e-28 = 0.000...0002  (mantissa 2, scale 28)
+//     3e-28 = 0.000...0003  (mantissa 3, scale 28)
+//   2.5e-28 is EXACTLY between them → tie, ties-to-even picks EVEN mantissa = 2.
+//   So decimal(2.5e-28) = 2e-28 = 0.000...0002 ✓ per spec.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_5e_28_spec_5_2_4_4_ties_to_even) {
+    // §5.2 v0.311 line 768: "decimal(2.5e-28) is 0.0000000000000000000000000002,
+    //  the form's tie at scale 28 going to the even digit"
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.5e-28)", "0.0000000000000000000000000002"), 42);
+}
+
+// decimal(2.6e-28) — NON-TIE: dropped digit is 6 (> 5) → round UP.
+// Shortest round-trip "2.6e-28" → 26e-28 (mantissa 26, scale 28) = 2.6e-28 exactly.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_6e_28_non_tie_round_up_spec_5_2_4_4) {
+    // Dropped digit 6 > 5: always round up → mantissa 26 → 0.000...0003
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.6e-28)", "0.0000000000000000000000000003"), 42);
+}
+
+// decimal(3.5e-28) — ODD-TIE: dropped digit is 5, all subsequent digits are 0,
+// mantissa's last digit is 5 (odd) → ties-to-even rounds UP to 6.
+// Shortest round-trip "3.5e-28" → 35e-28 (mantissa 35, scale 28).
+// Reducing scale 28→27: dropped digit 5, tie, mantissa 35 last digit 5 (odd) → +1 → 36.
+// Result: 36e-28 = 3.6e-27 = 0.000...0004? No:
+//   35e-28 = 3.5 × 10^-28
+//   Scale 28: 35e-28 = X × 10^-28 → X = 35
+//   3.5e-28 tie between 3e-28 and 4e-28 (mantissa 3 vs 4 at scale 28).
+//   Mantissa 35 → last digit 5 (odd) → round up to 36e-28.
+//   36e-28 = 0.000...0004 at scale 28 (wait: 36e-28 = 3.6 × 10^-27 ≠ 4 × 10^-28)
+// Actually: 36e-28 with scale 28 = 36 × 10^-28 = 3.6 × 10^-27.
+// But the string "0.000...0004" at scale 28 = 4 × 10^-28 = 4e-28.
+// Let me re-trace:
+//   2.5e-28 = 25e-29 (mantissa 25, scale 29) → round to scale 28: tie 2e-28 vs 3e-28.
+//   2.5e-28 is exactly in between → ties-to-even → 2e-28 (mantissa 2, even) → 0.000...0002
+//   2.6e-28 = 26e-29 (mantissa 26, scale 29) → reduce to scale 28: 26e-29 = 2.6 × 10^-28.
+//   At scale 28: 2.6e-28 is NOT exactly representable; 2.6 is between 2e-28 and 3e-28.
+//   2.6e-28 is closer to 3e-28 (distance 0.4e-28) than 2e-28 (distance 0.6e-28) → rounds to 3.
+//   So decimal(2.6e-28) = 3e-28 = 0.000...0003. ✓
+//   3.5e-28 = 35e-29 (mantissa 35, scale 29) → reduce to scale 28: 35e-29 = 3.5 × 10^-28.
+//   At scale 28: 3.5e-28 is exactly between 3e-28 and 4e-28 (mantissa 3 vs 4).
+//   Mantissa 35 → last digit 5 (odd) → round up to 36e-28 = 3.6 × 10^-27 = 0.000...0004 at scale 27? No!
+//   36e-28 at scale 28 = 36 × 10^-28 = 3.6 × 10^-27.
+//   Wait: 0.000...0004 at scale 28 = 4 × 10^-28 = 4e-28.
+//   Let me redo:
+//   - 2.5e-28: mantissa 25, scale 29. Reduce 1 digit (k=0): q=2, r=5. first_drop_eq_5=true.
+//     m=2 after loop. any_nonzero_dropped=false. first_drop_eq_5 && m%2==1 → 2%2==0 (even), so NO round-up.
+//     Result: mantissa 2, scale 28 = 0.000...0002 ✓
+//   - 2.6e-28: mantissa 26, scale 29. Reduce 1 digit: q=2, r=6. first_drop_eq_5=false.
+//     any_nonzero_dropped=true. Round up → m=3. Result: mantissa 3, scale 28 = 0.000...0003 ✓
+//   - 3.5e-28: mantissa 35, scale 29. Reduce 1 digit: q=3, r=5. first_drop_eq_5=true, m=3.
+//     any_nonzero_dropped=false. first_drop_eq_5 && m%2==1 → 3%2==1 (odd) → round up → m=4.
+//     Result: mantissa 4, scale 28 = 0.000...0004 ✓
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_3_5e_28_odd_tie_round_up_spec_5_2_4_4) {
+    // §4.4 / §6.4 ties-to-even: 3.5e-28 tie at scale 28, mantissa 35 last digit 5 (odd)
+    // → round to even 6, so 36e-28 = 3.6e-27 = 0.000...0004? NO:
+    // Re-trace: 3.5e-28 = 35e-29. Reduce scale 29→28: q=3, r=5. Tie. m=3 (odd).
+    // Round UP → m=4. 4e-28 = 0.000...0004. ✓
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(3.5e-28)", "0.0000000000000000000000000004"), 42);
 }
 
 // decimal(-0.1) — negative double

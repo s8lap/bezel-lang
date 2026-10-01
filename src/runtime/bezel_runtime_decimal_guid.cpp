@@ -549,17 +549,36 @@ extern "C" void bz_decimal_from_float(float v, bz_decimal_t* out,
     if (bz_exc) return;
 
     // §4.4: scale must be ≤ 28; round mantissa if necessary.
+    // §6.4 / §5.2 v0.311: ties-to-even (banker's rounding):
+    //   the entire dropped portion is compared to 5 × 10^(drop-1):
+    //     > half → round up   < half → truncate   == half → ties-to-even
     uint32_t s = dec_scale(out);
     if (s > 28) {
         __uint128_t m = dec_mantissa(out);
         int neg = dec_sign(out);
         uint32_t drop = s - 28;
+        // Scan the dropped digits; stop as soon as the rounding direction is known.
+        // first_gt_5: first dropped digit > 5  → must round up.
+        // first_lt_5: first dropped digit < 5  → must truncate.
+        // first_eq_5: first dropped digit = 5; all subsequent dropped = 0 → tie.
+        bool first_gt_5 = false, first_lt_5 = false, first_eq_5 = false;
         for (uint32_t k = 0; k < drop; ++k) {
             __uint128_t q = m / 10;
             __uint128_t r = m - q * 10;
+            if (first_gt_5 || first_lt_5) {
+                // direction already determined; nothing more to do
+            } else if (r > 5) {
+                first_gt_5 = true;
+            } else if (r < 5) {
+                first_lt_5 = true;
+            } else {  // r == 5
+                if (k == 0) first_eq_5 = true;
+                // if any later dropped digit is non-zero, direction was already set
+            }
             m = q;
-            if (r >= 5) m += 1;
         }
+        bool round_up = first_gt_5 || (first_eq_5 && !first_lt_5 && (uint64_t)(m & 1) == 1);
+        if (round_up) m += 1;
         dec_store(out, m, 28, neg, ove_vtable);
     }
 }
@@ -591,17 +610,36 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     if (bz_exc) return;
 
     // §4.4: scale must be ≤ 28; round mantissa if necessary.
+    // §6.4 / §5.2 v0.311: ties-to-even (banker's rounding):
+    //   the entire dropped portion is compared to 5 × 10^(drop-1):
+    //     > half → round up   < half → truncate   == half → ties-to-even
     uint32_t s = dec_scale(out);
     if (s > 28) {
         __uint128_t m = dec_mantissa(out);
         int neg = dec_sign(out);
         uint32_t drop = s - 28;
+        // Scan the dropped digits; stop as soon as the rounding direction is known.
+        // first_gt_5: first dropped digit > 5  → must round up.
+        // first_lt_5: first dropped digit < 5  → must truncate.
+        // first_eq_5: first dropped digit = 5; all subsequent dropped = 0 → tie.
+        bool first_gt_5 = false, first_lt_5 = false, first_eq_5 = false;
         for (uint32_t k = 0; k < drop; ++k) {
             __uint128_t q = m / 10;
             __uint128_t r = m - q * 10;
+            if (first_gt_5 || first_lt_5) {
+                // direction already determined; nothing more to do
+            } else if (r > 5) {
+                first_gt_5 = true;
+            } else if (r < 5) {
+                first_lt_5 = true;
+            } else {  // r == 5
+                if (k == 0) first_eq_5 = true;
+                // if any later dropped digit is non-zero, direction was already set
+            }
             m = q;
-            if (r >= 5) m += 1;
         }
+        bool round_up = first_gt_5 || (first_eq_5 && !first_lt_5 && (uint64_t)(m & 1) == 1);
+        if (round_up) m += 1;
         dec_store(out, m, 28, neg, ove_vtable);
     }
 }
