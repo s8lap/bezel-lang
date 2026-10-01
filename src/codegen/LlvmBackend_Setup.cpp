@@ -30089,7 +30089,11 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     auto* ms = dynamic_cast<sema::MethodSymbol*>(
         call.callee ? ctx.exprSymbol(*call.callee) : nullptr);
     if (!ms || ms->isOperator || ctx.isImported(ms)) return false;
-    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    auto* md = dynamic_cast<const ast::MethodDecl*>(
+        // SEAM-DEBT: #5129 — class-3 read on ms->decl; the callee-body
+        // walk needs the AST. An imported callee is refused just above, so
+        // it fails closed (ESCAPE → leak, never an early release).
+        ms->decl);
     if (!md || md->genericParams.empty()) return false;
     for (auto mod : md->modifiers)
         if (mod == "async") return false;
