@@ -2086,6 +2086,34 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             ctx_.exprSymbol(*as->value))
                         nullTransferredOwnedLocalSlot(as->value.get());
                 }
+                // fix #5218 (§28.3 K7.4 / K1.4, v0.313): a bare `owned`
+                // PARAMETER stored into an `owned` field transfers its
+                // obligation into the field. The ownership pass models that
+                // as a discharge of the parameter (handleOwnedFieldAssignment),
+                // and when the store sits on only ONE branch the join with the
+                // untouched path leaves the parameter flagged for the §28.3
+                // method-end auto-drop (`autoDropAtScopeEnd`). The spec makes
+                // that drop PER-PATH ("scope-end disposal is per-path", K1.4 /
+                // K7.4: a transferred value is in moved-from state "so the
+                // scope-end disposal skips it"), so null the parameter slot at
+                // the transfer, exactly as the call-argument and collection-Add
+                // transfers do: the null-guarded auto-drop then skips the
+                // moved path and still disposes the no-store path. Without
+                // this the drop freed the object the field now owns
+                // (heap-use-after-free). Self-gated: only an `owned`
+                // parameter source into an owned class/collection/task field.
+                if (as->value && !as->valueHasOwnedMarker) {
+                    if (auto* vid = dynamic_cast<const ast::IdentifierExpr*>(
+                            as->value.get())) {
+                        auto* vps = dynamic_cast<sema::ParameterSymbol*>(
+                            ctx_.exprSymbol(*vid));
+                        if (vps && vps->modifier == "owned" &&
+                            (isOwnedClassFieldLvalue(*as->target) ||
+                             isOwnedCollectionFieldLvalue(*as->target) ||
+                             isOwnedTaskField(*as->target)))
+                            nullTransferredOwnedLocalSlot(as->value.get());
+                    }
+                }
                 // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
                 // NORMAL-EXIT boundary. This is the end of the whole `:=` store
                 // sequence, so the instance is observed in the state the store
