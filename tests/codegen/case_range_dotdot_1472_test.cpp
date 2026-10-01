@@ -92,11 +92,39 @@ bool rejectedAsNullableScrutineePattern(const std::string& program) {
 }  // namespace
 
 BEZEL_TEST(case_range_dotdot_1472, nullable_present_value_dotdot_rejected) {
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): an UN-narrowed nullable
+    // scrutinee (a bare parameter here) still rejects. The narrowed
+    // variant is admitted — covered by `_admitted_5173` below.
     BEZEL_EXPECT_TRUE(rejectedAsNullableScrutineePattern(
-        "module M; class App public static method Main(): int "
-        "  var x: int? := 5; "
+        "module M; class App public static method Main(x: int?): int "
         "  return (case x of .. => 7, null => 9); "
         "end Main; end App;"));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed nullable scrutinee,
+// bare `..` range pattern. patternMatches's `isNullableVal` branch unwraps
+// the `{i8, i32}` box; the bare `..` reduces to `hasVal` for a narrowed
+// read (the value is present) and selects the `..` arm.
+//
+// `Main(x: int?)` is NOT a §33.2 entry-point signature (only `Main()` or
+// `Main(args: Array<string>)` are); Helper.Get() returns `int?` so
+// `valueProvesNonNull` returns false and `x` is NOT narrowed at the
+// declaration — the `if x <> null then` block narrows `x` for the case
+// form (§7.4; §19.1).
+BEZEL_TEST(case_range_dotdot_1472,
+           narrowed_nullable_dotdot_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 5; end Get; end Helper; "
+        "class App public static method Main(): int "
+        "  var x: int? := Helper.Get(); "
+        "  if x <> null then "
+        "    return (case x of .. => 7, null => 9); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
 BEZEL_TEST(case_range_dotdot_1472, nullable_null_value_dotdot_rejected) {

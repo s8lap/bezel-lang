@@ -77,18 +77,24 @@ BEZEL_TEST(case_decimal_pattern_1152, constant_scale_insensitive) {
     BEZEL_EXPECT_EQ(run(decCase("1.00m", "1.0m => 7")), 7);
 }
 
-// §19.3 / §7.11 (v0.286, #3298) — REJECTION, reversing the acceptance this row
-// used to assert. A relational pattern over a NULLABLE scrutinee is a compile
-// error: "ordering admits no absent participant (§7.11), and pattern position
-// performs no narrowing" (§19.3). The CONSTANT arm over a nullable scrutinee is
-// untouched — §19.3: "Constant patterns over a nullable scrutinee are
-// unaffected: a constant pattern is the equality test of §8.4, which is total
-// on `null`" — so the second row below is the acceptance control that keeps the
-// #1152 bz_decimal_cmp constant path covered at `decimal?`.
+// §19.3 / §7.11 (v0.286, #3298; v0.310, #5143 ruling) — REJECTION for an
+// UN-narrowed nullable scrutinee, reversing the acceptance this row used to
+// assert. A relational pattern over a NULLABLE scrutinee is a compile error:
+// "ordering admits no absent participant (§7.11)" (§19.3). The CONSTANT arm
+// over a nullable scrutinee is untouched — §19.3: "Constant patterns over a
+// nullable scrutinee are unaffected: a constant pattern is the equality test
+// of §8.4, which is total on `null`" — so the second row below is the
+// acceptance control that keeps the #1152 bz_decimal_cmp constant path
+// covered at `decimal?`.
+//
+// fix #5173 / §19.3 (v0.310): a §7.4-narrowed non-null read of a nullable
+// scrutinee is now ADMITTED. The narrowed variant is covered by the
+// `_admitted_5173` test below — runAot over the lowered program selects the
+// `< 2m` arm and prints `1`, exercising bz_decimal_cmp on the unwrapped
+// `%bz.decimal` payload.
 BEZEL_TEST(case_decimal_pattern_1152, nullable_relational_arm_rejected) {
     auto r = runAot(
-        "module M; class App public static method Main(): int "
-        "  var x: decimal? := 3.5m; "
+        "module M; class App public static method Main(x: decimal?): int "
         "  return (case x of < 2m => 1, 3.5m => 7, _ => 4); end Main; end App;");
     BEZEL_EXPECT_FALSE(r.ran);
     bool sawRule = false;
@@ -98,6 +104,35 @@ BEZEL_TEST(case_decimal_pattern_1152, nullable_relational_arm_rejected) {
             d.message.find("19.3") != std::string::npos)
             sawRule = true;
     BEZEL_EXPECT_TRUE(sawRule);
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed nullable decimal
+// scrutinee, relational pattern. patternMatches's `isNullableVal` branch
+// unwraps the `{i8 hasValue; %bz.decimal payload}` box, and the relational
+// pattern routes through `bz_decimal_cmp` (#1152 path) on the bare
+// `%bz.decimal` payload.
+//
+// `Main(x: decimal?)` is NOT a §33.2 entry-point signature (only `Main()` or
+// `Main(args: Array<string>)` are), so a parameter-driven form never runs to
+// completion — runAot's driver fails the entry-point check. Helper.Get() returns
+// `decimal?` (the declared-null form), so `valueProvesNonNull` returns false and
+// `x` is NOT narrowed at the declaration; the `if x <> null then` block narrows
+// `x` for the case form (§7.4; §19.1 reads the scrutinee's nullability after
+// narrowing, as §7.11 reads an operand's).
+BEZEL_TEST(case_decimal_pattern_1152,
+           nullable_relational_arm_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): decimal? "
+        "  return 1.0m; end Get; end Helper; "
+        "class App public static method Main(): int "
+        "  var x: decimal? := Helper.Get(); "
+        "  if x <> null then "
+        "    return (case x of < 2m => 1, 3.5m => 7, _ => 4); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 BEZEL_TEST(case_decimal_pattern_1152, nullable_constant_arm_still_accepted) {

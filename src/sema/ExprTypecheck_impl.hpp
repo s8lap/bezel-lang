@@ -2680,13 +2680,16 @@ private:
     // case of its own.
     TypeRef* operandStaticTypeAt(const ast::Expr* e, TypeRef* declared);
 
-    // §19.3 / §16.6 / §7.11 (v0.286, #3298): reject a relational or range
-    // pattern in `arms` when the scrutinee's static type is nullable. Shared by
-    // the CaseExpr and CaseStmt sites — the two forms take the same rule and
-    // the same diagnostic, and §19.3 keys the rejection on the pattern's KIND,
-    // not on which bounds are written.
+    // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): reject a
+    // relational or range pattern in `arms` when the scrutinee's static type
+    // is nullable — EXCEPT when the scrutinee Expr is a §7.4-narrowed
+    // non-null read of the nullable scrutinee. Shared by the CaseExpr and
+    // CaseStmt sites — the two forms take the same rule and the same
+    // diagnostic, and §19.3 keys the rejection on the pattern's KIND, not on
+    // which bounds are written.
     void checkOrderingPatternsOverNullableScrutinee(
-        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
+        const ast::Expr* scrutinee = nullptr);
 
     // §19.3 (v0.294, #3692): the single-pattern walk `
     // checkOrderingPatternsOverNullableScrutinee` runs per arm — factored out

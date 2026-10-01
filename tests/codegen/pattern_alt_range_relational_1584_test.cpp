@@ -137,11 +137,39 @@ bool altRangeOverNullableRejected(const std::string& prog) {
 }  // namespace
 
 BEZEL_TEST(codegen_alt_range_1584, null_or_range_member_over_nullable_rejected) {
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): an UN-narrowed nullable
+    // scrutinee (a bare parameter here) still rejects. The narrowed
+    // variant is admitted — covered by `_admitted_5173` below.
     BEZEL_EXPECT_TRUE(altRangeOverNullableRejected(
-        "module M; class C public static method Main(): int "
-        "  var x: int? := 3; "
+        "module M; class C public static method Main(x: int?): int "
         "  return (case x of null | 1..5 => 8, _ => 0); "
         "end Main; end C;"));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed nullable scrutinee
+// with a `null | 1..5` alternative list. The `null` member is unaffected
+// (§19.3 constant-path); the `1..5` member runs the narrowed range pattern
+// via patternMatches's `isNullableVal` branch.
+//
+// `Main(x: int?)` is NOT a §33.2 entry-point signature (only `Main()` or
+// `Main(args: Array<string>)` are); Helper.Get() returns `int?` so
+// `valueProvesNonNull` returns false and `x` is NOT narrowed at the
+// declaration — the `if x <> null then` block narrows `x` for the case
+// form (§7.4; §19.1).
+BEZEL_TEST(codegen_alt_range_1584,
+           null_or_range_member_over_narrowed_nullable_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 3; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var x: int? := Helper.Get(); "
+        "  if x <> null then "
+        "    return (case x of null | 1..5 => 8, _ => 0); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 8);
 }
 
 // The absent-case member alone is still admitted: `null` is not an ordering

@@ -892,19 +892,24 @@ BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_null_738) {
 // §19.3 / §16.6 (v0.286, #3298) — REJECTION, reversing #738's two acceptance
 // rows. #738 taught the nullable-value RangePattern lowering ("matches hasValue
 // AND in-range"); v0.267 deliberately overrode that reading (proposal 0114's
-// declined D5) and §19.3 now reads: "A nullable scrutinee — value or reference
-// — is a compile error at a relational pattern, and at a range pattern (§16.6)
-// alike: ordering admits no absent participant (§7.11), and pattern position
-// performs no narrowing." An explicit `null` arm beside the range does not
-// rescue it — the rejection is on the range pattern itself. The absent case is
-// written `case x of null => …, var n: int when n >= 5 and n <= 10 => …`.
+// declined D5) and §19.3 (v0.310, #5143 ruling) reads: "A nullable scrutinee
+// — value or reference — is a compile error at a relational pattern, and at a
+// range pattern (§16.6) alike: ordering admits no absent participant (§7.11)"
+// for an UN-narrowed scrutinee. An explicit `null` arm beside the range does
+// not rescue it — the rejection is on the range pattern itself. The absent
+// case is written `case x of null => …, var n: int when n >= 5 and n <= 10
+// => …`.
+//
+// fix #5173 (v0.310): a §7.4-narrowed non-null read of a nullable scrutinee
+// is ADMITTED. The narrowed variant is covered by
+// `range_pattern_over_narrowed_nullable_value_admitted_5173` below — runAot
+// over the lowered program selects the `5..10` arm and prints `1`.
 //
 // #738's OTHER subject — a typed binding pattern over a nullable scrutinee —
 // is unaffected and still covered by the rows above.
 BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_rejected_3298) {
     auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "  var x: int? := 5; "
+        "module M; class C public static method Main(x: int?): int "
         "  var v := (case x of null => 0, 5..10 => 1, _ => 2); "
         "  return v; end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
@@ -915,6 +920,32 @@ BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_rejected_3298) {
             d.message.find("19.3") != std::string::npos)
             sawRule = true;
     BEZEL_EXPECT_TRUE(sawRule);
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed nullable scrutinee,
+// range pattern. patternMatches's `isNullableVal` branch unwraps the
+// `{i8 hasValue; i32 payload}` box and runs the range comparison on the
+// inner `i32`.
+//
+// `Main(x: int?)` is NOT a §33.2 entry-point signature (only `Main()` or
+// `Main(args: Array<string>)` are); Helper.Get() returns `int?` so
+// `valueProvesNonNull` returns false and `x` is NOT narrowed at the
+// declaration — the `if x <> null then` block narrows `x` for the case
+// form (§7.4; §19.1).
+BEZEL_TEST(codegen_cg28,
+           range_pattern_over_narrowed_nullable_value_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 7; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var x: int? := Helper.Get(); "
+        "  if x <> null then "
+        "    return (case x of null => 0, 5..10 => 1, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // The same program with the range arm replaced by a guarded typed binding —

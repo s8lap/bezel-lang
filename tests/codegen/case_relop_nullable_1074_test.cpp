@@ -30,9 +30,10 @@ using bezel::test::runAot;
 
 namespace {
 
-// §19.3 / §16.6 / #3298 (v0.267): a relational pattern over a nullable
-// scrutinee is rejected at sema. runAot returns ran=false when bezelc
-// emits a diagnostic; that's the assertion below.
+// §19.3 / §16.6 / #3298 (v0.267; v0.310, #5143 ruling): a relational pattern
+// over an UN-narrowed nullable scrutinee is rejected at sema. runAot returns
+// ran=false when bezelc emits a diagnostic; the assertion below confirms the
+// specific §19.3/§16.6/§7.11 needle.
 bool runs(const std::string& prog) {
     return runAot(prog).ran;
 }
@@ -40,52 +41,188 @@ int run(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
-std::string caseProg(const std::string& init, const std::string& arm) {
-    return std::string("module M; class C public static method Main(): int "
-                       "  var n: int? := ") + init + "; "
-           "  var r := (case n of " + arm + ", _ => 2); "
+// §19.3 (v0.310, #5143 ruling): the caseProg helper takes an un-narrowed
+// scrutinee — a parameter `n: int?` is not in `nullNarrowed_`, so the gate
+// fires. The original `var n: int? := <init>` form narrowed `n` at the
+// assignment (narrowOnAssignment's `valueProvesNonNull(5, int?) = true`)
+// which made the gate vacuous after #5173; the parameter form restores the
+// un-narrowed condition #1074 originally pinned.
+std::string caseProg(const std::string& arm) {
+    return std::string("module M; class C public static method Main(n: int?): int "
+                       "  var r := (case n of ") + arm + ", _ => 2); "
            "  return r; end Main; end C;";
+}
+// Assert that `prog` is rejected at sema with the §19.3/§16.6/§7.11
+// relational-pattern needle — strict, not just `!r.ran`.
+bool rejectedAsNullableOrderingPattern(const std::string& prog) {
+    auto r = bezel::test::runAot(prog);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("relational pattern requires a non-nullable scrutinee") ==
+                std::string::npos)
+            continue;
+        if (m.find("19.3") == std::string::npos) continue;
+        if (m.find("16.6") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
 }
 }  // namespace
 
-// §19.3 / v0.267 / #3298: a present value with a relational pattern is no
-// longer admitted — sema rejects the form. Inverted from #1074's
-// acceptance that pinned `nv.relop.match`'s silent-never-match.
+// §19.3 / v0.267 / #3298; v0.310 / #5143 ruling: a present value with a
+// relational pattern over an UN-narrowed nullable scrutinee still rejects.
+// Inverted from #1074's acceptance that pinned `nv.relop.match`'s
+// silent-never-match.
 BEZEL_TEST(case_relop_nullable_1074, present_value_matches_gt_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(caseProg("5", "> 3 => 1")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
 }
 
-// §19.3 / v0.267 / #3298: a null scrutinee with a relational pattern is no
-// longer silently handled — sema rejects.
+// §19.3 / v0.267 / #3298; v0.310 / #5143 ruling: an un-narrowed nullable
+// scrutinee with a relational pattern still rejects. (The narrowed variant
+// is covered by `_admitted_5173` below.)
 BEZEL_TEST(case_relop_nullable_1074, null_scrutinee_falls_through_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(caseProg("null", "> 3 => 1")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
 }
 
 // Boundary on `>`: still rejected (semantically meaningless once the
 // pattern's scrutinee precondition is gone).
 BEZEL_TEST(case_relop_nullable_1074, present_value_below_boundary_gt_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(caseProg("3", "> 3 => 1")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
 }
 
 // `<=` at boundary — same gate.
 BEZEL_TEST(case_relop_nullable_1074, present_value_matches_le_boundary_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(caseProg("3", "<= 3 => 8")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("<= 3 => 8")));
 }
 
 // `<` and `>=`: both spellings rejected.
 BEZEL_TEST(case_relop_nullable_1074, lt_and_ge_forms_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(caseProg("2", "< 5 => 4")));
-    BEZEL_EXPECT_FALSE(runs(caseProg("7", ">= 7 => 6")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("< 5 => 4")));
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg(">= 7 => 6")));
 }
 
 // A relational arm first, then a constant arm on the same nullable
 // scrutinee — the relational arm is the one that triggers the new gate.
 BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm_rejected_v0_267) {
-    BEZEL_EXPECT_FALSE(runs(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 10; "
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+        "module M; class C public static method Main(n: int?): int "
         "  var r := (case n of > 100 => 1, 10 => 5, _ => 2); "
         "  return r; end Main; end C;"));
+}
+
+// ---------------------------------------------------------------------------
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed non-null reads of a
+// nullable scrutinee are ADMITTED. The narrowed variant runs through
+// patternMatches's `isNullableVal` branch, which extracts the inner `i32`
+// payload and compares against the pattern bound. Each accept row asserts
+// the SELECTED arm's value on stdout.
+// ---------------------------------------------------------------------------
+
+// `n` narrowed by `if n <> null`; `5` matches `> 3` and selects 1.
+//
+// `Main(n: int?)` is NOT a §33.2 entry-point signature (only `Main()` or
+// `Main(args: Array<string>)` are); Helper.Get() returns `int?` so
+// `valueProvesNonNull` returns false and `n` is NOT narrowed at the
+// declaration — the `if n <> null then` block narrows `n` for the case
+// form (§7.4; §19.1). The repeated "class helper ... end Helper" prelude is
+// the only way to get a non-literal `int?` initial value at a no-arg Main.
+BEZEL_TEST(case_relop_nullable_1074,
+           present_value_matches_gt_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 5; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of > 3 => 1, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// `n` narrowed, `3` does NOT match `> 3` and selects the `_ => 2` arm.
+BEZEL_TEST(case_relop_nullable_1074,
+           present_value_below_boundary_gt_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 3; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of > 3 => 1, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
+}
+
+// `n` narrowed, `3` matches `<= 3` (boundary inclusive).
+BEZEL_TEST(case_relop_nullable_1074,
+           present_value_matches_le_boundary_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 3; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of <= 3 => 8, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 8);
+}
+
+// `<` and `>=` spellings, narrowed — `2` matches `< 5`; `7` matches `>= 7`.
+BEZEL_TEST(case_relop_nullable_1074,
+           lt_and_ge_forms_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 2; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of < 5 => 4, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);
+    auto r2 = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 7; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of >= 7 => 6, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r2.ran);
+    BEZEL_EXPECT_EQ(r2.exitCode, 6);
+}
+
+// A relational arm then a constant arm, narrowed — `10` does NOT match
+// `> 100`, so the constant arm `10 => 5` selects.
+BEZEL_TEST(case_relop_nullable_1074,
+           relational_then_constant_arm_narrowed_admitted_5173) {
+    auto r = runAot(
+        "module M; class Helper public static method Get(): int? "
+        "  return 10; end Get; end Helper; "
+        "class C public static method Main(): int "
+        "  var n: int? := Helper.Get(); "
+        "  if n <> null then "
+        "    return (case n of > 100 => 1, 10 => 5, _ => 2); "
+        "  end if; "
+        "  return 99; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +319,10 @@ namespace {
 // asserts message TEXT — the same §19.3/§16.6/§7.11 wording the arm-level gate
 // already uses (checkOrderingPatternOverNullableType is the single shared
 // walk), not merely `!r.ran` (which is also true on a runtime signal death).
-bool rejectedAsNullableOrderingPattern(const std::string& prog) {
+// Renamed from rejectedAsNullableOrderingPattern to avoid colliding with the
+// file-level helper above (different strictness: this matches any
+// "pattern requires a non-nullable scrutinee", not just "relational").
+bool rejectedAsNullableOrderingPatternInSlot(const std::string& prog) {
     auto r = bezel::test::runAot(prog);
     if (r.ran) return false;
     for (const auto& d : r.diagnostics.diagnostics()) {
@@ -206,7 +346,7 @@ bool rejectedAsNullableOrderingPattern(const std::string& prog) {
 // null, because the rejection is on the PATTERN'S KIND, not on a runtime
 // value.
 BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_rejected_3692) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record R(X: int?, Y: int); "
         "class C public static method Main(): int "
         "  var r := new R(99, 1); "
@@ -216,7 +356,7 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_range_rejected_3692) {
 
 // §19.3 (v0.294, #3692): the RELATIONAL slot sub-pattern form, same field.
 BEZEL_TEST(case_relop_nullable_1074, nullable_slot_relational_rejected_3692) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record R(X: int?, Y: int); "
         "class C public static method Main(): int "
         "  var r := new R(99, 1); "
@@ -228,7 +368,7 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_relational_rejected_3692) {
 // deep (`Outer(Inner(1..5), b)`), which is a SEPARATE call site
 // (the nested-destructuring worklist) from the top-level slot loop above.
 BEZEL_TEST(case_relop_nullable_1074, nullable_nested_slot_range_rejected_3692) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Inner(V: int?); record Outer(I: Inner, B: int); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(99), 1); "
@@ -296,7 +436,7 @@ BEZEL_TEST(case_relop_nullable_1074, nullable_slot_constant_still_admitted_3692)
 // rejection is on the PATTERN'S KIND, not on a runtime value — mirroring
 // `nullable_slot_range_rejected_3692`'s non-generic form above.
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_rejected_3898) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(99, 1); "
@@ -306,7 +446,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_rejected_
 
 // RELATIONAL form, same generic-field shape.
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_rejected_3898) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(10, 1); "
@@ -319,7 +459,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_relational_pattern_reje
 // above; the fix's CaseStmt-side `substituteGenericFieldType` call must reach
 // it too.
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_stmt_form_rejected_3898) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(3, 1); "
@@ -334,7 +474,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_range_pattern_stmt_form
 // substitution walk must match the RIGHT parameter by name, not just "the
 // first one" or "any one".
 BEZEL_TEST(case_relop_nullable_1074, generic_record_second_type_param_slot_rejected_3898) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Pair<A, B>(X: A, Y: B); "
         "class C public static method Main(): int "
         "  var p := new Pair<int, int?>(1, 3); "
@@ -396,7 +536,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_two_instantiations_valu
 // every `*_rejected_3938` row below FAILS (the program still compiles
 // and runs); restored, all reject on the §19.3/§16.6/§7.11 wording.
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_rejected_3938) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
         "class C public static method Main(): int "
@@ -409,7 +549,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_rejected
 // §19.3 rejection covers both arms' sub-patterns symmetrically (no
 // accidental `r1 = 7`/`r2 = 3` half-rejection).
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match_rejected_3938) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "record Outer<T>(B: Box<T>, Z: int); "
         "class C public static method Main(): int "
@@ -429,7 +569,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_nested_pattern_no_match
 // `generic_record_slot_in_choice_payload_range_pattern_rejected_3938`
 // below rejects its top-level sibling.
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_rejected_3938) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
         "class C public static method Main(): int "
@@ -438,7 +578,7 @@ BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_rejec
         "end Main; end C;"));
 }
 BEZEL_TEST(case_relop_nullable_1074, generic_record_slot_in_choice_payload_no_match_rejected_3938) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(
+    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPatternInSlot(
         "module M; record Box<T>(X: T, Y: int); "
         "choice Wrap<T> Val(B: Box<T>), None; end Wrap; "
         "class C public static method Main(): int "

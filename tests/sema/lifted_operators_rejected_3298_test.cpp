@@ -585,15 +585,43 @@ BEZEL_TEST(lifted_operators_rejected_3298, case_relop_over_nullable_stmt_rejecte
     // case_relop_pattern_over_nullable_rejected's comment. VERIFIED against
     // the real `bezelc -c` with the comma restored: parses cleanly, rejects
     // at the relop pattern (§19.3/§16.6/§7.11).
+    //
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): a §7.4-narrowed non-null read
+    // of the nullable scrutinee is now ADMITTED. A bare parameter `n: int?`
+    // is not narrowed (no `nullNarrowed_` entry) and therefore still rejects
+    // at the relop pattern (the genuinely-un-narrowed case). The narrowed
+    // variant is covered by the next test.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
+        "module M; class C public static method Main(n: int?): int "
         "  case n of "
         "    > 3 => return 1;, "
         "    _ => return 0; "
         "  end case; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): the statement-position `case`
+// over a §7.4-narrowed non-null read of a nullable scrutinee is ADMITTED.
+// The narrowing context (`if n <> null`) puts `n` in `nullNarrowed_`, so
+// `checkOrderingPatternsOverNullableScrutinee`'s `isNarrowedNonNullRead`
+// gate (v0.310) lets the relop pattern through; codegen unwraps the
+// narrowed `{i8 hasValue; i32 payload}` box in patternMatches's
+// `isNullableVal` branch and runs the comparison against the inner value.
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_relop_over_narrowed_nullable_stmt_admitted_5173) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(n: int?): int "
+        "  if n <> null then "
+        "    case n of "
+        "      > 3 => return 1;, "
+        "      _ => return 0; "
+        "    end case; "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 
@@ -626,14 +654,37 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 
 BEZEL_TEST(lifted_operators_rejected_3298,
            case_range_pattern_over_nullable_record_scrutinee_rejected) {
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): a §7.4-narrowed non-null
+    // read of a nullable record scrutinee is now ADMITTED (codegen
+    // unwraps the `{i8 hasValue; <record payload>}` box in patternMatches's
+    // `isNullableVal` branch — records are covered by isNullableValueTy).
+    // A bare parameter that is not narrowed still rejects.
     auto r = parseSemaAll(
         "module M; record R(X: int); "
-        "class C public static method Main(): int "
-        "  var q: R? := new R(1); "
+        "class C public static method Main(q: R?): int "
         "  var v := (case q of .. => 1, _ => 2); "
         "  return v; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed record-scrutinee
+// `case q of .. => 1, _ => 2` is admitted. patternMatches's `isNullableVal`
+// path covers `record?` via `isNullableRecordTy` and unwraps with
+// `nullablePrimValue` exactly as it does for a primitive.
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_range_pattern_over_narrowed_nullable_record_scrutinee_admitted_5173) {
+    auto r = parseSemaAll(
+        "module M; record R(X: int); "
+        "class C public static method Main(q: R?): int "
+        "  if q <> null then "
+        "    var v := (case q of .. => 1, _ => 2); "
+        "    return v; "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
@@ -641,14 +692,42 @@ BEZEL_TEST(lifted_operators_rejected_3298,
     // §7.11: "Nullable **reference** operands take the same answer at their
     // own types (§4.6 for `string`)" — and §19.3 says the same in pattern
     // position.
+    //
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed non-null reads of
+    // a nullable VALUE-typed scrutinee (primitive, enum, decimal, record,
+    // choice) are ADMITTED. Reference types (`string?`) are OUT OF SCOPE:
+    // patternMatches's reference-type relational comparison is not
+    // implemented (it would `CreateICmpSLT` two `bz_string*` pointers — a
+    // silent wrong value). The narrowed reference form is filed separately.
+    // The test below covers the un-narrowed case (a bare parameter is not
+    // narrowed and still rejects).
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var s: string? := \"a\"; "
+        "module M; class C public static method Main(s: string?): int "
         "  var v := (case s of > \"b\" => 1, _ => 2); "
         "  return v; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
 }
+
+// fix-forward #5173 / §19.3 / §7.11: the narrowed nullable reference-
+// typed form (`if s <> null then case s of > "b" => …, …` over `string?`)
+// is now REJECTED — the predicate at `valueTyScrut` excludes `string` and
+// `Object` from the value-primitive family (the same exclusion codegen's
+// `Emitter::isNullablePrimTy` enforces at LlvmBackend_Layout.cpp:755).
+// Pre-fix-forward the predicate's Primitive arm admitted any
+// `TypeRef::Kind::Primitive` regardless of `primitive`, so a narrowed
+// `string?` reached codegen via patternMatches's NON-`isNullableVal` branch
+// and lowered to `CreateICmpSLT(bz_string*, bz_string*)` — a SILENT WRONG
+// VALUE (heap address, not §4.6 ordinal content). The narrowed-string
+// reject is the only behavior flip on a reference-typed scrutinee; its
+// UN-narrowed sibling (`case_relop_pattern_over_nullable_string_scrutinee
+// _rejected` above) was already REJECTED by the loop walk and stays that
+// way. The codegen path for the narrowed reference form is filed
+// separately as issue #5220 (relop against `bz_string*` via
+// `bz_str_compare_cp`, §4.6 ordinal) — once that lands, this predicate
+// can be widened to admit `string?`/`Object?`. The narrowed-string/Object
+// REJECT rows live in tests/sema/scrutinee_string_narrowed_relop_5173_
+// test.cpp alongside the matching VALUE-typed control rows.
 
 BEZEL_TEST(lifted_operators_rejected_3298,
            case_bare_open_range_pattern_over_nullable_rejected) {
@@ -656,13 +735,32 @@ BEZEL_TEST(lifted_operators_rejected_3298,
     // because the rejection is keyed on the pattern's KIND: "a rule that
     // counted bounds would give a range pattern and another range pattern of
     // the same extent opposite verdicts".
+    //
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed nullable scrutinees
+    // are admitted. A bare parameter that is not narrowed still rejects.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
+        "module M; class C public static method Main(n: int?): int "
         "  var v := (case n of .. => 1, _ => 2); "
         "  return v; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed bare-`..` over a
+// nullable scrutinee is ADMITTED. `if n <> null then case n of .. => 1,
+// _ => 2` compiles and selects the in-range arm.
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_bare_open_range_pattern_over_narrowed_nullable_admitted_5173) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(n: int?): int "
+        "  if n <> null then "
+        "    var v := (case n of .. => 1, _ => 2); "
+        "    return v; "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
@@ -670,13 +768,32 @@ BEZEL_TEST(lifted_operators_rejected_3298,
     // §19.3 admits ranges and relationals as binding-free ALTERNATIVE members
     // (`1..5 | 10 => …`), so the walk has to descend into an alternative list
     // or the rule is spelling-dependent inside one arm.
+    //
+    // fix #5173 / §19.3 (v0.310, #5143 ruling): a §7.4-narrowed non-null read
+    // of the nullable scrutinee is now ADMITTED. A bare parameter is not
+    // narrowed and still rejects.
     auto r = parseSemaAll(
-        "module M; class C public static method Main(): int "
-        "  var n: int? := 5; "
+        "module M; class C public static method Main(n: int?): int "
         "  var v := (case n of 1..5 | 10 => 1, _ => 2); "
         "  return v; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// fix #5173 / §19.3 (v0.310, #5143 ruling): the alternative-list member
+// form, narrowed — admitted.
+BEZEL_TEST(lifted_operators_rejected_3298,
+           case_alternative_list_member_range_over_narrowed_nullable_admitted_5173) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(n: int?): int "
+        "  if n <> null then "
+        "    var v := (case n of 1..5 | 10 => 1, _ => 2); "
+        "    return v; "
+        "  end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
@@ -1036,14 +1153,22 @@ BEZEL_TEST(lifted_operators_rejected_3298, section_16_6_parity_in_and_case_agree
 
 BEZEL_TEST(lifted_operators_rejected_3298,
            section_19_3_pattern_position_performs_no_narrowing) {
-    // The one place §17.5 and §19.3 deliberately DISAGREE, recorded so the
-    // next reader does not file it as a defect. §19.3: "pattern position
-    // performs no narrowing" — so a scrutinee whose DECLARED type is nullable
-    // is rejected at a range pattern even where §7.4 has proved it non-null,
-    // while the same narrowing DOES rescue `n in 1..5` (§7.11's static-type
-    // reading, which §17.5 defers to through §5.1). §16.6's parity claim is
-    // stated "over a nullable `v`", i.e. about the un-narrowed operand, and is
-    // pinned by section_16_6_parity_in_and_case_agree above.
+    // §17.5 / §19.3 NOW AGREE on a §7.4-narrowed non-null read of a nullable
+    // scrutinee, after fix #5173 (v0.310, #5143 ruling). v0.286 read §19.3
+    // as "pattern position performs no narrowing" and the case form was the
+    // one place §17.5 and §19.3 DELIBERATELY DISAGREED — the case form was
+    // rejected at a range pattern even where §7.4 had proved the operand
+    // non-null, while the same narrowing DID rescue `n in 1..5` via §7.11's
+    // static-type reading (§17.5 defers to §7.11 through §5.1).
+    //
+    // v0.310 collapses the disagreement. §19.3 now reads the scrutinee's
+    // nullability off the static type AFTER §7.4 narrowing, as §7.11 does;
+    // the pattern rule keys on `isNarrowedNonNullRead(scrutinee)` rather
+    // than on the declared-null flag alone. §16.6's parity claim "over a
+    // nullable `v`" — un-narrowed — is preserved by the bare-parameter reject
+    // (still pinned by case_range_pattern_over_nullable_rejected, the
+    // _rejected rows, and the lit companion at
+    // tests/lit/sema/lifted_ops_3298__range_pattern_bare_open_nullable_rejected.bzl).
     auto narrowedIn = parseSemaAll(
         "module M; class C public static method Main(): int "
         "  var n: int? := 5; "
@@ -1058,8 +1183,11 @@ BEZEL_TEST(lifted_operators_rejected_3298,
         "  if n <> null then v := (case n of 1..5 => 1, _ => 2); end; "
         "  return v; "
         "end Main; end C;");
+    // §7.11's reading (narrowed `n in 1..5`): admitted.
     BEZEL_EXPECT_FALSE(narrowedIn.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasNullablePatternError(narrowedCase));
+    // §19.3 (v0.310): the same narrowing now ALSO admits the case form.
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(narrowedCase));
+    BEZEL_EXPECT_FALSE(narrowedCase.diagnostics.hasErrors());
 }
 
 

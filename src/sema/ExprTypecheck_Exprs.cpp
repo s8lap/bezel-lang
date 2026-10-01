@@ -11940,11 +11940,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(ce->scrutinee.get(), scrutTy);
-        // §19.3 / §16.6 / §7.11 (v0.286, #3298): a relational or range
-        // pattern requires a NON-NULLABLE scrutinee — value or reference, and
-        // keyed on the pattern's KIND rather than on which bounds are written
-        // (§19.3, v0.286). One shared checker with the CaseStmt site below.
-        checkOrderingPatternsOverNullableScrutinee(scrutTy, ce->arms);
+        // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): a
+        // relational or range pattern requires a NON-NULLABLE scrutinee —
+        // value or reference, and keyed on the pattern's KIND rather than on
+        // which bounds are written (§19.3, v0.286). v0.310 / #5143 opens the
+        // gate for a §7.4-narrowed non-null READ of a nullable scrutinee:
+        // `if (n <> null) then case n of 1..5 => 1, _ => 2` is now admitted.
+        // One shared checker with the CaseStmt site below.
+        checkOrderingPatternsOverNullableScrutinee(
+            scrutTy, ce->arms, ce->scrutinee.get());
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee

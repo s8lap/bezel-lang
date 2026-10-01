@@ -12882,13 +12882,13 @@ void ExprTC::checkOrderingPatternOverNullableType(const TypeRef* ty,
                 Severity::Error, q->span.begin,
                 std::string("a ") + (isRel ? "relational" : "range") +
                 " pattern requires a non-nullable scrutinee \xE2\x80\x94 "
-                "ordering admits no absent participant and pattern "
-                "position performs no narrowing (\xC2\xA7""19.3, "
+                "ordering admits no absent participant (\xC2\xA7""19.3, "
                 "\xC2\xA7""16.6, \xC2\xA7""7.11); separate the absent "
                 "case first (`case x of null => \xE2\x80\xA6, "
                 "var v: T when v > 70 => \xE2\x80\xA6, _ => "
                 "\xE2\x80\xA6 end`), or narrow the scrutinee with `??` "
-                "(\xC2\xA7""7.7) or `!` (\xC2\xA7""7.8) before the "
+                "(\xC2\xA7""7.7), `!` (\xC2\xA7""7.8), or an explicit "
+                "`if x <> null then` (\xC2\xA7""7.4) before the "
                 "`case`");
             continue;
         }
@@ -13070,13 +13070,96 @@ void ExprTC::bindNestedDestructuringNames(
     }
 }
 
-// §19.3 / §16.6 / §7.11 (v0.286, #3298): reject a relational or range pattern
-// in `arms` when the ARM SCRUTINEE's static type is nullable. Shared by the
-// CaseExpr and CaseStmt sites via checkOrderingPatternOverNullableType, which
-// also serves the destructuring-slot call sites (#3692).
+// §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): reject a
+// relational or range pattern in `arms` when the ARM SCRUTINEE's static type
+// is nullable — EXCEPT when the scrutinee is a §7.4-narrowed non-null READ of
+// a nullable VALUE-typed scrutinee. v0.310 / #5143 revises v0.286: §19.3 now
+// reads the scrutinee's nullability off the static type AFTER §7.4 narrowing,
+// as §7.11 already does for the binary-operator form (`if (n <> null) then
+// n + 1` is admitted on the narrowed read). The gate must therefore check
+// the EXPRESSION's narrowed-null state (`isNarrowedNonNullRead`), not the
+// type's declared-null flag alone.
+//
+// Scoped to VALUE-typed scrutinees (the value-typed primitives enumerated
+// in `Emitter::isNullablePrimTy` at LlvmBackend_Layout.cpp:755 — Bool/Byte/
+// SByte/Short/UShort/Int/UInt/Long/ULong/Float/Double/Char/Decimal — plus
+// enum, record, choice, unit, and inline-array; matches the codegen
+// `isNullableValueTy` helper in `LlvmBackend_impl.hpp` exactly). A narrowed
+// nullable REFERENCE scrutinee (`string?`, `Object?`, a class or
+// interface?) is NOT admitted here: patternMatches's reference-type
+// relational comparison is not implemented — the RelOpPattern handler at
+// LlvmBackend_Exprs2.cpp:14146 emits `CreateICmpSLT(ptr, ptr)`, comparing
+// pointer addresses rather than the §4.6 ordinal content (`bz_str_compare_cp
+// (lhs, rhs)`); for `string?` narrowing this would silently misorder
+// strings by heap address. The narrowed reference form is filed separately
+// (issue #5220: codegen path for narrowed nullable REFERENCE-typed
+// scrutinees — once that lands with a proper `bz_str_compare_cp` lowering,
+// this predicate can be widened to admit `string?`/`Object?`).
+//
+// Codegen already lowers the admitted value-typed case: patternMatches's
+// `isNullableVal` branch extracts `nullablePrimValue(scrut)` (the unwrapped
+// T field of the `{i8 hasValue; T payload}` box) and runs the
+// relational/range comparison against `innerVal` directly — same path the
+// slot-handlers and the `case.end` lowering have used since #3298 for the
+// SLOT-path-only admission. Sema never rewrites a narrowed operand's
+// `exprType` (it stays `T?`), so the runtime shape (the `{i8; T}` tagged
+// struct) is unchanged at this call site and the existing path runs
+// unmodified.
+//
+// Shared by the CaseExpr and CaseStmt sites via
+// checkOrderingPatternOverNullableType, which also serves the destructuring-
+// slot call sites (#3692, #3938) — those keep the old per-slot-declared-type
+// gate (slots do not admit narrowing).
 void ExprTC::checkOrderingPatternsOverNullableScrutinee(
-        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms) {
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
+        const ast::Expr* scrutinee) {
     if (!scrutTy || !scrutTy->nullable) return;
+    // §19.3 / §7.4 (v0.310, #5143 ruling): a §7.4-narrowed non-null read of
+    // a nullable VALUE-typed scrutinee is a non-nullable operand for this
+    // rule, mirroring §7.11's binary-operator reading. The scrutinee
+    // parameter is OPTIONAL (some destructuring-slot callers reach the
+    // single-pattern walk directly without a scrutinee Expr), but the two
+    // `case` sites always supply it; the fallback path below keeps the
+    // historical reject when no Expr is available or the scrutinee is a
+    // reference type (out of scope for #5173; see header).
+    //
+    // Sema has no `isNullableValueTy` of its own (the codegen helper covers
+    // many kinds in `LlvmBackend_impl.hpp`); the ordering gate needs only
+    // "is this a value type the §19.3 relational/range slot-handler
+    // knows how to compare?". That is the value-typed primitives (mirrors
+    // `Emitter::isNullablePrimTy` at LlvmBackend_Layout.cpp:755 — Bool/Byte/
+    // SByte/Short/UShort/Int/UInt/Long/ULong/Float/Double/Char/Decimal) plus
+    // Unit/InlineArray, and a Named whose declaration is a Record/Enum/Choice.
+    // Everything else (Named+Class, Named+Interface, String, Object, an
+    // unresolved bare type-param like `T?`) is a REFERENCE type and stays
+    // rejected — `string` and `Object` are `PrimitiveType` enum values in
+    // Bezel sema (§3 builtin types, TypeRef.hpp:30) but they lower to heap
+    // pointers (`bz_string*`, `bz_object*`) in codegen, so admitting them
+    // here would route patternMatches past its `isNullableVal` branch and
+    // into the RelOpPattern handler at LlvmBackend_Exprs2.cpp:14146, which
+    // emits `CreateICmpSLT(ptr, ptr)` — a SILENT WRONG CODE (compare
+    // pointer addresses, not the §4.6 ordinal content). The narrowed
+    // reference form is filed separately as #5220 (codegen path with
+    // `bz_str_compare_cp`).
+    using P = PrimitiveType;
+    const bool valueTyScrut =
+        (scrutTy->kind == TypeRef::Kind::Primitive &&
+         (scrutTy->primitive == P::Bool ||
+          scrutTy->primitive == P::Byte || scrutTy->primitive == P::SByte ||
+          scrutTy->primitive == P::Short || scrutTy->primitive == P::UShort ||
+          scrutTy->primitive == P::Int || scrutTy->primitive == P::UInt ||
+          scrutTy->primitive == P::Long || scrutTy->primitive == P::ULong ||
+          scrutTy->primitive == P::Float || scrutTy->primitive == P::Double ||
+          scrutTy->primitive == P::Char ||
+          scrutTy->primitive == P::Decimal)) ||
+        scrutTy->kind == TypeRef::Kind::Unit ||
+        scrutTy->kind == TypeRef::Kind::InlineArray ||
+        (scrutTy->kind == TypeRef::Kind::Named && scrutTy->declaration &&
+         (scrutTy->declaration->kind == ast::TypeDeclKind::Record ||
+          scrutTy->declaration->kind == ast::TypeDeclKind::Enum ||
+          scrutTy->declaration->kind == ast::TypeDeclKind::Choice));
+    if (scrutinee && isNarrowedNonNullRead(scrutinee) && valueTyScrut)
+        return;
     for (const ast::CaseArm& arm : arms)
         checkOrderingPatternOverNullableType(scrutTy, arm.pattern.get());
 }
@@ -22163,10 +22246,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         const_cast<ast::CaseStmt*>(cs)->noMatchEdgeStaticallyDead =
             caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
                                 s.span.begin, /*quiet=*/true);
-        // §19.3 / §16.6 / §7.11 (v0.286, #3298): the statement-position form
-        // takes the same rule as the CaseExpr site — one shared checker, so
-        // the two spellings of `case` cannot drift apart on this verdict.
-        checkOrderingPatternsOverNullableScrutinee(scrutTy, cs->arms);
+        // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): the
+        // statement-position form takes the same rule as the CaseExpr site —
+        // one shared checker, so the two spellings of `case` cannot drift
+        // apart on this verdict. v0.310 opens the gate for a §7.4-narrowed
+        // non-null read of a nullable scrutinee.
+        checkOrderingPatternsOverNullableScrutinee(
+            scrutTy, cs->arms, cs->scrutinee.get());
         // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
         // (statement-position `case` is exempt from exhaustiveness but not from
         // the literal-range gate — codegen would otherwise truncate it).
