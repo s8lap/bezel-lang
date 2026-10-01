@@ -33,7 +33,7 @@ s2_2_0007	pass
 s2_3_0001	pass	
 s2_3_0002	fail	divergence
 s2_3_0003	pass	
-s2_3_0004	fail	divergence
+s2_3_0004	pass	
 s2_3_0005	pass	
 s2_3_0006	pass	
 s2_3_0007	fail	divergence
@@ -298,7 +298,7 @@ s9_2_0018	pass
 s9_2_0019	pass	
 s9_2_0020	pass	
 s9_3_0001	pass	
-s9_3_0002	fail	divergence
+s9_3_0002	pass	
 s9_3_0003	pass	
 s9_3_0004	pass	
 s9_3_0005	pass	
