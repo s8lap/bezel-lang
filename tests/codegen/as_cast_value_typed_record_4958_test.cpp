@@ -35,6 +35,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -128,6 +129,11 @@ BEZEL_TEST(as_cast_value_typed_record_4958,
         "  end Main; "
         "end C; ");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // per §12.7 (v0.313): the specific other-value-type reject, at a real
+    // location, not just "something failed" (#3892).
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "a different value type is a compile error"));
 }
 
 }  // namespace

@@ -13,6 +13,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -90,4 +91,9 @@ BEZEL_TEST(event_handler_overload_selection_4978,
         "  public static method On(x: bool) Console.WriteLine($\"{x}\"); end On;\n",
         "using var d := _src.Subscribe(H.On);"));
     BEZEL_EXPECT_FALSE(r.ran);
+    // per §27.6 (v0.313): the handler-conversion reject, at a real location,
+    // not a crash or timeout masquerading as `!ran` (#3892).
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "is not implicitly convertible to the target type"));
 }
