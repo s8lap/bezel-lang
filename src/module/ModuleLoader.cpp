@@ -15,6 +15,7 @@
 #include "lexer/Lexer.hpp"
 #include "module/ModuleMetadata.hpp"
 #include "module/ModuleMetadataBuilder.hpp"  // kMetadataSectionName
+#include "common/BuiltinRegistry.hpp"
 #include "common/IntLiteral.hpp"
 #include "parser/Parser.hpp"
 #include "sema/ExprTypecheck.hpp"
@@ -335,6 +336,25 @@ struct Loader {
                 break;
             case TypeKind::Named: {
                 ref->kind = sema::TypeRef::Kind::Named;
+                // per §2.2 (v0.313), fix #5241: `<home module>.<Builtin>` is
+                // how the exporter spells an alias-qualified compiler built-in
+                // (ModuleMetadataBuilder::convertType). It names the stdlib
+                // type, never an exported user type, so it takes the builtin
+                // shape (`importedName` = bare name) with NO by-name lookup.
+                {
+                    auto dot = mt.namedName.rfind('.');
+                    if (dot != std::string::npos) {
+                        std::string_view bare =
+                            std::string_view(mt.namedName).substr(dot + 1);
+                        if (common::builtinTypeHomeModuleOf(bare) ==
+                            std::string_view(mt.namedName).substr(0, dot)) {
+                            ref->importedName = ctx.internString(std::string(bare));
+                            for (const MetaType& ga : mt.genericArgs)
+                                ref->genericArgs.push_back(convert(ga));
+                            break;
+                        }
+                    }
+                }
                 ref->declaration = lookupNamed(mt.namedName);
                 // §2.5 / §29.3 (issue #495): when the named type is a builtin
                 // interface or stdlib class (IEnumerable<T>, Array<T>, Task,

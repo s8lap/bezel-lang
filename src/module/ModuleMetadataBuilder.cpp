@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"
 #include "common/IntLiteral.hpp"
 #include "common/OwnershipFacts.hpp"
 #include "lexer/Lexer.hpp"
@@ -179,6 +180,18 @@ MetaType convertType(const sema::TypeRef* ref) {
                 // the type and lowerTypeRef can route it to ptrTy() (or the
                 // appropriate value-type for DateTime/Guid/etc.).
                 t.namedName = std::string(ref->astNode->name->parts[0]);
+                // per §2.2 (v0.313), fix #5241: an alias-qualified built-in
+                // (`D.Stopwatch`, alias segment dropped by sema) must not be
+                // carried as the BARE name, which an importer would rebind to
+                // a same-named public type of this module (or of any module
+                // it imports). Carry the home-module-qualified spelling
+                // instead; ModuleLoader's Loader::convert recognizes it.
+                if (ref->astNode->aliasQualifiedBuiltin) {
+                    std::string_view home =
+                        common::builtinTypeHomeModuleOf(t.namedName);
+                    if (!home.empty())
+                        t.namedName = std::string(home) + "." + t.namedName;
+                }
             }
             for (const sema::TypeRef* arg : ref->genericArgs)
                 t.genericArgs.push_back(convertType(arg));
