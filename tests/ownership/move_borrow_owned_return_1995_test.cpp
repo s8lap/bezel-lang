@@ -152,20 +152,21 @@ BEZEL_TEST(move_borrow_owned_return_1995,
 // §28.8.1: `return move x!;` where `x` is an OWNED local — the legal owned
 // transfer. The caller disposes it exactly once; `x` does not auto-drop.
 BEZEL_TEST(move_borrow_owned_return_1995,
-           return_move_owned_local_disposes_once_spec_28_8_1) {
-    std::string src =
+           return_move_owned_local_rejected_redundant_marker_spec_28_3) {
+    auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
         "  public static method Take(): owned Cell "
         "    var x: Cell? := new Cell(); return move x!; "
         "  end Take; "
-        "  public static method Main(): int "
-        "    do using var got := C.Take(); end; return Cell.live; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end C;");
+    // §17.8 / §28.3 K3.13 / K3.2 (v0.309, #5144, #4993): the `!` is
+    // transparent to the marker, so `return move x!` is the redundant marker
+    // — `return x!` is the §17.8 consume at marker-free K3.2. The pre-fix
+    // "disposes once" pin attached to the silent-accept behavior the #5144
+    // fix removes. // per §17.8, §28.3 K3.13
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "the `move` marker is redundant"));
 }
 
 // §28.8: `return b;` where `b` is an OWNED parameter — the legal transfer

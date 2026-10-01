@@ -72,30 +72,43 @@ const char* kCell =
 // runtime's / sink's disposal). Pass-with: rejected at compile time.
 // ===========================================================================
 
-// §31.1 / §17.12: `throw x!` where `x: Exception?` (a BUILTIN, null-declaration
-// exception). `x!` borrows x's value; the throw hands it to the runtime while x
-// still auto-drops it — a double-dispose (ASan heap-use-after-free at runtime
-// without the fix). Must be rejected (write `throw move x!`).
+// §17.8 / §31.1 (v0.309, #5144, #4993): `throw x!` where `x: Exception?` (a
+// BUILTIN, null-declaration exception). §17.8 makes `throw` a marker-free
+// position of the consume table (K3.7); `x!` over a named owned binding is
+// classified by position EXACTLY as `x` is. So `throw x!` consumes x and the
+// runtime owns the value — no double-dispose. The pre-fix #1985 behaviour
+// rejected this as a borrow (the `ownedArgSourceIsBorrow` PostfixBang arm
+// classified `x!` as a borrow unconditionally), which forced users to write
+// `throw move x!` even though the `!` is transparent to the marker at a
+// marker-free throw. Fail-without (revert #5144): rc != 0 with the "must be
+// an OWNED exception" borrow diagnostic. // per §17.8, §31.1, §28.3 K3.7
 BEZEL_TEST(null_forgiving_owned_sink_1985,
-           builtin_exc_local_bang_into_throw_rejected_spec_31_1) {
-    auto r = parseAndCheckOwnership(
+           builtin_exc_local_bang_into_throw_consumes_spec_17_8) {
+    std::string src =
         "module M; "
         "class C "
         "  public static method Boom() "
         "    var x: Exception? := new InvalidOperationException(\"boom\"); "
         "    throw x!; "
         "  end Boom; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "must be an OWNED exception"));
+        "  public static method Main(): int "
+        "    try C.Boom(); catch var e: Exception => return 0; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.3 / §28.5 / §17.4: `this.f := x!` — a builtin-exception place `E!` stored
-// into an owned `Exception?` field. A double-dispose (the field's owner and x's
-// real owner both dispose). Must be rejected.
+// §17.8 / §28.3 / §28.5 (v0.309, #5144, #4993): `this.f := x!` over a
+// builtin-exception place — a marker-free owned-field store consumes `x`
+// exactly as `this.f := x` does (§17.8). The pre-fix #1985 behaviour rejected
+// this with "borrow cannot be stored into an" — same misclassification as the
+// Cell row above (the §17.8 consume was classified as a borrow). // per §17.8
 BEZEL_TEST(null_forgiving_owned_sink_1985,
-           builtin_exc_local_bang_into_owned_field_rejected_spec_17_4) {
-    auto r = parseAndCheckOwnership(
+           builtin_exc_local_bang_into_owned_field_consumes_spec_17_8) {
+    std::string src =
         "module M; "
         "class Box "
         "  public owned f: Exception? := null; "
@@ -103,15 +116,24 @@ BEZEL_TEST(null_forgiving_owned_sink_1985,
         "    var x: Exception? := new InvalidOperationException(\"boom\"); "
         "    this.f := x!; "
         "  end Set; "
-        "end Box;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "borrow cannot be stored into an"));
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  do using var b := new Box(); b.Set(); end; return 0; "
+        "end Main; end C;";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.8 / §17.4: `C.Sink(x!)` — a builtin-exception place `E!` passed to an
-// `owned Exception` parameter. Must be rejected (write `C.Sink(move x!)`).
+// §17.8 / §22.3 / §28.8 (v0.309, #5144, #4993): `C.Sink(x!)` — a null-forgiving
+// over a named OWNED BINDING passed to an `owned` PARAMETER. Argument position
+// is a MARKED position (§17.8 / K3.3), so the user must write `C.Sink(move
+// x!)`. Rejected with the marker-required diagnostic, NOT the §28.8 "borrow
+// cannot be passed" wording (the borrow wording is for non-binding borrows like
+// `C.Sink(this.f)`). // per §17.8, §22.3, §28.8
 BEZEL_TEST(null_forgiving_owned_sink_1985,
-           builtin_exc_local_bang_into_owned_param_rejected_spec_28_8) {
+           builtin_exc_local_bang_into_owned_param_missing_marker_spec_22_3) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
@@ -122,8 +144,8 @@ BEZEL_TEST(null_forgiving_owned_sink_1985,
         "  end Use; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        errorSays(r, "borrow cannot be passed where an"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `x!`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "M(move x!)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -175,27 +197,25 @@ BEZEL_TEST(null_forgiving_owned_sink_1985,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.8.1: `throw move x!` — the EXPLICIT owned transfer of a builtin exception.
-// x is left moved-from (no auto-drop), the runtime owns and disposes the value
-// exactly once → no double-free (ASan-clean). The `!`-free form the #1985
-// rejections steer to. // per §28.8.1, §31.1
+// §17.8 / §28.3 (v0.309, #5144, #4993): `throw move x!` is the REDUNDANT
+// MARKER. §17.8 makes `throw` a marker-free position of the consume table
+// (K3.7); the `move` marker is admitted only at the marker-required
+// consuming positions (§28.3 K3.13 / K3.7). §17.8 makes the `!` transparent
+// to the marker — `throw x!` and `throw move x!` are spelled DIFFERENTLY
+// but the `move` is redundant in both. Rejected with §28.3's redundant-
+// marker diagnostic. // per §17.8, §28.3 K3.13, §31.1
 BEZEL_TEST(null_forgiving_owned_sink_1985,
-           builtin_exc_move_bang_into_throw_disposes_once_28_8_1) {
-    std::string src =
+           builtin_exc_move_bang_into_throw_rejected_redundant_marker_spec_28_3) {
+    auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
         "  public static method Boom() "
         "    var x: Exception? := new InvalidOperationException(\"boom\"); "
         "    throw move x!; "
         "  end Boom; "
-        "  public static method Main(): int "
-        "    try C.Boom(); catch var e: Exception => return 0; end; "
-        "    return 0; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "the `move` marker is redundant"));
 }
 
 // ===========================================================================
@@ -292,22 +312,20 @@ BEZEL_TEST(null_forgiving_owned_sink_1986,
     BEZEL_EXPECT_TRUE(errorSays(r, "already moved out"));
 }
 
-// §28.8.1: the FIELD sink `this.f := move x!` was ALREADY correct (its LocalDecl/
-// assignment path runs recordMovesIn) — pin it so the handleDischarge fix does
-// not disturb it. Disposes exactly once → Cell.live == 0.
+// §17.8 / §28.3 / §28.8.1 (v0.309, #5144, #4993): `this.f := move x!` is the
+// REDUNDANT MARKER — §17.8 makes `x!` classified by position EXACTLY as `x`
+// is, and `move` at a marker-free position (K3.1 owned-field store) is the
+// §28.3 K3.13 redundant-marker diagnostic. This row REPLACES the pre-fix
+// "still disposes once" pin (which pinned the silent-accept behavior the #5144
+// fix explicitly removes). // per §17.8, §28.3 K3.13
 BEZEL_TEST(null_forgiving_owned_sink_1986,
-           move_bang_into_owned_field_still_disposes_once_28_8_1) {
-    std::string src =
+           move_bang_into_owned_field_rejected_redundant_marker_spec_28_3) {
+    auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class Box "
         "  public owned f: Cell? := null; "
         "  public method Set() var x: Cell? := new Cell(); this.f := move x!; end Set; "
-        "end Box; "
-        "class C public static method Main(): int "
-        "  do using var b := new Box(); b.Set(); end; "
-        "  return Cell.live; "
-        "end Main; end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end Box;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "the `move` marker is redundant"));
 }

@@ -251,7 +251,7 @@ BEZEL_TEST(move_field_temporary_receiver_sink_2005,
         "  public method Take(): owned Cell? "
         "    var t: Cell? := move this.f!; "
         "    this.f := null; "
-        "    return move t!; "
+        "    return t!; "
         "  end Take; "
         "  destructor end destructor; "
         "end Box; "

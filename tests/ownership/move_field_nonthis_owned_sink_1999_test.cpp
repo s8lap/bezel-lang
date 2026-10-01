@@ -257,7 +257,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  public method Take(): owned Cell? "
         "    var t: Cell? := move this.f!; "
         "    this.f := null; "
-        "    return move t!; "
+        "    return t!; "
         "  end Take; "
         "  destructor end destructor; "
         "end Box; "

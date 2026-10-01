@@ -68,20 +68,32 @@ const char* kCell =
 // twice (a use-after-free at the owning object's / callee's disposal).
 // ---------------------------------------------------------------------------
 
-// §28.3 / §28.5 / §17.4: `this.f := x!` — force-unwrap of a nullable OWNED LOCAL
-// stored into an owned field. `x!` borrows x's value; x still auto-drops it and
-// the field disposes it too. Must be rejected (write `this.f := move x!` or, for
-// a nullable field, the bare `this.f := x`).
+// §17.8 / §28.3 / §28.5 (v0.309, #5144, #4993): `this.f := x!` — force-unwrap
+// of a nullable OWNED LOCAL stored into an owned field. §17.8: "Over a named
+// owned binding, `x!` is therefore classified by its position exactly as the
+// bare read `x` is. At a marker-free position of the consume table — for
+// example a store into an `owned` field — `sink._f := x!;` consumes `x`
+// exactly as `sink._f := x;` does." The owned-field store IS the announcement
+// (§28.3 K3.1); `x!` consumes x and the field disposes it exactly once →
+// Cell.live == 0. The pre-fix #1983 behaviour rejected this with "borrow
+// cannot be stored" — the §17.8 consume at a marker-free position was
+// mis-classified as a borrow. Fail-without (revert #5144): rc != 0 with the
+// borrow-store diagnostic.
 BEZEL_TEST(null_forgiving_owned_sink_1983,
-           local_bang_into_owned_field_rejected_spec_17_4) {
-    auto r = parseAndCheckOwnership(
+           local_bang_into_owned_field_consumes_spec_17_8) {
+    std::string src =
         std::string(kCell) +
         "class Box "
         "  public owned f: Cell? := null; "
         "  public method Set() var x: Cell? := new Cell(); this.f := x!; end Set; "
-        "end Box;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "borrow cannot be stored into an `owned` field"));
+        "end Box; "
+        "class C public static method Main(): int "
+        "  do using var b := new Box(); b.Set(); end; "
+        "  return Cell.live; "
+        "end Main; end C;";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // §28.3 / §28.8.1: `this.f := this.g!` — force-unwrap of a nullable OWNED FIELD
@@ -102,11 +114,17 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
     BEZEL_EXPECT_TRUE(errorSays(r, "borrow cannot be stored into an `owned` field"));
 }
 
-// §28.8 / §17.4: `C.Sink(x!)` — a place `E!` passed to an `owned` PARAMETER. The
-// owned sink takes disposal responsibility; the borrow's real owner (x) disposes
-// it too. Must be rejected (write `C.Sink(move x!)` or pass a fresh producer).
+// §17.8 / §22.3 / §28.8 (v0.309, #5144, #4993): `C.Sink(x!)` — a null-forgiving
+// `E!` over a named OWNED BINDING passed to an `owned` PARAMETER. §17.8: "At a
+// marked position — an `owned` argument, a local binding or assignment — the
+// transfer is spelled `move x!`, the `!` being transparent to the marker."
+// The argument position is a MARKED position (K3.3), so the user must write
+// `C.Sink(move x!)`. The bare `C.Sink(x!)` is rejected with the marker-required
+// diagnostic — steering the user to the legal spelling (NOT the §28.8 "borrow
+// cannot be passed" diagnostic, which is for non-binding borrows like
+// `C.Sink(this.f)`). // per §17.8, §22.3, §28.8
 BEZEL_TEST(null_forgiving_owned_sink_1983,
-           local_bang_into_owned_param_rejected_spec_28_8) {
+           local_bang_into_owned_param_missing_marker_spec_22_3) {
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
@@ -114,14 +132,16 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
         "  public static method Use() var x: Cell? := new Cell(); C.Sink(x!); end Use; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        errorSays(r, "borrow cannot be passed where an `owned` value is required"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `x!`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "M(move x!)"));
 }
 
-// §28.8: `new Holder(x!)` — a place `E!` passed to an `owned` CONSTRUCTOR
-// parameter (the owned-sink classification covers ctor args). Must be rejected.
+// §17.8 / §22.3 / §28.8 (v0.309, #5144, #4993): `new Holder(x!)` — same as the
+// param twin above at a CONSTRUCTOR ARGUMENT position (also a MARKED position
+// per §17.8 / K3.3). Rejected with the marker-required diagnostic, NOT the
+// §28.8 borrow diagnostic. // per §17.8, §22.3, §28.8
 BEZEL_TEST(null_forgiving_owned_sink_1983,
-           local_bang_into_owned_ctor_arg_rejected_spec_28_8) {
+           local_bang_into_owned_ctor_arg_missing_marker_spec_22_3) {
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class Holder "
@@ -135,8 +155,8 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
         "  end Use; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(
-        errorSays(r, "borrow cannot be passed where an `owned` value is required"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `x!`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "M(move x!)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -144,24 +164,25 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
 // Fail-without (had the fix over-reached): compile error; with the fix: exit 0.
 // ---------------------------------------------------------------------------
 
-// §28.8.1: `this.f := move x!` — the EXPLICIT owned transfer. `move` reads the
-// place as an owned value; x is left moved-from (no auto-drop), the field owns
-// and disposes the value exactly once → Cell.live == 0.
+// §17.8 / §28.3 / §28.8.1 (v0.309, #5144, #4993): `this.f := move x!` is the
+// REDUNDANT MARKER. §17.8: "`x!` is classified by its position exactly as the
+// bare read `x` is. At a marker-free position of the consume table — for
+// example a store into an `owned` field — `sink._f := x!;` consumes `x`
+// exactly as `sink._f := x;` does." A `move` marker at a marker-free position
+// (a store into an `owned` field, K3.1) is §28.3 K3.13's "redundant marker"
+// — `move` is admitted only at the marker-required consuming positions
+// (`owned` argument, local binding / assignment, K3.3/K3.4). The §28.3 K3.13
+// / K3.1 redundant-marker diagnostic reports it. // per §17.8, §28.3 K3.13
 BEZEL_TEST(null_forgiving_owned_sink_1983,
-           move_bang_into_owned_field_disposes_once_28_8_1) {
-    std::string src =
+           move_bang_into_owned_field_rejected_redundant_marker_spec_28_3) {
+    auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class Box "
         "  public owned f: Cell? := null; "
         "  public method Set() var x: Cell? := new Cell(); this.f := move x!; end Set; "
-        "end Box; "
-        "class C public static method Main(): int "
-        "  do using var b := new Box(); b.Set(); end; "   // Box disposes f exactly once
-        "  return Cell.live; "                             // 0
-        "end Main; end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+        "end Box;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "the `move` marker is redundant"));
 }
 
 // §17.4: `this.f := producer()!` — a FRESH PRODUCER unwrapped. The call result is

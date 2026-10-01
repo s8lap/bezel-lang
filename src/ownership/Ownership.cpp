@@ -3880,26 +3880,48 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             exprIsOwnedFieldRead(*as->target)) {
             if (auto* ue =
                     dynamic_cast<const ast::UnaryExpr*>(as->value.get())) {
-                if (ue->op == "move" &&
-                    dynamic_cast<const ast::IdentifierExpr*>(
-                        ue->operand.get())) {
-                    auto* id = static_cast<const ast::IdentifierExpr*>(
-                        ue->operand.get());
-                    auto* sym = ctx_.exprSymbol(*id);
-                    bool sourceIsLocalOrParam =
-                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
-                                dynamic_cast<sema::ParameterSymbol*>(sym));
-                    if (sourceIsLocalOrParam) {
-                        report(
-                            Severity::Error, ue->span.begin,
-                            std::string("the `move` marker is redundant on "
-                                        "the right-hand side of a store into "
-                                        "an `owned` field — the declared "
-                                        "field slot already announces the "
-                                        "ownership transfer; write `") +
-                                std::string(id->name) +
-                                "` without `move` (§28.3 K3.13 marker "
-                                "economy; K3.1 owned-field store)");
+                if (ue->op == "move") {
+                    // fix #5144 / §17.8 (v0.309): a `move x!` (a `move` of a
+                    // postfix-null-forgiving PLACE) is the SAME redundant
+                    // marker as `move x` — §17.8 makes the `!` transparent to
+                    // the marker. The pre-fix check matched only a bare
+                    // `IdentifierExpr` operand, so `move x!` slipped through
+                    // (the bare-bang classifier at ownedArgSourceIsBorrow's
+                    // PostfixBang arm treated `x!` as a borrow and rejected
+                    // it before the field write could be reached; with #5144
+                    // it now consumes x, and the redundant-marker check
+                    // below fires). Peel a single `!` to the underlying
+                    // identifier for the binding name.
+                    const ast::IdentifierExpr* id = nullptr;
+                    if (auto* idInner =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ue->operand.get())) {
+                        id = idInner;
+                    } else if (auto* pb =
+                                   dynamic_cast<const ast::PostfixBangExpr*>(
+                                       ue->operand.get())) {
+                        id = dynamic_cast<const ast::IdentifierExpr*>(
+                            pb->operand.get());
+                    }
+                    if (id) {
+                        auto* sym = ctx_.exprSymbol(*id);
+                        bool sourceIsLocalOrParam =
+                            sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                    dynamic_cast<sema::ParameterSymbol*>(sym));
+                        if (sourceIsLocalOrParam) {
+                            report(
+                                Severity::Error, ue->span.begin,
+                                std::string("the `move` marker is redundant "
+                                            "on the right-hand side of a "
+                                            "store into an `owned` field — "
+                                            "the declared field slot already "
+                                            "announces the ownership "
+                                            "transfer; write `") +
+                                    std::string(id->name) +
+                                    "` without `move` (§28.3 K3.13 marker "
+                                    "economy; K3.1 owned-field store; §17.8 "
+                                    "v0.309)");
+                        }
                     }
                 }
             }
@@ -3953,24 +3975,46 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // not-reassigned diagnostic that owns those cases must continue to
             // fire (`s28_8_1_0002`, etc.).
             if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                if (ue->op == "move" && returnOwned_ &&
-                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
-                    auto* id = static_cast<const ast::IdentifierExpr*>(
-                        ue->operand.get());
-                    auto* sym = ctx_.exprSymbol(*id);
-                    bool sourceIsLocalOrParam =
-                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
-                                dynamic_cast<sema::ParameterSymbol*>(sym));
-                    if (sourceIsLocalOrParam) {
-                        report(
-                            Severity::Error, ue->span.begin,
-                            std::string("the `move` marker is redundant on a "
-                                        "`return` operand — the owned return "
-                                        "type already announces the ownership "
-                                        "transfer; write `return ") +
-                                std::string(id->name) +
-                                "` without `move` (§28.3 K3.13 marker "
-                                "economy; K3.2 return)");
+                if (ue->op == "move" && returnOwned_) {
+                    // fix #5144 / §17.8 (v0.309): `return move x!;` is the SAME
+                    // redundant marker as `return move x;` — the `!` is
+                    // transparent to the marker (§17.8). The pre-fix check
+                    // matched only a bare `IdentifierExpr` operand, so
+                    // `return move x!` slipped through with `checkOwnedReturn
+                    // DirectBorrow`'s own PostfixBang arm carrying the accept
+                    // for the bare `return x!` form. After the #5144 peel in
+                    // the borrow classifier, `return move x!` is the only
+                    // marker-required-position form that needs the redundant
+                    // marker reported — peel a single `!` to the underlying
+                    // identifier for the binding name. // per §17.8, §28.3
+                    const ast::IdentifierExpr* id = nullptr;
+                    if (auto* idInner =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ue->operand.get())) {
+                        id = idInner;
+                    } else if (auto* pb =
+                                   dynamic_cast<const ast::PostfixBangExpr*>(
+                                       ue->operand.get())) {
+                        id = dynamic_cast<const ast::IdentifierExpr*>(
+                            pb->operand.get());
+                    }
+                    if (id) {
+                        auto* sym = ctx_.exprSymbol(*id);
+                        bool sourceIsLocalOrParam =
+                            sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                                    dynamic_cast<sema::ParameterSymbol*>(sym));
+                        if (sourceIsLocalOrParam) {
+                            report(
+                                Severity::Error, ue->span.begin,
+                                std::string("the `move` marker is redundant "
+                                            "on a `return` operand — the owned "
+                                            "return type already announces the "
+                                            "ownership transfer; write "
+                                            "`return ") +
+                                    std::string(id->name) +
+                                    "` without `move` (§28.3 K3.13 marker "
+                                    "economy; K3.2 return; §17.8 v0.309)");
+                        }
                     }
                 }
             }
@@ -4121,10 +4165,18 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // needs the marker.
         if (th->value) {
             if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(th->value.get())) {
+                // fix #5144 / §17.8 (v0.309): `throw move x!` is also a
+                // redundant marker — `throw x!` already announces the consume,
+                // the `move` adds nothing. Peel the `!` (one layer, identical to
+                // the AssignmentStmt / ReturnStmt redundant-marker fix above) so
+                // the `throw move x!` form is rejected the same way `throw
+                // move x;` already is.
+                const ast::Expr* moveOperand =
+                    lookThroughForceUnwrap(ue->operand.get());
                 if (ue->op == "move" &&
-                    dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get())) {
+                    dynamic_cast<const ast::IdentifierExpr*>(moveOperand)) {
                     auto* id = static_cast<const ast::IdentifierExpr*>(
-                        ue->operand.get());
+                        moveOperand);
                     auto* sym = ctx_.exprSymbol(*id);
                     bool sourceIsLocalOrParam =
                         sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
@@ -4182,7 +4234,8 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // borrowed — this only fires for a currently-Owned local. // per
             // §28.3, §31.1
             if (const auto* id =
-                    dynamic_cast<const ast::IdentifierExpr*>(th->value.get())) {
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        lookThroughForceUnwrap(th->value.get()))) {
                 if (id->name != "this" && id->name != "base") {
                     if (auto* st = lookupState(id->name)) {
                         if (st->state == OwnershipState::Owned)

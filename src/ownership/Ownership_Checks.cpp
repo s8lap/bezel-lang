@@ -1414,19 +1414,31 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 ++pos; continue;
             }
             if (ownedSink) {
+                // fix #5144 / §17.8 (v0.309): the value may be a null-forgiving
+                // `x!` over a named owned binding — peel the `!` so the named-
+                // binding / source-classification logic sees `x` and the
+                // missing-marker diagnostic steers the user to `M(move x!)`.
+                // Mirrors the `recordMovesInArgs` twin call above; the ctor
+                // path here is its own loop (separate so an inner-NewExpr's
+                // ctor params can resolve correctly), so the same peel needs
+                // to live in BOTH places.
+                const ast::Expr* argValue = lookThroughForceUnwrap(a.value.get());
                 if (auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                        dynamic_cast<const ast::IdentifierExpr*>(argValue)) {
                     // §28.8 (#395): a borrow flowing into the owned formal is
                     // rejected regardless of the marker.
-                    if (checkOwnedArgSource(*a.value, id->span.begin)) {
+                    if (checkOwnedArgSource(*argValue, id->span.begin)) {
                         ++pos; continue;
                     }
                     // A valid owned source. §22.3 (v0.169): if it is a NAMED
                     // OWNED BINDING the call leaves it moved-from, so the marker
                     // is REQUIRED; a fresh producer (not a bare Owned binding)
-                    // is unmarked and handled by the fall-through below.
+                    // is unmarked and handled by the fall-through below. The
+                    // withBang flag preserves the original `x!` spelling in the
+                    // steer text.
                     if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
-                        reportMissingOwnedMarker(id->name, id->span.begin);
+                        reportMissingOwnedMarker(id->name, id->span.begin,
+                                                 /*withBang=*/argValue != a.value.get());
                     markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
                 }
@@ -1726,18 +1738,26 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // classification is exactly the pre-v0.169 one; the call-site `owned`
         // marker (§22.3, v0.169) is layered on top of the SAME classification.
         if (ownedSink) {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                    a.value.get())) {
+            // fix #5144 / §17.8 (v0.309): the value may be a null-forgiving
+            // `x!` over a named owned binding — peel the `!` so the named-
+            // binding / source-classification logic sees `x` and the missing-
+            // marker diagnostic steers the user to `M(move x!)`. Mirrors
+            // #1985/#1993's force-unwrap handling on the handleDischarge twin.
+            const ast::Expr* argValue = lookThroughForceUnwrap(a.value.get());
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(argValue)) {
                 // §28.8 (#395): a borrow flowing into the owned formal is
                 // rejected regardless of the marker.
-                if (checkOwnedArgSource(*a.value, id->span.begin)) {
+                if (checkOwnedArgSource(*argValue, id->span.begin)) {
                     ++pos; continue;
                 }
                 // A valid owned source. §22.3 (v0.169): a NAMED OWNED BINDING is
                 // left moved-from by the call, so the marker is REQUIRED. (A
                 // fresh producer never reaches here as a bare identifier.)
+                // The withBang flag preserves the `!` in the steer text (the
+                // original `x!` spelling).
                 if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
-                    reportMissingOwnedMarker(id->name, id->span.begin);
+                    reportMissingOwnedMarker(id->name, id->span.begin,
+                                             /*withBang=*/argValue != a.value.get());
                 markMovedByName(id->name, id->span.begin);
                 ++pos; continue;
             }
@@ -1928,7 +1948,8 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // that survives it and is currently Owned is exactly the case to
             // discharge. // per §28.3, §31.1
             if (const auto* id =
-                    dynamic_cast<const ast::IdentifierExpr*>(te->operand.get())) {
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        lookThroughForceUnwrap(te->operand.get()))) {
                 if (id->name != "this" && id->name != "base") {
                     if (auto* st = lookupState(id->name)) {
                         if (st->state == OwnershipState::Owned)
@@ -2189,9 +2210,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                                   /*onFreshProducer=*/true);
                 } else if (a.modifier.empty() && namedBinding) {
                     // Missing marker on a named owned binding left moved-from.
+                    // fix #5144 / §17.8 (v0.309): the argument may be a
+                    // null-forgiving `x!` over the binding — peel to the
+                    // underlying identifier for the binding name, and steer
+                    // the user to `M(move x!)` (not `M(move x)`) so the
+                    // null-check the `!` asks for is preserved.
+                    const ast::Expr* core =
+                        lookThroughForceUnwrap(a.value.get());
                     const auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
-                    reportMissingOwnedMarker(id->name, id->span.begin);
+                        dynamic_cast<const ast::IdentifierExpr*>(core);
+                    reportMissingOwnedMarker(
+                        id->name, a.value->span.begin,
+                        /*withBang=*/core != a.value.get());
                 }
             }
             // §28.3 / §28.11 (#860 / #892): an `out owned` arg is a WRITE
@@ -2363,6 +2393,28 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // is a borrow (it would be double-disposed). Bare `this`
                     // (#403) is handled by the identifier branch above.
                     consumed = true;
+                }
+            }
+            // fix #5144 / §17.8 (v0.309, #5060 sibling): a `!` wrapping an
+            // if/case mixed meet — `(if c then g else new W())!` — must drive
+            // checkArmMeetMixed on the underlying ConditionalExpr/CaseExpr at
+            // the bare-statement call site too. This peel MUST run BEFORE the
+            // `checkOwnedArgOtherBorrow` PostfixBang arm below — that arm calls
+            // `ownedArgSourceIsBorrow`, which (after the #5144 peel fix) reaches
+            // the ConditionalExpr recursion at line 14400 and reports the WRONG
+            // diagnostic ("a borrow cannot be passed …" from `checkOwnedArgSource`)
+            // for an arg that the meet driver would reject more precisely
+            // ("the arms of this if/case expression mix an owned value with a
+            // borrow"). Mirrors the MemberAccessExpr peel (`(_w ?? new W()).Name()`)
+            // that fires from the same loop's sibling #5071. // per §17.8,
+            // §28.3 K7.3
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(a.value.get())) {
+                if (auto* inner = pb->operand.get()) {
+                    if (dynamic_cast<const ast::ConditionalExpr*>(inner) ||
+                        dynamic_cast<const ast::CaseExpr*>(inner)) {
+                        if (!exprContainsMarkedTransfer(*inner))
+                            checkArmMeetMixed(*inner);
+                    }
                 }
             }
             if (!consumed) {
@@ -2592,9 +2644,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                         reportSpuriousOwnedMarker(a.value->span.begin,
                                                   /*onFreshProducer=*/true);
                 } else if (a.modifier.empty() && namedBinding) {
+                    // fix #5144 / §17.8 (v0.309): same as the CallExpr arm —
+                    // the ctor argument may be `x!` over an owned binding;
+                    // peel to the identifier and steer the user to
+                    // `new T(move x!)`.
+                    const ast::Expr* core =
+                        lookThroughForceUnwrap(a.value.get());
                     const auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
-                    reportMissingOwnedMarker(id->name, id->span.begin);
+                        dynamic_cast<const ast::IdentifierExpr*>(core);
+                    reportMissingOwnedMarker(
+                        id->name, a.value->span.begin,
+                        /*withBang=*/core != a.value.get());
                 }
             }
             if (a.modifier == "owned") {
@@ -3219,7 +3279,26 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     // so reading such a local via `!` is a genuine read-of-moved-from, not an
     // over-rejection. // per §15.3
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
-        if (pb->operand) checkRead(*pb->operand, /*selfTarget=*/false);
+        // fix #5144 / §17.8 (v0.309, #5060 sibling): a `!` wrapping an if/case
+        // mixed meet — `(if c then g else new W())!` — must drive checkArmMeet-
+        // Mixed on the underlying ConditionalExpr/CaseExpr, mirroring the
+        // MemberAccessExpr peel above for `(_w ?? new W()).Name()`. Without the
+        // peel the PostfixBangExpr arm recurses into the ConditionalExpr but
+        // checkArmMeetMixed never fires on the outer node (the ConditionalExpr
+        // arm above requires the top-level e to BE a ConditionalExpr — for
+        // `(if c then g else new W())!` the top is the PostfixBangExpr). §17.8
+        // classifies `x!` "by its position exactly as the bare read `x` is", so
+        // the meet driver's "the arms of this if/case expression mix an owned
+        // value with a borrow" reject fires identically for the `!` form.
+        if (pb->operand) {
+            const ast::Expr* inner = pb->operand.get();
+            if (dynamic_cast<const ast::ConditionalExpr*>(inner) ||
+                dynamic_cast<const ast::CaseExpr*>(inner)) {
+                if (!exprContainsMarkedTransfer(*inner))
+                    checkArmMeetMixed(*inner);
+            }
+            checkRead(*pb->operand, /*selfTarget=*/false);
+        }
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
@@ -9626,8 +9705,15 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // // per §28.3, §28.8, §28.9, v0.286
     if (dest == Dest::Field && targetIsOwnedField(*as.target) &&
         scope != EscapeScope::LambdaBody) {
+        // fix #5144 / §17.8 (v0.309): the RHS may be a postfix-null-forgiving
+        // `x!` over a bare identifier — §17.8 makes `x!` classified by
+        // position EXACTLY as `x` is, so an Owned local in the `x!` form
+        // consumes here (K3.1 owned-field store) just as `x` does. Peel a
+        // single `!` to the underlying identifier and apply the same
+        // Owned-state skip the bare form already gets.
         if (const auto* rid =
-                dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+                dynamic_cast<const ast::IdentifierExpr*>(
+                    lookThroughForceUnwrap(as.value.get()))) {
             if (const LocalOwnership* rst = lookupState(rid->name))
                 if (rst->state == OwnershipState::Owned) return false;
         }
@@ -12915,7 +13001,15 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
 // binding already moved/disposed) is not, so the marker is neither required nor
 // (for the not-owned states) meaningfully transferable here.
 bool MethodOwnership::isNamedOwnedBinding(const ast::Expr& e) {
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    // fix #5144 / §17.8 (v0.309): the null-forgiving `x!` over a named owned
+    // binding is classified by its position EXACTLY as `x` is — the `!` is a
+    // type-system assertion only, transparent to the marker. The marker-required
+    // check at the call site therefore recognizes `x!` as a named owned binding
+    // by looking through a single `!` to the underlying identifier (mirrors
+    // #1125's force-unwrap handling, used identically by lookThroughForceUnwrap
+    // here). A `!` over `this`/`base`/a non-owned place stays unrecognized.
+    const ast::Expr* core = lookThroughForceUnwrap(&e);
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return false;
     if (id->name == "this" || id->name == "base") return false;
     const LocalOwnership* st = lookupState(id->name);
@@ -12923,13 +13017,25 @@ bool MethodOwnership::isNamedOwnedBinding(const ast::Expr& e) {
 }
 
 void MethodOwnership::reportMissingOwnedMarker(std::string_view name,
-                                               SourceLocation loc) {
+                                               SourceLocation loc,
+                                               bool withBang) {
+    // fix #5144 / §17.8 (v0.309): when the user wrote `name!` at the call site
+    // (a postfix null-forgiving over the named owned binding), the suggested
+    // spelling is `M(move name!)` — the `!` is transparent to the marker, so
+    // `move name` would silently drop the null check the user is asking for
+    // (§17.8's runtime null-check obligation). The binding's own name remains
+    // `name` (the `!` is not a binding), so the diagnostic quotes `name` for
+    // the "passing the named owned binding" clause. // per §17.8, §22.3
+    std::string xStr = std::string(name) + (withBang ? "!" : "");
+    std::string moveSpelling = std::string("move ") + xStr;
     report(Severity::Error, loc,
-           std::string("this call consumes `") + std::string(name) +
-               "`; write `M(move " + std::string(name) +
-               ")` — passing the named owned binding `" + std::string(name) +
+           std::string("this call consumes `") + xStr +
+               "`; write `M(" + moveSpelling +
+               ")` — passing the named owned binding `" +
+               std::string(name) +
                "` to an `owned` parameter transfers ownership and leaves it "
-               "moved-from, which the call site must announce (§22.3, v0.286)");
+               "moved-from, which the call site must announce (§22.3, v0.286; "
+               "§17.8 v0.309)");
 }
 
 void MethodOwnership::reportSpuriousOwnedMarker(SourceLocation loc,
@@ -14132,61 +14238,101 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             unwrappedMove = true;
         }
     }
-    // §17.4 / §7.8 / §28.8.1 (issue #1975 discovery): a *bare* postfix
-    // null-forgiving `E!` on a PLACE — a named local/parameter/field or index
-    // slot, no enclosing `move` — is a BORROW of `E`'s value. A null-aware
-    // operator "neither transfers ownership out of `x` nor disposes `x`'s value"
-    // and its result is borrowed even when the operand is owned — §17.4 states
-    // this for `as`, and it applies to every null-aware operator (`!`, `??`,
-    // `?.`, `?(`); §28.8.1 makes `move E!` the ONLY way to read a place's value
-    // as an owned value. Flowing a bare `E!` into an owned sink (an `owned`
-    // field/slot store, an `owned` parameter/constructor argument, an `owned`
-    // return, a `throw` operand) is the double-dispose hazard the un-`!` place
-    // reads below already guard: `E!` neither moves `E` (so `E`'s real owner
-    // still disposes it) nor is a fresh producer (so the sink disposes it too)
-    // — a use-after-free / double-free. A TEMPORARY/producer operand (`f()!`,
-    // `new T()!`) carries its own sole ownership through the `!` and is not a
-    // place, so it is not flagged. Checked before the place-read branches below
-    // because the `!` wrapper is not a bare identifier — without this it slips
-    // past every owned-sink handler's bare-identifier move-on-read, so `E` is
-    // neither moved nor rejected and the value is disposed twice. // per §17.4, §28.8.1
-    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+    // §17.8 / §28.3 (v0.309, #5144, #4993): a *bare* postfix null-forgiving
+    // `x!` over a named owned binding is classified by its position EXACTLY as
+    // the bare read `x` is — the `!` is a type-system assertion only (with a
+    // runtime null check); it does not move, copy, or borrow beyond what
+    // reading `x` already does. §17.8 (v0.309) "Over a named owned binding,
+    // `x!` is therefore classified by its position exactly as the bare read
+    // `x` is. At a marker-free position of the consume table — for example a
+    // store into an `owned` field, ... a `throw`, the discard, an owning
+    // iterator's `yield return`, the operand of a Pattern B `await` —
+    // `sink._f := x!;` consumes `x` exactly as `sink._f := x;` does. At a
+    // marked position — an `owned` argument, a local binding or assignment —
+    // the transfer is spelled `move x!`."
+    //
+    // The classifier therefore peels the `!` for the bare form (`x!`, no
+    // enclosing `move`) and falls through to the place-read branches below,
+    // which classify the underlying place by the calling position's semantics.
+    // A TEMPORARY/producer operand (`f()!`, `new T()!`) is NOT a place, so it
+    // does not match `PostfixBangExpr` at all — the `!` is part of the
+    // producer expression and is handled by the producer-state machinery above.
+    //
+    // Pre-fix behavior: the `!unwrappedMove` arm unconditionally returned true
+    // for any non-temporary `x!`, which wrongly REJECTED `this.f := x!` and
+    // `throw x!` at marker-free positions (x! consumes x here per §17.8) and
+    // emitted the WRONG diagnostic for `C.Sink(x!)` (the "borrow cannot be
+    // passed" branch fires instead of the marker-required one — the fix
+    // routes it to "this call consumes `x!`; write `M(move x!)`" via the
+    // updated isNamedOwnedBinding peel + reportMissingOwnedMarker withBang).
+    //
+    // The `unwrappedMove` arm (`move x!`) already peels the `!` and is the
+    // legal owned read of a place when that place is itself owned (#1986/
+    // #1993). // per §17.8, §28.3, §28.8.1, §31.1
+    if (dynamic_cast<const ast::PostfixBangExpr*>(e)) {
         if (!unwrappedMove) {
-            return pb->operand && !exprIsTemporary(*pb->operand) &&
-                   isBorrowableType(ctx_.exprType(*e));
+            // fix #5144 / §17.8 (v0.309): peel the `!` and classify the
+            // underlying place via the place-read branches below. A bare
+            // `x!` over a named owned binding in the Owned state is NOT a
+            // borrow at a marker-free position (the identifier branch
+            // returns false for state==Owned); at a MARKED position the
+            // isNamedOwnedBinding peel + reportMissingOwnedMarker withBang
+            // produces the missing-marker diagnostic instead. A bare `x!`
+            // over a borrow place (a non-`owned` parameter, a Borrowed-state
+            // local, a non-`owned` field) keeps the borrow classification
+            // through the peeled identifier / member-access branches below.
+            e = lookThroughForceUnwrap(e);
+            // fix #5144 carve-out: the pre-fix PostfixBang arm gated the
+            // borrow classification on `isBorrowableType`, which returns
+            // FALSE for a generic type parameter / value builtin (the
+            // `isBorrowableType` null-declaration branch's "every OTHER
+            // null-declaration Named type ... keeps its prior (non-
+            // borrowable) classification" — see isBorrowableType's Named
+            // null-declaration arm at line 3580). The peel-then-classify
+            // path below is greedy: a non-`owned` parameter is ALWAYS a
+            // borrow (the ParameterSymbol branch's modifier check), with no
+            // generic-parameter carve-out. Re-gate on isBorrowableType so
+            // `Sink<T>.Use(x: T?): this.Take(x!);` keeps its pre-fix
+            // "not over-rejected" semantics — T erases to a by-value
+            // boundary and the conservative answer is to NOT classify as
+            // borrow (mirrors #1985's own generic-param carve-out).
+            if (!isBorrowableType(ctx_.exprType(*e))) return false;
+            // Fall through to the place-read branches below — same code path
+            // as the bare-identifier / bare-field cases. // per §17.8
+        } else {
+            // §28.8.1 / §17.4 (issue #1993): `move E!`. `move` reads the underlying
+            // PLACE as owned ONLY when that place is itself owned — an owned local or
+            // a `move`d owned field (§28.8.1: `move` is the owned read of a place).
+            // When the underlying place is a BORROW (a non-`owned` parameter, a catch
+            // binding, a Borrowed-state local, a non-`owned` field), `move E!` is no
+            // more an owned value than `move E` is; it must be REJECTED, not silently
+            // consumed, or the owned sink AND the borrow's real owner both dispose the
+            // value (a double-free). Earlier reasoning wrongly assumed `move E!` is
+            // ALWAYS the legal owned transfer — so the `move` unwrap above set
+            // `unwrappedMove` and this branch was skipped entirely, letting a `move
+            // b!` of a BORROW slip past the classifier for every owned sink that
+            // routes through it (an `owned` field store §28.5 via handleOwnedField-
+            // Assignment, a `throw` operand §31.1 via checkThrowOperandNotBorrowed, an
+            // owning-array slot §28.11, and the recordMovesIn owned-sink discharge).
+            // Peel the `!` to the underlying place and classify it exactly as `move E`
+            // via the place-read branches below (all `!unwrappedMove`-gated, so an
+            // owned field/local/index under `move` is a legal owned source and is not
+            // flagged; a producer/temporary erases to `return false` at the tail; a
+            // BORROW place is caught by the identifier classification). An owned FIELD
+            // read (`move obj.f!` / `move _field!`) is the one place-form the gated
+            // branches skip but that reaches the un-gated FieldSymbol tail — it is a
+            // legal owned read of the field (§28.8.1) ONLY when the field's RECEIVER
+            // is an owned place. An owned-field read off a BORROW receiver (`move
+            // b.f!` where `b` is a borrowed parameter / catch binding / Borrowed-state
+            // local / nested field read) is NOT an owned transfer — a borrower does
+            // not own the object and cannot move its owned fields out; the field's
+            // real owner disposes the value, so the owned sink double-frees it (#2011,
+            // §28.6). Classify by the receiver: `this`/owned-place receiver → accept
+            // (return false); provably-borrow receiver → reject (return true).
+            // // per §28.8.1, §28.6, §17.4
+            e = lookThroughForceUnwrap(e);
+            if (exprIsOwnedFieldRead(*e)) return ownedFieldMoveReceiverIsBorrow(*e);
         }
-        // §28.8.1 / §17.4 (issue #1993): `move E!`. `move` reads the underlying
-        // PLACE as owned ONLY when that place is itself owned — an owned local or
-        // a `move`d owned field (§28.8.1: `move` is the owned read of a place).
-        // When the underlying place is a BORROW (a non-`owned` parameter, a catch
-        // binding, a Borrowed-state local, a non-`owned` field), `move E!` is no
-        // more an owned value than `move E` is; it must be REJECTED, not silently
-        // consumed, or the owned sink AND the borrow's real owner both dispose the
-        // value (a double-free). Earlier reasoning wrongly assumed `move E!` is
-        // ALWAYS the legal owned transfer — so the `move` unwrap above set
-        // `unwrappedMove` and this branch was skipped entirely, letting a `move
-        // b!` of a BORROW slip past the classifier for every owned sink that
-        // routes through it (an `owned` field store §28.5 via handleOwnedField-
-        // Assignment, a `throw` operand §31.1 via checkThrowOperandNotBorrowed, an
-        // owning-array slot §28.11, and the recordMovesIn owned-sink discharge).
-        // Peel the `!` to the underlying place and classify it exactly as `move E`
-        // via the place-read branches below (all `!unwrappedMove`-gated, so an
-        // owned field/local/index under `move` is a legal owned source and is not
-        // flagged; a producer/temporary erases to `return false` at the tail; a
-        // BORROW place is caught by the identifier classification). An owned FIELD
-        // read (`move obj.f!` / `move _field!`) is the one place-form the gated
-        // branches skip but that reaches the un-gated FieldSymbol tail — it is a
-        // legal owned read of the field (§28.8.1) ONLY when the field's RECEIVER
-        // is an owned place. An owned-field read off a BORROW receiver (`move
-        // b.f!` where `b` is a borrowed parameter / catch binding / Borrowed-state
-        // local / nested field read) is NOT an owned transfer — a borrower does
-        // not own the object and cannot move its owned fields out; the field's
-        // real owner disposes the value, so the owned sink double-frees it (#2011,
-        // §28.6). Classify by the receiver: `this`/owned-place receiver → accept
-        // (return false); provably-borrow receiver → reject (return true).
-        // // per §28.8.1, §28.6, §17.4
-        e = lookThroughForceUnwrap(e);
-        if (exprIsOwnedFieldRead(*e)) return ownedFieldMoveReceiverIsBorrow(*e);
     }
     // §28.3 / §28.8.1 (issue #398): a *bare* read of an `owned` field — no
     // enclosing `move` — is Borrowed ("Field access `obj.f` where `f` is
@@ -15426,7 +15572,18 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
     // `move`), which §28.3 treats as a move-on-read because the field is an
     // owned slot ("Reading an owned local x in a position that requires an
     // owned value … transfers ownership out of x"). // per §28.3, §28.8
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.value.get());
+    //
+    // fix #5144 / §17.8 (v0.309): the RHS may be a postfix-null-forgiving
+    // `x!` over a bare identifier — §17.8 makes `x!` classified by position
+    // EXACTLY as `x` is at a marker-free position. Peel a single `!` to the
+    // underlying identifier and apply the same Owned-state mark the bare form
+    // already gets — without this, the bare `x!` RHS slips past the consume-
+    // mark here, x is never recorded as moved-from, and at Set-end x's scope-
+    // bound auto-drop disposes the value while the field already owns it — a
+    // measured double-free (segfault in `bz$M.Box$DisposeCore`, value's
+    // destructor runs twice). // per §17.8, §28.3
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+        lookThroughForceUnwrap(as.value.get()));
     if (!id) return;
     auto* st = lookupState(id->name);
     if (!st) return;
@@ -17661,7 +17818,14 @@ void MethodOwnership::recordAwaitOperandConsume(
     // producer-call operand has no single local to spend a second time in
     // straight-line code; the general aliased / cross-method second await is
     // not statically preventable per Appendix C.6). // per §30.5, §30.4
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&awaitOperand);
+    //
+    // fix #5144 / §17.8 (v0.309): the operand may be a postfix-null-forgiving
+    // `t!` over the bare identifier — `await t!` is a marker-free-position
+    // consume of `t` (§17.8: `x!` classified by position exactly as `x` is).
+    // Peel the `!` to the bare identifier so the existing state-transition
+    // logic fires. // per §17.8, §30.5
+    const ast::Expr* core = lookThroughForceUnwrap(&awaitOperand);
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return;
     LocalOwnership* st = lookupState(id->name);
     if (!st) return;

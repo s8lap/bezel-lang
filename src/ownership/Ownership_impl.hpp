@@ -4289,7 +4289,12 @@ private:
     // §22.3 (v0.169, #1348): report the "missing marker" error — a named owned
     // binding `name` is being transferred into an `owned` sink without the
     // required call-site `owned` marker. Emits the spec-stated fix-it.
-    void reportMissingOwnedMarker(std::string_view name, SourceLocation loc);
+    // fix #5144 / §17.8 (v0.309): `withBang` says the user wrote `name!` at
+    // the call site (a postfix-null-forgiving over the binding); the
+    // diagnostic then steers them to `M(move name!)` instead of `M(move name)`
+    // so the null-check the `!` asks for is preserved.
+    void reportMissingOwnedMarker(std::string_view name, SourceLocation loc,
+                                  bool withBang = false);
 
     // §22.3 (v0.169, #1348): report a "spurious marker" error — an `owned`
     // call-site marker written where it is rejected. `onFreshProducer` selects
