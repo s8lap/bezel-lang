@@ -43,13 +43,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 std::string sanitizerText(const JitResult& r) {
     std::string all;
     for (const auto& d : r.diagnostics.diagnostics()) all += d.message + "\n";
@@ -114,7 +107,6 @@ const char* kAsTBangIndexerGetter =
 BEZEL_TEST(codegen_generic_indexer_asT_bang_4914,
            asT_bang_indexer_getter_leaks_but_no_memory_error_spec_17_4_17_8) {
     JitResult r = runAotChecked(kAsTBangIndexerGetter);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 

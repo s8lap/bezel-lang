@@ -138,10 +138,6 @@ BEZEL_TEST(function_value_call_arg_conversion_5221, callee_storing_box_no_use_af
         "  Console.WriteLine((s.saved as R)!.Show()); return 0; "
         "end Main; end C;";
     JitResult r = runAotCheckedLenient(src);
-    if (!r.ran) {
-        for (const auto& d : r.diagnostics.diagnostics())
-            if (d.message.find("SKIP") != std::string::npos) return;
-    }
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "R49\n");
 }
