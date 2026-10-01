@@ -6602,7 +6602,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
-                        recvTy->astNode->name->parts.size() == 1) {
+                        recvTy->astNode->name->parts.size() == 1 &&
+                        // fix #5241 (§2.2, v0.313): an alias-qualified
+                        // built-in (`G.Stack<int>`, alias segment dropped) is
+                        // never a type parameter, whatever parameter shares
+                        // its bare name.
+                        !recvTy->astNode->aliasQualifiedBuiltin) {
                     std::string_view paramName =
                         recvTy->headName();
                     const auto& mbr = ma->member;

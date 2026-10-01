@@ -1024,9 +1024,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // bz_array_free. A bare unresolved type parameter (`T` with no
             // substitution) still reaches the value-kind i32 fallback at the
             // end of this switch, so that behavior is unchanged.
+            // per §2.2 (v0.313), fix #5241: an alias-qualified built-in
+            // (`D.Stopwatch`) is never the same-named type parameter.
             if (!rt->declaration && !genericSubst_.empty() &&
                 rt->astNode && rt->astNode->name &&
-                rt->astNode->name->parts.size() == 1) {
+                rt->astNode->name->parts.size() == 1 &&
+                !rt->astNode->aliasQualifiedBuiltin) {
                 auto sit = genericSubst_.find(rt->headName());
                 if (sit != genericSubst_.end())
                     return sit->second;
@@ -2675,8 +2678,12 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
         return sub;
     };
     // Local generic record: type-param name is in astNode.
+    // per §2.2 (v0.313), fix #5241: an alias-qualified built-in (`D.Stopwatch`,
+    // alias segment dropped by sema) is never the type parameter that shares
+    // its bare name.
     if (declared->astNode && declared->astNode->name &&
-        declared->astNode->name->parts.size() == 1) {
+        declared->astNode->name->parts.size() == 1 &&
+        !declared->astNode->aliasQualifiedBuiltin) {
         auto it = genericSubstSemaTy_.find(declared->headName());
         if (it != genericSubstSemaTy_.end() && it->second)
             return withNullability(it->second);
