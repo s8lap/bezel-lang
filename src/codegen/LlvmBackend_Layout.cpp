@@ -3322,11 +3322,24 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // NOT a Primitive String and so still falls through to the #1071 guard
     // below (widened by #4925 to recognize a bare type-parameter placeholder).
     const sema::TypeRef* opTyRaw = operandStaticTy();
+    // fix #5234 (§12.7 "Value-typed operands", v0.313): resolveTypeParamRef
+    // returns the substitution's own TypeRef and so drops the operand's `?`
+    // (`v: T?` at T=int resolved to plain `int`, though `obj` is the
+    // `{i8, i32}` nullable carrier). Re-apply the nullable flag on a copy so
+    // the nullable-value arm below sees `int?`, and the concrete-value arm
+    // never wraps an already-nullable operand a second time.
+    sema::TypeRef opTyNullableCopy;
     const sema::TypeRef* opTyResolved =
         (opTyRaw && opTyRaw->kind == sema::TypeRef::Kind::Named &&
          !opTyRaw->declaration && opTyRaw->genericArgs.empty())
             ? resolveTypeParamRef(opTyRaw)
             : opTyRaw;
+    if (opTyResolved && opTyResolved != opTyRaw && opTyRaw->nullable &&
+        !opTyResolved->nullable) {
+        opTyNullableCopy = *opTyResolved;
+        opTyNullableCopy.nullable = true;
+        opTyResolved = &opTyNullableCopy;
+    }
     if (opTyResolved && opTyResolved->kind == sema::TypeRef::Kind::Primitive &&
         opTyResolved->primitive == sema::PrimitiveType::String &&
         obj->getType()->isPointerTy() &&
