@@ -606,6 +606,41 @@ inline bool isLambdaExprBodyVoidBuiltin(const ast::LambdaExpr& lam) {
     return false;
 }
 
+// fix #5216 / narrow #5129 (§28.9 / §28.14, v0.313): true iff EVERY reference
+// to the formal `name` inside the locally compiled, non-virtual callee `md`
+// is the bare callee of a direct invocation `name(...)`. This is the one
+// callee-body shape under which a caller may drop its OWN reference to a
+// function value bound to a bare METHOD-OWN type-parameter formal
+// (`Keep<U>(x: U)` at `U := () -> int`) after the call: an invocation reads
+// through the cell's function pointer and takes nothing, so the callee holds
+// no reference of its own once it returns. (For a BARE `U` formal §27.7
+// rejects `x(...)` outright — "cannot call a value of type `U`" — so the
+// verdict there reduces to "the callee never references `x`"; the
+// invocation arm keeps the walk correct for a formal spelled as a function
+// type.) Any other reference is a RETENTION HAZARD: `l.Add(x)` into a caller-supplied `Array<U>` (issue
+// #5216), a `Dictionary<K,U>` store, a `T`-typed field of a generic class,
+// a local binding, a capture, a return, a forward to another generic
+// callee. Sema cannot see through `U` to §28.14's call-bounded sink
+// obligations (they are keyed on a FUNCTION-typed formal), and the
+// borrowing-collection insert path takes NO reference of its own for a
+// function-typed element (MEASURED: the non-generic
+// `Array<() -> int>.Add(f)` leaks 48 B per element and never releases one —
+// the §28.11 runtime-managed row is implemented for `string` only), so the
+// caller's reference is the ONLY one keeping such a stored value alive and
+// releasing it is a heap-use-after-free at the next invocation.
+//
+// FAILS CLOSED. Every node kind is enumerated; one the walk does not know,
+// a lambda (a capture), a `case` (pattern bindings), a `bind`, a `yield`
+// (frame residence), a binding that shadows `name` (local, const, `for`
+// variable, catch variable), a `move name`, and any `virtual` / `abstract`
+// / `override` callee (the runtime override may store `x`) all answer
+// false, which the two arms below turn into "do not release" — a leak, the
+// safe direction. Used by lowerCallDispatch's #5116 literal arm (release at
+// the call's end) and by ClosureEscapeWalker's #5129 named-local arm
+// (release at the local's scope end, LlvmBackend_Setup.cpp).
+bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
+                                          std::string_view name);
+
 // Per-module emitter. Holds the LLVM context/module/builder and lowers the
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {

@@ -13238,6 +13238,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 formalIsFunction = true;
                         }
                     }
+                    // fix #5216 (§28.9 / §28.14, v0.313): the paragraph above
+                    // is wrong where it says a method-own-`U` argument "can
+                    // never be stored into … a collection reachable beyond
+                    // the call": `AddTo<U>(l: Array<U>, x: U)` with
+                    // `l.Add(x)` stores it into the CALLER's collection at
+                    // type `U`, sema admits that for every `U` (the §28.14
+                    // sink obligations are keyed on a function-TYPED formal,
+                    // which a bare `U` is not), and the borrowing insert takes
+                    // no reference of its own for a function element. The
+                    // literal's only +1 was therefore released here at the
+                    // call's end while the array still pointed at the cell —
+                    // heap-use-after-free at the next invocation (issue
+                    // #5216's repro). Arm the release only when the callee
+                    // body provably uses `x` by direct invocation alone
+                    // (calleeBodyUsesFormalOnlyByInvocation, fail-closed);
+                    // every other shape leaks the cell, the safe direction,
+                    // exactly as the non-generic `Array<() -> int>.Add(f)`
+                    // path leaks it today (§28.11's runtime-managed row is
+                    // implemented for `string` only — a separate gap).
+                    if (formalIsFunction && isMethodOwnTypeParam &&
+                        !calleeBodyUsesFormalOnlyByInvocation(*mdCb, p.name))
+                        continue;
                 }
                 if (!formalIsFunction) continue;
                 if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
@@ -14329,6 +14351,234 @@ void Emitter::collectClosureArgBodyIdentifiers(
     }
     // Other expression / statement forms carry no identifier that could be
     // a method parameter reference (literals, type expressions, etc.).
+}
+
+
+namespace {
+// fix #5216 / narrow #5129 (§28.9 / §28.14, v0.313): the fail-closed walk
+// behind calleeBodyUsesFormalOnlyByInvocation (declared and documented in
+// LlvmBackend_impl.hpp). `ok` is the running verdict; every arm either
+// descends into the children it knows or sets `ok = false`. The walk is
+// deliberately NOT collectClosureArgBodyIdentifiers: that one collects
+// identifiers and skips node kinds "that carry no identifier" (a lambda body,
+// a `case` arm, a `try`'s catch arms, a `do … end` block), which is
+// fail-OPEN — a reference it misses would be turned into a release here,
+// which is exactly the UAF this predicate exists to rule out.
+struct FormalInvocationOnlyWalk {
+    std::string_view name;
+    bool ok = true;
+
+    bool isName(const ast::Expr* e) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && id->name == name;
+    }
+    void stmts(const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+        for (const auto& s : v) { if (!ok) return; stmt(s.get()); }
+    }
+    void args(const std::vector<ast::CallArgument>& v) {
+        for (const auto& a : v) { if (!ok) return; expr(a.value.get()); }
+    }
+    void stmt(const ast::Stmt* s) {
+        if (!ok || !s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (ld->name == name) { ok = false; return; }  // shadowing
+            expr(ld->initializer.get());
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            if (lc->name == name) { ok = false; return; }
+            expr(lc->value.get());
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(rs->value.get());
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get());
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get());
+            expr(as->value.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            stmts(is->ifBranch.body);
+            for (const auto& el : is->elifBranches) {
+                expr(el.condition.get());
+                stmts(el.body);
+            }
+            stmts(is->elseBody);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            stmts(ws->body);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            if (fs->varName == name) { ok = false; return; }  // shadowing
+            expr(fs->iterable.get());
+            expr(fs->withExpr.get());
+            stmts(fs->body);
+            return;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            stmts(db->body);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get());
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get());
+            return;
+        }
+        if (dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s))
+            return;
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            stmts(tr->body);
+            for (const auto& c : tr->catches) {
+                if (c.hasBinding && c.varName == name) { ok = false; return; }
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            stmts(tr->finallyBody);
+            return;
+        }
+        // YieldStmt (frame residence), CaseStmt (pattern bindings) and
+        // anything else: fail closed.
+        ok = false;
+    }
+    void expr(const ast::Expr* e) {
+        if (!ok || !e) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            // A bare read in any position other than the callee of a direct
+            // call (handled in the CallExpr arm) is a retention hazard.
+            if (id->name == name) ok = false;
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (!isName(c->callee.get())) expr(c->callee.get());
+            args(c->args);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (!isName(c->callee.get())) expr(c->callee.get());
+            args(c->args);
+            return;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(ma->target.get());  // `x.Member` is a read of `x` → false
+            return;
+        }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(nm->target.get());
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            args(ix->indices);
+            return;
+        }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(pb->operand.get());
+            return;
+        }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            args(ne->args);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(be->left.get());
+            expr(be->right.get());
+            return;
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(un->operand.get());
+            return;
+        }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(tt->operand.get());
+            return;
+        }
+        if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(cd->condition.get());
+            expr(cd->thenValue.get());
+            expr(cd->elseValue.get());
+            return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get());
+            return;
+        }
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(rg->lo.get());
+            expr(rg->hi.get());
+            expr(rg->step.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& p : is->parts) expr(p.expr.get());
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(we->source.get());
+            for (const auto& a : we->assigns) expr(a.value.get());
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& el : cl->elements) expr(el.get());
+            for (const auto& k : cl->keys) expr(k.get());
+            return;
+        }
+        if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
+            if (mt->name == name) ok = false;  // `move x`
+            return;
+        }
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e))
+            return;
+        // LambdaExpr (a capture retains and may escape anywhere), CaseExpr
+        // (pattern bindings), BindExpr, and anything else: fail closed.
+        ok = false;
+    }
+};
+}  // namespace
+
+bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
+                                          std::string_view name) {
+    if (name.empty()) return false;
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    FormalInvocationOnlyWalk w{name};
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return false;
+        w.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        w.stmts(md.stmts);
+    } else {
+        return false;
+    }
+    return w.ok;
 }
 
 
