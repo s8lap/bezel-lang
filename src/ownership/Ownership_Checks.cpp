@@ -6466,6 +6466,33 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             if (sema::Symbol* s = borrowSourceForExpr(*co->left)) return s;
         return co->right ? borrowSourceForExpr(*co->right) : nullptr;
     }
+    // fix #5225 (§28.3 returns table source 1 `this`, K2.2, v0.313): a call
+    // whose resolved callee returns only receiver-sourced borrows (`return
+    // this;` / a receiver-rooted field read) yields a borrow whose source is
+    // the CALL'S RECEIVER (K2.2 composition), so the call result carries
+    // whatever source the receiver expression carries: `value.Self()` over an
+    // `owned` parameter / owned local `value` borrows `value`, and a chain
+    // `value.Self().Self()` composes. A receiver that is `this`, a plain
+    // (borrow) parameter or a field carries no escape-bound source here, so
+    // those stay admitted (§28.3 field-store clause 2). Direct, non-async,
+    // non-`owned`-returning user methods only, the same gate the §28.10
+    // using-var borrow-pin recognizer applies. // per §28.3, §28.10
+    if (const auto* ce =
+            dynamic_cast<const ast::CallExpr*>(peelTopCastBang(&rhs))) {
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            bool isAsync = false;
+            for (std::string_view mod : md->modifiers)
+                if (mod == "async") { isAsync = true; break; }
+            const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+            // A value-typed result is a copy, never a borrow (§28.3
+            // "value-typed returns"), so the same type gate as Shape 1.
+            if (!isAsync && !md->returnOwned && ma && ma->target &&
+                returnedExprMayBorrow(rhs) &&
+                methodReturnsOnlyReceiverSourcedBorrows(*md))
+                return borrowSourceForExpr(*ma->target);
+        }
+    }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
     // a local read `r` of an owned local in a borrowing position is a
     // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
