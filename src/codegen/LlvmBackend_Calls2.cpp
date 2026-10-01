@@ -16742,6 +16742,10 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     };
     std::vector<Branch> branches;
     sema::MethodSymbol* defaultImpl = nullptr;
+    // fix #5247: set when a generic candidate below the static type has type
+    // parameters the chain does not pin (`class EGO<X> : GA`), so its
+    // instantiations cannot be enumerated from the call site.
+    bool unboundGenericCandidate = false;
     // fix #5124: the descriptors of the known classes whose instances run
     // `defaultImpl` (see `unknownDescriptorTrap`), and whether one of them is
     // generic below the static type.
@@ -16807,8 +16811,50 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                 if (!t2->genericParams.empty()) { genericBelow = true; break; }
             if (genericBelow) {
                 std::vector<DescendantLevelSubst> levels;
-                if (!deriveDescendantGenericSubst(staticType, c, levels))
-                    return nullptr;  // undeterminable — abandon the dispatch
+                if (!deriveDescendantGenericSubst(staticType, c, levels)) {
+                    // fix #5247 (§12.1 / §12.9 / §14.1, v0.313): the candidate
+                    // declares parameters its base clause does not pin
+                    // (`class EGO<X> : GA`): a `GA` receiver may hold any
+                    // instantiation. Abandoning the whole dispatch sent EVERY
+                    // receiver (not just this class's) to the erased vtable
+                    // template, which degrades to a zero return. Instead give
+                    // each instantiation of `c` the program names (concrete
+                    // resolved types) its own branch, and mark the dispatch so
+                    // an instantiation this scan cannot see aborts loudly on
+                    // the default path (see `unboundGuard`).
+                    unboundGenericCandidate = true;
+                    if (impl->parent != c || c->genericParams.empty())
+                        continue;  // reaches the abort guard, never silent
+                    std::map<std::string, std::vector<const sema::TypeRef*>>
+                        insts;
+                    for (const auto& [node, tr] : ctx_.allResolvedTypes()) {
+                        if (!tr || tr->kind != sema::TypeRef::Kind::Named ||
+                            tr->declaration != c ||
+                            tr->genericArgs.size() != c->genericParams.size())
+                            continue;
+                        std::vector<const sema::TypeRef*> a(
+                            tr->genericArgs.begin(), tr->genericArgs.end());
+                        if (!descArgsConcrete(a)) continue;
+                        insts.emplace(descIdentityKey(c, a), std::move(a));
+                    }
+                    for (auto& [key, a] : insts) {
+                        llvm::GlobalVariable* pid = instanceDescriptorFor(c, a);
+                        auto dit = descArray_.find(c);
+                        if (!pid || (dit != descArray_.end() &&
+                                     pid == dit->second))
+                            continue;
+                        Branch ib{c, impl};
+                        ib.desc = pid;
+                        for (std::size_t gi = 0; gi < a.size(); ++gi) {
+                            std::string_view pn = c->genericParams[gi]->name;
+                            ib.substLlvm[pn] = lowerTypeRef(a[gi]);
+                            ib.substSema[pn] = a[gi];
+                        }
+                        ib.hasSubst = true;
+                        branches.push_back(std::move(ib));
+                    }
+                    continue;
+                }
                 if (!c->genericParams.empty()) {
                     // §12.9: name the candidate's own instantiation, exactly as
                     // the `new` site minted it and as `is Box<int>` resolves it.
@@ -16912,14 +16958,36 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // descriptors cannot be enumerated, #1843).
     bool slotGuard = false;
     bool descGuard = false;
+    bool unboundGuard = false;
     unsigned guardSlot = 0;
     llvm::Constant* guardDefaultFn = nullptr;
-    if (!isMainModule_) {
-        auto chainNonGeneric = [&](const sema::TypeSymbol* c) {
-            for (const sema::TypeSymbol* t = c; t; t = baseClassOf(t))
-                if (!t->genericParams.empty()) return false;
-            return true;
-        };
+    auto chainNonGeneric = [&](const sema::TypeSymbol* c) {
+        for (const sema::TypeSymbol* t = c; t; t = baseClassOf(t))
+            if (!t->genericParams.empty()) return false;
+        return true;
+    };
+    // fix #5247: the default path of a dispatch with an unenumerable generic
+    // candidate runs the default only for a receiver whose vtable slot holds
+    // the default's function (the slot guard below); any other receiver is an
+    // instantiation this site could not specialize and aborts. Needs the
+    // slot's identity, so it is available only on a non-generic chain; where it
+    // is not, the old bail stands.
+    if (unboundGenericCandidate) {
+        auto slotIt = vtableSlot_.find(ms);
+        auto defFnIt = methodFns_.find(defaultImpl);
+        if (!ifaceParent && slotIt != vtableSlot_.end() &&
+            defFnIt != methodFns_.end() && defFnIt->second &&
+            chainNonGeneric(staticType) && defaultImpl->parent &&
+            chainNonGeneric(defaultImpl->parent)) {
+            slotGuard = true;
+            unboundGuard = true;
+            guardSlot = slotIt->second;
+            guardDefaultFn = llvm::cast<llvm::Constant>(defFnIt->second);
+        } else {
+            return nullptr;
+        }
+    }
+    if (!isMainModule_ && !unboundGuard) {
         auto extensible = [&](const sema::TypeSymbol* c) {
             if (!c || c->visibility != ast::Visibility::Public) return false;
             for (auto mod : c->modifiers)
@@ -17032,6 +17100,15 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         if (br && br->hasSubst) {
             genericSubst_ = br->substLlvm;
             genericSubstSemaTy_ = br->substSema;
+            // fix #5247: keep the call's METHOD type-argument bindings (`T` of
+            // `VB<T>`), which the remap below reads by the static method's
+            // names and which the candidate's class-parameter map lacks.
+            for (const auto& gp : staticMd->genericParams) {
+                if (auto it = savedSubst.find(gp.name); it != savedSubst.end())
+                    genericSubst_.emplace(gp.name, it->second);
+                if (auto is = savedSema.find(gp.name); is != savedSema.end())
+                    genericSubstSemaTy_.emplace(gp.name, is->second);
+            }
         }
         if (implMd && implMd->genericParams.size() ==
                           staticMd->genericParams.size() &&
@@ -17327,7 +17404,13 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             failFn,
             {lowerStringLiteralConst(
                 // a source-form literal: the quotes are stripped
-                (slotGuard || descGuard)
+                unboundGuard
+                    ? "\"virtual call to generic method `" +
+                          std::string(ms->name) +
+                          "` reached an instantiation of a generic subclass "
+                          "whose override this call site cannot specialize "
+                          "(#5247)\""
+                : (slotGuard || descGuard)
                     ? "\"virtual call to generic method `" +
                           std::string(ms->name) +
                           "` from a library reached an override declared in "
